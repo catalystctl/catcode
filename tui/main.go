@@ -36,11 +36,11 @@ type session struct {
 	queuedNext      bool // a follow-up/steer turn is chained after the current one
 	turnCount       int
 	pendingApproval *approvalPrompt
+	pendingIntercom   *intercomPrompt
 	lastMetrics     json.RawMessage
 	approvalModeStr string
 	sessionList     []sessionEntry
 	coreBashTimeout int
-	coreMaxTurns    int
 	coreRestarts    int
 
 	settings *settingsStore
@@ -60,8 +60,17 @@ type session struct {
 	// view yanking back down on each new token; a banner offers to re-pin.
 	follow        bool
 	welcomeIdx    int    // welcome-screen example cursor (empty conversation)
-	contextTokens uint64 // cumulative session tokens (last metrics in+out)
+	contextTokens uint64 // live context size from the last metrics event (drives the footer budget)
+	subProgress    []*subProgressEntry // live subagent runs (drives the progress panel)
 	cwd           string // working dir, shown in the header as ~/
+
+	// @-mention file flyout state (see mention.go): active when an
+	// unbroken @-token sits at the cursor; mentionAt is its rune index.
+	mentionActive bool
+	mentionItems  []mentionItem
+	mentionCursor int
+	mentionScroll int
+	mentionAt     int
 
 	viewport viewport.Model
 	input    textinput.Model
@@ -82,7 +91,6 @@ func initialSession() *session {
 	s.follow = true // pin viewport to newest line until the user scrolls up
 	s.cwd = cwdDisplay()
 	s.coreBashTimeout = 30
-	s.coreMaxTurns = 25
 
 	s.input = textinput.New()
 	s.input.Placeholder = "Chat with the agent…  (/ for commands)"
@@ -267,6 +275,10 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		model, cmd := s.handleKey(msg)
 		return model, cmd
+
+	case tea.MouseMsg:
+		return s, s.handleMouseWheel(msg)
+
 	default:
 		// bubbletea v1.3 can't decode modified-Enter (the Key type carries no
 		// modifier bits), so terminals send Ctrl+Enter as an unrecognized CSI sequence.
@@ -284,7 +296,7 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	prog := tea.NewProgram(initialSession(), tea.WithAltScreen())
+	prog := tea.NewProgram(initialSession(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := prog.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

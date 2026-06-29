@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+- Removed the fixed agentic turn cap (`--max-turns` / `max_turns`, default 200)
+  and the `spawn` sub-agent turn cap (`spawn_max_turns`, default 10). Turns are
+  now bounded only by the session token budget (`--max-session-tokens`, 0 =
+  unlimited), the `finish` tool, abort, or the model stopping. Removed: the
+  `--max-turns` flag, `UMANS_HARNESS_MAX_TURNS` env var, `max_turns` config
+  key, `ready` event's `max_turns` field, the `set_config max_turns` knob, and
+  the TUI "Max Turns" setting. Stale `max_turns` config values are ignored.
+
 ### Added — in-flight steer, follow-up & commands
 - While a turn is running the input now stays live so you can compose a
   follow-up, steer the model, or run commands without waiting:

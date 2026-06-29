@@ -85,7 +85,7 @@ pub enum Command {
     #[serde(rename = "set_approval")]
     SetApproval { mode: String },
     /// Change a runtime config knob at runtime. Recognized keys:
-    ///   bash_timeout_secs (u64), max_turns (u64).
+    ///   bash_timeout_secs (u64).
     /// Values are coerced from the JSON type (string or number).
     #[serde(rename = "set_config")]
     SetConfig { key: String, value: Value },
@@ -103,6 +103,15 @@ pub enum Command {
     /// Ask core to re-inject memories into the system prompt (called after saving a memory).
     #[serde(rename = "refresh_memory")]
     RefreshMemory,
+    /// Reply to a subagent's contact_supervisor need_decision ask.
+    /// The TUI surfaces an `intercom_message` event and the user (acting as
+    /// the orchestrator) replies with this command; the awaiting subagent
+    /// wakes and continues.
+    #[serde(rename = "intercom_reply")]
+    IntercomReply {
+        request_id: String,
+        reply: String,
+    },
 }
 
 /// Events written to stdout. Constructed with serde_json::json! and emitted via `emit`.

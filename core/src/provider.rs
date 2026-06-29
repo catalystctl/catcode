@@ -2,11 +2,11 @@
 // Streams SSE chunks; emits delta/thinking/tool_call events. Retries on
 // transient HTTP errors with exponential backoff (honors Retry-After).
 use crate::config::Config;
-use crate::logging::TurnTimer;
+use crate::logging::{TurnTimer, estimate_messages_tokens, estimate_tokens};
 use crate::protocol::{emit, Event, ModelInfo};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
@@ -34,6 +34,19 @@ pub const DEFAULT_THINKING_LEVELS: &[&str] = &["low", "medium", "high"];
 pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
     if levels.is_empty() {
         return requested.to_string();
+    }
+
+    #[test]
+    fn token_count_handles_int_float_and_string() {
+        // integer (standard OpenAI)
+        assert_eq!(token_count(&json!(1234)), Some(1234));
+        // float — some proxies serialize counts as `100.0`
+        assert_eq!(token_count(&json!(100.0)), Some(100));
+        // quoted number
+        assert_eq!(token_count(&json!("567")), Some(567));
+        // absent / null / garbage
+        assert_eq!(token_count(&Value::Null), None);
+        assert_eq!(token_count(&json!("n/a")), None);
     }
     if let Some(hit) = levels.iter().find(|l| l.eq_ignore_ascii_case(requested)) {
         return hit.clone();
@@ -96,39 +109,143 @@ fn fallback_models() -> Vec<ModelInfo> {
     ]
 }
 
-/// Discover models live from /models/info; fall back to the snapshot on any error.
+/// Discover models live from /models/info; cache to disk with an 8-hour TTL.
+/// Falls back to the disk cache (even if stale) on HTTP error, then to the
+/// hardcoded snapshot as a last resort.
 pub async fn discover_models(client: &reqwest::Client, base_url: &str) -> Vec<ModelInfo> {
-    let url = format!("{base_url}{MODELS_INFO_PATH}");
-    match client.get(&url).timeout(Duration::from_secs(5)).send().await {
-        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-            Ok(data) if data.is_object() => {
-                let mut out = Vec::new();
-                for (id, info) in data.as_object().unwrap() {
-                    let caps = info.get("capabilities");
-                    let cw = caps.and_then(|c| c.get("context_window")).and_then(|v| v.as_u64()).unwrap_or(200_000) as u32;
-                    let mt = caps.and_then(|c| c.get("recommended_max_tokens")).and_then(|v| v.as_u64()).unwrap_or(65000) as u32;
-                    let name = info.get("display_name").and_then(|v| v.as_str()).unwrap_or(id).to_string();
-                    // ponytail: model-advertised thinking levels. The endpoint may
-                    // expose them under any of these keys (per-model override of
-                    // the default low/medium/high set). Empty => no constraint.
-                    let thinking_levels = caps
-                        .and_then(|c| c.get("thinking_levels").or_else(|| c.get("reasoning_levels")).or_else(|| c.get("reasoning_efforts")))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    out.push(ModelInfo { id: id.clone(), name, reasoning: true, context_window: cw, max_tokens: mt, thinking_levels });
-                }
-                if out.is_empty() { fallback_models() } else { out }
-            }
-            _ => fallback_models(),
-        },
-        _ => fallback_models(),
+    // 1. Try disk cache (fresh: < 8 hours old).
+    if let Some(models) = read_models_cache(base_url) {
+        return models;
     }
+
+    // 2. Fetch live from the endpoint.
+    let url = format!("{base_url}{MODELS_INFO_PATH}");
+    let live = match client.get(&url).timeout(Duration::from_secs(5)).send().await {
+        Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
+            Ok(v) => v,
+            Err(_) => {
+                // HTTP ok but JSON parse failed — fall back to stale cache.
+                return read_models_cache_stale(base_url).unwrap_or_else(fallback_models);
+            }
+        }),
+        _ => {
+            // HTTP failed — fall back to stale cache.
+            return read_models_cache_stale(base_url).unwrap_or_else(fallback_models);
+        }
+    };
+
+    // 3. Write fresh data to disk cache.
+    write_models_cache(base_url, &live);
+    live
+}
+
+/// Model cache TTL in seconds (8 hours).
+const MODELS_CACHE_TTL: u64 = 28800;
+
+fn models_cache_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/umans-harness/models-cache.json"))
+}
+
+fn read_models_cache(base_url: &str) -> Option<Vec<ModelInfo>> {
+    let path = models_cache_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let cache: Value = serde_json::from_str(&content).ok()?;
+    let cached_url = cache.get("base_url")?.as_str()?;
+    if cached_url != base_url {
+        return None;
+    }
+    let updated = cache.get("updated_at")?.as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if now.saturating_sub(updated) > MODELS_CACHE_TTL {
+        return None;
+    }
+    parse_cache_models(&cache)
+}
+
+fn read_models_cache_stale(base_url: &str) -> Option<Vec<ModelInfo>> {
+    let path = models_cache_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let cache: Value = serde_json::from_str(&content).ok()?;
+    let cached_url = cache.get("base_url")?.as_str()?;
+    if cached_url != base_url {
+        return None;
+    }
+    parse_cache_models(&cache)
+}
+
+fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
+    let path = match models_cache_path() {
+        Some(p) => p,
+        None => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let models_json: Vec<Value> = models.iter().map(|m| {
+        json!({
+            "id": m.id,
+            "name": m.name,
+            "context_window": m.context_window,
+            "max_tokens": m.max_tokens,
+            "thinking_levels": m.thinking_levels,
+        })
+    }).collect();
+    let cache = json!({
+        "base_url": base_url,
+        "updated_at": now,
+        "models": models_json,
+    });
+    let _ = std::fs::write(&path, serde_json::to_string(&cache).unwrap_or_default());
+}
+
+fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
+    let arr = cache.get("models")?.as_array()?;
+    let mut out = Vec::new();
+    for m in arr {
+        let id = m.get("id")?.as_str()?.to_string();
+        let name = m.get("name")?.as_str()?.to_string();
+        let context_window = m.get("context_window")?.as_u64()? as u32;
+        let max_tokens = m.get("max_tokens")?.as_u64()? as u32;
+        let thinking_levels = m.get("thinking_levels")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        out.push(ModelInfo { id, name, reasoning: true, context_window, max_tokens, thinking_levels });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Parse the live /models/info response into ModelInfo vec.
+fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
+    let mut out = Vec::new();
+    if let Some(obj) = data.as_object() {
+        for (id, info) in obj {
+            let caps = info.get("capabilities");
+            let cw = caps.and_then(|c| c.get("context_window")).and_then(|v| v.as_u64()).unwrap_or(200_000) as u32;
+            let mt = caps.and_then(|c| c.get("recommended_max_tokens")).and_then(|v| v.as_u64()).unwrap_or(65000) as u32;
+            let name = info.get("display_name").and_then(|v| v.as_str()).unwrap_or(id).to_string();
+            let thinking_levels = caps
+                .and_then(|c| c.get("thinking_levels").or_else(|| c.get("reasoning_levels")).or_else(|| c.get("reasoning_efforts")))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            out.push(ModelInfo { id: id.clone(), name, reasoning: true, context_window: cw, max_tokens: mt, thinking_levels });
+        }
+    }
+    if out.is_empty() { fallback_models() } else { out }
 }
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
@@ -202,6 +319,23 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
     }
 }
 
+/// Read a token count from a usage field, tolerating the integer, float, and
+/// string encodings different OpenAI-compatible servers emit. `as_u64` alone
+/// misses floats (some proxies serialize counts as `100.0`) and quoted numbers,
+/// which silently drops the context budget to zero.
+fn token_count(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(n) = v.as_f64() {
+        return Some(n as u64);
+    }
+    if let Some(s) = v.as_str() {
+        return s.trim().parse::<u64>().ok();
+    }
+    None
+}
+
 /// One streamed assistant turn. Emits `thinking`/`delta`/`tool_call` events as it goes.
 /// Retries the initial POST on 429/5xx with exponential backoff (honors Retry-After).
 /// Returns the finalized assistant message, finish_reason, and (in/out) token counts.
@@ -216,7 +350,8 @@ pub async fn stream_turn(
     thinking_levels: &[String],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
-) -> Result<(Value, String, u64, u64), String> {
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
     // ponytail: reasoning_effort + reasoning_content replay are Umans-specific.
     // Only emit them when pointed at an Umans endpoint; other OpenAI-compatible
     // servers reject unknown fields with a 400.
@@ -238,7 +373,7 @@ pub async fn stream_turn(
         // levels: clamp to the closest supported level when the model constrains
         // the set (e.g. GLM only accepts "high"). Empty levels => pass through.
         let resolved = resolve_effort(reasoning_effort, thinking_levels);
-        if resolved != reasoning_effort {
+        if resolved != reasoning_effort && !quiet {
             emit(&Event::new("info").with("message", json!(format!(
                 "reasoning effort '{}' not supported by model '{}'; using '{}'",
                 reasoning_effort, model, resolved
@@ -260,9 +395,21 @@ pub async fn stream_turn(
     let mut finish_reason = String::new();
     let mut tokens_in: u64 = 0;
     let mut tokens_out: u64 = 0;
+    // ponytail: cached_tokens comes from usage.prompt_tokens_details.cached_tokens
+    // (OpenAI/Z.AI implicit prefix caching). Surfaced so the harness can confirm
+    // prefix-cache hits and diagnose busts — the request shape is already stable,
+    // this just makes the hit visible.
+    let mut cached_tokens: u64 = 0;
     // Per-chunk idle timeout: if no bytes arrive for this long mid-stream, abort.
     // Configurable because reasoning models can think >60s before the first token.
     let idle = Duration::from_secs(cfg.idle_timeout_secs.max(10));
+
+    // Live stats: estimate the prompt's token count once (the prompt is fixed for
+    // this request) so the footer can show a growing context + live TPS as output
+    // streams in. The real usage chunk at stream end overwrites these.
+    // ponytail: char/4 estimate — same heuristic the compaction threshold uses.
+    let est_prompt = estimate_messages_tokens(messages);
+    let mut last_stats: Option<Instant> = None;
 
     let mut attempt = 0u32;
     loop {
@@ -309,12 +456,18 @@ pub async fn stream_turn(
                 let Ok(obj) = serde_json::from_str::<Value>(data) else { continue };
 
                 // usage is sent in a final chunk with an empty choices array.
+                // usage is sent in a final chunk with an empty choices array.
                 if let Some(u) = obj.get("usage") {
-                    if let Some(p) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                    if let Some(p) = u.get("prompt_tokens").and_then(token_count) {
                         tokens_in = p;
                     }
-                    if let Some(c) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
+                    if let Some(c) = u.get("completion_tokens").and_then(token_count) {
                         tokens_out = c;
+                    }
+                    // prompt_tokens_details.cached_tokens — the prefix-cache hit count.
+                    // Absent on servers that don't support/report caching (stays 0).
+                    if let Some(c) = u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(token_count) {
+                        cached_tokens = c;
                     }
                 }
 
@@ -327,15 +480,19 @@ pub async fn stream_turn(
                             timer.mark_first_token();
                         }
                         content.push_str(c);
-                        emitted = true;
-                        emit(&Event::new("delta").with("text", json!(c)));
+                        if !quiet {
+                            emitted = true;
+                            emit(&Event::new("delta").with("text", json!(c)));
+                        }
                     }
                 }
                 if let Some(r) = delta.and_then(|d| d.get("reasoning_content")).and_then(|v| v.as_str()) {
                     if !r.is_empty() {
                         reasoning.push_str(r);
-                        emitted = true;
-                        emit(&Event::new("thinking").with("text", json!(r)));
+                        if !quiet {
+                            emitted = true;
+                            emit(&Event::new("thinking").with("text", json!(r)));
+                        }
                     }
                 }
                 if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|v| v.as_array()) {
@@ -348,22 +505,28 @@ pub async fn stream_turn(
                         if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                             if acc.id.is_empty() {
                                 acc.id = id.to_string();
-                                emitted = true;
-                                emit(&Event::new("tool_call_start").with("id", json!(id)).with("index", json!(idx)));
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("tool_call_start").with("id", json!(id)).with("index", json!(idx)));
+                                }
                             }
                         }
                         let func = tc.get("function");
                         if let Some(name) = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
                             if acc.name.is_empty() {
                                 acc.name = name.to_string();
-                                emitted = true;
-                                emit(&Event::new("tool_call_name").with("index", json!(idx)).with("name", json!(name)));
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("tool_call_name").with("index", json!(idx)).with("name", json!(name)));
+                                }
                             }
                         }
                         if let Some(args) = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
                             acc.args.push_str(args);
-                            emitted = true;
-                            emit(&Event::new("tool_call_args").with("index", json!(idx)).with("args", json!(args)));
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("tool_call_args").with("index", json!(idx)).with("args", json!(args)));
+                            }
                         }
                     }
                 }
@@ -371,6 +534,33 @@ pub async fn stream_turn(
                     if !fr.is_empty() {
                         finish_reason = fr.to_string();
                     }
+                }
+            }
+
+            // Live footer stats: emit a metrics event at most every ~400ms so the
+            // TUI's context + TPS move during the turn, not just at the end.
+            // ponytail: char/4 estimate (same heuristic as the compaction threshold);
+            // the real usage chunk at stream end overwrites these with exact values.
+			if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
+                let now = Instant::now();
+                let due = last_stats.map(|t| now.duration_since(t) >= Duration::from_millis(400)).unwrap_or(true);
+                if due {
+                    last_stats = Some(now);
+                    let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+                    let live_ctx = est_prompt.saturating_add(est_out);
+                    let mut ev = Event::new("metrics")
+                        .with("tokens_in", json!(live_ctx))
+                        .with("tokens_out", json!(est_out));
+                    if let Some(ttft) = timer.first_token.map(|t| t.duration_since(timer.start).as_millis() as u64) {
+                        ev = ev.with("ttft_ms", json!(ttft));
+                    }
+                    if let Some(tps) = timer.first_token.and_then(|ft| {
+                        let e = ft.elapsed().as_secs_f64();
+                        if e >= 0.2 { Some(est_out as f64 / e) } else { None }
+                    }) {
+                        ev = ev.with("tps", json!(tps));
+                    }
+                    emit(&ev);
                 }
             }
         }
@@ -395,6 +585,7 @@ pub async fn stream_turn(
         finish_reason.clear();
         tokens_in = 0;
         tokens_out = 0;
+        cached_tokens = 0;
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
 
@@ -423,7 +614,7 @@ pub async fn stream_turn(
         msg.insert("tool_calls".into(), json!(arr));
     }
 
-    Ok((Value::Object(msg), finish_reason, tokens_in, tokens_out))
+    Ok((Value::Object(msg), finish_reason, tokens_in, tokens_out, cached_tokens))
 }
 
 /// POST with retry on 429/5xx. Exponential backoff: 0.5s, 1s, 2s, 4s (cap 8s),

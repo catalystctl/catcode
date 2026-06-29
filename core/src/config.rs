@@ -103,7 +103,6 @@ pub struct Config {
     pub bash_deny: Vec<String>,
     pub max_read_bytes: u64,
     pub max_read_lines: usize,
-    pub max_turns: usize,
     pub context_compact_at: f32, // fraction of context_window that triggers compaction
     pub debug_log: Option<PathBuf>,
     pub session_file: Option<PathBuf>,
@@ -114,7 +113,6 @@ pub struct Config {
     pub idle_timeout_secs: u64,      // per-chunk SSE idle timeout
     pub max_session_tokens: u64,     // hard session token budget (0 = unlimited)
     pub summarize_on_compact: bool, // use a model call to summarize dropped turns
-    pub spawn_max_turns: usize,     // turn cap for the `spawn` subagent tool
     pub allow_vision: bool,         // accept image_url content in send
     // --- permission rules (item 1) ---
     pub allow_rules: Vec<PermissionRule>,
@@ -125,6 +123,76 @@ pub struct Config {
     pub plugins_disabled: Vec<String>, // plugin names that are explicitly disabled
     // --- regex denylist upgrade (quick win) ---
     pub bash_deny_regex: Vec<String>, // regex patterns that block bash commands
+    pub bash_deny_regex_compiled: Vec<regex::Regex>, // pre-compiled at startup
+    // --- subagent system (pi-subagents port) ---
+    pub subagents: SubagentConfig,
+}
+
+/// Intercom bridge mode: controls whether subagents get a coordination channel
+/// back to the orchestrator and to each other.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IntercomBridgeMode {
+    Off,       // no intercom tools injected into subagents
+    ForkOnly,  // only for forked-context runs
+    Always,    // always inject (default)
+}
+
+impl IntercomBridgeMode {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "none" => IntercomBridgeMode::Off,
+            "fork-only" | "fork_only" | "fork" => IntercomBridgeMode::ForkOnly,
+            _ => IntercomBridgeMode::Always,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IntercomBridgeMode::Off => "off",
+            IntercomBridgeMode::ForkOnly => "fork-only",
+            IntercomBridgeMode::Always => "always",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubagentConfig {
+    /// Max nesting depth for subagent delegation (main → sub → sub-sub).
+    /// 0 blocks all subagents; default 2.
+    pub max_depth: u32,
+    /// Whether subagents receive intercom coordination tools + instructions.
+    pub intercom_bridge_mode: IntercomBridgeMode,
+    /// Max tasks in a top-level parallel run.
+    pub parallel_max_tasks: u32,
+    /// Default concurrency for parallel runs.
+    pub parallel_concurrency: u32,
+    /// Top-level calls use background execution when async is not explicitly set.
+    pub async_by_default: bool,
+    /// Hide builtin agents from discovery.
+    pub disable_builtins: bool,
+    /// Per-builtin agent overrides keyed by agent name.
+    pub agent_overrides: std::collections::HashMap<String, AgentOverride>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentOverride {
+    pub model: Option<String>,
+    pub fallback_models: Vec<String>,
+    pub thinking: Option<String>,
+    pub disabled: bool,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 2,
+            intercom_bridge_mode: IntercomBridgeMode::Always,
+            parallel_max_tasks: 8,
+            parallel_concurrency: 4,
+            async_by_default: false,
+            disable_builtins: false,
+            agent_overrides: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -145,9 +213,6 @@ impl Default for Config {
             ],
             max_read_bytes: 5_242_880,   // 5 MiB (was 1 MiB; real files exceed 1MB)
             max_read_lines: 10_000,        // was 2000; pagination covers the rest
-            // ponytail: raised from 25 — real agentic loops need headroom.
-            // A token/cost budget (max_session_tokens) is the real ceiling.
-            max_turns: 200,
             context_compact_at: 0.70,
             debug_log: None,
             session_file: None,
@@ -157,7 +222,6 @@ impl Default for Config {
             idle_timeout_secs: 120, // some reasoning models think >60s before first token
             max_session_tokens: 0,
             summarize_on_compact: true,
-            spawn_max_turns: 10,
             allow_vision: true,
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -165,6 +229,8 @@ impl Default for Config {
             plugin_dir: PathBuf::from(".umans-harness/plugins"),
             plugins_disabled: Vec::new(),
             bash_deny_regex: Vec::new(),
+            bash_deny_regex_compiled: Vec::new(),
+            subagents: SubagentConfig::default(),
         }
     }
 }
@@ -181,7 +247,6 @@ OPTIONS:
       --base-url <URL>          OpenAI-compatible base URL [env: UMANS_BASE_URL]
       --approval <MODE>         never | destructive | always  [env: UMANS_HARNESS_APPROVAL]
       --bash-timeout <SECS>     Per-command bash timeout in seconds [env: UMANS_HARNESS_BASH_TIMEOUT]
-      --max-turns <N>           Max agentic tool turns per prompt [env: UMANS_HARNESS_MAX_TURNS]
       --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: UMANS_HARNESS_SANDBOX]
       --no-network             Block bash network egress (unshare -n) [env: UMANS_HARNESS_NO_NETWORK=1]
       --idle-timeout <SECS>    SSE idle timeout in seconds [env: UMANS_HARNESS_IDLE_TIMEOUT]
@@ -222,7 +287,6 @@ pub fn load() -> Config {
             "--base-url" => if let Some(v) = take_val(&mut i) { c.base_url = v; },
             "--approval" => if let Some(v) = take_val(&mut i) { c.approval = Approval::parse(&v); },
             "--bash-timeout" => if let Some(v) = take_val(&mut i) { c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs); },
-            "--max-turns" => if let Some(v) = take_val(&mut i) { c.max_turns = v.parse().unwrap_or(c.max_turns); },
             "--debug-log" => if let Some(v) = take_val(&mut i) { c.debug_log = Some(PathBuf::from(v)); },
             "--session" => if let Some(v) = take_val(&mut i) { c.session_file = Some(PathBuf::from(v)); },
             "--model" => if let Some(v) = take_val(&mut i) { c.default_model = Some(v); },
@@ -283,9 +347,13 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("UMANS_HARNESS_WORKSPACE") { c.workspace = PathBuf::from(v); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_APPROVAL") { c.approval = Approval::parse(&v); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_BASH_TIMEOUT") { c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs); }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_MAX_TURNS") { c.max_turns = v.parse().unwrap_or(c.max_turns); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_DEBUG_LOG") { c.debug_log = Some(PathBuf::from(v)); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_SESSION") { c.session_file = Some(PathBuf::from(v)); }
+
+    // Pre-compile bash denylist regexes once at startup.
+    c.bash_deny_regex_compiled = c.bash_deny_regex.iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
 
     c
 }
@@ -301,7 +369,6 @@ fn apply_json(c: &mut Config, v: &Value) {
     if let Some(x) = s("workspace") { c.workspace = PathBuf::from(x); }
     if let Some(x) = s("approval") { c.approval = Approval::parse(&x); }
     if let Some(b) = v.get("bash_timeout_secs").and_then(|x| x.as_u64()) { c.bash_timeout_secs = b; }
-    if let Some(n) = v.get("max_turns").and_then(|x| x.as_u64()) { c.max_turns = n as usize; }
     if let Some(x) = s("debug_log") { c.debug_log = Some(PathBuf::from(x)); }
     if let Some(x) = s("session") { c.session_file = Some(PathBuf::from(x)); }
     if let Some(x) = s("model") { c.default_model = Some(x); }
@@ -340,6 +407,35 @@ fn apply_json(c: &mut Config, v: &Value) {
             c.plugins_disabled = disabled.iter().filter_map(|x| x.as_str().map(String::from)).collect();
         }
     }
+    // Subagent system config (pi-subagents port).
+    if let Some(sa) = v.get("subagents").and_then(|x| x.as_object()) {
+        if let Some(n) = sa.get("maxSubagentDepth").and_then(|x| x.as_u64()) {
+            c.subagents.max_depth = n as u32;
+        }
+        if let Some(m) = sa.get("intercomBridge").and_then(|x| x.as_object()) {
+            if let Some(mode) = m.get("mode").and_then(|x| x.as_str()) {
+                c.subagents.intercom_bridge_mode = IntercomBridgeMode::parse(mode);
+            }
+        }
+        if let Some(n) = sa.get("parallel").and_then(|x| x.as_object()) {
+            if let Some(mt) = n.get("maxTasks").and_then(|x| x.as_u64()) { c.subagents.parallel_max_tasks = mt as u32; }
+            if let Some(cc) = n.get("concurrency").and_then(|x| x.as_u64()) { c.subagents.parallel_concurrency = cc as u32; }
+        }
+        if let Some(b) = sa.get("asyncByDefault").and_then(|x| x.as_bool()) { c.subagents.async_by_default = b; }
+        if let Some(b) = sa.get("disableBuiltins").and_then(|x| x.as_bool()) { c.subagents.disable_builtins = b; }
+        if let Some(ovs) = sa.get("agentOverrides").and_then(|x| x.as_object()) {
+            for (name, ov) in ovs {
+                let mut o = AgentOverride::default();
+                if let Some(m) = ov.get("model").and_then(|x| x.as_str()) { o.model = Some(m.to_string()); }
+                if let Some(arr) = ov.get("fallbackModels").and_then(|x| x.as_array()) {
+                    o.fallback_models = arr.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                }
+                if let Some(t) = ov.get("thinking").and_then(|x| x.as_str()) { o.thinking = Some(t.to_string()); }
+                if let Some(d) = ov.get("disabled").and_then(|x| x.as_bool()) { o.disabled = d; }
+                c.subagents.agent_overrides.insert(name.clone(), o);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,7 +462,6 @@ mod tests {
     #[test]
     fn defaults_lean_agentic() {
         let c = Config::default();
-        assert!(c.max_turns >= 100, "max_turns default too low: {}", c.max_turns);
         assert!(c.idle_timeout_secs >= 120);
         assert!(c.summarize_on_compact);
         assert!(c.allow_vision);

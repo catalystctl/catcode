@@ -32,13 +32,35 @@ A production-grade, OpenAI-compatible coding-agent harness with **native Umans**
 - **Session persistence** — sessions are stored **per workspace** under `~/.config/umans-harness/sessions/<hex(cwd)>/` as append-only JSONL files; one project can hold an unlimited number of them. On restart the most-recently-modified session is replayed (crash-safe: a mid-turn crash loses at most the in-flight turn). `/new` starts a fresh session file (the previous one is kept on disk); `/sessions` opens a searchable picker to switch between this project's sessions. A legacy single-file layout is migrated into the per-project dir automatically.
 
 **Config & packaging**
-- **CLI flags + env vars + JSON config file** — `--workspace`, `--base-url`, `--approval`, `--bash-timeout`, `--max-turns`, `--debug-log`, `--session`, `--model`, `--config`. Env: `UMANS_BASE_URL`, `UMANS_HARNESS_*`. Config files: `./umans-harness.json` or `~/.config/umans-harness/config.json`.
+- **CLI flags + env vars + JSON config file** — `--workspace`, `--base-url`, `--approval`, `--bash-timeout`, `--debug-log`, `--session`, `--model`, `--config`. Env: `UMANS_BASE_URL`, `UMANS_HARNESS_*`. Config files: `./umans-harness.json` or `~/.config/umans-harness/config.json`.
 - **`--help` / `--version`** — CLI is self-documenting.
 - **OpenAI-compatible** — change `--base-url` and model IDs to point at any OpenAI-shaped endpoint. Umans is the default; the GLM `reasoning_effort=high` clamp and `reasoning_content` replay are Umans/Zhipu-specific.
 
 ## Layout
 
 ```
+
+## Subagents & intercom
+
+A port of [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is built into the core. The orchestrator (parent agent) can delegate to focused child agents via the `subagent` tool; children can prompt the orchestrator for decisions and talk to each other over an in-process intercom bus.
+
+**Built-in agents** (`.umans-harness/agents/*.md`, overridable): `scout`, `researcher`, `planner`, `worker`, `reviewer`, `context-builder`, `oracle`, `delegate`. Each is a markdown file with YAML frontmatter (`tools`, `model`, `thinking`, `systemPromptMode`, `defaultContext`, …). Discover with `subagent({ action: "list" })` or `/subagents`.
+
+**Execution modes**: single `{ agent, task }`, parallel `{ tasks, concurrency }`, chain `{ chain: [...] }` (with `{previous}`/`{outputs.name}` templating and inline parallel groups), plus management actions `list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`/`resume`/`doctor`/`models`. Recursion is capped by `maxSubagentDepth` (default 2; env `UMANS_SUBAGENT_MAX_DEPTH`).
+
+**Intercom (the centerpiece):**
+- `contact_supervisor({ reason: "need_decision", message })` — a subagent asks the orchestrator a blocking question. It surfaces in the TUI as a prompt (`❓ subagent … asks: …`); type a reply + Enter (or Esc to unblock with best-judgment). This is how subagents prompt the orchestrator for issues.
+- `intercom({ action: "send"|"ask"|"receive"|"reply"|"targets", to, message })` — peer-to-peer plumbing so subagents can talk to each other (e.g. a worker `ask`s a parallel reviewer, then `reply`).
+- Allowed by setup: the `intercomBridge` mode (`off`/`fork-only`/`always`, default `always`) and an agent's `tools` list (`contact_supervisor`/`intercom` must be present). Each subagent gets a registered target; discover peers with `action: "targets"`.
+
+**Slash commands** (TUI): `/run <agent> "<task>"`, `/parallel <a> "t" | <b> "t"`, `/chain <a> "t" -> <b> "t"`, `/subagents`, `/subagents-doctor`, `/subagents-status`, `/subagents-models`.
+
+**Config** (settings JSON under `subagents`):
+```json
+{ "subagents": { "maxSubagentDepth": 2, "intercomBridge": { "mode": "always" }, "parallel": { "maxTasks": 8, "concurrency": 4 }, "asyncByDefault": false, "disableBuiltins": false, "agentOverrides": { "reviewer": { "model": "umans-glm-5.2", "thinking": "high" } } } }
+```
+
+Forked context (`context: "fork"`) starts a child from a filtered snapshot of the parent conversation; model fallback tries `model` then `fallbackModels` on provider failures; the orchestrator skill (`.umans-harness/skills/pi-subagents/SKILL.md`) is injected into the parent only — children never receive it.
 core/                 Rust core (stdio JSON-RPC server)
   src/main.rs         stdin dispatch, approval gate, turn loop, compaction, metrics
   src/provider.rs     OpenAI streaming client: retry/backoff, idle timeout, orphaned-call sanitize
@@ -110,5 +132,5 @@ cd core && cargo test --release    # 25 unit tests (edit, confinement, bash time
 ## Notes
 
 - The core is OpenAI-compatible; Umans-specific logic (GLM clamp, `reasoning_content` replay, `/models/info` discovery) is isolated to `provider.rs` and toggled by `--base-url`.
-- Agentic turns default to 200 (`--max-turns`); the real ceiling is the session token budget (`--max-session-tokens`, 0 = unlimited). The model can also call the `finish` tool to exit the loop cleanly, or `spawn` a nested sub-agent (bounded by `spawn_max_turns`).
+- There is no fixed turn cap; the real ceiling is the session token budget (`--max-session-tokens`, 0 = unlimited). The model can also call the `finish` tool to exit the loop cleanly, or `spawn` a nested sub-agent.
 - For a hard security boundary, pass `--sandbox firejail --no-network` (or set them in the TUI settings modal). The denylist remains a tripwire on top; the workspace confinement covers file paths, but `bash` itself is only sandboxed when `--sandbox` is set.

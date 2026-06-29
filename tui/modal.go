@@ -182,6 +182,12 @@ func (s *session) commandItems() []listItem {
 		{label: "/plugin-enable", desc: "enable a disabled plugin"},
 		{label: "/plugin-disable", desc: "disable a plugin"},
 		{label: "/plugin-remove", desc: "uninstall a plugin"},
+		{label: "/run", desc: "delegate to a subagent (single)"},
+		{label: "/parallel", desc: "run subagents in parallel"},
+		{label: "/chain", desc: "run a subagent chain (->)"},
+		{label: "/subagents", desc: "list available subagents"},
+		{label: "/subagents-doctor", desc: "subagent setup diagnostics"},
+		{label: "/subagents-status", desc: "show active subagent runs"},
 	}
 }
 
@@ -480,7 +486,6 @@ func (s *session) settingsFields() []settingsField {
 		{label: "Reasoning", value: s.settings.ReasoningEffort, hint: "enter to cycle"},
 		{label: "Theme", value: activeTheme.name, hint: "enter to pick"},
 		{label: "Bash Timeout", value: fmt.Sprintf("%ds", s.coreBashTimeout), hint: "enter to edit"},
-		{label: "Max Turns", value: fmt.Sprintf("%d", s.coreMaxTurns), hint: "enter to edit"},
 		{label: "Sandbox", value: s.settings.Sandbox, hint: "enter to cycle"},
 		{label: "No Network", value: boolStr(s.settings.NoNetwork), hint: "enter to toggle"},
 		{label: "Idle Timeout", value: fmt.Sprintf("%ds", s.settings.IdleTimeout), hint: "enter to edit"},
@@ -538,11 +543,6 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 	case "Bash Timeout":
 		s.startEditField(idx)
 		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.coreBashTimeout))
-		s.modal.editBuf.Focus()
-		return s, textinput.Blink
-	case "Max Turns":
-		s.startEditField(idx)
-		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.coreMaxTurns))
 		s.modal.editBuf.Focus()
 		return s, textinput.Blink
 	case "Sandbox":
@@ -622,12 +622,6 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
 			s.coreBashTimeout = n
 			s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": n})
-		}
-	case "Max Turns":
-		var n int
-		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
-			s.coreMaxTurns = n
-			s.sendCore(map[string]any{"type": "set_config", "key": "max_turns", "value": n})
 		}
 	case "Idle Timeout":
 		var n int
@@ -768,6 +762,8 @@ func helpText() string {
 		"Keybindings",
 		"  ctrl+p / ctrl+k   open command palette",
 		"  /                 command palette (when input empty)",
+		"  @                 mention a file (CWD or @../ outside) — ↑↓ · tab",
+		"                    select, esc closes the flyout",
 		"  ctrl+t            toggle reasoning collapse",
 		"  ctrl+o            expand / collapse last tool output",
 		"  ctrl+r            set reasoning effort (low/med/high)",

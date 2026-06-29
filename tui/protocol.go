@@ -24,10 +24,29 @@ type modelInfo struct {
 	ThinkingLevels []string `json:"thinking_levels"`
 }
 
+type intercomPrompt struct {
+	requestID string
+	from      string
+	reason    string
+	message   string
+}
+
 type approvalPrompt struct {
 	requestID string
 	tool      string
 	args      string
+}
+
+type subProgressEntry struct {
+	runID       string
+	agent       string
+	toolCount   int
+	curTool     string
+	toolStart   time.Time
+	toolRunning bool
+	tokensIn    uint64
+	tokensOut   uint64
+	started     time.Time
 }
 
 // sessionEntry mirrors one element of the core's "sessions" event array.

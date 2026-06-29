@@ -1,6 +1,8 @@
 package main
 
+
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -369,7 +371,7 @@ func (s *session) renderMentionFlyout() string {
 			lines = append(lines, row)
 		}
 		if n > mentionMaxVisible {
-			lines = append(lines, dimStyle.Render(fmtf("  (%d more · ↑↓ scroll)", n-mentionMaxVisible)))
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d more · ↑↓ scroll)", n-mentionMaxVisible)))
 		}
 	}
 	hint := dimStyle.Render("  ↑↓ navigate · tab/enter select · esc close")
@@ -393,7 +395,3 @@ func (s *session) mentionFlyoutHeight() int {
 	return lipgloss.Height(f)
 }
 
-// fmtf is a tiny fmt.Sprintf wrapper to avoid importing fmt here.
-func fmtf(format string, a ...any) string {
-	return sprintf(format, a...)
-}

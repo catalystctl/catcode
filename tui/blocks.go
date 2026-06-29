@@ -108,7 +108,7 @@ func (s *session) renderBlocks() string {
 		if blk == s.cur || !isInFlight(blk) {
 			continue
 		}
-		if blk.name == "spawn" {
+		if blk.name == "spawn" || blk.name == "subagent" {
 			continue // active-tasks panel renders the scout
 		}
 		b.WriteString(s.renderBlock(blk, w))
@@ -335,6 +335,26 @@ func (s *session) lastToolOutputBlock() *block {
 		}
 	}
 	return nil
+}
+
+// findSubProgress returns the live progress entry for runID, or nil.
+func (s *session) findSubProgress(runID string) *subProgressEntry {
+	for _, e := range s.subProgress {
+		if e.runID == runID {
+			return e
+		}
+	}
+	return nil
+}
+
+// removeSubProgress drops the progress entry for runID (subagent finished).
+func (s *session) removeSubProgress(runID string) {
+	for i, e := range s.subProgress {
+		if e.runID == runID {
+			s.subProgress = append(s.subProgress[:i], s.subProgress[i+1:]...)
+			return
+		}
+	}
 }
 
 // ---- active-task (scout) helpers ----

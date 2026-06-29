@@ -16,7 +16,7 @@ pub enum ToolKind {
 /// Classify a tool by name for approval purposes.
 pub fn classify(name: &str) -> ToolKind {
     match name {
-        "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics" | "finish" => ToolKind::ReadOnly,
+        "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics" | "finish" | "contact_supervisor" | "intercom" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -26,16 +26,60 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "read_file",
-                "description": "Read a text file. Each line is returned as \"HASH│content\". Use the 4-char HASH values as anchors for the edit tool. Path is relative to the workspace root. For large files, pass offset (1-indexed line) and limit (line count) to page through the file instead of loading it all at once. Files >5MB are refused.",
+                "name": "subagent",
+                "description": "Delegate work to a focused child agent (scout, reviewer, worker, oracle, planner, researcher, context-builder, delegate, or a custom agent). Supports single, parallel, chain, and dynamic workflows, plus agent/chain management and async status/control. A subagent can prompt the orchestrator for decisions via contact_supervisor and talk to peer subagents via intercom when the setup allows it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string" },
-                        "offset": { "type": "integer", "description": "1-indexed line to start at (for paging large files)" },
-                        "limit": { "type": "integer", "description": "max lines to return (for paging large files)" }
+                        "action": { "type": "string", "enum": ["list","get","models","create","update","delete","status","interrupt","resume","doctor"], "description": "management/control action" },
+                        "agent": { "type": "string", "description": "agent name for single mode or target for management" },
+                        "task": { "type": "string", "description": "task string for single mode" },
+                        "model": { "type": "string", "description": "override model for this run" },
+                        "tasks": { "type": "array", "description": "top-level parallel tasks: each {agent, task, model?, count?}" },
+                        "chain": { "type": "array", "description": "sequential chain steps; a step is {agent, task, as?, parallel?:[...], concurrency?}" },
+                        "concurrency": { "type": "integer", "description": "parallel concurrency (default from config)" },
+                        "worktree": { "type": "boolean" },
+                        "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent conversation" },
+                        "async": { "type": "boolean", "description": "background execution" },
+                        "id": { "type": "string", "description": "run id for status/interrupt/resume" },
+                        "message": { "type": "string", "description": "follow-up message for resume" },
+                        "config": { "type": "object", "description": "agent/chain config for create/update" },
+                        "agentScope": { "type": "string", "enum": ["user","project","both"] }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "contact_supervisor",
+                "description": "Contact the orchestrator (parent session) that delegated this task. reason 'need_decision' blocks until the orchestrator replies; 'progress_update' is non-blocking. Use for blocking decisions, approvals, or scope ambiguity — not routine completion handoffs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": { "type": "string", "enum": ["need_decision","progress_update"] },
+                        "message": { "type": "string" }
                     },
-                    "required": ["path"]
+                    "required": ["reason","message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "intercom",
+                "description": "Peer-to-peer coordination between subagents (only available when the setup allows it). action 'send' posts to a peer mailbox (non-blocking); 'ask' posts and blocks for a reply; 'receive'/'poll' reads your mailbox; 'reply' answers a pending ask by id; 'targets' lists known peers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["send","ask","receive","poll","reply","targets"] },
+                        "to": { "type": "string", "description": "recipient target (peer subagent or the orchestrator)" },
+                        "message": { "type": "string" },
+                        "reason": { "type": "string", "description": "e.g. need_decision, progress_update" },
+                        "id": { "type": "string", "description": "ask id being replied to" },
+                        "reply": { "type": "string" }
+                    },
+                    "required": ["action"]
                 }
             }
         }),
@@ -336,7 +380,8 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "finish" => Outcome::ok("__finish__"), // sentinel; main.rs treats as loop exit
         "patch" => apply_patch(args, cfg),
         "diagnostics" => Outcome::err("diagnostics must be dispatched through execute_diagnostics (async)"),
-        "spawn" => Outcome::err("spawn must be dispatched through execute_spawn (async)"),
+        "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
+        "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
         "edit" => {
             let path = s("path");
             match args.get("edits").and_then(|v| v.as_array()) {
@@ -640,15 +685,10 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
             return Outcome::err(format!("bash command blocked by denylist (matched '{bad}'); use a sandbox for hard isolation"));
         }
     }
-    // Regex denylist: block commands matching regex patterns.
-    for pattern in &cfg.bash_deny_regex {
-        match regex::Regex::new(pattern) {
-            Ok(re) => {
-                if re.is_match(command) {
-                    return Outcome::err(format!("bash command blocked by regex denylist (matched '{pattern}'); use a sandbox for hard isolation"));
-                }
-            }
-            Err(_) => {} // Bad regex: ignore (config error, not runtime)
+    // Regex denylist: block commands matching regex patterns (pre-compiled at startup).
+    for re in &cfg.bash_deny_regex_compiled {
+        if re.is_match(command) {
+            return Outcome::err(format!("bash command blocked by regex denylist (matched '{}'); use a sandbox for hard isolation", re.as_str()));
         }
     }
 
@@ -718,10 +758,12 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
 /// is kept alive for the lifetime of the returned Command via the temp file.
 fn build_bash_command(command: &str, cfg: &Config) -> (Option<std::path::PathBuf>, tokio::process::Command) {
     use crate::config::Sandbox;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static PROFILE_CACHE: std::sync::LazyLock<Mutex<HashMap<(String, bool), std::path::PathBuf>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     match cfg.sandbox {
         Sandbox::None => {
-            // --no-network still applies even without firejail: unshare -n
-            // creates a new network namespace with no interfaces.
             if cfg.no_network {
                 let mut c = tokio::process::Command::new("unshare");
                 c.arg("-n").arg("bash").arg("-c").arg(command);
@@ -732,16 +774,37 @@ fn build_bash_command(command: &str, cfg: &Config) -> (Option<std::path::PathBuf
             (None, c)
         }
         Sandbox::Firejail => {
-            // Generate a per-run profile that whitelists the workspace (read+write)
-            // and the system paths bash needs, and optionally drops networking.
+            // Cache the firejail profile by (workspace_path, no_network) so we
+            // don't generate and write a temp file per bash call.
+            let ws_key = cfg.workspace.display().to_string();
+            let mut cache = PROFILE_CACHE.lock().unwrap();
+            if let Some(cached_path) = cache.get(&(ws_key.clone(), cfg.no_network)) {
+                if cached_path.exists() {
+                    let mut c = tokio::process::Command::new("firejail");
+                    c.arg("--quiet").arg("--profile").arg(cached_path).arg("bash").arg("-c").arg(command);
+                    return (Some(cached_path.clone()), c);
+                }
+            }
+            // Not cached or file missing — generate fresh.
             let profile = firejail_profile(&cfg.workspace, cfg.no_network);
-            let path = std::env::temp_dir().join(format!("umans-harness-fj-{}.profile", std::process::id()));
+            let path = std::env::temp_dir().join(format!("umans-harness-fj-{:x}.profile", fxhash(&ws_key)));
             let _ = std::fs::write(&path, &profile);
+            cache.insert((ws_key, cfg.no_network), path.clone());
             let mut c = tokio::process::Command::new("firejail");
             c.arg("--quiet").arg("--profile").arg(&path).arg("bash").arg("-c").arg(command);
             (Some(path), c)
         }
     }
+}
+
+/// A simple FNV-1a hash of a string, used for deterministic profile filenames.
+fn fxhash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// A firejail profile that whitelists the workspace (read+write), the shell

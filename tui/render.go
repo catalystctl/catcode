@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +42,10 @@ func (s *session) layout() {
 	if s.pendingApproval != nil {
 		extra++
 	}
+	if s.pendingIntercom != nil {
+		extra++
+	}
+	extra += s.mentionFlyoutHeight()
 	h := s.height - headerLines - positionBarLines - footerLines - extra
 	if h < minBodyLines {
 		h = minBodyLines
@@ -53,6 +58,18 @@ func (s *session) layout() {
 	s.viewport.Height = h
 	s.input.Width = s.width - 4
 	s.refresh()
+}
+
+func (s *session) renderIntercomBanner() string {
+	i := s.pendingIntercom
+	msg := fmt.Sprintf("❓ subagent %s asks: %s   ↵ reply   esc skip", i.from, truncate(i.message, max(1, s.width-60)))
+	return lipgloss.NewStyle().
+		Width(s.width).
+		Background(lipgloss.Color(c.accent)).
+		Foreground(lipgloss.Color(c.bg)).
+		Bold(true).
+		Padding(0, 1).
+		Render(msg)
 }
 
 // renderHeader: a 2-line branded banner — brand + tagline on row 1, the
@@ -163,9 +180,9 @@ func (s *session) renderFooter() string {
 }
 
 // renderMetrics builds the centred throughput string from the last metrics
-// event. Only TPS is shown in the chrome (compact) so it fits beside the
-// model + context budget; ttft and cumulative tokens live in /stats + the
-// debug log. The context bar (renderContext) already shows token usage.
+// event. Shows TPS plus, when the endpoint reports prefix-cache hits, the
+// cached-token fraction (e.g. "42 tok/s · 87% cached"). The cached fraction
+// confirms the stable-prefix strategy is landing cache hits turn over turn.
 func (s *session) renderMetrics() string {
 	if len(s.lastMetrics) == 0 {
 		return ""
@@ -175,10 +192,31 @@ func (s *session) renderMetrics() string {
 		return ""
 	}
 	tps := get(m, "tps")
-	if tps == "" || tps == "null" {
-		return ""
+	out := ""
+	if tps != "" && tps != "null" {
+		out = fmt.Sprintf("%s tok/s", tps)
 	}
-	return fmt.Sprintf("%s tok/s", tps)
+	// Cached-token hit rate for this turn. cached_tokens / prompt_tokens
+	// (the prompt is what gets cached; tokens_in now includes output too).
+	if cached := get(m, "cached_tokens"); cached != "" && cached != "null" && cached != "0" {
+		tin := get(m, "prompt_tokens")
+		if tin == "" || tin == "null" || tin == "0" {
+			tin = get(m, "tokens_in")
+		}
+		if tin != "" && tin != "null" && tin != "0" {
+			if cN, err := strconv.ParseUint(cached, 10, 64); err == nil && cN > 0 {
+				if tN, err := strconv.ParseUint(tin, 10, 64); err == nil && tN > 0 {
+					pct := cN * 100 / tN
+					if out != "" {
+						out += fmt.Sprintf(" · %d%% cached", pct)
+					} else {
+						out = fmt.Sprintf("%d%% cached", pct)
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 func fitRow3(width int, left, mid, right string) string {
@@ -314,30 +352,32 @@ func (s *session) renderInputBox() string {
 // context budget is shown in the footer instead. Add per-scout metrics if the
 // core grows a subagent-usage event.
 func (s *session) renderActiveTasks(w int) string {
-	var scouts []*block
-	for _, b := range s.blocks {
-		if isInFlight(b) && b.name == "spawn" {
-			scouts = append(scouts, b)
-		}
-	}
-	if len(scouts) == 0 {
+	if len(s.subProgress) == 0 {
 		return ""
 	}
-	if len(scouts) > 3 {
-		scouts = scouts[:3]
+	entries := s.subProgress
+	if len(entries) > 4 {
+		entries = entries[:4]
 	}
 	var rows []string
-	for _, b := range scouts {
-		label := taskLabel(b, w-6)
-		rows = append(rows, accentStyle.Render("◷ ")+baseStyle.Render(label))
-		meta := dimStyle.Render("  " + taskRole(b))
-		if m := taskModel(b); m != "" {
-			meta += dimStyle.Render(" · ") + mutedStyle.Render(m)
+	for _, e := range entries {
+		elapsed := formatDur(time.Since(e.started))
+		head := accentStyle.Render("◷ ") + boldBaseStyle.Render(e.agent) +
+			dimStyle.Render(" · "+elapsed+" · "+strconv.Itoa(e.toolCount)+" tools · "+compactTokens(e.tokensIn)+"+"+compactTokens(e.tokensOut)+" tok")
+		rows = append(rows, head)
+		if e.curTool != "" {
+			td := time.Since(e.toolStart)
+			marker := "  ▸ "
+			if e.toolRunning && td > 30*time.Second {
+				rows = append(rows, warnStyle.Render(marker+"⚠ "+e.curTool+" STUCK "+formatDur(td)))
+			} else if e.toolRunning {
+				rows = append(rows, dimStyle.Render(marker+e.curTool+" · "+formatDur(td)))
+			} else {
+				rows = append(rows, dimStyle.Render(marker+e.curTool+" ✓"))
+			}
 		}
-		meta += dimStyle.Render(" · " + formatDur(time.Since(b.started)))
-		rows = append(rows, meta)
 	}
-	body := accentStyle.Render("active tasks") + "\n" + strings.Join(rows, "\n")
+	body := accentStyle.Render("subagents") + "\n" + strings.Join(rows, "\n")
 	boxW := w - 2
 	if boxW < 20 {
 		boxW = 20
@@ -373,8 +413,15 @@ func (s *session) View() string {
 	if s.pendingApproval != nil {
 		parts = append(parts, s.renderApprovalBanner())
 	}
+	if s.pendingIntercom != nil {
+		parts = append(parts, s.renderIntercomBanner())
+	}
+
 	if p := s.renderActiveTasks(s.width); p != "" {
 		parts = append(parts, p)
+	}
+	if f := s.renderMentionFlyout(); f != "" {
+		parts = append(parts, f)
 	}
 	parts = append(parts, s.renderInputBox(), s.renderFooter())
 	view := strings.Join(parts, "\n")

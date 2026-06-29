@@ -3,17 +3,20 @@
 mod config;
 mod git_ctx;
 mod hashline;
+mod intercom;
 mod logging;
 mod memory;
 mod plugins;
 mod protocol;
 mod provider;
 mod session;
+mod subagent;
 mod tools;
 mod workspace;
 
 use config::{Config, Approval, PermissionRule};
-use logging::{estimate_messages_tokens, Logger, TurnTimer};
+use intercom::IntercomBus;
+use logging::{estimate_messages_tokens, estimate_message_tokens, Logger, TurnTimer};
 use protocol::{emit, Command, Event, ModelInfo};
 use plugins::{PluginManager, PLUGIN_DOCS};
 use memory::memory_injection;
@@ -51,7 +54,7 @@ Be concise. Prefer standard tools. When done, summarize what you did in two line
 
 /// Build the full system prompt by appending git context, memory context,
 /// and the plugin self-bootstrapping docs.
-fn build_system_prompt(workspace: &std::path::Path) -> String {
+pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> String {
     let mut prompt = SYSTEM_PROMPT_BASE.to_string();
     if let Some(git) = read_git_context(workspace) {
         prompt.push_str("\n\n");
@@ -64,7 +67,33 @@ fn build_system_prompt(workspace: &std::path::Path) -> String {
     }
     prompt.push_str("\n\n");
     prompt.push_str(PLUGIN_DOCS);
+    // Inject the pi-subagents orchestrator skill so the parent agent knows how
+    // to delegate via the `subagent` tool and how intercom coordination works.
+    // This is parent-only: subagents never receive it (they'd wrongly think
+    // they are the orchestrator).
+    if with_skill {
+        if let Some(skill) = subagent_orchestrator_skill(workspace) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&skill);
+        }
+    }
     prompt
+}
+
+/// Load the bundled pi-subagents SKILL.md (project then user scope) for the
+/// orchestrator's system prompt. Returns None if no skill file is found.
+fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
+    let candidates: [Option<std::path::PathBuf>; 2] = [
+        Some(workspace.join(".umans-harness/skills/pi-subagents/SKILL.md")),
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".umans-harness/skills/pi-subagents/SKILL.md")),
+    ];
+    for p in candidates.into_iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            let (_fm, body) = subagent::parse_frontmatter(&content);
+            return Some(format!("# Skill: pi-subagents\n\n{body}"));
+        }
+    }
+    None
 }
 
 /// A pending approval request the TUI must answer before the tool runs.
@@ -77,27 +106,41 @@ struct PendingApproval {
     escalated: Mutex<bool>,       // "always" was chosen → upgrade session mode
 }
 
-struct State {
-    cfg: RwLock<Config>,
-    api_key: RwLock<Option<String>>,
-    conversation: Mutex<Vec<Value>>,
-    models: RwLock<Vec<ModelInfo>>,
-    current: Mutex<Option<CancellationToken>>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    pending: Mutex<Option<Arc<PendingApproval>>>,
-    logger: Logger,
+pub struct State {
+    pub cfg: RwLock<Config>,
+    pub api_key: RwLock<Option<String>>,
+    pub conversation: Mutex<Vec<Value>>,
+    pub models: RwLock<Vec<ModelInfo>>,
+    pub current: Mutex<Option<CancellationToken>>,
+    pub handle: Mutex<Option<JoinHandle<()>>>,
+    pub pending: Mutex<Option<Arc<PendingApproval>>>,
+    pub logger: Logger,
     /// Token counts accumulated across the session (for the status bar).
-    tokens_in: Mutex<u64>,
-    tokens_out: Mutex<u64>,
+    pub tokens_in: Mutex<u64>,
+    pub tokens_out: Mutex<u64>,
+    /// Cumulative prefix-cache hits across the session (from
+    /// usage.prompt_tokens_details.cached_tokens). Surfaces whether the
+    /// stable-prefix strategy is actually landing cache hits.
+    pub cached_tokens: Mutex<u64>,
     /// Tool kinds ("destructive"/"readonly") the user said "always" to,
     /// so subsequent calls of that kind skip the gate without escalating all.
-    escalated_kinds: Mutex<std::collections::HashSet<&'static str>>,
+    pub escalated_kinds: Mutex<std::collections::HashSet<&'static str>>,
     /// Prompt queued while a turn was running (one-deep buffer).
-    queued: Mutex<Option<QueuedPrompt>>,
+    pub queued: Mutex<Option<QueuedPrompt>>,
     /// Plugin manager — scans, loads, and executes hooks.
-    plugin_manager: PluginManager,
+    pub plugin_manager: PluginManager,
     /// Last time a turn completed (for idle compaction).
-    last_turn_time: Mutex<std::time::Instant>,
+    pub last_turn_time: Mutex<std::time::Instant>,
+    /// Incrementally maintained token estimate for the main conversation,
+    /// updated on every push + recalculated after compaction.
+    pub estimated_tokens: Mutex<u64>,
+    /// True after compaction until the next sanitization pass.
+    pub needs_sanitize: Mutex<bool>,
+    /// Intercom bus: in-process mailboxes for subagent ↔ orchestrator and
+    /// subagent ↔ subagent coordination.
+    pub intercom: IntercomBus,
+    /// Tracked subagent runs for status/interrupt/resume (keyed by run id).
+    pub subagent_runs: Mutex<std::collections::HashMap<String, subagent::SubagentRun>>,
 }
 
 /// Generate a unique filename for a new session file. std has no date
@@ -137,6 +180,9 @@ async fn main() {
         session::ensure(p.as_path());
     }
 
+    // Pre-compute token estimate for resumed conversation.
+    let init_est = estimate_messages_tokens(&resumed);
+
     let state = Arc::new(State {
         cfg: RwLock::new(cfg),
         api_key: RwLock::new(None),
@@ -148,10 +194,15 @@ async fn main() {
         logger,
         tokens_in: Mutex::new(0),
         tokens_out: Mutex::new(0),
+        cached_tokens: Mutex::new(0),
         escalated_kinds: Mutex::new(HashSet::new()),
         queued: Mutex::new(None),
         plugin_manager: PluginManager::new(PathBuf::from(".umans-harness/plugins")),
         last_turn_time: Mutex::new(std::time::Instant::now()),
+        estimated_tokens: Mutex::new(init_est),
+        needs_sanitize: Mutex::new(false),
+        intercom: IntercomBus::new(),
+        subagent_runs: Mutex::new(std::collections::HashMap::new()),
     });
 
     // Apply disabled plugin list from config.
@@ -189,7 +240,6 @@ async fn main() {
                         .with("approval", json!(cfg.approval.as_str()))
                         .with("base_url", json!(cfg.base_url))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
-                        .with("max_turns", json!(cfg.max_turns))
                         .with("resumed_messages", json!(conv_len)));
                 // Replay any resumed conversation so the TUI shows prior history
                 // on launch instead of starting from an empty transcript.
@@ -198,7 +248,10 @@ async fn main() {
                     let visible: Vec<&Value> = conv.iter()
                         .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
                         .collect();
-                    emit(&Event::new("history").with("messages", json!(visible)));
+                    let est = estimate_messages_tokens(&conv);
+                    emit(&Event::new("history")
+                        .with("messages", json!(visible))
+                        .with("tokens_in", json!(est)));
                 }
             }
             Command::SetKey { api_key } => {
@@ -224,12 +277,6 @@ async fn main() {
                     "bash_timeout_secs" => {
                         if let Some(n) = as_u64(&value) {
                             cfg.bash_timeout_secs = n;
-                            out_val = json!(n);
-                        }
-                    }
-                    "max_turns" => {
-                        if let Some(n) = as_u64(&value) {
-                            cfg.max_turns = n as usize;
                             out_val = json!(n);
                         }
                     }
@@ -275,12 +322,16 @@ async fn main() {
                 // Force compaction now, then emit a compacted event.
                 let mut messages = state.conversation.lock().await.clone();
                 if messages.len() > 2 {
+                    let before_est = estimate_messages_tokens(&messages);
                     compact_conversation(&mut messages, 200_000);
                     *state.conversation.lock().await = messages.clone();
+                    let after_est = estimate_messages_tokens(&messages);
+                    *state.estimated_tokens.lock().await = after_est;
+                    *state.needs_sanitize.lock().await = true;
                     if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                         session::rewrite(p, &messages);
                     }
-                    emit(&Event::new("compacted").with("before_tokens", json!(estimate_messages_tokens(&messages))).with("after_tokens", json!(estimate_messages_tokens(&messages))));
+                    emit(&Event::new("compacted").with("before_tokens", json!(before_est)).with("after_tokens", json!(after_est)));
                 } else {
                     emit(&Event::new("info").with("message", json!("nothing to compact yet")));
                 }
@@ -354,7 +405,11 @@ async fn main() {
                 let visible: Vec<&Value> = loaded.iter()
                     .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
                     .collect();
-                emit(&Event::new("history").with("messages", json!(visible)));
+                let est = estimate_messages_tokens(&loaded);
+                *state.estimated_tokens.lock().await = est;
+                emit(&Event::new("history")
+                    .with("messages", json!(visible))
+                    .with("tokens_in", json!(est)));
                 emit(&Event::new("info").with("message", json!(format!("loaded {} messages from {}", loaded.len(), path))));
             }
             Command::NewSession { path } => {
@@ -387,11 +442,13 @@ async fn main() {
             Command::Stats => {
                 let ti = *state.tokens_in.lock().await;
                 let to = *state.tokens_out.lock().await;
+                let cached = *state.cached_tokens.lock().await;
                 let turns = state.logger.turn_count();
                 emit(&Event::new("stats")
                     .with("tokens_in", json!(ti))
                     .with("tokens_out", json!(to))
                     .with("tokens_total", json!(ti + to))
+                    .with("cached_tokens", json!(cached))
                     .with("turns", json!(turns))
                     .with("messages", json!(state.conversation.lock().await.len())));
             }
@@ -444,11 +501,24 @@ async fn main() {
                 let ws = state.cfg.read().await.workspace.clone();
                 let mem = memory_injection(&ws, "");
                 // Rebuild the system prompt with fresh memory and persist it.
+                // Guard: don't rebuild messages[0] unless the prompt actually
+                // changed — a rebuild busts the provider's prefix cache.
                 let mut conv = state.conversation.lock().await;
-                let new_system = build_system_prompt(&ws);
+                let new_system = build_system_prompt(&ws, true);
+                if let Some(first) = conv.first() {
+                    let old_content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if old_content == new_system {
+                        drop(conv);
+                        emit(&Event::new("info").with("message", json!("memory unchanged; system prompt kept intact (preserving prefix cache)")));
+                        return;
+                    }
+                }
                 if let Some(first) = conv.first_mut() {
                     if first.get("role").and_then(|v| v.as_str()) == Some("system") {
                         *first = json!({ "role": "system", "content": new_system });
+                        *state.needs_sanitize.lock().await = true;
+                        // Re-estimate after changing system message.
+                        *state.estimated_tokens.lock().await = estimate_messages_tokens(&conv);
                         if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                             session::rewrite(p, &conv);
                         }
@@ -471,6 +541,17 @@ async fn main() {
                         }
                         p.notify.notify_one();
                     }
+                }
+            }
+            Command::IntercomReply { request_id, reply } => {
+                // The orchestrator (user, via the TUI) replies to a subagent's
+                // contact_supervisor need_decision ask. Resolves the pending ask
+                // so the awaiting subagent loop wakes and continues.
+                let ok = state.intercom.resolve_ask(&request_id, &reply);
+                if ok {
+                    emit(&Event::new("info").with("message", json!("reply delivered to subagent")));
+                } else {
+                    emit(&Event::new("error").with("message", json!(format!("no pending intercom ask for id {request_id}"))));
                 }
             }
             Command::Abort => {
@@ -632,6 +713,19 @@ fn run_turn_and_drain(
     })
 }
 
+/// Token counts reported in the `metrics` event, which drive the footer's
+/// context budget. The provider returns the *last request's* usage
+/// (prompt/completion tokens ≈ the live context size) when the endpoint
+/// includes it; when usage is absent these come back as zero, which would
+/// pin the footer at "0%". Fall back to a char-based estimate of the current
+/// conversation so the budget always reflects reality.
+async fn reported_tokens(st: &Arc<State>, usage_in: u64, usage_out: u64) -> (u64, u64) {
+    if usage_in > 0 || usage_out > 0 {
+        return (usage_in, usage_out);
+    }
+    ({ *st.estimated_tokens.lock().await }, 0)
+}
+
 async fn run_turn(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -642,11 +736,14 @@ async fn run_turn(
     cancel: CancellationToken,
 ) {
     // Ensure system prompt is present; persist every finalized message to the session file.
+    let mut init_est_add = 0u64;
     {
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
             let workspace = st.cfg.read().await.workspace.clone();
-            conv.push(json!({ "role": "system", "content": build_system_prompt(&workspace) }));
+            let sys_msg = json!({ "role": "system", "content": build_system_prompt(&workspace, true) });
+            init_est_add += estimate_message_tokens(&sys_msg);
+            conv.push(sys_msg);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                 session::append(p, &conv[0]);
             }
@@ -665,35 +762,51 @@ async fn run_turn(
             }
             _ => json!({ "role": "user", "content": prompt }),
         };
+        init_est_add += estimate_message_tokens(&user_msg);
         conv.push(user_msg);
         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
             session::append(p, conv.last().unwrap());
         }
     }
+    if init_est_add > 0 {
+        *st.estimated_tokens.lock().await += init_est_add;
+    }
 
-    let tool_defs = tools::definitions();
-    let mut turns = 0usize;
+    // Main agent tool list: exclude the subagent-only intercom coordination tools
+    // (contact_supervisor/intercom) — those are registered only inside child runs.
+    let tool_defs: Vec<Value> = tools::definitions().into_iter()
+        .filter(|d| {
+            let n = d.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            n != "contact_supervisor" && n != "intercom"
+        })
+        .collect();
     let mut timer = TurnTimer::new();
-    let cfg_snap = st.cfg.read().await.clone();
-    let max_turns = cfg_snap.max_turns;
 
-    // Idle compaction: if 60+ minutes since the last turn completed, clear old
-    // cached content from messages so the next turn starts with a clean slate.
+    // Idle compaction: if 60+ minutes since the last turn completed, compact the
+    // conversation so the next turn starts lean. Uses the same summarize strategy
+    // as the threshold path; falls back to naive drop-oldest without an api key.
     {
         let last = *st.last_turn_time.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed.as_secs() > 3600 {
-            let mut messages = st.conversation.lock().await.clone();
-            if messages.len() > 4 {
-                compact_conversation(&mut messages, 200_000);
-                *st.conversation.lock().await = messages.clone();
-                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                    session::rewrite(p, &messages);
+        if last.elapsed().as_secs() > 3600 {
+                let mut messages = st.conversation.lock().await.clone();
+                if messages.len() > 4 {
+                    let est = { *st.estimated_tokens.lock().await };
+                    let cfg = st.cfg.read().await.clone();
+                    match st.api_key.read().await.clone() {
+                        Some(key) => compact_with_summary(client, &cfg, &key, &model, &mut messages, &cancel, false).await,
+                        None => compact_conversation(&mut messages, 0),
+                    }
+                    *st.conversation.lock().await = messages.clone();
+                    if let Some(p) = cfg.session_file.as_ref() {
+                        session::rewrite(p, &messages);
+                    }
+                    let after_est = estimate_messages_tokens(&messages);
+                    *st.estimated_tokens.lock().await = after_est;
+                    *st.needs_sanitize.lock().await = true;
+                    emit(&Event::new("compacted")
+                        .with("before_tokens", json!(est))
+                        .with("after_tokens", json!(after_est)));
                 }
-                emit(&Event::new("compacted")
-                    .with("before_tokens", json!(0))
-                    .with("after_tokens", json!(estimate_messages_tokens(&messages))));
-            }
         }
     }
 
@@ -702,13 +815,6 @@ async fn run_turn(
             emit(&Event::new("aborted"));
             return;
         }
-        turns += 1;
-        if turns > max_turns {
-            emit(&Event::new("error").with("message", json!(format!("exceeded {max_turns} tool turns; raise --max-turns to continue longer"))));
-            emit(&Event::new("done"));
-            return;
-        }
-
         // Session token budget (hard ceiling across the whole session, not per turn).
         // 0 = unlimited. Trips before the request so we don't blow past a cost cap.
         let budget = st.cfg.read().await.max_session_tokens;
@@ -733,7 +839,11 @@ async fn run_turn(
             }
         };
 
-        // Context window management: compact if we're over the threshold.
+        let cfg = st.cfg.read().await.clone();
+        // Context window management: compact once past the configured threshold
+        // (default 70%). The 95% hard cap is a floor — compact by then even if the
+        // configured threshold is higher, and force the summarize strategy even
+        // when disabled (naive drop-oldest may not reclaim enough at critical capacity).
         let mut messages = st.conversation.lock().await.clone();
         let (model_ctx, thinking_levels) = st
             .models
@@ -743,47 +853,33 @@ async fn run_turn(
             .find(|m| m.id == model)
             .map(|m| (m.context_window as u64, m.thinking_levels.clone()))
             .unwrap_or((200_000, Vec::new()));
-        let est = estimate_messages_tokens(&messages);
-        let threshold = (model_ctx as f32 * st.cfg.read().await.context_compact_at) as u64;
-        if est > threshold && messages.len() > 4 {
-            // Hard cap: if even over 95% of the window, force compact regardless of threshold.
-            let summarize = st.cfg.read().await.summarize_on_compact;
-            if summarize {
-                // Split into keep-head + summarize-tail.
-                let tail_start = messages.len().saturating_sub(8);
-                let to_summarize: Vec<Value> = messages[1..tail_start].to_vec();
-                let kept: Vec<Value> = messages[tail_start..].to_vec();
-                let summary = if !to_summarize.is_empty() {
-                    provider::summarize(client, &st.cfg.read().await.clone(), &api_key, &model, &to_summarize, &cancel).await
-                } else { None };
-                let mut compacted = vec![messages[0].clone()];
-                if let Some(s) = summary {
-                    compacted.push(json!({ "role": "system", "content": format!("[Summary of earlier turns]\n{s}") }));
-                } else {
-                    // summarization failed — fall back to the drop-oldest marker.
-                    compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
-                }
-                compacted.extend(kept);
-                messages = compacted;
-            } else {
-                compact_conversation(&mut messages, model_ctx);
-            }
-            // persist the compacted conversation
+        let est = { *st.estimated_tokens.lock().await };
+        let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
+        let hard_cap = (model_ctx as f32 * 0.95) as u64;
+        if est > threshold.min(hard_cap) && messages.len() > 4 {
+            let force_summarize = est > hard_cap;
+            compact_with_summary(client, &cfg, &api_key, &model, &mut messages, &cancel, force_summarize).await;
             *st.conversation.lock().await = messages.clone();
-            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+            if let Some(p) = cfg.session_file.as_ref() {
                 session::rewrite(p, &messages);
             }
+            let after_est = estimate_messages_tokens(&messages);
+            *st.estimated_tokens.lock().await = after_est;
+            *st.needs_sanitize.lock().await = true;
             emit(&Event::new("compacted")
                 .with("before_tokens", json!(est))
-                .with("after_tokens", json!(estimate_messages_tokens(&messages))));
+                .with("after_tokens", json!(after_est)));
         }
 
         // Sanitize orphaned tool calls right before the request (mirrors Umans extension).
-        provider::sanitize_orphaned_tool_calls(&mut messages);
-
-        let cfg = st.cfg.read().await.clone();
-        let (assistant, _finish, tokens_in, tokens_out) = match provider::stream_turn(
+        // Only needed after compaction; skip the O(n) scan on clean turns.
+        if *st.needs_sanitize.lock().await {
+            provider::sanitize_orphaned_tool_calls(&mut messages);
+            *st.needs_sanitize.lock().await = false;
+        }
+        let (assistant, _finish, tokens_in, tokens_out, cached_tokens) = match provider::stream_turn(
             client, &cfg, &api_key, &model, &messages, &tool_defs, &effort, &thinking_levels, &cancel, &mut timer,
+            false,
         )
         .await
         {
@@ -800,9 +896,18 @@ async fn run_turn(
             }
         };
 
-        // Accumulate token counts.
-        *st.tokens_in.lock().await += tokens_in;
-        *st.tokens_out.lock().await += tokens_out;
+        // Accumulate token counts for /stats. When the endpoint omits usage
+        // (tokens come back zero) estimate from the exchanged messages so the
+        // session totals aren't stuck at zero alongside the footer budget.
+        let (acc_in, acc_out) = if tokens_in > 0 || tokens_out > 0 {
+            (tokens_in, tokens_out)
+        } else {
+            ({ *st.estimated_tokens.lock().await }, estimate_message_tokens(&assistant))
+        };
+        *st.tokens_in.lock().await += acc_in;
+        *st.tokens_out.lock().await += acc_out;
+        // Accumulate prefix-cache hits so /stats can show cache effectiveness.
+        *st.cached_tokens.lock().await += cached_tokens;
 
         // Append + persist the finalized assistant message.
         {
@@ -812,6 +917,7 @@ async fn run_turn(
                 session::append(p, conv.last().unwrap());
             }
         }
+        *st.estimated_tokens.lock().await += estimate_message_tokens(&assistant);
 
         let tool_calls = assistant.get("tool_calls").and_then(|v| v.as_array()).cloned();
         match tool_calls {
@@ -856,11 +962,14 @@ async fn run_turn(
                     if force_deny {
                         let msg = format!("tool call '{}' denied by permission rule", name);
                         emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                        let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
-                        conv.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                        conv.push(tool_result);
                         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                             session::append(p, conv.last().unwrap());
                         }
+                        *st.estimated_tokens.lock().await += est;
                         continue;
                     }
 
@@ -879,11 +988,14 @@ async fn run_turn(
                             ApprovalResult::Denied => {
                                 let msg = format!("tool call '{}' was denied by the user", name);
                                 emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                                let est = estimate_message_tokens(&tool_result);
                                 let mut conv = st.conversation.lock().await;
-                                conv.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                                conv.push(tool_result);
                                 if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                                     session::append(p, conv.last().unwrap());
                                 }
+                                *st.estimated_tokens.lock().await += est;
                                 continue;
                             }
                             ApprovalResult::Aborted => {
@@ -903,11 +1015,14 @@ async fn run_turn(
                     };
                     if let Some(msg) = dangerous {
                         emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                        let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
-                        conv.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                        conv.push(tool_result);
                         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                             session::append(p, conv.last().unwrap());
                         }
+                        *st.estimated_tokens.lock().await += est;
                         continue;
                     }
 
@@ -931,11 +1046,14 @@ async fn run_turn(
                             if !result.allow {
                                 let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
                                 emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                                let est = estimate_message_tokens(&tool_result);
                                 let mut conv = st.conversation.lock().await;
-                                conv.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                                conv.push(tool_result);
                                 if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                                     session::append(p, conv.last().unwrap());
                                 }
+                                *st.estimated_tokens.lock().await += est;
                                 // Break out: save the denied state and skip execution.
                                 // We need a flag to skip the tool execution below.
                             }
@@ -961,11 +1079,14 @@ async fn run_turn(
                                 denied_by_hook = true;
                                 let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
                                 emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                                let est = estimate_message_tokens(&tool_result);
                                 let mut conv = st.conversation.lock().await;
-                                conv.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                                conv.push(tool_result);
                                 if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                                     session::append(p, conv.last().unwrap());
                                 }
+                                *st.estimated_tokens.lock().await += est;
                                 break;
                             }
                             if let Some(ref modify) = result.modify {
@@ -988,11 +1109,8 @@ async fn run_turn(
                         tools::execute_bulk(exec_args, &cfg).await
                     } else if name == "diagnostics" {
                         tools::execute_diagnostics(exec_args, &cfg).await
-                    } else if name == "spawn" {
-                        let sub_prompt = exec_args.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let sub_model = exec_args.get("model").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| model.clone());
-                        let sub_max = st.cfg.read().await.spawn_max_turns;
-                        run_spawn(st, client, &api_key, &sub_model, &sub_prompt, sub_max, &cancel).await
+                    } else if name == "spawn" || name == "subagent" {
+                        subagent::execute(st.clone(), client.clone(), api_key.clone(), model.clone(), exec_args.clone(), cancel.clone(), 0).await
                     } else {
                         tools::execute(&name, exec_args, &cfg)
                     };
@@ -1019,15 +1137,18 @@ async fn run_turn(
                     // finish sentinel: the model signaled completion.
                     if name == "finish" && outcome.ok && outcome.output == "__finish__" {
                         *st.last_turn_time.lock().await = std::time::Instant::now();
-                        let metrics = timer.finalize(*st.tokens_in.lock().await, *st.tokens_out.lock().await, model.clone());
+                        let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
+                        let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
                         emit(&Event::new("metrics")
                             .with("ttft_ms", json!(metrics.ttft_ms))
                             .with("elapsed_ms", json!(metrics.elapsed_ms))
-                            .with("tokens_in", json!(metrics.tokens_in))
+                            .with("tokens_in", json!(metrics.tokens_in.saturating_add(metrics.tokens_out)))
+                            .with("prompt_tokens", json!(metrics.tokens_in))
                             .with("tokens_out", json!(metrics.tokens_out))
+                            .with("cached_tokens", json!(metrics.cached_tokens))
                             .with("tps", json!(metrics.tps))
                             .with("model", json!(metrics.model)));
-                        st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
+                        st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                         st.logger.record_turn();
                         emit(&Event::new("done"));
                         return;
@@ -1037,26 +1158,32 @@ async fn run_turn(
                         .with("id", json!(id))
                         .with("ok", json!(outcome.ok))
                         .with("output", json!(outcome.output)));
+                    let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": outcome.output });
+                    let est = estimate_message_tokens(&tool_result);
                     let mut conv = st.conversation.lock().await;
-                    conv.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
+                    conv.push(tool_result);
                     if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                         session::append(p, conv.last().unwrap());
                     }
+                    *st.estimated_tokens.lock().await += est;
                 }
                 // Loop back for the model to continue.
             }
             _ => {
                 // Turn complete: emit metrics + done.
                 *st.last_turn_time.lock().await = std::time::Instant::now();
-                let metrics = timer.finalize(*st.tokens_in.lock().await, *st.tokens_out.lock().await, model.clone());
+                let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
+                let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
                 emit(&Event::new("metrics")
                     .with("ttft_ms", json!(metrics.ttft_ms))
                     .with("elapsed_ms", json!(metrics.elapsed_ms))
-                    .with("tokens_in", json!(metrics.tokens_in))
+                    .with("tokens_in", json!(metrics.tokens_in.saturating_add(metrics.tokens_out)))
+                    .with("prompt_tokens", json!(metrics.tokens_in))
                     .with("tokens_out", json!(metrics.tokens_out))
+                    .with("cached_tokens", json!(metrics.cached_tokens))
                     .with("tps", json!(metrics.tps))
                     .with("model", json!(metrics.model)));
-                st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
+                st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                 st.logger.record_turn();
                 emit(&Event::new("done"));
                 return;
@@ -1119,7 +1246,7 @@ async fn request_approval(st: &Arc<State>, id: &str, name: &str, args: &str, kin
 /// and keep system + recent turns. A summarization call would be better but adds
 /// cost+complexity; this keeps the agent unblocked. Orphaned-tool-call sanitizer
 /// in provider.rs backstops any tool_call/result mismatch this creates.
-fn compact_conversation(messages: &mut Vec<Value>, _ctx: u64) {
+pub fn compact_conversation(messages: &mut Vec<Value>, _ctx: u64) {
     // Keep: system (first), and the last ~10 messages verbatim.
     // Drop tool messages (role == "tool") in the middle band to reclaim tokens.
     if messages.len() <= 12 {
@@ -1135,83 +1262,47 @@ fn compact_conversation(messages: &mut Vec<Value>, _ctx: u64) {
     *messages = compacted;
 }
 
-/// Run a nested agentic sub-turn with a fresh sub-conversation. Shares the
-/// workspace, tools, and api key but cannot spawn further sub-agents (depth 1).
-/// Returns the final assistant text as an Outcome (for the spawn tool).
-async fn run_spawn(
-    st: &Arc<State>,
+/// Compact a conversation by summarizing older turns into one system message,
+/// keeping the system prompt + last 8 messages verbatim. Falls back to the
+/// naive drop-oldest (`compact_conversation`) when summarization is disabled
+/// and not forced, or when there's too little middle to summarize. On summary
+/// failure, degrades to a drop-oldest marker so the turn still proceeds.
+/// `force_summarize` overrides `summarize_on_compact=false` — used by the 95%
+/// hard cap where naive drop-oldest may not reclaim enough.
+pub async fn compact_with_summary(
     client: &reqwest::Client,
+    cfg: &Config,
     api_key: &str,
     model: &str,
-    prompt: &str,
-    max_turns: usize,
+    messages: &mut Vec<Value>,
     cancel: &CancellationToken,
-) -> tools::Outcome {
-    use tools::Outcome;
-    let workspace = st.cfg.read().await.workspace.clone();
-    let mut sub: Vec<Value> = vec![
-        json!({ "role": "system", "content": build_system_prompt(&workspace) }),
-        json!({ "role": "user", "content": prompt }),
-    ];
-    let tool_defs = tools::definitions();
-    let cfg = st.cfg.read().await.clone();
-    let effort = "medium".to_string();
-    // Respect the sub-model's advertised thinking levels (clamp effort like the main loop).
-    let thinking_levels = st
-        .models
-        .read()
-        .await
-        .iter()
-        .find(|m| m.id == model)
-        .map(|m| m.thinking_levels.clone())
-        .unwrap_or_default();
-    let mut timer = TurnTimer::new();
-    for turn in 0..=max_turns {
-        if cancel.is_cancelled() { return Outcome::ok("[spawn aborted]"); }
-        provider::sanitize_orphaned_tool_calls(&mut sub);
-        let (assistant, _finish, _ti, _to) = match provider::stream_turn(
-            client, &cfg, api_key, model, &sub, &tool_defs, &effort, &thinking_levels, cancel, &mut timer,
-        ).await {
-            Ok(v) => v,
-            Err(e) => return Outcome::err(format!("spawn stream error: {e}")),
-        };
-        sub.push(assistant.clone());
-        let Some(calls) = assistant.get("tool_calls").and_then(|v| v.as_array()).cloned() else {
-            // No more tool calls — return the final assistant text.
-            let text = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            return Outcome::ok(text);
-        };
-        if calls.is_empty() {
-            let text = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            return Outcome::ok(text);
-        }
-        // Execute each tool call in the sub-context. spawn/diagnostics/bash/bulk
-        // are honored; nested spawn is refused (depth 1).
-        for tc in &calls {
-            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let func = tc.get("function");
-            let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
-            let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
-            emit(&Event::new("tool_call").with("id", json!(id)).with("name", json!(format!("spawn:{name}"))).with("args", json!(args_str)));
-            let outcome = if name == "spawn" {
-                Outcome::err("nested spawn is not allowed (max depth 1)")
-            } else if name == "bash" {
-                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                tools::execute_bash(cmd, &cfg).await
-            } else if name == "bulk" {
-                tools::execute_bulk(&args, &cfg).await
-            } else if name == "diagnostics" {
-                tools::execute_diagnostics(&args, &cfg).await
-            } else {
-                tools::execute(&name, &args, &cfg)
-            };
-            emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(outcome.ok)).with("output", json!(outcome.output.clone())));
-            sub.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
-        }
-        let _ = turn;
+    force_summarize: bool,
+) {
+    if messages.len() <= 4 {
+        return;
     }
-    Outcome::ok(format!("[spawn reached max_turns ({max_turns}); returning last state]"))
+    if !cfg.summarize_on_compact && !force_summarize {
+        compact_conversation(messages, 0);
+        return;
+    }
+    // tail_start <= 1 means the kept tail covers everything after system —
+    // nothing in the middle to summarize, and messages[1..0] would panic.
+    let tail_start = messages.len().saturating_sub(8);
+    if tail_start <= 1 {
+        compact_conversation(messages, 0);
+        return;
+    }
+    let to_summarize: Vec<Value> = messages[1..tail_start].to_vec();
+    let kept: Vec<Value> = messages[tail_start..].to_vec();
+    let summary = provider::summarize(client, cfg, api_key, model, &to_summarize, cancel).await;
+    let mut compacted = vec![messages[0].clone()];
+    if let Some(s) = summary {
+        compacted.push(json!({ "role": "system", "content": format!("[Summary of earlier turns]\n{s}") }));
+    } else {
+        compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
+    }
+    compacted.extend(kept);
+    *messages = compacted;
 }
 
 /// Turn an image reference into a data URL. Accepts:

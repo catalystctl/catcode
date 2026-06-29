@@ -18,6 +18,7 @@ pub struct TurnMetrics {
     pub elapsed_ms: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    pub cached_tokens: u64,
     pub tps: Option<f64>,
     pub model: String,
 }
@@ -69,11 +70,15 @@ pub fn estimate_tokens(text: &str) -> u64 {
 pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
     let mut total = 0u64;
     for m in messages {
-        // serialize to compact JSON and count chars — captures all string content.
-        let s = serde_json::to_string(m).unwrap_or_default();
-        total += estimate_tokens(&s);
+        total += estimate_message_tokens(m);
     }
     total
+}
+
+/// Estimate tokens for a single message (serialize to JSON, count chars/4).
+pub fn estimate_message_tokens(m: &Value) -> u64 {
+    let s = serde_json::to_string(m).unwrap_or_default();
+    estimate_tokens(&s)
 }
 
 pub fn now_iso() -> String {
@@ -101,7 +106,7 @@ impl TurnTimer {
             self.first_token = Some(Instant::now());
         }
     }
-    pub fn finalize(self, tokens_in: u64, tokens_out: u64, model: String) -> TurnMetrics {
+    pub fn finalize(self, tokens_in: u64, tokens_out: u64, cached_tokens: u64, model: String) -> TurnMetrics {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let ttft_ms = self.first_token.map(|t| t.duration_since(self.start).as_millis() as u64);
         let tps = if elapsed_ms > 0 && tokens_out > 0 {
@@ -109,7 +114,7 @@ impl TurnTimer {
         } else {
             None
         };
-        TurnMetrics { ttft_ms, elapsed_ms, tokens_in, tokens_out, tps, model }
+        TurnMetrics { ttft_ms, elapsed_ms, tokens_in, tokens_out, cached_tokens, tps, model }
     }
 }
 

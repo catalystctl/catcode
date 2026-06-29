@@ -40,13 +40,6 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 					s.coreBashTimeout = n
 				}
 			}
-			if raw, ok := m["max_turns"]; ok {
-				var n int
-				_ = json.Unmarshal(raw, &n)
-				if n > 0 {
-					s.coreMaxTurns = n
-				}
-			}
 		}
 		s.models = models
 		s.modelIdx = 0
@@ -105,13 +98,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "tool_call":
 		name := ev.get("name")
-		sub := strings.HasPrefix(name, "spawn:") // sub-agent internal call
+		sub := strings.HasPrefix(name, "spawn:") || strings.HasPrefix(name, "subagent:") // sub-agent internal call
 		if sub {
-			name = strings.TrimPrefix(name, "spawn:")
+			name = strings.TrimPrefix(strings.TrimPrefix(name, "spawn:"), "subagent:")
 		}
 		b := s.logTool(name, ev.get("args"), sub)
 		b.id = ev.get("id")
-		if !sub && name == "spawn" {
+		if !sub && (name == "spawn" || name == "subagent") {
 			s.layout() // a scout started: make room for the active-tasks panel
 		}
 
@@ -133,7 +126,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			match.output = out
 			match.dur = time.Since(match.started)
 			s.cur = nil
-			wasScout := !match.sub && match.name == "spawn"
+			wasScout := !match.sub && (match.name == "spawn" || match.name == "subagent")
 			s.invalidateAll()
 			s.refresh()
 			if wasScout {
@@ -144,6 +137,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "done":
+		s.subProgress = nil
 		if s.queuedNext {
 			// A follow-up or steer turn begins right after this one; stay busy so the
 			// footer keeps streaming and the input stays live.
@@ -163,6 +157,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "aborted":
+		s.subProgress = nil
 		if s.queuedNext {
 			// A steer interrupted this turn; the steered turn runs next. Stay busy
 			// (a `done` is still coming for the interrupted turn) and drop the
@@ -183,6 +178,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.blocks = nil
 		s.cur = nil
 		s.contextTokens = 0
+		s.subProgress = nil
 		s.follow = true
 		s.invalidateAll()
 		s.logInfo("conversation reset")
@@ -194,6 +190,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				var msgs []map[string]json.RawMessage
 				if json.Unmarshal(raw, &msgs) == nil {
 					s.rebuildBlocksFromHistory(msgs)
+					// Show the loaded session's used context immediately instead
+					// of waiting for the first turn's metrics event.
+					if ti, err := strconv.ParseUint(ev.get("tokens_in"), 10, 64); err == nil {
+						s.contextTokens = ti
+					}
 					s.follow = true
 					s.invalidateAll()
 					s.refresh()
@@ -201,6 +202,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 	case "compacted":
+		if ev.get("scope") == "subagent" {
+			break // subagent-internal compaction; don't clutter the main transcript
+		}
 		s.logInfo(fmt.Sprintf("context compacted: %s → %s tokens", ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "approval_changed":
@@ -215,11 +219,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "metrics":
 		s.lastMetrics = ev.Raw
-		// tokens_in/out are cumulative session totals from the core.
+		// tokens_in is the live context size (prompt + output). During a turn the
+		// core emits periodic estimates so the footer moves; at turn end the real
+		// usage overwrites them. prompt_tokens (when present) is the prompt-only
+		// count, used for the cached-fraction denominator.
 		if ti, err := strconv.ParseUint(ev.get("tokens_in"), 10, 64); err == nil {
-			if to, err := strconv.ParseUint(ev.get("tokens_out"), 10, 64); err == nil {
-				s.contextTokens = ti + to
-			}
+			s.contextTokens = ti
 		}
 
 	case "approval_request":
@@ -230,10 +235,69 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.logApprove(ev.get("tool"), ev.get("args"))
 		s.input.Focus()
-		s.layout() // banner claims a line, shrink viewport
+	case "intercom_message":
+		// A subagent is prompting the orchestrator for a decision (or a progress
+		// update). need_decision blocks until we reply; progress_update is a log line.
+		reason := ev.get("reason")
+		if reason == "progress_update" {
+			s.logInfo(fmt.Sprintf("⟵ %s (progress): %s", ev.get("from"), ev.get("message")))
+		} else {
+			s.pendingIntercom = &intercomPrompt{
+				requestID: ev.get("id"),
+				from:      ev.get("from"),
+				reason:    reason,
+				message:   ev.get("message"),
+			}
+			s.logWarn(fmt.Sprintf("⟵ subagent %s asks: %s", ev.get("from"), ev.get("message")))
+			s.input.SetValue("")
+			s.input.Focus()
+			s.layout()
+		}
+		
+	case "subagent_progress":
+		runID := ev.get("run_id")
+		if ev.get("phase") == "done" {
+			if runID != "" {
+				s.removeSubProgress(runID)
+			}
+			s.layout()
+			break
+		}
+		entry := s.findSubProgress(runID)
+		if entry == nil {
+			entry = &subProgressEntry{runID: runID, agent: ev.get("agent"), started: time.Now()}
+			s.subProgress = append(s.subProgress, entry)
+			s.layout()
+		}
+		if tc := ev.get("tool_count"); tc != "" {
+			if n, err := strconv.Atoi(tc); err == nil {
+				entry.toolCount = n
+			}
+		}
+		if ti := ev.get("tokens_in"); ti != "" {
+			if n, err := strconv.ParseUint(ti, 10, 64); err == nil {
+				entry.tokensIn = n
+			}
+		}
+		if to := ev.get("tokens_out"); to != "" {
+			if n, err := strconv.ParseUint(to, 10, 64); err == nil {
+				entry.tokensOut = n
+			}
+		}
+		switch ev.get("phase") {
+		case "tool":
+			entry.curTool = ev.get("tool")
+			entry.toolStart = time.Now()
+			entry.toolRunning = true
+		case "tool_end":
+			entry.toolRunning = false
+			entry.curTool = ev.get("tool")
+		case "streaming":
+			entry.toolRunning = false
+		}
+		s.refresh()
 
 	case "info":
-		s.logInfo(ev.get("message"))
 
 	case "steer":
 		// Core acknowledged a steer: the running turn was interrupted and the
@@ -260,9 +324,21 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		ti := ev.get("tokens_in")
 		to := ev.get("tokens_out")
 		tt := ev.get("tokens_total")
+		cached := ev.get("cached_tokens")
 		turns := ev.get("turns")
 		msgs := ev.get("messages")
 		s.logInfo(fmt.Sprintf("stats: %s in / %s out (%s total) · %s turns · %s msgs", ti, to, tt, turns, msgs))
+		if cached != "" && cached != "0" {
+			// Show cache effectiveness as cached/total-prompt-in (%).
+			if tiN, err := strconv.ParseUint(ti, 10, 64); err == nil && tiN > 0 {
+				if cN, err := strconv.ParseUint(cached, 10, 64); err == nil {
+					pct := float64(cN) * 100.0 / float64(tiN)
+					s.logSuccess(fmt.Sprintf("cache: %s/%s prompt tokens hit (%.0f%%)", cached, ti, pct))
+				}
+			} else {
+				s.logInfo(fmt.Sprintf("cache: %s tokens hit", cached))
+			}
+		}
 
 	case "error":
 		s.logError(ev.get("message"))
@@ -290,9 +366,158 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	return waitForEvent(s.coreEvents)
 }
 
+// handleMouseWheel routes mouse-wheel events to the transcript viewport,
+// mirroring handleScrollKey so follow mode stays consistent: scrolling up
+// pauses follow (a streaming turn won't yank the view back to the bottom) and
+// scrolling back to the bottom re-pins follow. Non-wheel mouse events (clicks
+// and drags) are dropped so the wheel is the only mouse surface. Works in every
+// state (idle/busy/approval) like the keyboard scroll bindings; modal overlays
+// take over the whole screen and are skipped.
+//
+// Mouse tracking is enabled via tea.WithMouseCellMotion in main.go. That mode
+// also forwards click/drag events to us, which we deliberately ignore. (Hold
+// Shift to select text in the terminal as usual — most terminals bypass an app's
+// mouse capture while Shift is held.)
+func (s *session) handleMouseWheel(msg tea.MouseMsg) tea.Cmd {
+	// Modal overlays own the whole screen; never scroll the transcript behind one.
+	if s.modal.kind != modalNone {
+		return nil
+	}
+	// Only react to wheel presses; let clicks and drags fall through untouched.
+	if msg.Action != tea.MouseActionPress {
+		return nil
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		s.follow = false
+		s.viewport.ScrollUp(s.viewport.MouseWheelDelta)
+	case tea.MouseButtonWheelDown:
+		s.viewport.ScrollDown(s.viewport.MouseWheelDelta)
+		if s.viewport.AtBottom() {
+			s.follow = true
+		}
+	}
+	return nil
+}
+
 // sendSteer dispatches a steer command to the core: interrupt the running
 // turn (if any) and redirect it with prompt. Marks a chained turn so the TUI
 // keeps streaming across the interrupt. Used by both Ctrl+Enter and /steer.
+// sendDelegation sends a prompt that instructs the orchestrator to invoke the
+// subagent tool (the model applies the pi-subagents skill). cmdName is shown
+// to the user as the originating slash command.
+func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
+	if !s.authed {
+		s.logError("not authenticated — run /key sk-... first")
+		return nil
+	}
+	if len(s.models) == 0 {
+		s.logError("no models loaded yet")
+		return nil
+	}
+	model := s.models[s.modelIdx].ID
+	s.follow = true
+	s.logUser(prompt + "  ↳ " + cmdName)
+	s.pushHistory(prompt)
+	s.sendCore(map[string]any{
+		"type":             "send",
+		"prompt":           prompt,
+		"model":            model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	})
+	s.busy = true
+	return nil
+}
+
+// runSubagentCommand parses a /run, /parallel, or /chain slash command and
+// delegates to the subagent tool via a structured prompt. Supported forms:
+//   /run <agent> "<task>"            (single)
+//   /parallel <a1> "<t1>" | <a2> "<t2>"   (parallel)
+//   /chain <a1> "<t1>" -> <a2> "<t2>"      (chain, {previous} flows)
+func (s *session) runSubagentCommand(parts []string, mode string) tea.Cmd {
+	if len(parts) < 2 {
+		usage := map[string]string{"single": "/run <agent> \"<task>\"", "parallel": "/parallel <a1> \"<t1>\" | <a2> \"<t2>\"", "chain": "/chain <a1> \"<t1>\" -> <a2> \"<t2>\""}
+		s.logError("usage: " + usage[mode])
+		return nil
+	}
+	rest := strings.TrimSpace(strings.Join(parts[1:], " "))
+	var prompt string
+	switch mode {
+	case "single":
+		agent, task := splitAgentTask(rest)
+		if agent == "" {
+			s.logError("usage: /run <agent> \"<task>\"")
+			return nil
+		}
+		prompt = fmt.Sprintf("Run the subagent tool: agent=%q, task=%q. Return its result.", agent, task)
+	case "parallel":
+		tasks := splitParallel(rest)
+		prompt = "Run the subagent tool in parallel mode with these tasks:\n" + tasks
+	case "chain":
+		steps := splitChain(rest)
+		prompt = "Run the subagent tool as a chain with these steps (use {previous} to pass the prior step's output):\n" + steps
+	}
+	return s.sendDelegation(prompt, "/"+mode)
+}
+
+// splitAgentTask splits "agent \"task text\"" (or agent task...) into (agent, task).
+func splitAgentTask(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	// quoted task: agent "task"
+	if idx := strings.IndexAny(s, "\""); idx >= 0 {
+		agent := strings.TrimSpace(s[:idx])
+		task := strings.Trim(s[idx:], "\"")
+		return unquoteFirst(agent), strings.TrimSpace(task)
+	}
+	// bare: first token is agent, rest is task
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	return parts[0], strings.Join(parts[1:], " ")
+}
+
+func unquoteFirst(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '"' && s[len(s)-1] == '"' || s[0] == '\'' && s[len(s)-1] == '\'') {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// splitParallel renders a parallel tasks list from "a1 \"t1\" | a2 \"t2\"".
+func splitParallel(s string) string {
+	var lines []string
+	for i, step := range strings.Split(s, "|") {
+		agent, task := splitAgentTask(step)
+		if agent == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("  %d. agent=%q, task=%q", i+1, agent, task))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// splitChain renders a chain steps list from "a1 \"t1\" -> a2 \"t2\"".
+func splitChain(s string) string {
+	var lines []string
+	for i, step := range strings.Split(s, "->") {
+		agent, task := splitAgentTask(step)
+		if agent == "" {
+			continue
+		}
+		if task == "" {
+			lines = append(lines, fmt.Sprintf("  %d. agent=%q (task inherits {previous})", i+1, agent))
+		} else {
+			lines = append(lines, fmt.Sprintf("  %d. agent=%q, task=%q", i+1, agent, task))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (s *session) sendSteer(prompt string) tea.Cmd {
 	if !s.authed {
 		s.logError("not authenticated — run /key sk-... first")
@@ -413,6 +638,41 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.openCommandPalette()
 		return s, nil
 	}
+	// @-mention flyout: when open it owns arrow/tab/enter/esc; printable
+	// and editing keys fall through to the input and re-evaluate the token.
+	if s.mentionActive && s.handleMentionNav(msg) {
+		return s, nil
+	}
+
+
+	if s.pendingIntercom != nil {
+		// A subagent asked the orchestrator a blocking question. Enter replies;
+		// Esc unblocks the child with a best-judgment nudge so it isn't stuck.
+		switch msg.String() {
+		case "esc":
+			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": "[no reply — proceed with your best judgment]"})
+			s.pendingIntercom = nil
+			s.layout()
+			s.input.Reset()
+			s.input.Focus()
+			return s, nil
+		}
+		if msg.Type == tea.KeyEnter {
+			reply := strings.TrimSpace(s.input.Value())
+			if reply == "" {
+				return s, nil
+			}
+			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": reply})
+			s.logSuccess(fmt.Sprintf("↦ reply to %s sent", s.pendingIntercom.from))
+			s.pendingIntercom = nil
+			s.input.Reset()
+			s.layout()
+			return s, nil
+		}
+		var cmd tea.Cmd
+		s.input, cmd = s.input.Update(msg)
+		return s, cmd
+	}
 	if s.pendingApproval != nil {
 		switch msg.String() {
 		case "y", "Y":
@@ -450,6 +710,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return s, nil
 			}
 			s.input.Reset()
+			s.evalMention()
 			if strings.HasPrefix(text, "/") {
 				return s, s.handleUserLine(text)
 			}
@@ -457,6 +718,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		s.input, cmd = s.input.Update(msg)
+		s.evalMention()
 		return s, cmd
 	}
 
@@ -474,6 +736,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if msg.Type == tea.KeyEnter && strings.TrimSpace(s.input.Value()) == "" {
 			s.input.SetValue(welcomeExamples[s.welcomeIdx])
+			s.evalMention()
 			s.input.Focus()
 			return s, nil
 		}
@@ -483,11 +746,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "up" && len(s.history) > 0 {
 		val := s.recallHistory(-1)
 		s.input.SetValue(val)
+		s.evalMention()
 		return s, nil
 	}
 	if msg.String() == "down" && len(s.history) > 0 {
 		val := s.recallHistory(+1)
 		s.input.SetValue(val)
+		s.evalMention()
 		return s, nil
 	}
 
@@ -497,11 +762,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return s, nil
 		}
 		s.input.Reset()
+		s.evalMention()
 		s.histIdx = len(s.history)
 		return s, s.handleUserLine(text)
 	}
 
 	s.input, _ = s.input.Update(msg)
+	s.evalMention()
 	return s, nil
 }
 
@@ -740,7 +1007,23 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.sendCore(map[string]any{"type": "remove_plugin", "name": parts[1]})
 			return nil
+		case "/run":
+			return s.runSubagentCommand(parts, "single")
+		case "/parallel":
+			return s.runSubagentCommand(parts, "parallel")
+		case "/chain":
+			return s.runSubagentCommand(parts, "chain")
+		case "/subagents", "/subagents-list":
+			return s.sendDelegation(`Run subagent({ action: "list" }) and show the available agents.`, "/subagents")
+		case "/subagents-doctor":
+			return s.sendDelegation(`Run subagent({ action: "doctor" }) and show the setup diagnostics.`, "/subagents-doctor")
+		case "/subagents-status":
+			return s.sendDelegation(`Run subagent({ action: "status" }) and show the active subagent runs.`, "/subagents-status")
+		case "/subagents-models":
+			return s.sendDelegation(`Run subagent({ action: "models" }) and show the runtime model mapping for the builtin agents.`, "/subagents-models")
 		default:
+			s.logError("unknown command: " + parts[0])
+			return nil
 			s.logError("unknown command: " + parts[0])
 			return nil
 		}
