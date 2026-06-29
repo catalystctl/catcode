@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added — macOS standalone executable
+- `release-macos.sh` cross-compiles the harness into a single self-contained
+  macOS executable per arch (arm64 + x86_64): the Rust core is built with
+  `cargo zigbuild` (zig as the macOS linker; pure-Rust `rustls-tls` so no
+  macOS SDK is needed), then embedded into the Go TUI via `go:embed`
+  (`-tags embed_core`). Each output file runs from any CWD — it extracts its
+  bundled core to `~/Library/Caches/umans-harness` on first run and launches
+  the harness in that directory, with no separate `umans-core` and no install.
+- TUI: new `embeddedCorePath()` (build-tagged `embed_core`) is wired into
+  `coreBinaryPath()` ahead of the usual `$UMANS_CORE`/dev/installed search;
+  it's a no-op stub in normal builds, so dev, Linux, and the Windows MSI
+  layout are unchanged.
+
 ### Changed
 - Removed the fixed agentic turn cap (`--max-turns` / `max_turns`, default 200)
   and the `spawn` sub-agent turn cap (`spawn_max_turns`, default 10). Turns are
@@ -10,6 +23,18 @@
   `--max-turns` flag, `UMANS_HARNESS_MAX_TURNS` env var, `max_turns` config
   key, `ready` event's `max_turns` field, the `set_config max_turns` knob, and
   the TUI "Max Turns" setting. Stale `max_turns` config values are ignored.
+
+### Fixed
+- Tokens-per-second (`tps` in the `metrics` event, shown as "tok/s" in the
+  footer) was wrong: it divided the *last* request's output tokens by the
+  whole turn's wall time — including every tool call's execution/wait time
+  and every prefill. It now divides total output tokens across all requests
+  by accumulated *generation time* (each request's first-token → end
+  window), so tool-call waits and prefill (TTFT) are excluded — pure model
+  throughput, not end-to-end wall time. The live mid-stream TPS now times
+  each request from its own first token (not the turn's), and
+  `mark_first_token` fires on the first reasoning chunk as well as content,
+  so reasoning-model (GLM @ high) TPS is accurate.
 
 ### Added — in-flight steer, follow-up & commands
 - While a turn is running the input now stays live so you can compose a

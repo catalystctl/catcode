@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -169,6 +170,9 @@ func (s *session) renderFooter() string {
 		eff = s.preferredLevel(s.thinkingLevels())
 	}
 	left.WriteString(dimStyle.Render(" · think:" + eff))
+	if s.settings.MouseWheel {
+		left.WriteString(dimStyle.Render(" · mouse:on"))
+	}
 
 	mid := s.renderMetrics()
 	midStyled := ""
@@ -180,9 +184,10 @@ func (s *session) renderFooter() string {
 }
 
 // renderMetrics builds the centred throughput string from the last metrics
-// event. Shows TPS plus, when the endpoint reports prefix-cache hits, the
-// cached-token fraction (e.g. "42 tok/s · 87% cached"). The cached fraction
-// confirms the stable-prefix strategy is landing cache hits turn over turn.
+// event. Shows TPS (rounded to the nearest integer) and TTFT, plus — when the
+// endpoint reports prefix-cache hits — the cached-token fraction
+// (e.g. "42 tok/s · 180ms ttft · 87% cached"). The cached fraction confirms the
+// stable-prefix strategy is landing cache hits turn over turn.
 func (s *session) renderMetrics() string {
 	if len(s.lastMetrics) == 0 {
 		return ""
@@ -194,7 +199,21 @@ func (s *session) renderMetrics() string {
 	tps := get(m, "tps")
 	out := ""
 	if tps != "" && tps != "null" {
-		out = fmt.Sprintf("%s tok/s", tps)
+		// Round to the nearest integer so the footer reads "71 tok/s"
+		// rather than "71.123132991239 tok/s".
+		if f, err := strconv.ParseFloat(tps, 64); err == nil {
+			out = fmt.Sprintf("%d tok/s", int(math.Round(f)))
+		} else {
+			out = fmt.Sprintf("%s tok/s", tps)
+		}
+	}
+	// Time-to-first-token for this turn (latency, not throughput).
+	if ttft := get(m, "ttft_ms"); ttft != "" && ttft != "null" {
+		if out != "" {
+			out += fmt.Sprintf(" · %sms ttft", ttft)
+		} else {
+			out = fmt.Sprintf("%sms ttft", ttft)
+		}
 	}
 	// Cached-token hit rate for this turn. cached_tokens / prompt_tokens
 	// (the prompt is what gets cached; tokens_in now includes output too).

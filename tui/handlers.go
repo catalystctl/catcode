@@ -207,6 +207,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.logInfo(fmt.Sprintf("context compacted: %s → %s tokens", ev.get("before_tokens"), ev.get("after_tokens")))
 
+	case "digested":
+		s.logInfo(fmt.Sprintf("context digested: %s result(s), %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
+
 	case "approval_changed":
 		s.approvalModeStr = ev.get("mode")
 		s.logInfo(fmt.Sprintf("approval mode: %s", ev.get("mode")))
@@ -253,7 +256,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.input.Focus()
 			s.layout()
 		}
-		
+
 	case "subagent_progress":
 		runID := ev.get("run_id")
 		if ev.get("phase") == "done" {
@@ -362,6 +365,29 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
+	case "vision_config":
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			vm := map[string]bool{}
+			if raw, ok := m["vision_models"]; ok {
+				var arr []string
+				if json.Unmarshal(raw, &arr) == nil {
+					for _, id := range arr {
+						vm[id] = true
+					}
+				}
+			}
+			s.visionModels = vm
+			if raw, ok := m["vision_model"]; ok {
+				var v string
+				_ = json.Unmarshal(raw, &v)
+				s.visionModel = v
+			}
+			if s.pendingVisionPicker {
+				s.pendingVisionPicker = false
+				s.openVisionPicker()
+			}
+		}
 	}
 	return waitForEvent(s.coreEvents)
 }
@@ -374,10 +400,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 // state (idle/busy/approval) like the keyboard scroll bindings; modal overlays
 // take over the whole screen and are skipped.
 //
-// Mouse tracking is enabled via tea.WithMouseCellMotion in main.go. That mode
-// also forwards click/drag events to us, which we deliberately ignore. (Hold
-// Shift to select text in the terminal as usual — most terminals bypass an app's
-// mouse capture while Shift is held.)
+// Mouse tracking is opt-in: it's enabled at startup only when the Mouse Wheel
+// setting is on, and toggled at runtime via /settings → Mouse Wheel
+// (tea.EnableMouseCellMotion / tea.DisableMouse). Off (the default) leaves
+// native click-drag text selection/copy to the terminal; when on, hold Shift
+// to select/copy. Only wheel presses scroll; clicks and drags are ignored.
 func (s *session) handleMouseWheel(msg tea.MouseMsg) tea.Cmd {
 	// Modal overlays own the whole screen; never scroll the transcript behind one.
 	if s.modal.kind != modalNone {
@@ -419,21 +446,22 @@ func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
 	s.follow = true
 	s.logUser(prompt + "  ↳ " + cmdName)
 	s.pushHistory(prompt)
-	s.sendCore(map[string]any{
+	s.sendCore(s.withImages(map[string]any{
 		"type":             "send",
 		"prompt":           prompt,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
-	})
+	}, prompt))
 	s.busy = true
 	return nil
 }
 
 // runSubagentCommand parses a /run, /parallel, or /chain slash command and
 // delegates to the subagent tool via a structured prompt. Supported forms:
-//   /run <agent> "<task>"            (single)
-//   /parallel <a1> "<t1>" | <a2> "<t2>"   (parallel)
-//   /chain <a1> "<t1>" -> <a2> "<t2>"      (chain, {previous} flows)
+//
+//	/run <agent> "<task>"            (single)
+//	/parallel <a1> "<t1>" | <a2> "<t2>"   (parallel)
+//	/chain <a1> "<t1>" -> <a2> "<t2>"      (chain, {previous} flows)
 func (s *session) runSubagentCommand(parts []string, mode string) tea.Cmd {
 	if len(parts) < 2 {
 		usage := map[string]string{"single": "/run <agent> \"<task>\"", "parallel": "/parallel <a1> \"<t1>\" | <a2> \"<t2>\"", "chain": "/chain <a1> \"<t1>\" -> <a2> \"<t2>\""}
@@ -532,12 +560,12 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 	s.logUser(prompt + "  ↳ steer")
 	s.pushHistory(prompt)
 	s.queuedNext = true
-	s.sendCore(map[string]any{
+	s.sendCore(s.withImages(map[string]any{
 		"type":             "steer",
 		"prompt":           prompt,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
-	})
+	}, prompt))
 	return nil
 }
 
@@ -568,12 +596,12 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 	s.logUser(text + "  ↳ queued")
 	s.pushHistory(text)
 	s.queuedNext = true
-	s.sendCore(map[string]any{
+	s.sendCore(s.withImages(map[string]any{
 		"type":             "send",
 		"prompt":           text,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
-	})
+	}, text))
 	return nil
 }
 
@@ -633,8 +661,9 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.openReasoningPicker()
 		return s, nil
 	}
-	// "/" opens the palette when the input is empty and idle.
-	if msg.String() == "/" && s.input.Value() == "" && !s.busy {
+	// "/" opens the palette when the input is empty — works while idle and
+	// in-flight, mirroring the @-mention flyout (which also opens mid-turn).
+	if msg.String() == "/" && s.input.Value() == "" {
 		s.openCommandPalette()
 		return s, nil
 	}
@@ -643,7 +672,6 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.mentionActive && s.handleMentionNav(msg) {
 		return s, nil
 	}
-
 
 	if s.pendingIntercom != nil {
 		// A subagent asked the orchestrator a blocking question. Enter replies;
@@ -692,8 +720,8 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.busy {
 		// While a turn runs the input stays live: type a follow-up (Enter),
 		// steer the model (Ctrl+Enter), run a slash command, or abort (Esc).
-		// Scrolling + ctrl+t/o/p above still work; a typed "/" composes a slash
-		// command (the lone-"/" palette opener stays idle-only).
+		// Scrolling + ctrl+t/o/p above still work; a lone "/" with an empty
+		// input opens the command palette mid-turn too (like the @ flyout).
 		switch msg.String() {
 		case "esc":
 			// Esc aborts the turn and drops any queued follow-up/steer.
@@ -983,8 +1011,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.sendCore(map[string]any{"type": "install_plugin", "path": parts[1]})
 			s.logInfo(fmt.Sprintf("installing plugin from %s…", parts[1]))
 			return nil
-		case "/plugin-list":
+		case "/plugin-list", "/plugin-config":
 			s.sendCore(map[string]any{"type": "list_plugins"})
+			return nil
+		case "/vision":
+			s.pendingVisionPicker = true
+			s.sendCore(map[string]any{"type": "get_vision_config"})
+			s.logInfo("loading vision config…")
 			return nil
 		case "/plugin-enable":
 			if len(parts) < 2 {
@@ -1041,12 +1074,12 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	s.follow = true // jump to bottom so the user sees their turn + the response
 	s.logUser(text)
 	s.pushHistory(text)
-	s.sendCore(map[string]any{
+	s.sendCore(s.withImages(map[string]any{
 		"type":             "send",
 		"prompt":           text,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
-	})
+	}, text))
 	s.busy = true
 	return nil
 }

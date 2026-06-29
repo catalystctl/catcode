@@ -9,6 +9,8 @@ core/target/
 # Go (tui/) compiled binaries
 tui/tui
 tui/umans-harness-tui
+tui/ucli
+tui/ucli.exe
 tui/bin/
 
 # Release / distribution output (built by release.sh)
@@ -52,3 +54,18 @@ desktop.ini
 !.env.example
 *.pem
 *.key
+
+# macOS standalone build: core binary injected into the TUI at build time
+tui/embed/umans-core
+
+# =============================================================================
+# External reference clones & scratch artifacts (not part of this project)
+# =============================================================================
+# Cloned external repos kept locally for reference only (each has its own .git)
+continue/
+roo-code/
+# Subagent-generated scratch / working notes
+context.md
+plan.md
+# Stray build/test artifacts
+.intentionally-empty-file.o

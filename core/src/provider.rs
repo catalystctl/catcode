@@ -100,12 +100,12 @@ fn fallback_models() -> Vec<ModelInfo> {
     // clamps to it — replacing the old hardcoded model-name sniff.
     let std = || DEFAULT_THINKING_LEVELS.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     vec![
-        ModelInfo { id: "umans-coder".into(), name: "Umans Coder".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std() },
-        ModelInfo { id: "umans-kimi-k2.5".into(), name: "Umans Kimi K2.5".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std() },
-        ModelInfo { id: "umans-kimi-k2.6".into(), name: "Umans Kimi K2.6".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std() },
-        ModelInfo { id: "umans-glm-5.1".into(), name: "Umans GLM 5.1".into(), reasoning: true, context_window: 202752, max_tokens: 131072, thinking_levels: vec!["high".to_string()] },
-        ModelInfo { id: "umans-glm-5.2".into(), name: "Umans GLM 5.2".into(), reasoning: true, context_window: 413696, max_tokens: 131072, thinking_levels: vec!["high".to_string()] },
-        ModelInfo { id: "umans-minimax-m2.5".into(), name: "Umans MiniMax M2.5".into(), reasoning: true, context_window: 204800, max_tokens: 8192, thinking_levels: std() },
+        ModelInfo { id: "umans-coder".into(), name: "Umans Coder".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
+        ModelInfo { id: "umans-kimi-k2.5".into(), name: "Umans Kimi K2.5".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
+        ModelInfo { id: "umans-kimi-k2.6".into(), name: "Umans Kimi K2.6".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
+        ModelInfo { id: "umans-glm-5.1".into(), name: "Umans GLM 5.1".into(), reasoning: true, context_window: 202752, max_tokens: 131072, thinking_levels: vec!["high".to_string()], vision: false },
+        ModelInfo { id: "umans-glm-5.2".into(), name: "Umans GLM 5.2".into(), reasoning: true, context_window: 413696, max_tokens: 131072, thinking_levels: vec!["high".to_string()], vision: false },
+        ModelInfo { id: "umans-minimax-m2.5".into(), name: "Umans MiniMax M2.5".into(), reasoning: true, context_window: 204800, max_tokens: 8192, thinking_levels: std(), vision: false },
     ]
 }
 
@@ -143,8 +143,8 @@ pub async fn discover_models(client: &reqwest::Client, base_url: &str) -> Vec<Mo
 const MODELS_CACHE_TTL: u64 = 28800;
 
 fn models_cache_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".config/umans-harness/models-cache.json"))
+    let home = crate::config::home_dir()?;
+    Some(home.join(".config/umans-harness/models-cache.json"))
 }
 
 fn read_models_cache(base_url: &str) -> Option<Vec<ModelInfo>> {
@@ -196,6 +196,7 @@ fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
             "context_window": m.context_window,
             "max_tokens": m.max_tokens,
             "thinking_levels": m.thinking_levels,
+            "vision": m.vision,
         })
     }).collect();
     let cache = json!({
@@ -214,11 +215,12 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
         let name = m.get("name")?.as_str()?.to_string();
         let context_window = m.get("context_window")?.as_u64()? as u32;
         let max_tokens = m.get("max_tokens")?.as_u64()? as u32;
+        let vision = m.get("vision").and_then(|v| v.as_bool()).unwrap_or(false);
         let thinking_levels = m.get("thinking_levels")
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        out.push(ModelInfo { id, name, reasoning: true, context_window, max_tokens, thinking_levels });
+        out.push(ModelInfo { id, name, reasoning: true, context_window, max_tokens, thinking_levels, vision });
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -231,6 +233,7 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
             let caps = info.get("capabilities");
             let cw = caps.and_then(|c| c.get("context_window")).and_then(|v| v.as_u64()).unwrap_or(200_000) as u32;
             let mt = caps.and_then(|c| c.get("recommended_max_tokens")).and_then(|v| v.as_u64()).unwrap_or(65000) as u32;
+            let vision = caps.and_then(|c| c.get("vision")).and_then(|v| v.as_bool()).unwrap_or(false);
             let name = info.get("display_name").and_then(|v| v.as_str()).unwrap_or(id).to_string();
             let thinking_levels = caps
                 .and_then(|c| c.get("thinking_levels").or_else(|| c.get("reasoning_levels")).or_else(|| c.get("reasoning_efforts")))
@@ -242,7 +245,7 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            out.push(ModelInfo { id: id.clone(), name, reasoning: true, context_window: cw, max_tokens: mt, thinking_levels });
+            out.push(ModelInfo { id: id.clone(), name, reasoning: true, context_window: cw, max_tokens: mt, thinking_levels, vision });
         }
     }
     if out.is_empty() { fallback_models() } else { out }
@@ -488,6 +491,7 @@ pub async fn stream_turn(
                 }
                 if let Some(r) = delta.and_then(|d| d.get("reasoning_content")).and_then(|v| v.as_str()) {
                     if !r.is_empty() {
+                        if reasoning.is_empty() { timer.mark_first_token(); }
                         reasoning.push_str(r);
                         if !quiet {
                             emitted = true;
@@ -554,7 +558,7 @@ pub async fn stream_turn(
                     if let Some(ttft) = timer.first_token.map(|t| t.duration_since(timer.start).as_millis() as u64) {
                         ev = ev.with("ttft_ms", json!(ttft));
                     }
-                    if let Some(tps) = timer.first_token.and_then(|ft| {
+                    if let Some(tps) = timer.call_first_token.and_then(|ft| {
                         let e = ft.elapsed().as_secs_f64();
                         if e >= 0.2 { Some(est_out as f64 / e) } else { None }
                     }) {
@@ -586,8 +590,16 @@ pub async fn stream_turn(
         tokens_in = 0;
         tokens_out = 0;
         cached_tokens = 0;
+        timer.call_first_token = None;
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
+
+    // Fold this call's generation time + output tokens into the turn totals so
+    // finalize() computes TPS over generation time only (excluding tool-call
+    // wait and prefill). est_out is the char/4 fallback numerator when the
+    // endpoint omits usage.
+    let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+    timer.end_call(tokens_out, est_out);
 
     // Build the assistant message. OpenAI requires content null when tool_calls
     // present and empty. reasoning_content is Umans-only (gated above).
@@ -824,5 +836,30 @@ mod tests {
         // a non-GLM model advertises the standard trio
         let coder = models.iter().find(|m| m.id == "umans-coder").unwrap();
         assert_eq!(coder.thinking_levels, vec!["low".to_string(), "medium".to_string(), "high".to_string()]);
+    }
+
+    #[test]
+    fn parse_models_response_reads_vision_flag() {
+        let data = json!({
+            "vision-model": { "display_name": "Vision", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "vision": true } },
+            "text-model": { "display_name": "Text", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "vision": false } },
+            "unspecified": { "display_name": "Unspec", "capabilities": { "context_window": 128000 } }
+        });
+        let models = parse_models_response(&data);
+        let by_id: std::collections::HashMap<&str, &ModelInfo> =
+            models.iter().map(|m| (m.id.as_str(), m)).collect();
+        assert_eq!(by_id["vision-model"].vision, true);
+        assert_eq!(by_id["text-model"].vision, false);
+        assert_eq!(by_id["unspecified"].vision, false); // default false when absent
+    }
+
+    #[test]
+    fn modelinfo_vision_defaults_false_when_absent() {
+        let j = r#"{"id":"x","name":"X","context_window":1,"max_tokens":1}"#;
+        let m: ModelInfo = serde_json::from_str(j).unwrap();
+        assert!(!m.vision);
+        let j2 = r#"{"id":"x","name":"X","context_window":1,"max_tokens":1,"vision":true}"#;
+        let m2: ModelInfo = serde_json::from_str(j2).unwrap();
+        assert!(m2.vision);
     }
 }

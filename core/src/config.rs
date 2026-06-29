@@ -104,6 +104,7 @@ pub struct Config {
     pub max_read_bytes: u64,
     pub max_read_lines: usize,
     pub context_compact_at: f32, // fraction of context_window that triggers compaction
+    pub context_digest_at: f32,  // fraction of context_window that triggers stale-tool-result digesting (sub-threshold reclaim; 0 disables)
     pub debug_log: Option<PathBuf>,
     pub session_file: Option<PathBuf>,
     pub default_model: Option<String>,
@@ -214,6 +215,7 @@ impl Default for Config {
             max_read_bytes: 5_242_880,   // 5 MiB (was 1 MiB; real files exceed 1MB)
             max_read_lines: 10_000,        // was 2000; pagination covers the rest
             context_compact_at: 0.70,
+            context_digest_at: 0.40,
             debug_log: None,
             session_file: None,
             default_model: None,
@@ -313,8 +315,8 @@ pub fn load() -> Config {
         None => {
             let managed = dirs_config_path();
             let managed_dir = managed.with_file_name("umans-harness.d");
-            let home = std::env::var("HOME").unwrap_or_default();
-            let settings_path = PathBuf::from(home).join(".config/umans-harness/settings.json");
+            let home = home_dir().unwrap_or_default();
+            let settings_path = home.join(".config/umans-harness/settings.json");
             let local = PathBuf::from("settings.local.json");
             let proj = PathBuf::from("settings.json");
             let mut v = vec![managed];
@@ -358,9 +360,29 @@ pub fn load() -> Config {
     c
 }
 
+/// Cross-platform home directory: prefers `$HOME`, falls back to `$USERPROFILE`
+/// (Windows). Returns None if neither is set.
+pub fn home_dir() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    if let Some(h) = std::env::var_os("USERPROFILE") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    None
+}
+
+/// Cross-platform config base: `~/.config/umans-harness` on Unix, and
+/// `%USERPROFILE%\.config\umans-harness` on Windows (kept under the same
+/// relative path so settings are shared across shells / WSL).
+
 fn dirs_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/umans-harness/config.json")
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config/umans-harness/config.json")
 }
 
 fn apply_json(c: &mut Config, v: &Value) {
@@ -369,6 +391,7 @@ fn apply_json(c: &mut Config, v: &Value) {
     if let Some(x) = s("workspace") { c.workspace = PathBuf::from(x); }
     if let Some(x) = s("approval") { c.approval = Approval::parse(&x); }
     if let Some(b) = v.get("bash_timeout_secs").and_then(|x| x.as_u64()) { c.bash_timeout_secs = b; }
+    if let Some(f) = v.get("context_digest_at").and_then(|x| x.as_f64()) { c.context_digest_at = f as f32; }
     if let Some(x) = s("debug_log") { c.debug_log = Some(PathBuf::from(x)); }
     if let Some(x) = s("session") { c.session_file = Some(PathBuf::from(x)); }
     if let Some(x) = s("model") { c.default_model = Some(x); }

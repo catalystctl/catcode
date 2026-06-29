@@ -241,8 +241,8 @@ pub fn discover_agents(workspace: &Path, cfg: &SubagentConfig) -> Vec<AgentConfi
     }
 
     // user scope: ~/.umans-harness/agents/**/*.md
-    if let Some(home) = std::env::var_os("HOME") {
-        let dir = PathBuf::from(&home).join(".umans-harness/agents");
+    if let Some(home) = crate::config::home_dir() {
+        let dir = home.join(".umans-harness/agents");
         load_agent_dir(&dir, AgentSource::User, &mut by_name);
     }
     // project scope: <workspace>/.umans-harness/agents/**/*.md
@@ -331,7 +331,7 @@ fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
     let mut out: Vec<(String, String, String)> = Vec::new();
     let dirs = [
         (workspace.join(".umans-harness/skills"), true),
-        (std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".umans-harness/skills")).unwrap_or_default(), false),
+        (crate::config::home_dir().map(|h| h.join(".umans-harness/skills")).unwrap_or_default(), false),
     ];
     for (dir, _proj) in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
@@ -1230,7 +1230,7 @@ fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     if name.is_empty() { return Outcome::err("create config requires 'name'"); }
     let scope = cfg.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
     let dir = match scope {
-        "user" => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".umans-harness/agents")).unwrap_or_else(|| workspace.join(".umans-harness/agents")),
+        "user" => crate::config::home_dir().map(|h| h.join(".umans-harness/agents")).unwrap_or_else(|| workspace.join(".umans-harness/agents")),
         _ => workspace.join(".umans-harness/agents"),
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1259,7 +1259,7 @@ fn update_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     // find the file
     let candidates = [
         workspace.join(".umans-harness/agents").join(format!("{name}.md")),
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
+        crate::config::home_dir().map(|h| h.join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
     ];
     let path = candidates.iter().find(|p| p.exists()).cloned();
     let path = match path {
@@ -1290,7 +1290,7 @@ fn delete_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     if name.is_empty() { return Outcome::err("delete requires 'agent'"); }
     let candidates = [
         workspace.join(".umans-harness/agents").join(format!("{name}.md")),
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
+        crate::config::home_dir().map(|h| h.join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
     ];
     for p in &candidates {
         if p.exists() {

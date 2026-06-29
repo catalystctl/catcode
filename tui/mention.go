@@ -1,6 +1,5 @@
 package main
 
-
 import (
 	"fmt"
 	"io/fs"
@@ -394,4 +393,3 @@ func (s *session) mentionFlyoutHeight() int {
 	}
 	return lipgloss.Height(f)
 }
-

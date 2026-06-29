@@ -31,6 +31,7 @@ type settingsStore struct {
 	NoNetwork        bool   `json:"no_network,omitempty"`
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
+	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
 }
 
 func configDir() string {
@@ -166,6 +167,7 @@ func loadSettings() *settingsStore {
 		s.IdleTimeout = 120
 	}
 	s.MaxSessionTokens = onDisk.MaxSessionTokens
+	s.MouseWheel = onDisk.MouseWheel
 	return s
 }
 

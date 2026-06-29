@@ -2,7 +2,6 @@
 // writes commands to stdin, and reads newline-delimited events from stdout.
 mod config;
 mod git_ctx;
-mod hashline;
 mod intercom;
 mod logging;
 mod memory;
@@ -13,12 +12,14 @@ mod session;
 mod subagent;
 mod tools;
 mod workspace;
+mod vision;
 
 use config::{Config, Approval, PermissionRule};
 use intercom::IntercomBus;
 use logging::{estimate_messages_tokens, estimate_message_tokens, Logger, TurnTimer};
 use protocol::{emit, Command, Event, ModelInfo};
 use plugins::{PluginManager, PLUGIN_DOCS};
+use vision::VisionConfig;
 use memory::memory_injection;
 use git_ctx::{read_git_context, git_context_injection};
 use serde_json::{json, Value};
@@ -42,10 +43,9 @@ struct QueuedPrompt {
 const SYSTEM_PROMPT_BASE: &str = r#"You are a coding agent operating inside a Rust/Go harness with native Umans model access.
 You can read, edit, write, and list files, search with grep/glob, and run bash commands — all confined to the current workspace directory.
 
-File editing uses HASH ANCHORS, not line numbers:
-- read_file returns each line as "HASH│content". The 4-char HASH on the left is the anchor for that line.
-- To change a file, call edit with those hashes: op=replace needs start+end hashes (inclusive; single line = start==end; delete = lines:[]); op=append inserts after a pos hash (omit pos for end-of-file); op=prepend inserts before a pos hash (omit pos for start-of-file). You can pass multiple ops in one edit call; they apply atomically.
-- If edit returns a "stale anchor" error, the file changed since your read — re-read it and retry with fresh hashes.
+File editing uses search-and-replace, not line numbers or hashes:
+- read_file returns a file's plain content. Call it before editing so you see the exact text.
+- To change a file, call edit with one or more {search, replace} pairs. `search` must match the file content EXACTLY (copy it verbatim, including whitespace) and be unique in the file; `replace` is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in `replace`. All edits in one call apply atomically — if any `search` is not found or is ambiguous (matches multiple places) nothing is written; re-read and correct the search text.
 - Use write_file only for new files or complete rewrites; prefer edit for targeted changes. Use grep to search and glob to find files by pattern.
 
 All paths are relative to the workspace root; absolute paths and ".." are rejected.
@@ -85,7 +85,7 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
 fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
     let candidates: [Option<std::path::PathBuf>; 2] = [
         Some(workspace.join(".umans-harness/skills/pi-subagents/SKILL.md")),
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".umans-harness/skills/pi-subagents/SKILL.md")),
+        config::home_dir().map(|h| h.join(".umans-harness/skills/pi-subagents/SKILL.md")),
     ];
     for p in candidates.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&p) {
@@ -129,6 +129,9 @@ pub struct State {
     pub queued: Mutex<Option<QueuedPrompt>>,
     /// Plugin manager — scans, loads, and executes hooks.
     pub plugin_manager: PluginManager,
+	/// Vision-handoff config (curated vision models + preferred target), persisted
+	/// to .umans-harness/vision.json; merged into the pre_turn hook context.
+	pub vision: RwLock<VisionConfig>,
     /// Last time a turn completed (for idle compaction).
     pub last_turn_time: Mutex<std::time::Instant>,
     /// Incrementally maintained token estimate for the main conversation,
@@ -183,6 +186,7 @@ async fn main() {
     // Pre-compute token estimate for resumed conversation.
     let init_est = estimate_messages_tokens(&resumed);
 
+    let vision_cfg = VisionConfig::load(&cfg.workspace);
     let state = Arc::new(State {
         cfg: RwLock::new(cfg),
         api_key: RwLock::new(None),
@@ -198,6 +202,7 @@ async fn main() {
         escalated_kinds: Mutex::new(HashSet::new()),
         queued: Mutex::new(None),
         plugin_manager: PluginManager::new(PathBuf::from(".umans-harness/plugins")),
+        vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
         needs_sanitize: Mutex::new(false),
@@ -497,6 +502,34 @@ async fn main() {
                 }).collect();
                 emit(&Event::new("plugins_list").with("plugins", json!(entries)));
             }
+            Command::GetVisionConfig => {
+                let vc = state.vision.read().await.clone();
+                let models = state.models.read().await.clone();
+                let models_json: Vec<Value> = models.iter().map(|m| json!({
+                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                })).collect();
+                emit(&Event::new("vision_config")
+                    .with("vision_models", json!(vc.vision_models.clone()))
+                    .with("vision_model", json!(vc.vision_model.clone()))
+                    .with("models", json!(models_json)));
+            }
+            Command::SetVisionConfig { vision_models, vision_model } => {
+                let vc = VisionConfig {
+                    vision_models,
+                    vision_model: vision_model.filter(|s| !s.is_empty()),
+                };
+                let workspace = state.cfg.read().await.workspace.clone();
+                vc.save(&workspace);
+                *state.vision.write().await = vc.clone();
+                let models = state.models.read().await.clone();
+                let models_json: Vec<Value> = models.iter().map(|m| json!({
+                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                })).collect();
+                emit(&Event::new("vision_config")
+                    .with("vision_models", json!(vc.vision_models.clone()))
+                    .with("vision_model", json!(vc.vision_model.clone()))
+                    .with("models", json!(models_json)));
+            }
             Command::RefreshMemory => {
                 let ws = state.cfg.read().await.workspace.clone();
                 let mem = memory_injection(&ws, "");
@@ -735,6 +768,10 @@ async fn run_turn(
     images: Option<Vec<String>>,
     cancel: CancellationToken,
 ) {
+    // Vision handoff (pre_turn) and other plugins may remap the model for
+    // this turn; keep a mutable binding so a swap propagates to the request loop.
+    let mut model = model;
+
     // Ensure system prompt is present; persist every finalized message to the session file.
     let mut init_est_add = 0u64;
     {
@@ -770,6 +807,83 @@ async fn run_turn(
     }
     if init_est_add > 0 {
         *st.estimated_tokens.lock().await += init_est_add;
+    }
+
+    // Vision handoff (pre_turn hook): let plugins inspect the upcoming turn
+    // (model + attached images) and optionally remap the model before the first
+    // request. Advisory — a broken/missing hook or `allow:false` never blocks
+    // the turn; only `modify.model` (validated against discovered models) is honored.
+    {
+        let has_images = images.as_ref().map_or(false, |v| !v.is_empty());
+        let image_count = images.as_ref().map_or(0, |v| v.len());
+        let vc = st.vision.read().await.clone();
+        let models_json: Vec<Value> = st.models.read().await.iter().map(|m| json!({
+            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+        })).collect();
+        let (workspace, session_id) = {
+            let cfg = st.cfg.read().await;
+            (
+                cfg.workspace.display().to_string(),
+                cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            )
+        };
+        let original_model = model.clone();
+        for (plugin_name, config) in &st.plugin_manager.get_hook_configs("pre_turn") {
+            let turn_args = json!({
+                "model": model.clone(),
+                "has_images": has_images,
+                "image_count": image_count,
+                "models": models_json,
+                "vision_model": vc.vision_model.clone(),
+            });
+            let ctx = plugins::build_context(
+                "pre_turn", "", &workspace, Some(&turn_args), &session_id, config.pass_args,
+            );
+            let result = plugins::execute_hook("pre_turn", plugin_name, config, &ctx).await;
+            if let Some(new_model) = result
+                .modify
+                .as_ref()
+                .and_then(|m| m.get("model"))
+                .and_then(|v| v.as_str())
+            {
+                if new_model != model.as_str() {
+                    let valid = st.models.read().await.iter().any(|m| m.id.as_str() == new_model);
+                    if valid {
+                        let why = if result.reason.is_empty() {
+                            "vision handoff".to_string()
+                        } else {
+                            result.reason.clone()
+                        };
+                        emit(&Event::new("info").with("message", json!(format!(
+                            "vision handoff: {} → {} ({})", model, new_model, why
+                        ))));
+                        st.logger.log("vision_handoff", json!({
+                            "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
+                        }));
+                        model = new_model.to_string();
+                    } else {
+                        emit(&Event::new("info").with("message", json!(format!(
+                            "vision handoff ignored: '{}' is not a discovered model", new_model
+                        ))));
+                    }
+                }
+            }
+        }
+        // No vision plugin handed off an image-bearing turn on a non-vision
+        // model. Surface it so the user knows to configure /vision (or that
+        // no vision model is available) instead of silently parsing bytes.
+        if has_images && model == original_model {
+            let current_has_vision = st.models.read().await.iter()
+                .find(|m| m.id == model.as_str())
+                .map(|m| m.vision || vc.has_vision(m.id.as_str()))
+                .unwrap_or(false);
+            if !current_has_vision {
+                emit(&Event::new("info").with("message", json!(format!(
+                    "image attached but '{}' lacks vision and no vision model is configured to hand off to; use /vision to set one (or select a vision model with /model)",
+                    model
+                ))));
+            }
+        }
     }
 
     // Main agent tool list: exclude the subagent-only intercom coordination tools
@@ -853,9 +967,35 @@ async fn run_turn(
             .find(|m| m.id == model)
             .map(|m| (m.context_window as u64, m.thinking_levels.clone()))
             .unwrap_or((200_000, Vec::new()));
-        let est = { *st.estimated_tokens.lock().await };
+        let mut est = { *st.estimated_tokens.lock().await };
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
+        // Soft digest: collapse stale, large tool results into one-line digests
+        // well before the compaction threshold so they stop being re-sent verbatim
+        // on every turn. Conservative — only tool messages older than the
+        // compaction tail (DIGEST_KEEP_LAST) and larger than DIGEST_MIN_BYTES are
+        // touched; idempotent; tool_call_id + role preserved so the model's
+        // tool-call/result pairing stays intact. This never removes information
+        // compaction would keep (compaction drops these entirely), so it is
+        // strictly safer than waiting for compaction to fire.
+        let soft = (model_ctx as f32 * cfg.context_digest_at) as u64;
+        if est > soft && messages.len() > DIGEST_KEEP_LAST {
+            let before_est = est;
+            let changed = digest_stale_tool_results(&mut messages, DIGEST_KEEP_LAST);
+            if changed > 0 {
+                *st.conversation.lock().await = messages.clone();
+                if let Some(p) = cfg.session_file.as_ref() {
+                    session::rewrite(p, &messages);
+                }
+                est = estimate_messages_tokens(&messages);
+                *st.estimated_tokens.lock().await = est;
+                st.logger.log("digested", json!({ "results": changed, "before_tokens": before_est, "after_tokens": est }));
+                emit(&Event::new("digested")
+                    .with("results", json!(changed))
+                    .with("before_tokens", json!(before_est))
+                    .with("after_tokens", json!(est)));
+            }
+        }
         if est > threshold.min(hard_cap) && messages.len() > 4 {
             let force_summarize = est > hard_cap;
             compact_with_summary(client, &cfg, &api_key, &model, &mut messages, &cancel, force_summarize).await;
@@ -1241,6 +1381,106 @@ async fn request_approval(st: &Arc<State>, id: &str, name: &str, args: &str, kin
     }
 }
 
+/// Number of trailing messages whose tool results are always kept verbatim.
+/// Chosen >= the compaction tail (8 summarize / 10 naive) so digesting never
+/// touches anything compaction would keep — it only reclaims tokens from
+/// results that compaction would otherwise drop entirely.
+const DIGEST_KEEP_LAST: usize = 10;
+/// Minimum tool-result size (bytes) worth digesting. Small results (ok/err
+/// one-liners, denial messages) stay full — they're cheap and the model may
+/// need them verbatim.
+const DIGEST_MIN_BYTES: usize = 256;
+
+/// Collapse stale, large `role: "tool"` results into a one-line digest so they
+/// stop being re-sent verbatim on every turn. Only tool messages older than the
+/// last `keep` messages are eligible, and only if their content exceeds
+/// `DIGEST_MIN_BYTES`. Already-digested results are skipped (idempotent). The
+/// tool_call_id and role are preserved so orphaned-call sanitization and the
+/// model's tool-call/result pairing stay intact. Returns the count digested.
+pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usize {
+    if messages.len() <= keep {
+        return 0;
+    }
+    // Build tool_call_id -> (tool_name, args_json) from assistant tool_calls so
+    // the digest records WHAT was read/run, not just the size.
+    let mut call_map: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let func = tc.get("function");
+                let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let args = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                call_map.insert(id, (name, args));
+            }
+        }
+    }
+    let digest_to = messages.len().saturating_sub(keep);
+    let mut changed = 0usize;
+    for m in messages[..digest_to].iter_mut() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let content = match m.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+        if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
+            continue;
+        }
+        let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
+        let lines = content.lines().count();
+        let digest = make_digest(&name, &args_json, content.len(), lines);
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".into(), Value::String(digest));
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Build a one-line digest for a tool result, preserving enough to navigate
+/// back to the content: the tool name, its key argument, and the size/line
+/// count. The suffix tells the model how to recover the full output.
+fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String {
+    let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let what = match tool {
+        "read_file" => {
+            if lines > 0 {
+                format!("read_file {:?} ({} lines, {} bytes)", get("path"), lines, len)
+            } else {
+                format!("read_file {:?} ({} bytes)", get("path"), len)
+            }
+        }
+        "bulk_read" => format!("bulk_read ({} bytes)", len),
+        "bash" => format!("bash {:?} ({} bytes)", truncate_str(get("command"), 80), len),
+        "grep" => format!("grep {:?} ({} bytes)", truncate_str(get("pattern"), 80), len),
+        "glob" => format!("glob {:?} ({} bytes)", truncate_str(get("pattern"), 80), len),
+        "diagnostics" => format!("diagnostics ({} bytes)", len),
+        other => format!("{} ({} bytes)", other, len),
+    };
+    let how = if tool == "bash" { "re-run if needed" } else { "re-run to recover full output" };
+    format!("[digested: {what} — {how}]")
+}
+
+/// Truncate a string to `n` chars at a char boundary, appending an ellipsis.
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n).collect();
+    out.push('…');
+    out
+}
+
 /// Compact the conversation when it nears the context window.
 /// ponytail: simple strategy — drop the oldest tool results (the bulk of tokens)
 /// and keep system + recent turns. A summarization call would be better but adds
@@ -1366,4 +1606,111 @@ fn base64_encode(input: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    fn asst_tool_call(id: &str, name: &str, args: &str) -> Value {
+        json!({ "role": "assistant", "tool_calls": [ {
+            "id": id, "type": "function",
+            "function": { "name": name, "arguments": args }
+        } ] })
+    }
+    fn tool_result(id: &str, content: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": id, "content": content })
+    }
+    fn asst_text(t: &str) -> Value {
+        json!({ "role": "assistant", "content": t })
+    }
+
+    fn big_content(n: usize) -> String { "x\n".repeat(n) }
+
+    /// system + a stale large read result + padding + a recent large read result.
+    fn fixture() -> Vec<Value> {
+        let mut m = vec![json!({ "role": "system", "content": "sys" })];
+        m.push(asst_tool_call("call_1", "read_file", "{\"path\":\"src/big.rs\"}"));
+        m.push(tool_result("call_1", &big_content(150))); // 300 bytes, 150 lines
+        // padding (assistant texts) to push call_1's result out of the keep window
+        for i in 1..=9 { m.push(asst_text(&format!("pad{i}"))); }
+        // a recent large read result that must stay verbatim (inside keep window)
+        m.push(asst_tool_call("call_2", "read_file", "{\"path\":\"src/recent.rs\"}"));
+        m.push(tool_result("call_2", &big_content(140))); // 280 bytes
+        m.push(asst_text("final"));
+        m
+    }
+
+    #[test]
+    fn digests_old_large_tool_result_keeps_recent() {
+        let mut m = fixture();
+        let n = digest_stale_tool_results(&mut m, 10);
+        assert_eq!(n, 1, "only the stale large result should be digested");
+        // stale result (index 2) is now a digest
+        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(d.starts_with("[digested:"), "{}", d);
+        assert!(d.contains("read_file"), "{}", d);
+        assert!(d.contains("src/big.rs"), "{}", d);
+        assert!(d.contains("lines"), "should report line count: {}", d);
+        assert!(d.contains("re-run to recover full output"), "{}", d);
+        // tool_call_id preserved so the assistant/tool pairing stays valid
+        assert_eq!(m[2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
+        // recent large result (inside the keep tail) is untouched
+        let r = m[m.len() - 2].get("content").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(r.len(), 280, "recent result kept full: {}", r);
+        assert!(!r.starts_with("[digested:"));
+        assert_eq!(m[m.len() - 2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
+    }
+
+    #[test]
+    fn digest_is_idempotent() {
+        let mut m = fixture();
+        let n1 = digest_stale_tool_results(&mut m, 10);
+        assert_eq!(n1, 1);
+        let after = m[2].get("content").and_then(|v| v.as_str()).unwrap().to_string();
+        let n2 = digest_stale_tool_results(&mut m, 10);
+        assert_eq!(n2, 0, "second pass must find nothing to digest");
+        assert_eq!(m[2].get("content").and_then(|v| v.as_str()), Some(after.as_str()));
+    }
+
+    #[test]
+    fn digest_skips_small_results() {
+        let mut m = vec![
+            json!({ "role": "system", "content": "sys" }),
+            asst_tool_call("c1", "edit", "{\"path\":\"a.rs\"}"),
+            tool_result("c1", "applied 1 edit(s)"), // 17 bytes — under MIN_BYTES
+        ];
+        // pad to push it out of the keep window
+        for i in 0..12 { m.push(asst_text(&format!("p{i}"))); }
+        let n = digest_stale_tool_results(&mut m, 10);
+        assert_eq!(n, 0, "small result must not be digested");
+        assert_eq!(m[2].get("content").and_then(|v| v.as_str()), Some("applied 1 edit(s)"));
+    }
+
+    #[test]
+    fn digest_noop_when_under_keep() {
+        let mut m = vec![
+            json!({ "role": "system", "content": "sys" }),
+            asst_tool_call("c1", "read_file", "{\"path\":\"a.rs\"}"),
+            tool_result("c1", &big_content(200)),
+        ];
+        // only 3 messages, keep=10 → nothing eligible
+        assert_eq!(digest_stale_tool_results(&mut m, 10), 0);
+        assert_eq!(m[2].get("content").and_then(|v| v.as_str()).unwrap().len(), 400);
+    }
+
+    #[test]
+    fn digest_bash_label_says_rerun_if_needed() {
+        let mut m = vec![
+            json!({ "role": "system", "content": "sys" }),
+            asst_tool_call("c1", "bash", "{\"command\":\"cargo build\"}"),
+            tool_result("c1", &big_content(150)),
+        ];
+        for i in 0..12 { m.push(asst_text(&format!("p{i}"))); }
+        digest_stale_tool_results(&mut m, 10);
+        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(d.contains("bash"), "{}", d);
+        assert!(d.contains("cargo build"), "{}", d);
+        assert!(d.contains("re-run if needed"), "bash digest should not promise side-effect-free recovery: {}", d);
+    }
 }

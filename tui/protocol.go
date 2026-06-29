@@ -22,6 +22,9 @@ type modelInfo struct {
 	// (e.g. ["low","medium","high"]). Empty when the endpoint provides none;
 	// the TUI then falls back to its own low/medium/high set.
 	ThinkingLevels []string `json:"thinking_levels"`
+	// Vision is true when the model accepts image inputs (from /models/info
+	// capabilities.vision). Drives the vision-handoff plugin's routing.
+	Vision bool `json:"vision"`
 }
 
 type intercomPrompt struct {

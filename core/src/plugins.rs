@@ -117,6 +117,28 @@ Safety rules enforced by the core:
 | session_start | When a session begins (prompt received) | lifecycle |
 | session_stop  | When a session ends (done/abort)        | lifecycle |
 | pre_compact   | Before conversation compaction         | pre  |
+| pre_turn      | Before a model request (advisory)      | pre  |
+
+### pre_turn hook (model handoff)
+
+`pre_turn` fires once per assistant turn, after the user message (including any
+attached images) is built and before the first model request. It is advisory:
+it can remap the model for the turn but can never block it (a missing/broken
+hook or `allow:false` is ignored — the turn proceeds with the original model).
+
+Context `args` (set `pass_args: true` in the manifest):
+```
+{
+  "model": "umans-glm-5.2",
+  "has_images": true,
+  "image_count": 2,
+  "models": [ {"id":"...", "vision":true}, ... ]
+}
+```
+Response: return `modify: { "model": "<new-model-id>" }` to swap the turn's
+model. The core validates the id against discovered models and emits an `info`
+event on handoff. Use this to route image-bearing turns to a vision-capable
+model when the active one lacks vision (see the bundled `vision-handoff` plugin).
 
 ### Example: a pre_write linter plugin
 
@@ -167,6 +189,7 @@ pub const HOOK_POINTS: &[&str] = &[
     "session_start",
     "session_stop",
     "pre_compact",
+    "pre_turn",
 ];
 
 /// Default timeout in milliseconds for pre_* hooks (blocking — keep short).
@@ -347,13 +370,9 @@ impl PluginManager {
                 return Err(format!("hook script {:?} does not exist", entry.script));
             }
 
-            // Check that the script is executable (Unix permission bit).
-            let is_exe = std::fs::metadata(&canon_script)
-                .map(|m| {
-                    use std::os::unix::fs::PermissionsExt;
-                    m.permissions().mode() & 0o111 != 0
-                })
-                .unwrap_or(false);
+            // Cross-platform executable check (Unix permission bit, or
+            // extension/presence on Windows where there is no exec bit).
+            let is_exe = is_executable(&canon_script);
             if !is_exe {
                 return Err(format!(
                     "hook script {:?} is not executable (try chmod +x)",
@@ -530,7 +549,7 @@ pub async fn execute_hook(
 
     // Spawn the hook script.
     let script_path = &config.script;
-    let mut child = match Command::new(script_path)
+    let mut child = match hook_command(script_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -673,6 +692,69 @@ fn default_hook_timeout(hook_name: &str) -> u64 {
     }
 }
 
+/// Cross-platform check for whether a hook script is executable.
+/// - Unix: any executable permission bit set (owner/group/other).
+/// - Windows / non-Unix: no permission bit exists, so any file that exists
+///   counts as executable (the OS governs launch by extension; a bad or
+///   missing interpreter surfaces as a spawn error at hook execution time).
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
+/// Build the command to run a hook script, selecting the right interpreter by
+/// extension so plugins work cross-platform. On Unix a shebang handles `*.sh`;
+/// on Windows `.bat`/`.cmd`/`.exe` launch directly, `.ps1` uses powershell,
+/// `.py` uses python, and `.sh`/`.bash` use `bash` (Git Bash/WSL) when present.
+/// `UMANS_HARNESS_SHELL` overrides the interpreter for `.sh`/`.bash`.
+fn hook_command(script: &Path) -> Command {
+    let ext = script
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "bat" | "cmd" | "exe" | "com" => Command::new(script),
+        "ps1" => {
+            let mut c = Command::new("powershell");
+            c.arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(script);
+            c
+        }
+        "py" => {
+            let mut c = Command::new("python");
+            c.arg(script);
+            c
+        }
+        "sh" | "bash" => {
+            // Prefer an explicit override, then bash (Git Bash/WSL on Windows).
+            // On bare Windows without bash the spawn fails → graceful pre-hook deny.
+            if let Ok(shell) = std::env::var("UMANS_HARNESS_SHELL") {
+                let mut c = Command::new(shell);
+                c.arg(script);
+                c
+            } else {
+                let mut c = Command::new("bash");
+                c.arg(script);
+                c
+            }
+        }
+        _ => Command::new(script),
+    }
+}
+
 /// Recursively copy a directory from `src` to `dst`.
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst)
@@ -706,7 +788,17 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {
+        // No executable bit on Windows; hooks launch by extension.
+    }
 
     /// Create a temporary directory that is cleaned up on drop.
     struct TmpDir {
@@ -740,9 +832,7 @@ mod tests {
             stdout_json, exit_code
         );
         fs::write(&script, &content).unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        make_executable(&script);
         script
     }
 
@@ -1147,9 +1237,7 @@ mod tests {
             "#!/bin/sh\nsleep 10\necho '{\"allow\":true}'\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        make_executable(&script);
 
         let config = HookConfig {
             script,

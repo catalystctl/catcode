@@ -44,13 +44,13 @@ func TestTypingDuringBusy(t *testing.T) {
 		t.Fatal("Enter while busy should queue a follow-up (queuedNext=true)")
 	}
 
-	// A slash command during busy runs through handleUserLine (no crash, no-op
-	// sendCore). Type and submit "/stats".
-	for _, r := range "/stats" {
-		s.handleKey(keyMsg(string(r)))
-	}
-	if !strings.HasPrefix(s.input.Value(), "/stats") {
-		t.Fatalf("should be able to type a slash command while busy; got %q", s.input.Value())
+	// A lone "/" while busy now opens the command palette (mirroring the
+	// @-mention flyout, which also works in-flight) instead of composing a
+	// slash command as literal text.
+	s.modal = modal{}
+	s.handleKey(keyMsg("/"))
+	if s.modal.kind != modalCommand {
+		t.Fatalf("typing '/' while busy should open the command palette; got %v", s.modal.kind)
 	}
 }
 

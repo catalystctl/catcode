@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -29,19 +30,22 @@ type session struct {
 	coreIn     io.WriteCloser
 	coreEvents chan *coreEvent
 
-	authed          bool
-	models          []modelInfo
-	modelIdx        int
-	busy            bool
-	queuedNext      bool // a follow-up/steer turn is chained after the current one
-	turnCount       int
-	pendingApproval *approvalPrompt
-	pendingIntercom   *intercomPrompt
-	lastMetrics     json.RawMessage
-	approvalModeStr string
-	sessionList     []sessionEntry
-	coreBashTimeout int
-	coreRestarts    int
+	authed              bool
+	models              []modelInfo
+	modelIdx            int
+	busy                bool
+	queuedNext          bool // a follow-up/steer turn is chained after the current one
+	turnCount           int
+	pendingApproval     *approvalPrompt
+	pendingIntercom     *intercomPrompt
+	lastMetrics         json.RawMessage
+	approvalModeStr     string
+	sessionList         []sessionEntry
+	coreBashTimeout     int
+	coreRestarts        int
+	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)
+	visionModel         string          // preferred handoff target ("" = pick dynamically)
+	pendingVisionPicker bool            // open the vision picker once the config arrives
 
 	settings *settingsStore
 	modal    modal
@@ -59,10 +63,10 @@ type session struct {
 	// default). Scrolling up pauses follow so history can be read without the
 	// view yanking back down on each new token; a banner offers to re-pin.
 	follow        bool
-	welcomeIdx    int    // welcome-screen example cursor (empty conversation)
-	contextTokens uint64 // live context size from the last metrics event (drives the footer budget)
-	subProgress    []*subProgressEntry // live subagent runs (drives the progress panel)
-	cwd           string // working dir, shown in the header as ~/
+	welcomeIdx    int                 // welcome-screen example cursor (empty conversation)
+	contextTokens uint64              // live context size from the last metrics event (drives the footer budget)
+	subProgress   []*subProgressEntry // live subagent runs (drives the progress panel)
+	cwd           string              // working dir, shown in the header as ~/
 
 	// @-mention file flyout state (see mention.go): active when an
 	// unbroken @-token sits at the cursor; mentionAt is its rune index.
@@ -91,6 +95,7 @@ func initialSession() *session {
 	s.follow = true // pin viewport to newest line until the user scrolls up
 	s.cwd = cwdDisplay()
 	s.coreBashTimeout = 30
+	s.visionModels = map[string]bool{}
 
 	s.input = textinput.New()
 	s.input.Placeholder = "Chat with the agent…  (/ for commands)"
@@ -113,16 +118,52 @@ func initialSession() *session {
 // Core subprocess lifecycle
 // ---------------------------------------------------------------------------
 
-// coreBinaryPath resolves the core binary relative to this executable
-// (../core/target/release/core) or ./core/target/release/core from cwd.
+// coreExeSuffix returns the platform executable suffix (".exe" on Windows,
+// "" elsewhere) so the installed Windows layout (ucli.exe + umans-core.exe)
+// is discovered correctly.
+func coreExeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
+// coreBinaryPath resolves the core subprocess binary. Search order:
+//  1. $UMANS_CORE — explicit override (used as-is if it exists)
+//  2. <dir of this exe>/umans-core[.exe] — installed layout (beside the TUI)
+//  3. <dir of this exe>/core[.exe] — dev/legacy core placed beside the TUI
+//  4. core/target/release/core[.exe] — dev build run from the repo root
+//  5. ../core/target/release/core[.exe] — dev build run from a sibling dir
+//  6. <dir of this exe>/../core/target/release/core[.exe]
+//
+// On Windows ".exe" is appended to every candidate so the install layout
+// (ucli.exe next to umans-core.exe) is found from any CWD.
 func coreBinaryPath() string {
+	if env := os.Getenv("UMANS_CORE"); env != "" {
+		if _, err := os.Stat(env); err == nil {
+			if abs, err := filepath.Abs(env); err == nil {
+				return abs
+			}
+			return env
+		}
+	}
+	if p := embeddedCorePath(); p != "" {
+		return p
+	}
+	sfx := coreExeSuffix()
+	coreName := "umans-core" + sfx // installed beside the TUI
+	devName := "core" + sfx        // cargo's bin name in the dev build
 	candidates := []string{
-		"core/target/release/core",
-		"../core/target/release/core",
+		"core/target/release/" + devName,
+		"../core/target/release/" + devName,
 	}
 	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "core"))
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "../core/target/release/core"))
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, coreName), // installed layout
+			filepath.Join(dir, devName),  // dev/legacy core beside the TUI
+			filepath.Join(dir, "../core/target/release/"+devName),
+		)
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -132,7 +173,7 @@ func coreBinaryPath() string {
 			return c
 		}
 	}
-	return "core/target/release/core"
+	return "core/target/release/" + devName
 }
 
 func (s *session) startCore() tea.Cmd {
@@ -296,7 +337,11 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	prog := tea.NewProgram(initialSession(), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if loadSettings().MouseWheel {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	prog := tea.NewProgram(initialSession(), opts...)
 	if _, err := prog.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

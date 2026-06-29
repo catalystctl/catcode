@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ucli Windows installer — WiX source (compatible with msitools `wixl` and
+  the WiX Toolset `candle`+`light`).
+
+  Produces a per-user MSI (no UAC/admin) that installs ucli.exe + umans-core.exe
+  into %LOCALAPPDATA%\Programs\ucli and appends that directory to the user PATH
+  via the Environment table — so new processes pick `ucli` up from any CWD with
+  no script, no ExecutionPolicy dance, and a clean Add/Remove Programs entry.
+
+  Build (msitools wixl, run from the dir that contains the two .exe files):
+      wixl -D Version=0.2.0 ucli.wxs -o ucli-0.2.0-windows.msi
+
+  Build (WiX Toolset on Windows):
+      candle ucli.wxs && light -o ucli-0.2.0-windows.msi ucli.wixobj
+  (keep ucli.exe + umans-core.exe beside ucli.wxs, or adjust SourceFile paths)
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="ucli"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="Umans"
+           UpgradeCode="8c4e2f7a-3b1d-4a6e-9c2b-1e5f8a7d0b3c">
+
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perUser"/>
+
+    <Media Id="1" Cabinet="ucli.cab" EmbedCab="yes"/>
+
+    <!-- Per-user install (Windows Installer 4.5+): no admin prompt. -->
+    <Property Id="ALLUSERS" Value="2"/>
+    <Property Id="MSIINSTALLPERUSER" Value="1"/>
+
+    <!-- In-place major upgrade across versions (UpgradeCode is fixed above). -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ucli is already installed."/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="PROGRAMS" Name="Programs">
+          <Directory Id="INSTALLDIR" Name="ucli">
+            <Component Id="Main" Guid="b6a1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d">
+              <File Id="ucli_exe"        Source="ucli.exe"      KeyPath="yes"/>
+              <File Id="umans_core_exe"  Source="umans-core.exe"/>
+              <Environment Id="PATHENV" Name="PATH"
+                           Value="[INSTALLDIR]" Action="set" Part="last" System="no"/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="ProductFeature" Level="1" Title="ucli"
+             Description="ucli (TUI) and umans-core (agent engine)">
+      <ComponentRef Id="Main"/>
+    </Feature>
+  </Product>
+</Wix>

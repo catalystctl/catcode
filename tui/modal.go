@@ -30,6 +30,7 @@ const (
 	modalSessions
 	modalPlugins
 	modalReasoning
+	modalVision
 )
 
 type modal struct {
@@ -117,6 +118,117 @@ func (s *session) openPluginPicker(rawPlugins []json.RawMessage) {
 
 var sPluginStore []json.RawMessage
 
+// openVisionPicker opens the vision-models modal. The list comes from the
+// discovered models (s.models); per-row vision state merges each model's
+// endpoint Vision flag with the /vision-curated set (s.visionModels), and the
+// preferred handoff target is s.visionModel (★).
+func (s *session) openVisionPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalVision
+	s.modal.cursor = 0
+}
+
+func (s *session) visionItems() []listItem {
+	items := make([]listItem, len(s.models))
+	for i, m := range s.models {
+		on := m.Vision || s.visionModels[m.ID]
+		check := " "
+		if on {
+			check = "x"
+		}
+		star := "  "
+		if s.visionModel == m.ID {
+			star = "★ "
+		}
+		label := fmt.Sprintf("[%s] %s%s", check, star, m.ID)
+		desc := ""
+		if m.Vision {
+			desc = "endpoint vision"
+		}
+		items[i] = listItem{label: label, desc: desc}
+	}
+	return items
+}
+
+// saveVisionConfig persists the current vision config (curated set + preferred
+// target) to the core, which writes .umans-harness/vision.json and echoes a
+// vision_config event that re-syncs the TUI state. Empty vision_model => the
+// core treats it as None (pick dynamically).
+func (s *session) saveVisionConfig() {
+	vm := make([]string, 0, len(s.visionModels))
+	for id, on := range s.visionModels {
+		if on {
+			vm = append(vm, id)
+		}
+	}
+	s.sendCore(map[string]any{
+		"type":          "set_vision_config",
+		"vision_models": vm,
+		"vision_model":  s.visionModel,
+	})
+}
+
+// handleVisionKey drives the vision picker: space toggles vision-capable for
+// the highlighted model, enter sets/clears the preferred handoff target (★).
+// Both live-persist via saveVisionConfig; the modal stays open. Filter typing
+// works like the other list modals.
+func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	items := s.visionItems()
+	idx := filterList(items, s.modal.filter)
+	n := len(idx)
+	switch msg.String() {
+	case "up", "k":
+		if n > 0 {
+			s.modal.cursor = (s.modal.cursor - 1 + n) % n
+		}
+	case "down", "j":
+		if n > 0 {
+			s.modal.cursor = (s.modal.cursor + 1) % n
+		}
+	case " ":
+		if n > 0 && s.modal.cursor < n {
+			abs := idx[s.modal.cursor]
+			if abs < len(s.models) {
+				id := s.models[abs].ID
+				s.visionModels[id] = !s.visionModels[id]
+				if !s.visionModels[id] && s.visionModel == id {
+					s.visionModel = "" // can't be the target if not vision-capable
+				}
+				s.saveVisionConfig()
+			}
+		}
+	case "enter":
+		if n > 0 && s.modal.cursor < n {
+			abs := idx[s.modal.cursor]
+			if abs < len(s.models) {
+				id := s.models[abs].ID
+				if s.visionModel == id {
+					s.visionModel = "" // toggle off → dynamic pick
+				} else {
+					s.visionModels[id] = true // a target must be vision-capable
+					s.visionModel = id
+				}
+				s.saveVisionConfig()
+			}
+		}
+	case "backspace":
+		if len(s.modal.filter) > 0 {
+			r := []rune(s.modal.filter)
+			s.modal.filter = string(r[:len(r)-1])
+			s.modal.cursor = 0
+		}
+	case "ctrl+w":
+		s.modal.filter = ""
+		s.modal.cursor = 0
+	default:
+		if isPrintable(msg) {
+			s.modal.filter += msg.String()
+			s.modal.cursor = 0
+		}
+	}
+	return s, nil
+}
+
 // sessionItems builds the filtered-list entries for the session picker. The
 // label is the human-readable title (derived from the first user message);
 // the description shows the live message count and last-modified time, which
@@ -173,14 +285,14 @@ func (s *session) commandItems() []listItem {
 		{label: "/stats", desc: "token + turn totals"},
 		{label: "/abort", desc: "stop running turn (or Esc)"},
 		{label: "/steer", desc: "steer an in-flight turn (or Ctrl+Enter)"},
+		{label: "/settings", desc: "open settings modal"},
 		{label: "/theme", desc: "switch colour theme"},
 		{label: "/help", desc: "keybindings & commands"},
 		{label: "/copy", desc: "copy last assistant reply"},
 		{label: "/attach", desc: "attach an image (vision)"},
+		{label: "/vision", desc: "configure vision models & handoff target"},
 		{label: "/plugin-install", desc: "install a plugin from directory"},
-		{label: "/plugin-list", desc: "list installed plugins"},
-		{label: "/plugin-enable", desc: "enable a disabled plugin"},
-		{label: "/plugin-disable", desc: "disable a plugin"},
+		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{label: "/plugin-remove", desc: "uninstall a plugin"},
 		{label: "/run", desc: "delegate to a subagent (single)"},
 		{label: "/parallel", desc: "run subagents in parallel"},
@@ -241,15 +353,52 @@ func (s *session) pluginItems() []listItem {
 		desc := get(m, "description")
 		enabled := get(m, "enabled")
 		label := name + " v" + version
+		action := "disable"
 		if enabled == "false" {
-			label = label + " (disabled)"
+			label += " (disabled)"
+			action = "enable"
+		} else {
+			label += " (enabled)"
 		}
-		items = append(items, listItem{label: label, desc: desc})
+		hint := "enter to " + action
+		if desc != "" {
+			hint = desc + " · " + hint
+		}
+		items = append(items, listItem{label: label, desc: hint})
 	}
 	if len(items) == 0 {
 		items = append(items, listItem{label: "(no plugins installed)", desc: "use /plugin-install <dir> to add one"})
 	}
 	return items
+}
+
+// togglePlugin flips the enabled state of the plugin at store index idx. It
+// sends the matching core command (enable_plugin / disable_plugin) and
+// optimistically updates the cached store so the picker re-renders the new
+// state immediately, without waiting for a fresh list_plugins round-trip.
+func (s *session) togglePlugin(idx int) {
+	if idx < 0 || idx >= len(sPluginStore) {
+		return
+	}
+	var m map[string]any
+	if json.Unmarshal(sPluginStore[idx], &m) != nil {
+		return
+	}
+	name, _ := m["name"].(string)
+	enabled, _ := m["enabled"].(bool)
+	if name == "" {
+		return
+	}
+	if enabled {
+		s.sendCore(map[string]any{"type": "disable_plugin", "name": name})
+		m["enabled"] = false
+	} else {
+		s.sendCore(map[string]any{"type": "enable_plugin", "name": name})
+		m["enabled"] = true
+	}
+	if raw, err := json.Marshal(m); err == nil {
+		sPluginStore[idx] = raw
+	}
 }
 
 // filterList returns the indices of items whose label or desc contains the
@@ -286,6 +435,8 @@ func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning:
 		return s.handleListKey(msg)
+	case modalVision:
+		return s.handleVisionKey(msg)
 	case modalSettings:
 		return s.handleSettingsKey(msg)
 	case modalHelp:
@@ -391,8 +542,9 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		s.closeModal()
 		return s, nil
 	case modalPlugins:
-		// Plugin picker is read-only; esc closes it.
-		s.closeModal()
+		// Enter toggles the selected plugin's enabled state; the modal
+		// stays open so several can be toggled in one visit.
+		s.togglePlugin(abs)
 		return s, nil
 	case modalReasoning:
 		levels := s.thinkingLevels()
@@ -488,6 +640,7 @@ func (s *session) settingsFields() []settingsField {
 		{label: "Bash Timeout", value: fmt.Sprintf("%ds", s.coreBashTimeout), hint: "enter to edit"},
 		{label: "Sandbox", value: s.settings.Sandbox, hint: "enter to cycle"},
 		{label: "No Network", value: boolStr(s.settings.NoNetwork), hint: "enter to toggle"},
+		{label: "Mouse Wheel", value: boolStr(s.settings.MouseWheel), hint: "enter to toggle"},
 		{label: "Idle Timeout", value: fmt.Sprintf("%ds", s.settings.IdleTimeout), hint: "enter to edit"},
 		{label: "Max Session Tok", value: fmt.Sprintf("%d", s.settings.MaxSessionTokens), hint: "enter to edit"},
 	}
@@ -551,6 +704,15 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 		s.settings.NoNetwork = !s.settings.NoNetwork
 		_ = s.settings.save()
 		s.logInfo(fmt.Sprintf("no-network: %s (restarts core)", boolStr(s.settings.NoNetwork)))
+	case "Mouse Wheel":
+		s.settings.MouseWheel = !s.settings.MouseWheel
+		_ = s.settings.save()
+		if s.settings.MouseWheel {
+			s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
+			return s, tea.EnableMouseCellMotion
+		}
+		s.logInfo("mouse wheel: off (click-drag to select/copy text)")
+		return s, tea.DisableMouse
 	case "Idle Timeout":
 		s.startEditField(idx)
 		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.settings.IdleTimeout))
@@ -777,6 +939,11 @@ func helpText() string {
 		"  (scrolling up pauses auto-follow; sending a",
 		"   message or reaching the bottom re-pins)",
 		"",
+		"Mouse & copy",
+		"  click-drag selects/copies text (mouse off by default)",
+		"  /settings → Mouse Wheel enables wheel scrolling",
+		"  (hold Shift to select/copy while the mouse is on)",
+		"",
 		"While a turn is running (in-flight)",
 		"  enter             queue a follow-up message",
 		"  ctrl+enter        steer (interrupt + redirect the model)",
@@ -805,6 +972,7 @@ func helpText() string {
 		"  /theme            switch colour theme",
 		"  /copy             copy last assistant reply",
 		"  /attach <path>   send an image (vision) with the current input",
+		"  /vision          configure vision models & handoff target",
 		"",
 		"Settings persist to ~/.config/umans-harness/settings.json",
 		"Config (core) persists to ~/.config/umans-harness/config.json",
@@ -849,6 +1017,8 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Plugins", s.pluginItems(), false)
 	case modalReasoning:
 		return s.renderListModal("Reasoning Effort", s.reasoningItems(), true)
+	case modalVision:
+		return s.renderListModal("Vision Models", s.visionItems(), true)
 	case modalSettings:
 		return s.renderSettingsModal()
 	case modalHelp:
@@ -931,7 +1101,14 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d more · ↑↓ scroll)", n-maxVisible)))
 	}
 	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  ↑↓ navigate · enter select · esc close"))
+	footer := "  ↑↓ navigate · enter select · esc close"
+	if s.modal.kind == modalPlugins {
+		footer = "  ↑↓ navigate · enter toggle enable/disable · esc close"
+	}
+	if s.modal.kind == modalVision {
+		footer = "  ↑↓ navigate · space toggle vision · enter set target · esc close"
+	}
+	lines = append(lines, dimStyle.Render(footer))
 	body := strings.Join(lines, "\n")
 	return modalBox(w, body)
 }

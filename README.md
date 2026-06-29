@@ -22,7 +22,7 @@ A production-grade, OpenAI-compatible coding-agent harness with **native Umans**
 - **SSE parser** — handles `data:` framing, `[DONE]`, keepalive comments, and the final `usage` chunk (`stream_options.include_usage`).
 
 **Tooling**
-- **Hash-anchored editing** — `read_file` returns `HASH│content` per line; `edit` targets those 4-char hashes (`replace`/`append`/`prepend`, atomic, multi-op). Stale-anchor errors trigger a re-read loop. No line-number drift.
+- **Search-and-replace editing** — `read_file` returns a file's plain content; `edit` takes `{search, replace}` pairs (exact, unique match; empty replace deletes; atomic, multi-op). To insert, anchor on a unique line and include it in the replacement. No hashes or line numbers to drift.
 - **grep + glob** — purpose-built search tools (regex content search, `**/*.ext` glob) so the model doesn't fumble with raw bash for exploration.
 - **bash** — async, timeout, kill, denylist, cwd-locked, 8KB output cap.
 
@@ -68,7 +68,6 @@ core/                 Rust core (stdio JSON-RPC server)
   src/config.rs       CLI + env + JSON config, approval modes
   src/workspace.rs    path confinement (absolute/.. /symlink rejection)
   src/tools.rs        read_file / edit / write_file / list_dir / grep / glob / bash
-  src/hashline.rs     4-char line hashes for anchored editing
   src/logging.rs      JSONL debug log + token estimation + turn timer
   src/session.rs      append-only JSONL session persistence
 tui/                  Go Bubble Tea TUI
@@ -104,6 +103,85 @@ In the TUI:
 - when `⚠ APPROVE?` shows: `y` approve once · `a` approve and stop asking · `n` deny
 - anything else          sent as a prompt to the current model
 
+## Windows install (`ucli`)
+
+Cross-compile both binaries for Windows and package them into a per-user MSI
+that installs `ucli` + `umans-core` to `%LOCALAPPDATA%\Programs\ucli` and adds
+that directory to the user PATH (so `ucli` works from any CWD, no admin needed):
+
+```bash
+./release-windows.sh        # -> dist/ucli-<ver>-windows.msi + .sha256
+```
+
+`release-windows.sh` cross-compiles with cargo (`x86_64-pc-windows-gnu`) and Go
+(`GOOS=windows`), then builds the MSI with msitools `wixl` from
+`packaging/windows/ucli.wxs` (the same `.wxs` also compiles with the WiX
+Toolset `candle`+`light` on a Windows build host).
+
+On Windows, install by double-clicking the `.msi`, or silently:
+
+```powershell
+msiexec /i ucli-<ver>-windows.msi            # interactive (no UAC prompt)
+msiexec /i ucli-<ver>-windows.msi /quiet     # silent
+```
+
+The MSI is per-user (no admin), writes a clean Add/Remove Programs entry,
+and supports in-place upgrades (fixed `UpgradeCode`). Open a new PowerShell
+window after install and run `ucli` from any directory. First run: `/key sk-...`
+then `/model`.
+
+No `wixl`/WiX available? `packaging/windows/install.ps1` is a no-build fallback:
+unzip the two `.exe` files beside it and run `.\install.ps1` to copy them into
+`%LOCALAPPDATA%\Programs\ucli` and update the user PATH.
+
+The TUI finds the core by searching, in order: `$UMANS_CORE`, `umans-core(.exe)`
+next to the TUI, then the dev paths `core/target/release/core(.exe)`. Set
+`UMANS_CORE=<path>` to point at a custom core build.
+
+Runtime caveats on Windows:
+- The agent's `bash` tool needs bash on PATH (Git Bash or WSL); chat and the
+  file tools (read/edit/write/grep/glob/list_dir) work without it.
+- Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; leave
+  `/sandbox` set to `none`.
+
+## macOS standalone executable
+
+Download a single self-contained executable that runs from any CWD — no install,
+no separate `umans-core`. The Rust core is embedded in the binary and extracted
+to `~/Library/Caches/umans-harness` on first run.
+
+Grab the matching arch from `dist/` (built by `./release-macos.sh`):
+
+- `umans-harness-<ver>-macos-arm64`  — Apple Silicon (M-series)
+- `umans-harness-<ver>-macos-x86_64` — Intel
+
+```bash
+chmod +x umans-harness-0.2.0-macos-arm64
+./umans-harness-0.2.0-macos-arm64      # launches in the current directory
+```
+
+Then `/key sk-...`, `/model`, and type a prompt. The workspace is the directory
+you launched from — rerun from another folder to work on a different project.
+
+Build it yourself on Linux (zig is the macOS linker; no Xcode/SDK needed):
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo install cargo-zigbuild          # and put zig 0.13+ on PATH
+./release-macos.sh                    # -> dist/umans-harness-<ver>-macos-{arm64,x86_64} + .sha256
+```
+
+`release-macos.sh` cross-compiles the core with `cargo zigbuild` (pure-Rust
+`rustls-tls`, so no macOS SDK) and the TUI with `GOOS=darwin`, embedding the
+core via `go:embed` (`-tags embed_core`) so each output is one file. The TUI
+resolves the core as: `$UMANS_CORE` → embedded extraction → the usual
+dev/installed search, so dev builds and the Windows MSI layout are unchanged.
+
+Runtime caveats on macOS:
+- Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; leave
+  `/sandbox` set to `none`.
+- The agent's `bash` tool needs `bash` on PATH (present by default on macOS).
+
 ## Protocol
 
 Core reads commands from stdin, writes events to stdout, one JSON object per line.
@@ -124,7 +202,7 @@ Events (stdout): `ready` · `authed` · `thinking` · `delta` · `tool_call_star
 ## Test
 
 ```bash
-cd core && cargo test --release    # 25 unit tests (edit, confinement, bash timeout, glob, grep, sanitize, backoff, session, hashline)
+cd core && cargo test --release    # unit tests (edit search/replace, confinement, bash timeout, glob, grep, sanitize, backoff, session)
 ./test_tui.exp                     # basic e2e against live Umans
 ./test_prod.exp                    # approval gate + confinement + metrics e2e
 ```

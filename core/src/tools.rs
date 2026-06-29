@@ -1,8 +1,7 @@
 // Built-in tools the agent can call. OpenAI function-calling schema.
 // All file ops are confined to the workspace root; bash runs with cwd=workspace
-// and a real timeout+kill. read_file uses hashline format for anchored editing.
+// and a real timeout+kill. read_file returns plain content; edit uses search/replace.
 use crate::config::Config;
-use crate::hashline::{line_hash, tag_line};
 use crate::workspace;
 use serde_json::{json, Value};
 
@@ -87,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Apply hash-anchored edits to a file. Read it first with read_file to get HASH anchors, then call edit with those hashes. On a stale-anchor error, re-read and retry with fresh hashes. ops: replace (start+end hashes, inclusive; single line = start==end; delete = lines:[]), append (insert after pos hash; omit pos for EOF), prepend (insert before pos hash; omit pos for BOF). All ops in one call apply atomically to one file snapshot.",
+                "description": "Apply search-and-replace edits to a file. Read it first with read_file to see the exact content, then call edit with search/replace pairs. Each 'search' string must match the file content EXACTLY (copy it verbatim, including whitespace) and must be unique in the file; 'replace' is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in 'replace'. All edits in one call apply atomically — if any 'search' is not found or is ambiguous (matches more than once) the file is left unchanged; re-read and correct the search text. Use write_file only for new files or full rewrites.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -97,13 +96,10 @@ pub fn definitions() -> Vec<Value> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "op": { "type": "string", "enum": ["replace", "append", "prepend"] },
-                                    "start": { "type": "string", "description": "hash anchor; required for replace" },
-                                    "end": { "type": "string", "description": "hash anchor; required for replace" },
-                                    "pos": { "type": "string", "description": "hash anchor; for append/prepend (omit for EOF/BOF)" },
-                                    "lines": { "type": "array", "items": { "type": "string" }, "description": "new content, one string per line" }
+                                    "search": { "type": "string", "description": "exact text to find in the file (must be unique; copy it verbatim from read_file output)" },
+                                    "replace": { "type": "string", "description": "replacement text (empty string = delete the search text)" }
                                 },
-                                "required": ["op", "lines"]
+                                "required": ["search", "replace"]
                             }
                         }
                     },
@@ -142,12 +138,13 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents for a pattern (regex) under the workspace. Returns matching lines as path:line:content, capped at 50 matches.",
+                "description": "Search file contents for a pattern (regex) under the workspace. Returns matching lines as path:line:content, capped at 50 matches. Pass `context` (int) to include N lines before+after each match (like grep -C): matched lines keep the ':' separator, context lines use '-' so you can tell them apart. Overlapping windows merge; distinct groups are separated by '...'. Use context to grab a snippet + its surroundings without reading the whole file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "Rust regex" },
-                        "path": { "type": "string", "description": "directory to search (relative); defaults to workspace root" }
+                        "path": { "type": "string", "description": "directory to search (relative); defaults to workspace root" },
+                        "context": { "type": "integer", "description": "lines of context to show before and after each match (like grep -C n). 0 = matched line only (default)." }
                     },
                     "required": ["pattern"]
                 }
@@ -205,7 +202,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk_read",
-                "description": "Read many files in one call. Returns each file as a headed block with hashlined content (same HASH│content format as read_file). Paths are relative to the workspace root. Per-file errors are reported inline rather than failing the whole call.",
+                "description": "Read many files in one call. Returns each file as a headed block with its plain content (same format as read_file). Paths are relative to the workspace root. Per-file errors are reported inline rather than failing the whole call.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -243,7 +240,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk_edit",
-                "description": "Apply hash-anchored edits to many files in one call. Each entry is {path, ops} where ops is the same edit op array as the edit tool (replace/append/prepend with HASH anchors). Read each file first with read_file/bulk_read to get fresh hashes. All ops on a file apply atomically to one snapshot; one stale anchor fails only that file's block.",
+                "description": "Apply search-and-replace edits to many files in one call. Each entry is {path, edits} where edits is the same search/replace array as the edit tool (each {search, replace}). Read each file first with read_file/bulk_read to see exact content. All edits on a file apply atomically — a failed search (not found or not unique) fails only that file's block.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -253,22 +250,19 @@ pub fn definitions() -> Vec<Value> {
                                 "type": "object",
                                 "properties": {
                                     "path": { "type": "string" },
-                                    "ops": {
+                                    "edits": {
                                         "type": "array",
                                         "items": {
                                             "type": "object",
                                             "properties": {
-                                                "op": { "type": "string", "enum": ["replace","append","prepend"] },
-                                                "start": { "type": "string" },
-                                                "end": { "type": "string" },
-                                                "pos": { "type": "string" },
-                                                "lines": { "type": "array", "items": { "type": "string" } }
+                                                "search": { "type": "string", "description": "exact text to find (must be unique in the file)" },
+                                                "replace": { "type": "string", "description": "replacement text (empty = delete)" }
                                             },
-                                            "required": ["op","lines"]
+                                            "required": ["search","replace"]
                                         }
                                     }
                                 },
-                                "required": ["path","ops"]
+                                "required": ["path","edits"]
                             }
                         }
                     },
@@ -391,7 +385,10 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         }
         "write_file" => write_file(s("path"), s("content"), cfg),
         "list_dir" => list_dir(s("path"), cfg),
-        "grep" => grep(s("pattern"), s("path"), cfg),
+        "grep" => {
+            let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            grep(s("pattern"), s("path"), context, cfg)
+        }
         "glob" => glob(s("pattern"), cfg),
         "bulk_read" => bulk_read(args, cfg),
         "bulk_write" => bulk_write(args, cfg),
@@ -447,7 +444,7 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
         let mut out = String::new();
         out.push_str(&format!("# {input} lines {}-{} of {}\n", start + 1, end, lines.len()));
         for l in window {
-            out.push_str(&tag_line(l));
+            out.push_str(l);
             out.push('\n');
         }
         return Outcome::ok(out);
@@ -458,7 +455,8 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
             lines.len(), cfg.max_read_lines
         ));
     }
-    Outcome::ok(read_hashlined(&content))
+    // Plain content: the model copies substrings verbatim for edit's search/replace.
+    Outcome::ok(content)
 }
 
 
@@ -505,7 +503,7 @@ fn list_dir(input: &str, cfg: &Config) -> Outcome {
     }
 }
 
-fn grep(pattern: &str, input: &str, cfg: &Config) -> Outcome {
+fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     let re = match regex::Regex::new(pattern) {
         Ok(r) => r,
         Err(e) => return Outcome::err(format!("grep bad pattern: {e}")),
@@ -518,9 +516,17 @@ fn grep(pattern: &str, input: &str, cfg: &Config) -> Outcome {
             Err(e) => return Outcome::err(e),
         }
     };
-    let mut hits: Vec<String> = Vec::new();
+    const MAX_MATCHES: usize = 50;
+    // Records of every match: (rel_path, line_index_0based, matched_line).
+    // Context windows are built in a second per-file pass so we don't hold
+    // every scanned file's full content in memory — only matched files are
+    // re-read, and only when context > 0.
+    let mut records: Vec<(String, usize, String)> = Vec::new();
+    let mut file_order: Vec<String> = Vec::new();
+    let mut per_file: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
     let mut dirs: Vec<std::path::PathBuf> = vec![root.clone()];
     let mut seen = 0u32;
+    let mut capped = false;
     while let Some(dir) = dirs.pop() {
         if seen > 5000 {
             break;
@@ -559,15 +565,91 @@ fn grep(pattern: &str, input: &str, cfg: &Config) -> Outcome {
             let rel = p.strip_prefix(&cfg.workspace).unwrap_or(&p).display().to_string();
             for (i, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    hits.push(format!("{rel}:{}:{}", i + 1, line));
-                    if hits.len() >= 50 {
-                        return Outcome::ok(hits.join("\n") + "\n...[50 match cap reached]");
+                    records.push((rel.clone(), i, line.to_string()));
+                    let entry = per_file.entry(rel.clone()).or_default();
+                    if entry.is_empty() {
+                        file_order.push(rel.clone());
+                    }
+                    entry.push(i);
+                    if records.len() >= MAX_MATCHES {
+                        capped = true;
+                        break;
                     }
                 }
             }
+            if capped {
+                break;
+            }
+        }
+        if capped {
+            break;
         }
     }
-    Outcome::ok(hits.join("\n"))
+
+    if context == 0 {
+        // Original behaviour: one line per match.
+        let mut out: Vec<String> = Vec::with_capacity(records.len());
+        for (rel, i, line) in &records {
+            out.push(format!("{rel}:{}:{}", i + 1, line));
+        }
+        let mut s = out.join("\n");
+        if capped {
+            s.push_str("\n...[50 match cap reached]");
+        }
+        return Outcome::ok(s);
+    }
+
+    // Context mode (like grep -C n): re-read only the files that had matches and
+    // emit merged [i-context, i+context] windows. Matched lines use ':' as the
+    // separator; context lines use '-' (GNU grep convention) so the model can
+    // distinguish them. Overlapping/adjacent windows merge; distinct windows are
+    // separated by '...'. Total output is capped so a huge file can't flood context.
+    const MAX_CTX_LINES: usize = 400;
+    let mut out: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for rel in &file_order {
+        let path = cfg.workspace.join(rel);
+        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = content.lines().collect();
+        let idxs = per_file.get(rel).cloned().unwrap_or_default();
+        // Merge overlapping/adjacent [start, end] windows (0-based, inclusive).
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for &i in &idxs {
+            let start = i.saturating_sub(context);
+            let end = (i + context).min(lines.len().saturating_sub(1));
+            match windows.last_mut() {
+                Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+                _ => windows.push((start, end)),
+            }
+        }
+        for (wi, (ws, we)) in windows.iter().enumerate() {
+            if wi > 0 {
+                out.push("...".to_string());
+            }
+            for ln in *ws..=*we {
+                if total >= MAX_CTX_LINES {
+                    capped = true;
+                    break;
+                }
+                // idxs is naturally ascending (line scan order) so binary_search works.
+                let matched = idxs.binary_search(&ln).is_ok();
+                let sep = if matched { ':' } else { '-' };
+                out.push(format!("{rel}{sep}{}{sep}{}", ln + 1, lines[ln]));
+                total += 1;
+            }
+            if capped {
+                break;
+            }
+        }
+        if capped {
+            break;
+        }
+    }
+    let mut s = out.join("\n");
+    if capped {
+        s.push_str("\n...[output cap reached]");
+    }
+    Outcome::ok(s)
 }
 
 fn glob(pattern: &str, cfg: &Config) -> Outcome {
@@ -838,21 +920,7 @@ fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
 }
 
 
-// ---- hashline edit (unchanged logic, now confined) ----
-
-fn read_hashlined(content: &str) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-    let trailing_nl = content.ends_with('\n');
-    let body = if trailing_nl { &content[..content.len() - 1] } else { content };
-    let mut out = String::with_capacity(content.len() + body.lines().count() * 6);
-    for line in body.split('\n') {
-        out.push_str(&tag_line(line));
-        out.push('\n');
-    }
-    out
-}
+// ---- search/replace edit ----
 
 fn split_lines(content: &str) -> (Vec<String>, bool) {
     let trailing_nl = content.ends_with('\n');
@@ -866,19 +934,10 @@ fn split_lines(content: &str) -> (Vec<String>, bool) {
     (v, trailing_nl)
 }
 
-fn find_hash(lines: &[String], hash: &str, from: usize) -> Option<usize> {
-    lines
-        .iter()
-        .enumerate()
-        .skip(from)
-        .find(|(_, l)| line_hash(l) == hash)
-        .map(|(i, _)| i)
-}
-
-fn stale_msg(hash: &str, path: &str) -> String {
-    format!("stale anchor '{hash}' not found in {path:?}; re-read the file and use fresh hashes")
-}
-
+/// Apply a list of search/replace edits to a file atomically. Each `search`
+/// string must match the current file content exactly and uniquely; edits apply
+/// in order to the evolving content. If any search is not found or is
+/// ambiguous, the file is left untouched and an error is returned.
 fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
     let path = match workspace::resolve(&cfg.workspace, input) {
         Ok(p) => p,
@@ -888,74 +947,35 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
         Ok(c) => c,
         Err(e) => return Outcome::err(format!("edit: read {input:?} failed: {e}")),
     };
-    let (mut lines, trailing_nl) = split_lines(&content);
+    let mut new_content = content;
     let mut log: Vec<String> = Vec::new();
     let mut applied = 0usize;
 
     for (i, ev) in edits.iter().enumerate() {
-        let op = ev.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let new_lines: Vec<String> = ev
-            .get("lines")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let anchor = |key: &str| ev.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
-
-        match op {
-            "replace" => {
-                let (Some(start), Some(end)) = (anchor("start"), anchor("end")) else {
-                    return Outcome::err(format!("edit #{i}: replace needs both start and end hashes"));
-                };
-                let si = match find_hash(&lines, &start, 0) {
-                    Some(x) => x,
-                    None => return Outcome::err(stale_msg(&start, input)),
-                };
-                let ei = match find_hash(&lines, &end, si) {
-                    Some(x) => x,
-                    None => return Outcome::err(stale_msg(&end, input)),
-                };
-                let removed = ei - si + 1;
-                lines.splice(si..=ei, new_lines.clone());
-                log.push(format!("replaced {removed} line(s) [{start}..{end}] with {}", new_lines.len()));
-                applied += 1;
-            }
-            "append" => {
-                let at = match anchor("pos") {
-                    Some(p) => match find_hash(&lines, &p, 0) {
-                        Some(x) => x + 1,
-                        None => return Outcome::err(stale_msg(&p, input)),
-                    },
-                    None => lines.len(),
-                };
-                for (k, l) in new_lines.iter().enumerate() {
-                    lines.insert(at + k, l.clone());
-                }
-                log.push(format!("appended {} line(s) at {at}", new_lines.len()));
-                applied += 1;
-            }
-            "prepend" => {
-                let at = match anchor("pos") {
-                    Some(p) => match find_hash(&lines, &p, 0) {
-                        Some(x) => x,
-                        None => return Outcome::err(stale_msg(&p, input)),
-                    },
-                    None => 0,
-                };
-                for (k, l) in new_lines.iter().enumerate() {
-                    lines.insert(at + k, l.clone());
-                }
-                log.push(format!("prepended {} line(s) at {at}", new_lines.len()));
-                applied += 1;
-            }
-            other => return Outcome::err(format!("edit #{i}: unknown op '{other}'")),
+        let search = ev.get("search").and_then(|v| v.as_str()).unwrap_or("");
+        let replace = ev.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+        if search.is_empty() {
+            return Outcome::err(format!("edit #{i}: 'search' must not be empty (use write_file for new files)"));
         }
+        let count = new_content.matches(search).count();
+        if count == 0 {
+            return Outcome::err(format!(
+                "edit #{i}: search text not found in {input:?}; re-read the file and copy the exact text (watch whitespace). Search was:\n{}",
+                search
+            ));
+        }
+        if count > 1 {
+            return Outcome::err(format!(
+                "edit #{i}: search text matches {count} places in {input:?}; include more surrounding lines so the match is unique. Search was:\n{}",
+                search
+            ));
+        }
+        new_content = new_content.replacen(search, replace, 1);
+        log.push(format!("replaced {} byte(s) with {} byte(s)", search.len(), replace.len()));
+        applied += 1;
     }
 
-    let mut out = lines.join("\n");
-    if trailing_nl && !lines.is_empty() {
-        out.push('\n');
-    }
-    if let Err(e) = std::fs::write(&path, out) {
+    if let Err(e) = std::fs::write(&path, &new_content) {
         return Outcome::err(format!("edit: write {input:?} failed: {e}"));
     }
     Outcome::ok(format!("applied {applied} edit(s): {}", log.join("; ")))
@@ -1014,8 +1034,8 @@ fn bulk_write(args: &Value, cfg: &Config) -> Outcome {
     Outcome { ok, output: lines.join("\n") }
 }
 
-/// Apply edits to many files. Each file edits apply atomically to one snapshot;
-/// a stale anchor fails only that file's block.
+/// Apply edits to many files. Each file's edits apply atomically to one snapshot;
+/// a failed search (not found / not unique) fails only that file's block.
 fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
     let Some(edits) = args.get("edits").and_then(|v| v.as_array()) else {
         return Outcome::err("bulk_edit requires an 'edits' array");
@@ -1032,21 +1052,20 @@ fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
             blocks.push(format!("### [{i}] <missing path>\nerror: missing 'path'"));
             continue;
         }
-        let Some(ops) = e.get("ops").and_then(|v| v.as_array()) else {
+        let Some(file_edits) = e.get("edits").and_then(|v| v.as_array()) else {
             ok = false;
-            blocks.push(format!("### [{i}] {path}\nerror: missing 'ops' array"));
+            blocks.push(format!("### [{i}] {path}\nerror: missing 'edits' array"));
             continue;
         };
-        if ops.is_empty() {
+        if file_edits.is_empty() {
             ok = false;
-            blocks.push(format!("### [{i}] {path}\nerror: empty 'ops' array"));
+            blocks.push(format!("### [{i}] {path}\nerror: empty 'edits' array"));
             continue;
         }
         // Wrap as an edit tool call and reuse execute_edit.
-        let wrapped = json!({ "path": path, "edits": ops });
-        // ponytail: execute() takes a tool NAME, not a path — bulk_edit used to
-        // pass the path string here, falling through to "unknown tool: <path>".
+        let wrapped = json!({ "path": path, "edits": file_edits });
         let r = execute("edit", &wrapped, cfg);
+        if !r.ok { ok = false; }
         blocks.push(format!("### [{i}] {path}\n{}", r.output));
     }
     Outcome { ok, output: blocks.join("\n\n") }
@@ -1293,38 +1312,36 @@ mod tests {
         (dir, cfg)
     }
 
-    fn hashes(content: &str) -> Vec<String> {
-        let (lines, _) = split_lines(content);
-        lines.iter().map(|l| line_hash(l)).collect()
-    }
-
     #[test]
-    fn read_hashlined_tags_each_line() {
-        let out = read_hashlined("a\nb\n");
-        assert!(out.starts_with(&format!("{}│a\n", line_hash("a"))));
-        assert!(out.contains(&format!("{}│b\n", line_hash("b"))));
+    fn read_file_returns_plain_content() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "alpha\nbeta\n").unwrap();
+        let o = execute("read_file", &json!({"path":"f.txt"}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        // Plain content: no hash/line-number prefix, exact bytes the model can copy.
+        assert_eq!(o.output, "alpha\nbeta\n", "{}", o.output);
+        assert!(!o.output.contains('│'), "should not contain a hash/line-number gutter");
     }
 
     #[test]
     fn edit_replace_single_line() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "one\ntwo\nthree\n").unwrap();
-        let h = hashes("one\ntwo\nthree\n");
-        let args = json!({ "path": "f.txt", "edits": [{ "op": "replace", "start": h[1], "end": h[1], "lines": ["TWO"] }] });
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "two", "replace": "TWO" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
         assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\nTWO\nthree\n");
     }
 
     #[test]
-    fn edit_replace_range_then_append_and_prepend() {
+    fn edit_replace_multiline_insert_and_prepend() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "a\nb\nc\nd\n").unwrap();
-        let h = hashes("a\nb\nc\nd\n");
+        // replace a 2-line block, then append after 'd', then prepend before 'a'
         let edits = vec![
-            json!({ "op": "replace", "start": h[1], "end": h[2], "lines": ["X", "Y"] }),
-            json!({ "op": "append", "pos": h[3], "lines": ["Z"] }),
-            json!({ "op": "prepend", "pos": h[0], "lines": ["P"] }),
+            json!({ "search": "b\nc", "replace": "X\nY" }),
+            json!({ "search": "d", "replace": "d\nZ" }),
+            json!({ "search": "a", "replace": "P\na" }),
         ];
         let args = json!({ "path": "f.txt", "edits": edits });
         let o = execute("edit", &args, &cfg);
@@ -1333,47 +1350,66 @@ mod tests {
     }
 
     #[test]
-    fn edit_append_eof_and_prepend_bof_without_pos() {
-        let (_root, cfg) = tmp_ws();
-        fs::write(cfg.workspace.join("f.txt"), "mid\n").unwrap();
-        let edits = json!([
-            { "op": "prepend", "lines": ["TOP"] },
-            { "op": "append", "lines": ["BOT"] }
-        ]);
-        let args = json!({ "path": "f.txt", "edits": edits });
-        let o = execute("edit", &args, &cfg);
-        assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "TOP\nmid\nBOT\n");
-    }
-
-    #[test]
-    fn edit_delete_via_empty_lines() {
+    fn edit_delete_via_empty_replace() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "keep\nkill\nkeep2\n").unwrap();
-        let h = hashes("keep\nkill\nkeep2\n");
-        let args = json!({ "path": "f.txt", "edits": [{ "op": "replace", "start": h[1], "end": h[1], "lines": [] }] });
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "kill\n", "replace": "" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
         assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "keep\nkeep2\n");
     }
 
     #[test]
-    fn edit_stale_anchor_rejected() {
+    fn edit_not_found_rejected() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "one\ntwo\n").unwrap();
-        let args = json!({ "path": "f.txt", "edits": [{ "op": "replace", "start": "ZZZZ", "end": "ZZZZ", "lines": ["x"] }] });
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "nope", "replace": "x" }] });
         let o = execute("edit", &args, &cfg);
         assert!(!o.ok);
-        assert!(o.output.contains("stale anchor"), "{}", o.output);
+        assert!(o.output.contains("not found"), "{}", o.output);
+        // file unchanged
         assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn edit_ambiguous_rejected() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "dup\nx\ndup\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "dup", "replace": "DUP" }] });
+        let o = execute("edit", &args, &cfg);
+        assert!(!o.ok);
+        assert!(o.output.contains("2 places"), "{}", o.output);
+    }
+
+    #[test]
+    fn edit_atomic_on_failure() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "one\ntwo\n").unwrap();
+        // first edit would succeed, second fails -> nothing written
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "one", "replace": "ONE" },
+            { "search": "missing", "replace": "x" }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(!o.ok);
+        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn edit_empty_search_rejected() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "a\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "", "replace": "b" }] });
+        let o = execute("edit", &args, &cfg);
+        assert!(!o.ok);
+        assert!(o.output.contains("empty"), "{}", o.output);
     }
 
     #[test]
     fn edit_preserves_no_trailing_newline() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "a\nb").unwrap();
-        let h = hashes("a\nb");
-        let args = json!({ "path": "f.txt", "edits": [{ "op": "append", "pos": h[1], "lines": ["c"] }] });
+        let args = json!({ "path": "f.txt", "edits": [{ "search": "b", "replace": "b\nc" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
         assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "a\nb\nc");
@@ -1427,6 +1463,61 @@ mod tests {
         assert!(o.output.contains("b.txt:1:beta again"));
     }
 
+    #[test]
+    fn grep_context_surrounds_matches() {
+        let (root, cfg) = tmp_ws();
+        // Two matches 5 lines apart in one file; context=1 windows must not overlap
+        // so a '...' separator appears between them.
+        fs::write(root.join("a.txt"), "l1\nl2\nMARK\nl4\nl5\nl6\nl7\nMARK\nl9\n").unwrap();
+        let o = execute("grep", &json!({"pattern":"MARK", "context": 1}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        // match line uses ':' before the line number
+        assert!(o.output.contains("a.txt:3:MARK"), "match marker: {}", o.output);
+        assert!(o.output.contains("a.txt:9:MARK"), "match marker: {}", o.output);
+        // context lines use '-' as the separator (GNU grep -C convention)
+        assert!(o.output.contains("a.txt-2-l2"), "context marker: {}", o.output);
+        assert!(o.output.contains("a.txt-4-l4"), "context marker: {}", o.output);
+        // windows 5 apart (line 3 ±1 and line 9 ±1) do not overlap → '...' between
+        assert!(o.output.contains("..."), "group separator: {}", o.output);
+    }
+
+    #[test]
+    fn grep_context_merges_overlapping_windows() {
+        let (root, cfg) = tmp_ws();
+        // Two adjacent matches at lines 3 and 4 with context=2 → one merged window, no '...'
+        fs::write(root.join("a.txt"), "l1\nl2\nMARK\nMARK\nl5\nl6\n").unwrap();
+        let o = execute("grep", &json!({"pattern":"MARK", "context": 2}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.txt:3:MARK"));
+        assert!(o.output.contains("a.txt:4:MARK"));
+        assert!(!o.output.contains("..."), "merged window should have no separator: {}", o.output);
+    }
+
+    #[test]
+    fn grep_context_clamps_at_file_edges() {
+        let (root, cfg) = tmp_ws();
+        // Match on line 1 with context=5 must clamp to the file start (no line 0).
+        fs::write(root.join("a.txt"), "MARK\nl2\nl3\n").unwrap();
+        let o = execute("grep", &json!({"pattern":"MARK", "context": 5}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.txt:1:MARK"));
+        assert!(o.output.contains("a.txt-2-l2"));
+        assert!(o.output.contains("a.txt-3-l3"));
+        // no negative/zero line numbers leaked
+        assert!(!o.output.contains("a.txt-0-"));
+        assert!(!o.output.contains("a.txt:0:"));
+    }
+
+    #[test]
+    fn grep_context_zero_matches_legacy_format() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        // context omitted (default 0) → original one-line-per-match format, no '-'/'...'
+        let o = execute("grep", &json!({"pattern":"beta"}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(o.output, "a.txt:2:beta");
+    }
+
     #[tokio::test]
     async fn bash_timeout_kills() {
         let (_root, cfg) = tmp_ws();
@@ -1469,18 +1560,16 @@ mod tests {
         assert!(w.ok, "{}", w.output);
         assert_eq!(fs::read_to_string(cfg.workspace.join("sub/b.txt")).unwrap(), "one\ntwo\n");
 
-        // bulk_read them back; middle file via hashlined content
+        // bulk_read them back; middle file via plain content
         let r = bulk_read(&json!({ "paths": ["a.txt","sub/b.txt","nope.txt"] }), &cfg);
         assert!(!r.ok, "per-file error should mark batch not-ok");
         assert!(r.output.contains("alpha"), "{}", r.output);
         assert!(r.output.contains("### [2] nope.txt"), "{}", r.output);
 
-        // bulk_edit: replace line 1 of a.txt, append to c.txt
-        let ha = hashes("alpha\nbeta\n");
-        let hc = hashes("x\ny\nz\n");
+        // bulk_edit: replace 'alpha' in a.txt, append 'END' after 'z' in c.txt
         let e = bulk_edit(&json!({ "edits": [
-            { "path": "a.txt", "ops": [{ "op": "replace", "start": ha[0], "end": ha[0], "lines": ["ALPHA"] }] },
-            { "path": "c.txt", "ops": [{ "op": "append", "pos": hc[2], "lines": ["END"] }] }
+            { "path": "a.txt", "edits": [{ "search": "alpha", "replace": "ALPHA" }] },
+            { "path": "c.txt", "edits": [{ "search": "z", "replace": "z\nEND" }] }
         ] }), &cfg);
         assert!(e.ok, "{}", e.output);
         assert_eq!(fs::read_to_string(cfg.workspace.join("a.txt")).unwrap(), "ALPHA\nbeta\n");

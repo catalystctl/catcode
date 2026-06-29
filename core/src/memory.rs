@@ -49,8 +49,8 @@ struct Store {
 
 impl Store {
     fn default_root() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".config/umans-harness/memory")
+        let home = crate::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".config/umans-harness/memory")
     }
 
     fn new(root: PathBuf) -> Self {

@@ -15,6 +15,11 @@ pub struct ModelInfo {
     /// model declares no specific levels and any effort string is passed through.
     #[serde(default)]
     pub thinking_levels: Vec<String>,
+    /// Whether the model accepts image (vision) inputs. Populated from
+    /// /models/info `capabilities.vision` when the endpoint advertises it;
+    /// false otherwise. Drives the vision-handoff (pre_turn plugin) routing.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// Commands read from stdin.
@@ -111,6 +116,21 @@ pub enum Command {
     IntercomReply {
         request_id: String,
         reply: String,
+    },
+    /// Get the current vision-handoff configuration (curated vision-capable
+    /// models + preferred target). Emits a `vision_config` event.
+    #[serde(rename = "get_vision_config")]
+    GetVisionConfig,
+    /// Set the vision-handoff configuration and persist it to
+    /// .umans-harness/vision.json. `vision_model` is the preferred handoff
+    /// target; an empty string / null means "pick dynamically". Emits a
+    /// `vision_config` event with the new state.
+    #[serde(rename = "set_vision_config")]
+    SetVisionConfig {
+        #[serde(default)]
+        vision_models: Vec<String>,
+        #[serde(default)]
+        vision_model: Option<String>,
     },
 }
 
