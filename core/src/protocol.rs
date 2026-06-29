@@ -1,0 +1,136 @@
+// Wire protocol: newline-delimited JSON over stdio.
+// TUI -> Core commands (stdin), Core -> TUI events (stdout).
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub reasoning: bool,
+    pub context_window: u32,
+    pub max_tokens: u32,
+    /// Reasoning/thinking levels the model advertises (e.g. ["low","medium","high"]).
+    /// Populated from /models/info when the endpoint provides them; empty means the
+    /// model declares no specific levels and any effort string is passed through.
+    #[serde(default)]
+    pub thinking_levels: Vec<String>,
+}
+
+/// Commands read from stdin.
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum Command {
+    #[serde(rename = "init")]
+    Init,
+    #[serde(rename = "set_key")]
+    SetKey { api_key: String },
+    #[serde(rename = "send")]
+    Send {
+        prompt: String,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+        /// Optional images: each is a data URL (data:image/png;base64,...) or an
+        /// absolute file path to attach. Built into a multimodal user message.
+        #[serde(default)]
+        images: Option<Vec<String>>,
+    },
+    /// Steer an in-flight turn: interrupt the running turn and redirect it with
+    /// `prompt`. If no turn is running, behaves like `send`. Carries model +
+    /// reasoning_effort so the steered turn uses the same leader as the run it
+    /// interrupted (the TUI always sends a model from its discovered list).
+    #[serde(rename = "steer")]
+    Steer {
+        prompt: String,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+    },
+    #[serde(rename = "abort")]
+    Abort,
+    #[serde(rename = "reset")]
+    Reset,
+    /// Clear the in-memory conversation but keep the session file (vs Reset which wipes both).
+    #[serde(rename = "clear")]
+    Clear,
+    /// Drop the last turn (user prompt + its assistant reply + tool calls/results).
+    #[serde(rename = "undo")]
+    Undo,
+    /// Force a context compaction now (regardless of the 70% threshold).
+    #[serde(rename = "compact")]
+    Compact,
+    /// List available session files (returns a `sessions` event).
+    #[serde(rename = "list_sessions")]
+    ListSessions,
+    /// Load a specific session file (replaces the current conversation).
+    #[serde(rename = "load_session")]
+    LoadSession { path: String },
+    /// Start a fresh session file in the same project directory. The current
+    /// file is left intact so sessions accumulate per project. An optional
+    /// `path` (a filename) overrides the auto-generated name.
+    #[serde(rename = "new_session")]
+    NewSession { #[serde(default)] path: Option<String> },
+    /// Request a stats summary (returns a `stats` event).
+    #[serde(rename = "stats")]
+    Stats,
+    /// Approve a pending tool call. decision: "yes" | "no" | "always".
+    /// "always" upgrades the session approval mode so subsequent same-tool calls skip the gate.
+    #[serde(rename = "approve")]
+    Approve {
+        request_id: String,
+        decision: String,
+    },
+    /// Change the approval mode at runtime: "never" | "destructive" | "always".
+    #[serde(rename = "set_approval")]
+    SetApproval { mode: String },
+    /// Change a runtime config knob at runtime. Recognized keys:
+    ///   bash_timeout_secs (u64), max_turns (u64).
+    /// Values are coerced from the JSON type (string or number).
+    #[serde(rename = "set_config")]
+    SetConfig { key: String, value: Value },
+    /// Plugin lifecycle commands.
+    #[serde(rename = "install_plugin")]
+    InstallPlugin { path: String },
+    #[serde(rename = "remove_plugin")]
+    RemovePlugin { name: String },
+    #[serde(rename = "enable_plugin")]
+    EnablePlugin { name: String },
+    #[serde(rename = "disable_plugin")]
+    DisablePlugin { name: String },
+    #[serde(rename = "list_plugins")]
+    ListPlugins,
+    /// Ask core to re-inject memories into the system prompt (called after saving a memory).
+    #[serde(rename = "refresh_memory")]
+    RefreshMemory,
+}
+
+/// Events written to stdout. Constructed with serde_json::json! and emitted via `emit`.
+#[derive(Serialize, Debug)]
+pub struct Event {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    #[serde(flatten)]
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Event {
+    pub fn new(kind: &'static str) -> Self {
+        Self { kind, data: serde_json::Map::new() }
+    }
+    pub fn with(mut self, k: &str, v: serde_json::Value) -> Self {
+        self.data.insert(k.to_string(), v);
+        self
+    }
+}
+
+/// Emit one event as a single line of JSON to stdout. Thread-safe via stdout lock.
+pub fn emit(ev: &Event) {
+    let mut line = serde_json::to_string(ev).unwrap_or_else(|_| "{}".into());
+    line.push('\n');
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut h = stdout.lock();
+    let _ = h.write_all(line.as_bytes());
+    let _ = h.flush();
+}

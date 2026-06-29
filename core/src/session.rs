@@ -1,0 +1,298 @@
+// Session persistence: append-only JSONL of conversation messages, prefixed
+// by a schema-version header line so future shape changes can migrate old
+// files instead of silently misreading them. On init, if the session file
+// exists it's loaded and replayed; each finalized message is appended (and
+// fsync'd) so a crash mid-task loses at most the in-flight turn.
+use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+
+/// Bump when the on-disk message shape changes. load() validates the header.
+pub const SESSION_VERSION: u32 = 1;
+
+fn header_line() -> String {
+    format!("{{\"_session_version\": {}}}", SESSION_VERSION)
+}
+
+fn ensure_header(path: &Path) {
+    // Create the file with a header if it doesn't exist yet.
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(path) {
+        let _ = writeln!(f, "{}", header_line());
+        let _ = f.flush();
+        let _ = f.sync_all();
+    }
+}
+
+/// Create the session file with just its version header if it doesn't already
+/// exist. Used so a new/active session shows up in `list_sessions`
+/// immediately, even before the first message is appended.
+pub fn ensure(path: &Path) {
+    ensure_header(path);
+}
+
+/// Append one message to the session file (creating it with a header if needed).
+/// fsync'd so a crash never truncates a finalized message mid-write.
+pub fn append(path: &Path, msg: &Value) {
+    ensure_header(path);
+    let Ok(mut f) = OpenOptions::new().append(true).open(path) else {
+        return;
+    };
+    let mut line = serde_json::to_string(msg).unwrap_or_default();
+    line.push('\n');
+    let _ = f.write_all(line.as_bytes());
+    let _ = f.flush();
+    let _ = f.sync_all(); // crash durability for finalized turns
+}
+
+/// Load all messages from a session file. Skips the version header and any
+/// unparseable lines. Returns an empty vec if the file is missing or the
+/// header version is newer than SESSION_VERSION (refuses to misread).
+pub fn load(path: &Path) -> Vec<Value> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    // First non-empty line must be the version header. If it's absent or a
+    // future version, bail rather than guess.
+    let first = lines.next().unwrap_or("");
+    if let Ok(v) = serde_json::from_str::<Value>(first) {
+        if let Some(ver) = v.get("_session_version").and_then(|x| x.as_u64()) {
+            if ver as u32 > SESSION_VERSION {
+                return Vec::new();
+            }
+            // header consumed; load the rest
+        } else {
+            // no header on an old file — treat the first line as a real message
+            let mut out = Vec::new();
+            if let Ok(m) = serde_json::from_str::<Value>(first) {
+                out.push(m);
+            }
+            for l in lines {
+                if let Ok(m) = serde_json::from_str::<Value>(l) {
+                    out.push(m);
+                }
+            }
+            return out;
+        }
+    }
+    lines
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect()
+}
+
+/// Truncate/replace the whole session file with `messages` (used on reset /
+/// compaction), re-writing the version header first. fsync'd.
+pub fn rewrite(path: &Path, messages: &[Value]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut f) = OpenOptions::new().create(true).truncate(true).write(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(f, "{}", header_line());
+    for m in messages {
+        let mut line = serde_json::to_string(m).unwrap_or_default();
+        line.push('\n');
+        let _ = f.write_all(line.as_bytes());
+    }
+    let _ = f.flush();
+    let _ = f.sync_all();
+    let _ = f.sync_all();
+}
+
+/// A lightweight description of a session file used by the session picker.
+/// `title` is derived from the first user message so a session is identifiable
+/// by its topic instead of by an opaque hex-hash filename. Because it is read
+/// fresh from the append-only file each time `list_sessions` runs, it updates
+/// automatically as the conversation grows (empty → first prompt → fuller).
+pub struct SessionInfo {
+    pub title: Option<String>,
+    pub messages: usize,
+}
+
+/// Scan a session file once (streaming, bounded) and return its title + message
+/// count. The title is the first user message's text, truncated to 80 chars.
+/// Returns `title: None, messages: 0` for a missing or header-only file.
+pub fn describe(path: &Path) -> SessionInfo {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return SessionInfo { title: None, messages: 0 },
+    };
+    let reader = BufReader::new(file);
+    let mut title: Option<String> = None;
+    let mut messages = 0usize;
+    let mut header_consumed = false;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !header_consumed {
+            header_consumed = true;
+            // First non-empty line: if it's the version header, skip it (mirrors load()).
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if v.get("_session_version").is_some() {
+                    continue;
+                }
+            }
+            // Old file with no header — this line is a real message; fall through.
+        }
+        messages += 1;
+        // Sanity guard against a pathological file; stop counting beyond this.
+        if messages > 100_000 {
+            break;
+        }
+        if title.is_none() {
+            if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+                if let Some(t) = first_user_text(&msg) {
+                    let t: String = t.trim().chars().take(80).collect();
+                    title = Some(t);
+                }
+            }
+        }
+    }
+    SessionInfo { title, messages }
+}
+
+/// Extract the text of a user message: plain string content, or the joined
+/// text parts of a multimodal content array. Returns None for non-user or
+/// empty messages (so tool/assistant/system messages never become a title).
+fn first_user_text(msg: &Value) -> Option<String> {
+    if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    match msg.get("content") {
+        Some(Value::String(s)) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                if p.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str(t);
+                    }
+                }
+            }
+            if out.trim().is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn append_then_load_roundtrip() {
+        let dir = std::env::temp_dir().join("umans_harness_session_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &json!({"role":"system","content":"x"}));
+        append(&p, &json!({"role":"user","content":"hi"}));
+        let v = load(&p);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["role"], "system");
+        // rewrite
+        rewrite(&p, &[json!({"role":"system","content":"y"})]);
+        assert_eq!(load(&p).len(), 1);
+    }
+
+    #[test]
+    fn header_version_is_present_and_validated() {
+        let dir = std::env::temp_dir().join("umans_harness_session_hdr_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &json!({"role":"user","content":"hi"}));
+        // header line present and well-formed
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.starts_with("{\"_session_version\": 1}"));
+        // load() drops the header, returns only real messages
+        assert_eq!(load(&p).len(), 1);
+    }
+
+    #[test]
+    fn future_version_refused() {
+        let dir = std::env::temp_dir().join("umans_harness_session_future");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        std::fs::write(&p, "{\"_session_version\": 99}\n{\"role\":\"user\",\"content\":\"x\"}\n").unwrap();
+        // refuses to load a newer-version file
+        assert!(load(&p).is_empty());
+    }
+
+    #[test]
+    fn describe_extracts_first_user_title_and_count() {
+        let dir = std::env::temp_dir().join("umans_harness_session_describe_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &json!({"role":"system","content":"sys"}));
+        append(&p, &json!({"role":"user","content":"Add a login form to the app"}));
+        append(&p, &json!({"role":"assistant","content":"done"}));
+        append(&p, &json!({"role":"user","content":"now add tests"}));
+        let info = describe(&p);
+        assert_eq!(info.messages, 4);
+        // Title is the FIRST user message (the stable topic), not the latest.
+        assert_eq!(info.title.as_deref(), Some("Add a login form to the app"));
+    }
+
+    #[test]
+    fn describe_header_only_and_multimodal() {
+        let dir = std::env::temp_dir().join("umans_harness_session_describe_mm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        // header-only file: no messages, no title
+        let info = describe(&p);
+        assert_eq!(info.messages, 0);
+        assert!(info.title.is_none());
+        // a multimodal user message: title is the joined text parts
+        append(&p, &json!({"role":"user","content":[
+            {"type":"text","text":"describe this"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+        ]}));
+        let info = describe(&p);
+        assert_eq!(info.messages, 1);
+        assert_eq!(info.title.as_deref(), Some("describe this"));
+    }
+
+    #[test]
+    fn describe_truncates_long_titles() {
+        let dir = std::env::temp_dir().join("umans_harness_session_describe_long");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let long = "x".repeat(200);
+        append(&p, &json!({"role":"user","content":long}));
+        let info = describe(&p);
+        assert_eq!(info.title.as_deref().map(|s| s.len()), Some(80));
+    }
+}

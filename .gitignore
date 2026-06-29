@@ -1,0 +1,54 @@
+# =============================================================================
+# Build artifacts
+# =============================================================================
+
+# Rust (core/)
+core/target/
+**/*.rs.bk
+
+# Go (tui/) compiled binaries
+tui/tui
+tui/umans-harness-tui
+tui/bin/
+
+# Release / distribution output (built by release.sh)
+dist/
+
+# =============================================================================
+# Local tooling & editor state
+# =============================================================================
+
+# Umans harness local state (plugins, todo, sessions)
+.umans-harness/
+**/.umans-harness/
+
+# Other AI tooling local state
+.pi/
+.claude/
+.kilocode/
+.opencode/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# OS junk
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Logs & secrets
+# =============================================================================
+*.log
+*.log.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
