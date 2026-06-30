@@ -1,0 +1,40 @@
+{
+  "name": "@umans-harness/coding-agent",
+  "version": "0.2.0",
+  "description": "pi-coding-agent-compatible TypeScript SDK that wraps the umans-harness core binary. A drop-in adapter — no agent-loop reimplementation.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "coding-agent",
+    "ai",
+    "llm",
+    "sdk",
+    "umans",
+    "pi-compatible"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

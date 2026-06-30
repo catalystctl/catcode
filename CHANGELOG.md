@@ -35,6 +35,57 @@
   1.24 linker rejects. Corrected to `-X main.coreVersion` (dot), matching
   `release-macos.sh`.
 
+### Added — core tooling, compaction & approval improvements
+- **`fetch` tool** (native HTTP GET): a first-class read-only tool that fetches
+  a URL and returns lightly HTML-stripped text (bounded to `fetch_max_bytes`,
+  default 256 KiB). Unlike `bash curl`, it is NOT subject to the bash sandbox, so
+  it still works under `--no-network` where bash egress is dead — but it honors
+  `--no-network` unless you explicitly populate `fetch_allowlist` (so it can't
+  surprise-bypass an egress block; the allowlist is the opt-in). A non-empty
+  `fetch_allowlist` (host globs like `*.rust-lang.org`, `docs.rs`) restricts
+  egress; empty = any host when network is enabled. Closes the gap where the
+  `researcher` agent couldn't look anything up under the hard-security config.
+  New config: `fetch_allowlist`, `fetch_timeout_secs` (20), `fetch_max_bytes`
+  (262144); CLI `--fetch-timeout`; env `UMANS_HARNESS_FETCH_ALLOWLIST`,
+  `UMANS_HARNESS_FETCH_TIMEOUT`, `UMANS_HARNESS_FETCH_MAX_BYTES`. Also usable
+  via `bulk`.
+- **`edit`: `replace_all` and `normalize_whitespace`** per edit. `replace_all`
+  replaces every occurrence instead of erroring on a non-unique match.
+  `normalize_whitespace` matches on whitespace-collapsed text (runs of
+  whitespace become a single space) so indentation/spacing drift still lands —
+  the replacement edits the real text region, projected back via a char map. On
+  a failed search, a closest-line hint (line number + token overlap) lets the
+  model self-correct in one shot instead of re-reading the whole file. The
+  matching core is refactored into a non-writing `plan_edit` shared by
+  `execute_edit` and the new approval preview.
+- **`bash`: per-call `timeout`** override (clamped to `[1, max_bash_timeout_secs]`,
+  default ceiling 600s) so a slow `cargo build --release`/`npm install`/test
+  suite can get more time for one command without raising the global default.
+  New config: `max_bash_timeout_secs`; CLI `--max-bash-timeout`; env
+  `UMANS_HARNESS_MAX_BASH_TIMEOUT`.
+- **`bash`: smarter output truncation.** When over the 32 KiB cap, the tail is
+  kept AND error/warning lines are salvaged from the dropped head — a compile
+  error in the middle of a huge build log no longer vanishes under a pure tail
+  truncation.
+- **Approval diff preview.** For `write_file`/`edit`/`patch`, the
+  `approval_request` event now carries a `diff` field: the unified diff the
+  call *would* produce (computed without writing). The TUI renders it under the
+  approval banner (and in the history block), so the human approves the actual
+  resulting change, not just the raw search/replace blobs. Layout reserves the
+  real banner height so the diff never overlaps the viewport.
+- **Subagent per-agent depth.** An agent's `maxSubagentDepth` frontmatter now
+  actually caps its subtree (it was dead code): `run_single` computes
+  `child_max_depth(global, agent.max_subagent_depth)`, so e.g. a constrained
+  agent can't fan out deeper than its declared ceiling even when the global
+  cap is higher.
+- **Token-budget-aware compaction tail.** The verbatim tail kept on compaction
+  is now sized by a token budget (25% of the context window, floored at 6k)
+  with a 6-message minimum, instead of a fixed 8/10 messages — so a quiet
+  stretch isn't over-kept and a huge tool result doesn't eat the whole tail.
+- **`session-extract` memory accumulates.** Auto-extracted durable facts now
+  APPEND across compactions (with a rolling 16 KiB cap, oldest trimmed) instead
+  of overwriting, so early-session facts survive later compactions.
+
 ### Fixed - plugin hook dispatch for write/edit/bash/read
 - Pre-execution hooks (`pre_write`/`pre_bash`/`pre_read`) ran **twice** per
   tool call: a leftover dead loop re-executed every hook, so on denial the model

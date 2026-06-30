@@ -17,10 +17,10 @@
 // instructions, and can prompt the orchestrator for decisions or talk to peer
 // subagents when the setup allows it.
 
-use crate::config::{Config, SubagentConfig};
+use crate::config::{Config, ResolvedProvider, SubagentConfig};
 use crate::intercom::{execute_contact_supervisor, execute_intercom};
 use crate::logging::{estimate_messages_tokens, TurnTimer};
-use crate::protocol::{emit, Event};
+use crate::protocol::{emit, Event, ModelInfo};
 use crate::tools::{self, Outcome};
 use crate::State;
 use serde_json::{json, Value};
@@ -532,7 +532,6 @@ pub fn resolve_max_depth(cfg: &SubagentConfig) -> u32 {
         .unwrap_or(cfg.max_depth)
 }
 
-#[allow(dead_code)]
 pub fn child_max_depth(parent: u32, agent: Option<u32>) -> u32 {
     match agent {
         Some(a) => parent.min(a),
@@ -562,6 +561,7 @@ fn all_tool_names() -> &'static [&'static str] {
         "finish",
         "patch",
         "diagnostics",
+        "fetch",
         "subagent",
         "contact_supervisor",
         "intercom",
@@ -681,7 +681,7 @@ pub struct SubagentRun {
 pub fn execute(
     st: Arc<State>,
     client: reqwest::Client,
-    api_key: String,
+    provider: ResolvedProvider,
     parent_model: String,
     args: Value,
     cancel: CancellationToken,
@@ -716,7 +716,7 @@ pub fn execute(
                 return run_single(
                     &st,
                     &client,
-                    &api_key,
+                    &provider,
                     &parent_model,
                     &agent,
                     prompt,
@@ -757,7 +757,7 @@ pub fn execute(
             return run_single(
                 &st,
                 &client,
-                &api_key,
+                &provider,
                 &parent_model,
                 &agent,
                 &task,
@@ -775,7 +775,7 @@ pub fn execute(
             return run_parallel(
                 &st,
                 &client,
-                &api_key,
+                &provider,
                 &parent_model,
                 tasks,
                 &args,
@@ -790,7 +790,7 @@ pub fn execute(
             return run_chain(
                 &st,
                 &client,
-                &api_key,
+                &provider,
                 &parent_model,
                 chain,
                 &args,
@@ -826,7 +826,7 @@ fn next_run_id() -> String {
 async fn run_single(
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     agent: &AgentConfig,
     task: &str,
@@ -837,7 +837,10 @@ async fn run_single(
     cancel: &CancellationToken,
 ) -> Outcome {
     let cfg = st.cfg.read().await.clone();
-    let max_depth = resolve_max_depth(&cfg.subagents);
+    let max_depth = child_max_depth(
+        resolve_max_depth(&cfg.subagents),
+        agent.max_subagent_depth,
+    );
     let bridge = bridge_active(&cfg.subagents.intercom_bridge_mode, Some(&context));
     let my_target = subagent_target(run_id, &agent.name, None);
     let orchestrator = st.intercom.orchestrator_target();
@@ -873,7 +876,7 @@ async fn run_single(
     let result = run_agent(
         st,
         client,
-        api_key,
+        provider,
         parent_model,
         agent,
         task,
@@ -908,7 +911,7 @@ async fn run_single(
 pub async fn run_agent(
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     agent: &AgentConfig,
     task: &str,
@@ -926,7 +929,7 @@ pub async fn run_agent(
     let result = run_agent_inner(
         st,
         client,
-        api_key,
+        provider,
         parent_model,
         agent,
         task,
@@ -949,7 +952,7 @@ pub async fn run_agent(
 async fn run_agent_inner(
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     agent: &AgentConfig,
     task: &str,
@@ -1062,20 +1065,17 @@ async fn run_agent_inner(
         .thinking
         .clone()
         .unwrap_or_else(|| "medium".to_string());
-    let thinking_levels = st
-        .models
-        .read()
-        .await
+    // Clone the model registry once (vs two read-lock acquisitions) and reuse it
+    // for the candidate lookups below + the per-candidate max_tokens the
+    // Anthropic path needs inside stream_with_fallback.
+    let models_registry = st.models.read().await.clone();
+    let first_model = models_registry
         .iter()
-        .find(|m| candidates.iter().any(|c| c == &m.id))
+        .find(|m| candidates.iter().any(|c| c == &m.id));
+    let thinking_levels = first_model
         .map(|m| m.thinking_levels.clone())
         .unwrap_or_default();
-    let model_ctx = st
-        .models
-        .read()
-        .await
-        .iter()
-        .find(|m| candidates.iter().any(|c| c == &m.id))
+    let model_ctx = first_model
         .map(|m| m.context_window as u64)
         .unwrap_or(200_000);
     let mut timer = TurnTimer::new();
@@ -1102,11 +1102,12 @@ async fn run_agent_inner(
             crate::compact_with_summary(
                 client,
                 &cfg,
-                api_key,
+                provider,
                 candidates.first().unwrap(),
                 &mut sub,
                 cancel,
                 est > hard_cap,
+                model_ctx,
             )
             .await;
             emit(
@@ -1128,12 +1129,13 @@ async fn run_agent_inner(
         let (assistant, _finish_reason, ti, to, cached, served_model) = match stream_with_fallback(
             client,
             &cfg,
-            api_key,
+            provider,
             &candidates,
             &sub,
             &tool_defs,
             &effort,
             &thinking_levels,
+            &models_registry,
             cancel,
             &mut timer,
         )
@@ -1273,7 +1275,7 @@ async fn run_agent_inner(
                 &args_str,
                 st,
                 client,
-                api_key,
+                provider,
                 parent_model,
                 my_target,
                 agent,
@@ -1332,7 +1334,7 @@ async fn dispatch_subagent_tool(
     args_str: &str,
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     my_target: &str,
     agent: &AgentConfig,
@@ -1556,8 +1558,11 @@ async fn dispatch_subagent_tool(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let timeout_override = exec_args
+                .get("timeout")
+                .and_then(|v| v.as_u64());
             tokio::select! {
-                o = tools::execute_bash(cmd, cfg) => o,
+                o = tools::execute_bash(cmd, cfg, timeout_override) => o,
                 _ = cancel.cancelled() => Outcome::err("bash aborted"),
             }
         }
@@ -1571,6 +1576,12 @@ async fn dispatch_subagent_tool(
             tokio::select! {
                 o = tools::execute_diagnostics(&exec_args, cfg) => o,
                 _ = cancel.cancelled() => Outcome::err("diagnostics aborted"),
+            }
+        }
+        "fetch" => {
+            tokio::select! {
+                o = tools::execute_fetch(&exec_args, cfg) => o,
+                _ = cancel.cancelled() => Outcome::err("fetch aborted"),
             }
         }
         "contact_supervisor" => {
@@ -1588,7 +1599,7 @@ async fn dispatch_subagent_tool(
                 execute(
                     st.clone(),
                     client.clone(),
-                    api_key.to_string(),
+                    provider.clone(),
                     parent_model.to_string(),
                     exec_args.clone(),
                     cancel.clone(),
@@ -1668,12 +1679,13 @@ fn resolve_model_candidates(
 async fn stream_with_fallback(
     client: &reqwest::Client,
     cfg: &Config,
-    api_key: &str,
+    provider: &ResolvedProvider,
     candidates: &[String],
     messages: &[Value],
     tools: &[Value],
     effort: &str,
     thinking_levels: &[String],
+    models: &[ModelInfo],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
 ) -> Result<(Value, String, u64, u64, u64, String), String> {
@@ -1685,8 +1697,27 @@ async fn stream_with_fallback(
         // instead of reusing the parent's levels for every candidate.
         let _ = thinking_levels;
         let levels: Vec<String> = Vec::new();
+        // Per-candidate max_tokens (Anthropic requires it; OpenAI servers ignore
+        // it). Looked up from the registry so a fallback model with a smaller
+        // output cap doesn't get an over-large request that the API rejects.
+        let max_tokens = models
+            .iter()
+            .find(|m| m.id == *model)
+            .map(|m| m.max_tokens)
+            .unwrap_or(8_192);
         match crate::provider::stream_turn(
-            client, cfg, api_key, model, messages, tools, effort, &levels, cancel, timer, true,
+            client,
+            provider,
+            cfg.idle_timeout_secs,
+            model,
+            messages,
+            tools,
+            effort,
+            &levels,
+            max_tokens,
+            cancel,
+            timer,
+            true,
         )
         .await
         {
@@ -1846,7 +1877,7 @@ fn now_ms() -> u64 {
 async fn run_parallel(
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     tasks: &[Value],
     args: &Value,
@@ -1927,7 +1958,7 @@ async fn run_parallel(
     for (i, (agent, task, model_override, ctx)) in resolved.into_iter().enumerate() {
         let stc = st.clone();
         let clientc = client.clone();
-        let apik = api_key.to_string();
+        let prov = provider.clone();
         let pm = parent_model.to_string();
         let cancelc = run_cancel.clone(); // child of parent; interrupt cancels just this batch
         let semc = sem.clone();
@@ -1937,7 +1968,7 @@ async fn run_parallel(
             run_single(
                 &stc,
                 &clientc,
-                &apik,
+                &prov,
                 &pm,
                 &agent,
                 &task,
@@ -1997,7 +2028,7 @@ async fn run_parallel(
 async fn run_chain(
     st: &Arc<State>,
     client: &reqwest::Client,
-    api_key: &str,
+    provider: &ResolvedProvider,
     parent_model: &str,
     chain: &[Value],
     args: &Value,
@@ -2046,7 +2077,7 @@ async fn run_chain(
             let o = Box::pin(run_parallel(
                 st,
                 client,
-                api_key,
+                provider,
                 parent_model,
                 group,
                 &group_args,
@@ -2095,7 +2126,7 @@ async fn run_chain(
         let o = run_single(
             st,
             client,
-            api_key,
+            provider,
             parent_model,
             &agent,
             &task,
@@ -2511,6 +2542,16 @@ mod tests {
         assert_eq!(fm.get("name").unwrap(), "scout");
         assert_eq!(fm.get("tools").unwrap(), "read, grep");
         assert!(body.starts_with("You are a scout."));
+    }
+
+    #[test]
+    fn child_max_depth_caps_the_subtree() {
+        // no override -> inherit the parent ceiling
+        assert_eq!(child_max_depth(2, None), 2);
+        // override below parent -> capped down
+        assert_eq!(child_max_depth(5, Some(1)), 1);
+        // override above parent -> parent still wins (a child can't widen the cap)
+        assert_eq!(child_max_depth(2, Some(9)), 2);
     }
 
     #[test]

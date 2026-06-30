@@ -1,7 +1,11 @@
-// OpenAI-compatible chat completions client with native Umans defaults.
-// Streams SSE chunks; emits delta/thinking/tool_call events. Retries on
-// transient HTTP errors with exponential backoff (honors Retry-After).
-use crate::config::Config;
+// Multi-provider chat client. The internal conversation is always kept in
+// OpenAI chat-completions shape (role:"tool", assistant `tool_calls`, ...)
+// because every other layer (compaction, sanitization, subagents, session
+// persistence) understands that shape. Translation to/from other wire
+// protocols (Anthropic Messages API) happens only at the HTTP boundary,// driven by the active `ResolvedProvider`'s `kind`. Streams SSE chunks; emits
+// delta/thinking/tool_call events. Retries on transient HTTP errors with
+// exponential backoff (honors Retry-After).
+use crate::config::{ProviderKind, ResolvedProvider};
 use crate::logging::{estimate_messages_tokens, estimate_tokens, TurnTimer};
 use crate::protocol::{emit, Event, ModelInfo};
 use futures_util::StreamExt;
@@ -13,6 +17,12 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
 const MODELS_INFO_PATH: &str = "/models/info";
 const CHAT_PATH: &str = "/chat/completions";
+/// Anthropic Messages API requires an `anthropic-version` header.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Anthropic endpoints: `{base_url}/messages` and `{base_url}/models`
+/// (base_url conventionally ends in `/v1`, e.g. `https://api.anthropic.com/v1`).
+const ANTHROPIC_MESSAGES_PATH: &str = "/messages";
+const ANTHROPIC_MODELS_PATH: &str = "/models";
 
 /// True if the base URL points at an Umans endpoint. Umans accepts extra
 /// fields (reasoning_effort, reasoning_content replay) that vanilla OpenAI
@@ -82,27 +92,92 @@ fn message_for_summary(m: &Value) -> String {
 /// Summarize a slice of messages into one system message. Used by context
 /// compaction so dropped turns become a short recap instead of vanishing.
 /// Non-streaming, cheap; returns None on any failure (caller keeps the
-/// naive drop-oldest fallback).
+/// naive drop-oldest fallback). Protocol-agnostic: branches on the provider's
+/// `kind` (OpenAI chat-completions vs Anthropic Messages).
 pub async fn summarize(
     client: &reqwest::Client,
-    cfg: &Config,
-    api_key: &str,
+    provider: &ResolvedProvider,
     model: &str,
     messages: &[Value],
+    cancel: &CancellationToken,
+) -> Option<String> {
+    const SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
+    let user = messages
+        .iter()
+        .map(message_for_summary)
+        .collect::<Vec<_>>()
+        .join("\n");
+    complete_text(client, provider, model, SYS, &user, 1024, cancel).await
+}
+
+/// Extract durable facts worth remembering across future sessions from a slice of
+/// the conversation. Best-effort (returns None on any failure, or if there is
+/// nothing durable). Used by the session memory extraction hook on compaction.
+/// Protocol-agnostic: branches on the provider's `kind`.
+pub async fn extract_facts(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    model: &str,
+    messages: &[Value],
+    cancel: &CancellationToken,
+) -> Option<String> {
+    const SYS: &str = "Extract durable facts about this project worth remembering across future sessions: conventions, structure, key decisions, gotchas, and how things work. Be concise and specific (paths, names). If there is nothing durable, reply with the single word: none\n\nOutput a short bulleted list, one fact per line, no preamble.";
+    let user = messages
+        .iter()
+        .map(message_for_summary)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let s = complete_text(client, provider, model, SYS, &user, 512, cancel).await?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(s)
+}
+
+/// One-shot text completion (no tools, no streaming). Returns the model's text
+/// reply. Branches on provider kind so callers (summarize/extract_facts) stay
+/// protocol-agnostic. `max_tokens` caps the reply (Anthropic requires it;
+/// OpenAI servers ignore/apply it tolerantly).
+async fn complete_text(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    match provider.kind {
+        ProviderKind::OpenAI => {
+            openai_complete(client, provider, model, system, user, cancel).await
+        }
+        ProviderKind::Anthropic => {
+            anthropic_complete(client, provider, model, system, user, max_tokens, cancel).await
+        }
+    }
+}
+
+async fn openai_complete(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    model: &str,
+    system: &str,
+    user: &str,
     cancel: &CancellationToken,
 ) -> Option<String> {
     let body = json!({
         "model": model,
         "stream": false,
         "messages": [
-            { "role": "system", "content": "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>" },
-            { "role": "user", "content": messages.iter().map(message_for_summary).collect::<Vec<_>>().join("\n") }
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
         ]
     });
-    let url = format!("{}{CHAT_PATH}", cfg.base_url);
+    let url = format!("{}{CHAT_PATH}", provider.base_url);
     let req = client
         .post(&url)
-        .bearer_auth(api_key)
+        .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
         .json(&body)
         .timeout(Duration::from_secs(120));
     let resp = tokio::select! {
@@ -121,31 +196,32 @@ pub async fn summarize(
         .map(|s| s.to_string())
 }
 
-/// Extract durable facts worth remembering across future sessions from a slice of
-/// the conversation. Best-effort (returns None on any failure, or if there is
-/// nothing durable). Used by the session memory extraction hook on compaction.
-pub async fn extract_facts(
+async fn anthropic_complete(
     client: &reqwest::Client,
-    cfg: &Config,
-    api_key: &str,
+    provider: &ResolvedProvider,
     model: &str,
-    messages: &[Value],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    let body = json!({
-        "model": model,
-        "stream": false,
-        "messages": [
-            { "role": "system", "content": "Extract durable facts about this project worth remembering across future sessions: conventions, structure, key decisions, gotchas, and how things work. Be concise and specific (paths, names). If there is nothing durable, reply with the single word: none\n\nOutput a short bulleted list, one fact per line, no preamble." },
-            { "role": "user", "content": messages.iter().map(message_for_summary).collect::<Vec<_>>().join("\n") }
-        ]
-    });
-    let url = format!("{}{CHAT_PATH}", cfg.base_url);
-    let req = client
+    let messages = vec![
+        json!({ "role": "system", "content": system }),
+        json!({ "role": "user", "content": user }),
+    ];
+    let body = build_anthropic_request(&messages, &[], model, "none", &[], max_tokens.max(256));
+    let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
+    let mut req = client
         .post(&url)
-        .bearer_auth(api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&body)
         .timeout(Duration::from_secs(120));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.header("x-api-key", k);
+    }
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
     let resp = tokio::select! {
         r = req.send() => r.ok()?,
         _ = cancel.cancelled() => return None,
@@ -154,19 +230,18 @@ pub async fn extract_facts(
         return None;
     }
     let v: Value = resp.json().await.ok()?;
-    let content = v
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())?
-        .to_string();
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    Some(content)
+    // content is an array of blocks; return the first text block's text.
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|blocks| {
+            blocks.iter().find_map(|b| {
+                (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .then(|| b.get("text").and_then(|t| t.as_str()).map(String::from))
+                    .flatten()
+            })
+        })
 }
+
 
 fn fallback_models() -> Vec<ModelInfo> {
     // ponytail: GLM chat template maps any effort except 'high' to 'max', which
@@ -239,35 +314,61 @@ fn fallback_models() -> Vec<ModelInfo> {
 /// Discover models live from /models/info; cache to disk with an 8-hour TTL.
 /// Falls back to the disk cache (even if stale) on HTTP error, then to the
 /// hardcoded snapshot as a last resort.
-pub async fn discover_models(client: &reqwest::Client, base_url: &str) -> Vec<ModelInfo> {
+/// Discover available models for the active provider. Branches on the
+/// provider's wire protocol: OpenAI-compatible (`/models/info`) or Anthropic
+/// (`/v1/models`). Results are cached to disk, keyed by base URL + kind so an
+/// OpenAI and an Anthropic endpoint at the same host don't collide.
+pub async fn discover_models(client: &reqwest::Client, provider: &ResolvedProvider) -> Vec<ModelInfo> {
+    let cache_key = provider_cache_key(provider);
+    match provider.kind {
+        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key).await,
+        ProviderKind::Anthropic => discover_models_anthropic(client, provider, &cache_key).await,
+    }
+}
+
+/// Cache key: base URL (trailing slash normalized) + provider kind.
+fn provider_cache_key(provider: &ResolvedProvider) -> String {
+    format!(
+        "{}|{}",
+        provider.base_url.trim_end_matches('/'),
+        provider.kind.as_str()
+    )
+}
+
+async fn discover_models_openai(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    cache_key: &str,
+) -> Vec<ModelInfo> {
     // 1. Try disk cache (fresh: < 8 hours old).
-    if let Some(models) = read_models_cache(base_url) {
+    if let Some(models) = read_models_cache(cache_key) {
         return models;
     }
 
-    // 2. Fetch live from the endpoint.
-    let url = format!("{base_url}{MODELS_INFO_PATH}");
-    let live = match client
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
+    // 2. Fetch live from the endpoint. Auth is optional here (Umans /models/info
+    // is public; custom OpenAI-compatible endpoints may gate it). Send the key
+    // only when one is configured so an unauthenticated default still works.
+    let url = format!("{}{MODELS_INFO_PATH}", provider.base_url);
+    let mut req = client.get(&url).timeout(Duration::from_secs(5));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.bearer_auth(k);
+    }
+    let live = match req.send().await {
         Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
             Ok(v) => v,
             Err(_) => {
                 // HTTP ok but JSON parse failed — fall back to stale cache.
-                return read_models_cache_stale(base_url).unwrap_or_else(fallback_models);
+                return read_models_cache_stale(cache_key).unwrap_or_else(fallback_models);
             }
         }),
         _ => {
             // HTTP failed — fall back to stale cache.
-            return read_models_cache_stale(base_url).unwrap_or_else(fallback_models);
+            return read_models_cache_stale(cache_key).unwrap_or_else(fallback_models);
         }
     };
 
     // 3. Write fresh data to disk cache.
-    write_models_cache(base_url, &live);
+    write_models_cache(cache_key, &live);
     live
 }
 
@@ -278,7 +379,7 @@ const MODELS_CACHE_TTL: u64 = 28800;
 /// cache written by an older parser (e.g. one that stored empty thinking_levels
 /// or wrong vision flags because it read the wrong field) is treated as a miss
 /// and refreshed, instead of masking the fix for up to the TTL window.
-const MODELS_CACHE_VERSION: u64 = 3;
+const MODELS_CACHE_VERSION: u64 = 4;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -291,12 +392,12 @@ fn models_cache_path() -> Option<std::path::PathBuf> {
     Some(home.join(".config/umans-harness/models-cache.json"))
 }
 
-fn read_models_cache(base_url: &str) -> Option<Vec<ModelInfo>> {
+fn read_models_cache(cache_key: &str) -> Option<Vec<ModelInfo>> {
     let path = models_cache_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     let cache: Value = serde_json::from_str(&content).ok()?;
-    let cached_url = cache.get("base_url")?.as_str()?;
-    if cached_url != base_url {
+    let cached_key = cache.get("key")?.as_str()?;
+    if cached_key != cache_key {
         return None;
     }
     if !cache_version_ok(&cache) {
@@ -313,12 +414,12 @@ fn read_models_cache(base_url: &str) -> Option<Vec<ModelInfo>> {
     parse_cache_models(&cache)
 }
 
-fn read_models_cache_stale(base_url: &str) -> Option<Vec<ModelInfo>> {
+fn read_models_cache_stale(cache_key: &str) -> Option<Vec<ModelInfo>> {
     let path = models_cache_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     let cache: Value = serde_json::from_str(&content).ok()?;
-    let cached_url = cache.get("base_url")?.as_str()?;
-    if cached_url != base_url {
+    let cached_key = cache.get("key")?.as_str()?;
+    if cached_key != cache_key {
         return None;
     }
     if !cache_version_ok(&cache) {
@@ -327,7 +428,7 @@ fn read_models_cache_stale(base_url: &str) -> Option<Vec<ModelInfo>> {
     parse_cache_models(&cache)
 }
 
-fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
+fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
     let path = match models_cache_path() {
         Some(p) => p,
         None => return,
@@ -353,7 +454,7 @@ fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
         })
         .collect();
     let cache = json!({
-        "base_url": base_url,
+        "key": cache_key,
         "version": MODELS_CACHE_VERSION,
         "updated_at": now,
         "models": models_json,
@@ -634,8 +735,39 @@ fn token_count(v: &Value) -> Option<u64> {
 /// Returns the finalized assistant message, finish_reason, and (in/out) token counts.
 pub async fn stream_turn(
     client: &reqwest::Client,
-    cfg: &Config,
-    api_key: &str,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
+    match provider.kind {
+        ProviderKind::OpenAI => stream_turn_openai(
+            client, provider, idle_timeout_secs, model, messages, tools, reasoning_effort,
+            thinking_levels, cancel, timer, quiet,
+        )
+        .await,
+        ProviderKind::Anthropic => stream_turn_anthropic(
+            client, provider, idle_timeout_secs, model, messages, tools, reasoning_effort,
+            thinking_levels, max_tokens, cancel, timer, quiet,
+        )
+        .await,
+    }
+}
+
+/// OpenAI-compatible streaming turn. Emits the same delta/thinking/tool_call
+/// events and returns the same (assistant_msg, finish_reason, tokens) tuple
+/// as the Anthropic path, so the caller is protocol-agnostic.
+async fn stream_turn_openai(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
     model: &str,
     messages: &[Value],
     tools: &[Value],
@@ -648,11 +780,9 @@ pub async fn stream_turn(
     // ponytail: reasoning_effort + reasoning_content replay are Umans-specific.
     // Only emit them when pointed at an Umans endpoint; other OpenAI-compatible
     // servers reject unknown fields with a 400.
-    let base_url = &cfg.base_url;
-    // ponytail: reasoning_effort + reasoning_content replay are Umans-specific.
-    // Only emit them when pointed at an Umans endpoint; other OpenAI-compatible
-    // servers reject unknown fields with a 400.
+    let base_url = &provider.base_url;
     let umans = is_umans(base_url);
+    let api_key = provider.api_key.as_deref().unwrap_or("");
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -698,7 +828,7 @@ pub async fn stream_turn(
     let mut cached_tokens: u64 = 0;
     // Per-chunk idle timeout: if no bytes arrive for this long mid-stream, abort.
     // Configurable because reasoning models can think >60s before the first token.
-    let idle = Duration::from_secs(cfg.idle_timeout_secs.max(10));
+    let idle = Duration::from_secs(idle_timeout_secs.max(10));
 
     // Live stats: estimate the prompt's token count once (the prompt is fixed for
     // this request) so the footer can show a growing context + live TPS as output
@@ -725,7 +855,7 @@ pub async fn stream_turn(
             let chunk = tokio::select! {
                 c = tokio::time::timeout(idle, stream.next()) => match c {
                     Ok(x) => x,
-                    Err(_) => { err = Some(format!("stream idle timeout ({}s with no data)", cfg.idle_timeout_secs)); break; }
+                    Err(_) => { err = Some(format!("stream idle timeout ({}s with no data)", idle_timeout_secs)); break; }
                 },
                 _ = cancel.cancelled() => return Err("aborted".into()),
             };
@@ -1185,6 +1315,777 @@ fn fmt_chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+// =========================================================================
+// Anthropic Messages API translation
+// =========================================================================
+//
+// The harness keeps the conversation in OpenAI chat-completions shape. These
+// functions translate OpenAI messages + tools -> an Anthropic `/v1/messages`
+// request, and an Anthropic SSE stream -> the same delta/thinking/tool_call
+// events the OpenAI path emits, then rebuild the assistant message in OpenAI
+// shape. The rest of the harness never sees Anthropic wire format.
+
+/// Map a reasoning effort to an Anthropic extended-thinking token budget.
+/// Returns None when thinking can't be enabled (effort "none"/unknown, or
+/// `max_tokens` too small to leave room for a >=1024 budget — Anthropic counts
+/// thinking within `max_tokens`, so the budget must be < max_tokens).
+fn anthropic_thinking_budget(effort: &str, max_tokens: u32) -> Option<u32> {
+    let base: u32 = match effort.to_ascii_lowercase().as_str() {
+        "low" | "minimal" => 4096,
+        "medium" => 12288,
+        "high" | "max" => 24576,
+        _ => return None,
+    };
+    let budget = base.min(max_tokens.saturating_sub(1024));
+    if budget < 1024 {
+        return None;
+    }
+    Some(budget)
+}
+
+/// Push text from an OpenAI `content` (string or multimodal array) into a vec
+/// of system-parts. Image parts are ignored (system is text-only).
+fn push_content_str(content: &Value, parts: &mut Vec<String>) {
+    if let Some(s) = content.as_str() {
+        if !s.is_empty() {
+            parts.push(s.to_string());
+        }
+    } else if let Some(arr) = content.as_array() {
+        for part in arr {
+            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Append a message with the given role + content blocks, merging into the
+/// previous message when it has the same role (Anthropic requires alternating
+/// roles; consecutive same-role messages 400). Merging concatenates the block
+/// arrays — e.g. several OpenAI `role:tool` results fold into one user message
+/// with multiple `tool_result` blocks.
+fn push_or_merge(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                arr.extend(blocks);
+                return;
+            }
+        }
+    }
+    out.push(json!({ "role": role, "content": blocks }));
+}
+
+/// Convert a single OpenAI message `content` (string or multimodal array) into
+/// Anthropic content blocks. Images become Anthropic `image` blocks (base64 or
+/// url source); text stays text. A plain string yields a single text block.
+fn anthropic_content_blocks(content: &Value) -> Vec<Value> {
+    if let Some(s) = content.as_str() {
+        return vec![json!({ "type": "text", "text": s })];
+    }
+    let mut blocks = Vec::new();
+    if let Some(arr) = content.as_array() {
+        for part in arr {
+            match part.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        blocks.push(json!({ "type": "text", "text": t }));
+                    }
+                }
+                Some("image_url") => {
+                    if let Some(url) = part
+                        .get("image_url")
+                        .and_then(|iu| iu.get("url"))
+                        .and_then(|u| u.as_str())
+                    {
+                        if let Some(img) = anthropic_image_block(url) {
+                            blocks.push(img);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(json!({ "type": "text", "text": "" }));
+    }
+    blocks
+}
+
+/// Build an Anthropic `image` block from an OpenAI `image_url.url`. Supports
+/// `data:<media>;base64,<data>` (-> base64 source) and plain URLs (-> url source).
+fn anthropic_image_block(url: &str) -> Option<Value> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let media = meta.split(';').next()?;
+        Some(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media, "data": data }
+        }))
+    } else {
+        Some(json!({ "type": "image", "source": { "type": "url", "url": url } }))
+    }
+}
+
+/// Convert OpenAI function tools to Anthropic tool definitions.
+/// OpenAI: `{"type":"function","function":{"name","description","parameters"}}`
+/// Anthropic: `{"name","description","input_schema"}`
+fn anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            let name = f.get("name").and_then(|v| v.as_str())?;
+            let description = f.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let schema = f.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            Some(json!({ "name": name, "description": description, "input_schema": schema }))
+        })
+        .collect()
+}
+
+/// Build an Anthropic `/v1/messages` request body from OpenAI-shaped messages +
+/// tools. Extracts `role: system` messages into the top-level `system` field,
+/// converts user/assistant/tool messages to Anthropic format, and converts
+/// OpenAI function tools to `input_schema` tools. `thinking_levels` non-empty +
+/// a supported effort enables extended thinking. Pure (no I/O) so it can be
+/// unit-tested directly.
+pub fn build_anthropic_request(
+    messages: &[Value],
+    tools: &[Value],
+    model: &str,
+    reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
+) -> Value {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut out: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "system" => push_content_str(m.get("content").unwrap_or(&Value::Null), &mut system_parts),
+            "user" => {
+                let blocks = anthropic_content_blocks(m.get("content").unwrap_or(&Value::Null));
+                push_or_merge(&mut out, "user", blocks);
+            }
+            "assistant" => {
+                let mut blocks = Vec::new();
+                if let Some(content) = m.get("content") {
+                    if let Some(s) = content.as_str() {
+                        if !s.is_empty() {
+                            blocks.push(json!({ "type": "text", "text": s }));
+                        }
+                    } else if let Some(arr) = content.as_array() {
+                        for part in arr {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        blocks.push(json!({ "type": "text", "text": t }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // assistant tool_calls -> tool_use blocks. reasoning_content is
+                // dropped: Anthropic can't replay raw thinking without matching
+                // signatures (it would 400), so prior reasoning is never sent back.
+                if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                        let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input
+                        }));
+                    }
+                }
+                if blocks.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": "" }));
+                }
+                push_or_merge(&mut out, "assistant", blocks);
+            }
+            "tool" => {
+                // OpenAI tool result -> Anthropic user message with a tool_result block.
+                let tool_use_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                push_or_merge(
+                    &mut out,
+                    "user",
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content
+                    })],
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("max_tokens".into(), json!(max_tokens));
+    if !system_parts.is_empty() {
+        body.insert("system".into(), json!(system_parts.join("\n\n")));
+    }
+    if !out.is_empty() {
+        body.insert("messages".into(), Value::Array(out));
+    }
+    if !tools.is_empty() {
+        body.insert("tools".into(), Value::Array(anthropic_tools(tools)));
+        body.insert("tool_choice".into(), json!({ "type": "auto" }));
+    }
+    if !thinking_levels.is_empty() {
+        // Only enable extended thinking when the user actually asked for it.
+        // `resolve_effort` would otherwise clamp "none" up to a supported level
+        // and silently turn thinking on; gate on the raw requested effort first.
+        let wants = !matches!(
+            reasoning_effort.to_ascii_lowercase().as_str(),
+            "" | "none" | "minimal" | "off"
+        );
+        if wants {
+            let resolved = resolve_effort(reasoning_effort, thinking_levels);
+            if let Some(budget) = anthropic_thinking_budget(&resolved, max_tokens) {
+                body.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
+            }
+        }
+    }
+    Value::Object(body)
+}
+
+/// Map an Anthropic `stop_reason` to the OpenAI `finish_reason` the harness
+/// expects ("stop" | "tool_calls" | "length").
+fn anthropic_stop_reason(sr: &str) -> String {
+    match sr {
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        "max_tokens" => "length".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Accumulator for one Anthropic content block while streaming (text / thinking
+/// / tool_use). Keyed by the block `index` from the SSE events.
+#[derive(Default)]
+struct AnthropicBlock {
+    kind: String,
+    tool_id: String,
+    tool_name: String,
+    tool_args: String,
+}
+
+/// POST an Anthropic request with retry on 429/5xx (same policy as the OpenAI
+/// path). Auth is `x-api-key` (not Bearer); `anthropic-version` + any provider
+/// headers are attached. Cancellation-aware.
+async fn send_anthropic_request(
+    client: &reqwest::Client,
+    url: &str,
+    provider: &ResolvedProvider,
+    body: &Value,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Response, String> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut req = client
+            .post(url)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(body);
+        if let Some(k) = provider.api_key.as_deref() {
+            req = req.header("x-api-key", k);
+        }
+        for (k, v) in &provider.headers {
+            req = req.header(k, v);
+        }
+        let resp = tokio::select! {
+            r = req.send() => r,
+            _ = cancel.cancelled() => return Err("aborted".into()),
+        };
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_success() {
+                    return Ok(r);
+                }
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                if !retryable || attempt >= 4 {
+                    let text = r.text().await.unwrap_or_default();
+                    return Err(format!("HTTP {status}: {text}"));
+                }
+                let retry_after = r
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after);
+                let _ = r.text().await;
+                let backoff = backoff_ms(attempt, retry_after);
+                emit(
+                    &Event::new("http_retry")
+                        .with("attempt", json!(attempt))
+                        .with("status", json!(status.as_u16()))
+                        .with("backoff_ms", json!(backoff)),
+                );
+                sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
+            }
+            Err(e) => {
+                if attempt >= 4 {
+                    return Err(format!("request failed after {attempt} attempts: {}", fmt_chain(&e)));
+                }
+                let backoff = backoff_ms(attempt, None);
+                emit(
+                    &Event::new("http_retry")
+                        .with("attempt", json!(attempt))
+                        .with("reason", json!("transport error"))
+                        .with("backoff_ms", json!(backoff)),
+                );
+                sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
+            }
+        }
+    }
+}
+
+/// Anthropic streaming turn. Emits the same delta/thinking/tool_call events
+/// and returns the same (assistant_msg, finish_reason, tokens) tuple as
+/// `stream_turn_openai`, so the caller is protocol-agnostic.
+async fn stream_turn_anthropic(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
+    let mt = if max_tokens == 0 { 8192 } else { max_tokens };
+    let mut body = build_anthropic_request(messages, tools, model, reasoning_effort, thinking_levels, mt);
+    body["stream"] = json!(true);
+
+    let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
+    let idle = Duration::from_secs(idle_timeout_secs.max(10));
+    let est_prompt = estimate_messages_tokens(messages);
+    let mut last_stats: Option<Instant> = None;
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut blocks: Vec<AnthropicBlock> = Vec::new();
+    let mut finish_reason = String::new();
+    let mut tokens_in: u64 = 0;
+    let mut tokens_out: u64 = 0;
+    let mut cached_tokens: u64 = 0;
+
+    let max_attempts = 3u32;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let resp = send_anthropic_request(client, &url, provider, &body, cancel).await?;
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut cur_event = String::new();
+        let mut pending = String::new();
+        let mut emitted = false;
+        let mut err: Option<String> = None;
+
+        loop {
+            let chunk = tokio::select! {
+                c = tokio::time::timeout(idle, stream.next()) => match c {
+                    Ok(x) => x,
+                    Err(_) => {
+                        err = Some(format!("stream idle timeout ({}s with no data)", idle_timeout_secs));
+                        break;
+                    }
+                },
+                _ = cancel.cancelled() => return Err("aborted".into()),
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    break;
+                }
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE frames. Anthropic frames pair an `event:`
+            // line with a `data:` line; the event type drives dispatch.
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim().to_string();
+                buf.drain(..=nl);
+                if line.is_empty() {
+                    pending.clear();
+                    cur_event.clear();
+                    continue;
+                }
+                if line.starts_with(':') {
+                    continue; // SSE comment / keepalive
+                }
+                if let Some(ev) = line.strip_prefix("event:") {
+                    cur_event = ev.trim().to_string();
+                    continue;
+                }
+                let data = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                    .unwrap_or("");
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    pending.clear();
+                    continue;
+                }
+                pending.push_str(data);
+                let obj = match serde_json::from_str::<Value>(&pending) {
+                    Ok(o) => {
+                        pending.clear();
+                        o
+                    }
+                    Err(_) => continue, // wait for more `data:` lines to complete the frame
+                };
+
+                match cur_event.as_str() {
+                    "message_start" => {
+                        if let Some(u) = obj.get("message").and_then(|m| m.get("usage")) {
+                            if let Some(p) = u.get("input_tokens").and_then(token_count) {
+                                tokens_in = p;
+                            }
+                            if let Some(c) = u.get("cache_read_input_tokens").and_then(token_count) {
+                                cached_tokens = c;
+                            }
+                        }
+                    }
+                    "content_block_start" => {
+                        let idx = obj.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        while blocks.len() <= idx {
+                            blocks.push(AnthropicBlock::default());
+                        }
+                        let cb = obj.get("content_block").cloned().unwrap_or(Value::Null);
+                        let btype = cb.get("type").and_then(|t| t.as_str()).unwrap_or("text").to_string();
+                        let b = &mut blocks[idx];
+                        b.kind = btype.clone();
+                        if btype == "tool_use" {
+                            b.tool_id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            b.tool_name = cb.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if let Some(input) = cb.get("input") {
+                                if let Some(s) = input.as_str() {
+                                    b.tool_args.push_str(s);
+                                } else {
+                                    b.tool_args.push_str(&input.to_string());
+                                }
+                            }
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("tool_call_start")
+                                    .with("id", json!(b.tool_id))
+                                    .with("index", json!(idx)));
+                                if !b.tool_name.is_empty() {
+                                    emit(&Event::new("tool_call_name")
+                                        .with("index", json!(idx))
+                                        .with("name", json!(b.tool_name)));
+                                }
+                            }
+                        }
+                    }
+                    "content_block_delta" => {
+                        let idx = obj.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        while blocks.len() <= idx {
+                            blocks.push(AnthropicBlock::default());
+                        }
+                        let Some(delta) = obj.get("delta") else { continue };
+                        let dtype = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match dtype {
+                            "text_delta" => {
+                                if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        if content.is_empty() {
+                                            timer.mark_first_token();
+                                        }
+                                        content.push_str(t);
+                                        blocks[idx].kind = "text".into();
+                                        if !quiet {
+                                            emitted = true;
+                                            emit(&Event::new("delta").with("text", json!(t)));
+                                        }
+                                    }
+                                }
+                            }
+                            "thinking_delta" => {
+                                if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        if reasoning.is_empty() {
+                                            timer.mark_first_token();
+                                        }
+                                        reasoning.push_str(t);
+                                        blocks[idx].kind = "thinking".into();
+                                        if !quiet {
+                                            emitted = true;
+                                            emit(&Event::new("thinking").with("text", json!(t)));
+                                        }
+                                    }
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                    let b = &mut blocks[idx];
+                                    if b.kind.is_empty() {
+                                        b.kind = "tool_use".into();
+                                    }
+                                    b.tool_args.push_str(pj);
+                                    if !quiet {
+                                        emitted = true;
+                                        emit(&Event::new("tool_call_args")
+                                            .with("index", json!(idx))
+                                            .with("args", json!(pj)));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "content_block_stop" => { /* block complete; nothing to emit */ }
+                    "message_delta" => {
+                        if let Some(d) = obj.get("delta") {
+                            if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
+                                finish_reason = anthropic_stop_reason(sr);
+                            }
+                        }
+                        if let Some(u) = obj.get("usage") {
+                            if let Some(o) = u.get("output_tokens").and_then(token_count) {
+                                tokens_out = o;
+                            }
+                        }
+                    }
+                    "message_stop" | "ping" => { /* keepalive / done */ }
+                    "error" => {
+                        let msg = obj
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("anthropic stream error")
+                            .to_string();
+                        err = Some(msg);
+                        break;
+                    }
+                    _ => {}
+                }
+
+                // Live footer stats (same ~400ms throttle as the OpenAI path).
+                if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
+                    let now = Instant::now();
+                    let due = last_stats
+                        .map(|t| now.duration_since(t) >= Duration::from_millis(400))
+                        .unwrap_or(true);
+                    if due {
+                        last_stats = Some(now);
+                        let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+                        let live_ctx = est_prompt.saturating_add(est_out);
+                        let mut ev = Event::new("metrics")
+                            .with("tokens_in", json!(live_ctx))
+                            .with("tokens_out", json!(est_out));
+                        if let Some(ttft) = timer
+                            .first_token
+                            .map(|t| t.duration_since(timer.start).as_millis() as u64)
+                        {
+                            ev = ev.with("ttft_ms", json!(ttft));
+                        }
+                        emit(&ev);
+                    }
+                }
+            }
+        }
+
+        if err.is_none() {
+            break; // stream completed cleanly
+        }
+        let msg = err.unwrap();
+        if emitted || attempt >= max_attempts {
+            return Err(msg);
+        }
+        let backoff = backoff_ms(attempt, None);
+        emit(
+            &Event::new("http_retry")
+                .with("attempt", json!(attempt))
+                .with("reason", json!("stream error before first token"))
+                .with("backoff_ms", json!(backoff)),
+        );
+        content.clear();
+        reasoning.clear();
+        blocks.clear();
+        finish_reason.clear();
+        tokens_in = 0;
+        tokens_out = 0;
+        cached_tokens = 0;
+        timer.call_first_token = None;
+        sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
+    }
+
+    let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+    timer.end_call(tokens_out, est_out);
+
+    // Rebuild the assistant message in OpenAI shape. reasoning is shown live but
+    // NOT persisted: Anthropic thinking blocks aren't replayable (would 400 next
+    // turn), so we drop them from history — same as the OpenAI path drops
+    // reasoning_content on non-Umans endpoints.
+    let mut msg = serde_json::Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    msg.insert(
+        "content".into(),
+        if content.is_empty() { Value::Null } else { json!(content) },
+    );
+    let tool_calls: Vec<Value> = blocks
+        .iter()
+        .filter(|b| b.kind == "tool_use")
+        .map(|b| {
+            json!({
+                "id": b.tool_id,
+                "type": "function",
+                "function": {
+                    "name": b.tool_name,
+                    "arguments": if b.tool_args.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        b.tool_args.clone()
+                    }
+                }
+            })
+        })
+        .collect();
+    if !tool_calls.is_empty() {
+        msg.insert("tool_calls".into(), json!(tool_calls));
+    }
+
+    Ok((Value::Object(msg), finish_reason, tokens_in, tokens_out, cached_tokens))
+}
+
+/// Discover models from an Anthropic-compatible endpoint (`GET /v1/models`).
+/// Anthropic lists model ids but not capabilities, so each id is mapped through
+/// a curated capability table; unknown ids get conservative defaults.
+async fn discover_models_anthropic(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    cache_key: &str,
+) -> Vec<ModelInfo> {
+    if let Some(models) = read_models_cache(cache_key) {
+        return models;
+    }
+    let url = format!("{}{ANTHROPIC_MODELS_PATH}", provider.base_url);
+    let mut req = client.get(&url).timeout(Duration::from_secs(8));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.header("x-api-key", k);
+    }
+    req = req.header("anthropic-version", ANTHROPIC_VERSION);
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
+    let live = match req.send().await {
+        Ok(r) if r.status().is_success() => {
+            parse_anthropic_models(&r.json::<Value>().await.unwrap_or_else(|_| json!({})))
+        }
+        _ => read_models_cache_stale(cache_key).unwrap_or_else(anthropic_fallback_models),
+    };
+    write_models_cache(cache_key, &live);
+    live
+}
+
+/// Parse Anthropic `GET /v1/models` -> `{data:[{id,display_name,...}]}` into
+/// ModelInfo, applying curated per-id capabilities. Falls back to the static
+/// list when the response has no models.
+fn parse_anthropic_models(data: &Value) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
+        return anthropic_fallback_models();
+    };
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = m
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            Some(anthropic_model_caps(&id, &name))
+        })
+        .collect();
+    if out.is_empty() {
+        return anthropic_fallback_models();
+    }
+    // de-dup by id, preserve order
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
+/// Curated capabilities for a Claude model id (context window, max output,
+/// extended-thinking support, vision). Unknown ids get conservative defaults
+/// (thinking off, vision on — Claude has had vision since 3.0).
+#[allow(clippy::if_same_then_else)] // families share caps today but are kept
+// distinct for readability + future divergence as models gain new caps.
+fn anthropic_model_caps(id: &str, name: &str) -> ModelInfo {
+    let l = id.to_ascii_lowercase();
+    let (ctx, max, thinking, vision) = if l.contains("opus-4") {
+        (200_000, 32_000, true, true)
+    } else if l.contains("sonnet-4") {
+        (200_000, 16_000, true, true)
+    } else if l.contains("haiku-4") {
+        (200_000, 8_192, false, true)
+    } else if l.contains("3-7-sonnet") || l.contains("3.7-sonnet") {
+        (200_000, 8_192, true, true)
+    } else if l.contains("3-5-sonnet") || l.contains("3.5-sonnet") {
+        (200_000, 8_192, false, true)
+    } else if l.contains("3-5-haiku") || l.contains("3.5-haiku") {
+        (200_000, 8_192, false, true)
+    } else if l.contains("3-opus") || l.contains("3.0-opus") {
+        (200_000, 4_096, false, true)
+    } else if l.contains("3-haiku") {
+        (200_000, 4_096, false, true)
+    } else {
+        (200_000, 8_192, false, true)
+    };
+    ModelInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        reasoning: thinking,
+        context_window: ctx,
+        max_tokens: max,
+        thinking_levels: if thinking {
+            DEFAULT_THINKING_LEVELS.iter().map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
+        },
+        vision,
+    }
+}
+
+/// Static Claude model list used when `/v1/models` is unreachable.
+fn anthropic_fallback_models() -> Vec<ModelInfo> {
+    let ids = [
+        "claude-opus-4-1",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-0",
+        "claude-haiku-4-5",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+    ];
+    ids.iter().map(|id| anthropic_model_caps(id, id)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,5 +2409,346 @@ mod tests {
         assert!(!cache_version_ok(&json!({ "base_url": "x", "updated_at": 0 })));
         // A future / mismatched version is rejected.
         assert!(!cache_version_ok(&json!({ "version": 99 })));
+    }
+
+    // ---- Anthropic translation ----
+
+    #[test]
+    fn anthropic_thinking_budget_maps_and_clamps() {
+        // effort -> budget
+        assert_eq!(anthropic_thinking_budget("low", 100_000), Some(4096));
+        assert_eq!(anthropic_thinking_budget("medium", 100_000), Some(12288));
+        assert_eq!(anthropic_thinking_budget("HIGH", 100_000), Some(24576));
+        assert_eq!(anthropic_thinking_budget("max", 100_000), Some(24576));
+        // unsupported effort -> no thinking
+        assert_eq!(anthropic_thinking_budget("none", 100_000), None);
+        assert_eq!(anthropic_thinking_budget("bogus", 100_000), None);
+        // clamp to max_tokens-1024 when base exceeds it
+        assert_eq!(anthropic_thinking_budget("high", 20000), Some(18976));
+        // base below the cap passes through unchanged
+        assert_eq!(anthropic_thinking_budget("high", 30000), Some(24576));
+        // too small to leave room -> None
+        assert_eq!(anthropic_thinking_budget("low", 2000), None);
+        assert_eq!(anthropic_thinking_budget("high", 1500), None);
+    }
+
+    #[test]
+    fn anthropic_stop_reason_maps_to_openai() {
+        assert_eq!(anthropic_stop_reason("end_turn"), "stop");
+        assert_eq!(anthropic_stop_reason("stop_sequence"), "stop");
+        assert_eq!(anthropic_stop_reason("tool_use"), "tool_calls");
+        assert_eq!(anthropic_stop_reason("max_tokens"), "length");
+        assert_eq!(anthropic_stop_reason("weird"), "weird");
+    }
+
+    #[test]
+    fn anthropic_image_block_data_url_and_plain_url() {
+        let b = anthropic_image_block("data:image/png;base64,QUJD").unwrap();
+        assert_eq!(b["type"], "image");
+        assert_eq!(b["source"]["type"], "base64");
+        assert_eq!(b["source"]["media_type"], "image/png");
+        assert_eq!(b["source"]["data"], "QUJD");
+        let b = anthropic_image_block("https://x.test/cat.png").unwrap();
+        assert_eq!(b["source"]["type"], "url");
+        assert_eq!(b["source"]["url"], "https://x.test/cat.png");
+    }
+
+    #[test]
+    fn anthropic_content_blocks_string_and_multimodal() {
+        // plain string -> single text block
+        let b = anthropic_content_blocks(&json!("hi"));
+        assert_eq!(b, vec![json!({ "type": "text", "text": "hi" })]);
+        // multimodal: text + base64 image
+        let content = json!([
+            { "type": "text", "text": "look" },
+            { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,ZGF0YQ==" } }
+        ]);
+        let b = anthropic_content_blocks(&content);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["type"], "text");
+        assert_eq!(b[1]["type"], "image");
+        assert_eq!(b[1]["source"]["media_type"], "image/jpeg");
+        // empty -> placeholder text block
+        let b = anthropic_content_blocks(&json!([]));
+        assert_eq!(b, vec![json!({ "type": "text", "text": "" })]);
+    }
+
+    #[test]
+    fn build_anthropic_extracts_system_to_toplevel() {
+        let msgs = json!([
+            { "role": "system", "content": "You are a coder." },
+            { "role": "user", "content": "hi" }
+        ]);
+        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        assert_eq!(req["system"], "You are a coder.");
+        assert_eq!(req["model"], "claude-x");
+        assert_eq!(req["max_tokens"], 4096);
+        // system extracted -> messages starts with user
+        assert_eq!(req["messages"][0]["role"], "user");
+        assert!(req.get("tools").is_none());
+        assert!(req.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_converts_tools_and_tool_choice() {
+        let msgs = json!([{ "role": "user", "content": "do it" }]);
+        let tools = json!([
+            { "type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": { "type": "object", "properties": {} }
+            }}
+        ]);
+        let req = build_anthropic_request(
+            msgs.as_array().unwrap(),
+            tools.as_array().unwrap(),
+            "claude-x",
+            "none",
+            &[],
+            4096,
+        );
+        let t = req["tools"].as_array().unwrap();
+        assert_eq!(t[0]["name"], "read_file");
+        assert_eq!(t[0]["description"], "Read a file");
+        assert_eq!(t[0]["input_schema"]["type"], "object");
+        assert_eq!(req["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn build_anthropic_assistant_tool_calls_become_tool_use() {
+        let msgs = json!([
+            { "role": "user", "content": "read foo" },
+            { "role": "assistant", "content": null, "tool_calls": [
+                { "id": "call_1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"foo.rs\"}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "call_1", "content": "contents of foo" }
+        ]);
+        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let m = req["messages"].as_array().unwrap();
+        // user, assistant(tool_use), user(tool_result)
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1]["role"], "assistant");
+        let blocks = m[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "read_file");
+        assert_eq!(blocks[0]["input"]["path"], "foo.rs");
+        assert_eq!(m[2]["role"], "user");
+        let rblocks = m[2]["content"].as_array().unwrap();
+        assert_eq!(rblocks[0]["type"], "tool_result");
+        assert_eq!(rblocks[0]["tool_use_id"], "call_1");
+        assert_eq!(rblocks[0]["content"], "contents of foo");
+    }
+
+    #[test]
+    fn build_anthropic_drops_reasoning_content() {
+        // Prior Umans reasoning must NOT be replayed: Anthropic rejects raw
+        // thinking blocks without signatures (400). Verify it's stripped.
+        let msgs = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": "hello", "reasoning_content": "secret thoughts" },
+            { "role": "user", "content": "again" }
+        ]);
+        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let m = req["messages"].as_array().unwrap();
+        let asst = &m[1];
+        assert_eq!(asst["role"], "assistant");
+        assert!(asst.get("reasoning_content").is_none());
+        assert_eq!(asst["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn build_anthropic_merges_consecutive_same_role() {
+        // Two tool results back-to-back fold into ONE user message with two
+        // tool_result blocks (Anthropic requires alternating roles).
+        let msgs = json!([
+            { "role": "user", "content": "read two" },
+            { "role": "assistant", "content": null, "tool_calls": [
+                { "id": "a", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+                { "id": "b", "type": "function", "function": { "name": "f", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "a", "content": "r1" },
+            { "role": "tool", "tool_call_id": "b", "content": "r2" }
+        ]);
+        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let m = req["messages"].as_array().unwrap();
+        // user, assistant, user(2 tool_results)
+        assert_eq!(m.len(), 3);
+        let rblocks = m[2]["content"].as_array().unwrap();
+        assert_eq!(rblocks.len(), 2);
+    }
+
+    #[test]
+    fn build_anthropic_enables_thinking_only_when_supported() {
+        let msgs = json!([{ "role": "user", "content": "think" }]);
+        // thinking-capable model advertises levels -> thinking present
+        let levels: Vec<String> = vec!["low".into(), "medium".into(), "high".into()];
+        let req = build_anthropic_request(
+            msgs.as_array().unwrap(), &[], "claude-sonnet-4", "medium", &levels, 100_000,
+        );
+        assert_eq!(req["thinking"]["type"], "enabled");
+        assert_eq!(req["thinking"]["budget_tokens"], 12288);
+        // non-thinking model (empty levels) -> no thinking even with effort set
+        let req2 = build_anthropic_request(
+            msgs.as_array().unwrap(), &[], "claude-3-5-sonnet", "high", &[], 100_000,
+        );
+        assert!(req2.get("thinking").is_none());
+        // effort "none" with thinking-capable -> no thinking
+        let req3 = build_anthropic_request(
+            msgs.as_array().unwrap(), &[], "claude-sonnet-4", "none", &levels, 100_000);
+        assert!(req3.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_model_caps_known_families() {
+        let opus = anthropic_model_caps("claude-opus-4-1-20250805", "Opus");
+        assert!(opus.reasoning);
+        assert!(opus.vision);
+        assert_eq!(opus.max_tokens, 32_000);
+        assert_eq!(opus.thinking_levels.len(), 3);
+        let sonnet4 = anthropic_model_caps("claude-sonnet-4-5", "Sonnet 4.5");
+        assert!(sonnet4.reasoning);
+        assert_eq!(sonnet4.max_tokens, 16_000);
+        let sonnet35 = anthropic_model_caps("claude-3-5-sonnet-20241022", "Sonnet 3.5");
+        assert!(!sonnet35.reasoning);
+        assert!(sonnet35.thinking_levels.is_empty());
+        let haiku4 = anthropic_model_caps("claude-haiku-4-5", "Haiku 4.5");
+        assert!(!haiku4.reasoning);
+        let sonnet37 = anthropic_model_caps("claude-3-7-sonnet-20250219", "Sonnet 3.7");
+        assert!(sonnet37.reasoning);
+        // unknown id -> conservative defaults (no thinking, vision on)
+        let unknown = anthropic_model_caps("claude-future-9", "Future");
+        assert!(!unknown.reasoning);
+        assert!(unknown.vision);
+    }
+
+    #[test]
+    fn parse_anthropic_models_parses_and_dedups() {
+        let data = json!({
+            "data": [
+                { "id": "claude-sonnet-4-5", "display_name": "Sonnet 4.5" },
+                { "id": "claude-opus-4-1", "display_name": "Opus" },
+                { "id": "claude-sonnet-4-5" }
+            ],
+            "has_more": false
+        });
+        let models = parse_anthropic_models(&data);
+        assert_eq!(models.len(), 2); // dedup by id
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
+        assert!(models[0].reasoning);
+        assert_eq!(models[1].id, "claude-opus-4-1");
+    }
+
+    #[test]
+    fn parse_anthropic_models_falls_back_when_empty() {
+        // no data array -> static fallback list
+        let models = parse_anthropic_models(&json!({}));
+        assert!(!models.is_empty());
+        assert!(models.iter().any(|m| m.id.contains("sonnet")));
+        // empty data array -> fallback too
+        let models = parse_anthropic_models(&json!({ "data": [] }));
+        assert!(!models.is_empty());
+    }
+
+    // ---- mocked-provider integration tests ----
+    // A tiny one-shot HTTP server so summarize/extract_facts exercise the real
+    // reqwest HTTP path (request build, POST /chat/completions, JSON parse)
+    // end-to-end against a canned OpenAI response — not just the parsers.
+    fn find_header_end(b: &[u8]) -> Option<usize> {
+        b.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    async fn mock_openai_server(response_body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let h = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while find_header_end(&buf).is_none() {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let header_end = find_header_end(&buf).unwrap_or(buf.len());
+            let header_str = String::from_utf8_lossy(&buf[..header_end]);
+            let clen = header_str
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            let mut have = buf.len().saturating_sub(body_start);
+            while have < clen {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                have += n;
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (base, h)
+    }
+
+    fn mock_provider(base: String) -> ResolvedProvider {
+        ResolvedProvider {
+            name: "mock".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            headers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_against_mock_provider() {
+        let body = r#"{"choices":[{"message":{"content":"<summary>mocked</summary>"}}]}"#;
+        let (base, _h) = mock_openai_server(body.into()).await;
+        let client = reqwest::Client::new();
+        let provider = mock_provider(base);
+        let cancel = CancellationToken::new();
+        let msgs = vec![
+            json!({ "role": "user", "content": "please refactor the auth module" }),
+            json!({ "role": "assistant", "content": "on it" }),
+        ];
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        assert_eq!(out.as_deref(), Some("<summary>mocked</summary>"));
+    }
+
+    #[tokio::test]
+    async fn extract_facts_none_short_circuits() {
+        let body = r#"{"choices":[{"message":{"content":"none"}}]}"#;
+        let (base, _h) = mock_openai_server(body.into()).await;
+        let client = reqwest::Client::new();
+        let provider = mock_provider(base);
+        let cancel = CancellationToken::new();
+        let msgs = vec![json!({ "role": "user", "content": "hello" })];
+        let out = extract_facts(&client, &provider, "mock-model", &msgs, &cancel).await;
+        assert!(out.is_none(), "a 'none' reply must not be persisted as a fact");
+    }
+
+    #[tokio::test]
+    async fn summarize_returns_none_on_http_error() {
+        let body = ""; // 200 with empty body -> JSON parse fails -> None
+        let (base, _h) = mock_openai_server(body.into()).await;
+        let client = reqwest::Client::new();
+        let provider = mock_provider(base);
+        let cancel = CancellationToken::new();
+        let msgs = vec![json!({ "role": "user", "content": "x" })];
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        assert!(out.is_none());
     }
 }

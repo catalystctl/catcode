@@ -121,6 +121,71 @@ pub fn save_memory(
     Store::new(Store::default_root()).save(workspace, name, content, mem_type, description)
 }
 
+/// Append `new_facts` to an existing memory (same name/slug), capped to
+/// `max_bytes` by trimming the oldest facts from the front (on a line boundary).
+/// Unlike `save_memory` (which overwrites), this accumulates durable facts across
+/// compactions so early-session facts aren't lost when later compactions fire —
+/// the rolling cap keeps the file bounded instead of growing forever.
+pub fn append_memory(
+    workspace: &Path,
+    name: &str,
+    new_facts: &str,
+    mem_type: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, String> {
+    append_memory_into(
+        &Store::new(Store::default_root()),
+        workspace,
+        name,
+        new_facts,
+        mem_type,
+        description,
+        max_bytes,
+    )
+}
+
+fn append_memory_into(
+    store: &Store,
+    workspace: &Path,
+    name: &str,
+    new_facts: &str,
+    mem_type: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, String> {
+    let dir = store.dir(workspace);
+    let slug = slugify(name);
+    let path = dir.join(format!("{slug}.md"));
+    let mut combined = match parse_memory_file(&path) {
+        Some(m) if !m.content.is_empty() => {
+            let mut s = m.content;
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("\n--- appended ---\n");
+            s.push_str(new_facts);
+            s
+        }
+        _ => new_facts.to_string(),
+    };
+    if combined.len() > max_bytes {
+        // Keep the newest facts (the tail, since we append) and trim the oldest
+        // from the front. We keep the last `max_bytes` verbatim; a mid-line start
+        // is acceptable for a rolling fact buffer (a giant single-line fact must
+        // not be dropped entirely just because it has no newline to snap to).
+        let mut start = combined.len() - max_bytes;
+        while !combined.is_char_boundary(start) {
+            start += 1;
+        }
+        combined = format!(
+            "[older auto-extracted facts trimmed to fit]\n{}",
+            &combined[start..]
+        );
+    }
+    store.save(workspace, name, &combined, mem_type, description)
+}
+
 /// Delete a memory by its slug/id (the filename stem) and rebuild the index.
 /// Accepts either the slug (file stem) or the original memory `name` — slugify()
 /// normalizes both to the same filename, so only the slug candidate is needed.
@@ -605,5 +670,34 @@ mod tests {
 
         let entries = store.scan(&ws);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn append_memory_accumulates_and_caps() {
+        let root = tmp_root();
+        let ws = fake_workspace("append");
+        let store = test_store(&root);
+        // first append: no existing file -> writes new facts
+        let _ = append_memory_into(&store, &ws, "facts", "fact A", "note", "d", 4096).unwrap();
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("fact A"), "{}", entries[0].content);
+
+        // second append: accumulates onto the first (does NOT overwrite)
+        let _ = append_memory_into(&store, &ws, "facts", "fact B", "note", "d", 4096).unwrap();
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1);
+        let c = &entries[0].content;
+        assert!(c.contains("fact A"), "early fact must survive: {c}");
+        assert!(c.contains("fact B"), "new fact must be present: {c}");
+
+        // third append exceeds the cap -> oldest facts trimmed, newest survive
+        let _ = append_memory_into(&store, &ws, "facts", &"new big fact ".repeat(400), "note", "d", 4096).unwrap();
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1);
+        let c = &entries[0].content;
+        assert!(c.contains("trimmed to fit"), "must note trimming: {c}");
+        assert!(c.contains("new big fact"), "newest must survive trimming: {c}");
+        assert!(!c.contains("fact A"), "oldest should be trimmed away: {c}");
     }
 }

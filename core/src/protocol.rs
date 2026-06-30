@@ -30,7 +30,19 @@ pub enum Command {
     #[serde(rename = "init")]
     Init,
     #[serde(rename = "set_key")]
-    SetKey { api_key: String },
+    SetKey {
+        api_key: String,
+        /// Optional provider name this key applies to. When omitted, the key
+        /// applies to the currently active provider (backward-compatible with
+        /// the pre-provider single-endpoint flow).
+        #[serde(default)]
+        provider: Option<String>,
+    },
+    /// Switch the active model provider at runtime. Re-resolves base URL / key /
+    /// wire protocol, re-discovers models, and emits `provider_changed` + a
+    /// fresh `models` event. Unknown names are ignored (stays on current).
+    #[serde(rename = "set_provider")]
+    SetProvider { name: String },
     #[serde(rename = "send")]
     Send {
         prompt: String,

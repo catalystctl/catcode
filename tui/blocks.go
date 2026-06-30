@@ -193,9 +193,9 @@ func (s *session) logToolResult(output string) {
 	s.refresh()
 }
 
-func (s *session) logApprove(tool, args string) {
+func (s *session) logApproveDiff(tool, args, diff string) {
 	b := s.push(blkApprove)
-	b.name, b.args = tool, args
+	b.name, b.args, b.diff = tool, args, diff
 	s.refresh()
 }
 
@@ -277,7 +277,11 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		// compact history marker; the live decision is the sticky banner
 		head := warnStyle.Render("? approve ") + toolNameStyle.Render(b.name) +
 			toolDetailStyle.Render("("+truncate(b.args, 60)+")")
-		return head + dimStyle.Render("   [y]es  [n]o  [a]lways")
+		head += dimStyle.Render("   [y]es  [n]o  [a]lways")
+		if strings.TrimSpace(b.diff) != "" {
+			head += "\n" + renderDiffPanel(b.diff, b.expanded, s.width)
+		}
+		return head
 	case blkRaw:
 		return b.text.String()
 	}

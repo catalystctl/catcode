@@ -23,7 +23,7 @@ import (
 //   banner   (1)   approval prompt (when pending)
 //   panel    (?)   active-tasks box (when a scout is in flight)
 //   inputbox (3)   bordered chat input
-//   footer   (1)   status line: state · model · metrics · context
+//   footer   (2)   line 1: state·model·approval·think  |  line 2: metrics·context
 //
 // The posbar is always reserved so scrolling up never reflows the transcript.
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ import (
 const (
 	headerLines      = 3 // brand row + cwd row + separator
 	positionBarLines = 1 // scroll-position / new-messages bar
-	footerLines      = 4 // bordered input (3) + status line (1)
+	footerLines      = 5 // bordered input (3) + two status lines (identity, metrics/context)
 	minBodyLines     = 3
 )
 
@@ -41,7 +41,7 @@ func (s *session) layout() {
 	}
 	extra := s.activeTasksHeight()
 	if s.pendingApproval != nil {
-		extra++
+		extra += s.approvalHeight()
 	}
 	if s.pendingIntercom != nil {
 		extra++
@@ -131,22 +131,36 @@ func (s *session) renderPositionBar() string {
 }
 
 // approvalBanner: a full-width sticky bar shown while a decision is pending.
+// For write/edit/patch a unified-diff preview of the resulting change is
+// rendered below the bar (via the shared diff panel) so the human approves the
+// actual change, not just the raw search/replace blobs.
 func (s *session) renderApprovalBanner() string {
 	a := s.pendingApproval
 	args := truncate(a.args, max(1, s.width-40))
 	msg := fmt.Sprintf("⚠  approve %s(%s)   [y]es   [n]o   [a]lways", a.tool, args)
-	return lipgloss.NewStyle().
+	banner := lipgloss.NewStyle().
 		Width(s.width).
 		Background(lipgloss.Color(c.warn)).
 		Foreground(lipgloss.Color(c.bg)).
 		Bold(true).
 		Padding(0, 1).
 		Render(msg)
+	if strings.TrimSpace(a.diff) != "" {
+		banner += "\n" + renderDiffPanel(a.diff, false, s.width)
+	}
+	return banner
 }
 
-// renderFooter: the status rail under the input box — state · leader · model ·
-// approval on the left, throughput metrics centered, context budget on the right.
+// renderFooter: the status rail under the input box, split across two lines so
+// each carries one concern instead of cramming everything onto a single row:
+//
+//	line 1 — identity/state: working|ready badge · leader · model · approval · think effort [· mouse]
+//	line 2 — performance: throughput + cache hit (left) · context budget (right)
+//
+// Splitting the old single line lets the metrics breathe and keeps the state
+// read glanceable.
 func (s *session) renderFooter() string {
+	// Line 1 — state & identity.
 	var left strings.Builder
 	if s.busy {
 		left.WriteString(s.spinner.View())
@@ -173,90 +187,75 @@ func (s *session) renderFooter() string {
 	if s.settings.MouseWheel {
 		left.WriteString(dimStyle.Render(" · mouse:on"))
 	}
+	statusLine := left.String()
 
+	// Line 2 — metrics (left) + context budget (right). Both can be empty
+	// before the first turn; then we emit just the status line.
 	mid := s.renderMetrics()
-	midStyled := ""
-	if mid != "" {
-		midStyled = mutedStyle.Render(mid)
-	}
 	right := s.renderContext()
-	return fitRow3(s.width, left.String(), midStyled, right)
+	if mid == "" && right == "" {
+		return statusLine
+	}
+	return statusLine + "\n" + fitRow(s.width, mutedStyle.Render(mid), right)
 }
 
-// renderMetrics builds the centred throughput string from the last metrics
-// event. Shows TPS (rounded to the nearest integer) and TTFT, plus — when the
-// endpoint reports prefix-cache hits — the cached-token fraction
-// (e.g. "42 tok/s · 180ms ttft · 87% cached"). The cached fraction confirms the
-// stable-prefix strategy is landing cache hits turn over turn.
+// renderMetrics builds the throughput string for the footer's second line:
+// TPS (rounded to the nearest integer) and TTFT, plus the prefix-cache hit rate
+// (e.g. "42 tok/s · 180ms ttft · 87% cached").
+//
+// The cache rate has a wrinkle: the live mid-stream metrics event omits
+// cached_tokens — it only lands in the turn-end metrics. So while a turn is in
+// flight there's no cache number for *this* turn yet. We fall back to the
+// previous turn's measured rate (captured in s.lastCachePct by the metrics
+// handler) and prefix it with "~" so it reads as "from last turn", not a live
+// reading. Once the turn-end metrics arrive (cached_tokens present), the fresh,
+// un-tilde'd rate is shown.
 func (s *session) renderMetrics() string {
-	if len(s.lastMetrics) == 0 {
-		return ""
-	}
 	var m map[string]json.RawMessage
-	if json.Unmarshal(s.lastMetrics, &m) != nil {
-		return ""
-	}
-	tps := get(m, "tps")
-	out := ""
-	if tps != "" && tps != "null" {
-		// Round to the nearest integer so the footer reads "71 tok/s"
-		// rather than "71.123132991239 tok/s".
-		if f, err := strconv.ParseFloat(tps, 64); err == nil {
-			out = fmt.Sprintf("%d tok/s", int(math.Round(f)))
-		} else {
-			out = fmt.Sprintf("%s tok/s", tps)
+	haveLive := len(s.lastMetrics) > 0 && json.Unmarshal(s.lastMetrics, &m) == nil
+
+	var out string
+	if haveLive {
+		tps := get(m, "tps")
+		if tps != "" && tps != "null" {
+			// Round to the nearest integer so the footer reads "71 tok/s"
+			// rather than "71.123132991239 tok/s".
+			if f, err := strconv.ParseFloat(tps, 64); err == nil {
+				out = fmt.Sprintf("%d tok/s", int(math.Round(f)))
+			} else {
+				out = fmt.Sprintf("%s tok/s", tps)
+			}
 		}
-	}
-	// Time-to-first-token for this turn (latency, not throughput).
-	if ttft := get(m, "ttft_ms"); ttft != "" && ttft != "null" {
-		if out != "" {
-			out += fmt.Sprintf(" · %sms ttft", ttft)
-		} else {
-			out = fmt.Sprintf("%sms ttft", ttft)
-		}
-	}
-	// Cached-token hit rate for this turn. cached_tokens / prompt_tokens
-	// (the prompt is what gets cached; tokens_in now includes output too).
-	if cached := get(m, "cached_tokens"); cached != "" && cached != "null" && cached != "0" {
-		tin := get(m, "prompt_tokens")
-		if tin == "" || tin == "null" || tin == "0" {
-			tin = get(m, "tokens_in")
-		}
-		if tin != "" && tin != "null" && tin != "0" {
-			if cN, err := strconv.ParseUint(cached, 10, 64); err == nil && cN > 0 {
-				if tN, err := strconv.ParseUint(tin, 10, 64); err == nil && tN > 0 {
-					pct := cN * 100 / tN
-					if out != "" {
-						out += fmt.Sprintf(" · %d%% cached", pct)
-					} else {
-						out = fmt.Sprintf("%d%% cached", pct)
-					}
-				}
+		// Time-to-first-token for this turn (latency, not throughput).
+		if ttft := get(m, "ttft_ms"); ttft != "" && ttft != "null" {
+			if out != "" {
+				out += fmt.Sprintf(" · %sms ttft", ttft)
+			} else {
+				out = fmt.Sprintf("%sms ttft", ttft)
 			}
 		}
 	}
-	return out
-}
 
-func fitRow3(width int, left, mid, right string) string {
-	tl := lipgloss.Width(left)
-	tr := lipgloss.Width(right)
-	tm := lipgloss.Width(mid)
-
-	// place mid centered, right flush; fall back to left/right if too narrow.
-	if tm > 0 && width-(tl+tr+4) >= tm {
-		leftMid := (width - tm) / 2
-		leftPad := leftMid - tl
-		if leftPad < 2 {
-			leftPad = 2
-		}
-		rightPad := width - tl - leftPad - tm - tr
-		if rightPad < 2 {
-			rightPad = 2
-		}
-		return left + strings.Repeat(" ", leftPad) + mid + strings.Repeat(" ", rightPad) + right
+	// Prefix-cache hit rate. cached_tokens present in the live metrics ⇒ this
+	// is the turn-end number (fresh); absent ⇒ mid-stream, so carry the last
+	// turn's rate and mark it "~" so it isn't mistaken for a live reading.
+	fresh := false
+	if haveLive {
+		c := get(m, "cached_tokens")
+		fresh = c != "" && c != "null" && c != "0"
 	}
-	return fitRow(width, left, right)
+	if s.lastCachePct > 0 {
+		cacheStr := fmt.Sprintf("%d%% cached", s.lastCachePct)
+		if !fresh {
+			cacheStr = "~" + cacheStr
+		}
+		if out != "" {
+			out += " · " + cacheStr
+		} else {
+			out = cacheStr
+		}
+	}
+	return out
 }
 
 // fitRow places left flush and right flush, padding the gap.
@@ -417,6 +416,15 @@ func (s *session) activeTasksHeight() int {
 		return 0
 	}
 	return lipgloss.Height(p)
+}
+
+// approvalHeight is the lines the sticky approval banner (plus its diff
+// preview, when present) claims, so layout() shrinks the viewport to fit.
+func (s *session) approvalHeight() int {
+	if s.pendingApproval == nil {
+		return 0
+	}
+	return lipgloss.Height(s.renderApprovalBanner())
 }
 
 func (s *session) View() string {

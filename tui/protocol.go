@@ -39,6 +39,7 @@ type approvalPrompt struct {
 	requestID string
 	tool      string
 	args      string
+	diff      string // unified-diff preview for write/edit/patch (empty for other tools)
 }
 
 type subProgressEntry struct {

@@ -8,6 +8,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod config;
+mod fetch_tool;
 mod git_ctx;
 mod intercom;
 mod logging;
@@ -21,7 +22,7 @@ mod tools;
 mod vision;
 mod workspace;
 
-use config::{Approval, Config, PermissionRule};
+use config::{Approval, Config, PermissionRule, ResolvedProvider};
 use git_ctx::{git_context_injection, read_git_context};
 use intercom::IntercomBus;
 use logging::{estimate_message_tokens, estimate_messages_tokens, Logger, TurnTimer};
@@ -29,7 +30,7 @@ use memory::memory_injection;
 use plugins::{PluginManager, PLUGIN_DOCS};
 use protocol::{emit, Command, Event, ModelInfo};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -121,7 +122,14 @@ pub struct PendingApproval {
 
 pub struct State {
     pub cfg: RwLock<Config>,
-    pub api_key: RwLock<Option<String>>,
+    /// Per-provider runtime API keys (set via `set_key {provider,api_key}`).
+    /// Keyed by provider name; the active provider's key (if present) wins over
+    /// config literals/env vars during resolution. The "default" slot holds the
+    /// legacy single key when no providers are configured.
+    pub api_keys: RwLock<HashMap<String, String>>,
+    /// Runtime override of the active provider name (set via `set_provider`).
+    /// Wins over `cfg.active_provider`; None => use config's active provider.
+    pub active_provider: RwLock<Option<String>>,
     pub conversation: Mutex<Vec<Value>>,
     pub models: RwLock<Vec<ModelInfo>>,
     pub current: Mutex<Option<CancellationToken>>,
@@ -161,6 +169,21 @@ pub struct State {
     pub subagent_runs: Mutex<std::collections::HashMap<String, subagent::SubagentRun>>,
 }
 
+impl State {
+    /// Resolve the active provider for an API call: kind, base URL, effective
+    /// API key (runtime override -> config literal -> config env var -> global
+    /// env), and extra headers. Combines the config snapshot with the runtime
+    /// active-provider override and per-provider keys. This is the single
+    /// source of truth every provider call site uses, so switching providers
+    /// (or setting a key) takes effect on the next call with no other wiring.
+    pub async fn resolved_provider(&self) -> ResolvedProvider {
+        let cfg = self.cfg.read().await;
+        let active = self.active_provider.read().await.clone();
+        let keys = self.api_keys.read().await.clone();
+        cfg.resolve_provider_with(&keys, active.as_deref())
+    }
+}
+
 /// Generate a unique filename for a new session file. std has no date
 /// formatting; the picker shows the derived title, not the filename, so a
 /// monotonic nanos id is fine. Used only as a fallback when the TUI does not
@@ -180,10 +203,12 @@ async fn main() {
         .build()
         .expect("client");
 
-    // Discover models up front (live /models/info, snapshot fallback).
-    let models = provider::discover_models(&client, &cfg.base_url).await;
+    // Discover models up front for the active provider (live endpoint, snapshot
+    // fallback). At init there are no runtime keys yet, so resolve from config.
+    let init_provider = cfg.resolve_provider(&HashMap::new());
+    let models = provider::discover_models(&client, &init_provider).await;
     let logger = Logger::new(cfg.debug_log.as_deref());
-    logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "base_url": cfg.base_url, "approval": cfg.approval.as_str() }));
+    logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
 
     // Resume session if configured and present. A future-version session file
     // returns Err (surfaced to the user via an `error` event at Init) rather
@@ -231,7 +256,8 @@ async fn main() {
     let vision_cfg = VisionConfig::load(&cfg.workspace);
     let state = Arc::new(State {
         cfg: RwLock::new(cfg),
-        api_key: RwLock::new(None),
+        api_keys: RwLock::new(HashMap::new()),
+        active_provider: RwLock::new(None),
         conversation: Mutex::new(resumed),
         models: RwLock::new(models),
         current: Mutex::new(None),
@@ -277,7 +303,8 @@ async fn main() {
         match cmd {
             Command::Init => {
                 let models = state.models.read().await.clone();
-                let authed = state.api_key.read().await.is_some();
+                let rp = state.resolved_provider().await;
+                let authed = rp.api_key.is_some();
                 let cfg = state.cfg.read().await;
                 let conv_len = state.conversation.lock().await.len();
                 emit(
@@ -286,7 +313,10 @@ async fn main() {
                         .with("authed", json!(authed))
                         .with("workspace", json!(cfg.workspace.display().to_string()))
                         .with("approval", json!(cfg.approval.as_str()))
-                        .with("base_url", json!(cfg.base_url))
+                        .with("base_url", json!(rp.base_url))
+                        .with("provider", json!(rp.name))
+                        .with("providerKind", json!(rp.kind.as_str()))
+                        .with("providers", json!(cfg.provider_names()))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("resumed_messages", json!(conv_len)),
                 );
@@ -310,9 +340,51 @@ async fn main() {
                     );
                 }
             }
-            Command::SetKey { api_key } => {
-                *state.api_key.write().await = Some(api_key);
-                emit(&Event::new("authed").with("ok", json!(true)));
+            Command::SetKey { api_key, provider } => {
+                // Apply the key to a named provider, or to the active provider
+                // when no name is given (backward-compatible with the pre-provider
+                // single-key flow, which lands in the "default" slot).
+                let name = match provider {
+                    Some(p) => p,
+                    None => state.resolved_provider().await.name,
+                };
+                state.api_keys.write().await.insert(name.clone(), api_key);
+                state.logger.log("set_key", json!({ "provider": name }));
+                emit(&Event::new("authed").with("ok", json!(true)).with("provider", json!(name)));
+            }
+            Command::SetProvider { name } => {
+                // Switch the active provider at runtime, then re-discover models
+                // for the new endpoint. Unknown names are ignored (stays put).
+                {
+                    let cfg = state.cfg.read().await;
+                    if cfg.find_provider(&name).is_none() {
+                        emit(
+                            &Event::new("error").with(
+                                "message",
+                                json!(format!("unknown provider '{name}'; not switching")),
+                            ),
+                        );
+                        return;
+                    }
+                }
+                *state.active_provider.write().await = Some(name.clone());
+                let rp = state.resolved_provider().await;
+                // Re-discover models for the new provider (bypass cache freshness
+                // by relying on the 8h TTL; switching is rare so a cache hit is fine).
+                let models = provider::discover_models(&client, &rp).await;
+                *state.models.write().await = models.clone();
+                state.logger.log(
+                    "set_provider",
+                    json!({ "provider": rp.name, "kind": rp.kind.as_str(), "base_url": rp.base_url }),
+                );
+                emit(
+                    &Event::new("provider_changed")
+                        .with("provider", json!(rp.name))
+                        .with("kind", json!(rp.kind.as_str()))
+                        .with("base_url", json!(rp.base_url))
+                        .with("has_key", json!(rp.api_key.is_some())),
+                );
+                emit(&Event::new("models").with("models", json!(models)));
             }
             Command::SetApproval { mode } => {
                 let new = Approval::parse(&mode);
@@ -1259,20 +1331,29 @@ async fn run_turn(
                 dispatch_lifecycle(st, "pre_compact").await;
                 let est = { *st.estimated_tokens.lock().await };
                 let cfg = st.cfg.read().await.clone();
-                match st.api_key.read().await.clone() {
-                    Some(key) => {
-                        compact_with_summary(
-                            client,
-                            &cfg,
-                            &key,
-                            &model,
-                            &mut messages,
-                            &cancel,
-                            false,
-                        )
-                        .await
-                    }
-                    None => compact_conversation(&mut messages, 0),
+                let rp = st.resolved_provider().await;
+                let idle_ctx = st
+                    .models
+                    .read()
+                    .await
+                    .iter()
+                    .find(|m| m.id == model)
+                    .map(|m| m.context_window as u64)
+                    .unwrap_or(200_000);
+                if rp.api_key.is_some() {
+                    compact_with_summary(
+                        client,
+                        &cfg,
+                        &rp,
+                        &model,
+                        &mut messages,
+                        &cancel,
+                        false,
+                        idle_ctx,
+                    )
+                    .await
+                } else {
+                    compact_conversation(&mut messages, idle_ctx)
                 }
                 *st.conversation.lock().await = messages.clone();
                 if let Some(p) = cfg.session_file.as_ref() {
@@ -1312,14 +1393,22 @@ async fn run_turn(
             }
         }
 
-        let api_key = {
-            let k = st.api_key.read().await.clone();
-            match k {
-                Some(k) => k,
+        // Resolve the active provider for this turn. Errors out if no API key is
+        // available for it (runtime override -> config literal -> env var).
+        let provider = {
+            let rp = st.resolved_provider().await;
+            match rp.api_key.as_ref() {
+                Some(_) => rp,
                 None => {
                     emit(
                         &Event::new("error")
-                            .with("message", json!("no API key set; use set_key first")),
+                            .with(
+                                "message",
+                                json!(format!(
+                                    "no API key set for provider '{}'; use set_key first",
+                                    rp.name
+                                )),
+                            ),
                     );
                     emit(&Event::new("done"));
                     return;
@@ -1333,14 +1422,14 @@ async fn run_turn(
         // configured threshold is higher, and force the summarize strategy even
         // when disabled (naive drop-oldest may not reclaim enough at critical capacity).
         let mut messages = st.conversation.lock().await.clone();
-        let (model_ctx, thinking_levels) = st
+        let (model_ctx, thinking_levels, max_tokens) = st
             .models
             .read()
             .await
             .iter()
             .find(|m| m.id == model)
-            .map(|m| (m.context_window as u64, m.thinking_levels.clone()))
-            .unwrap_or((200_000, Vec::new()));
+            .map(|m| (m.context_window as u64, m.thinking_levels.clone(), m.max_tokens))
+            .unwrap_or((200_000, Vec::new(), 8_192));
         let mut est = { *st.estimated_tokens.lock().await };
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
@@ -1381,11 +1470,12 @@ async fn run_turn(
             compact_with_summary(
                 client,
                 &cfg,
-                &api_key,
+                &provider,
                 &model,
                 &mut messages,
                 &cancel,
                 force_summarize,
+                model_ctx,
             )
             .await;
             *st.conversation.lock().await = messages.clone();
@@ -1426,13 +1516,14 @@ async fn run_turn(
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
             match provider::stream_turn(
                 client,
-                &cfg,
-                &api_key,
+                &provider,
+                cfg.idle_timeout_secs,
                 &model,
                 &messages,
                 &tool_defs,
                 &effort,
                 &thinking_levels,
+                max_tokens,
                 &cancel,
                 &mut timer,
                 false,
@@ -1864,14 +1955,22 @@ async fn run_turn(
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
+                        let timeout_override = exec_args
+                            .get("timeout")
+                            .and_then(|v| v.as_u64());
                         tokio::select! {
-                            o = tools::execute_bash(cmd, &cfg) => o,
+                            o = tools::execute_bash(cmd, &cfg, timeout_override) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
                         }
                     } else if name == "bulk" {
                         tokio::select! {
                             o = tools::execute_bulk(&exec_args, &cfg, &bulk_denied) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("bulk aborted"),
+                        }
+                    } else if name == "fetch" {
+                        tokio::select! {
+                            o = tools::execute_fetch(&exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("fetch aborted"),
                         }
                     } else if name == "diagnostics" {
                         tokio::select! {
@@ -1882,7 +1981,7 @@ async fn run_turn(
                         subagent::execute(
                             st.clone(),
                             client.clone(),
-                            api_key.clone(),
+                            provider.clone(),
                             model.clone(),
                             exec_args.clone(),
                             cancel.clone(),
@@ -2054,12 +2153,47 @@ pub(crate) async fn request_approval(
         .lock()
         .await
         .insert(request_id.clone(), pending.clone());
-    emit(
-        &Event::new("approval_request")
-            .with("request_id", json!(request_id))
-            .with("tool", json!(name))
-            .with("args", json!(args)),
-    );
+    // Surface the resulting change to the human, not just the raw search/replace
+    // blobs: compute the unified diff the call *would* produce (without writing)
+    // and attach it to the approval_request event so the TUI can render it. Only
+    // write/edit/patch produce a file diff; other destructive tools (bash, git)
+    // carry no preview.
+    let cfg = st.cfg.read().await.clone();
+    let args_v: Value = serde_json::from_str(args).unwrap_or(json!({}));
+    let diff: Option<String> = match name {
+        "write_file" => {
+            let path = args_v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args_v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            tools::preview_diff_write(path, content, &cfg).ok()
+        }
+        "edit" => {
+            let path = args_v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            match args_v.get("edits").and_then(|v| v.as_array()) {
+                Some(e) if !e.is_empty() => tools::preview_diff_edit(path, e, &cfg).ok(),
+                _ => None,
+            }
+        }
+        "patch" => {
+            let path = args_v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let patch = args_v.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() && !patch.is_empty() {
+                tools::preview_diff_patch(path, patch, &cfg).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let evt = Event::new("approval_request")
+        .with("request_id", json!(request_id))
+        .with("tool", json!(name))
+        .with("args", json!(args));
+    let evt = if let Some(d) = &diff {
+        evt.with("diff", json!(d))
+    } else {
+        evt
+    };
+    emit(&evt);
 
     // Wait for the approve command or abort.
     let granted = tokio::select! {
@@ -2273,55 +2407,85 @@ async fn refresh_memory_injection(state: &State) -> String {
     }
 }
 
-pub fn compact_conversation(messages: &mut Vec<Value>, _ctx: u64) {
-    // Keep: system (first), and the last ~10 messages verbatim.
-    // Drop tool messages (role == "tool") in the middle band to reclaim tokens.
+/// Index where the kept verbatim tail begins, chosen by token budget rather
+/// than a fixed message count. Walks backward from the end accumulating
+/// `estimate_message_tokens` until the budget (25% of the context window,
+/// floored at 6k tokens) is exceeded, always keeping at least `MIN_TAIL`
+/// messages. A fixed count over-keeps a quiet stretch and under-keeps when a
+/// huge tool result eats the whole window; a budget keeps the live context
+/// that actually fits and lets the summary reclaim the rest.
+fn token_budget_tail_start(messages: &[Value], context_window: u64) -> usize {
+    const MIN_TAIL: usize = 6;
+    const TAIL_FRACTION: f32 = 0.25;
+    let n = messages.len();
+    if n <= MIN_TAIL {
+        return 0;
+    }
+    let budget = ((context_window as f32 * TAIL_FRACTION) as u64).max(6_000);
+    let mut acc: u64 = 0;
+    let mut start = n;
+    for i in (0..n).rev() {
+        let t = estimate_message_tokens(&messages[i]);
+        // Always keep the most recent MIN_TAIL messages; only enforce the
+        // budget on older ones so a single giant tool result can't shrink the
+        // tail to nothing.
+        if i < n.saturating_sub(MIN_TAIL) && acc + t > budget {
+            break;
+        }
+        acc += t;
+        start = i;
+    }
+    start
+}
+
+/// Naive compaction fallback: keep the system prompt + a token-budgeted tail
+/// verbatim, drop the middle with a marker. `context_window` sizes the tail
+/// (0/unset → the 6k floor). Used when summarization is disabled or unavailable.
+pub fn compact_conversation(messages: &mut Vec<Value>, context_window: u64) {
     if messages.len() <= 12 {
         return;
     }
     let system = messages[0].clone();
-    let tail_start = messages.len().saturating_sub(10);
+    let tail_start = token_budget_tail_start(messages, context_window).max(1);
     let tail: Vec<Value> = messages[tail_start..].to_vec();
     let mut compacted = vec![system];
-    // Insert a marker so the model knows history was trimmed.
     compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped.]" }));
     compacted.extend(tail);
     *messages = compacted;
 }
 
 /// Compact a conversation by summarizing older turns into one system message,
-/// keeping the system prompt + last 8 messages verbatim. Falls back to the
-/// naive drop-oldest (`compact_conversation`) when summarization is disabled
-/// and not forced, or when there's too little middle to summarize. On summary
-/// failure, degrades to a drop-oldest marker so the turn still proceeds.
-/// `force_summarize` overrides `summarize_on_compact=false` — used by the 95%
-/// hard cap where naive drop-oldest may not reclaim enough.
+/// keeping the system prompt + a token-budgeted tail verbatim. Falls back to
+/// the naive drop-oldest (`compact_conversation`) when summarization is
+/// disabled and not forced, or when there's too little middle to summarize. On
+/// summary failure, degrades to a drop-oldest marker so the turn still
+/// proceeds. `force_summarize` overrides `summarize_on_compact=false` — used by
+/// the 95% hard cap where naive drop-oldest may not reclaim enough.
 pub async fn compact_with_summary(
     client: &reqwest::Client,
     cfg: &Config,
-    api_key: &str,
+    provider: &ResolvedProvider,
     model: &str,
     messages: &mut Vec<Value>,
     cancel: &CancellationToken,
     force_summarize: bool,
+    context_window: u64,
 ) {
     if messages.len() <= 4 {
         return;
     }
     if !cfg.summarize_on_compact && !force_summarize {
-        compact_conversation(messages, 0);
+        compact_conversation(messages, context_window);
         return;
     }
-    // tail_start <= 1 means the kept tail covers everything after system —
-    // nothing in the middle to summarize, and messages[1..0] would panic.
-    let tail_start = messages.len().saturating_sub(8);
+    let tail_start = token_budget_tail_start(messages, context_window).max(1);
     if tail_start <= 1 {
-        compact_conversation(messages, 0);
+        compact_conversation(messages, context_window);
         return;
     }
     let to_summarize: Vec<Value> = messages[1..tail_start].to_vec();
     let kept: Vec<Value> = messages[tail_start..].to_vec();
-    let summary = provider::summarize(client, cfg, api_key, model, &to_summarize, cancel).await;
+    let summary = provider::summarize(client, provider, model, &to_summarize, cancel).await;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
         compacted.push(
@@ -2331,19 +2495,20 @@ pub async fn compact_with_summary(
         compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
     }
     // Session memory extraction: persist durable facts so future sessions inherit
-    // project knowledge. Best-effort; never blocks compaction. A fixed memory
-    // name ("session-extract") rolls forward — it overwrites rather than spamming
-    // one entry per compaction.
+    // project knowledge. Best-effort; never blocks compaction. Facts ACCUMULATE
+    // across compactions (append, not overwrite) so early-session facts survive,
+    // with a rolling byte cap so the file stays bounded.
     if cfg.summarize_on_compact {
         if let Some(facts) =
-            provider::extract_facts(client, cfg, api_key, model, &to_summarize, cancel).await
+            provider::extract_facts(client, provider, model, &to_summarize, cancel).await
         {
-            let _ = memory::save_memory(
+            let _ = memory::append_memory(
                 &cfg.workspace,
                 "session-extract",
                 &facts,
                 "session",
-                "auto-extracted durable facts (updated on compaction)",
+                "auto-extracted durable facts (accumulated on compaction)",
+                16_384,
             );
         }
     }
@@ -2582,5 +2747,50 @@ mod digest_tests {
             "bash digest should not promise side-effect-free recovery: {}",
             d
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    fn sys() -> Value {
+        json!({ "role": "system", "content": "sys" })
+    }
+    fn user(t: &str) -> Value {
+        json!({ "role": "user", "content": t })
+    }
+
+    #[test]
+    fn tail_start_keeps_min_tail_on_tiny_budget() {
+        // 20 messages each big enough that the floor budget (6k tokens) is
+        // exceeded, so the tail trims the middle but always keeps MIN_TAIL (6).
+        let mut m = vec![sys()];
+        for i in 0..20 {
+            m.push(user(&format!("msg {i}: {}", "x".repeat(2000))));
+        }
+        // small context window -> budget hits the 6k floor
+        let s = token_budget_tail_start(&m, 1000);
+        assert!(s >= 1, "must not fold system into the tail: {s}");
+        assert!(s <= m.len() - 6, "must keep at least the min tail: {s}");
+    }
+
+    #[test]
+    fn tail_start_keeps_everything_when_small() {
+        let m = vec![sys(), user("a"), user("b"), user("c")];
+        assert_eq!(token_budget_tail_start(&m, 200_000), 0);
+    }
+
+    #[test]
+    fn tail_start_shrinks_for_huge_recent_result() {
+        // normal turns then one giant tool result: with a small window the
+        // budget keeps only the giant result + the min tail, trimming the rest.
+        let mut m = vec![sys()];
+        for i in 0..40 {
+            m.push(user(&format!("turn {i}")));
+        }
+        m.push(json!({ "role": "tool", "content": "x".repeat(50_000) }));
+        let s = token_budget_tail_start(&m, 1000); // floor budget 6k
+        assert!(s >= m.len() - 7 && s <= m.len() - 6, "kept the giant result + min tail: {s}");
     }
 }

@@ -107,6 +107,21 @@ pub struct Config {
     pub approval: Approval,
     pub bash_timeout_secs: u64,
     pub diag_timeout_secs: u64, // wall-clock timeout for the diagnostics tool (cargo check / tsc / go build)
+    /// Hard cap for a per-call bash timeout override (the `timeout` arg on the
+    /// bash tool). A model can request more time for a slow build/test, but it
+    /// can't escalate past this ceiling (default 600s) without changing config.
+    pub max_bash_timeout_secs: u64,
+    /// Allowlist of host glob patterns the `fetch` tool may contact (e.g.
+    /// `["*.rust-lang.org", "docs.rs", "crates.io"]`). Empty = allow any http(s)
+    /// host (the tool is still useful out of the box, and works under
+    /// `--no-network` where bash curl is dead — PROVIDED you populate this
+    /// allowlist, since `--no-network` + empty allowlist denies fetch to avoid a
+    /// surprise bypass of the egress block). Populate it to restrict egress.
+    pub fetch_allowlist: Vec<String>,
+    /// Wall-clock timeout for the `fetch` tool (default 20s).
+    pub fetch_timeout_secs: u64,
+    /// Max response body the `fetch` tool returns (default 256 KiB).
+    pub fetch_max_bytes: usize,
     pub bash_deny: Vec<String>,
     pub max_read_bytes: u64,
     pub max_read_lines: usize,
@@ -135,6 +150,13 @@ pub struct Config {
     pub bash_deny_regex_compiled: Vec<regex::Regex>, // pre-compiled at startup
     // --- subagent system (pi-subagents port) ---
     pub subagents: SubagentConfig,
+    // --- custom providers (openai/anthropic endpoints) ---
+    /// Named, configurable model providers. Empty = legacy single-endpoint mode
+    /// (uses `base_url` + the runtime key set via `set_key`).
+    pub providers: Vec<ProviderConfig>,
+    /// Name of the active provider. None = use the first configured provider, or
+    /// the legacy default when none are configured.
+    pub active_provider: Option<String>,
 }
 
 /// Intercom bridge mode: controls whether subagents get a coordination channel
@@ -204,6 +226,170 @@ impl Default for SubagentConfig {
     }
 }
 
+/// A model provider: a named OpenAI- or Anthropic-compatible endpoint with
+/// its own base URL, auth, and wire protocol. Defined in config (JSON/env);
+/// switched at runtime via the `set_provider` command.
+///
+/// The harness keeps the *internal* conversation in OpenAI chat-completions
+/// shape (role:"tool", assistant `tool_calls`, ...) because every other layer
+/// (compaction, sanitization, subagents, session persistence) understands
+/// that shape. The provider abstraction only translates at the HTTP boundary:
+/// `kind` decides whether requests/responses are OpenAI-shaped or translated
+/// to/from the Anthropic Messages API. This means adding a provider never
+/// touches the rest of the harness.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum ProviderKind {
+    #[default]
+    OpenAI,
+    Anthropic,
+}
+
+impl ProviderKind {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => ProviderKind::Anthropic,
+            _ => ProviderKind::OpenAI,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::OpenAI => "openai",
+            ProviderKind::Anthropic => "anthropic",
+        }
+    }
+    pub fn is_openai(&self) -> bool {
+        matches!(self, ProviderKind::OpenAI)
+    }
+    pub fn is_anthropic(&self) -> bool {
+        matches!(self, ProviderKind::Anthropic)
+    }
+}
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A configured provider as it appears in the config file/env (no resolved
+/// runtime key). `api_key` is a literal (user-owned config only, never a
+/// project-local file); `api_key_env` names an env var to read instead.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    /// Literal API key stored in the (user-owned, 0600) config file. Optional.
+    pub api_key: Option<String>,
+    /// Name of an env var holding the API key (resolved at request time).
+    pub api_key_env: Option<String>,
+    /// Extra HTTP headers appended to every request (e.g. `HTTP-Referer`).
+    pub headers: Vec<(String, String)>,
+}
+
+/// A provider fully resolved for an API call: kind, base URL, the effective API
+/// key (runtime override -> config literal -> config env var -> global env),
+/// and extra headers. This is what `stream_turn` / `discover_models` /
+/// `summarize` consume — it carries everything provider-specific so those
+/// functions stop depending on `cfg.base_url` + a bare `api_key` string.
+#[derive(Clone, Debug)]
+pub struct ResolvedProvider {
+    pub name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl ResolvedProvider {
+    /// The legacy/default provider when none are configured: OpenAI-shaped,
+    /// `cfg.base_url` for the URL, key resolved from `runtime_keys["default"]`
+    /// then the `UMANS_API_KEY` env var (backward-compatible with the pre-provider
+    /// single-endpoint setup).
+    pub fn legacy_default(
+        cfg: &Config,
+        runtime_keys: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let api_key = runtime_keys
+            .get("default")
+            .cloned()
+            .or_else(|| std::env::var("UMANS_API_KEY").ok())
+            .filter(|s| !s.is_empty());
+        ResolvedProvider {
+            name: "default".to_string(),
+            kind: ProviderKind::OpenAI,
+            base_url: cfg.base_url.clone(),
+            api_key,
+            headers: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    /// Find a configured provider by name (case-sensitive).
+    pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.name == name)
+    }
+
+    /// Names of configured providers in declaration order.
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// Resolve the active provider into a `ResolvedProvider`, combining the
+    /// config definition with per-provider runtime keys (set via `set_key`).
+    ///
+    /// Resolution order for the active provider:
+    ///   1. `active_provider` (if it names a configured provider)
+    ///   2. the first configured provider (if any)
+    ///   3. the legacy default (OpenAI, `cfg.base_url`) when none are configured
+    ///
+    /// API key for the resolved provider:
+    ///   runtime_keys[name] -> provider.api_key -> provider.api_key_env (env) ->
+    ///   (legacy default only) `UMANS_API_KEY` env. Empty values are dropped.
+    pub fn resolve_provider(
+        &self,
+        runtime_keys: &std::collections::HashMap<String, String>,
+    ) -> ResolvedProvider {
+        self.resolve_provider_with(runtime_keys, None)
+    }
+
+    /// Like `resolve_provider` but with an optional runtime override of the
+    /// active provider name (set via `set_provider`). The override wins over
+    /// the config's `active_provider`; an unknown override falls back to the
+    /// first configured provider, then the legacy default.
+    pub fn resolve_provider_with(
+        &self,
+        runtime_keys: &std::collections::HashMap<String, String>,
+        active_override: Option<&str>,
+    ) -> ResolvedProvider {
+        let pick = match active_override.or(self.active_provider.as_deref()) {
+            Some(name) => self
+                .find_provider(name)
+                .cloned()
+                .or_else(|| self.providers.first().cloned()),
+            None => self.providers.first().cloned(),
+        };
+        let Some(p) = pick else {
+            return ResolvedProvider::legacy_default(self, runtime_keys);
+        };
+        let api_key = runtime_keys
+            .get(&p.name)
+            .cloned()
+            .or_else(|| p.api_key.clone())
+            .or_else(|| {
+                p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok())
+            })
+            .filter(|s| !s.is_empty());
+        ResolvedProvider {
+            name: p.name.clone(),
+            kind: p.kind,
+            base_url: p.base_url.clone(),
+            api_key,
+            headers: p.headers.clone(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -212,6 +398,10 @@ impl Default for Config {
             approval: Approval::Destructive,
             bash_timeout_secs: 30,
             diag_timeout_secs: 120, // builds/checks can run longer than bash; bounded so a hung checker can't wedge the turn
+            max_bash_timeout_secs: 600, // a model may ask up to 10 min for one command, but no more
+            fetch_allowlist: Vec::new(), // empty = allow any http(s) host; populate to restrict
+            fetch_timeout_secs: 20,
+            fetch_max_bytes: 262_144, // 256 KiB — enough for a doc page, bounded so a giant response can't OOM
             bash_deny: vec![
                 // ponytail: minimal denylist of obviously catastrophic commands.
                 // Not a security boundary (use a sandbox for that); a tripwire.
@@ -243,6 +433,8 @@ impl Default for Config {
             bash_deny_regex: Vec::new(),
             bash_deny_regex_compiled: Vec::new(),
             subagents: SubagentConfig::default(),
+            providers: Vec::new(),
+            active_provider: None,
         }
     }
 }
@@ -259,6 +451,8 @@ OPTIONS:
       --base-url <URL>          OpenAI-compatible base URL [env: UMANS_BASE_URL]
       --approval <MODE>         never | destructive | always  [env: UMANS_HARNESS_APPROVAL]
       --bash-timeout <SECS>     Per-command bash timeout in seconds [env: UMANS_HARNESS_BASH_TIMEOUT]
+      --max-bash-timeout <SECS>  Ceiling for the bash tool's per-call `timeout` override [env: UMANS_HARNESS_MAX_BASH_TIMEOUT]
+      --fetch-timeout <SECS>    Wall-clock timeout for the `fetch` tool [env: UMANS_HARNESS_FETCH_TIMEOUT]
       --diag-timeout <SECS>     Diagnostics tool (cargo check/tsc/go build) timeout in seconds [env: UMANS_HARNESS_DIAG_TIMEOUT]
       --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: UMANS_HARNESS_SANDBOX]
       --no-network             Block bash network egress (unshare -n) [env: UMANS_HARNESS_NO_NETWORK=1]
@@ -268,6 +462,7 @@ OPTIONS:
       --debug-log <FILE>        Structured JSONL debug log [env: UMANS_HARNESS_DEBUG_LOG]
       --session <FILE>          Append-only JSONL session file (resume on restart) [env: UMANS_HARNESS_SESSION]
       --model <ID>              Default model id
+      --provider <NAME>        Active model provider (openai/anthropic endpoint; see `providers` in config) [env: UMANS_ACTIVE_PROVIDER]
       --config <FILE>           JSON config file (defaults: ./umans-harness.json, ~/.config/umans-harness/config.json)
   -h, --help                    Print this help
   -V, --version                 Print version
@@ -317,6 +512,16 @@ pub fn load() -> Config {
                     c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs);
                 }
             }
+            "--max-bash-timeout" => {
+                if let Some(v) = take_val(&mut i) {
+                    c.max_bash_timeout_secs = v.parse().unwrap_or(c.max_bash_timeout_secs);
+                }
+            }
+            "--fetch-timeout" => {
+                if let Some(v) = take_val(&mut i) {
+                    c.fetch_timeout_secs = v.parse().unwrap_or(c.fetch_timeout_secs);
+                }
+            }
             "--diag-timeout" => {
                 if let Some(v) = take_val(&mut i) {
                     c.diag_timeout_secs = v.parse().unwrap_or(c.diag_timeout_secs);
@@ -341,6 +546,15 @@ pub fn load() -> Config {
             "--model" => {
                 if let Some(v) = take_val(&mut i) {
                     c.default_model = Some(v);
+                }
+            }
+            "--provider" => {
+                // Select the active provider by name at startup (overrides
+                // config/env `activeProvider`). The provider must be defined in
+                // config/env; a name not in the list is ignored with a later
+                // `ready` event surfacing the effective provider.
+                if let Some(v) = take_val(&mut i) {
+                    c.active_provider = Some(v);
                 }
             }
             "--config" => {
@@ -412,6 +626,29 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("UMANS_HARNESS_BASH_TIMEOUT") {
         c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs);
     }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_MAX_BASH_TIMEOUT") {
+        if let Ok(n) = v.parse::<u64>() {
+            c.max_bash_timeout_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_TIMEOUT") {
+        if let Ok(n) = v.parse::<u64>() {
+            c.fetch_timeout_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_MAX_BYTES") {
+        if let Ok(n) = v.parse::<usize>() {
+            c.fetch_max_bytes = n;
+        }
+    }
+    // Comma-separated host glob allowlist for the fetch tool. Empty/unset = any host.
+    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_ALLOWLIST") {
+        c.fetch_allowlist = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
     if let Ok(v) = std::env::var("UMANS_HARNESS_DIAG_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
             c.diag_timeout_secs = n;
@@ -449,6 +686,28 @@ pub fn load() -> Config {
         if let Ok(n) = v.parse::<u64>() {
             c.max_session_tokens = n;
         }
+    }
+
+    // Custom providers. `UMANS_PROVIDERS` is a JSON array of provider objects
+    // (same shape as the config-file `providers` field); merged after the file
+    // layers so env-defined providers are appended (and deduped by name, env
+    // winning). `UMANS_ACTIVE_PROVIDER` selects the active one. `--provider`
+    // (CLI) wins over both.
+    if let Ok(v) = std::env::var("UMANS_PROVIDERS") {
+        if let Ok(arr) = serde_json::from_str::<Value>(&v) {
+            if let Some(list) = arr.as_array() {
+                for p in list {
+                    if let Some(pc) = parse_provider(p) {
+                        if !c.providers.iter().any(|x| x.name == pc.name) {
+                            c.providers.push(pc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("UMANS_ACTIVE_PROVIDER") {
+        c.active_provider = Some(v);
     }
 
     // Pre-compile bash denylist regexes once at startup.
@@ -501,6 +760,21 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(b) = v.get("diag_timeout_secs").and_then(|x| x.as_u64()) {
         c.diag_timeout_secs = b;
+    }
+    if let Some(b) = v.get("max_bash_timeout_secs").and_then(|x| x.as_u64()) {
+        c.max_bash_timeout_secs = b;
+    }
+    if let Some(b) = v.get("fetch_timeout_secs").and_then(|x| x.as_u64()) {
+        c.fetch_timeout_secs = b;
+    }
+    if let Some(b) = v.get("fetch_max_bytes").and_then(|x| x.as_u64()) {
+        c.fetch_max_bytes = b as usize;
+    }
+    if let Some(arr) = v.get("fetch_allowlist").and_then(|x| x.as_array()) {
+        c.fetch_allowlist = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(x) = s("sandbox") {
         c.sandbox = Sandbox::parse(&x);
@@ -622,11 +896,95 @@ fn apply_json(c: &mut Config, v: &Value) {
             }
         }
     }
+    // Custom providers (openai/anthropic endpoints).
+    if let Some(arr) = v.get("providers").and_then(|x| x.as_array()) {
+        for p in arr {
+            if let Some(pc) = parse_provider(p) {
+                c.providers.push(pc);
+            }
+        }
+    }
+    if let Some(name) = v.get("activeProvider").and_then(|x| x.as_str()) {
+        c.active_provider = Some(name.to_string());
+    }
+}
+
+/// Parse one provider object from JSON. Requires a non-empty `name` and
+/// `base_url`; `kind` defaults to `openai`. `headers` accepts an object
+/// `{"K":"V"}` or an array of `["K","V"]` / `{"name","value"}` entries.
+pub fn parse_provider(v: &Value) -> Option<ProviderConfig> {
+    let name = v.get("name").and_then(|x| x.as_str())?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let base_url = v
+        .get("base_url")
+        .or_else(|| v.get("baseUrl"))
+        .and_then(|x| x.as_str())?
+        .to_string();
+    let kind = v
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .map(ProviderKind::parse)
+        .unwrap_or(ProviderKind::OpenAI);
+    let api_key = v
+        .get("api_key")
+        .or_else(|| v.get("apiKey"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let api_key_env = v
+        .get("api_key_env")
+        .or_else(|| v.get("apiKeyEnv"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let headers = parse_headers(v.get("headers"));
+    Some(ProviderConfig {
+        name,
+        kind,
+        base_url,
+        api_key,
+        api_key_env,
+        headers,
+    })
+}
+
+/// Parse a `headers` value into an ordered (name, value) vec. Accepts an
+/// object `{"K":"V"}` or an array of `["K","V"]` / `{"name","value"}`.
+pub fn parse_headers(v: Option<&Value>) -> Vec<(String, String)> {
+    let Some(v) = v else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if let Some(val) = val.as_str() {
+                out.push((k.clone(), val.to_string()));
+            }
+        }
+        return out;
+    }
+    if let Some(arr) = v.as_array() {
+        for entry in arr {
+            if let Some(obj) = entry.as_object() {
+                let k = obj.get("name").and_then(|x| x.as_str());
+                let val = obj.get("value").and_then(|x| x.as_str());
+                if let (Some(k), Some(val)) = (k, val) {
+                    out.push((k.to_string(), val.to_string()));
+                }
+            } else if let Some(pair) = entry.as_array() {
+                if pair.len() == 2 {
+                    if let (Some(k), Some(val)) = (pair[0].as_str(), pair[1].as_str()) {
+                        out.push((k.to_string(), val.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn approval_parse_roundtrip() {
         assert_eq!(Approval::parse("never"), Approval::Never);
@@ -684,5 +1042,167 @@ mod tests {
         assert!(c.no_network);
         assert_eq!(c.idle_timeout_secs, 42);
         assert_eq!(c.max_session_tokens, 123456);
+    }
+
+    #[test]
+    fn provider_kind_parse() {
+        assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAI);
+        assert_eq!(ProviderKind::parse("OpenAI"), ProviderKind::OpenAI);
+        assert_eq!(ProviderKind::parse("anthropic"), ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::parse("claude"), ProviderKind::Anthropic);
+        assert_eq!(ProviderKind::parse("garbage"), ProviderKind::OpenAI);
+        assert!(ProviderKind::OpenAI.is_openai());
+        assert!(ProviderKind::Anthropic.is_anthropic());
+        assert_eq!(ProviderKind::Anthropic.to_string(), "anthropic");
+    }
+
+    #[test]
+    fn parse_provider_valid() {
+        let v = json!({
+            "name": "anthropic",
+            "kind": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "headers": {"anthropic-version": "2023-06-01"}
+        });
+        let p = parse_provider(&v).unwrap();
+        assert_eq!(p.name, "anthropic");
+        assert_eq!(p.kind, ProviderKind::Anthropic);
+        assert_eq!(p.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(p.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(p.api_key.is_none());
+        assert_eq!(p.headers, vec![("anthropic-version".into(), "2023-06-01".into())]);
+    }
+
+    #[test]
+    fn parse_provider_defaults_openai() {
+        let v = json!({"name": "local", "base_url": "http://localhost:11434/v1"});
+        let p = parse_provider(&v).unwrap();
+        assert_eq!(p.kind, ProviderKind::OpenAI);
+        assert!(p.api_key.is_none());
+        assert!(p.api_key_env.is_none());
+        assert!(p.headers.is_empty());
+    }
+
+    #[test]
+    fn parse_provider_requires_name_and_url() {
+        assert!(parse_provider(&json!({"base_url": "x"})).is_none()); // no name
+        assert!(parse_provider(&json!({"name": "x"})).is_none()); // no base_url
+        assert!(parse_provider(&json!({"name": "", "base_url": "x"})).is_none());
+    }
+
+    #[test]
+    fn parse_headers_variants() {
+        // object form
+        let h = parse_headers(Some(&json!({"X-A": "1", "X-B": "2"})));
+        assert_eq!(h.len(), 2);
+        assert!(h.contains(&("X-A".into(), "1".into())));
+        // array of [k,v]
+        let h = parse_headers(Some(&json!([["K","V"],["K2","V2"]])));
+        assert_eq!(h, vec![("K".into(), "V".into()), ("K2".into(), "V2".into())]);
+        // array of {name,value}
+        let h = parse_headers(Some(&json!([{"name":"N","value":"V"}])));
+        assert_eq!(h, vec![("N".into(), "V".into())]);
+        // none / empty
+        assert!(parse_headers(None).is_empty());
+    }
+
+    #[test]
+    fn resolve_provider_legacy_default_when_none_configured() {
+        let mut c = Config::default();
+        c.base_url = "https://example.test/v1".into();
+        let keys = std::collections::HashMap::new();
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.name, "default");
+        assert!(r.kind.is_openai());
+        assert_eq!(r.base_url, "https://example.test/v1");
+        assert!(r.api_key.is_none());
+    }
+
+    #[test]
+    fn resolve_provider_uses_runtime_key_then_config_then_env() {
+        // Save/restore env vars this test touches.
+        let env = "PROV_TEST_KEY_ENV";
+        let saved = std::env::var(env).ok();
+        std::env::set_var(env, "env-key");
+
+        let mut c = Config::default();
+        c.providers.push(ProviderConfig {
+            name: "p".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key: Some("config-key".into()),
+            api_key_env: Some(env.into()),
+            headers: vec![("h".into(), "v".into())],
+        });
+        // active_provider None -> first configured provider.
+        let mut keys = std::collections::HashMap::new();
+        // runtime wins over config + env
+        keys.insert("p".to_string(), "runtime-key".to_string());
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.api_key.as_deref(), Some("runtime-key"));
+
+        // no runtime key -> config literal wins
+        keys.clear();
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.api_key.as_deref(), Some("config-key"));
+
+        // no runtime, no config literal -> env var
+        c.providers[0].api_key = None;
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.api_key.as_deref(), Some("env-key"));
+        assert!(r.kind.is_anthropic());
+        assert_eq!(r.headers, vec![("h".into(), "v".into())]);
+
+        match saved {
+            Some(v) => std::env::set_var(env, v),
+            None => std::env::remove_var(env),
+        }
+    }
+
+    #[test]
+    fn resolve_provider_honors_active_name() {
+        let mut c = Config::default();
+        c.providers.push(ProviderConfig {
+            name: "first".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "https://first/v1".into(),
+            ..Default::default()
+        });
+        c.providers.push(ProviderConfig {
+            name: "second".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://second/v1".into(),
+            ..Default::default()
+        });
+        let keys = std::collections::HashMap::new();
+        // None -> first
+        assert_eq!(c.resolve_provider(&keys).name, "first");
+        // explicit active -> that one
+        c.active_provider = Some("second".into());
+        assert_eq!(c.resolve_provider(&keys).name, "second");
+        assert!(c.resolve_provider(&keys).kind.is_anthropic());
+        // unknown active name -> falls back to first configured
+        c.active_provider = Some("nope".into());
+        assert_eq!(c.resolve_provider(&keys).name, "first");
+    }
+
+    #[test]
+    fn apply_json_loads_providers() {
+        let mut c = Config::default();
+        let v = json!({
+            "providers": [
+                {"name":"umans","kind":"openai","base_url":"https://api.code.umans.ai/v1"},
+                {"name":"anthropic","kind":"anthropic","base_url":"https://api.anthropic.com/v1","api_key_env":"ANTHROPIC_API_KEY"}
+            ],
+            "activeProvider": "anthropic"
+        });
+        apply_json(&mut c, &v);
+        assert_eq!(c.providers.len(), 2);
+        assert_eq!(c.providers[0].name, "umans");
+        assert!(c.providers[0].kind.is_openai());
+        assert_eq!(c.providers[1].name, "anthropic");
+        assert!(c.providers[1].kind.is_anthropic());
+        assert_eq!(c.active_provider.as_deref(), Some("anthropic"));
     }
 }

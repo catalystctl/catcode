@@ -636,6 +636,7 @@ func (s *session) settingsFields() []settingsField {
 		key = "(not set)"
 	}
 	return []settingsField{
+		{label: "Provider", value: s.providerFieldLabel(), hint: s.providerFieldHint()},
 		{label: "API Key", value: key, hint: "enter to edit"},
 		{label: "Approval", value: s.approvalMode(), hint: "enter to cycle"},
 		{label: "Reasoning", value: s.settings.ReasoningEffort, hint: "enter to cycle"},
@@ -684,6 +685,8 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 		return s, nil
 	}
 	switch fields[idx].label {
+	case "Provider":
+		s.cycleProvider(+1)
 	case "API Key":
 		s.startEditField(idx)
 		s.modal.editBuf.SetValue("")
@@ -777,9 +780,19 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 	switch fields[idx].label {
 	case "API Key":
 		if strings.TrimSpace(val) != "" {
-			s.settings.APIKey = strings.TrimSpace(val)
+			key := strings.TrimSpace(val)
+			// Scope the key to the active provider (per-provider keys).
+			name := s.activeProvider
+			if name == "" {
+				name = "default"
+			}
+			if s.settings.ProviderKeys == nil {
+				s.settings.ProviderKeys = map[string]string{}
+			}
+			s.settings.ProviderKeys[name] = key
+			s.settings.APIKey = key
 			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_key", "api_key": s.settings.APIKey})
+			s.sendCore(map[string]any{"type": "set_key", "provider": name, "api_key": key})
 			s.logInfo("sending key…")
 		}
 	case "Bash Timeout":
@@ -806,19 +819,66 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
-// cycleField cycles a cyclable field (approval, reasoning) by dir (+1/-1).
+// cycleField cycles a cyclable field (approval, reasoning, provider) by dir (+1/-1).
 func (s *session) cycleField(idx, dir int) {
 	fields := s.settingsFields()
 	if idx < 0 || idx >= len(fields) {
 		return
 	}
 	switch fields[idx].label {
+	case "Provider":
+		s.cycleProvider(dir)
 	case "Approval":
 		s.cycleApproval(dir)
 	case "Reasoning":
 		s.cycleReasoning(dir)
 	}
 }
+
+// providerFieldLabel renders the active provider's name + kind for the settings
+// modal (e.g. "anthropic [anthropic]"). Shows "default" when none configured.
+func (s *session) providerFieldLabel() string {
+	name := s.activeProvider
+	if name == "" {
+		name = "default"
+	}
+	if s.providerKind != "" {
+		return fmt.Sprintf("%s [%s]", name, s.providerKind)
+	}
+	return name
+}
+
+// providerFieldHint tells the user what enter/cycle does; "(configured in
+// config.json)" when no custom providers are defined (nothing to cycle).
+func (s *session) providerFieldHint() string {
+	if len(s.providers) > 0 {
+		return "←→ cycle · enter apply"
+	}
+	return "configured in config.json"
+}
+
+// cycleProvider switches to the next/previous configured provider and tells
+// the core to switch (re-discovers models + re-resolves the key). No-op when
+// no providers are configured.
+func (s *session) cycleProvider(dir int) {
+	if len(s.providers) == 0 {
+		return
+	}
+	cur := 0
+	for i, p := range s.providers {
+		if p == s.activeProvider {
+			cur = i
+			break
+		}
+	}
+	next := (cur + dir + len(s.providers)) % len(s.providers)
+	name := s.providers[next]
+	s.settings.ActiveProvider = name
+	_ = s.settings.save()
+	s.sendCore(map[string]any{"type": "set_provider", "name": name})
+	s.logInfo(fmt.Sprintf("switching provider: %s", name))
+}
+
 
 func (s *session) cycleApproval(dir int) {
 	modes := []string{"never", "destructive", "always"}
@@ -979,6 +1039,16 @@ func helpText() string {
 		"",
 		"Settings persist to ~/.config/umans-harness/settings.json",
 		"Config (core) persists to ~/.config/umans-harness/config.json",
+		"",
+		"Custom providers (OpenAI- & Anthropic-compatible endpoints)",
+		"  Define named providers in the core config file's `providers` array:",
+		"    { \"name\": \"anthropic\", \"kind\": \"anthropic\",",
+		"      \"base_url\": \"https://api.anthropic.com/v1\",",
+		"      \"api_key_env\": \"ANTHROPIC_API_KEY\" }",
+		"    { \"name\": \"local\", \"kind\": \"openai\", \"base_url\": \"http://localhost:11434/v1\" }",
+		"  Select one at startup with `--provider <name>` or UMANS_ACTIVE_PROVIDER.",
+		"  Switch at runtime: /settings -> Provider (cycles + re-discovers models).",
+		"  Each provider keeps its own key (/key stores per-provider).",
 	}, "\n")
 }
 

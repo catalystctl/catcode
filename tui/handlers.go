@@ -40,44 +40,69 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 					s.coreBashTimeout = n
 				}
 			}
-		}
-		s.models = models
-		s.modelIdx = 0
-		// Apply persisted model selection if it matches a discovered model.
-		if sel := s.settings.SelectedModel; sel != "" {
-			for i, mm := range models {
-				if mm.ID == sel || strings.Contains(mm.ID, sel) {
-					s.modelIdx = i
-					break
-				}
+			// Provider fields (openai/anthropic endpoints).
+			if raw, ok := m["provider"]; ok {
+				_ = json.Unmarshal(raw, &s.activeProvider)
 			}
-		} else {
-			for i, mm := range models {
-				if strings.Contains(mm.ID, "glm") {
-					s.modelIdx = i
-					break
-				}
+			if raw, ok := m["providerKind"]; ok {
+				_ = json.Unmarshal(raw, &s.providerKind)
 			}
-		}
-		// Keep the persisted reasoning effort valid for the selected model's
-		// advertised thinking levels (clamps e.g. "medium" -> "high" on GLM).
-		if s.clampReasoning() {
-			_ = s.settings.save()
-			if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
-				s.logInfo(fmt.Sprintf("reasoning: %s (for %s)", s.settings.ReasoningEffort, s.models[s.modelIdx].ID))
+			if raw, ok := m["providers"]; ok {
+				_ = json.Unmarshal(raw, &s.providers)
 			}
+			s.providerHasKey = s.authed // ready's authed reflects the active provider's key
 		}
+		s.applyModels(models)
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
-		// Re-authenticate with a persisted key, if any.
-		if !s.authed && s.settings.APIKey != "" {
-			s.sendCore(map[string]any{"type": "set_key", "api_key": s.settings.APIKey})
-		} else if !s.authed {
-			s.logWarn("set your key: /key sk-...  (or open settings)")
+		// Sync a persisted provider selection that differs from the core's
+		// startup choice (e.g. switched in a previous session). The core emits
+		// provider_changed + models, which re-resolves the key below.
+		if s.settings.ActiveProvider != "" && s.settings.ActiveProvider != s.activeProvider &&
+			s.containsProvider(s.settings.ActiveProvider) {
+			s.sendCore(map[string]any{"type": "set_provider", "name": s.settings.ActiveProvider})
+			return nil
 		}
+		s.reauthActiveProvider()
+
+	case "provider_changed":
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(ev.Raw, &m); err == nil {
+			_ = json.Unmarshal([]byte(get(m, "provider")), &s.activeProvider)
+			_ = json.Unmarshal([]byte(get(m, "kind")), &s.providerKind)
+			if hk := get(m, "has_key"); hk != "" {
+				var b bool
+				_ = json.Unmarshal([]byte(hk), &b)
+				s.providerHasKey = b
+			}
+		}
+		// Persist the selection so the next session restores it.
+		if s.activeProvider != "" && s.settings.ActiveProvider != s.activeProvider {
+			s.settings.ActiveProvider = s.activeProvider
+			_ = s.settings.save()
+		}
+		s.reauthActiveProvider()
 
 	case "authed":
 		s.authed = true
+		s.providerHasKey = true
 		s.logSuccess("authenticated")
+
+	case "models":
+		// The core emits this after a provider switch (and on demand). Re-apply the
+		// model list + persisted selection exactly like the ready path.
+		var models []modelInfo
+		if raw := ev.get("models"); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &models)
+		} else {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(ev.Raw, &m); err == nil {
+				if raw, ok := m["models"]; ok {
+					_ = json.Unmarshal(raw, &models)
+				}
+			}
+		}
+		s.applyModels(models)
+		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
 
 	case "delta":
 		if s.cur == nil || s.cur.kind != blkAssistant {
@@ -182,6 +207,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.blocks = nil
 		s.cur = nil
 		s.contextTokens = 0
+		s.lastCachePct = 0
 		s.subProgress = nil
 		s.follow = true
 		s.invalidateAll()
@@ -233,14 +259,32 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if ti, err := strconv.ParseUint(ev.get("tokens_in"), 10, 64); err == nil {
 			s.contextTokens = ti
 		}
+		// The mid-stream metrics event omits cached_tokens; it only lands at turn
+		// end. Capture the per-turn cache hit rate here (cached / prompt_tokens,
+		// falling back to tokens_in) so renderMetrics can keep showing a cache %
+		// while the *next* turn is in flight — carried and marked "~".
+		if cached := ev.get("cached_tokens"); cached != "" && cached != "null" && cached != "0" {
+			tin := ev.get("prompt_tokens")
+			if tin == "" || tin == "null" || tin == "0" {
+				tin = ev.get("tokens_in")
+			}
+			if tin != "" && tin != "null" && tin != "0" {
+				if cN, err := strconv.ParseUint(cached, 10, 64); err == nil && cN > 0 {
+					if tN, err := strconv.ParseUint(tin, 10, 64); err == nil && tN > 0 {
+						s.lastCachePct = int(cN * 100 / tN)
+					}
+				}
+			}
+		}
 
 	case "approval_request":
 		s.pendingApproval = &approvalPrompt{
 			requestID: ev.get("request_id"),
 			tool:      ev.get("tool"),
 			args:      ev.get("args"),
+			diff:      ev.get("diff"),
 		}
-		s.logApprove(ev.get("tool"), ev.get("args"))
+		s.logApproveDiff(ev.get("tool"), ev.get("args"), ev.get("diff"))
 		s.input.Focus()
 	case "intercom_message":
 		// A subagent is prompting the orchestrator for a decision (or a progress
@@ -443,6 +487,86 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 //
 // Mouse tracking is opt-in: it's enabled at startup only when the Mouse Wheel
 // setting is on, and toggled at runtime via /settings → Mouse Wheel
+// applyModels sets the discovered model list and re-applies the persisted
+// model selection + reasoning clamp. Shared by the `ready` and `models`
+// events so a provider switch re-selects the same model id when present.
+func (s *session) applyModels(models []modelInfo) {
+	s.models = models
+	s.modelIdx = 0
+	if sel := s.settings.SelectedModel; sel != "" {
+		for i, mm := range models {
+			if mm.ID == sel || strings.Contains(mm.ID, sel) {
+				s.modelIdx = i
+				break
+			}
+		}
+	} else {
+		for i, mm := range models {
+			if strings.Contains(mm.ID, "glm") {
+				s.modelIdx = i
+				break
+			}
+		}
+	}
+	if s.clampReasoning() {
+		_ = s.settings.save()
+		if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+			s.logInfo(fmt.Sprintf("reasoning: %s (for %s)", s.settings.ReasoningEffort, s.models[s.modelIdx].ID))
+		}
+	}
+}
+
+// containsProvider reports whether name is in the core's configured provider list.
+func (s *session) containsProvider(name string) bool {
+	for _, p := range s.providers {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
+// providerKey returns the persisted API key for a provider, preferring the
+// per-provider key map over the legacy single APIKey (which applies to the
+// default/active provider). Empty when nothing is stored.
+func (s *session) providerKey(name string) string {
+	if k, ok := s.settings.ProviderKeys[name]; ok && k != "" {
+		return k
+	}
+	if s.settings.APIKey != "" {
+		return s.settings.APIKey
+	}
+	return ""
+}
+
+// sendProviderKey sends `set_key` for a named provider (or the active one when
+// name is empty). Only sent when a key is actually available.
+func (s *session) sendProviderKey(name string) bool {
+	if name == "" {
+		name = s.activeProvider
+	}
+	key := s.providerKey(name)
+	if key == "" {
+		return false
+	}
+	s.sendCore(map[string]any{"type": "set_key", "provider": name, "api_key": key})
+	return true
+}
+
+// reauthActiveProvider re-sends the active provider's persisted key when the
+// core reports it isn't authenticated yet (e.g. after launch or a switch to a
+// provider whose key isn't in the config file/env).
+func (s *session) reauthActiveProvider() {
+	if s.providerHasKey {
+		return // already authed for this provider
+	}
+	if s.sendProviderKey(s.activeProvider) {
+		s.logInfo("sending key…")
+	} else {
+		s.logWarn("set your key: /key sk-...  (or open settings)")
+	}
+}
+
 // (tea.EnableMouseCellMotion / tea.DisableMouse). Off (the default) leaves
 // native click-drag text selection/copy to the terminal; when on, hold Shift
 // to select/copy. Only wheel presses scroll; clicks and drags are ignored.
@@ -899,10 +1023,20 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				s.logError("usage: /key sk-...")
 				return nil
 			}
-			s.settings.APIKey = parts[1]
+			key := parts[1]
+			// Scope the key to the active provider (per-provider keys). Also keep the
+			// legacy single APIKey field in sync for the default/active provider.
+			if s.activeProvider == "" {
+				s.activeProvider = "default"
+			}
+			if s.settings.ProviderKeys == nil {
+				s.settings.ProviderKeys = map[string]string{}
+			}
+			s.settings.ProviderKeys[s.activeProvider] = key
+			s.settings.APIKey = key
 			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_key", "api_key": parts[1]})
-			s.logInfo("sending key…")
+			s.sendCore(map[string]any{"type": "set_key", "provider": s.activeProvider, "api_key": key})
+			s.logInfo(fmt.Sprintf("sending key for provider '%s'…", s.activeProvider))
 			return nil
 		case "/model":
 			if len(parts) < 2 {

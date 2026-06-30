@@ -5,6 +5,8 @@ use crate::config::Config;
 use crate::workspace;
 use serde_json::{json, Value};
 
+pub use crate::fetch_tool::execute_fetch;
+
 /// ToolKind drives the approval gate in main.rs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolKind {
@@ -104,7 +106,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Apply search-and-replace edits to a file. Read it first with read_file to see the exact content, then call edit with search/replace pairs. Each 'search' string must match the file content EXACTLY (copy it verbatim, including whitespace) and must be unique in the file; 'replace' is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in 'replace'. All edits in one call apply atomically — if any 'search' is not found or is ambiguous (matches more than once) the file is left unchanged; re-read and correct the search text. Use write_file only for new files or full rewrites.",
+                "description": "Apply search-and-replace edits to a file. Read it first with read_file to see the exact content, then call edit with search/replace pairs. Each 'search' string must match the file content EXACTLY (copy it verbatim, including whitespace) and must be unique in the file; 'replace' is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in 'replace'. Set 'replace_all': true to replace every occurrence instead of requiring a unique match. Set 'normalize_whitespace': true to match on whitespace-collapsed text (runs of whitespace become a single space) so indentation/spacing drift still lands — the replacement edits the real text region. All edits in one call apply atomically — if any 'search' is not found or is ambiguous (matches more than once without replace_all) the file is left unchanged; re-read and correct the search text. Use write_file only for new files or full rewrites.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -115,7 +117,9 @@ pub fn definitions() -> Vec<Value> {
                                 "type": "object",
                                 "properties": {
                                     "search": { "type": "string", "description": "exact text to find in the file (must be unique; copy it verbatim from read_file output)" },
-                                    "replace": { "type": "string", "description": "replacement text (empty string = delete the search text)" }
+                                    "replace": { "type": "string", "description": "replacement text (empty string = delete the search text)" },
+                                    "replace_all": { "type": "boolean", "description": "replace every occurrence instead of requiring a unique match" },
+                                    "normalize_whitespace": { "type": "boolean", "description": "match on whitespace-collapsed text so indentation/spacing drift still lands" }
                                 },
                                 "required": ["search", "replace"]
                             }
@@ -184,10 +188,13 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a bash command in the workspace root. Returns combined stdout+stderr (truncated to 32KB). Commands run with a 30s timeout (configurable). A small denylist blocks catastrophic commands. Keep the command short and simple: for loops, nested quotes, long && chains, or multi-line logic, write a script to a file with write_file and run `bash script.sh` instead of inlining one long command string (long inline commands are prone to JSON-encoding errors when wrapped in bulk).",
+                "description": "Run a bash command in the workspace root. Returns combined stdout+stderr (truncated to 32KB). Commands run with a 30s timeout (configurable). A small denylist blocks catastrophic commands. Pass `timeout` (seconds) to give a slow build/test up to the configured ceiling more time for this one command — useful for `cargo build --release`, `npm install`, or test suites that exceed the default. Keep the command short and simple: for loops, nested quotes, long && chains, or multi-line logic, write a script to a file with write_file and run `bash script.sh` instead of inlining one long command string (long inline commands are prone to JSON-encoding errors when wrapped in bulk).",
                 "parameters": {
                     "type": "object",
-                    "properties": { "command": { "type": "string" } },
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout": { "type": "integer", "description": "per-call wall-clock timeout in seconds (clamped to [1, max_bash_timeout_secs]; default = the configured bash timeout)" }
+                    },
                     "required": ["command"]
                 }
             }
@@ -205,7 +212,7 @@ pub fn definitions() -> Vec<Value> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash"] },
+                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash","fetch"] },
                                     "args": { "type": "object" }
                                 },
                                 "required": ["name","args"]
@@ -258,7 +265,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk_edit",
-                "description": "Apply search-and-replace edits to many files in one call. Each entry is {path, edits} where edits is the same search/replace array as the edit tool (each {search, replace}). Read each file first with read_file/bulk_read to see exact content. All edits on a file apply atomically — a failed search (not found or not unique) fails only that file's block.",
+                "description": "Apply search-and-replace edits to many files in one call. Each entry is {path, edits} where edits is the same search/replace array as the edit tool (each {search, replace, replace_all?, normalize_whitespace?}). Read each file first with read_file/bulk_read to see exact content. All edits on a file apply atomically — a failed search (not found or not unique) fails only that file's block.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -274,7 +281,9 @@ pub fn definitions() -> Vec<Value> {
                                             "type": "object",
                                             "properties": {
                                                 "search": { "type": "string", "description": "exact text to find (must be unique in the file)" },
-                                                "replace": { "type": "string", "description": "replacement text (empty = delete)" }
+                                                "replace": { "type": "string", "description": "replacement text (empty = delete)" },
+                                                "replace_all": { "type": "boolean", "description": "replace every occurrence instead of requiring a unique match" },
+                                                "normalize_whitespace": { "type": "boolean", "description": "match on whitespace-collapsed text so indentation/spacing drift still lands" }
                                             },
                                             "required": ["search","replace"]
                                         }
@@ -352,6 +361,21 @@ pub fn definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": { "path": { "type": "string", "description": "subdirectory to check (defaults to workspace root)" } }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "fetch",
+                "description": "Fetch a URL over HTTP(S) and return the response body as text (HTML is lightly stripped to text, bounded to the configured max bytes). Unlike bash curl, this is a native tool that still works under --no-network (it is not subject to the bash sandbox). A host allowlist may restrict which domains are reachable; empty allowlist = any host. Use for looking up docs, man pages, or API references. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "absolute http(s) URL to fetch" },
+                        "raw": { "type": "boolean", "description": "if true, return the raw body without HTML stripping (use for JSON/API responses)" }
+                    },
+                    "required": ["url"]
                 }
             }
         }),
@@ -485,6 +509,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "finish" => Outcome::ok("__finish__"), // sentinel; main.rs treats as loop exit
         "patch" => apply_patch(args, cfg),
         "diagnostics" => Outcome::err("diagnostics must be dispatched through execute_diagnostics (async)"),
+        "fetch" => Outcome::err("fetch must be dispatched through execute_fetch (async)"),
         "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
         "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
         "edit" => {
@@ -973,12 +998,84 @@ fn contains_at_boundary(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Truncate `output` to `cap` bytes, keeping the tail (where errors usually
+/// live) and salvaging error/warning lines from the dropped head. A pure
+/// tail truncation loses a compile error that sits in the *middle* of a huge
+/// build log; this keeps the tail plus the first few matching head lines so
+/// the model still sees the root cause. UTF-8 safe: the tail slice is walked
+/// back to a char boundary.
+pub(crate) fn smart_truncate(output: &str, cap: usize) -> String {
+    if output.len() <= cap {
+        return output.to_string();
+    }
+    // Roughly 60% tail, 40% for salvaged head lines. The tail is the part that
+    // almost always matters; head salvage is best-effort.
+    let tail_budget = cap * 3 / 4;
+    let head_budget = cap.saturating_sub(tail_budget);
+
+    // Salvage error/warning lines from the head (the bytes we're dropping).
+    let split = output.len() - tail_budget;
+    let split = {
+        let mut s = split;
+        while !output.is_char_boundary(s) {
+            s += 1;
+        }
+        s
+    };
+    let head = &output[..split];
+    let tail = &output[split..];
+
+    let errorish = regex::Regex::new(
+        r"(?i)^(?:error|warning|error\[|error:|warning:|note:|help:|\s*--\>\s|panic|fatal|failed|undefined|cannot|exception|not found|no such|denied|traceback)",
+    )
+    .expect("static salvage regex");
+    let mut salvaged: Vec<&str> = Vec::new();
+    let mut salvaged_bytes = 0usize;
+    for line in head.lines().rev() {
+        if !errorish.is_match(line) {
+            continue;
+        }
+        let b = line.len() + 1; // +newline
+        if salvaged_bytes + b > head_budget {
+            break;
+        }
+        salvaged_bytes += b;
+        salvaged.push(line);
+    }
+    salvaged.reverse(); // back to file order
+
+    let mut out = String::with_capacity(cap + 128);
+    if salvaged.is_empty() {
+        out.push_str(&format!(
+            "...[output truncated, showing last {}KB]...\n",
+            tail_budget / 1024
+        ));
+    } else {
+        out.push_str(&format!(
+            "...[output truncated: {} salvaged error/warning line(s) from the head + last {}KB]...\n",
+            salvaged.len(),
+            tail_budget / 1024
+        ));
+        for l in &salvaged {
+            out.push_str(l);
+            out.push('\n');
+        }
+        out.push_str("--- tail ---\n");
+    }
+    out.push_str(tail);
+    out
+}
+
 /// Run bash with cwd=workspace, a real timeout, and a denylist tripwire.
 /// Optional hard sandbox: --sandbox firejail wraps the command in a
 /// firejail profile that whitelists only the workspace; --no-network adds
 /// `unshare -n` so the command can't phone home. Both are belt-and-suspenders
 /// on top of the denylist tripwire.
-pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
+pub async fn execute_bash(
+    command: &str,
+    cfg: &Config,
+    timeout_override: Option<u64>,
+) -> Outcome {
     // ponytail: denylist is a tripwire, not a sandbox. It blocks the most
     // catastrophic obvious commands; a determined model bypasses it.
     // Normalize whitespace first so `rm  -rf  /` (extra spaces) can't slip past
@@ -1048,7 +1145,15 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
         }
     };
 
-    let timeout = std::time::Duration::from_secs(cfg.bash_timeout_secs);
+    // Per-call timeout override (the bash tool's `timeout` arg): clamp to
+    // [1, max_bash_timeout_secs] so a model can buy more time for a slow
+    // build/test but can't escalate past the configured ceiling. None falls
+    // back to the default bash timeout.
+    let secs = match timeout_override {
+        Some(t) => t.clamp(1, cfg.max_bash_timeout_secs.max(1)),
+        None => cfg.bash_timeout_secs,
+    };
+    let timeout = std::time::Duration::from_secs(secs);
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     match result {
         Ok(Ok(o)) => {
@@ -1066,22 +1171,13 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
             if combined.is_empty() {
                 combined.push_str("(no output)");
             }
-            // ponytail: 32KB cap (was 8KB) — large builds/logs need room to
-            // reach the error. Truncate the *head* when over cap so the tail
-            // (where errors usually are) survives.
+            // ponytail: 32KB cap. When over cap, keep the tail (where errors
+            // usually are) AND salvage error/warning lines from the dropped
+            // head — a compile error in the middle of a huge build log would
+            // otherwise vanish entirely under a pure tail truncation.
             const CAP: usize = 32_768;
             if combined.len() > CAP {
-                let mut start = combined.len() - CAP;
-                // Walk `start` back to a UTF-8 char boundary so slicing a
-                // multibyte string (emoji/CJK command output) doesn't panic
-                // with "byte index N is not a char boundary". Advances <= 3 bytes.
-                while !combined.is_char_boundary(start) {
-                    start -= 1;
-                }
-                let mut cut = String::with_capacity(CAP + 64);
-                cut.push_str("...[head truncated, showing last 32KB]...\n");
-                cut.push_str(&combined[start..]);
-                combined = cut;
+                combined = smart_truncate(&combined, CAP);
             }
             Outcome {
                 ok,
@@ -1090,10 +1186,7 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
             }
         }
         Ok(Err(e)) => Outcome::err(format!("bash wait failed: {e}")),
-        Err(_) => Outcome::err(format!(
-            "bash timed out after {}s (killed)",
-            cfg.bash_timeout_secs
-        )),
+        Err(_) => Outcome::err(format!("bash timed out after {secs}s (killed)")),
     }
 }
 
@@ -1216,64 +1309,236 @@ fn split_lines(content: &str) -> (Vec<String>, bool) {
     (v, trailing_nl)
 }
 
+/// Collapse every run of whitespace to a single space (and trim ends), returning
+/// the normalized string plus a map from each normalized char's index to the
+/// byte offset where its *first* source char begins. Used for
+/// whitespace-tolerant edit matching: a search with drifted indentation still
+/// locates the right region, and the map projects the match back onto the
+/// original bytes so the replacement edits the real text, not the normalized
+/// copy.
+fn normalize_ws_with_map(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len());
+    let mut prev_ws = false;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+                map.push(i);
+            }
+            prev_ws = true;
+        } else {
+            out.push(c);
+            map.push(i);
+            prev_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+        map.pop();
+    }
+    (out, map)
+}
+
+/// Find every non-overlapping occurrence of `search` in `content`. With
+/// `normalize` true, matching runs on whitespace-collapsed forms and the
+/// returned spans are byte ranges in the *original* content (so a drifted
+/// match still edits the real text). Without `normalize`, spans are the exact
+/// substring byte ranges.
+fn find_matches(content: &str, search: &str, normalize: bool) -> Vec<(usize, usize)> {
+    if search.is_empty() {
+        return Vec::new();
+    }
+    if !normalize {
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(pos) = content[from..].find(search) {
+            let s = from + pos;
+            out.push((s, s + search.len()));
+            from = s + search.len();
+        }
+        return out;
+    }
+    let (nsearch, _) = normalize_ws_with_map(search);
+    if nsearch.is_empty() {
+        return Vec::new();
+    }
+    let (ncontent, map) = normalize_ws_with_map(content);
+    let nlen = nsearch.len();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(pos) = ncontent[from..].find(&nsearch) {
+        let p = from + pos;
+        let start_orig = map[p];
+        let end_norm = p + nlen;
+        let end_orig = if end_norm < map.len() {
+            // Start of the next kept char sits right after any whitespace that
+            // was collapsed between the last matched char and it — so this
+            // includes the matched region's internal whitespace (correct) and
+            // excludes trailing gap whitespace (also correct).
+            map[end_norm]
+        } else {
+            // Match runs to the end of the normalized content: end right after
+            // the last matched SOURCE char, not content.len(), so trailing
+            // whitespace the normalizer trimmed (e.g. a final newline) isn't
+            // consumed by the replacement.
+            let last_start = map[p + nlen - 1];
+            last_start + content[last_start..].chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+        };
+        out.push((start_orig, end_orig));
+        from = p + nlen;
+    }
+    out
+}
+
+/// A best-effort hint for a failed search: the content line sharing the most
+/// whitespace tokens with the search, with its 1-indexed line number. Lets the
+/// model self-correct in one shot instead of re-reading the whole file when the
+/// only drift is a typo or a nearby line.
+fn closest_hint(content: &str, search: &str) -> String {
+    let search_tokens: Vec<&str> = search.split_whitespace().collect();
+    if search_tokens.is_empty() {
+        return String::new();
+    }
+    let mut best: Option<(usize, usize, &str)> = None; // (overlap, lineno, line)
+    for (idx, line) in content.lines().enumerate() {
+        let line_tokens: std::collections::HashSet<&str> = line.split_whitespace().collect();
+        let overlap = search_tokens.iter().filter(|t| line_tokens.contains(*t)).count();
+        if overlap == 0 {
+            continue;
+        }
+        if best.is_none() || best.is_some_and(|(o, _, _)| overlap > o) {
+            best = Some((overlap, idx + 1, line));
+        }
+    }
+    match best {
+        Some((o, lineno, line)) => {
+            let snip: String = line.chars().take(120).collect();
+            format!(
+                "closest match: line {lineno} ({o} token(s) in common): {snip}"
+            )
+        }
+        None => String::new(),
+    }
+}
+
+/// Resolve, read, and apply a list of search/replace edits in memory — WITHOUT
+/// writing. Returns (path, old_content, new_content) so both the writing path
+/// (`execute_edit`) and the approval-preview path (`preview_diff_edit`) share
+/// one source of truth. Each edit may set `replace_all` (replace every match,
+/// not just a unique one) and `normalize_whitespace` (match on whitespace-
+/// collapsed text so indentation/spacing drift still lands). On a not-found or
+/// ambiguous search the file is left untouched and an error is returned.
+fn plan_edit(
+    input: &str,
+    edits: &[Value],
+    cfg: &Config,
+) -> Result<(std::path::PathBuf, String, String), String> {
+    if let Some(msg) = workspace::check_dangerous_path(input) {
+        return Err(msg);
+    }
+    let path = workspace::resolve(&cfg.workspace, input)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
+    let mut new_content = content.clone();
+
+    for (i, ev) in edits.iter().enumerate() {
+        let search = ev.get("search").and_then(|v| v.as_str()).unwrap_or("");
+        let replace = ev.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+        let replace_all = ev
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let normalize = ev
+            .get("normalize_whitespace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if search.is_empty() {
+            return Err(format!(
+                "edit #{i}: 'search' must not be empty (use write_file for new files)"
+            ));
+        }
+        let spans = find_matches(&new_content, search, normalize);
+        if spans.is_empty() {
+            let hint = closest_hint(&new_content, search);
+            let hint_part = if hint.is_empty() {
+                String::new()
+            } else {
+                format!("\n{hint}")
+            };
+            return Err(format!(
+                "edit #{i}: search text not found in {input:?}; re-read the file and copy the exact text (watch whitespace). Search was:\n{}{hint_part}",
+                search
+            ));
+        }
+        if spans.len() > 1 && !replace_all {
+            return Err(format!(
+                "edit #{i}: search text matches {} places in {input:?}; include more surrounding lines so the match is unique, or set replace_all:true to replace all of them. Search was:\n{}",
+                spans.len(),
+                search
+            ));
+        }
+        if replace_all {
+            // Replace right-to-left so earlier spans' byte offsets stay valid.
+            let mut spans = spans;
+            spans.sort_by_key(|s| std::cmp::Reverse(s.0));
+            for (s, e) in spans {
+                new_content.replace_range(s..e, replace);
+            }
+        } else {
+            let (s, e) = spans[0];
+            new_content.replace_range(s..e, replace);
+        }
+    }
+    Ok((path, content, new_content))
+}
+
 /// Apply a list of search/replace edits to a file atomically. Each `search`
 /// string must match the current file content exactly and uniquely; edits apply
 /// in order to the evolving content. If any search is not found or is
 /// ambiguous, the file is left untouched and an error is returned.
 fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
-    // P0-3: blocklist enforced inside the primitive (covers bulk_edit too).
-    if let Some(msg) = workspace::check_dangerous_path(input) {
-        return Outcome::err(msg);
-    }
-    let path = match workspace::resolve(&cfg.workspace, input) {
-        Ok(p) => p,
+    let (path, old_content, new_content) = match plan_edit(input, edits, cfg) {
+        Ok(v) => v,
         Err(e) => return Outcome::err(e),
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return Outcome::err(format!("edit: read {input:?} failed: {e}")),
-    };
-    let old_content = content.clone();
-    let mut new_content = content;
-    let mut log: Vec<String> = Vec::new();
-    let mut applied = 0usize;
-
-    for (i, ev) in edits.iter().enumerate() {
-        let search = ev.get("search").and_then(|v| v.as_str()).unwrap_or("");
-        let replace = ev.get("replace").and_then(|v| v.as_str()).unwrap_or("");
-        if search.is_empty() {
-            return Outcome::err(format!(
-                "edit #{i}: 'search' must not be empty (use write_file for new files)"
-            ));
-        }
-        let count = new_content.matches(search).count();
-        if count == 0 {
-            return Outcome::err(format!(
-                "edit #{i}: search text not found in {input:?}; re-read the file and copy the exact text (watch whitespace). Search was:\n{}",
-                search
-            ));
-        }
-        if count > 1 {
-            return Outcome::err(format!(
-                "edit #{i}: search text matches {count} places in {input:?}; include more surrounding lines so the match is unique. Search was:\n{}",
-                search
-            ));
-        }
-        new_content = new_content.replacen(search, replace, 1);
-        log.push(format!(
-            "replaced {} byte(s) with {} byte(s)",
-            search.len(),
-            replace.len()
-        ));
-        applied += 1;
-    }
-
     if let Err(e) = std::fs::write(&path, &new_content) {
         return Outcome::err(format!("edit: write {input:?} failed: {e}"));
     }
-    let mut out = Outcome::ok(format!("applied {applied} edit(s): {}", log.join("; ")));
+    let mut out = Outcome::ok(format!("applied {} edit(s)", edits.len()));
     out.diff = Some(make_unified_diff(&old_content, &new_content, input, 3));
     out
+}
+
+/// Compute the unified diff an `edit` call *would* produce, without writing.
+/// Used by the approval gate so the human sees the resulting change before
+/// approving, not just the raw search/replace blobs. Returns Ok(diff) (possibly
+/// empty if identical) or Err(reason) if the edit wouldn't apply.
+pub fn preview_diff_edit(input: &str, edits: &[Value], cfg: &Config) -> Result<String, String> {
+    let (_path, old_content, new_content) = plan_edit(input, edits, cfg)?;
+    Ok(make_unified_diff(&old_content, &new_content, input, 3))
+}
+
+/// Compute the unified diff a `patch` call *would* produce, without writing.
+pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<String, String> {
+    if let Some(msg) = workspace::check_dangerous_path(path) {
+        return Err(msg);
+    }
+    let resolved = workspace::resolve(&cfg.workspace, path)?;
+    let original = std::fs::read_to_string(&resolved).unwrap_or_default();
+    let new = apply_unified_diff(&original, patch)?;
+    Ok(make_unified_diff(&original, &new, path, 3))
+}
+
+/// Compute the unified diff a `write_file` call *would* produce, without
+/// writing. For a new file the diff is the whole content as additions.
+pub fn preview_diff_write(input: &str, content: &str, cfg: &Config) -> Result<String, String> {
+    if let Some(msg) = workspace::check_dangerous_path(input) {
+        return Err(msg);
+    }
+    let path = workspace::resolve(&cfg.workspace, input)?;
+    let old_content = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(make_unified_diff(&old_content, content, input, 3))
 }
 
 // ---- bulk tools ----
@@ -1435,7 +1700,10 @@ pub async fn execute_bulk(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            execute_bash(cmd, cfg).await
+            let timeout_override = inner_args.get("timeout").and_then(|v| v.as_u64());
+            execute_bash(cmd, cfg, timeout_override).await
+        } else if name == "fetch" {
+            execute_fetch(&inner_args, cfg).await
         } else {
             execute(&name, &inner_args, cfg)
         };
@@ -2277,6 +2545,106 @@ mod tests {
     }
 
     #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "dup\nx\ndup\ndup\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "dup", "replace": "DUP", "replace_all": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "DUP\nx\nDUP\nDUP\n"
+        );
+    }
+
+    #[test]
+    fn edit_normalize_whitespace_tolerates_drift() {
+        let (_root, cfg) = tmp_ws();
+        // file uses tabs + extra spaces; search uses single spaces
+        fs::write(cfg.workspace.join("f.txt"), "fn  main() {\n\tif (x)  return;\n}\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "if (x) return;", "replace": "if (x) { return; }", "normalize_whitespace": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "fn  main() {\n\tif (x) { return; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn edit_normalize_whitespace_replace_all() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "a   b\na\tb\na b\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "a b", "replace": "X", "normalize_whitespace": true, "replace_all": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "X\nX\nX\n"
+        );
+    }
+
+    #[test]
+    fn edit_not_found_gives_closest_hint() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "alpha beta gamma\ndelta epsilon\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "alpha gamma", "replace": "x" }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(!o.ok);
+        assert!(o.output.contains("closest match"), "{}", o.output);
+        assert!(o.output.contains("line 1"), "{}", o.output);
+    }
+
+    #[test]
+    fn preview_diff_edit_does_not_write() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "one\ntwo\n").unwrap();
+        let edits = vec![json!({ "search": "one", "replace": "ONE" })];
+        let diff = preview_diff_edit("f.txt", &edits, &cfg).unwrap();
+        assert!(diff.contains("-one"), "{}", diff);
+        assert!(diff.contains("+ONE"), "{}", diff);
+        // file untouched — preview never writes
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn preview_diff_write_shows_new_file_as_addition() {
+        let (_root, cfg) = tmp_ws();
+        let diff = preview_diff_write("new.txt", "hello\n", &cfg).unwrap();
+        assert!(diff.contains("+hello"), "{}", diff);
+        assert!(diff.contains("+++ b/new.txt"), "{}", diff);
+    }
+
+    #[test]
+    fn smart_truncate_keeps_tail_and_salvages_errors() {
+        // build output: many plain head lines, an error line, more plain lines, a tail line
+        let mut head = String::new();
+        for _ in 0..2000 {
+            head.push_str("line of build log\n");
+        }
+        head.push_str("error[E0308]: mismatched types\n");
+        for _ in 0..2000 {
+            head.push_str("more log\n");
+        }
+        head.push_str("final tail line here\n");
+        let out = smart_truncate(&head, 4096);
+        assert!(out.contains("final tail line here"), "tail must survive");
+        assert!(out.contains("error[E0308]"), "error line from head must be salvaged");
+        assert!(out.contains("salvaged"), "must note salvaged lines: {}", out);
+    }
+
+    #[test]
     fn edit_empty_search_rejected() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "a\n").unwrap();
@@ -2431,7 +2799,7 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         let mut cfg = cfg;
         cfg.bash_timeout_secs = 1;
-        let o = execute_bash("sleep 30", &cfg).await;
+        let o = execute_bash("sleep 30", &cfg, None).await;
         assert!(!o.ok);
         assert!(o.output.contains("timed out"), "{}", o.output);
     }
@@ -2439,7 +2807,7 @@ mod tests {
     #[tokio::test]
     async fn bash_denylist_blocks() {
         let (_root, cfg) = tmp_ws();
-        let o = execute_bash("rm -rf /", &cfg).await;
+        let o = execute_bash("rm -rf /", &cfg, None).await;
         assert!(!o.ok);
         assert!(o.output.contains("denylist"), "{}", o.output);
     }
@@ -2447,7 +2815,7 @@ mod tests {
     #[tokio::test]
     async fn bash_runs_in_workspace() {
         let (root, cfg) = tmp_ws();
-        let o = execute_bash("pwd", &cfg).await;
+        let o = execute_bash("pwd", &cfg, None).await;
         assert!(o.ok, "{}", o.output);
         // canonicalize both for comparison (tmp may be a symlink)
         assert_eq!(
@@ -2663,7 +3031,7 @@ mod tests {
     async fn bash_denylist_blocks_extra_whitespace_root() {
         let (_root, cfg) = tmp_ws();
         // P1-7: extra spaces can't evade the pattern after whitespace normalization.
-        let o = execute_bash("rm   -rf    /", &cfg).await;
+        let o = execute_bash("rm   -rf    /", &cfg, None).await;
         assert!(!o.ok, "{}", o.output);
         assert!(o.output.contains("denylist"), "{}", o.output);
     }
@@ -2673,11 +3041,11 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         // P1-7: `rm -rf /tmp/x` no longer false-positives on `rm -rf /`.
         // Use `echo` so nothing destructive runs; the tripwire must NOT match.
-        let o = execute_bash("echo rm -rf /tmp/x-nope", &cfg).await;
+        let o = execute_bash("echo rm -rf /tmp/x-nope", &cfg, None).await;
         assert!(o.ok, "{}", o.output);
         // And a plain workspace-relative rm still runs.
         fs::write(cfg.workspace.join("to_delete"), "x").unwrap();
-        let o2 = execute_bash("rm -f to_delete", &cfg).await;
+        let o2 = execute_bash("rm -f to_delete", &cfg, None).await;
         assert!(o2.ok, "{}", o2.output);
     }
 

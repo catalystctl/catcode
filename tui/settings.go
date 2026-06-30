@@ -32,6 +32,14 @@ type settingsStore struct {
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
 	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
+
+	// Custom providers (openai/anthropic endpoints). ActiveProvider is the
+	// provider name selected in the TUI; the core re-applies it on launch via
+	// the `set_provider` command. ProviderKeys holds a per-provider API key
+	// (keyed by provider name) so each endpoint keeps its own secret; it
+	// supersedes the legacy single APIKey when set. Stored in this 0600 file.
+	ActiveProvider string            `json:"active_provider,omitempty"`
+	ProviderKeys   map[string]string `json:"provider_keys,omitempty"`
 }
 
 func configDir() string {
@@ -168,6 +176,15 @@ func loadSettings() *settingsStore {
 	}
 	s.MaxSessionTokens = onDisk.MaxSessionTokens
 	s.MouseWheel = onDisk.MouseWheel
+	if onDisk.ActiveProvider != "" {
+		s.ActiveProvider = onDisk.ActiveProvider
+	}
+	s.ProviderKeys = map[string]string{}
+	for k, v := range onDisk.ProviderKeys {
+		if v != "" {
+			s.ProviderKeys[k] = v
+		}
+	}
 	return s
 }
 

@@ -48,6 +48,15 @@ type session struct {
 	visionModel         string          // preferred handoff target ("" = pick dynamically)
 	pendingVisionPicker bool            // open the vision picker once the config arrives
 
+	// Active model provider (openai/anthropic endpoint). activeProvider is the
+	// name the core resolved; providers is the list of configured names for the
+	// settings picker; providerHasKey reflects the last provider_changed/ready
+	// event (drives re-auth after a switch).
+	activeProvider  string
+	providerKind    string
+	providers       []string
+	providerHasKey  bool
+
 	settings *settingsStore
 	modal    modal
 	history  []string
@@ -66,6 +75,7 @@ type session struct {
 	follow        bool
 	welcomeIdx    int                 // welcome-screen example cursor (empty conversation)
 	contextTokens uint64              // live context size from the last metrics event (drives the footer budget)
+	lastCachePct  int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
 	subProgress   []*subProgressEntry // live subagent runs (drives the progress panel)
 	cwd           string              // working dir, shown in the header as ~/
 
