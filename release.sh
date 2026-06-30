@@ -16,7 +16,7 @@ cargo build --release --locked --manifest-path core/Cargo.toml
 
 echo "[2/4] building tui (go, reproducible -trimpath + version)..."
 ( cd tui && CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w -X main/coreVersion=${VERSION}" -o umans-harness-tui . )
+    -ldflags "-s -w -X main.coreVersion=${VERSION}" -o umans-harness-tui . )
 
 echo "[3/4] staging..."
 STAGE="umans-harness-${VERSION}"
@@ -44,5 +44,5 @@ echo "[4/4] packing tarball + checksum..."
 ( cd dist && tar czf "${STAGE}.tar.gz" "${STAGE}" )
 ( cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
 
-echo "==> dist/${STAGE}.tar.gz  ($(du -h dist/${STAGE}.tar.gz | cut -f1))"
+echo "==> dist/${STAGE}.tar.gz  ($(du -h "dist/${STAGE}.tar.gz" | cut -f1))"
 echo "==> dist/${STAGE}.tar.gz.sha256"

@@ -567,6 +567,14 @@ async fn main() {
                 let to = *state.tokens_out.lock().await;
                 let cached = *state.cached_tokens.lock().await;
                 let turns = state.logger.turn_count();
+                let session_file = state
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 emit(
                     &Event::new("stats")
                         .with("tokens_in", json!(ti))
@@ -574,7 +582,8 @@ async fn main() {
                         .with("tokens_total", json!(ti + to))
                         .with("cached_tokens", json!(cached))
                         .with("turns", json!(turns))
-                        .with("messages", json!(state.conversation.lock().await.len())),
+                        .with("messages", json!(state.conversation.lock().await.len()))
+                        .with("session_file", json!(session_file)),
                 );
             }
             Command::InstallPlugin { path } => {
@@ -675,44 +684,97 @@ async fn main() {
                 );
             }
             Command::RefreshMemory => {
+                let msg = refresh_memory_injection(&state).await;
+                emit(&Event::new("info").with("message", json!(msg)));
+            }
+            Command::SaveMemory { text, tags } => {
+                if text.trim().is_empty() {
+                    emit(&Event::new("error").with("message", json!("save_memory: 'text' must not be empty")));
+                } else {
+                    // Derive a name from the text (first words + timestamp) so
+                    // the slug/filename is unique and human-readable.
+                    let name = {
+                        let stem: String = text
+                            .split_whitespace()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        format!("{stem} [{ts}]")
+                    };
+                    let mem_type = tags
+                        .as_ref()
+                        .and_then(|t| t.first().cloned())
+                        .unwrap_or_else(|| "note".to_string());
+                    let ws = state.cfg.read().await.workspace.clone();
+                    match memory::save_memory(&ws, &name, &text, &mem_type, "") {
+                        Ok(p) => {
+                            let id = p
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            // Refresh the injection so the next turn sees the new memory.
+                            let _ = refresh_memory_injection(&state).await;
+                            emit(
+                                &Event::new("memory_saved")
+                                    .with("id", json!(id))
+                                    .with("message", json!("memory saved")),
+                            );
+                        }
+                        Err(e) => {
+                            emit(&Event::new("error").with("message", json!(format!("save_memory failed: {e}"))));
+                        }
+                    }
+                }
+            }
+            Command::ListMemory => {
                 let ws = state.cfg.read().await.workspace.clone();
-                let mem = memory_injection(&ws, "");
-                // Rebuild the system prompt with fresh memory and persist it.
-                // Guard: don't rebuild messages[0] unless the prompt actually
-                // changed — a rebuild busts the provider's prefix cache.
-                let mut conv = state.conversation.lock().await;
-                let new_system = build_system_prompt(&ws, true);
-                if let Some(first) = conv.first() {
-                    let old_content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    if old_content == new_system {
-                        drop(conv);
-                        emit(&Event::new("info").with("message", json!("memory unchanged; system prompt kept intact (preserving prefix cache)")));
-                        return;
+                let entries = memory::scan_memories(&ws);
+                let arr: Vec<Value> = entries
+                    .iter()
+                    .map(|m| {
+                        let id = m
+                            .path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        json!({
+                            "id": id,
+                            "name": m.name,
+                            "type": m.mem_type,
+                            "description": m.description,
+                            "content": m.content,
+                            // Display fields consumed by the TUI's /memory list:
+                            // `text` is the scannable label (the memory name),
+                            // `tags` surfaces the type as a single tag.
+                            "text": m.name,
+                            "tags": [m.mem_type],
+                        })
+                    })
+                    .collect();
+                emit(
+                    &Event::new("memory_list")
+                        .with("entries", json!(arr))
+                        .with("count", json!(arr.len())),
+                );
+            }
+            Command::ForgetMemory { id } => {
+                let ws = state.cfg.read().await.workspace.clone();
+                match memory::forget_memory(&ws, &id) {
+                    Ok(()) => {
+                        let _ = refresh_memory_injection(&state).await;
+                        emit(
+                            &Event::new("memory_saved")
+                                .with("message", json!(format!("forgot memory '{id}'"))),
+                        );
+                    }
+                    Err(e) => {
+                        emit(&Event::new("error").with("message", json!(format!("forget_memory failed: {e}"))));
                     }
                 }
-                if let Some(first) = conv.first_mut() {
-                    if first.get("role").and_then(|v| v.as_str()) == Some("system") {
-                        *first = json!({ "role": "system", "content": new_system });
-                        *state.needs_sanitize.lock().await = true;
-                        // Re-estimate after changing system message.
-                        *state.estimated_tokens.lock().await = estimate_messages_tokens(&conv);
-                        if let Some(p) = state.cfg.read().await.session_file.as_ref() {
-                            session::rewrite(p, &conv);
-                        }
-                    }
-                }
-                drop(conv);
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!(
-                        "memory refreshed: {}",
-                        if mem.is_empty() {
-                            "no memories found"
-                        } else {
-                            "memories injected"
-                        }
-                    )),
-                ));
             }
             Command::Approve {
                 request_id,
@@ -1900,12 +1962,18 @@ async fn run_turn(
                         outcome.output.push_str(&hook_notes.join("\n- "));
                     }
                     st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
-                    emit(
-                        &Event::new("tool_result")
-                            .with("id", json!(id))
-                            .with("ok", json!(outcome.ok))
-                            .with("output", json!(outcome.output)),
-                    );
+                    let mut ev = Event::new("tool_result")
+                        .with("id", json!(id))
+                        .with("ok", json!(outcome.ok))
+                        .with("output", json!(outcome.output));
+                    // Surface a unified-diff rendering to the TUI as a separate
+                    // `diff` field (edit/patch/write_file). It is NOT added to the
+                    // model-facing tool content (`output`) so the model's context
+                    // stays compact — the diff is for the human approver.
+                    if let Some(d) = &outcome.diff {
+                        ev = ev.with("diff", json!(d));
+                    }
+                    emit(&ev);
                     let tool_result =
                         json!({ "role": "tool", "tool_call_id": id, "content": outcome.output });
                     let est = estimate_message_tokens(&tool_result);
@@ -2171,6 +2239,40 @@ fn truncate_str(s: &str, n: usize) -> String {
 /// and keep system + recent turns. A summarization call would be better but adds
 /// cost+complexity; this keeps the agent unblocked. Orphaned-tool-call sanitizer
 /// in provider.rs backstops any tool_call/result mismatch this creates.
+/// Rebuild the system prompt with fresh memory and persist it. Returns a
+/// human-readable status. No-op (preserving the provider prefix cache) when
+/// the prompt is unchanged. Shared by RefreshMemory and the save/forget
+/// commands so a saved/removed memory is visible to the very next turn.
+async fn refresh_memory_injection(state: &State) -> String {
+    let ws = state.cfg.read().await.workspace.clone();
+    let mem = memory_injection(&ws, "");
+    let new_system = build_system_prompt(&ws, true);
+    let mut conv = state.conversation.lock().await;
+    if let Some(first) = conv.first() {
+        let old_content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if old_content == new_system {
+            return "memory unchanged; system prompt kept intact (preserving prefix cache)"
+                .to_string();
+        }
+    }
+    if let Some(first) = conv.first_mut() {
+        if first.get("role").and_then(|v| v.as_str()) == Some("system") {
+            *first = json!({ "role": "system", "content": new_system });
+            *state.needs_sanitize.lock().await = true;
+            *state.estimated_tokens.lock().await = estimate_messages_tokens(&conv);
+            if let Some(p) = state.cfg.read().await.session_file.as_ref() {
+                session::rewrite(p, &conv);
+            }
+        }
+    }
+    drop(conv);
+    if mem.is_empty() {
+        "memory refreshed: no memories found".to_string()
+    } else {
+        "memory refreshed: memories injected".to_string()
+    }
+}
+
 pub fn compact_conversation(messages: &mut Vec<Value>, _ctx: u64) {
     // Keep: system (first), and the last ~10 messages verbatim.
     // Drop tool messages (role == "tool") in the middle band to reclaim tokens.
@@ -2227,6 +2329,23 @@ pub async fn compact_with_summary(
         );
     } else {
         compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
+    }
+    // Session memory extraction: persist durable facts so future sessions inherit
+    // project knowledge. Best-effort; never blocks compaction. A fixed memory
+    // name ("session-extract") rolls forward — it overwrites rather than spamming
+    // one entry per compaction.
+    if cfg.summarize_on_compact {
+        if let Some(facts) =
+            provider::extract_facts(client, cfg, api_key, model, &to_summarize, cancel).await
+        {
+            let _ = memory::save_memory(
+                &cfg.workspace,
+                "session-extract",
+                &facts,
+                "session",
+                "auto-extracted durable facts (updated on compaction)",
+            );
+        }
     }
     compacted.extend(kept);
     *messages = compacted;

@@ -89,6 +89,13 @@ cd tui && go build -o tui             # -> tui/tui
 
 Requires Rust (stable) and Go 1.21+ (tested with Go 1.23).
 
+To build **all** release artifacts at once — Windows MSI + standalone `.exe`,
+macOS standalone + `.dmg`, Linux standalone + AppImage — run
+`./release-all.sh [version]`. It runs each platform script independently and
+reports per-platform pass/fail, so a host with only a partial toolchain (e.g.
+no `zig` for macOS) still builds whatever it can. See the per-platform sections
+below for each toolchain's requirements.
+
 ## Run
 
 ```bash
@@ -110,12 +117,21 @@ In the TUI:
 
 ## Windows install (`ucli`)
 
-Cross-compile both binaries for Windows and package them into a per-user MSI
-that installs `ucli` + `umans-core` to `%LOCALAPPDATA%\Programs\ucli` and adds
-that directory to the user PATH (so `ucli` works from any CWD, no admin needed):
+`release-windows.sh` cross-compiles for Windows x86_64 and produces two
+self-contained artifacts:
+
+- **`ucli-<ver>-windows.msi`** — a per-user MSI installer that installs
+  `ucli` + `umans-core` to `%LOCALAPPDATA%\Programs\ucli` and adds that
+  directory to the user PATH (so `ucli` works from any CWD, no admin needed).
+- **`ucli-<ver>-windows-x86_64.exe`** — a single standalone executable with the
+  Rust core embedded (`-tags embed_core`); no install, no separate
+  `umans-core`. Run it from any CWD — it extracts its bundled core to
+  `%LOCALAPPDATA%\umans-harness` on first run.
 
 ```bash
 ./release-windows.sh        # -> dist/ucli-<ver>-windows.msi + .sha256
+                           #    dist/ucli-<ver>-windows-x86_64.exe + .sha256
+                           #    dist/ucli-<ver>-windows.zip (no-build fallback)
 ```
 
 `release-windows.sh` cross-compiles with cargo (`x86_64-pc-windows-gnu`) and Go
@@ -135,6 +151,10 @@ and supports in-place upgrades (fixed `UpgradeCode`). Open a new PowerShell
 window after install and run `ucli` from any directory. First run: `/key sk-...`
 then `/model`.
 
+Prefer no install? Run the standalone `.exe` from anywhere — double-click
+`ucli-<ver>-windows-x86_64.exe` (or `.\ucli-<ver>-windows-x86_64.exe` in
+PowerShell) and it launches in the current directory with the core embedded.
+
 No `wixl`/WiX available? `packaging/windows/install.ps1` is a no-build fallback:
 unzip the two `.exe` files beside it and run `.\install.ps1` to copy them into
 `%LOCALAPPDATA%\Programs\ucli` and update the user PATH.
@@ -149,20 +169,29 @@ Runtime caveats on Windows:
 - Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; leave
   `/sandbox` set to `none`.
 
-## macOS standalone executable
+## macOS install (`ucli`)
 
-Download a single self-contained executable that runs from any CWD — no install,
-no separate `umans-core`. The Rust core is embedded in the binary and extracted
-to `~/Library/Caches/umans-harness` on first run.
+`release-macos.sh` cross-compiles per arch (arm64 + x86_64) and produces two
+self-contained artifacts:
+
+- **`umans-harness-<ver>-macos-{arm64,x86_64}`** — a single standalone
+  executable with the Rust core embedded (`-tags embed_core`); runs from any
+  CWD, no install, no separate `umans-core`. It extracts its bundled core to
+  `~/Library/Caches/umans-harness` on first run.
+- **`ucli-<ver>-macos-{arm64,x86_64}.dmg`** — a disk-image installer wrapping
+  that standalone executable. Mount it and double-click `Install ucli.command`
+  to copy `ucli` onto your PATH (`/usr/local/bin`), then run `ucli` from any
+  terminal.
 
 Grab the matching arch from `dist/` (built by `./release-macos.sh`):
 
-- `umans-harness-<ver>-macos-arm64`  — Apple Silicon (M-series)
-- `umans-harness-<ver>-macos-x86_64` — Intel
+- `umans-harness-<ver>-macos-arm64` / `ucli-<ver>-macos-arm64.dmg`  — Apple Silicon (M-series)
+- `umans-harness-<ver>-macos-x86_64` / `ucli-<ver>-macos-x86_64.dmg` — Intel
 
 ```bash
 chmod +x umans-harness-0.2.0-macos-arm64
 ./umans-harness-0.2.0-macos-arm64      # launches in the current directory
+# or: open ucli-0.2.0-macos-arm64.dmg, then double-click "Install ucli.command"
 ```
 
 Then `/key sk-...`, `/model`, and type a prompt. The workspace is the directory
@@ -174,18 +203,69 @@ Build it yourself on Linux (zig is the macOS linker; no Xcode/SDK needed):
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo install cargo-zigbuild          # and put zig 0.13+ on PATH
 ./release-macos.sh                    # -> dist/umans-harness-<ver>-macos-{arm64,x86_64} + .sha256
+                                       #    dist/ucli-<ver>-macos-{arm64,x86_64}.dmg + .sha256
 ```
 
 `release-macos.sh` cross-compiles the core with `cargo zigbuild` (pure-Rust
 `rustls-tls`, so no macOS SDK) and the TUI with `GOOS=darwin`, embedding the
-core via `go:embed` (`-tags embed_core`) so each output is one file. The TUI
-resolves the core as: `$UMANS_CORE` → embedded extraction → the usual
-dev/installed search, so dev builds and the Windows MSI layout are unchanged.
+core via `go:embed` (`-tags embed_core`) so each standalone output is one file.
+The `.dmg` is built with `hdiutil` (real UDIF) on macOS, or `xorriso` (an HFS+
+hybrid image that mounts on macOS) when cross-built on Linux. The TUI resolves
+the core as: `$UMANS_CORE` → embedded extraction → the usual dev/installed
+search, so dev builds and the Windows MSI layout are unchanged.
 
 Runtime caveats on macOS:
 - Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; leave
   `/sandbox` set to `none`.
 - The agent's `bash` tool needs `bash` on PATH (present by default on macOS).
+
+## Linux install (`ucli`)
+
+`release-linux.sh` builds for the host arch (x86_64 or aarch64) and produces two
+self-contained artifacts:
+
+- **`umans-harness-<ver>-linux-<arch>`** — a single standalone executable with
+  the Rust core embedded (`-tags embed_core`); runs from any CWD, no install,
+  no separate `umans-core`. It extracts its bundled core to
+  `~/.cache/umans-harness` on first run.
+- **`ucli-<ver>-<arch>.AppImage`** — a self-contained AppImage (squashfs
+  payload) wrapping that standalone executable. Run it from any terminal with
+  `./ucli-<ver>-<arch>.AppImage`; it launches the TUI in the current directory.
+  `<arch>` is `x86_64` or `aarch64`.
+
+```bash
+./release-linux.sh          # -> dist/umans-harness-<ver>-linux-<arch> + .sha256
+                            #    dist/ucli-<ver>-<arch>.AppImage + .sha256
+```
+
+Run either from any directory:
+
+```bash
+chmod +x umans-harness-0.2.0-linux-x86_64 && ./umans-harness-0.2.0-linux-x86_64
+chmod +x ucli-0.2.0-x86_64.AppImage       && ./ucli-0.2.0-x86_64.AppImage
+```
+
+Or install either as a `ucli` command on your PATH (the AppImage is a single
+ELF you can rename and place on PATH, just like the standalone):
+
+```bash
+sudo install -m 0755 ucli-0.2.0-x86_64.AppImage /usr/local/bin/ucli   # then run: ucli
+```
+
+Then `/key sk-...`, `/model`, and type a prompt. The workspace is the directory
+you launched from — rerun from another folder to work on a different project.
+
+`release-linux.sh` builds the core natively (`cargo --release`), embeds it into
+the TUI via `go:embed` (`-tags embed_core`), then wraps that standalone binary
+in an AppImage with `appimagetool` (fetched once to `~/.cache/appimagetool/`
+if not on PATH; set `APPIMAGETOOL=<path>` to use a local copy). The AppImage
+needs no install and no root; on headless/CI boxes without FUSE it is still
+built (`APPIMAGE_EXTRACT_AND_RUN=1` runs appimagetool without FUSE).
+
+Runtime caveats on Linux:
+- Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; set it in
+  the TUI settings modal or pass `--sandbox firejail --no-network` to the core.
+- The agent's `bash` tool needs `bash` on PATH (present by default).
 
 ## Protocol
 

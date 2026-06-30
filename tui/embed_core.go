@@ -63,8 +63,11 @@ func embeddedCorePath() string {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return ""
 	}
-	name := fmt.Sprintf("umans-core-%s-%s-%s", coreVersion, runtime.GOOS, runtime.GOARCH)
+	name := fmt.Sprintf("umans-core-%s-%s-%s%s", coreVersion, runtime.GOOS, runtime.GOARCH, coreExeSuffix())
 	dst := filepath.Join(cacheDir, name)
+	// On Windows the extracted core needs the .exe suffix (coreExeSuffix) so
+	// CreateProcess exec's it by name and AV tools recognize it; on macOS/Linux
+	// coreExeSuffix() is "" so the cache name is unchanged from prior releases.
 	// Reuse an existing extraction only if it matches the embedded core by BOTH
 	// size AND content hash, so a tampered/replaced cache file (same size, different
 	// bytes) can't be exec'd (P2: was size-only — a TOCTOU on the shared cache).

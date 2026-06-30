@@ -124,6 +124,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		if match != nil {
 			match.output = out
+			match.diff = ev.get("diff")
 			match.dur = time.Since(match.started)
 			s.cur = nil
 			wasScout := !match.sub && (match.name == "spawn" || match.name == "subagent")
@@ -333,7 +334,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		cached := ev.get("cached_tokens")
 		turns := ev.get("turns")
 		msgs := ev.get("messages")
+		sessionFile := ev.get("session_file")
 		s.logInfo(fmt.Sprintf("stats: %s in / %s out (%s total) · %s turns · %s msgs", ti, to, tt, turns, msgs))
+		if sessionFile != "" {
+			s.logInfo(fmt.Sprintf("session: %s", sessionFile))
+		}
 		if cached != "" && cached != "0" {
 			// Show cache effectiveness as cached/total-prompt-in (%).
 			if tiN, err := strconv.ParseUint(ti, 10, 64); err == nil && tiN > 0 {
@@ -346,6 +351,39 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 
+	case "memory_saved":
+		if msg := ev.get("message"); msg != "" {
+			s.logSuccess(msg)
+		} else {
+			s.logInfo("memory saved")
+		}
+	case "memory_list":
+		var m map[string]json.RawMessage
+		var entries []memoryEntry
+		if err := json.Unmarshal(ev.Raw, &m); err == nil {
+			if raw, ok := m["entries"]; ok {
+				_ = json.Unmarshal(raw, &entries)
+			}
+		}
+		if len(entries) == 0 {
+			s.logInfo("no memories saved")
+			break
+		}
+		var rows []string
+		rows = append(rows, accentStyle.Render("◆ Memories"))
+		for _, e := range entries {
+			text := truncateRunes(e.Text, 80)
+			id := e.ID
+			if id == "" {
+				id = "?"
+			}
+			tags := ""
+			if len(e.Tags) > 0 {
+				tags = "  " + dimStyle.Render("["+strings.Join(e.Tags, ",")+"]")
+			}
+			rows = append(rows, mutedStyle.Render(id)+"  "+baseStyle.Render(text)+tags)
+		}
+		s.logRaw(strings.Join(rows, "\n"))
 	case "error":
 		s.logError(ev.get("message"))
 	case "plugin_installed":
@@ -1004,6 +1042,26 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/compact":
 			s.sendCore(map[string]any{"type": "compact"})
 			s.logInfo("forcing context compaction…")
+			return nil
+		case "/remember":
+			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
+			if rest == "" {
+				s.logError("usage: /remember <text>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "save_memory", "text": rest})
+			s.sendCore(map[string]any{"type": "refresh_memory"})
+			s.logSuccess("memory saved")
+			return nil
+		case "/memory":
+			s.sendCore(map[string]any{"type": "list_memory"})
+			return nil
+		case "/forget":
+			if len(parts) < 2 {
+				s.logError("usage: /forget <id>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "forget_memory", "id": parts[1]})
 			return nil
 		case "/sessions":
 			s.sendCore(map[string]any{"type": "list_sessions"})

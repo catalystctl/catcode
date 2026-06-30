@@ -40,6 +40,7 @@ type block struct {
 	name      string          // tool name (blkTool / blkApprove)
 	args      string          // tool args
 	output    string          // blkToolResult
+	diff      string          // blkTool: unified-diff text (tool_result only); shown instead of output when present
 	started   time.Time       // blkTool: when the call began
 	dur       time.Duration   // blkTool: elapsed until result
 	collapsed bool            // blkThinking only
@@ -310,10 +311,16 @@ func (s *session) renderToolBlock(b *block, w int) string {
 	if b.dur == 0 {
 		return head.String() // in-flight: head only; live status is in the panel
 	}
+	// Prefer a unified-diff view when the core attached one (edit/patch/
+	// write_file); fall back to the plain output panel, then to "(no output)" only
+	// when both are empty. ctrl+o toggles b.expanded for either view.
 	body := ""
-	if strings.TrimSpace(b.output) != "" {
+	switch {
+	case strings.TrimSpace(b.diff) != "":
+		body = "\n" + renderDiffPanel(b.diff, b.expanded, w)
+	case strings.TrimSpace(b.output) != "":
 		body = "\n" + renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w)
-	} else {
+	default:
 		body = "\n" + dimStyle.Italic(true).Render("│ (no output)")
 	}
 	return head.String() + body

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=ucli
+GenericName=Umans AI Harness
+Comment=Terminal coding-agent harness with native Umans provider
+Exec=ucli
+Icon=ucli
+Terminal=true
+Type=Application
+Categories=Development;ConsoleOnly;Utility;
+Keywords=ai;agent;coding;llm;umans;terminal;tui;
+StartupNotify=false

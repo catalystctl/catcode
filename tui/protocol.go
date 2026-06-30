@@ -23,7 +23,8 @@ type modelInfo struct {
 	// the TUI then falls back to its own low/medium/high set.
 	ThinkingLevels []string `json:"thinking_levels"`
 	// Vision is true when the model accepts image inputs (from /models/info
-	// capabilities.vision). Drives the vision-handoff plugin's routing.
+	// capabilities.supports_vision; only boolean true counts — "via-handoff"
+	// is not native client-side vision). Drives the vision-handoff plugin's routing.
 	Vision bool `json:"vision"`
 }
 
@@ -60,6 +61,14 @@ type sessionEntry struct {
 	Messages int    `json:"messages"`
 	Mtime    uint64 `json:"mtime"`
 	Current  bool   `json:"current"`
+}
+
+// memoryEntry mirrors one element of the core's "memory_list" event array
+// (id + text + tags; any extra fields the core sends are ignored).
+type memoryEntry struct {
+	ID   string   `json:"id"`
+	Text string   `json:"text"`
+	Tags []string `json:"tags"`
 }
 
 // coreEvent is one newline-delimited JSON line from the core.

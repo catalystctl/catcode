@@ -275,7 +275,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/key", desc: "set API key"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
-		{label: "/reasoning", desc: "set reasoning effort (low/med/high)"},
+		{label: "/reasoning", desc: "set reasoning effort (per model)"},
 		{label: "/reset", desc: "wipe conversation + session file"},
 		{label: "/clear", desc: "clear view (keep session file)"},
 		{label: "/undo", desc: "drop last turn"},
@@ -300,6 +300,9 @@ func (s *session) commandItems() []listItem {
 		{label: "/subagents", desc: "list available subagents"},
 		{label: "/subagents-doctor", desc: "subagent setup diagnostics"},
 		{label: "/subagents-status", desc: "show active subagent runs"},
+		{label: "/remember", desc: "save a memory note (persisted across sessions)"},
+		{label: "/memory", desc: "list saved memories"},
+		{label: "/forget", desc: "forget a memory by id"},
 	}
 }
 
@@ -928,7 +931,7 @@ func helpText() string {
 		"                    select, esc closes the flyout",
 		"  ctrl+t            toggle reasoning collapse",
 		"  ctrl+o            expand / collapse last tool output",
-		"  ctrl+r            set reasoning effort (low/med/high)",
+		"  ctrl+r            set reasoning effort (per model)",
 		"  ctrl+c            quit",
 		"  esc               close modal / deny approval / abort turn",
 		"",
@@ -959,7 +962,7 @@ func helpText() string {
 		"  /key sk-...       set API key",
 		"  /model [N|substr] list or switch model",
 		"  /approval <mode>  never | destructive | always",
-		"  /reasoning        set reasoning effort (low/med/high)",
+		"  /reasoning        set reasoning effort (per model)",
 		"  /reset            wipe conversation + session file",
 		"  /clear            clear view (keep session file)",
 		"  /undo             drop last turn",

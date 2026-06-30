@@ -121,6 +121,53 @@ pub async fn summarize(
         .map(|s| s.to_string())
 }
 
+/// Extract durable facts worth remembering across future sessions from a slice of
+/// the conversation. Best-effort (returns None on any failure, or if there is
+/// nothing durable). Used by the session memory extraction hook on compaction.
+pub async fn extract_facts(
+    client: &reqwest::Client,
+    cfg: &Config,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let body = json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            { "role": "system", "content": "Extract durable facts about this project worth remembering across future sessions: conventions, structure, key decisions, gotchas, and how things work. Be concise and specific (paths, names). If there is nothing durable, reply with the single word: none\n\nOutput a short bulleted list, one fact per line, no preamble." },
+            { "role": "user", "content": messages.iter().map(message_for_summary).collect::<Vec<_>>().join("\n") }
+        ]
+    });
+    let url = format!("{}{CHAT_PATH}", cfg.base_url);
+    let req = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .timeout(Duration::from_secs(120));
+    let resp = tokio::select! {
+        r = req.send() => r.ok()?,
+        _ = cancel.cancelled() => return None,
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    let content = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())?
+        .to_string();
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(content)
+}
+
 fn fallback_models() -> Vec<ModelInfo> {
     // ponytail: GLM chat template maps any effort except 'high' to 'max', which
     // degenerates thinking output. Advertise only ["high"] so resolve_effort
@@ -227,6 +274,18 @@ pub async fn discover_models(client: &reqwest::Client, base_url: &str) -> Vec<Mo
 /// Model cache TTL in seconds (8 hours).
 const MODELS_CACHE_TTL: u64 = 28800;
 
+/// Cache schema version. Bumped when the parsed model shape changes so a stale
+/// cache written by an older parser (e.g. one that stored empty thinking_levels
+/// or wrong vision flags because it read the wrong field) is treated as a miss
+/// and refreshed, instead of masking the fix for up to the TTL window.
+const MODELS_CACHE_VERSION: u64 = 3;
+
+/// True when a parsed cache object matches the current schema version. Pure
+/// (no disk) so the version gate can be unit-tested.
+fn cache_version_ok(cache: &Value) -> bool {
+    cache.get("version").and_then(|v| v.as_u64()) == Some(MODELS_CACHE_VERSION)
+}
+
 fn models_cache_path() -> Option<std::path::PathBuf> {
     let home = crate::config::home_dir()?;
     Some(home.join(".config/umans-harness/models-cache.json"))
@@ -238,6 +297,9 @@ fn read_models_cache(base_url: &str) -> Option<Vec<ModelInfo>> {
     let cache: Value = serde_json::from_str(&content).ok()?;
     let cached_url = cache.get("base_url")?.as_str()?;
     if cached_url != base_url {
+        return None;
+    }
+    if !cache_version_ok(&cache) {
         return None;
     }
     let updated = cache.get("updated_at")?.as_u64()?;
@@ -257,6 +319,9 @@ fn read_models_cache_stale(base_url: &str) -> Option<Vec<ModelInfo>> {
     let cache: Value = serde_json::from_str(&content).ok()?;
     let cached_url = cache.get("base_url")?.as_str()?;
     if cached_url != base_url {
+        return None;
+    }
+    if !cache_version_ok(&cache) {
         return None;
     }
     parse_cache_models(&cache)
@@ -289,6 +354,7 @@ fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
         .collect();
     let cache = json!({
         "base_url": base_url,
+        "version": MODELS_CACHE_VERSION,
         "updated_at": now,
         "models": models_json,
     });
@@ -344,8 +410,13 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                 .and_then(|c| c.get("recommended_max_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(65000) as u32;
+            // Vision comes from capabilities.supports_vision, which the endpoint
+            // encodes as true / false / "via-handoff". Only boolean true counts
+            // as native client-side vision; "via-handoff" (GLM 5.2, whose vision
+            // only works on /v1/messages) falls through to false so the
+            // vision-handoff plugin routes image turns to a natively-capable model.
             let vision = caps
-                .and_then(|c| c.get("vision"))
+                .and_then(|c| c.get("supports_vision"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let name = info
@@ -353,11 +424,26 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                 .and_then(|v| v.as_str())
                 .unwrap_or(id)
                 .to_string();
-            let thinking_levels = caps
-                .and_then(|c| {
-                    c.get("thinking_levels")
-                        .or_else(|| c.get("reasoning_levels"))
-                        .or_else(|| c.get("reasoning_efforts"))
+            // The live /models/info endpoint nests reasoning config under
+            // capabilities.reasoning: { supported, can_disable, levels,
+            // default_level }. Read levels from there so each model advertises
+            // the efforts it actually accepts (e.g. GLM: none/high/max, flash:
+            // none/low/medium/high, kimi: []). Flat capability fields
+            // (thinking_levels / reasoning_levels / reasoning_efforts) are kept
+            // as a fallback for other OpenAI-compatible endpoints.
+            let reasoning_caps = caps.and_then(|c| c.get("reasoning"));
+            let reasoning_supported = reasoning_caps
+                .and_then(|r| r.get("supported"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let thinking_levels = reasoning_caps
+                .and_then(|r| r.get("levels"))
+                .or_else(|| {
+                    caps.and_then(|c| {
+                        c.get("thinking_levels")
+                            .or_else(|| c.get("reasoning_levels"))
+                            .or_else(|| c.get("reasoning_efforts"))
+                    })
                 })
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -370,7 +456,7 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
             out.push(ModelInfo {
                 id: id.clone(),
                 name,
-                reasoning: true,
+                reasoning: reasoning_supported,
                 context_window: cw,
                 max_tokens: mt,
                 thinking_levels,
@@ -1320,9 +1406,14 @@ mod tests {
 
     #[test]
     fn parse_models_response_reads_vision_flag() {
+        // The endpoint exposes vision as capabilities.supports_vision, encoded
+        // as true / false / "via-handoff". Only boolean true counts as native
+        // client-side vision; "via-handoff" (vision only on /v1/messages, which
+        // the harness doesn't use) falls through to false.
         let data = json!({
-            "vision-model": { "display_name": "Vision", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "vision": true } },
-            "text-model": { "display_name": "Text", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "vision": false } },
+            "vision-model": { "display_name": "Vision", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "supports_vision": true } },
+            "text-model": { "display_name": "Text", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "supports_vision": false } },
+            "handoff-model": { "display_name": "Handoff", "capabilities": { "context_window": 128000, "recommended_max_tokens": 4096, "supports_vision": "via-handoff" } },
             "unspecified": { "display_name": "Unspec", "capabilities": { "context_window": 128000 } }
         });
         let models = parse_models_response(&data);
@@ -1330,6 +1421,7 @@ mod tests {
             models.iter().map(|m| (m.id.as_str(), m)).collect();
         assert!(by_id["vision-model"].vision);
         assert!(!by_id["text-model"].vision);
+        assert!(!by_id["handoff-model"].vision); // "via-handoff" is not native client-side vision
         assert!(!by_id["unspecified"].vision); // default false when absent
     }
 
@@ -1341,5 +1433,80 @@ mod tests {
         let j2 = r#"{"id":"x","name":"X","context_window":1,"max_tokens":1,"vision":true}"#;
         let m2: ModelInfo = serde_json::from_str(j2).unwrap();
         assert!(m2.vision);
+    }
+
+    #[test]
+    fn parse_models_response_reads_reasoning_levels_nested() {
+        // The live /models/info endpoint nests reasoning levels under
+        // capabilities.reasoning.levels (not a flat capabilities.thinking_levels).
+        let data = json!({
+            "umans-glm-5.2": { "display_name": "Umans GLM 5.2", "capabilities": {
+                "context_window": 405504, "recommended_max_tokens": 131071,
+                "reasoning": { "supported": true, "can_disable": true, "levels": ["none","high","max"], "default_level": "high" }
+            }},
+            "umans-flash": { "display_name": "Umans Flash", "capabilities": {
+                "context_window": 262144, "recommended_max_tokens": 32768,
+                "reasoning": { "supported": true, "can_disable": true, "levels": ["none","low","medium","high"], "default_level": "medium" }
+            }},
+            "umans-kimi-k2.7": { "display_name": "Umans Kimi K2.7", "capabilities": {
+                "context_window": 262144, "recommended_max_tokens": 32768,
+                "reasoning": { "supported": true, "can_disable": false, "levels": [], "default_level": null }
+            }}
+        });
+        let models = parse_models_response(&data);
+        let by_id: std::collections::HashMap<&str, &ModelInfo> =
+            models.iter().map(|m| (m.id.as_str(), m)).collect();
+        assert_eq!(
+            by_id["umans-glm-5.2"].thinking_levels,
+            vec!["none".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert_eq!(
+            by_id["umans-flash"].thinking_levels,
+            vec!["none".to_string(), "low".to_string(), "medium".to_string(), "high".to_string()]
+        );
+        assert!(by_id["umans-kimi-k2.7"].thinking_levels.is_empty());
+        // reasoning flag follows reasoning.supported
+        assert!(by_id["umans-glm-5.2"].reasoning);
+        assert!(by_id["umans-kimi-k2.7"].reasoning);
+    }
+
+    #[test]
+    fn parse_models_response_reasoning_supported_false() {
+        let data = json!({
+            "no-think": { "display_name": "No Think", "capabilities": {
+                "context_window": 128000, "recommended_max_tokens": 4096,
+                "reasoning": { "supported": false, "levels": [] }
+            }}
+        });
+        let models = parse_models_response(&data);
+        assert!(!models[0].reasoning);
+        assert!(models[0].thinking_levels.is_empty());
+    }
+
+    #[test]
+    fn parse_models_response_flat_levels_fallback() {
+        // Endpoints that expose levels as a flat capability field still parse.
+        let data = json!({
+            "flat-model": { "display_name": "Flat", "capabilities": {
+                "context_window": 128000, "recommended_max_tokens": 4096,
+                "reasoning_levels": ["low","high"]
+            }}
+        });
+        let models = parse_models_response(&data);
+        assert_eq!(
+            models[0].thinking_levels,
+            vec!["low".to_string(), "high".to_string()]
+        );
+    }
+
+    #[test]
+    fn cache_version_gate() {
+        // A cache with the current version is accepted.
+        assert!(cache_version_ok(&json!({ "version": MODELS_CACHE_VERSION })));
+        // A pre-versioning cache (no version field) is rejected so a parser fix
+        // isn't masked by stale data for the TTL window.
+        assert!(!cache_version_ok(&json!({ "base_url": "x", "updated_at": 0 })));
+        // A future / mismatched version is rejected.
+        assert!(!cache_version_ok(&json!({ "version": 99 })));
     }
 }

@@ -16,8 +16,9 @@ pub struct ModelInfo {
     #[serde(default)]
     pub thinking_levels: Vec<String>,
     /// Whether the model accepts image (vision) inputs. Populated from
-    /// /models/info `capabilities.vision` when the endpoint advertises it;
-    /// false otherwise. Drives the vision-handoff (pre_turn plugin) routing.
+    /// /models/info `capabilities.supports_vision` (true/false/"via-handoff";
+    /// only boolean true counts as native client-side vision); false otherwise.
+    /// Drives the vision-handoff (pre_turn plugin) routing.
     #[serde(default)]
     pub vision: bool,
 }
@@ -111,6 +112,22 @@ pub enum Command {
     /// Ask core to re-inject memories into the system prompt (called after saving a memory).
     #[serde(rename = "refresh_memory")]
     RefreshMemory,
+    /// Save a memory note (persisted across sessions, scoped to the workspace).
+    /// Core generates a name, saves it, and refreshes the system-prompt injection.
+    /// Emits a `memory_saved` event with the new id.
+    #[serde(rename = "save_memory")]
+    SaveMemory {
+        text: String,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+    },
+    /// List saved memories for this workspace. Emits a `memory_list` event.
+    #[serde(rename = "list_memory")]
+    ListMemory,
+    /// Forget (delete) a memory by its id (the slug or the memory name).
+    /// Emits a `memory_saved` event describing the outcome.
+    #[serde(rename = "forget_memory")]
+    ForgetMemory { id: String },
     /// Reply to a subagent's contact_supervisor need_decision ask.
     /// The TUI surfaces an `intercom_message` event and the user (acting as
     /// the orchestrator) replies with this command; the awaiting subagent

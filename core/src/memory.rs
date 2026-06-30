@@ -121,6 +121,28 @@ pub fn save_memory(
     Store::new(Store::default_root()).save(workspace, name, content, mem_type, description)
 }
 
+/// Delete a memory by its slug/id (the filename stem) and rebuild the index.
+/// Accepts either the slug (file stem) or the original memory `name` — slugify()
+/// normalizes both to the same filename, so only the slug candidate is needed.
+/// slugify() strips '/', '\', and '.' to '-', so the joined path can never
+/// escape the memory dir (no path-traversal deletion via a crafted id).
+pub fn forget_memory(workspace: &Path, id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("memory id must not be empty".to_string());
+    }
+    let store = Store::new(Store::default_root());
+    let dir = store.dir(workspace);
+    let slug = slugify(id);
+    let path = dir.join(format!("{}.md", slug));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("failed to remove memory: {e}"))?;
+        rebuild_index(&dir)?;
+        Ok(())
+    } else {
+        Err(format!("no memory found with id/name '{id}'"))
+    }
+}
+
 /// Build a string to inject into the system prompt with memories relevant to
 /// the user's current prompt. Returns an empty string if no memories match.
 pub fn memory_injection(workspace: &Path, prompt: &str) -> String {
@@ -546,6 +568,9 @@ mod tests {
         assert_eq!(slugify("TypeScript Rules!"), "typescript-rules");
         assert_eq!(slugify("  spaces  "), "spaces");
         assert_eq!(slugify("a/b:c"), "a-b-c");
+        // traversal chars are stripped, so a crafted id can't escape the memory dir
+        assert_eq!(slugify("../../etc/passwd"), "etc-passwd");
+        assert!(!slugify("../../etc/passwd").contains('/') && !slugify("../../etc/passwd").contains('.'));
     }
 
     #[test]

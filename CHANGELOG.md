@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added — cross-platform installers & standalone executables
+- All three desktop platforms now ship BOTH a native installer AND a
+  self-contained standalone executable, so `ucli` runs from the terminal with
+  no install on any OS:
+  - **Windows** — `ucli-<ver>-windows.msi` (per-user MSI, adds `ucli` to PATH,
+    no admin) **and** `ucli-<ver>-windows-x86_64.exe` (single file, Rust core
+    embedded via `go:embed` `-tags embed_core`; extracts its core to
+    `%LOCALAPPDATA%\umans-harness` on first run). `release-windows.sh` now
+    emits both (previously MSI + zip only).
+  - **macOS** — `ucli-<ver>-macos-{arm64,x86_64}.dmg` (disk-image installer:
+    mount + double-click `Install ucli.command` to put `ucli` on `/usr/local/bin`)
+    **and** the existing `umans-harness-<ver>-macos-{arm64,x86_64}` standalone.
+    `release-macos.sh` now builds the `.dmg` too (`hdiutil` real UDIF on macOS,
+    `xorriso` HFS+ hybrid when cross-built on Linux).
+  - **Linux** — `ucli-<ver>-<arch>.AppImage` (self-contained AppImage wrapping
+    the embedded-core standalone) **and** `umans-harness-<ver>-linux-<arch>`
+    standalone. New `release-linux.sh` builds the core natively, embeds it into
+    the TUI, generates a terminal-prompt icon, and packages the AppImage with
+    `appimagetool` (fetched on demand; runs without FUSE via
+    `APPIMAGE_EXTRACT_AND_RUN=1`).
+  - New `release-all.sh` runs all three platform scripts and reports
+    per-platform pass/fail, so a partial toolchain still ships what it can.
+  - Packaging assets: `packaging/linux/{AppRun,ucli.desktop,make-icon.py}` and
+    `packaging/macos/{install.command,README.txt}`.
+- `tui/embed_core.go`: the extracted embedded core now gets the platform exe
+  suffix (`coreExeSuffix()`), so on Windows it caches as
+  `umans-core-<ver>-windows-amd64.exe` (a proper PE name CreateProcess exec's
+  and AV tools recognize); unchanged on macOS/Linux.
+- Fixed a latent `go build -ldflags` bug: `release-windows.sh` and `release.sh`
+  used `-X main/coreVersion` with a slash (`main/coreVersion`), which the Go
+  1.24 linker rejects. Corrected to `-X main.coreVersion` (dot), matching
+  `release-macos.sh`.
+
 ### Fixed - plugin hook dispatch for write/edit/bash/read
 - Pre-execution hooks (`pre_write`/`pre_bash`/`pre_read`) ran **twice** per
   tool call: a leftover dead loop re-executed every hook, so on denial the model
@@ -22,6 +55,35 @@
   (`workspace::check_dangerous_path`) to `write_file`/`edit`/`patch` as the main
   loop, so scoped subagent writes to `.git/**`, `**/.ssh/**`, `**/.env*`, etc.
   are blocked and the subagent model is told why.
+
+### Fixed — per-model reasoning levels from /models/info
+- The core's `/models/info` parser looked for reasoning levels under the wrong
+  field (`capabilities.thinking_levels` / `reasoning_levels` / `reasoning_efforts`),
+  but the endpoint nests them under `capabilities.reasoning.levels`. Every
+  live-discovered model therefore got **empty** levels and the TUI fell back to
+  the hardcoded `low/medium/high` trio for all models. The parser now reads the
+  real `capabilities.reasoning.levels` (with `reasoning.supported` for the flag),
+  so each model advertises the efforts it actually accepts — e.g. GLM 5.2
+  `none/high/max`, flash & qwen `none/low/medium/high`, kimi/coder `[]`
+  (keep the low/med/high fallback). Flat capability fields remain as a fallback
+  for other OpenAI-compatible endpoints.
+- Bumped the models cache schema to v3 (with a `version` gate on read) so stale
+  caches written by the older parser — which stored empty `thinking_levels` and
+  wrong `vision` flags — are treated as a miss and refreshed instead of masking
+  the fixes for the 8h TTL.
+- TUI: the `/reasoning` + `ctrl+r` hints no longer hardcode `(low/med/high)`;
+  the picker already renders the selected model's actual advertised levels.
+
+### Fixed — vision capability from /models/info
+- The `/models/info` parser read vision from the wrong field
+  (`capabilities.vision`), but the endpoint exposes it as
+  `capabilities.supports_vision`, encoded as `true` / `false` / `"via-handoff"`.
+  Every live model therefore reported `vision=false`, so the vision-handoff
+  plugin always handed image turns off even from natively vision-capable models
+  (kimi/coder/flash/qwen). The parser now reads `capabilities.supports_vision`;
+  only boolean `true` counts as native client-side vision, so `"via-handoff"`
+  (GLM 5.2, whose vision only works on `/v1/messages`, which the harness doesn't
+  use) maps to `false` and the plugin routes its image turns to a native model.
 
 ### Added — macOS standalone executable
 - `release-macos.sh` cross-compiles the harness into a single self-contained

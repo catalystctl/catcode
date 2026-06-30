@@ -147,6 +147,10 @@ func applyTheme(t theme) {
 	roleErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err)).Bold(true)
 	roleWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.warn)).Bold(true)
 	roleSuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success)).Bold(true)
+	toolDiffAdded = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success))
+	toolDiffRemoved = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+	toolDiffContext = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
+	toolDiffMeta = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
 }
 
 func themeNames() []string {

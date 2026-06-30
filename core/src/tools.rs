@@ -16,7 +16,8 @@ pub enum ToolKind {
 pub fn classify(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
-        | "finish" | "contact_supervisor" | "intercom" => ToolKind::ReadOnly,
+        | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff"
+        | "git_log" | "memory" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -357,6 +358,95 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "git_status",
+                "description": "Show the working-tree status (staged, unstaged, untracked) as `git status --short --branch`. Optional relative `path` limits the scope. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "optional relative path to scope the status" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Show unstaged changes (`git diff --no-color`) or staged changes with staged:true. Optional relative `path` scopes the diff. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "optional relative path to scope the diff" },
+                        "staged": { "type": "boolean", "description": "if true, show staged (--cached) changes" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_log",
+                "description": "Show recent commit history as `git log --oneline -n <limit>`. Optional relative `path` limits to a file's history. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "description": "max commits to show (default 20)" },
+                        "path": { "type": "string", "description": "optional relative path to filter history" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_add",
+                "description": "Stage files for commit (`git add -- <paths>`). Paths must be workspace-relative; absolute paths and `..` escapes are rejected. Destructive (modifies the index).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" }, "description": "relative paths to stage" }
+                    },
+                    "required": ["paths"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_commit",
+                "description": "Create a commit (`git commit -m <message>`). By default commits only already-staged changes; pass all:true to also stage modified tracked files first (does NOT add untracked files). Destructive.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "commit message" },
+                        "all": { "type": "boolean", "description": "if true, stage modified tracked files before committing (git commit --all)" }
+                    },
+                    "required": ["message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": "Persist, list, or forget durable memories scoped to this workspace. Memories survive across sessions and are injected into the system prompt when relevant. Use `save` to record conventions, structure, decisions, or gotchas worth remembering. Read-only (no workspace side effects).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["save", "list", "forget"], "description": "save a new memory, list memories, or forget one by id" },
+                        "name": { "type": "string", "description": "(save) short memory name; becomes the file slug and the id" },
+                        "content": { "type": "string", "description": "(save) the memory body" },
+                        "type": { "type": "string", "description": "(save) memory type, e.g. note/convention/decision (default note)" },
+                        "description": { "type": "string", "description": "(save) one-line description shown in the injection" },
+                        "id": { "type": "string", "description": "(forget) the memory id (slug or name) to remove" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "spawn",
                 "description": "Run a nested agentic turn with a fresh sub-conversation and its own tool loop. Use to delegate a bounded sub-task (research, review, implementation) and get a text result back. The sub-agent shares the same workspace and tools but cannot spawn further sub-agents.",
                 "parameters": {
@@ -378,6 +468,10 @@ pub fn definitions() -> Vec<Value> {
 pub struct Outcome {
     pub ok: bool,
     pub output: String,
+    /// Optional unified-diff rendering of the change (edit/patch/write_file).
+    /// Surfaced to the TUI as a separate `diff` event field so the model's
+    /// tool-result content (output) stays compact — the diff is for humans.
+    pub diff: Option<String>,
 }
 
 /// Execute a (non-bash) tool call synchronously. `cfg` provides confinement+limits.
@@ -410,6 +504,12 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "bulk_read" => bulk_read(args, cfg),
         "bulk_write" => bulk_write(args, cfg),
         "bulk_edit" => bulk_edit(args, cfg),
+        "git_status" => git_status(args, cfg),
+        "git_diff" => git_diff(args, cfg),
+        "git_log" => git_log(args, cfg),
+        "git_add" => git_add(args, cfg),
+        "git_commit" => git_commit(args, cfg),
+        "memory" => memory_tool(args, cfg),
         "bash" => Outcome::err("bash must be dispatched through execute_bash (async)"),
         "bulk" => Outcome::err("bulk must be dispatched through execute_bulk (async)"),
         other => Outcome::err(format!("unknown tool: {other}")),
@@ -421,12 +521,14 @@ impl Outcome {
         Self {
             ok: true,
             output: msg.into(),
+            diff: None,
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             output: msg.into(),
+            diff: None,
         }
     }
 }
@@ -511,8 +613,13 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
             }
         }
     }
+    let old_content = std::fs::read_to_string(&path).unwrap_or_default();
     match std::fs::write(&path, content) {
-        Ok(_) => Outcome::ok(format!("wrote {} bytes to {input}", content.len())),
+        Ok(_) => {
+            let mut out = Outcome::ok(format!("wrote {} bytes to {input}", content.len()));
+            out.diff = Some(make_unified_diff(&old_content, content, input, 3));
+            out
+        }
         Err(e) => Outcome::err(format!("write_file {input:?} failed: {e}")),
     }
 }
@@ -979,6 +1086,7 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
             Outcome {
                 ok,
                 output: combined,
+                diff: None,
             }
         }
         Ok(Err(e)) => Outcome::err(format!("bash wait failed: {e}")),
@@ -1125,6 +1233,7 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
         Ok(c) => c,
         Err(e) => return Outcome::err(format!("edit: read {input:?} failed: {e}")),
     };
+    let old_content = content.clone();
     let mut new_content = content;
     let mut log: Vec<String> = Vec::new();
     let mut applied = 0usize;
@@ -1162,7 +1271,9 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
     if let Err(e) = std::fs::write(&path, &new_content) {
         return Outcome::err(format!("edit: write {input:?} failed: {e}"));
     }
-    Outcome::ok(format!("applied {applied} edit(s): {}", log.join("; ")))
+    let mut out = Outcome::ok(format!("applied {applied} edit(s): {}", log.join("; ")));
+    out.diff = Some(make_unified_diff(&old_content, &new_content, input, 3));
+    out
 }
 
 // ---- bulk tools ----
@@ -1197,6 +1308,7 @@ error: path must be a string"
     Outcome {
         ok,
         output: blocks.join("\n\n"),
+        diff: None,
     }
 }
 
@@ -1227,6 +1339,7 @@ fn bulk_write(args: &Value, cfg: &Config) -> Outcome {
     Outcome {
         ok,
         output: lines.join("\n"),
+        diff: None,
     }
 }
 
@@ -1269,6 +1382,7 @@ fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
     Outcome {
         ok,
         output: blocks.join("\n\n"),
+        diff: None,
     }
 }
 
@@ -1333,6 +1447,7 @@ pub async fn execute_bulk(
     Outcome {
         ok,
         output: blocks.join("\n\n"),
+        diff: None,
     }
 }
 
@@ -1408,11 +1523,13 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
             if let Err(e) = std::fs::write(&resolved, &new) {
                 return Outcome::err(format!("patch write failed: {e}"));
             }
-            Outcome::ok(format!(
+            let mut out = Outcome::ok(format!(
                 "applied patch to {path} ({} -> {} bytes)",
                 original.len(),
                 new.len()
-            ))
+            ));
+            out.diff = Some(make_unified_diff(&original, &new, path, 3));
+            out
         }
         Err(e) => Outcome::err(format!("patch failed: {e}")),
     }
@@ -1633,6 +1750,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     Outcome {
         ok: out.status.success(),
         output: format!("{label}\n{s}"),
+        diff: None,
     }
 }
 
@@ -1640,6 +1758,398 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
 // ponytail: the spawn tool's body is in main.rs (it needs the reqwest client,
 // api key, models, conversation). tools.rs just exposes the tool definition.
 // execute() returns a sentinel so misuse surfaces clearly.
+
+// ---- unified diff (display only) ----
+// A compact LCS-based line diff for the TUI. Emitted as a separate `diff` event
+// field (NOT in the model-facing output) so the model's tool-result stays small.
+/// Build a unified diff between `old` and `new`, labeled with `path`, keeping
+/// `context` lines around each change. Returns "" when byte-identical. Bounded:
+/// falls back to a coarse summary for very large files and caps line output.
+#[allow(clippy::needless_range_loop)]
+pub fn make_unified_diff(old: &str, new: &str, path: &str, context: usize) -> String {
+    if old == new {
+        return String::new();
+    }
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let (m, n) = (a.len(), b.len());
+    // Guard: O(m*n) LCS is too expensive for huge files; emit a bounded note.
+    if (m as u64) * (n as u64) > 4_000_000 {
+        return format!(
+            "--- a/{path}\n+++ b/{path}\n@@ -1,{m} +1,{n} @@\n… large change ({m} → {n} lines); diff omitted for size …"
+        );
+    }
+    // LCS length table.
+    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        Equal,
+        Del,
+        Ins,
+    }
+    let mut script: Vec<(Op, &str)> = Vec::with_capacity(m + n);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if a[i] == b[j] {
+            script.push((Op::Equal, a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            script.push((Op::Del, a[i]));
+            i += 1;
+        } else {
+            script.push((Op::Ins, b[j]));
+            j += 1;
+        }
+    }
+    while i < m {
+        script.push((Op::Del, a[i]));
+        i += 1;
+    }
+    while j < n {
+        script.push((Op::Ins, b[j]));
+        j += 1;
+    }
+    let len = script.len();
+    // Precompute old/new line counters before each entry (1-based).
+    let mut ol_before = vec![0usize; len];
+    let mut nl_before = vec![0usize; len];
+    let (mut ol, mut nl) = (1usize, 1usize);
+    for idx in 0..len {
+        ol_before[idx] = ol;
+        nl_before[idx] = nl;
+        match script[idx].0 {
+            Op::Equal => {
+                ol += 1;
+                nl += 1;
+            }
+            Op::Del => ol += 1,
+            Op::Ins => nl += 1,
+        }
+    }
+    // Mark kept lines: changed lines plus `context` around them.
+    let mut keep = vec![false; len];
+    for idx in 0..len {
+        if script[idx].0 != Op::Equal {
+            let lo = idx.saturating_sub(context);
+            let hi = (idx + context).min(len - 1);
+            for k in lo..=hi {
+                keep[k] = true;
+            }
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    let cap = 4000usize;
+    let mut emitted = 0usize;
+    let mut idx = 0usize;
+    while idx < len {
+        if !keep[idx] {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        while idx < len && keep[idx] {
+            idx += 1;
+        }
+        let end = idx;
+        let old_start = ol_before[start];
+        let new_start = nl_before[start];
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        for k in start..end {
+            match script[k].0 {
+                Op::Equal => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Op::Del => old_count += 1,
+                Op::Ins => new_count += 1,
+            }
+        }
+        out.push_str(&format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"));
+        for k in start..end {
+            if emitted >= cap {
+                out.push_str(&format!("… (diff truncated; {m}→{n} lines) …\n"));
+                return out;
+            }
+            match script[k].0 {
+                Op::Equal => {
+                    out.push(' ');
+                    out.push_str(script[k].1);
+                    out.push('\n');
+                }
+                Op::Del => {
+                    out.push('-');
+                    out.push_str(script[k].1);
+                    out.push('\n');
+                }
+                Op::Ins => {
+                    out.push('+');
+                    out.push_str(script[k].1);
+                    out.push('\n');
+                }
+            }
+            emitted += 1;
+        }
+    }
+    out
+}
+
+// ---- git tools (shell out to the `git` binary; cwd = workspace) ----
+
+/// Run `git` in the workspace and return its combined output. Bounded:
+/// - stdin is null so a hook reading stdin can't hang the harness;
+/// - a 30s deadline kills a stuck process (git tools run synchronously,
+///   outside the /abort tokio::select, so we must self-limit);
+/// - stdout/stderr are drained on threads so a large diff can't fill the
+///   pipe buffer and deadlock the child while we poll for exit.
+fn git_exec(cfg: &Config, subcmd: &[&str]) -> Outcome {
+    use std::io::Read;
+    fn read_all<R: Read>(r: &mut R) -> String {
+        let mut v = Vec::new();
+        let _ = r.read_to_end(&mut v);
+        String::from_utf8_lossy(&v).into_owned()
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(&cfg.workspace)
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .args(subcmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Outcome::err("git not found on PATH");
+        }
+        Err(e) => return Outcome::err(format!("git exec failed: {e}")),
+    };
+    let out_h = child.stdout.take();
+    let err_h = child.stderr.take();
+    let t_out = std::thread::spawn(move || out_h.map(|mut r| read_all(&mut r)).unwrap_or_default());
+    let t_err = std::thread::spawn(move || err_h.map(|mut r| read_all(&mut r)).unwrap_or_default());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(_) => break None,
+        }
+    };
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+    match status {
+        Some(s) if s.success() => {
+            let body = if !stdout.trim().is_empty() {
+                stdout
+            } else if !stderr.trim().is_empty() {
+                stderr
+            } else {
+                String::from("(no output)")
+            };
+            Outcome::ok(body)
+        }
+        Some(s) => {
+            let body = if !stderr.trim().is_empty() {
+                stderr
+            } else if !stdout.trim().is_empty() {
+                stdout
+            } else {
+                format!("git {:?} failed (exit {:?})", subcmd, s.code())
+            };
+            Outcome::err(body)
+        }
+        None => Outcome::err(format!("git {:?} timed out after 30s", subcmd)),
+    }
+}
+
+/// Validate a workspace-relative git pathspec: reject absolute paths and `..`
+/// escapes. Returns Ok("") for an empty path (meaning "no path filter").
+fn git_rel_path(p: &str) -> Result<String, String> {
+    if p.is_empty() {
+        return Ok(String::new());
+    }
+    if p.starts_with('/') || p.starts_with('\\') || (p.len() >= 2 && p.as_bytes()[1] == b':') {
+        return Err(format!("git path must be workspace-relative, got absolute: {p:?}"));
+    }
+    for comp in p.split(['/', '\\']) {
+        if comp == ".." {
+            return Err(format!("git path must not escape the workspace (..): {p:?}"));
+        }
+    }
+    Ok(p.to_string())
+}
+
+fn git_status(args: &Value, cfg: &Config) -> Outcome {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match git_rel_path(path) {
+        Err(e) => Outcome::err(e),
+        Ok(p) if p.is_empty() => git_exec(cfg, &["status", "--short", "--branch"]),
+        Ok(p) => git_exec(cfg, &["status", "--short", "--branch", "--", &p]),
+    }
+}
+
+fn git_diff(args: &Value, cfg: &Config) -> Outcome {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+    match git_rel_path(path) {
+        Err(e) => Outcome::err(e),
+        Ok(p) => {
+            let mut cmd: Vec<String> = vec!["diff".into(), "--no-color".into()];
+            if staged {
+                cmd.push("--staged".into());
+            }
+            if !p.is_empty() {
+                cmd.push("--".into());
+                cmd.push(p);
+            }
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            git_exec(cfg, &refs)
+        }
+    }
+}
+
+fn git_log(args: &Value, cfg: &Config) -> Outcome {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(1000);
+    match git_rel_path(path) {
+        Err(e) => Outcome::err(e),
+        Ok(p) => {
+            let n = format!("-n{limit}");
+            let mut cmd: Vec<String> = vec!["log".into(), "--oneline".into(), n];
+            if !p.is_empty() {
+                cmd.push("--".into());
+                cmd.push(p);
+            }
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            git_exec(cfg, &refs)
+        }
+    }
+}
+
+fn git_add(args: &Value, cfg: &Config) -> Outcome {
+    let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
+        return Outcome::err("git_add requires a 'paths' array");
+    };
+    if paths.is_empty() {
+        return Outcome::err("git_add requires a non-empty 'paths' array");
+    }
+    let mut cmd: Vec<String> = vec!["add".into(), "--".into()];
+    for p in paths {
+        let Some(ps) = p.as_str() else {
+            return Outcome::err("git_add: every path must be a string");
+        };
+        match git_rel_path(ps) {
+            Err(e) => return Outcome::err(e),
+            Ok(rp) => cmd.push(rp),
+        }
+    }
+    let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    git_exec(cfg, &refs)
+}
+
+fn git_commit(args: &Value, cfg: &Config) -> Outcome {
+    let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    if message.trim().is_empty() {
+        return Outcome::err("git_commit requires a non-empty 'message'");
+    }
+    let mut cmd: Vec<String> = vec!["commit".into(), "-m".into(), message.to_string()];
+    if all {
+        cmd.push("--all".into());
+    }
+    let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    git_exec(cfg, &refs)
+}
+
+// ---- memory tool (agent-callable wrapper over crate::memory) ----
+
+fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    match action {
+        "save" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if name.trim().is_empty() {
+                return Outcome::err("memory save requires 'name'");
+            }
+            if content.trim().is_empty() {
+                return Outcome::err("memory save requires 'content'");
+            }
+            match crate::memory::save_memory(&cfg.workspace, name, content, mem_type, description) {
+                Ok(p) => {
+                    let id = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Outcome::ok(format!("saved memory '{name}' (id: {id})"))
+                }
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "list" => {
+            let entries = crate::memory::scan_memories(&cfg.workspace);
+            if entries.is_empty() {
+                return Outcome::ok("(no memories)");
+            }
+            let mut out = String::new();
+            for m in &entries {
+                let id = m
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let desc = if m.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", m.description)
+                };
+                out.push_str(&format!("- {} [id: {}] ({}){}\n", m.name, id, m.mem_type, desc));
+                if !m.content.is_empty() {
+                    for l in m.content.lines().take(3) {
+                        out.push_str(&format!("    {l}\n"));
+                    }
+                }
+            }
+            Outcome::ok(out.trim_end().to_string())
+        }
+        "forget" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.trim().is_empty() {
+                return Outcome::err("memory forget requires 'id' (the memory slug/name)");
+            }
+            match crate::memory::forget_memory(&cfg.workspace, id) {
+                Ok(()) => Outcome::ok(format!("forgot memory '{id}'")),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        other => Outcome::err(format!("memory: unknown action '{other}' (save|list|forget)")),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2169,5 +2679,127 @@ mod tests {
         fs::write(cfg.workspace.join("to_delete"), "x").unwrap();
         let o2 = execute_bash("rm -f to_delete", &cfg).await;
         assert!(o2.ok, "{}", o2.output);
+    }
+
+    fn git_present() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Init a git repo in the workspace with a configured author + one commit.
+    fn git_init(cfg: &Config) {
+        let ws = &cfg.workspace;
+        let _ = std::process::Command::new("git")
+            .current_dir(ws)
+            .args(["init"])
+            .output();
+        let _ = std::process::Command::new("git")
+            .current_dir(ws)
+            .args(["config", "user.email", "test@example.com"])
+            .output();
+        let _ = std::process::Command::new("git")
+            .current_dir(ws)
+            .args(["config", "user.name", "Test"])
+            .output();
+        std::fs::write(ws.join("README.md"), "hello\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .current_dir(ws)
+            .args(["add", "README.md"])
+            .output();
+        let _ = std::process::Command::new("git")
+            .current_dir(ws)
+            .args(["commit", "-m", "init"])
+            .output();
+    }
+
+    #[test]
+    fn unified_diff_insert_delete_modify() {
+        let old = "a\nb\nc\n";
+        let d = make_unified_diff(old, "a\nb2\nc\nd\n", "f.rs", 2);
+        assert!(d.contains("--- a/f.rs"));
+        assert!(d.contains("+++ b/f.rs"));
+        assert!(d.contains("-b"), "diff: {d}");
+        assert!(d.contains("+b2"), "diff: {d}");
+        assert!(d.contains("+d"), "diff: {d}");
+        // identical → empty
+        assert_eq!(make_unified_diff(old, old, "f.rs", 3), "");
+    }
+
+    #[test]
+    fn unified_diff_new_file_all_additions() {
+        let d = make_unified_diff("", "x\ny\n", "new.rs", 3);
+        assert!(d.contains("+x"), "diff: {d}");
+        assert!(d.contains("+y"), "diff: {d}");
+        // a brand-new file has no deletions
+        assert!(!d.contains("\n-"), "diff should have no removed lines: {d}");
+    }
+
+    #[test]
+    fn unified_diff_large_change_falls_back() {
+        let big = "line\n".repeat(5000);
+        // identical → short-circuits to empty before the size guard
+        assert_eq!(make_unified_diff(&big, &big, "big.rs", 3), "");
+        // a large *change* triggers the size-guard note (no OOM)
+        let big2 = "other\n".repeat(5000);
+        let d = make_unified_diff(&big, &big2, "big.rs", 3);
+        assert!(d.contains("diff omitted for size"), "diff: {d}");
+    }
+
+    #[test]
+    fn git_tools_roundtrip() {
+        if !git_present() {
+            eprintln!("skipping git tests: git not on PATH");
+            return;
+        }
+        let (_root, cfg) = tmp_ws();
+        git_init(&cfg);
+
+        let s = execute("git_status", &json!({}), &cfg);
+        assert!(s.ok, "git_status: {}", s.output);
+
+        let l = execute("git_log", &json!({}), &cfg);
+        assert!(l.ok, "git_log: {}", l.output);
+        assert!(l.output.contains("init"), "git_log missing commit: {}", l.output);
+
+        // modify → unstaged diff shows the change
+        std::fs::write(cfg.workspace.join("README.md"), "hello world\n").unwrap();
+        let d = execute("git_diff", &json!({}), &cfg);
+        assert!(d.ok, "git_diff: {}", d.output);
+        assert!(d.output.contains("-hello"), "git_diff: {}", d.output);
+
+        // add + commit the change
+        let a = execute("git_add", &json!({ "paths": ["README.md"] }), &cfg);
+        assert!(a.ok, "git_add: {}", a.output);
+        let c = execute("git_commit", &json!({ "message": "update readme" }), &cfg);
+        assert!(c.ok, "git_commit: {}", c.output);
+
+        // git_add rejects absolute / escaping paths
+        let bad = execute("git_add", &json!({ "paths": ["/etc/hosts"] }), &cfg);
+        assert!(!bad.ok, "git_add must reject absolute paths");
+        let bad2 = execute("git_add", &json!({ "paths": ["../escape"] }), &cfg);
+        assert!(!bad2.ok, "git_add must reject .. escapes");
+
+        // git_commit rejects empty messages
+        let bad3 = execute("git_commit", &json!({ "message": "   " }), &cfg);
+        assert!(!bad3.ok, "git_commit must reject empty messages");
+    }
+
+    #[test]
+    fn memory_tool_arg_validation() {
+        let (_root, cfg) = tmp_ws();
+        // unknown action
+        let o = execute("memory", &json!({ "action": "nope" }), &cfg);
+        assert!(!o.ok, "unknown action should fail");
+        // save requires name + content (no disk write on validation failure)
+        assert!(!execute("memory", &json!({ "action": "save", "content": "x" }), &cfg).ok);
+        assert!(!execute("memory", &json!({ "action": "save", "name": "x" }), &cfg).ok);
+        // forget requires id
+        assert!(!execute("memory", &json!({ "action": "forget" }), &cfg).ok);
+        // list is safe (read-only); tolerate empty store
+        let l = execute("memory", &json!({ "action": "list" }), &cfg);
+        assert!(l.ok, "list should always succeed: {}", l.output);
     }
 }

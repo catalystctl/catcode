@@ -1986,6 +1986,7 @@ async fn run_parallel(
     Outcome {
         ok: all_ok,
         output: blocks.trim().to_string(),
+        diff: None,
     }
 }
 
