@@ -1,0 +1,12 @@
+{
+  "name": "vision-handoff",
+  "version": "0.1.0",
+  "description": "Hand off image-bearing turns to a vision-capable model when the active model lacks vision. Set VISION_MODEL=<id> to pin a target, or VISION_MODELS=a,b,c to declare which models support vision.",
+  "hooks": {
+    "pre_turn": {
+      "script": "hooks/pre_turn.py",
+      "timeout_ms": 5000,
+      "pass_args": true
+    }
+  }
+}

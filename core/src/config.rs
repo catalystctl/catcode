@@ -351,6 +351,21 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("UMANS_HARNESS_BASH_TIMEOUT") { c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_DEBUG_LOG") { c.debug_log = Some(PathBuf::from(v)); }
     if let Ok(v) = std::env::var("UMANS_HARNESS_SESSION") { c.session_file = Some(PathBuf::from(v)); }
+    // Sandbox / network / token-budget knobs advertised in --help (P1-19: these
+    // were documented as env vars but never read, so the Dockerfile's
+    // `ENV UMANS_HARNESS_SANDBOX=firejail` etc. were dead). Wire them up here.
+    if let Ok(v) = std::env::var("UMANS_HARNESS_SANDBOX") { c.sandbox = Sandbox::parse(&v); }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_NO_NETWORK") {
+        // Present without a value, or "1"/"true", means block network; "0"/"false" off.
+        let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
+        c.no_network = on;
+    }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_IDLE_TIMEOUT") {
+        if let Ok(n) = v.parse::<u64>() { c.idle_timeout_secs = n; }
+    }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_MAX_SESSION_TOKENS") {
+        if let Ok(n) = v.parse::<u64>() { c.max_session_tokens = n; }
+    }
 
     // Pre-compile bash denylist regexes once at startup.
     c.bash_deny_regex_compiled = c.bash_deny_regex.iter()
@@ -379,7 +394,6 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Cross-platform config base: `~/.config/umans-harness` on Unix, and
 /// `%USERPROFILE%\.config\umans-harness` on Windows (kept under the same
 /// relative path so settings are shared across shells / WSL).
-
 fn dirs_config_path() -> PathBuf {
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".config/umans-harness/config.json")
@@ -391,6 +405,12 @@ fn apply_json(c: &mut Config, v: &Value) {
     if let Some(x) = s("workspace") { c.workspace = PathBuf::from(x); }
     if let Some(x) = s("approval") { c.approval = Approval::parse(&x); }
     if let Some(b) = v.get("bash_timeout_secs").and_then(|x| x.as_u64()) { c.bash_timeout_secs = b; }
+    if let Some(x) = s("sandbox") { c.sandbox = Sandbox::parse(&x); }
+    if let Some(b) = v.get("no_network").and_then(|x| x.as_bool()) { c.no_network = b; }
+    if let Some(b) = v.get("idle_timeout_secs").and_then(|x| x.as_u64()) { c.idle_timeout_secs = b; }
+    if let Some(b) = v.get("max_session_tokens").and_then(|x| x.as_u64()) { c.max_session_tokens = b; }
+    if let Some(b) = v.get("allow_vision").and_then(|x| x.as_bool()) { c.allow_vision = b; }
+    if let Some(b) = v.get("summarize_on_compact").and_then(|x| x.as_bool()) { c.summarize_on_compact = b; }
     if let Some(f) = v.get("context_digest_at").and_then(|x| x.as_f64()) { c.context_digest_at = f as f32; }
     if let Some(x) = s("debug_log") { c.debug_log = Some(PathBuf::from(x)); }
     if let Some(x) = s("session") { c.session_file = Some(PathBuf::from(x)); }
@@ -488,5 +508,34 @@ mod tests {
         assert!(c.idle_timeout_secs >= 120);
         assert!(c.summarize_on_compact);
         assert!(c.allow_vision);
+    }
+
+    #[test]
+    fn env_overrides_applied() {
+        // Save, set, restore the advertised env knobs (P1-19). Only this test
+        // calls load(), so there's no parallel-reader race on these vars.
+        let vars = [
+            ("UMANS_HARNESS_SANDBOX", "firejail"),
+            ("UMANS_HARNESS_NO_NETWORK", "1"),
+            ("UMANS_HARNESS_IDLE_TIMEOUT", "42"),
+            ("UMANS_HARNESS_MAX_SESSION_TOKENS", "123456"),
+        ];
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in &vars { std::env::set_var(k, v); }
+        let c = load();
+        for (k, _) in &vars { std::env::remove_var(k); }
+        for (k, prev) in saved {
+            match prev {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
+            }
+        }
+        assert_eq!(c.sandbox, Sandbox::Firejail);
+        assert!(c.no_network);
+        assert_eq!(c.idle_timeout_secs, 42);
+        assert_eq!(c.max_session_tokens, 123456);
     }
 }

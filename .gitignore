@@ -20,9 +20,15 @@ dist/
 # Local tooling & editor state
 # =============================================================================
 
-# Umans harness local state (plugins, todo, sessions)
-.umans-harness/
-**/.umans-harness/
+# Umans harness runtime state (mutable) -- ignored. The shipped agent
+# definitions, plugins, and skills under .umans-harness/{agents,plugins,skills}
+# are NOT ignored and ARE tracked (they ship the subagent + plugin systems).
+.umans-harness/sessions/
+.umans-harness/todo.json
+.umans-harness/vision.json
+**/.umans-harness/sessions/
+**/.umans-harness/todo.json
+**/.umans-harness/vision.json
 
 # Other AI tooling local state
 .pi/
@@ -67,5 +73,6 @@ roo-code/
 # Subagent-generated scratch / working notes
 context.md
 plan.md
+plan.html
 # Stray build/test artifacts
 .intentionally-empty-file.o

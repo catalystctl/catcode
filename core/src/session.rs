@@ -88,12 +88,17 @@ pub fn load(path: &Path) -> Vec<Value> {
 }
 
 /// Truncate/replace the whole session file with `messages` (used on reset /
-/// compaction), re-writing the version header first. fsync'd.
+/// compaction), re-writing the version header first. Atomic: writes a sibling
+/// temp file, fsyncs it, then renames it over the target, so a crash mid-
+/// rewrite never truncates the existing conversation — the old file stays intact
+/// until the rename lands (P1-3: the old truncate-then-write lost everything on a
+/// crash between truncate and final sync).
 pub fn rewrite(path: &Path, messages: &[Value]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(mut f) = OpenOptions::new().create(true).truncate(true).write(true).open(path) else {
+    let tmp = path.with_extension("tmp");
+    let Ok(mut f) = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp) else {
         return;
     };
     let _ = writeln!(f, "{}", header_line());
@@ -104,7 +109,9 @@ pub fn rewrite(path: &Path, messages: &[Value]) {
     }
     let _ = f.flush();
     let _ = f.sync_all();
-    let _ = f.sync_all();
+    drop(f); // release the handle before rename (Windows requires it)
+    // Atomic on POSIX (same dir/same volume); best-effort on Windows.
+    let _ = std::fs::rename(&tmp, path);
 }
 
 /// A lightweight description of a session file used by the session picker.

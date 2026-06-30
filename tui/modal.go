@@ -703,7 +703,7 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 	case "No Network":
 		s.settings.NoNetwork = !s.settings.NoNetwork
 		_ = s.settings.save()
-		s.logInfo(fmt.Sprintf("no-network: %s (restarts core)", boolStr(s.settings.NoNetwork)))
+		s.logInfo(fmt.Sprintf("no-network: %s (applies on next launch)", boolStr(s.settings.NoNetwork)))
 	case "Mouse Wheel":
 		s.settings.MouseWheel = !s.settings.MouseWheel
 		_ = s.settings.save()
@@ -739,7 +739,7 @@ func (s *session) cycleSandbox(dir int) {
 	next := (cur + dir + len(modes)) % len(modes)
 	s.settings.Sandbox = modes[next]
 	_ = s.settings.save()
-	s.logInfo(fmt.Sprintf("sandbox: %s (restarts core)", modes[next]))
+	s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", modes[next]))
 }
 
 func (s *session) startEditField(idx int) {
@@ -790,14 +790,14 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 10 {
 			s.settings.IdleTimeout = n
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("idle timeout: %ds (restarts core)", n))
+			s.logInfo(fmt.Sprintf("idle timeout: %ds (applies on next launch)", n))
 		}
 	case "Max Session Tok":
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 0 {
 			s.settings.MaxSessionTokens = n
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("max session tokens: %d (restarts core)", n))
+			s.logInfo(fmt.Sprintf("max session tokens: %d (applies on next launch)", n))
 		}
 	}
 	return s, nil
@@ -988,15 +988,17 @@ func (s *session) renderModalOverlay(base string) string {
 		return base
 	}
 	box := s.renderModalBody()
-	mw := lipgloss.Width(box)
-	mh := lipgloss.Height(box)
 	w := s.width
 	h := s.height
-	if mw > w-2 {
-		mw = w - 2
-	}
-	if mh > h-2 {
-		mh = h - 2
+	// Safety net: never let the modal exceed the terminal. If a body still
+	// comes out taller than the window (e.g. a non-scrolling modal on a very
+	// short terminal), clip it to the terminal height so lipgloss.Place can't
+	// overflow the canvas and scroll the terminal.
+	if bh := lipgloss.Height(box); bh > h && h > 0 {
+		ls := strings.Split(box, "\n")
+		if h <= len(ls) {
+			box = strings.Join(ls[:h], "\n")
+		}
 	}
 	// Overlay: place the box over the base via centered placement.
 	overlay := lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
@@ -1027,6 +1029,36 @@ func (s *session) renderModalBody() string {
 	return ""
 }
 
+// fitListRow builds a single-line list row — marker + label + desc — that
+// fits width visible columns, truncating the label first (it is the least
+// essential) so the description (e.g. "12 msgs · 2h ago") is kept whole. The
+// marker is already styled; markerW is its visible width.
+func fitListRow(marker, label, desc string, markerW, width int) string {
+	budget := width - markerW
+	if budget < 0 {
+		budget = 0
+	}
+	if d := len([]rune(desc)); d > 0 {
+		if 2+d <= budget {
+			label = truncateFit(label, budget-2-d)
+		} else {
+			// desc alone fills the row: drop the label, truncate the desc
+			label = ""
+			desc = truncateFit(desc, budget)
+		}
+	} else {
+		label = truncateFit(label, budget)
+	}
+	row := marker + baseStyle.Render(label)
+	switch {
+	case label != "" && desc != "":
+		row += "  " + dimStyle.Render(desc)
+	case desc != "":
+		row += dimStyle.Render(desc)
+	}
+	return row
+}
+
 func (s *session) renderListModal(title string, items []listItem, showFilter bool) string {
 	w := 52
 	if s.width-4 < w {
@@ -1039,9 +1071,12 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	n := len(idx)
 
 	// visible window: cap so long lists scroll instead of overflowing.
-	maxVisible := s.height - 9 // title+filter+sep+footer+border padding
-	if maxVisible < 4 {
-		maxVisible = 4
+	// Overhead (title + filter + separator + "(N more)" + blank + footer +
+	// the 2 border rows) is 8 lines, so maxVisible = height-9 leaves one line of
+	// headroom. Floor at 1 (not 4) so short terminals still fit without overflow.
+	maxVisible := s.height - 9
+	if maxVisible < 1 {
+		maxVisible = 1
 	}
 	if n > maxVisible {
 		// keep the cursor inside the window
@@ -1061,6 +1096,11 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		Background(lipgloss.Color(c.dim)).
 		Foreground(lipgloss.Color(c.fg)).
 		Width(rowW)
+	// truncStyle caps a line to a single line of rowW visible columns. Without
+	// it, a long label+desc wraps inside modalBox's fixed width and each row
+	// spans 2+ physical lines, so the modal grows past maxVisible and overflows
+	// the terminal.
+	truncStyle := lipgloss.NewStyle().MaxWidth(rowW)
 
 	var lines []string
 	lines = append(lines, accentStyle.Render("◆ "+title))
@@ -1069,7 +1109,7 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		if fq == "" {
 			fq = dimStyle.Render("type to filter…")
 		}
-		lines = append(lines, inputPromptStyle.Render("⟩ ")+mutedStyle.Render(fq))
+		lines = append(lines, truncStyle.Render(inputPromptStyle.Render("⟩ ")+mutedStyle.Render(fq)))
 	}
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
 	if n == 0 {
@@ -1086,14 +1126,12 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		if vi == s.modal.cursor {
 			marker = accentStyle.Render("▸ ")
 		}
-		label := baseStyle.Render(items[abs].label)
-		desc := ""
-		if items[abs].desc != "" {
-			desc = "  " + dimStyle.Render(items[abs].desc)
-		}
-		row := marker + label + desc
+		// Fit marker + label + desc into one line of rowW columns, truncating the
+		// label first so the description (msg count · time) is kept whole.
+		row := fitListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+		row = truncStyle.Render(row) // safety: guarantee a single line ≤ rowW
 		if vi == s.modal.cursor {
-			row = hiStyle.Render(row) // full-row highlight bar
+			row = hiStyle.Render(row) // full-width highlight bar (pads to rowW)
 		}
 		lines = append(lines, row)
 	}
@@ -1108,7 +1146,7 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	if s.modal.kind == modalVision {
 		footer = "  ↑↓ navigate · space toggle vision · enter set target · esc close"
 	}
-	lines = append(lines, dimStyle.Render(footer))
+	lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	body := strings.Join(lines, "\n")
 	return modalBox(w, body)
 }

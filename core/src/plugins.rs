@@ -90,12 +90,17 @@ JSON object to stdout before exiting. Stderr is captured for error reporting.
 ```
 
 - `allow` (required, bool): true to proceed, false to block (pre hooks) or skip result (post hooks)
-- `reason` (optional, string): human-readable explanation, shown in logs
-- `modify` (optional, object): for pre hooks, replaces or augments the original args.
-  For pre_write: `{ "content": "reformatted" }` replaces file content.
-  For pre_bash: `{ "command": "fixed command" }` replaces the command.
-  For pre_read and others: `{ "args": { "path": "new/path", ... } }` replaces full args.
-  For post hooks, modify is ignored (the operation already completed).
+- `reason` (optional, string): human-readable explanation. For pre hooks it
+  is shown to the model — appended to the tool result as a note on `allow`, and
+  used as the deny message on `allow:false`. Also logged. For post hooks it is
+  appended to the tool result as a note.
+- `modify` (optional, object): for pre hooks, a JSON object whose keys are
+  **merged over** the original tool args (shallow, per-key override). Return only
+  the fields you want to change; everything else is preserved. Examples:
+  pre_write `{ "content": "reformatted" }` overrides content but keeps `path`/
+  `edits`; pre_bash `{ "command": "fixed command" }` overrides the command;
+  pre_read `{ "path": "new/path" }` redirects the read. For post hooks, modify
+  is ignored (the operation already completed).
 
 Safety rules enforced by the core:
 - pre_* hooks: non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks the tool)
@@ -564,10 +569,25 @@ pub async fn execute_hook(
     };
 
     // Write the context JSON to stdin, then close it so the script can proceed.
+    // The write can block indefinitely if a hook with pass_args doesn't drain
+    // its stdin (a >64KB payload exceeds the pipe buffer). Bound it by the
+    // hook's own timeout so a wedged hook can't hang the turn forever; on
+    // timeout kill the child and deny/skip (P1-9).
     let context_bytes = serde_json::to_vec(context).unwrap_or_default();
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&context_bytes).await;
-        let _ = stdin.shutdown().await;
+        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
+        let write_fut = async {
+            let _ = stdin.write_all(&context_bytes).await;
+            let _ = stdin.shutdown().await;
+        };
+        if tokio::time::timeout(stdin_timeout, write_fut).await.is_err() {
+            let _ = child.start_kill();
+            let msg = format!(
+                "hook '{}' did not consume stdin within {}ms",
+                hook_name, stdin_timeout.as_millis()
+            );
+            return if is_pre { deny(msg) } else { skip(msg) };
+        }
     }
 
     let timeout_dur = Duration::from_millis(config.timeout_ms);
@@ -679,6 +699,23 @@ pub fn build_context(
     }
 
     ctx
+}
+
+/// Merge a hook's `modify` object over the running tool args, in place.
+///
+/// `modify` is a JSON object whose keys override the corresponding keys in
+/// `args` (shallow, per-key). Keys absent from `modify` are left untouched, so
+/// a pre_write hook can return `{"content": "..."}` to reformat content while
+/// preserving `path`/`edits`, a pre_bash hook can return `{"command": "..."}`
+/// to fix a command, and a pre_read hook can return `{"path": "..."}` to
+/// redirect a read. Non-object `modify` (or non-object `args`) is a no-op so a
+/// malformed hook never corrupts the tool call.
+pub fn apply_modify(args: &mut Value, modify: &Value) {
+    if let (Some(base), Some(over)) = (args.as_object_mut(), modify.as_object()) {
+        for (k, v) in over {
+            base.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 // ---- helpers ----
@@ -876,12 +913,10 @@ mod tests {
             &tmp.path,
             "with-hooks",
             "0.2.0",
-            &format!(
-                r#"{{
-          "pre_write": {{ "script": "hooks/pre_write.sh", "timeout_ms": 7000, "pass_args": true }},
-          "post_bash": {{ "script": "hooks/post_bash.sh" }}
-        }}"#
-            ),
+            r#"{
+          "pre_write": { "script": "hooks/pre_write.sh", "timeout_ms": 7000, "pass_args": true },
+          "post_bash": { "script": "hooks/post_bash.sh" }
+        }"#,
         );
 
         let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
@@ -983,7 +1018,7 @@ mod tests {
     fn manager_loads_plugins_on_new() {
         let tmp = TmpDir::new("mgr_loads");
         let plugin_dir = tmp.path.join("test-plugin");
-        fs::create_dir_all(&plugin_dir.join("hooks")).unwrap();
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
         write_hook_script(
             &plugin_dir.join("hooks"),
             "hook.sh",
@@ -1151,6 +1186,59 @@ mod tests {
         let result = execute_hook("pre_write", "test-plugin", &config, &ctx).await;
         assert!(!result.allow);
         assert_eq!(result.reason, "blocked");
+    }
+
+    #[test]
+    fn apply_modify_overrides_only_listed_keys() {
+        // pre_write: reformat content, keep path/edits.
+        let mut args = json!({ "path": "src/lib.rs", "content": "fn main(){}" });
+        let modify = json!({ "content": "fn main() {\n}\n" });
+        apply_modify(&mut args, &modify);
+        assert_eq!(args["path"], json!("src/lib.rs"));
+        assert_eq!(args["content"], json!("fn main() {\n}\n"));
+    }
+
+    #[test]
+    fn apply_modify_pre_bash_replaces_command_only() {
+        let mut args = json!({ "command": "rm -rf /", "timeout": 30 });
+        let modify = json!({ "command": "echo safe" });
+        apply_modify(&mut args, &modify);
+        assert_eq!(args["command"], json!("echo safe"));
+        assert_eq!(args["timeout"], json!(30), "unrelated keys must be preserved");
+    }
+
+    #[test]
+    fn apply_modify_pre_read_redirects_path() {
+        let mut args = json!({ "path": "a.txt", "context": 3 });
+        let modify = json!({ "path": "b.txt" });
+        apply_modify(&mut args, &modify);
+        assert_eq!(args["path"], json!("b.txt"));
+        assert_eq!(args["context"], json!(3));
+    }
+
+    #[test]
+    fn apply_modify_composes_across_hooks() {
+        // Two hooks amend different fields; both survive.
+        let mut args = json!({ "path": "f", "content": "x" });
+        apply_modify(&mut args, &json!({ "content": "y" }));
+        apply_modify(&mut args, &json!({ "path": "g" }));
+        assert_eq!(args, json!({ "path": "g", "content": "y" }));
+    }
+
+    #[test]
+    fn apply_modify_non_object_modify_is_noop() {
+        let mut args = json!({ "path": "f", "content": "x" });
+        apply_modify(&mut args, &json!("not an object"));
+        apply_modify(&mut args, &json!(42));
+        apply_modify(&mut args, &json!(null));
+        assert_eq!(args, json!({ "path": "f", "content": "x" }));
+    }
+
+    #[test]
+    fn apply_modify_non_object_args_is_noop() {
+        let mut args = json!("scalar args");
+        apply_modify(&mut args, &json!({ "content": "y" }));
+        assert_eq!(args, json!("scalar args"));
     }
 
     #[tokio::test]

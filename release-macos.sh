@@ -62,6 +62,14 @@ echo "[3/3] checksums..."
 	sha256sum "$f" > "$f.sha256"
   done )
 
+# P1-23: for distribution, codesign + notarize each binary with an Apple
+# Developer ID in CI (not done here — no signing identity available):
+#   codesign --force --options runtime --sign "Developer ID Application: ..." "$f"
+#   ditto -c -k --keepParent "$f" "${f}.zip"
+#   xcrun notarytool submit "${f}.zip" --apple-id ... --team-id ... --password ... --wait
+#   xcrun stapler staple "$f"
+# Without this, Gatekeeper blocks the unsigned binary for most users.
+
 echo "==> dist/umans-harness-${VERSION}-macos-arm64   (Apple Silicon)"
 echo "==> dist/umans-harness-${VERSION}-macos-x86_64  (Intel)"
 echo

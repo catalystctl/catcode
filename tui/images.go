@@ -55,6 +55,32 @@ func extractImagePaths(text string) []string {
 	return imgs
 }
 
+// validateImage checks that p is a readable image file of an allowed type and
+// within the size limit, returning its absolute path. Used by /attach (the main
+// send paths validate via withImages -> extractImagePaths); /attach sets
+// "images" directly so it must validate the explicit path itself (P2-12).
+func validateImage(p string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(p))
+	if !imageExtensions[ext] {
+		return "", fmt.Errorf("unsupported image type %q (png/jpg/jpeg/gif/webp/bmp/svg/tif/tiff)", ext)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("image not found: %s", p)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("not a file: %s", p)
+	}
+	if info.Size() > maxAttachImageBytes {
+		return "", fmt.Errorf("image too large (%d bytes; max %d)", info.Size(), maxAttachImageBytes)
+	}
+	return abs, nil
+}
+
 // withImages detects image file paths mentioned in text and, if any exist on
 // disk, adds them to payload's "images" array so the core builds a multimodal
 // message (and the vision-handoff plugin can route accordingly). It merges

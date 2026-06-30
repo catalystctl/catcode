@@ -1,8 +1,14 @@
-// Persistent memory system. Stores named memories as markdown files with
+// persistent memory system. Stores named memories as markdown files with
 // YAML-like frontmatter under ~/.config/umans-harness/memory/<project-hash>/.
 // Memories are scoped per workspace (hashed canonical path) and injected into
 // the system prompt when relevant keyword matches are found in the user's prompt.
 // ponytail: no DB, no extra crate — just markdown files on disk.
+//
+// Only memory_injection is wired (main.rs). The save/scan/hash half (Store::save,
+// rebuild_index, slugify, scan_memories, save_memory, project_hash) is a staged
+// feature not yet bound to a Command; keep it + its tests but silence dead-code
+// until it's wired so clippy stays clean.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

@@ -3,8 +3,11 @@
 package main
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +19,32 @@ import (
 //
 //go:embed embed/umans-core
 var embeddedCore []byte
+
+// embeddedCoreHash caches the SHA-256 of the embedded core (computed once).
+var embeddedCoreHash string
+
+// coreContentHash returns the SHA-256 hex of the embedded core binary.
+func coreContentHash() string {
+	if embeddedCoreHash == "" {
+		h := sha256.Sum256(embeddedCore)
+		embeddedCoreHash = hex.EncodeToString(h[:])
+	}
+	return embeddedCoreHash
+}
+
+// sha256File returns the SHA-256 hex of the file at p.
+func sha256File(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // embeddedCorePath extracts the embedded core to a per-user cache dir keyed by
 // the bundled version + target os/arch, marks it executable, and returns its
@@ -36,8 +65,13 @@ func embeddedCorePath() string {
 	}
 	name := fmt.Sprintf("umans-core-%s-%s-%s", coreVersion, runtime.GOOS, runtime.GOARCH)
 	dst := filepath.Join(cacheDir, name)
+	// Reuse an existing extraction only if it matches the embedded core by BOTH
+	// size AND content hash, so a tampered/replaced cache file (same size, different
+	// bytes) can't be exec'd (P2: was size-only — a TOCTOU on the shared cache).
 	if fi, err := os.Stat(dst); err == nil && !fi.IsDir() && fi.Size() == int64(len(embeddedCore)) {
-		return dst
+		if h, err := sha256File(dst); err == nil && h == coreContentHash() {
+			return dst
+		}
 	}
 	tmp, err := os.CreateTemp(cacheDir, name+".*.tmp")
 	if err != nil {

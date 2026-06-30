@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+#[allow(dead_code)]
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
 const MODELS_INFO_PATH: &str = "/models/info";
 const CHAT_PATH: &str = "/chat/completions";
@@ -34,19 +35,6 @@ pub const DEFAULT_THINKING_LEVELS: &[&str] = &["low", "medium", "high"];
 pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
     if levels.is_empty() {
         return requested.to_string();
-    }
-
-    #[test]
-    fn token_count_handles_int_float_and_string() {
-        // integer (standard OpenAI)
-        assert_eq!(token_count(&json!(1234)), Some(1234));
-        // float — some proxies serialize counts as `100.0`
-        assert_eq!(token_count(&json!(100.0)), Some(100));
-        // quoted number
-        assert_eq!(token_count(&json!("567")), Some(567));
-        // absent / null / garbage
-        assert_eq!(token_count(&Value::Null), None);
-        assert_eq!(token_count(&json!("n/a")), None);
     }
     if let Some(hit) = levels.iter().find(|l| l.eq_ignore_ascii_case(requested)) {
         return hit.clone();
@@ -257,6 +245,7 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
 /// extension's before_provider_request handler.
 /// Also verifies that the sanitizer doesn't leave behind a broken conversation
 /// (validate that every assistant with tool_calls has corresponding tool results).
+#[allow(clippy::ptr_arg)]
 pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
     let tool_call_ids: Vec<String> = messages
         .iter()
@@ -326,6 +315,45 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
 /// string encodings different OpenAI-compatible servers emit. `as_u64` alone
 /// misses floats (some proxies serialize counts as `100.0`) and quoted numbers,
 /// which silently drops the context budget to zero.
+/// Sanitize tool-call `arguments`: ensure every assistant tool_call's
+/// `arguments` field is a valid JSON string. Some models (notably the GLM
+/// family) occasionally emit malformed `arguments` for long, quote-heavy
+/// commands wrapped inside `bulk`'s nested JSON. When such a message is
+/// replayed in the conversation history, the API rejects the whole request
+/// with "Assistant tool call function.arguments must be valid JSON", which
+/// then repeats on every subsequent turn and bricks the session. This
+/// replaces any malformed `arguments` (and any non-string `arguments`) with
+/// the valid string `"{}"` so the history is always API-valid; the matching
+/// tool dispatch already returned an actionable error to the model. Returns
+/// the number of tool calls fixed.
+#[allow(clippy::ptr_arg)]
+pub fn sanitize_tool_call_arguments(messages: &mut Vec<Value>) -> usize {
+    let mut fixed = 0;
+    for m in messages.iter_mut() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for tc in calls.iter_mut() {
+            let Some(fobj) = tc.get_mut("function").and_then(|f| f.as_object_mut()) else {
+                continue;
+            };
+            let malformed = match fobj.get("arguments") {
+                None => true,
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).is_err(),
+                Some(_) => true, // non-string (e.g. object) — coerce to "{}"
+            };
+            if malformed {
+                fobj.insert("arguments".to_string(), Value::String("{}".to_string()));
+                fixed += 1;
+            }
+        }
+    }
+    fixed
+}
+
 fn token_count(v: &Value) -> Option<u64> {
     if let Some(n) = v.as_u64() {
         return Some(n);
@@ -420,6 +448,11 @@ pub async fn stream_turn(
         let resp = send_with_retry(client, &url, api_key, &body, cancel).await?;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
+        // P2-3: accumulator for a JSON object split across several `data:`
+        // lines (some OpenAI-compatible servers do this). A complete object
+        // parses on the first line, so the common path is unchanged; only a
+        // fragment keeps accumulating until it's whole.
+        let mut pending = String::new();
         let mut emitted = false;
         let mut err: Option<String> = None;
 
@@ -443,20 +476,30 @@ pub async fn stream_turn(
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].trim().to_string();
                 buf.drain(..=nl);
-                if line.is_empty() || line.starts_with(':') {
+                if line.is_empty() {
+                    // Blank line = event boundary: drop any half-accumulated frame.
+                    pending.clear();
                     continue;
+                }
+                if line.starts_with(':') {
+                    continue; // SSE comment / keepalive
                 }
                 let data = line
                     .strip_prefix("data: ")
                     .or_else(|| line.strip_prefix("data:"))
                     .unwrap_or("");
                 if data == "[DONE]" {
+                    pending.clear();
                     continue;
                 }
                 if data.is_empty() {
                     continue;
                 }
-                let Ok(obj) = serde_json::from_str::<Value>(data) else { continue };
+                pending.push_str(data);
+                let obj = match serde_json::from_str::<Value>(&pending) {
+                    Ok(o) => { pending.clear(); o }
+                    Err(_) => continue, // wait for more `data:` lines to complete the frame
+                };
 
                 // usage is sent in a final chunk with an empty choices array.
                 // usage is sent in a final chunk with an empty choices array.
@@ -685,12 +728,12 @@ async fn send_with_retry(
             return Err(format!("HTTP {status}: {text}"));
         }
 
-        // Parse Retry-After (seconds) if present.
+        // P2-6: Retry-After may be integer seconds OR an HTTP-date; parse both.
         let retry_after = resp
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+            .and_then(parse_retry_after);
         // Drain body before retry to free the connection.
         let _ = resp.text().await;
         let backoff = backoff_ms(attempt, retry_after);
@@ -700,6 +743,59 @@ async fn send_with_retry(
             .with("backoff_ms", json!(backoff)));
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
+}
+
+/// Parse a Retry-After header into seconds. Accepts an integer (seconds) or
+/// an HTTP-date (RFC 7231 IMF-fixdate, e.g. "Wed, 21 Oct 2025 07:28:00 GMT");
+/// the latter is converted to seconds-from-now (clamped >= 0). Returns None for
+/// anything unparseable so the caller falls back to exponential backoff.
+fn parse_retry_after(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let date = parse_http_date(s)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let diff = date.saturating_sub(now);
+    if diff == 0 { None } else { Some(diff) }
+}
+
+/// Parse an HTTP IMF-fixdate ("Wed, 21 Oct 2025 07:28:00 GMT") into UNIX
+/// seconds. The weekday is ignored (servers sometimes send the wrong one).
+fn parse_http_date(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 5 { return None; }
+    let day: u32 = parts[1].trim_end_matches(',').parse().ok()?;
+    let mon: u32 = match parts[2] {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = parts[3].parse().ok()?;
+    let tparts: Vec<&str> = parts[4].split(':').collect();
+    if tparts.len() != 3 { return None; }
+    let h: u64 = tparts[0].parse().ok()?;
+    let mi: u64 = tparts[1].parse().ok()?;
+    let se: u64 = tparts[2].parse().ok()?;
+    let days = days_from_civil(year, mon, day)?;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Days since the UNIX epoch (1970-01-01) for a proleptic Gregorian date.
+/// Howard Hinnant's days_from_civil algorithm; valid for any year.
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let m_shift = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * (m_shift as i64) + 2) / 5 + (d as i64) - 1;
+    let doe = (yoe as i64) * 365 + (yoe as i64) / 4 - (yoe as i64) / 100 + doy;
+    let days = (era as i64) * 146097 + doe - 719468;
+    if days < 0 { return None; }
+    Some(days as u64)
 }
 
 fn backoff_ms(attempt: u32, retry_after: Option<u64>) -> u64 {
@@ -741,6 +837,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_count_handles_int_float_and_string() {
+        // integer (standard OpenAI)
+        assert_eq!(token_count(&json!(1234)), Some(1234));
+        // float — some proxies serialize counts as `100.0`
+        assert_eq!(token_count(&json!(100.0)), Some(100));
+        // quoted number
+        assert_eq!(token_count(&json!("567")), Some(567));
+        // absent / null / garbage
+        assert_eq!(token_count(&Value::Null), None);
+        assert_eq!(token_count(&json!("n/a")), None);
+    }
+
+    #[test]
+    fn parse_http_date_known_epochs() {
+        // P2-6: HTTP-date Retry-After parsing.
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        // 2025-01-01 00:00:00 UTC = 1735689600
+        assert_eq!(parse_http_date("Wed, 01 Jan 2025 00:00:00 GMT"), Some(1735689600));
+        // weekday is ignored (servers sometimes send the wrong one)
+        assert_eq!(parse_http_date("Mon, 01 Jan 2025 00:00:00 GMT"), Some(1735689600));
+    }
+
+    #[test]
+    fn parse_retry_after_int_seconds() {
+        assert_eq!(parse_retry_after("5"), Some(5));
+        assert_eq!(parse_retry_after("  10 "), Some(10));
+        assert!(parse_retry_after("garbage").is_none());
+    }
+
+    #[test]
     fn sanitize_inserts_synthetic_results() {
         let mut msgs = vec![
             json!({"role":"user","content":"hi"}),
@@ -764,6 +890,54 @@ mod tests {
         ];
         sanitize_orphaned_tool_calls(&mut msgs);
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_args_fixes_malformed_arguments() {
+        let mut msgs = vec![
+            json!({"role":"assistant","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"bulk","arguments":"{broken json"}},
+                {"id":"c2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}},
+                {"id":"c3","type":"function","function":{"name":"bulk","arguments":"{\"calls\":[{\"name\":\"bash\",\"args\":{\"command\":\"echo '"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"err"}),
+            json!({"role":"tool","tool_call_id":"c2","content":"ok"}),
+            json!({"role":"tool","tool_call_id":"c3","content":"err"}),
+        ];
+        let n = sanitize_tool_call_arguments(&mut msgs);
+        assert_eq!(n, 2, "only the two malformed calls should be fixed");
+        let calls = msgs[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["arguments"].as_str().unwrap(), "{}");
+        assert_eq!(calls[1]["function"]["arguments"].as_str().unwrap(), "{\"command\":\"echo hi\"}");
+        assert_eq!(calls[2]["function"]["arguments"].as_str().unwrap(), "{}");
+        // every arguments field must now be valid JSON
+        for tc in calls {
+            let args = tc["function"]["arguments"].as_str().unwrap();
+            serde_json::from_str::<Value>(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn sanitize_args_coerces_nonstring_arguments() {
+        // Some clients serialize `arguments` as a JSON object instead of a string.
+        let mut msgs = vec![
+            json!({"role":"assistant","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"bash","arguments":{"command":"echo hi"}}}
+            ]}),
+        ];
+        let n = sanitize_tool_call_arguments(&mut msgs);
+        assert_eq!(n, 1);
+        let args = msgs[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        assert_eq!(args, "{}");
+    }
+
+    #[test]
+    fn sanitize_args_skips_non_assistant_messages() {
+        let mut msgs = vec![
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"tool","tool_call_id":"x","content":"{not real json but role is tool}"}),
+        ];
+        assert_eq!(sanitize_tool_call_arguments(&mut msgs), 0);
     }
 
     #[test]
@@ -848,9 +1022,9 @@ mod tests {
         let models = parse_models_response(&data);
         let by_id: std::collections::HashMap<&str, &ModelInfo> =
             models.iter().map(|m| (m.id.as_str(), m)).collect();
-        assert_eq!(by_id["vision-model"].vision, true);
-        assert_eq!(by_id["text-model"].vision, false);
-        assert_eq!(by_id["unspecified"].vision, false); // default false when absent
+        assert!(by_id["vision-model"].vision);
+        assert!(!by_id["text-model"].vision);
+        assert!(!by_id["unspecified"].vision); // default false when absent
     }
 
     #[test]

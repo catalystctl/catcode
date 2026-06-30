@@ -19,11 +19,12 @@ MSI="dist/ucli-${VERSION}-windows.msi"
 
 echo "==> building ucli ${VERSION} for Windows (${TARGET}) as an MSI"
 
-echo "[1/4] core -> umans-core.exe (cargo)..."
-cargo build --release --target "$TARGET" --manifest-path core/Cargo.toml
+echo "[1/4] core -> umans-core.exe (cargo, --locked)..."
+cargo build --release --locked --target "$TARGET" --manifest-path core/Cargo.toml
 
-echo "[2/4] tui -> ucli.exe (go, GOOS=windows)..."
-( cd tui && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ucli.exe . )
+echo "[2/4] tui -> ucli.exe (go, GOOS=windows, reproducible)..."
+( cd tui && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+    -ldflags "-s -w -X main/coreVersion=${VERSION}" -o ucli.exe . )
 
 echo "[3/4] staging + building MSI (wixl)..."
 rm -rf "$STAGE"; mkdir -p "$STAGE"
@@ -32,12 +33,23 @@ cp tui/ucli.exe                       "$STAGE/ucli.exe"
 cp packaging/windows/ucli.wxs         "$STAGE/ucli.wxs"
 ( cd "$STAGE" && wixl -D Version="$VERSION" ucli.wxs -o "ucli-${VERSION}-windows.msi" )
 mv "$STAGE/ucli-${VERSION}-windows.msi" "$MSI"
-rm -rf "$STAGE"   # drop intermediate stage; the MSI is self-contained
 
-echo "[4/4] checksum..."
+echo "[4/4] zip fallback + checksums..."
+# P1-24: the documented packaging/windows/install.ps1 no-build fallback needs a
+# zip of the two exes beside it; previously only the .msi was emitted, so the
+# fallback had no artifact.
+cp packaging/windows/install.ps1 "$STAGE/" 2>/dev/null || true
+ZIP="dist/ucli-${VERSION}-windows.zip"
+( cd "$STAGE" && zip -j "../$(basename "$ZIP")" ucli.exe umans-core.exe install.ps1 >/dev/null 2>&1 \
+    || echo "warning: zip unavailable; skipping fallback archive" )
+rm -rf "$STAGE"
 ( cd dist && sha256sum "$(basename "$MSI")" > "$(basename "$MSI").sha256" )
+( cd dist && sha256sum "$(basename "$ZIP")" > "$(basename "$ZIP").sha256" 2>/dev/null || true )
 
 echo "==> ${MSI}  ($(du -h "$MSI" | cut -f1))"
 echo "==> ${MSI}.sha256"
+echo "==> ${ZIP}  (no-build fallback)"
+# P1-23: Authenticode-sign the MSI/exe in CI (osslsigncode/signtool + a
+# code-signing cert) to avoid SmartScreen warnings. Not done here (no cert).
 echo "Install on Windows:  msiexec /i $(basename "$MSI")    (or double-click; no admin needed)"
 echo "Silent:              msiexec /i $(basename "$MSI") /quiet"

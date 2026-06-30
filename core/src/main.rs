@@ -1,5 +1,12 @@
 // umans-harness-core: stdio JSON-RPC server. The TUI spawns this binary,
 // writes commands to stdin, and reads newline-delimited events from stdout.
+//
+// Several core functions (stream_turn, run_turn, dispatch_*) intentionally
+// carry many positional args (the seam between the request loop and the tool
+// layer); refactoring each into a context struct is a larger change, so allow
+// the lint here rather than obscure the call sites.
+#![allow(clippy::too_many_arguments)]
+
 mod config;
 mod git_ctx;
 mod intercom;
@@ -31,15 +38,17 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
+
 #[derive(Clone)]
-struct QueuedPrompt {
+pub struct QueuedPrompt {
     prompt: String,
     model: String,
     effort: String,
 }
 
 /// A pending approval request the TUI must answer before the tool runs.
-
 const SYSTEM_PROMPT_BASE: &str = r#"You are a coding agent operating inside a Rust/Go harness with native Umans model access.
 You can read, edit, write, and list files, search with grep/glob, and run bash commands — all confined to the current workspace directory.
 
@@ -47,6 +56,10 @@ File editing uses search-and-replace, not line numbers or hashes:
 - read_file returns a file's plain content. Call it before editing so you see the exact text.
 - To change a file, call edit with one or more {search, replace} pairs. `search` must match the file content EXACTLY (copy it verbatim, including whitespace) and be unique in the file; `replace` is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in `replace`. All edits in one call apply atomically — if any `search` is not found or is ambiguous (matches multiple places) nothing is written; re-read and correct the search text.
 - Use write_file only for new files or complete rewrites; prefer edit for targeted changes. Use grep to search and glob to find files by pattern.
+
+Tool-call hygiene — keep tool arguments small and valid JSON:
+- Call the dedicated tool directly (bash, read_file, edit). Use `bulk` only to batch several genuinely independent calls — never wrap a single bash command in `bulk`.
+- Keep each bash `command` short. For loops, nested quotes, long `&&` chains, or multi-line logic, write a script to a file with `write_file` and run `bash script.sh` instead of inlining one long command string. Long, quote-heavy commands nested inside `bulk`'s JSON are the most common cause of malformed tool calls: the model botches the escaping, the call fails, and the broken message can then poison the whole conversation.
 
 All paths are relative to the workspace root; absolute paths and ".." are rejected.
 Work step by step: read/search before changing, make the smallest correct change, then verify with a command.
@@ -97,7 +110,8 @@ fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
 }
 
 /// A pending approval request the TUI must answer before the tool runs.
-struct PendingApproval {
+#[allow(dead_code)]
+pub struct PendingApproval {
     request_id: String,
     tool: String,
     args: Value,
@@ -185,6 +199,10 @@ async fn main() {
 
     // Pre-compute token estimate for resumed conversation.
     let init_est = estimate_messages_tokens(&resumed);
+    // Sanitize a resumed conversation before its first request: a prior crash
+    // may have left a malformed tool-call `arguments` in the history, which the
+    // API would reject with "function.arguments must be valid JSON".
+    let sanitize_on_resume = !resumed.is_empty();
 
     let vision_cfg = VisionConfig::load(&cfg.workspace);
     let state = Arc::new(State {
@@ -205,7 +223,7 @@ async fn main() {
         vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
-        needs_sanitize: Mutex::new(false),
+        needs_sanitize: Mutex::new(sanitize_on_resume),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
     });
@@ -327,6 +345,7 @@ async fn main() {
                 // Force compaction now, then emit a compacted event.
                 let mut messages = state.conversation.lock().await.clone();
                 if messages.len() > 2 {
+                    dispatch_lifecycle(&state, "pre_compact").await;
                     let before_est = estimate_messages_tokens(&messages);
                     compact_conversation(&mut messages, 200_000);
                     *state.conversation.lock().await = messages.clone();
@@ -363,7 +382,7 @@ async fn main() {
                         let mtime = e.metadata().ok()
                             .and_then(|m| m.modified().ok())
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as u64)
+                            .map(|d| d.as_secs())
                             .unwrap_or(0);
                         let current = current_name
                             .as_ref()
@@ -665,7 +684,7 @@ async fn main() {
 
 /// Check if a tool call matches a permission rule. Used by the approval gate
 /// to skip prompting for allow-listed tools, or block deny-listed ones outright.
-fn tool_matches_rule(tool_name: &str, args: &Value, rule: &PermissionRule) -> bool {
+pub(crate) fn tool_matches_rule(tool_name: &str, args: &Value, rule: &PermissionRule) -> bool {
     if !rule.tool_name.eq_ignore_ascii_case(tool_name) && rule.tool_name != "*" {
         return false;
     }
@@ -733,8 +752,22 @@ fn run_turn_and_drain(
     tok: CancellationToken,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
-        run_turn(&st, &client, model, prompt, effort, images, tok).await;
+        // Run the turn inside a panic guard: if run_turn panics (a bug or a
+        // malformed model payload hitting an unwrap/index), we still clear
+        // `current` and emit error+done so the TUI never wedges on a stuck
+        // "working" footer with no turn actually running.
+        let result = AssertUnwindSafe(run_turn(&st, &client, model, prompt, effort, images, tok))
+            .catch_unwind()
+            .await;
+        // The turn ended for any reason — notify lifecycle plugins and release
+        // the current-token slot unconditionally so new turns can start.
+        dispatch_lifecycle(&st, "session_stop").await;
         st.current.lock().await.take();
+        if let Err(_panic) = result {
+            emit(&Event::new("error").with("message", json!("turn terminated unexpectedly (panic); please retry")));
+            emit(&Event::new("done"));
+            return;
+        }
         // Drain a queued prompt if one was buffered while we ran (follow-up/steer).
         if let Some(q) = st.queued.lock().await.take() {
             let tok2 = CancellationToken::new();
@@ -744,6 +777,28 @@ fn run_turn_and_drain(
             ));
         }
     })
+}
+
+/// Dispatch a lifecycle/session hook (session_start / session_stop /
+/// pre_compact) to every enabled plugin that registered for it. Best-effort:
+/// lifecycle hooks run for their side effects and never block the turn (their
+/// `allow`/`deny` is ignored; a failing/timed-out/missing hook is skipped, not
+/// fatal). This wires the hook points that were previously advertised in
+/// HOOK_POINTS but never dispatched.
+async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
+    let (workspace, session_id) = {
+        let cfg = st.cfg.read().await;
+        (
+            cfg.workspace.display().to_string(),
+            cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        )
+    };
+    for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook) {
+        let ctx = plugins::build_context(
+            hook, "", &workspace, None, &session_id, config.pass_args,
+        );
+        let _ = plugins::execute_hook(hook, plugin_name, config, &ctx).await;
+    }
 }
 
 /// Token counts reported in the `metrics` event, which drive the footer's
@@ -768,6 +823,10 @@ async fn run_turn(
     images: Option<Vec<String>>,
     cancel: CancellationToken,
 ) {
+    // Lifecycle hook: notify plugins a session/turn is starting. Best-effort
+    // and never blocks the turn.
+    dispatch_lifecycle(st, "session_start").await;
+
     // Vision handoff (pre_turn) and other plugins may remap the model for
     // this turn; keep a mutable binding so a swap propagates to the request loop.
     let mut model = model;
@@ -814,7 +873,7 @@ async fn run_turn(
     // request. Advisory — a broken/missing hook or `allow:false` never blocks
     // the turn; only `modify.model` (validated against discovered models) is honored.
     {
-        let has_images = images.as_ref().map_or(false, |v| !v.is_empty());
+        let has_images = images.as_ref().is_some_and(|v| !v.is_empty());
         let image_count = images.as_ref().map_or(0, |v| v.len());
         let vc = st.vision.read().await.clone();
         let models_json: Vec<Value> = st.models.read().await.iter().map(|m| json!({
@@ -904,6 +963,7 @@ async fn run_turn(
         if last.elapsed().as_secs() > 3600 {
                 let mut messages = st.conversation.lock().await.clone();
                 if messages.len() > 4 {
+                    dispatch_lifecycle(st, "pre_compact").await;
                     let est = { *st.estimated_tokens.lock().await };
                     let cfg = st.cfg.read().await.clone();
                     match st.api_key.read().await.clone() {
@@ -998,6 +1058,7 @@ async fn run_turn(
         }
         if est > threshold.min(hard_cap) && messages.len() > 4 {
             let force_summarize = est > hard_cap;
+            dispatch_lifecycle(st, "pre_compact").await;
             compact_with_summary(client, &cfg, &api_key, &model, &mut messages, &cancel, force_summarize).await;
             *st.conversation.lock().await = messages.clone();
             if let Some(p) = cfg.session_file.as_ref() {
@@ -1015,7 +1076,22 @@ async fn run_turn(
         // Only needed after compaction; skip the O(n) scan on clean turns.
         if *st.needs_sanitize.lock().await {
             provider::sanitize_orphaned_tool_calls(&mut messages);
+            let fixed_args = provider::sanitize_tool_call_arguments(&mut messages);
             *st.needs_sanitize.lock().await = false;
+            // Persist the sanitized history so a resumed session doesn't replay
+            // orphaned tool_calls (which the API would reject) or malformed args.
+            // Both sanitizers mutate `messages`; write the whole sanitized vec
+            // back to the conversation + session file so the on-disk history stays
+            // valid for the API and for any other client that loads it.
+            *st.conversation.lock().await = messages.clone();
+            if let Some(p) = cfg.session_file.as_ref() {
+                session::rewrite(p, &messages);
+            }
+            if fixed_args > 0 {
+                emit(&Event::new("info").with("message", json!(format!(
+                    "sanitized {fixed_args} malformed tool-call argument(s) to keep the conversation valid for the API"
+                ))));
+            }
         }
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) = match provider::stream_turn(
             client, &cfg, &api_key, &model, &messages, &tool_defs, &effort, &thinking_levels, &cancel, &mut timer,
@@ -1067,11 +1143,38 @@ async fn run_turn(
                     let func = tc.get("function");
                     let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
-                    let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
                     emit(&Event::new("tool_call")
                         .with("id", json!(id))
                         .with("name", json!(name))
                         .with("args", json!(args_str)));
+                    let args: Value = match serde_json::from_str(&args_str) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // Malformed JSON arguments: the model produced an argument
+                            // string that isn't valid JSON (common with long, quote-heavy
+                            // commands wrapped inside `bulk`'s nested JSON). Return an
+                            // actionable error so the model retries simply, and flag the
+                            // conversation for argument sanitization so the malformed
+                            // assistant message doesn't make the next API request fail
+                            // with "function.arguments must be valid JSON" — which would
+                            // repeat on every turn and brick the session.
+                            *st.needs_sanitize.lock().await = true;
+                            let msg = format!(
+                                "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
+                                name
+                            );
+                            emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                            let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            let est = estimate_message_tokens(&tool_result);
+                            let mut conv = st.conversation.lock().await;
+                            conv.push(tool_result);
+                            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                                session::append(p, conv.last().unwrap());
+                            }
+                            *st.estimated_tokens.lock().await += est;
+                            continue;
+                        }
+                    };
 
                     // Approval gate for destructive tools.
                     let cfg = st.cfg.read().await.clone();
@@ -1166,93 +1269,82 @@ async fn run_turn(
                         continue;
                     }
 
-                    // Dispatch pre-execution hooks for this tool.
+                    // Dispatch pre-execution hooks for this tool. Each enabled
+                    // plugin registered for this hook point runs exactly once, in
+                    // order. A hook may: allow (optionally overriding specific arg
+                    // fields via `modify`, and/or posting a `reason` the model will
+                    // see), or deny (the tool call is skipped and the reason is
+                    // returned to the model). Hooks compose: each sees the args as
+                    // amended by earlier hooks.
                     let hook_name = match name.as_str() {
                         "bash" => "pre_bash",
                         "write_file" | "edit" => "pre_write",
                         "read_file" | "grep" | "glob" => "pre_read",
                         _ => "",
                     };
-                    let mut modified_args: Option<Value> = None;
-                    if !hook_name.is_empty() {
-                        let configs = st.plugin_manager.get_hook_configs(hook_name);
-                        for (plugin_name, config) in &configs {
-                            let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                            let ctx = plugins::build_context(
-                                hook_name, &name, &cfg.workspace.display().to_string(),
-                                Some(&args), &session_id, config.pass_args,
-                            );
-                            let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
-                            if !result.allow {
-                                let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
-                                emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
-                                let est = estimate_message_tokens(&tool_result);
-                                let mut conv = st.conversation.lock().await;
-                                conv.push(tool_result);
-                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                    session::append(p, conv.last().unwrap());
-                                }
-                                *st.estimated_tokens.lock().await += est;
-                                // Break out: save the denied state and skip execution.
-                                // We need a flag to skip the tool execution below.
-                            }
-                            if let Some(ref modify) = result.modify {
-                                modified_args = Some(modify.clone());
-                            }
-                        }
-                    }
-
-                    // Check if any pre-hook denied (ugly but we can't break the outer loop from here).
-                    // Track denied state.
+                    let pre_configs = if hook_name.is_empty() {
+                        Vec::new()
+                    } else {
+                        st.plugin_manager.get_hook_configs(hook_name)
+                    };
+                    // exec_args starts as the original args and is amended in
+                    // place by pre-hooks. Only clone when hooks will actually run,
+                    // so large write payloads aren't copied in the common case.
+                    let mut exec_args = if pre_configs.is_empty() { args } else { args.clone() };
+                    let mut hook_notes: Vec<String> = Vec::new();
                     let mut denied_by_hook = false;
-                    if !hook_name.is_empty() {
-                        let configs = st.plugin_manager.get_hook_configs(hook_name);
-                        for (plugin_name, config) in &configs {
-                            let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                            let ctx = plugins::build_context(
-                                hook_name, &name, &cfg.workspace.display().to_string(),
-                                Some(&args), &session_id, config.pass_args,
-                            );
-                            let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
-                            if !result.allow {
-                                denied_by_hook = true;
-                                let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
-                                emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
-                                let est = estimate_message_tokens(&tool_result);
-                                let mut conv = st.conversation.lock().await;
-                                conv.push(tool_result);
-                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                    session::append(p, conv.last().unwrap());
-                                }
-                                *st.estimated_tokens.lock().await += est;
-                                break;
+                    for (plugin_name, config) in &pre_configs {
+                        let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                        let ctx = plugins::build_context(
+                            hook_name, &name, &cfg.workspace.display().to_string(),
+                            Some(&exec_args), &session_id, config.pass_args,
+                        );
+                        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+                        if !result.allow {
+                            // Deny: skip the tool call and tell the model why.
+                            let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
+                            emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
+                            let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            let est = estimate_message_tokens(&tool_result);
+                            let mut conv = st.conversation.lock().await;
+                            conv.push(tool_result);
+                            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                                session::append(p, conv.last().unwrap());
                             }
-                            if let Some(ref modify) = result.modify {
-                                modified_args = Some(modify.clone());
-                            }
+                            *st.estimated_tokens.lock().await += est;
+                            denied_by_hook = true;
+                            break;
+                        }
+                        // Allow: merge `modify` over the running args so a hook
+                        // can override specific fields (e.g. reformatted `content`
+                        // or a fixed `command`) without dropping the rest (e.g.
+                        // `path`, `edits`). The contract is "return only the keys
+                        // you want to change"; anything else is preserved.
+                        if let Some(ref modify) = result.modify {
+                            plugins::apply_modify(&mut exec_args, modify);
+                        }
+                        // Remember non-empty reasons so the model is told its tool
+                        // call was inspected/modified (and can react accordingly).
+                        if !result.reason.is_empty() {
+                            hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
                         }
                     }
                     if denied_by_hook {
                         continue;
                     }
 
-                    // Use modified args if a hook provided them.
-                    let exec_args = modified_args.as_ref().unwrap_or(&args);
-
                     // Execute. bash/bulk/diagnostics/spawn are async; others sync.
-                    let outcome = if name == "bash" {
+                    let mut outcome = if name == "bash" {
                         let cmd = exec_args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         tools::execute_bash(cmd, &cfg).await
                     } else if name == "bulk" {
-                        tools::execute_bulk(exec_args, &cfg).await
+                        tools::execute_bulk(&exec_args, &cfg).await
                     } else if name == "diagnostics" {
-                        tools::execute_diagnostics(exec_args, &cfg).await
+                        tools::execute_diagnostics(&exec_args, &cfg).await
                     } else if name == "spawn" || name == "subagent" {
                         subagent::execute(st.clone(), client.clone(), api_key.clone(), model.clone(), exec_args.clone(), cancel.clone(), 0).await
                     } else {
-                        tools::execute(&name, exec_args, &cfg)
+                        tools::execute(&name, &exec_args, &cfg)
                     };
 
                     // Dispatch post-execution hooks for this tool.
@@ -1268,9 +1360,14 @@ async fn run_turn(
                             let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                             let ctx = plugins::build_context(
                                 post_hook, &name, &cfg.workspace.display().to_string(),
-                                Some(exec_args), &session_id, config.pass_args,
+                                Some(&exec_args), &session_id, config.pass_args,
                             );
-                            let _ = plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
+                            // Post-hooks can't block (the op already ran), but their
+                            // reason is surfaced to the model as a note.
+                            let result = plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
+                            if !result.reason.is_empty() {
+                                hook_notes.push(format!("{}/{}: {}", plugin_name, post_hook, result.reason));
+                            }
                         }
                     }
 
@@ -1292,6 +1389,14 @@ async fn run_turn(
                         st.logger.record_turn();
                         emit(&Event::new("done"));
                         return;
+                    }
+                    // Surface plugin hook feedback to the model. Any pre-hook that
+                    // modified args or posted a reason, and any post-hook that
+                    // observed something, is appended to the tool result so the
+                    // model knows its write/edit/read/bash call was inspected.
+                    if !hook_notes.is_empty() {
+                        outcome.output.push_str("\n\nPlugin hooks:\n- ");
+                        outcome.output.push_str(&hook_notes.join("\n- "));
                     }
                     st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
                     emit(&Event::new("tool_result")
@@ -1332,7 +1437,7 @@ async fn run_turn(
     }
 }
 
-enum ApprovalResult {
+pub(crate) enum ApprovalResult {
     Granted,
     Denied,
     Aborted,
@@ -1340,7 +1445,7 @@ enum ApprovalResult {
 
 /// Ask the TUI to approve a tool call; block until answered or aborted.
 /// On "always", only the matched tool KIND is escalated (not the whole session).
-async fn request_approval(st: &Arc<State>, id: &str, name: &str, args: &str, kind_str: &'static str, cancel: &CancellationToken) -> ApprovalResult {
+pub(crate) async fn request_approval(st: &Arc<State>, id: &str, name: &str, args: &str, kind_str: &'static str, cancel: &CancellationToken) -> ApprovalResult {
     let request_id = id.to_string();
     let notify = Arc::new(Notify::new());
     let pending = Arc::new(PendingApproval {
@@ -1397,6 +1502,7 @@ const DIGEST_MIN_BYTES: usize = 256;
 /// `DIGEST_MIN_BYTES`. Already-digested results are skipped (idempotent). The
 /// tool_call_id and role are preserved so orphaned-call sanitization and the
 /// model's tool-call/result pairing stay intact. Returns the count digested.
+#[allow(clippy::ptr_arg)]
 pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usize {
     if messages.len() <= keep {
         return 0;
@@ -1548,6 +1654,7 @@ pub async fn compact_with_summary(
 /// Turn an image reference into a data URL. Accepts:
 /// - an existing data URL (data:image/...;base64,...) → passthrough
 /// - an absolute or workspace-relative file path → read + base64-encode
+///
 /// Returns a placeholder data URL on failure so the model gets a clear signal.
 fn image_to_data_url(img: &str) -> String {
     if img.starts_with("data:") {
@@ -1581,7 +1688,7 @@ fn image_to_data_url(img: &str) -> String {
 /// Minimal base64 encoder (no extra crate).
 fn base64_encode(input: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
         let n = ((input[i] as u32) << 16) | ((input[i+1] as u32) << 8) | (input[i+2] as u32);

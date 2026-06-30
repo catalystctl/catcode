@@ -8,11 +8,12 @@
   via the Environment table — so new processes pick `ucli` up from any CWD with
   no script, no ExecutionPolicy dance, and a clean Add/Remove Programs entry.
 
-  Build (msitools wixl, run from the dir that contains the two .exe files):
-      wixl -D Version=0.2.0 ucli.wxs -o ucli-0.2.0-windows.msi
+  Build (msitools wixl, run from the dir that contains the two .exe files;
+  release-windows.sh invokes this with the real VERSION via -D Version=$VERSION):
+      wixl -D Version=$VERSION ucli.wxs -o ucli-$VERSION-windows.msi
 
   Build (WiX Toolset on Windows):
-      candle ucli.wxs && light -o ucli-0.2.0-windows.msi ucli.wixobj
+      candle ucli.wxs && light -o ucli-$VERSION-windows.msi ucli.wixobj
   (keep ucli.exe + umans-core.exe beside ucli.wxs, or adjust SourceFile paths)
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">

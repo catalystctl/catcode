@@ -39,6 +39,11 @@ use tokio_util::sync::CancellationToken;
 
 static ASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How long a blocking `ask`/`contact_supervisor` waits for a reply before
+/// giving up. Prevents an unanswered orchestrator/peer from wedging a subagent
+/// forever (P1-6).
+const INTERCOM_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -292,7 +297,8 @@ pub async fn execute_contact_supervisor(
     }
 
     let handle = bus.create_ask(ask);
-    // Block for the reply, or bail out on cancel.
+    // Block for the reply, bail out on cancel, or give up after a timeout so an
+    // unanswered ask never wedges the subagent forever (P1-6).
     let result = tokio::select! {
         _ = handle.notify.notified() => {
             let reply = handle.reply.lock().unwrap().clone();
@@ -301,6 +307,10 @@ pub async fn execute_contact_supervisor(
         _ = cancel.cancelled() => {
             bus.cancel_ask(&handle.id);
             "[interrupted]".to_string()
+        }
+        _ = tokio::time::sleep(INTERCOM_ASK_TIMEOUT) => {
+            bus.cancel_ask(&handle.id);
+            "[no supervisor response within 5 min; proceeding with best judgment]".to_string()
         }
     };
     Outcome::ok(result)
@@ -317,13 +327,13 @@ pub async fn execute_intercom(
     match action {
         "targets" => {
             let t = bus.targets();
-            return Outcome::ok(json!(t).to_string());
+            Outcome::ok(json!(t).to_string())
         }
         "receive" | "poll" => {
-            return match bus.receive(from) {
+            match bus.receive(from) {
                 Some(m) => Outcome::ok(json!(m).to_string()),
                 None => Outcome::ok("[]"), // no pending messages
-            };
+            }
         }
         "send" => {
             let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
@@ -383,6 +393,10 @@ pub async fn execute_intercom(
                 _ = cancel.cancelled() => {
                     bus.cancel_ask(&handle.id);
                     "[interrupted]".to_string()
+                }
+                _ = tokio::time::sleep(INTERCOM_ASK_TIMEOUT) => {
+                    bus.cancel_ask(&handle.id);
+                    "[no peer response within 5 min; proceeding with best judgment]".to_string()
                 }
             };
             Outcome::ok(result)

@@ -71,8 +71,7 @@ core/                 Rust core (stdio JSON-RPC server)
   src/logging.rs      JSONL debug log + token estimation + turn timer
   src/session.rs      append-only JSONL session persistence
 tui/                  Go Bubble Tea TUI
-test_tui.exp          basic e2e (auth, stream, tool call)
-test_prod.exp         production e2e (approval gate, confinement, metrics)
+.github/workflows/    CI (core clippy/test, tui vet/test/build, docker image)
 ```
 
 ## Build
@@ -203,8 +202,9 @@ Events (stdout): `ready` · `authed` · `thinking` · `delta` · `tool_call_star
 
 ```bash
 cd core && cargo test --release    # unit tests (edit search/replace, confinement, bash timeout, glob, grep, sanitize, backoff, session)
-./test_tui.exp                     # basic e2e against live Umans
-./test_prod.exp                    # approval gate + confinement + metrics e2e
+cd tui && go test ./...            # TUI tests (handlers, blocks, mention, modal)
+# Live e2e (auth, approval gate, confinement) against the Umans API is not yet
+# scripted — see .github/workflows/ci.yml for the automated checks that run.
 ```
 
 ## Notes

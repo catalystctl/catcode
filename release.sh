@@ -11,11 +11,12 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> building umans-harness ${VERSION}"
 
-echo "[1/4] building core (cargo --release)..."
-cargo build --release --manifest-path core/Cargo.toml
+echo "[1/4] building core (cargo --release, --locked for reproducibility)..."
+cargo build --release --locked --manifest-path core/Cargo.toml
 
-echo "[2/4] building tui (go)..."
-( cd tui && CGO_ENABLED=0 go build -o umans-harness-tui . )
+echo "[2/4] building tui (go, reproducible -trimpath + version)..."
+( cd tui && CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main/coreVersion=${VERSION}" -o umans-harness-tui . )
 
 echo "[3/4] staging..."
 STAGE="umans-harness-${VERSION}"

@@ -129,3 +129,21 @@ func truncateRunes(s string, n int) string {
 	}
 	return string(r[:n]) + "…"
 }
+
+// truncateFit truncates s to at most n runes, appending "…" when cut. The
+// ellipsis counts toward n, so the result never exceeds n runes; n <= 0 → "".
+// Use this (instead of truncateRunes) when the result must fit a fixed column
+// budget, e.g. a single-line list row inside a bordered modal.
+func truncateFit(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n == 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
+}

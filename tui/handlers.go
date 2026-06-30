@@ -149,6 +149,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		} else {
 			s.busy = false
 			s.turnCount++
+			s.coreRestarts = 0 // P1-17: a completed turn resets the crash-restart budget
 			s.cur = nil
 			s.finalizeInFlight("[no result]")
 			s.layout()
@@ -159,9 +160,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "aborted":
 		s.subProgress = nil
 		if s.queuedNext {
-			// A steer interrupted this turn; the steered turn runs next. Stay busy
-			// (a `done` is still coming for the interrupted turn) and drop the
-			// partial output without an "aborted" label.
+			// A steer interrupted this turn; the steered turn runs next. Clear the
+			// queued flag here so the steered turn's terminal `done` falls through
+			// to the else branch and clears `busy` — otherwise `busy` stays true
+			// forever and the TUI wedges (only Ctrl+C recovers) (P0-5).
+			s.queuedNext = false
 			s.cur = nil
 			s.finalizeInFlight("")
 			s.layout()
@@ -713,6 +716,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "no"})
 			s.logError("denied")
 			s.pendingApproval = nil
+		default:
+			// P2-17: pass non-decision keys to the input so typing isn't swallowed
+			// while an approval banner is up (and the user can't accidentally
+			// approve by typing "y...").
+			var cmd tea.Cmd
+			s.input, cmd = s.input.Update(msg)
+			return s, cmd
 		}
 		s.layout() // banner released, grow viewport back
 		return s, nil
@@ -933,6 +943,14 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				return nil
 			}
 			imgPath := parts[1]
+			// P2-12: validate the image like the main send paths do (via withImages),
+			// so /attach can't base64-encode a non-image or a >20MiB file (it
+			// previously set "images" directly with no checks).
+			abs, err := validateImage(imgPath)
+			if err != nil {
+				s.logError(err.Error())
+				return nil
+			}
 			// Remaining parts joined become the prompt; fall back to the current input value.
 			promptText := ""
 			if len(parts) > 2 {
@@ -954,13 +972,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			model := s.models[s.modelIdx].ID
 			s.follow = true // jump to bottom so the user sees their turn
 			s.logUser(promptText + " [image: " + imgPath + "]")
-			s.sendCore(map[string]any{
+			s.sendCore(s.withImages(map[string]any{
 				"type":             "send",
 				"prompt":           promptText,
 				"model":            model,
 				"reasoning_effort": s.settings.ReasoningEffort,
-				"images":           []string{imgPath},
-			})
+				"images":           []string{abs},
+			}, promptText))
 			s.busy = true
 			s.input.Reset()
 			return nil
@@ -1055,8 +1073,6 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/subagents-models":
 			return s.sendDelegation(`Run subagent({ action: "models" }) and show the runtime model mapping for the builtin agents.`, "/subagents-models")
 		default:
-			s.logError("unknown command: " + parts[0])
-			return nil
 			s.logError("unknown command: " + parts[0])
 			return nil
 		}

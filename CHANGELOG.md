@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixed - plugin hook dispatch for write/edit/bash/read
+- Pre-execution hooks (`pre_write`/`pre_bash`/`pre_read`) ran **twice** per
+  tool call: a leftover dead loop re-executed every hook, so on denial the model
+  received two "denied" tool-result messages (double token counting and
+  duplicate context pollution) and any side-effectful hook fired twice. The
+  dispatch is now a single pass.
+- A hook's `modify` now **merges** over the original tool args (per-key) instead
+  of replacing them wholesale. Previously a `pre_write` hook returning
+  `{"content": "..."}` (as in the bundled lint-check example) dropped `path`, so
+  the write targeted the wrong/empty path. `path`/`edits`/`command`/etc. are now
+  preserved and hooks compose (each sees earlier amendments). New helper
+  `plugins::apply_modify` (with unit tests) locks the contract.
+- Hook `reason` is now surfaced to the model: on `allow` it is appended to the
+  tool result as a `Plugin hooks:` note, and on deny it is the deny message - so
+  the model knows its write/edit/bash/read was inspected or modified and can
+  react. `PLUGIN_DOCS` updated to match (merge semantics + reason surfacing).
+- Subagent tool dispatch now applies the same dangerous-path guard
+  (`workspace::check_dangerous_path`) to `write_file`/`edit`/`patch` as the main
+  loop, so scoped subagent writes to `.git/**`, `**/.ssh/**`, `**/.env*`, etc.
+  are blocked and the subagent model is told why.
+
 ### Added — macOS standalone executable
 - `release-macos.sh` cross-compiles the harness into a single self-contained
   macOS executable per arch (arm64 + x86_64): the Rust core is built with

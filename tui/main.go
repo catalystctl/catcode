@@ -29,6 +29,7 @@ type session struct {
 	coreCmd    *exec.Cmd
 	coreIn     io.WriteCloser
 	coreEvents chan *coreEvent
+	stdinCh    chan []byte // P1-15: stdin writes are funneled through a writer goroutine
 
 	authed              bool
 	models              []modelInfo
@@ -182,11 +183,12 @@ func (s *session) startCore() tea.Cmd {
 	if approval == "" {
 		approval = "destructive"
 	}
+	debugLog := filepath.Join(configDir(), "debug.jsonl")
 	args := []string{
 		"--workspace", ".",
 		"--approval", approval,
 		"--session", sessionPath(),
-		"--debug-log", filepath.Join(configDir(), "debug.jsonl"),
+		"--debug-log", debugLog,
 		"--idle-timeout", fmt.Sprintf("%d", s.settings.IdleTimeout),
 	}
 	if s.settings.Sandbox != "" && s.settings.Sandbox != "none" {
@@ -200,44 +202,78 @@ func (s *session) startCore() tea.Cmd {
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir, _ = os.Getwd()
+	// P1-14: don't mutate UI state (logError) from this cmd goroutine on the
+	// error paths — return a message and let Update log it on the UI thread.
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		s.logError("failed to open core stdin: " + err.Error())
-		return nil
+		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to open core stdin: %s", err)} }
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		s.logError("failed to open core stdout: " + err.Error())
-		return nil
+		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to open core stdout: %s", err)} }
 	}
-	cmd.Stderr = os.Stderr
+	// P2: route the core's stderr (panic backtraces, unexpected warnings) to the
+	// debug log instead of the terminal — under the alt-screen TUI, raw stderr is
+	// buffered/lost and garbles the screen. The core appends its structured logs
+	// to the same file, so this is safe (append, no truncate race).
+	if f, ferr := os.OpenFile(debugLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
+		cmd.Stderr = f
+		defer f.Close() // child inherits the fd after Start; close our copy
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 	if err := cmd.Start(); err != nil {
-		s.logError("failed to start core (" + bin + "): " + err.Error())
-		return nil
+		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to start core (%s): %s", bin, err)} }
 	}
 	s.coreCmd = cmd
 	s.coreIn = in
 	s.coreEvents = make(chan *coreEvent, 256)
+	s.stdinCh = make(chan []byte, 256)
 
+	// P1-15: a dedicated stdin-writer goroutine funnels commands to the core. A
+	// blocking pipe write (core not draining) happens here, off the UI thread,
+	// so a wedged core can never freeze the Bubble Tea Update loop.
 	go func() {
-		sc := bufio.NewScanner(out)
-		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
+		for b := range s.stdinCh {
+			if _, err := s.coreIn.Write(b); err != nil {
+				return // core died; the stdout EOF will trigger restart
 			}
-			var raw json.RawMessage
-			var ev coreEvent
-			if err := json.Unmarshal([]byte(line), &raw); err == nil {
-				ev.Raw = raw
-				if t := ev.get("type"); t != "" {
-					ev.Type = t
+		}
+	}()
+
+	// P1-11: bufio.Reader.ReadString grows with the line (no 4 MiB cap like
+	// bufio.Scanner), so a large tool_result JSON line doesn't silently kill the
+	// stream. P1-10: the send is BLOCKING (backpressure) so a `done` or
+	// `approval_request` is never silently dropped — the core's stdout pipe fills
+	// and naturally throttles the core instead.
+	go func() {
+		r := bufio.NewReaderSize(out, 64*1024)
+		for {
+			line, err := r.ReadString('\n')
+			line = strings.TrimSpace(line)
+			if line != "" {
+				var raw json.RawMessage
+				var ev coreEvent
+				if json.Unmarshal([]byte(line), &raw) == nil {
+					ev.Raw = raw
+					if t := ev.get("type"); t != "" {
+						ev.Type = t
+					}
 				}
+				s.coreEvents <- &ev // blocking: backpressure, no drops
 			}
-			select {
-			case s.coreEvents <- &ev:
-			default:
+			if err != nil {
+				if err != io.EOF {
+					// Surface a real read error instead of a silent clean-looking EOF.
+					ev := &coreEvent{Type: "error"}
+					msg, _ := json.Marshal(map[string]string{"message": "core stdout read error: " + err.Error()})
+					ev.Raw = msg
+					select {
+					case s.coreEvents <- ev:
+					default:
+					}
+				}
+				break
 			}
 		}
 		close(s.coreEvents)
@@ -246,6 +282,10 @@ func (s *session) startCore() tea.Cmd {
 	s.sendCore(map[string]any{"type": "init"})
 	return waitForEvent(s.coreEvents)
 }
+
+// coreStartErrorMsg reports a core subprocess start failure (P1-14: logged on
+// the UI thread, not from the startCore goroutine).
+type coreStartErrorMsg struct{ err error }
 
 func waitForEvent(ch <-chan *coreEvent) tea.Cmd {
 	return func() tea.Msg {
@@ -263,7 +303,20 @@ func (s *session) sendCore(m map[string]any) {
 	}
 	b, _ := json.Marshal(m)
 	b = append(b, '\n')
-	_, _ = s.coreIn.Write(b)
+	// P1-15: hand the bytes to the stdin-writer goroutine instead of a direct
+	// (possibly blocking) pipe write from the UI thread. Non-blocking send with a
+	// drop+log on overflow so a wedged core can never freeze Update; in practice
+	// the buffer never fills (commands are human-paced and the writer drains to
+	// the pipe as fast as the core accepts).
+	if s.stdinCh != nil {
+		select {
+		case s.stdinCh <- b:
+		default:
+			s.logError("core not accepting input (backpressure); command dropped")
+		}
+		return
+	}
+	_, _ = s.coreIn.Write(b) // legacy path before startCore wires stdinCh
 }
 
 // ---------------------------------------------------------------------------
@@ -295,17 +348,38 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.spinner, cmd = s.spinner.Update(msg)
 		return s, cmd
 
+	case coreStartErrorMsg:
+		// P1-14: a core start failure is logged on the UI thread (startCore ran in
+		// a goroutine and must not touch UI state itself).
+		s.logError(msg.err.Error())
+		return s, nil
+
 	case coreEOFMsg:
 		// Core crashed or exited unexpectedly. Auto-restart once so the user
 		// isn't stranded, and re-auth with the persisted key if we had one.
-		// ponytail: one retry. A crash loop would mean a real bug to fix, not
-		// silent infinite restarts.
+		// P1-17: coreRestarts is reset to 0 after every successful turn (see the
+		// `done` handler), so this budget is per-incident, not lifetime — an early
+		// crash doesn't burn the only retry forever.
 		if s.coreRestarts >= 1 {
 			s.logError("core exited again after restart; quitting")
 			return s, tea.Quit
 		}
 		s.coreRestarts++
 		s.logWarn("core exited; restarting…")
+		// P1-13: reset stale turn/UI state so the restarted core isn't shown as
+		// "working" with a dead request_id the user could accidentally approve.
+		s.busy = false
+		s.cur = nil
+		s.queuedNext = false
+		s.pendingApproval = nil
+		s.pendingIntercom = nil
+		s.subProgress = nil
+		// Stop the old stdin writer (its range loop exits on close) and drop the
+		// dead pipes before respawning.
+		if s.stdinCh != nil {
+			close(s.stdinCh)
+			s.stdinCh = nil
+		}
 		s.coreCmd = nil
 		s.coreIn = nil
 		return s, s.startCore()

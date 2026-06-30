@@ -47,17 +47,32 @@ type block struct {
 	sub       bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
 	id        string          // blkTool: tool-call id, to match results out of order
 	expanded  bool            // blkTool / blkToolResult: full output shown (ctrl+o)
+	renderW   int             // P1-12: width the streaming block was last rendered at
+	renderLen int             // P1-12: text length at last render (throttle)
+	renderStr string          // P1-12: cached render of the streaming block
 }
 
 // push appends a block and updates the streaming cursor. Streaming kinds
 // (assistant, thinking) become s.cur; everything else finalizes s.cur=nil so
 // the previous streaming block gets cached.
+// maxBlocks caps the in-memory transcript so a long session doesn't grow
+// `blocks` + the pre-rendered `cache` (~3x the transcript) without bound (P1-16).
+const maxBlocks = 400
+
 func (s *session) push(kind blockKind) *block {
 	b := &block{kind: kind}
 	if kind == blkThinking {
 		b.collapsed = !s.thinkExpanded
 	}
 	s.blocks = append(s.blocks, b)
+	if len(s.blocks) > maxBlocks {
+		// Drop the oldest finalized blocks and reset the render cache (its prefix
+		// no longer matches the shifted indices). `s.cur` is always the newest
+		// block, so it's never trimmed.
+		trim := len(s.blocks) - maxBlocks
+		s.blocks = s.blocks[trim:]
+		s.invalidateAll()
+	}
 	if kind == blkAssistant || kind == blkThinking {
 		s.cur = b
 	} else {
@@ -199,7 +214,32 @@ func (s *session) logRaw(styled string) {
 // boxed card around every message. Tool output gets a left `│` rule panel.
 // ---------------------------------------------------------------------------
 
+// renderBlock renders a block, throttling re-renders of the LIVE streaming
+// block (s.cur) so a long reply isn't O(L^2): reuse the last render until the
+// text grows by >= streamBatch bytes or a newline / width change forces a fresh
+// full render. Every actual render is a complete re-render of the current text,
+// so this is purely a frequency cap (<= streamBatch bytes of display latency),
+// not a correctness compromise. Finalized blocks render fully once and are
+// cached upstream in renderBlocks.
 func (s *session) renderBlock(b *block, w int) string {
+	if b == s.cur && (b.kind == blkAssistant || b.kind == blkThinking) {
+		text := b.text.String()
+		force := w != b.renderW || strings.HasSuffix(text, "\n") || b.renderStr == ""
+		if !force && len(text)-b.renderLen < streamBatch {
+			return b.renderStr
+		}
+		out := s.renderBlockFull(b, w)
+		b.renderW = w
+		b.renderStr = out
+		b.renderLen = len(text)
+		return out
+	}
+	return s.renderBlockFull(b, w)
+}
+
+const streamBatch = 64 // P1-12: bytes of streaming growth between full re-renders
+
+func (s *session) renderBlockFull(b *block, w int) string {
 	switch b.kind {
 	case blkUser:
 		return roleLine("●", "you", "", c.user) + "\n" + renderMarkdown(b.text.String(), w)

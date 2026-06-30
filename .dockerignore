@@ -1,0 +1,33 @@
+# Build-context shrinkage for the Dockerfile (it only COPYs core/ and tui/).
+# Exclude everything the image doesn't need so `docker build` is fast + cacheable.
+
+.git/
+.gitignore
+.github/
+.pi/
+.umans-harness/
+continue/
+roo-code/
+dist/
+*.log
+*.log.*
+context.md
+plan.md
+plan.html
+
+# Stray binaries + build dirs (keep the image reproducible & lean)
+core/target/
+tui/tui
+tui/umans-harness-tui
+tui/ucli
+tui/ucli.exe
+tui/bin/
+tui/embed/umans-core
+**/*.rs.bk
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+node_modules/

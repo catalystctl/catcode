@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -231,14 +233,51 @@ func dirCompletion(query string) []mentionItem {
 	return items
 }
 
-// recursiveSearch walks the CWD and collects entries whose relative path
-// contains the prefix (case-insensitive). Heavy/hidden directories are pruned.
+// mentionCache memoizes the recursive file list for the CWD so a bare `@query`
+// doesn't re-walk the whole tree (up to 40k entries) on every keystroke (P1-18).
+// The walk is the expensive part (40k stat calls); filtering the cached list by
+// prefix is microseconds. A short TTL keeps it fresh as files are added.
+var mentionCache = struct {
+	sync.Mutex
+	cwd  string
+	list []mentionItem
+	at   time.Time
+}{}
+
+const mentionCacheTTL = 2 * time.Second
+const mentionCacheCap = 10000
+
 func recursiveSearch(prefix string) []mentionItem {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
+	mentionCache.Lock()
+	if mentionCache.cwd != cwd || time.Since(mentionCache.at) > mentionCacheTTL {
+		mentionCache.list = walkMentionList(cwd)
+		mentionCache.cwd = cwd
+		mentionCache.at = time.Now()
+	}
+	list := mentionCache.list
+	mentionCache.Unlock()
+
 	lp := strings.ToLower(prefix)
+	var items []mentionItem
+	for _, it := range list {
+		if strings.Contains(strings.ToLower(it.insert), lp) {
+			items = append(items, it)
+			if len(items) >= mentionMaxResults {
+				break
+			}
+		}
+	}
+	sortMentionItems(items)
+	return items
+}
+
+// walkMentionList walks the CWD once, collecting non-ignored entries (capped at
+// mentionCacheCap) with relative paths. Hidden files and heavy dirs are pruned.
+func walkMentionList(cwd string) []mentionItem {
 	var items []mentionItem
 	visited := 0
 	_ = filepath.WalkDir(cwd, func(path string, d fs.DirEntry, err error) error {
@@ -247,13 +286,10 @@ func recursiveSearch(prefix string) []mentionItem {
 		}
 		visited++
 		if visited > 40000 {
-			return filepath.SkipDir
+			return filepath.SkipAll
 		}
 		rel, rerr := filepath.Rel(cwd, path)
 		if rerr != nil || rel == "." {
-			if d != nil && d.IsDir() && rel == "." {
-				return nil
-			}
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
@@ -267,22 +303,19 @@ func recursiveSearch(prefix string) []mentionItem {
 		if d.IsDir() && isIgnoredDir(name) {
 			return filepath.SkipDir
 		}
-		if prefix == "" || strings.Contains(strings.ToLower(rel), lp) {
-			isDir := d.IsDir()
-			disp := rel
-			ins := rel
-			if isDir {
-				disp += "/"
-				ins += "/"
-			}
-			items = append(items, mentionItem{display: disp, insert: ins, isDir: isDir})
+		isDir := d.IsDir()
+		disp := rel
+		ins := rel
+		if isDir {
+			disp += "/"
+			ins += "/"
 		}
-		if len(items) >= mentionMaxResults {
-			return filepath.SkipDir
+		items = append(items, mentionItem{display: disp, insert: ins, isDir: isDir})
+		if len(items) >= mentionCacheCap {
+			return filepath.SkipAll
 		}
 		return nil
 	})
-	sortMentionItems(items)
 	return items
 }
 

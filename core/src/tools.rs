@@ -166,7 +166,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a bash command in the workspace root. Returns combined stdout+stderr (truncated to 8KB). Commands run with a 30s timeout (configurable). A small denylist blocks catastrophic commands.",
+                "description": "Run a bash command in the workspace root. Returns combined stdout+stderr (truncated to 32KB). Commands run with a 30s timeout (configurable). A small denylist blocks catastrophic commands. Keep the command short and simple: for loops, nested quotes, long && chains, or multi-line logic, write a script to a file with write_file and run `bash script.sh` instead of inlining one long command string (long inline commands are prone to JSON-encoding errors when wrapped in bulk).",
                 "parameters": {
                     "type": "object",
                     "properties": { "command": { "type": "string" } },
@@ -178,7 +178,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk",
-                "description": "Run several tool calls in one round-trip. Each entry has a tool name and its args object. Dispatches any built-in tool (read_file, write_file, edit, list_dir, grep, glob, bash). Returns one result block per call, in order. Use this to batch independent operations and cut round-trips; the whole batch shares one approval gate.",
+                "description": "Run several tool calls in one round-trip. Each entry has a tool name and its args object. Dispatches any built-in tool (read_file, write_file, edit, list_dir, grep, glob, bash). Returns one result block per call, in order. Use this to batch independent operations and cut round-trips; the whole batch shares one approval gate. Use bulk only to batch several genuinely independent calls — do not wrap a single bash command in bulk (call bash directly instead). Avoid putting long, quote-heavy commands inside bulk: their nested JSON escaping is a common source of malformed tool calls; write such commands to a script file with write_file and run `bash script.sh` instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -395,7 +395,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "bulk_edit" => bulk_edit(args, cfg),
         "bash" => Outcome::err("bash must be dispatched through execute_bash (async)"),
         "bulk" => Outcome::err("bulk must be dispatched through execute_bulk (async)"),
-        other => Outcome::err(&format!("unknown tool: {other}")),
+        other => Outcome::err(format!("unknown tool: {other}")),
     }
 }
 
@@ -461,6 +461,13 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
 
 
 fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
+    // P0-3: enforce the dangerous-path blocklist inside the primitive so every
+    // caller (main loop, subagent dispatch, AND bulk_write/bulk) is covered —
+    // previously only the top-level write_file/edit/patch dispatch checked, so
+    // bulk_write could write .git/config, .env, id_rsa, etc.
+    if let Some(msg) = workspace::check_dangerous_path(input) {
+        return Outcome::err(msg);
+    }
     let path = match workspace::resolve(&cfg.workspace, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
@@ -503,6 +510,7 @@ fn list_dir(input: &str, cfg: &Config) -> Outcome {
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     let re = match regex::Regex::new(pattern) {
         Ok(r) => r,
@@ -753,6 +761,49 @@ fn glob_dp(p: &[char], t: &[char]) -> bool {
 
 // ---- bash (async, timeout + kill) ----
 
+/// Collapse runs of whitespace to a single space and trim, so `rm  -rf  /`
+/// can't evade a `rm -rf /` denylist pattern (P1-7).
+fn normalize_bash_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(c);
+            prev_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Find `needle` in `haystack` only where the character right after the match
+/// is end-of-string or whitespace. Used for path-targeting denylist patterns
+/// (e.g. `rm -rf /`) so they match `rm -rf /` and `rm -rf / ` but NOT
+/// `rm -rf /tmp/x` — i.e. the `/` must be the end of a path token, not the
+/// prefix of `/tmp` (P1-7: removes the false-positive that blocked legit
+/// `rm -rf /tmp/...` cleanup).
+fn contains_at_boundary(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let after_is_boundary = end >= bytes.len() || bytes[end] == b' ';
+        if after_is_boundary {
+            return true;
+        }
+        from = end.max(start + 1);
+    }
+    false
+}
+
 /// Run bash with cwd=workspace, a real timeout, and a denylist tripwire.
 /// Optional hard sandbox: --sandbox firejail wraps the command in a
 /// firejail profile that whitelists only the workspace; --no-network adds
@@ -761,9 +812,20 @@ fn glob_dp(p: &[char], t: &[char]) -> bool {
 pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
     // ponytail: denylist is a tripwire, not a sandbox. It blocks the most
     // catastrophic obvious commands; a determined model bypasses it.
-    let lower = command.to_ascii_lowercase();
+    // Normalize whitespace first so `rm  -rf  /` (extra spaces) can't slip past
+    // a `rm -rf /` pattern (P1-7). Path-targeting patterns (ending in `/` or
+    // `~`) are matched at a token boundary so `rm -rf /` doesn't false-positive
+    // on `rm -rf /tmp/x` (the `/` must be the end of a path token).
+    let norm = normalize_bash_ws(command);
+    let lower = norm.to_ascii_lowercase();
     for bad in &cfg.bash_deny {
-        if lower.contains(&bad.to_ascii_lowercase()) {
+        let bad_l = bad.to_ascii_lowercase();
+        let blocked = if bad_l.ends_with('/') || bad_l.ends_with('~') {
+            contains_at_boundary(&lower, &bad_l)
+        } else {
+            lower.contains(&bad_l)
+        };
+        if blocked {
             return Outcome::err(format!("bash command blocked by denylist (matched '{bad}'); use a sandbox for hard isolation"));
         }
     }
@@ -786,6 +848,14 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
     cmd.kill_on_drop(true);
+    // P1-8: don't leak the parent environment (LD_PRELOAD, LD_LIBRARY_PATH,
+    // UMANS_*, arbitrary PATH/HOME overrides) into bash — even inside a sandbox
+    // these could subvert tool execution. Keep only the essentials.
+    cmd.env_clear();
+    cmd.env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()));
+    if let Ok(home) = std::env::var("HOME") { cmd.env("HOME", home); }
+    if let Ok(tmp) = std::env::var("TMPDIR") { cmd.env("TMPDIR", tmp); }
+    if let Ok(user) = std::env::var("USER") { cmd.env("USER", user); }
 
     let child: tokio::process::Child = match cmd.spawn() {
         Ok(c) => c,
@@ -939,6 +1009,10 @@ fn split_lines(content: &str) -> (Vec<String>, bool) {
 /// in order to the evolving content. If any search is not found or is
 /// ambiguous, the file is left untouched and an error is returned.
 fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
+    // P0-3: blocklist enforced inside the primitive (covers bulk_edit too).
+    if let Some(msg) = workspace::check_dangerous_path(input) {
+        return Outcome::err(msg);
+    }
     let path = match workspace::resolve(&cfg.workspace, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
@@ -1165,6 +1239,10 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
     if path.is_empty() || patch.is_empty() {
         return Outcome::err("patch requires 'path' and 'patch'");
     }
+    // P0-3: blocklist enforced inside the primitive (covers bulk patch too).
+    if let Some(msg) = workspace::check_dangerous_path(path) {
+        return Outcome::err(msg);
+    }
     let resolved = match workspace::resolve(&cfg.workspace, path) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
@@ -1221,8 +1299,10 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
                         return Err(format!("removal mismatch at line {}: {:?} not found", target + 1, content));
                     }
                 } else if let Some(content) = pl.strip_prefix('+') {
-                    // addition
-                    lines.insert(target, content.to_string());
+                    // addition. Clamp the insert index so a blank context line
+                    // (below) that advanced `target` past the end can't make this
+                    // insert panic with an out-of-bounds index (P1-1).
+                    lines.insert(target.min(lines.len()), content.to_string());
                     target += 1;
                 } else if pl.is_empty() {
                     // blank context line (treat as context)
@@ -1266,7 +1346,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     } else {
         return Outcome::err("no recognized project marker (Cargo.toml/package.json/go.mod/pyproject.toml)");
     };
-    let mut c = tokio::process::Command::new(&cmd[0]);
+    let mut c = tokio::process::Command::new(cmd[0]);
     c.args(&cmd[1..]);
     c.current_dir(&target);
     c.stdin(std::process::Stdio::null());
@@ -1305,10 +1385,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("umans_harness_tools_ws_{}", n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let mut cfg = Config::default();
-        cfg.workspace = dir.clone();
-        cfg.max_read_bytes = 1_048_576;
-        cfg.max_read_lines = 2000;
+        let cfg = Config {
+            workspace: dir.clone(),
+            max_read_bytes: 1_048_576,
+            max_read_lines: 2000,
+            ..Config::default()
+        };
         (dir, cfg)
     }
 
@@ -1473,11 +1555,11 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         // match line uses ':' before the line number
         assert!(o.output.contains("a.txt:3:MARK"), "match marker: {}", o.output);
-        assert!(o.output.contains("a.txt:9:MARK"), "match marker: {}", o.output);
+        assert!(o.output.contains("a.txt:8:MARK"), "match marker: {}", o.output);
         // context lines use '-' as the separator (GNU grep -C convention)
         assert!(o.output.contains("a.txt-2-l2"), "context marker: {}", o.output);
         assert!(o.output.contains("a.txt-4-l4"), "context marker: {}", o.output);
-        // windows 5 apart (line 3 ±1 and line 9 ±1) do not overlap → '...' between
+        // windows 5 apart (line 3 +/-1 and line 8 +/-1) do not overlap -> '...' between
         assert!(o.output.contains("..."), "group separator: {}", o.output);
     }
 
@@ -1669,5 +1751,62 @@ mod tests {
         let pn = firejail_profile(&cfg.workspace, true);
         assert!(pn.contains("net none")); // network dropped
         assert!(!pn.contains("protocol unix"));
+    }
+
+    #[test]
+    fn write_file_blocks_dangerous_paths() {
+        let (_root, cfg) = tmp_ws();
+        // P0-3: the blocklist is enforced inside write_file itself.
+        let o = execute("write_file", &json!({"path":".git/config","content":"x"}), &cfg);
+        assert!(!o.ok, "{}", o.output);
+        assert!(o.output.contains("dangerous pattern"), "{}", o.output);
+        assert!(!cfg.workspace.join(".git/config").exists());
+    }
+
+    #[test]
+    fn bulk_write_blocks_dangerous_paths() {
+        let (_root, cfg) = tmp_ws();
+        // P0-3: bulk_write must NOT bypass the blocklist (it calls write_file).
+        let o = bulk_write(&json!({"files":[{"path":".env","content":"LEAK=1"},{"path":"ok.txt","content":"hi"}]}), &cfg);
+        assert!(!o.ok, "{}", o.output);
+        assert!(o.output.contains("dangerous pattern"), "{}", o.output);
+        assert!(!cfg.workspace.join(".env").exists(), ".env must not be written");
+        assert!(cfg.workspace.join("ok.txt").exists(), "non-dangerous file should still be written");
+    }
+
+    #[test]
+    fn patch_blank_line_in_hunk_no_panic() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("p.txt"), "x\n").unwrap();
+        // A hunk body with a blank context line previously panicked (P1-1):
+        // the blank line advanced `target` past the end and the following `+`
+        // line inserted at an out-of-bounds index.
+        let diff = "@@ -1,1 +1,3 @@\n x\n\n+added\n";
+        let o = execute("patch", &json!({"path":"p.txt","patch":diff}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        let result = fs::read_to_string(cfg.workspace.join("p.txt")).unwrap();
+        assert!(result.contains("added"), "{}", result);
+    }
+
+    #[tokio::test]
+    async fn bash_denylist_blocks_extra_whitespace_root() {
+        let (_root, cfg) = tmp_ws();
+        // P1-7: extra spaces can't evade the pattern after whitespace normalization.
+        let o = execute_bash("rm   -rf    /", &cfg).await;
+        assert!(!o.ok, "{}", o.output);
+        assert!(o.output.contains("denylist"), "{}", o.output);
+    }
+
+    #[tokio::test]
+    async fn bash_denylist_allows_tmp_subtree() {
+        let (_root, cfg) = tmp_ws();
+        // P1-7: `rm -rf /tmp/x` no longer false-positives on `rm -rf /`.
+        // Use `echo` so nothing destructive runs; the tripwire must NOT match.
+        let o = execute_bash("echo rm -rf /tmp/x-nope", &cfg).await;
+        assert!(o.ok, "{}", o.output);
+        // And a plain workspace-relative rm still runs.
+        fs::write(cfg.workspace.join("to_delete"), "x").unwrap();
+        let o2 = execute_bash("rm -f to_delete", &cfg).await;
+        assert!(o2.ok, "{}", o2.output);
     }
 }

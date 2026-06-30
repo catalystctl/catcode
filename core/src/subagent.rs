@@ -25,7 +25,7 @@ use crate::tools::{self, Outcome};
 use crate::State;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +42,11 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     }
 
     let end = match normalized.find("\n---") {
-        Some(i) if i >= 3 => i,
+        // Require i > 3 so an immediately-closed fence ("---\n---…", empty
+        // frontmatter) doesn't slice [4..3] and panic. With i == 3 the block is
+        // empty; treat the whole content as the body (the caller skips agents
+        // with no parsed `name`).
+        Some(i) if i > 3 => i,
         _ => return (fm, normalized),
     };
     let block = &normalized[4..end];
@@ -399,6 +403,7 @@ pub fn resolve_max_depth(cfg: &SubagentConfig) -> u32 {
         .unwrap_or(cfg.max_depth)
 }
 
+#[allow(dead_code)]
 pub fn child_max_depth(parent: u32, agent: Option<u32>) -> u32 {
     match agent {
         Some(a) => parent.min(a),
@@ -643,6 +648,7 @@ pub async fn run_agent(
     result
 }
 
+#[allow(unused_assignments)]
 async fn run_agent_inner(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -774,6 +780,11 @@ async fn run_agent_inner(
         }
 
         crate::provider::sanitize_orphaned_tool_calls(&mut sub);
+        // Coerce any malformed tool-call `arguments` (e.g. a long, quote-heavy
+        // command that broke the model's JSON encoding) to "{}" so the history
+        // stays valid for the API. Without this, one malformed call makes every
+        // later subagent request fail with "function.arguments must be valid JSON".
+        let _ = crate::provider::sanitize_tool_call_arguments(&mut sub);
 
         // stream with model fallback
         let (assistant, _finish_reason, ti, to, cached) = match stream_with_fallback(
@@ -816,11 +827,27 @@ async fn run_agent_inner(
             let func = call.get("function");
             let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
-            let argsv: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
             tool_count += 1;
             emit_subagent_progress(run_id, agent, "tool", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, true);
+            let argsv: Value = match serde_json::from_str(&args_str) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Malformed JSON arguments: skip dispatch and push an actionable
+                    // error so the subagent retries simply. The unconditional
+                    // sanitize_tool_call_arguments() above keeps the history valid
+                    // for the API (otherwise the malformed message would make every
+                    // later request fail with "function.arguments must be valid JSON").
+                    let msg = format!(
+                        "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
+                        name
+                    );
+                    emit_subagent_progress(run_id, agent, "tool_end", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, false);
+                    sub.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                    continue;
+                }
+            };
 
-            let outcome = dispatch_subagent_tool(&name, &argsv, st, client, api_key, parent_model, my_target, agent, depth, max_depth, &cfg, cancel).await;
+            let outcome = dispatch_subagent_tool(&name, &argsv, &id, &args_str, st, client, api_key, parent_model, my_target, agent, depth, max_depth, &cfg, cancel).await;
 
             emit_subagent_progress(run_id, agent, "tool_end", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, outcome.ok);
             sub.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
@@ -842,9 +869,16 @@ async fn run_agent_inner(
 
 /// Dispatch a tool call inside a subagent loop. Handles async tools (bash/bulk/
 /// diagnostics/subagent) + intercom tools; others go through tools::execute.
+/// Like the main loop, destructive tools respect the configured `cfg.approval`
+/// mode + permission rules + escalated kinds, and every pre/post plugin hook
+/// (pre_bash/pre_write/pre_read/post_*) runs — so delegated work is gated and
+/// observable exactly like top-level tool calls (P0-4: previously subagents
+/// bypassed the approval gate and all plugin hooks entirely).
 async fn dispatch_subagent_tool(
     name: &str,
     args: &Value,
+    id: &str,
+    args_str: &str,
     st: &Arc<State>,
     client: &reqwest::Client,
     api_key: &str,
@@ -856,27 +890,170 @@ async fn dispatch_subagent_tool(
     cfg: &Config,
     cancel: &CancellationToken,
 ) -> Outcome {
-    match name {
+    // Honor the agent's declared tool allowlist (agent.tools). If non-empty,
+    // only those tools may be dispatched here; anything else is refused so a
+    // subagent can't exceed its declared capabilities (and this gives the
+    // previously-vestigial `agent` param a real job). Empty == all tools.
+    if !agent.tools.is_empty() && !agent.tools.iter().any(|t| t == name) {
+        return Outcome::err(format!(
+            "tool '{}' is not in agent '{}' declared tool list {:?}",
+            name, agent.name, agent.tools
+        ));
+    }
+
+    // Guard write/edit/patch the same way the main loop does: block paths that
+    // escape the workspace or hit sensitive system locations. The deny reason
+    // becomes the tool result so the subagent model knows why its write was
+    // refused.
+    if name == "write_file" || name == "edit" || name == "patch" {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(msg) = crate::workspace::check_dangerous_path(path) {
+            return Outcome::err(msg);
+        }
+    }
+
+    // Approval gate + permission rules. A subagent is model-driven (the parent
+    // model decides to spawn; the child decides what to run), so delegated work
+    // must honor the same `cfg.approval` mode and allow/deny rules as the main
+    // loop — otherwise `--approval always`/`destructive` is silently bypassed
+    // for every tool a subagent runs.
+    let kind = tools::classify(name);
+    let kind_str: &'static str = match kind {
+        tools::ToolKind::ReadOnly => "readonly",
+        tools::ToolKind::Destructive => "destructive",
+    };
+    let escalated = st.escalated_kinds.lock().await.contains(kind_str);
+    let mut force_allow = false;
+    let mut force_deny = false;
+    for rule in &cfg.allow_rules {
+        if crate::tool_matches_rule(name, args, rule) {
+            force_allow = true;
+            break;
+        }
+    }
+    if !force_allow {
+        for rule in &cfg.deny_rules {
+            if crate::tool_matches_rule(name, args, rule) {
+                force_deny = true;
+                break;
+            }
+        }
+    }
+    if force_deny {
+        return Outcome::err(format!("tool call '{}' denied by permission rule", name));
+    }
+    let needs_approval = if force_allow || escalated {
+        false
+    } else {
+        match cfg.approval {
+            crate::config::Approval::Never => false,
+            crate::config::Approval::Destructive => kind == tools::ToolKind::Destructive,
+            crate::config::Approval::Always => true,
+        }
+    };
+    if needs_approval {
+        match crate::request_approval(st, id, name, args_str, kind_str, cancel).await {
+            crate::ApprovalResult::Granted => {}
+            crate::ApprovalResult::Denied => {
+                return Outcome::err(format!("tool call '{}' was denied by the user", name));
+            }
+            crate::ApprovalResult::Aborted => {
+                return Outcome::ok("[subagent aborted]");
+            }
+        }
+    }
+
+    // Pre-execution plugin hooks (pre_bash/pre_write/pre_read). A hook may amend
+    // args (`modify`) or deny; deny returns the reason to the subagent model.
+    let hook_name = match name {
+        "bash" => "pre_bash",
+        "write_file" | "edit" => "pre_write",
+        "read_file" | "grep" | "glob" => "pre_read",
+        _ => "",
+    };
+    let mut exec_args = args.clone();
+    let mut hook_notes: Vec<String> = Vec::new();
+    if !hook_name.is_empty() {
+        let session_id = cfg
+            .session_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let workspace = cfg.workspace.display().to_string();
+        for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook_name) {
+            let ctx = crate::plugins::build_context(
+                hook_name, name, &workspace, Some(&exec_args), &session_id, config.pass_args,
+            );
+            let result = crate::plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+            if !result.allow {
+                return Outcome::err(format!(
+                    "tool call '{}' denied by plugin '{}' hook '{}': {}",
+                    name, plugin_name, hook_name, result.reason
+                ));
+            }
+            if let Some(ref modify) = result.modify {
+                crate::plugins::apply_modify(&mut exec_args, modify);
+            }
+            if !result.reason.is_empty() {
+                hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
+            }
+        }
+    }
+
+    // Execute. bash/bulk/diagnostics/subagent are async; others sync. Hooks that
+    // amended `exec_args` are honored here.
+    let mut outcome = match name {
         "bash" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = exec_args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             tools::execute_bash(cmd, cfg).await
         }
-        "bulk" => tools::execute_bulk(args, cfg).await,
-        "diagnostics" => tools::execute_diagnostics(args, cfg).await,
-        "contact_supervisor" => execute_contact_supervisor(args, &st.intercom, my_target, cancel).await,
-        "intercom" => execute_intercom(args, &st.intercom, my_target, cancel).await,
+        "bulk" => tools::execute_bulk(&exec_args, cfg).await,
+        "diagnostics" => tools::execute_diagnostics(&exec_args, cfg).await,
+        "contact_supervisor" => execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await,
+        "intercom" => execute_intercom(&exec_args, &st.intercom, my_target, cancel).await,
         "subagent" | "spawn" => {
             if depth + 1 >= max_depth {
                 Outcome::err(format!("nested subagent blocked at depth {} (max {})", depth + 1, max_depth))
             } else {
-                execute(st.clone(), client.clone(), api_key.to_string(), parent_model.to_string(), args.clone(), cancel.clone(), depth + 1).await
+                execute(st.clone(), client.clone(), api_key.to_string(), parent_model.to_string(), exec_args.clone(), cancel.clone(), depth + 1).await
             }
         }
-        _ => tools::execute(name, args, cfg),
+        _ => tools::execute(name, &exec_args, cfg),
+    };
+
+    // Post-execution plugin hooks. They can't block (the op already ran); their
+    // reason is surfaced to the subagent as a note appended to the result.
+    let post_hook = match name {
+        "bash" => "post_bash",
+        "write_file" | "edit" => "post_write",
+        "read_file" | "grep" | "glob" => "post_read",
+        _ => "",
+    };
+    if !post_hook.is_empty() {
+        let session_id = cfg
+            .session_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let workspace = cfg.workspace.display().to_string();
+        for (plugin_name, config) in &st.plugin_manager.get_hook_configs(post_hook) {
+            let ctx = crate::plugins::build_context(
+                post_hook, name, &workspace, Some(&exec_args), &session_id, config.pass_args,
+            );
+            let result = crate::plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
+            if !result.reason.is_empty() {
+                hook_notes.push(format!("{}/{}: {}", plugin_name, post_hook, result.reason));
+            }
+        }
     }
+    if !hook_notes.is_empty() {
+        outcome.output.push_str("\n\nPlugin hooks:\n- ");
+        outcome.output.push_str(&hook_notes.join("\n- "));
+    }
+    outcome
 }
 
-fn resolve_model_candidates(agent: &AgentConfig, parent_model: &str, override_model: Option<String>, st: &Arc<State>) -> Vec<String> {
+fn resolve_model_candidates(agent: &AgentConfig, parent_model: &str, override_model: Option<String>, _st: &Arc<State>) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
     if let Some(m) = override_model { cands.push(m); }
     if let Some(m) = &agent.model { cands.push(m.clone()); }
@@ -1308,7 +1485,7 @@ async fn status_action(args: &Value, st: &Arc<State>) -> Outcome {
     let id = args.get("id").and_then(|v| v.as_str());
     if let Some(id) = id {
         if let Some(r) = find_run_prefix(&runs, id) {
-            return Outcome::ok(format_run(&r));
+            return Outcome::ok(format_run(r));
         }
         return Outcome::err(format!("no run matching '{id}'"));
     }

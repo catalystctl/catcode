@@ -33,8 +33,24 @@ pub fn check_dangerous_path(input: &str) -> Option<String> {
     None
 }
 
-/// Simple glob match for path patterns. Supports ** (any depth) and * (single segment).
+/// Collapse `./` segments, duplicate slashes, and trailing slashes from a
+/// relative path so `.//.git/config`, `a/./b`, and `a//b` all match their
+/// canonical forms. Dot-dirs like `.git` are kept (the `.` is part of the
+/// name, not a current-dir marker).
+fn normalize_rel_path(s: &str) -> String {
+    s.split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Simple glob match for path patterns. Supports ** (any depth). Matching is
+/// case-insensitive (so `.GIT/config`/`.SSH/...`/`.ENV` are blocked on
+/// case-insensitive filesystems like macOS/Windows) and the path is normalized
+/// so `.//.git/config` can't slip past a pattern by adding a stray `./`.
 fn glob_match_path(pattern: &str, path: &str) -> bool {
+    let pattern = normalize_rel_path(pattern).to_ascii_lowercase();
+    let path = normalize_rel_path(path).to_ascii_lowercase();
     // ** matches any path depth
     if pattern.contains("**") {
         // Split on **, match prefix and suffix
@@ -56,6 +72,23 @@ fn glob_match_path(pattern: &str, path: &str) -> bool {
                 return path.ends_with(suffix) || path.ends_with(&format!("/{suffix}"));
             }
             return false;
+        }
+        if parts.len() == 3 {
+            // **/anchor/** — match if the path has `anchor` as a path segment
+            // (e.g. **/.ssh/** matches ".ssh/config" and "home/.ssh/x"); the two
+            // ** absorb anything before/after the anchor. Fixes a latent bug
+            // where two-** patterns never matched.
+            let prefix = parts[0];
+            let middle = parts[1];
+            let suffix = parts[2];
+            if !path.starts_with(prefix) || !path.ends_with(suffix) {
+                return false;
+            }
+            let anchor = middle.trim_matches('/');
+            if anchor.is_empty() {
+                return true;
+            }
+            return path.split('/').any(|seg| seg == anchor);
         }
     }
     // Exact or suffix match for patterns without **
@@ -91,12 +124,16 @@ pub fn resolve(root: &Path, input: &str) -> Result<PathBuf, String> {
     let canon = match std::fs::canonicalize(&joined) {
         Ok(c) => c,
         Err(_) => {
-            // Target doesn't exist yet (write/create). Canonicalize the existing
-            // prefix and append the missing tail, then confine.
+            // Target doesn't exist yet (write/create). Canonicalize the EXISTING
+            // prefix incrementally so an intermediate symlinked directory that
+            // points OUTSIDE the workspace is resolved (and then rejected by the
+            // confinement check below). A naive `cur.join(comp)` would leave the
+            // symlink un-resolved and the subsequent write would escape (P0-2).
             let mut cur = canon_root.clone();
             for comp in p.components() {
                 if let std::path::Component::Normal(s) = comp {
-                    cur = cur.join(s);
+                    let candidate = cur.join(s);
+                    cur = std::fs::canonicalize(&candidate).unwrap_or(candidate);
                 }
             }
             cur
@@ -109,6 +146,7 @@ pub fn resolve(root: &Path, input: &str) -> Result<PathBuf, String> {
 }
 
 /// True if `path` (already resolved) is confined within `root`.
+#[allow(dead_code)]
 pub fn is_confined(root: &Path, path: &Path) -> bool {
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -155,5 +193,43 @@ mod tests {
         let r = tmp_root();
         assert!(resolve(&r, "../escape").is_err());
         assert!(resolve(&r, "sub/../../escape").is_err());
+    }
+
+    #[test]
+    fn dangerous_paths_case_insensitive() {
+        // Case-insensitive match so `.GIT/config`/`.SSH/...`/`.ENV` are blocked
+        // on case-insensitive filesystems (macOS, Windows), not just lowercase.
+        assert!(check_dangerous_path(".GIT/config").is_some());
+        assert!(check_dangerous_path(".SSH/authorized_keys").is_some());
+        assert!(check_dangerous_path(".ENV").is_some());
+        assert!(check_dangerous_path(".git/config").is_some());
+    }
+
+    #[test]
+    fn dangerous_paths_normalize_dot_slash() {
+        // `.//.git/config` must still match `.git/**` after normalization.
+        assert!(check_dangerous_path(".//.git/config").is_some());
+        assert!(check_dangerous_path("a/./.env").is_some());
+        // A legit path that merely contains "git" (no leading dot) is NOT .git/**.
+        assert!(check_dangerous_path("mygitthing/file").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_escape_rejected() {
+        use std::os::unix::fs::symlink;
+        let r = tmp_root();
+        // `linkdir` is a symlink to a directory OUTSIDE the workspace.
+        let outside = std::env::temp_dir().join(format!(
+            "umans_harness_escape_{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, r.join("linkdir")).unwrap();
+        // Resolving a NEW file through the symlinked dir must be rejected (P0-2).
+        assert!(resolve(&r, "linkdir/newfile").is_err());
+        // A normal new file inside the workspace still resolves.
+        assert!(resolve(&r, "sub/newfile").is_ok());
+        let _ = fs::remove_dir_all(&outside);
     }
 }
