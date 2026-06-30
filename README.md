@@ -16,15 +16,15 @@ A production-grade, OpenAI-compatible coding-agent harness with **native Umans**
 
 **Robustness**
 - **HTTP retry/backoff** — 429 and 5xx retried with exponential backoff (0.5s→1s→2s→4s, capped 8s), honoring `Retry-After`. Transport errors retried too. Up to 4 attempts.
-- **Idle stream timeout** — if no bytes arrive for 60s mid-stream, the turn aborts instead of hanging for 300s.
+- **Idle stream timeout** — if no bytes arrive for 120s mid-stream (default `--idle-timeout`; raised from 60s so reasoning models that think before the first token don't abort), the turn aborts instead of hanging for 300s.
 - **Context window management** — token estimate (~4 chars/token) triggers compaction at 70% of the model's window: oldest tool results dropped, system + recent turns kept, with a compaction marker. **Orphaned-tool-call sanitization** inserts synthetic tool results so a compacted history never sends an assistant `tool_calls` without matching results (mirrors the `pi-provider-umans` extension).
-- **File-size guards** — `read_file` refuses files >1 MiB or >2000 lines; `grep`/`glob` cap results (50/200). No OOM from a giant log.
+- **File-size guards** — `read_file` refuses files >5 MiB or >10 000 lines (with `offset`/`limit` pagination for the rest); `grep`/`glob` cap results (50/200). No OOM from a giant log.
 - **SSE parser** — handles `data:` framing, `[DONE]`, keepalive comments, and the final `usage` chunk (`stream_options.include_usage`).
 
 **Tooling**
 - **Search-and-replace editing** — `read_file` returns a file's plain content; `edit` takes `{search, replace}` pairs (exact, unique match; empty replace deletes; atomic, multi-op). To insert, anchor on a unique line and include it in the replacement. No hashes or line numbers to drift.
 - **grep + glob** — purpose-built search tools (regex content search, `**/*.ext` glob) so the model doesn't fumble with raw bash for exploration.
-- **bash** — async, timeout, kill, denylist, cwd-locked, 8KB output cap.
+- **bash** — async, timeout, kill, denylist, cwd-locked, 32 KB output cap (head truncated, tail kept).
 
 **Observability & persistence**
 - **Structured debug log** — JSONL records (`init`, `tool`, `turn_done`, `http_retry`, `turn_error`) to `--debug-log <file>` for post-mortem.
@@ -64,11 +64,17 @@ Forked context (`context: "fork"`) starts a child from a filtered snapshot of th
 core/                 Rust core (stdio JSON-RPC server)
   src/main.rs         stdin dispatch, approval gate, turn loop, compaction, metrics
   src/provider.rs     OpenAI streaming client: retry/backoff, idle timeout, orphaned-call sanitize
+  src/subagent.rs     subagent execution (single/parallel/chain), forked context, depth cap
+  src/intercom.rs     peer intercom bus (contact_supervisor / intercom ask/receive/reply)
+  src/plugins.rs      plugin manager + hook execution (pre_*/post_*/lifecycle/pre_turn)
   src/protocol.rs     wire types (Command / Event) + line emit
   src/config.rs       CLI + env + JSON config, approval modes
   src/workspace.rs    path confinement (absolute/.. /symlink rejection)
   src/tools.rs        read_file / edit / write_file / list_dir / grep / glob / bash
   src/logging.rs      JSONL debug log + token estimation + turn timer
+  src/memory.rs       persistent memory store (injected into the system prompt)
+  src/git_ctx.rs      git status/branch context for the system prompt
+  src/vision.rs       vision model config + image attachment helpers
   src/session.rs      append-only JSONL session persistence
 tui/                  Go Bubble Tea TUI
 .github/workflows/    CI (core clippy/test, tui vet/test/build, docker image)

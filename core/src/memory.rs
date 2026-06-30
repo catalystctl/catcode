@@ -80,8 +80,7 @@ impl Store {
         description: &str,
     ) -> Result<PathBuf, String> {
         let dir = self.dir(workspace);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("failed to create memory dir: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create memory dir: {e}"))?;
 
         let slug = slugify(name);
         let filename = format!("{}.md", slug);
@@ -134,10 +133,7 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
     if memories.is_empty() {
         return String::new();
     }
-    let relevant: Vec<&MemoryEntry> = memories
-        .iter()
-        .filter(|m| is_relevant(m, prompt))
-        .collect();
+    let relevant: Vec<&MemoryEntry> = memories.iter().filter(|m| is_relevant(m, prompt)).collect();
     if relevant.is_empty() {
         return String::new();
     }
@@ -150,12 +146,7 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
         };
         out.push_str(&format!("- **{}** ({}){}\n", m.name, m.mem_type, desc_part));
         if !m.content.is_empty() {
-            let preview: String = m
-                .content
-                .lines()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let preview: String = m.content.lines().take(5).collect::<Vec<_>>().join("\n");
             out.push_str(&format!("  {}\n", preview));
         }
     }
@@ -198,12 +189,19 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         return None;
     }
     let after_open = &trimmed[3..];
-    let after_open = after_open.strip_prefix('\n').or_else(|| after_open.strip_prefix("\r\n")).unwrap_or(after_open);
+    let after_open = after_open
+        .strip_prefix('\n')
+        .or_else(|| after_open.strip_prefix("\r\n"))
+        .unwrap_or(after_open);
     let end_pos = find_frontmatter_end(after_open)?;
     let fm_block = &after_open[..end_pos];
     let body_start = end_pos + 3;
     let rest = &after_open[body_start..];
-    let content = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")).unwrap_or(rest).to_string();
+    let content = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+        .unwrap_or(rest)
+        .to_string();
 
     let mut name = String::new();
     let mut description = String::new();
@@ -263,12 +261,14 @@ fn rebuild_index(dir: &Path) -> Result<(), String> {
     } else {
         for e in &entries {
             let slug = slugify(&e.name);
-            idx.push_str(&format!("- [{}](./{}.md) — {}\n", e.name, slug, e.description));
+            idx.push_str(&format!(
+                "- [{}](./{}.md) — {}\n",
+                e.name, slug, e.description
+            ));
         }
     }
     let idx_path = dir.join("MEMORY.md");
-    std::fs::write(&idx_path, &idx)
-        .map_err(|e| format!("failed to write MEMORY.md: {e}"))
+    std::fs::write(&idx_path, &idx).map_err(|e| format!("failed to write MEMORY.md: {e}"))
 }
 
 // ---- relevance ----
@@ -284,15 +284,28 @@ fn is_relevant(entry: &MemoryEntry, prompt: &str) -> bool {
         .filter(|w| w.len() > 2)
         .filter(|w| !is_stopword(w))
         .collect();
-    keywords.iter().any(|kw| {
-        prompt_lower.contains(&kw.to_lowercase())
-    })
+    keywords
+        .iter()
+        .any(|kw| prompt_lower.contains(&kw.to_lowercase()))
 }
 
 fn is_stopword(w: &str) -> bool {
     matches!(
         w.to_lowercase().as_str(),
-        "the" | "and" | "for" | "with" | "that" | "this" | "from" | "are" | "was" | "has" | "not" | "but" | "its" | "can"
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "that"
+            | "this"
+            | "from"
+            | "are"
+            | "was"
+            | "has"
+            | "not"
+            | "but"
+            | "its"
+            | "can"
     )
 }
 
@@ -366,15 +379,34 @@ mod tests {
         let ws = fake_workspace("roundtrip");
         let store = test_store(&root);
 
-        let p1 = store.save(&ws, "user preferences", "Always use tabs", "user", "prefers tabs over spaces").unwrap();
+        let p1 = store
+            .save(
+                &ws,
+                "user preferences",
+                "Always use tabs",
+                "user",
+                "prefers tabs over spaces",
+            )
+            .unwrap();
         assert!(p1.exists());
-        let p2 = store.save(&ws, "Project Rules", "No panics in production", "project", "code rules").unwrap();
+        let p2 = store
+            .save(
+                &ws,
+                "Project Rules",
+                "No panics in production",
+                "project",
+                "code rules",
+            )
+            .unwrap();
         assert!(p2.exists());
 
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 2);
 
-        let user = entries.iter().find(|e| e.name == "user preferences").unwrap();
+        let user = entries
+            .iter()
+            .find(|e| e.name == "user preferences")
+            .unwrap();
         assert_eq!(user.mem_type, "user");
         assert_eq!(user.content, "Always use tabs");
         assert_eq!(user.description, "prefers tabs over spaces");
@@ -406,7 +438,9 @@ mod tests {
         let ws = fake_workspace("skipidx");
         let store = test_store(&root);
 
-        store.save(&ws, "rule", "cpp", "project", "c++ rules").unwrap();
+        store
+            .save(&ws, "rule", "cpp", "project", "c++ rules")
+            .unwrap();
         let dir = store.dir(&ws);
         std::fs::write(dir.join("garbage.md"), "no frontmatter here").unwrap();
 
@@ -452,8 +486,18 @@ mod tests {
         let ws = fake_workspace("inj");
         let store = test_store(&root);
 
-        store.save(&ws, "test rules", "run tests with jest", "project", "Jest is the test framework").unwrap();
-        store.save(&ws, "indent", "always use tabs", "user", "tab width 4").unwrap();
+        store
+            .save(
+                &ws,
+                "test rules",
+                "run tests with jest",
+                "project",
+                "Jest is the test framework",
+            )
+            .unwrap();
+        store
+            .save(&ws, "indent", "always use tabs", "user", "tab width 4")
+            .unwrap();
 
         let memories = store.scan(&ws);
         let injection = build_injection(&memories, "please add jest tests for the component");
@@ -469,7 +513,9 @@ mod tests {
         let ws = fake_workspace("noinj");
         let store = test_store(&root);
 
-        store.save(&ws, "rust rules", "no unsafe", "project", "safe Rust only").unwrap();
+        store
+            .save(&ws, "rust rules", "no unsafe", "project", "safe Rust only")
+            .unwrap();
         let memories = store.scan(&ws);
         let injection = build_injection(&memories, "write a python script");
         assert!(injection.is_empty());
@@ -481,8 +527,12 @@ mod tests {
         let ws = fake_workspace("over");
         let store = test_store(&root);
 
-        store.save(&ws, "my rule", "first version", "user", "desc 1").unwrap();
-        store.save(&ws, "my rule", "second version", "user", "desc 2").unwrap();
+        store
+            .save(&ws, "my rule", "first version", "user", "desc 1")
+            .unwrap();
+        store
+            .save(&ws, "my rule", "second version", "user", "desc 2")
+            .unwrap();
 
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);

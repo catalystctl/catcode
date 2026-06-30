@@ -32,8 +32,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -114,7 +114,10 @@ impl IntercomBus {
     pub fn new() -> Self {
         let s = Self::default();
         *s.orchestrator_target.lock().unwrap() = "orchestrator".to_string();
-        s.known_targets.lock().unwrap().push("orchestrator".to_string());
+        s.known_targets
+            .lock()
+            .unwrap()
+            .push("orchestrator".to_string());
         s
     }
 
@@ -142,6 +145,10 @@ impl IntercomBus {
     /// Drop a mailbox when its subagent finishes.
     pub fn unregister(&self, target: &str) {
         self.mailboxes.lock().unwrap().remove(target);
+        // Also drop it from the known-targets list so `targets()` no longer
+        // advertises a peer whose mailbox (and run) is gone — otherwise a
+        // subagent could `ask` a stale target and wedge until the 5-min timeout.
+        self.known_targets.lock().unwrap().retain(|t| t != target);
     }
 
     /// Known peer targets (for the `intercom({action:"targets"})` introspection
@@ -187,7 +194,7 @@ impl IntercomBus {
 
     /// Register a blocking ask and return its handle. The caller awaits the
     /// handle's notify; the recipient resolves it via `resolve_ask`.
-    pub fn create_ask(&self, ask: PendingAsk) -> Arc<PendingAsk> {
+    pub fn create_ask(&self, ask: PendingAsk) -> Result<Arc<PendingAsk>, String> {
         let arc = Arc::new(ask);
         {
             let mut pa = self.pending_asks.lock().unwrap();
@@ -195,7 +202,9 @@ impl IntercomBus {
         }
         // Surface it: if addressed to the orchestrator, emit an event so the
         // TUI/user can reply; otherwise drop it into the recipient mailbox so a
-        // peer subagent can `receive` it and `reply`.
+        // peer subagent can `receive` it and `reply`. If the peer is unknown,
+        // fail FAST (don't wedge the caller for 5 min waiting on a peer that
+        // can't reply) — cancel the ask and return the error immediately.
         if arc.to == self.orchestrator_target() {
             emit_intercom_message(&arc);
         } else {
@@ -208,9 +217,12 @@ impl IntercomBus {
                 ts: arc.ts,
                 ask_id: arc.id.clone(),
             };
-            let _ = self.post(msg);
+            if let Err(e) = self.post(msg) {
+                self.pending_asks.lock().unwrap().remove(&arc.id);
+                return Err(e);
+            }
         }
-        arc
+        Ok(arc)
     }
 
     /// Resolve a pending ask with a reply. Returns true if the ask existed.
@@ -266,7 +278,10 @@ pub async fn execute_contact_supervisor(
     from: &str,
     cancel: &CancellationToken,
 ) -> Outcome {
-    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("need_decision");
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("need_decision");
     let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if message.is_empty() {
         return Outcome::err("contact_supervisor requires a 'message'");
@@ -296,9 +311,15 @@ pub async fn execute_contact_supervisor(
         return Outcome::ok("progress update sent to supervisor");
     }
 
-    let handle = bus.create_ask(ask);
+    let handle = match bus.create_ask(ask) {
+        Ok(h) => h,
+        Err(e) => return Outcome::err(e),
+    };
     // Block for the reply, bail out on cancel, or give up after a timeout so an
-    // unanswered ask never wedges the subagent forever (P1-6).
+    // unanswered ask never wedges the subagent forever (P1-6). A need_decision
+    // timeout MUST NOT silently "proceed with best judgment" — that would
+    // authorize unapproved (potentially destructive) decisions after 5 min of
+    // orchestrator inattention; return an error so the model re-asks/escalates.
     let result = tokio::select! {
         _ = handle.notify.notified() => {
             let reply = handle.reply.lock().unwrap().clone();
@@ -306,11 +327,11 @@ pub async fn execute_contact_supervisor(
         }
         _ = cancel.cancelled() => {
             bus.cancel_ask(&handle.id);
-            "[interrupted]".to_string()
+            return Outcome::ok("[interrupted]");
         }
         _ = tokio::time::sleep(INTERCOM_ASK_TIMEOUT) => {
             bus.cancel_ask(&handle.id);
-            "[no supervisor response within 5 min; proceeding with best judgment]".to_string()
+            return Outcome::err("need_decision timed out after 5 min with no supervisor response; do NOT proceed with the unapproved decision — re-ask, simplify, or escalate.");
         }
     };
     Outcome::ok(result)
@@ -323,7 +344,10 @@ pub async fn execute_intercom(
     from: &str,
     cancel: &CancellationToken,
 ) -> Outcome {
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("send");
     match action {
         "targets" => {
             let t = bus.targets();
@@ -332,7 +356,7 @@ pub async fn execute_intercom(
         "receive" | "poll" => {
             match bus.receive(from) {
                 Some(m) => Outcome::ok(json!(m).to_string()),
-                None => Outcome::ok("[]"), // no pending messages
+                None => Outcome::ok("null"), // no pending messages (JSON null, same value-space as the object case)
             }
         }
         "send" => {
@@ -346,7 +370,11 @@ pub async fn execute_intercom(
                 from: from.to_string(),
                 to: to.to_string(),
                 message: message.to_string(),
-                reason: args.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                reason: args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 ts: now_ms(),
                 ask_id: String::new(),
             };
@@ -371,7 +399,10 @@ pub async fn execute_intercom(
             // Blocking ask to a peer subagent (or the orchestrator).
             let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
             let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("need_decision");
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("need_decision");
             if to.is_empty() || message.is_empty() {
                 return Outcome::err("intercom ask requires 'to' and 'message'");
             }
@@ -385,18 +416,21 @@ pub async fn execute_intercom(
                 reply: Mutex::new(None),
                 notify: Arc::new(Notify::new()),
             };
-            let handle = bus.create_ask(ask);
+            let handle = match bus.create_ask(ask) {
+                Ok(h) => h,
+                Err(e) => return Outcome::err(e),
+            };
             let result = tokio::select! {
                 _ = handle.notify.notified() => {
                     handle.reply.lock().unwrap().clone().unwrap_or_else(|| "[no reply]".to_string())
                 }
                 _ = cancel.cancelled() => {
                     bus.cancel_ask(&handle.id);
-                    "[interrupted]".to_string()
+                    return Outcome::ok("[interrupted]");
                 }
                 _ = tokio::time::sleep(INTERCOM_ASK_TIMEOUT) => {
                     bus.cancel_ask(&handle.id);
-                    "[no peer response within 5 min; proceeding with best judgment]".to_string()
+                    return Outcome::err("intercom ask timed out after 5 min with no peer response; do NOT proceed with the unapproved decision — re-ask or pick a different peer.");
                 }
             };
             Outcome::ok(result)
@@ -411,10 +445,14 @@ pub async fn execute_intercom(
             if bus.resolve_ask(id, reply) {
                 Outcome::ok(format!("replied to ask {id}"))
             } else {
-                Outcome::err(format!("no pending ask with id '{id}' (it may have timed out or been answered)"))
+                Outcome::err(format!(
+                    "no pending ask with id '{id}' (it may have timed out or been answered)"
+                ))
             }
         }
-        other => Outcome::err(format!("unknown intercom action '{other}'; use send|ask|receive|poll|reply|targets")),
+        other => Outcome::err(format!(
+            "unknown intercom action '{other}'; use send|ask|receive|poll|reply|targets"
+        )),
     }
 }
 
@@ -458,6 +496,46 @@ mod tests {
     }
 
     #[test]
+    fn unregister_removes_from_known_targets() {
+        // unregister must drop the peer from `targets()` so a later ask can't
+        // target a dead peer and wedge for the 5-min timeout.
+        let bus = IntercomBus::new();
+        bus.register_target("worker-1");
+        assert!(bus.targets().contains(&"worker-1".to_string()));
+        bus.unregister("worker-1");
+        assert!(
+            !bus.targets().contains(&"worker-1".to_string()),
+            "targets() still lists an unregistered peer"
+        );
+        assert!(
+            !bus.targets().contains(&"orchestrator".to_string())
+                || bus.targets().contains(&"orchestrator".to_string()),
+            "orchestrator target must always remain known"
+        );
+    }
+
+    #[test]
+    fn create_ask_to_unknown_peer_fails_fast() {
+        // An ask to a peer with no mailbox must error immediately (not register
+        // a dangling ask that wedges the caller until the timeout).
+        let bus = IntercomBus::new();
+        let ask = PendingAsk {
+            id: "a1".into(),
+            from: "me".into(),
+            to: "ghost".into(),
+            message: "?".into(),
+            reason: "need_decision".into(),
+            ts: 1,
+            reply: Mutex::new(None),
+            notify: Arc::new(Notify::new()),
+        };
+        let r = bus.create_ask(ask);
+        assert!(r.is_err(), "create_ask to unknown peer should error fast");
+        // The ask must be removed from pending_asks on failure.
+        assert!(bus.pending_asks.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn orchestrator_is_known_default() {
         let bus = IntercomBus::new();
         assert_eq!(bus.orchestrator_target(), "orchestrator");
@@ -477,7 +555,7 @@ mod tests {
             reply: Mutex::new(None),
             notify: Arc::new(Notify::new()),
         };
-        let handle = bus.create_ask(ask);
+        let handle = bus.create_ask(ask).unwrap();
         assert!(bus.resolve_ask("a1", "do it"));
         assert_eq!(handle.reply.lock().unwrap().clone().unwrap(), "do it");
         // second resolve fails (already removed)

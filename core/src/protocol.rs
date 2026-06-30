@@ -75,7 +75,10 @@ pub enum Command {
     /// file is left intact so sessions accumulate per project. An optional
     /// `path` (a filename) overrides the auto-generated name.
     #[serde(rename = "new_session")]
-    NewSession { #[serde(default)] path: Option<String> },
+    NewSession {
+        #[serde(default)]
+        path: Option<String>,
+    },
     /// Request a stats summary (returns a `stats` event).
     #[serde(rename = "stats")]
     Stats,
@@ -113,10 +116,7 @@ pub enum Command {
     /// the orchestrator) replies with this command; the awaiting subagent
     /// wakes and continues.
     #[serde(rename = "intercom_reply")]
-    IntercomReply {
-        request_id: String,
-        reply: String,
-    },
+    IntercomReply { request_id: String, reply: String },
     /// Get the current vision-handoff configuration (curated vision-capable
     /// models + preferred target). Emits a `vision_config` event.
     #[serde(rename = "get_vision_config")]
@@ -145,7 +145,10 @@ pub struct Event {
 
 impl Event {
     pub fn new(kind: &'static str) -> Self {
-        Self { kind, data: serde_json::Map::new() }
+        Self {
+            kind,
+            data: serde_json::Map::new(),
+        }
     }
     pub fn with(mut self, k: &str, v: serde_json::Value) -> Self {
         self.data.insert(k.to_string(), v);

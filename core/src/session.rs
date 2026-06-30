@@ -6,7 +6,7 @@
 use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bump when the on-disk message shape changes. load() validates the header.
 pub const SESSION_VERSION: u32 = 1;
@@ -23,7 +23,12 @@ fn ensure_header(path: &Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(path) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{}", header_line());
         let _ = f.flush();
         let _ = f.sync_all();
@@ -52,20 +57,26 @@ pub fn append(path: &Path, msg: &Value) {
 }
 
 /// Load all messages from a session file. Skips the version header and any
-/// unparseable lines. Returns an empty vec if the file is missing or the
-/// header version is newer than SESSION_VERSION (refuses to misread).
-pub fn load(path: &Path) -> Vec<Value> {
+/// unparseable lines. Returns `Ok(Vec)` for a missing file (nothing to resume)
+/// or a current-version file. Returns `Err(human_message)` when the file's
+/// header version is NEWER than `SESSION_VERSION` — refusing to silently
+/// misread/drop a session on upgrade (the caller surfaces the error to the
+/// user instead of quietly starting blank).
+pub fn load(path: &Path) -> Result<Vec<Value>, String> {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return Ok(Vec::new()); // missing file: nothing to resume (not an error)
     };
     let mut lines = content.lines().filter(|l| !l.trim().is_empty());
     // First non-empty line must be the version header. If it's absent or a
-    // future version, bail rather than guess.
+    // future version, bail with a clear error rather than guess.
     let first = lines.next().unwrap_or("");
     if let Ok(v) = serde_json::from_str::<Value>(first) {
         if let Some(ver) = v.get("_session_version").and_then(|x| x.as_u64()) {
             if ver as u32 > SESSION_VERSION {
-                return Vec::new();
+                return Err(format!(
+                    "session file {} is version {ver}, newer than supported ({SESSION_VERSION}); not loaded to avoid corrupting it. Delete the file (or migrate it) to continue.",
+                    path.display()
+                ));
             }
             // header consumed; load the rest
         } else {
@@ -79,12 +90,57 @@ pub fn load(path: &Path) -> Vec<Value> {
                     out.push(m);
                 }
             }
-            return out;
+            return Ok(out);
         }
     }
-    lines
+    Ok(lines
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .collect()
+        .collect())
+}
+
+/// Sidecar path for per-session "always" approval escalations (tool kinds the
+/// user said "always" to). Stored beside the session file so it travels with
+/// the project and survives restart — previously these were in-memory only,
+/// so a restart silently un-gated kinds the user had approved.
+fn escalations_path(session_path: &Path) -> PathBuf {
+    let mut p = session_path.as_os_str().to_os_string();
+    p.push(".escalations");
+    PathBuf::from(p)
+}
+
+/// Load persisted escalated approval kinds (empty set if absent/unreadable).
+pub fn load_escalations(session_path: &Path) -> std::collections::HashSet<String> {
+    let p = escalations_path(session_path);
+    let Ok(content) = std::fs::read_to_string(&p) else {
+        return std::collections::HashSet::new();
+    };
+    serde_json::from_str::<Vec<String>>(&content)
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Persist the current set of escalated approval kinds atomically (temp +
+/// fsync + rename) so a crash never truncates it.
+pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<String>) {
+    let p = escalations_path(session_path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = p.with_extension("tmp");
+    let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+    else {
+        return;
+    };
+    let list: Vec<&String> = kinds.iter().collect();
+    let _ = writeln!(f, "{}", serde_json::to_string(&list).unwrap_or_default());
+    let _ = f.flush();
+    let _ = f.sync_all();
+    drop(f); // release before rename (Windows)
+    let _ = std::fs::rename(&tmp, &p);
 }
 
 /// Truncate/replace the whole session file with `messages` (used on reset /
@@ -98,7 +154,12 @@ pub fn rewrite(path: &Path, messages: &[Value]) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = path.with_extension("tmp");
-    let Ok(mut f) = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp) else {
+    let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+    else {
         return;
     };
     let _ = writeln!(f, "{}", header_line());
@@ -110,7 +171,7 @@ pub fn rewrite(path: &Path, messages: &[Value]) {
     let _ = f.flush();
     let _ = f.sync_all();
     drop(f); // release the handle before rename (Windows requires it)
-    // Atomic on POSIX (same dir/same volume); best-effort on Windows.
+             // Atomic on POSIX (same dir/same volume); best-effort on Windows.
     let _ = std::fs::rename(&tmp, path);
 }
 
@@ -130,7 +191,12 @@ pub struct SessionInfo {
 pub fn describe(path: &Path) -> SessionInfo {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return SessionInfo { title: None, messages: 0 },
+        Err(_) => {
+            return SessionInfo {
+                title: None,
+                messages: 0,
+            }
+        }
     };
     let reader = BufReader::new(file);
     let mut title: Option<String> = None;
@@ -208,7 +274,6 @@ fn first_user_text(msg: &Value) -> Option<String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,12 +287,12 @@ mod tests {
         let p = dir.join("s.jsonl");
         append(&p, &json!({"role":"system","content":"x"}));
         append(&p, &json!({"role":"user","content":"hi"}));
-        let v = load(&p);
+        let v = load(&p).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[0]["role"], "system");
         // rewrite
         rewrite(&p, &[json!({"role":"system","content":"y"})]);
-        assert_eq!(load(&p).len(), 1);
+        assert_eq!(load(&p).unwrap().len(), 1);
     }
 
     #[test]
@@ -241,7 +306,7 @@ mod tests {
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.starts_with("{\"_session_version\": 1}"));
         // load() drops the header, returns only real messages
-        assert_eq!(load(&p).len(), 1);
+        assert_eq!(load(&p).unwrap().len(), 1);
     }
 
     #[test]
@@ -250,9 +315,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
-        std::fs::write(&p, "{\"_session_version\": 99}\n{\"role\":\"user\",\"content\":\"x\"}\n").unwrap();
-        // refuses to load a newer-version file
-        assert!(load(&p).is_empty());
+        std::fs::write(
+            &p,
+            "{\"_session_version\": 99}\n{\"role\":\"user\",\"content\":\"x\"}\n",
+        )
+        .unwrap();
+        // refuses to load a newer-version file and returns a clear error
+        let r = load(&p);
+        assert!(r.is_err(), "expected an error for a future-version session");
+        assert!(r.unwrap_err().contains("newer than supported"));
     }
 
     #[test]
@@ -262,7 +333,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
         append(&p, &json!({"role":"system","content":"sys"}));
-        append(&p, &json!({"role":"user","content":"Add a login form to the app"}));
+        append(
+            &p,
+            &json!({"role":"user","content":"Add a login form to the app"}),
+        );
         append(&p, &json!({"role":"assistant","content":"done"}));
         append(&p, &json!({"role":"user","content":"now add tests"}));
         let info = describe(&p);
@@ -282,10 +356,13 @@ mod tests {
         assert_eq!(info.messages, 0);
         assert!(info.title.is_none());
         // a multimodal user message: title is the joined text parts
-        append(&p, &json!({"role":"user","content":[
-            {"type":"text","text":"describe this"},
-            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
-        ]}));
+        append(
+            &p,
+            &json!({"role":"user","content":[
+                {"type":"text","text":"describe this"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+            ]}),
+        );
         let info = describe(&p);
         assert_eq!(info.messages, 1);
         assert_eq!(info.title.as_deref(), Some("describe this"));

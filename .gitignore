@@ -76,3 +76,4 @@ plan.md
 plan.html
 # Stray build/test artifacts
 .intentionally-empty-file.o
+sdk/node_modules/

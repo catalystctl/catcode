@@ -6,10 +6,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 // ---- constants ----
 
@@ -267,31 +267,57 @@ pub struct HookResult {
 /// Holds an in-memory registry behind a `RwLock`.
 pub struct PluginManager {
     plugins_dir: PathBuf,
+    /// Workspace root — used to decide whether a plugin dir is project-scoped
+    /// (inside the workspace) vs user-installed (outside it).
+    workspace: PathBuf,
+    /// When false (the secure default), project-scoped plugins under the
+    /// workspace's `.umans-harness/plugins` are NOT auto-loaded — a repo you
+    /// `cd` into must not run hook scripts with your privileges without opt-in.
+    trust_project: bool,
     plugins: RwLock<HashMap<String, Plugin>>,
+    /// Project-scoped plugin names skipped because trust_project is false.
+    skipped_project: Mutex<Vec<String>>,
 }
 
 impl PluginManager {
     /// Create a new manager and scan/load all plugins from `plugins_dir`.
-    /// The directory is created if it does not exist.
-    pub fn new(plugins_dir: PathBuf) -> Self {
+    /// `workspace` + `trust_project` gate project-scoped plugins (see struct).
+    pub fn new(plugins_dir: PathBuf, workspace: PathBuf, trust_project: bool) -> Self {
         let mgr = PluginManager {
             plugins_dir,
+            workspace,
+            trust_project,
             plugins: RwLock::new(HashMap::new()),
+            skipped_project: Mutex::new(Vec::new()),
         };
         mgr.scan_and_load();
         mgr
     }
 
+    /// Names of project-scoped plugins skipped because `trust_project` is false.
+    /// The caller surfaces these to the user so the opt-in is discoverable.
+    pub fn skipped_project_plugins(&self) -> Vec<String> {
+        self.skipped_project.lock().unwrap().clone()
+    }
+
     /// Re-scan the plugins directory and load/reload all valid plugins.
     /// Invalid plugins are skipped with a log message to stderr but never crash.
+    /// Project-scoped plugins (dir inside the workspace) are skipped unless
+    /// `trust_project` is true; their names are recorded in `skipped_project`.
     fn scan_and_load(&self) {
         let _ = std::fs::create_dir_all(&self.plugins_dir);
+        let canon_ws =
+            std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
         let mut plugins = self.plugins.write().unwrap();
         plugins.clear();
+        let mut skipped_local: Vec<String> = Vec::new();
 
         let rd = match std::fs::read_dir(&self.plugins_dir) {
             Ok(r) => r,
-            Err(_) => return,
+            Err(_) => {
+                *self.skipped_project.lock().unwrap() = skipped_local;
+                return;
+            }
         };
 
         for entry in rd.flatten() {
@@ -301,6 +327,33 @@ impl PluginManager {
             }
             let manifest_path = path.join("plugin.json");
             if !manifest_path.exists() {
+                continue;
+            }
+            // Project-scoped gating: a plugin dir inside the workspace (e.g.
+            // `.umans-harness/plugins/*` shipped by the repo) is treated as
+            // untrusted unless the user opted in via `trust_project`. This stops
+            // a repo from auto-running hook scripts (which see every tool's
+            // args, including bash commands + file contents) with your
+            // privileges. User-installed plugins (outside the workspace) load
+            // regardless. `trust_project` is read only from env/CLI, never a
+            // project config file, so a repo can't self-enable.
+            let canon_plugin = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let is_project = canon_plugin.starts_with(&canon_ws);
+            if is_project && !self.trust_project {
+                let name = std::fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .unwrap_or_else(|| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(String::from)
+                            .unwrap_or_default()
+                    });
+                eprintln!(
+                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / UMANS_HARNESS_TRUST_PROJECT_PLUGINS=1 to enable"
+                );
+                skipped_local.push(name);
                 continue;
             }
             match Self::load_plugin_from_dir(&path) {
@@ -315,6 +368,7 @@ impl PluginManager {
                 }
             }
         }
+        *self.skipped_project.lock().unwrap() = skipped_local;
     }
 
     /// Load a single plugin from a directory containing plugin.json.
@@ -323,16 +377,15 @@ impl PluginManager {
         let raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| format!("cannot read plugin.json: {e}"))?;
 
-        let manifest: PluginManifest = serde_json::from_str(&raw)
-            .map_err(|e| format!("plugin.json parse error: {e}"))?;
+        let manifest: PluginManifest =
+            serde_json::from_str(&raw).map_err(|e| format!("plugin.json parse error: {e}"))?;
 
         if manifest.name.is_empty() {
             return Err("plugin name is empty".into());
         }
 
         // Canonicalize the plugin directory for path-confinement checks.
-        let canon_dir = std::fs::canonicalize(dir)
-            .unwrap_or_else(|_| dir.to_path_buf());
+        let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
 
         let mut hooks: HashMap<String, HookConfig> = HashMap::new();
         for (hook_name, entry) in &manifest.hooks {
@@ -362,8 +415,8 @@ impl PluginManager {
             let script_abs = canon_dir.join(script_rel);
 
             // Canonicalize if possible to catch symlink escapes.
-            let canon_script = std::fs::canonicalize(&script_abs)
-                .unwrap_or_else(|_| script_abs.clone());
+            let canon_script =
+                std::fs::canonicalize(&script_abs).unwrap_or_else(|_| script_abs.clone());
             if !canon_script.starts_with(&canon_dir) {
                 return Err(format!(
                     "hook script {:?} escapes the plugin directory",
@@ -580,11 +633,15 @@ pub async fn execute_hook(
             let _ = stdin.write_all(&context_bytes).await;
             let _ = stdin.shutdown().await;
         };
-        if tokio::time::timeout(stdin_timeout, write_fut).await.is_err() {
+        if tokio::time::timeout(stdin_timeout, write_fut)
+            .await
+            .is_err()
+        {
             let _ = child.start_kill();
             let msg = format!(
                 "hook '{}' did not consume stdin within {}ms",
-                hook_name, stdin_timeout.as_millis()
+                hook_name,
+                stdin_timeout.as_millis()
             );
             return if is_pre { deny(msg) } else { skip(msg) };
         }
@@ -615,10 +672,7 @@ pub async fn execute_hook(
             let response: Value = match serde_json::from_str(&stdout) {
                 Ok(v) => v,
                 Err(e) => {
-                    let msg = format!(
-                        "hook '{}' returned invalid JSON: {e}",
-                        hook_name
-                    );
+                    let msg = format!("hook '{}' returned invalid JSON: {e}", hook_name);
                     return if is_pre { deny(msg) } else { skip(msg) };
                 }
             };
@@ -652,14 +706,22 @@ pub async fn execute_hook(
         }
         Ok(Err(e)) => {
             let msg = format!("hook '{}' wait error: {e}", hook_name);
-            if is_pre { deny(msg) } else { skip(msg) }
+            if is_pre {
+                deny(msg)
+            } else {
+                skip(msg)
+            }
         }
         Err(_elapsed) => {
             let msg = format!(
                 "hook '{}' timed out after {}ms",
                 hook_name, config.timeout_ms
             );
-            if is_pre { deny(msg) } else { skip(msg) }
+            if is_pre {
+                deny(msg)
+            } else {
+                skip(msg)
+            }
         }
     }
 }
@@ -748,6 +810,26 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Pick a Python interpreter, preferring `python3` then `python`, cached.
+/// Falls back to `python3` (which will fail-to-spawn gracefully if truly
+/// absent) so a missing interpreter never panics.
+fn python_interpreter() -> String {
+    use std::sync::OnceLock;
+    static INTERP: OnceLock<String> = OnceLock::new();
+    INTERP
+        .get_or_init(|| {
+            for cand in ["python3", "python"] {
+                if let Ok(o) = std::process::Command::new(cand).arg("--version").output() {
+                    if o.status.success() {
+                        return cand.to_string();
+                    }
+                }
+            }
+            "python3".to_string()
+        })
+        .clone()
+}
+
 /// Build the command to run a hook script, selecting the right interpreter by
 /// extension so plugins work cross-platform. On Unix a shebang handles `*.sh`;
 /// on Windows `.bat`/`.cmd`/`.exe` launch directly, `.ps1` uses powershell,
@@ -771,7 +853,12 @@ fn hook_command(script: &Path) -> Command {
             c
         }
         "py" => {
-            let mut c = Command::new("python");
+            // Prefer `python3` (present on most Linux/macOS); fall back to
+            // `python` (common on Windows / some distros). Launching a `.py`
+            // hook as `python` on a python3-only system fails to spawn, and for
+            // the advisory pre_turn hook that silently skips it — so vision
+            // handoff would never run. Probe once and cache the interpreter.
+            let mut c = Command::new(python_interpreter());
             c.arg(script);
             c
         }
@@ -794,11 +881,9 @@ fn hook_command(script: &Path) -> Command {
 
 /// Recursively copy a directory from `src` to `dst`.
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| format!("mkdir {:?}: {e}", dst))?;
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {:?}: {e}", dst))?;
 
-    let rd = std::fs::read_dir(src)
-        .map_err(|e| format!("read_dir {:?}: {e}", src))?;
+    let rd = std::fs::read_dir(src).map_err(|e| format!("read_dir {:?}: {e}", src))?;
 
     for entry in rd {
         let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
@@ -864,10 +949,7 @@ mod tests {
     /// Write a minimal executable shell script that outputs the given JSON.
     fn write_hook_script(dir: &Path, name: &str, stdout_json: &str, exit_code: u32) -> PathBuf {
         let script = dir.join(name);
-        let content = format!(
-            "#!/bin/sh\necho '{}'\nexit {}\n",
-            stdout_json, exit_code
-        );
+        let content = format!("#!/bin/sh\necho '{}'\nexit {}\n", stdout_json, exit_code);
         fs::write(&script, &content).unwrap();
         make_executable(&script);
         script
@@ -1019,12 +1101,7 @@ mod tests {
         let tmp = TmpDir::new("mgr_loads");
         let plugin_dir = tmp.path.join("test-plugin");
         fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
-        write_hook_script(
-            &plugin_dir.join("hooks"),
-            "hook.sh",
-            r#"{"allow":true}"#,
-            0,
-        );
+        write_hook_script(&plugin_dir.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
         write_plugin(
             &plugin_dir,
             "test-plugin",
@@ -1032,26 +1109,56 @@ mod tests {
             r#"{"pre_write": {"script": "hooks/hook.sh"}}"#,
         );
 
-        let mgr = PluginManager::new(tmp.path.clone());
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__pm_test_ws__"), true);
         let plugins = mgr.list();
         assert_eq!(plugins.len(), 1);
         assert!(plugins.contains_key("test-plugin"));
     }
 
     #[test]
+    fn project_plugins_skipped_unless_trusted() {
+        // A plugin shipped inside the workspace (project-scoped) must be skipped
+        // when trust_project is false — a repo must not auto-run its own hooks.
+        let tmp = TmpDir::new("proj_skip");
+        // workspace == the tmp dir; plugin under <tmp>/.umans-harness/plugins/x
+        let plugins_dir = tmp.path.join(".umans-harness/plugins");
+        let plugin_dir = plugins_dir.join("shady");
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        write_hook_script(&plugin_dir.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
+        write_plugin(
+            &plugin_dir,
+            "shady",
+            "1.0.0",
+            r#"{"pre_bash":{"script":"hooks/hook.sh"}}"#,
+        );
+        let mgr = PluginManager::new(plugins_dir.clone(), tmp.path.clone(), false);
+        assert!(
+            mgr.list().is_empty(),
+            "project plugin should be skipped when trust=false"
+        );
+        let skipped = mgr.skipped_project_plugins();
+        assert_eq!(skipped, vec!["shady".to_string()]);
+
+        // Same plugin loads when trust_project is true.
+        let mgr2 = PluginManager::new(plugins_dir, tmp.path.clone(), true);
+        assert_eq!(mgr2.list().len(), 1);
+        assert!(mgr2.skipped_project_plugins().is_empty());
+    }
+
+    #[test]
     fn install_and_remove_plugin() {
         let tmp = TmpDir::new("mgr_install");
-        let mgr = PluginManager::new(tmp.path.join("managed"));
+        let mgr = PluginManager::new(
+            tmp.path.join("managed"),
+            PathBuf::from("/__pm_test_ws__"),
+            true,
+        );
 
-        // Create a plugin source dir.
+        // Create a plugin source dir. (install target is outside the test
+        // workspace dummy, so it loads regardless of trust_project.)
         let src = TmpDir::new("install_src");
         fs::create_dir_all(src.path.join("hooks")).unwrap();
-        write_hook_script(
-            &src.path.join("hooks"),
-            "hook.sh",
-            r#"{"allow":true}"#,
-            0,
-        );
+        write_hook_script(&src.path.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
         write_plugin(
             &src.path,
             "fresh",
@@ -1076,16 +1183,15 @@ mod tests {
     #[test]
     fn install_rejects_duplicate() {
         let tmp = TmpDir::new("mgr_dup");
-        let mgr = PluginManager::new(tmp.path.join("managed"));
+        let mgr = PluginManager::new(
+            tmp.path.join("managed"),
+            PathBuf::from("/__pm_test_ws__"),
+            true,
+        );
 
         let src = TmpDir::new("dup_src");
         fs::create_dir_all(src.path.join("hooks")).unwrap();
-        write_hook_script(
-            &src.path.join("hooks"),
-            "h.sh",
-            r#"{"allow":true}"#,
-            0,
-        );
+        write_hook_script(&src.path.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
         write_plugin(
             &src.path,
             "dup",
@@ -1102,16 +1208,15 @@ mod tests {
     #[test]
     fn enable_disable_toggle() {
         let tmp = TmpDir::new("mgr_toggle");
-        let mgr = PluginManager::new(tmp.path.join("managed"));
+        let mgr = PluginManager::new(
+            tmp.path.join("managed"),
+            PathBuf::from("/__pm_test_ws__"),
+            true,
+        );
 
         let src = TmpDir::new("toggle_src");
         fs::create_dir_all(src.path.join("hooks")).unwrap();
-        write_hook_script(
-            &src.path.join("hooks"),
-            "h.sh",
-            r#"{"allow":true}"#,
-            0,
-        );
+        write_hook_script(&src.path.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
         write_plugin(
             &src.path,
             "toggle-me",
@@ -1139,7 +1244,7 @@ mod tests {
     #[test]
     fn enable_disable_unknown_is_error() {
         let tmp = TmpDir::new("mgr_unknown");
-        let mgr = PluginManager::new(tmp.path.clone());
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__pm_test_ws__"), true);
         assert!(mgr.enable("nope").is_err());
         assert!(mgr.disable("nope").is_err());
         assert!(mgr.remove("nope").is_err());
@@ -1204,7 +1309,11 @@ mod tests {
         let modify = json!({ "command": "echo safe" });
         apply_modify(&mut args, &modify);
         assert_eq!(args["command"], json!("echo safe"));
-        assert_eq!(args["timeout"], json!(30), "unrelated keys must be preserved");
+        assert_eq!(
+            args["timeout"],
+            json!(30),
+            "unrelated keys must be preserved"
+        );
     }
 
     #[test]
@@ -1281,12 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn execute_hook_nonzero_exit_post_skips() {
         let tmp = TmpDir::new("exec_exit_post");
-        let script = write_hook_script(
-            &tmp.path,
-            "fail.sh",
-            r#"{"allow": true}"#,
-            1,
-        );
+        let script = write_hook_script(&tmp.path, "fail.sh", r#"{"allow": true}"#, 1);
         let config = HookConfig {
             script,
             timeout_ms: 5000,
@@ -1320,11 +1424,7 @@ mod tests {
         let tmp = TmpDir::new("exec_timeout");
         // Script sleeps long enough to trigger the timeout.
         let script = tmp.path.join("sleep.sh");
-        fs::write(
-            &script,
-            "#!/bin/sh\nsleep 10\necho '{\"allow\":true}'\n",
-        )
-        .unwrap();
+        fs::write(&script, "#!/bin/sh\nsleep 10\necho '{\"allow\":true}'\n").unwrap();
         make_executable(&script);
 
         let config = HookConfig {
@@ -1411,14 +1511,7 @@ mod tests {
 
     #[test]
     fn build_context_handles_none_args() {
-        let ctx = build_context(
-            "session_start",
-            "",
-            "/ws",
-            None,
-            "sess.jsonl",
-            true,
-        );
+        let ctx = build_context("session_start", "", "/ws", None, "sess.jsonl", true);
         assert!(ctx.get("args").is_none());
     }
 

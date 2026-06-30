@@ -25,14 +25,11 @@ pub struct TurnMetrics {
 
 impl Logger {
     pub fn new(path: Option<&std::path::Path>) -> Self {
-        let file = path.and_then(|p| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-        });
-        Self { file: Mutex::new(file), turns: std::sync::atomic::AtomicU64::new(0) }
+        let file = path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
+        Self {
+            file: Mutex::new(file),
+            turns: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Number of completed turns this session (incremented by main on turn_done).
@@ -75,8 +72,33 @@ pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
     total
 }
 
-/// Estimate tokens for a single message (serialize to JSON, count chars/4).
+/// Estimate tokens for a single message. Text-only messages serialize to
+/// JSON and count chars/4 (within ~15% for prose/code). Multimodal messages
+/// (content is an array of parts) exclude `image_url` data URLs: a base64
+/// image is ~1.4M chars but only ~1-2k model tokens, so counting its chars
+/// would over-estimate by orders of magnitude and trip compaction every turn
+/// for vision users. Image parts are charged a fixed per-image token cost
+/// instead; text parts are estimated normally.
 pub fn estimate_message_tokens(m: &Value) -> u64 {
+    const PER_IMAGE_TOKENS: u64 = 768;
+    if let Some(arr) = m.get("content").and_then(|v| v.as_array()) {
+        let mut total = 0u64;
+        let mut images = 0u64;
+        for part in arr {
+            match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "image_url" => images += 1,
+                "text" => {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        total += estimate_tokens(t);
+                    }
+                }
+                _ => total += estimate_tokens(&serde_json::to_string(part).unwrap_or_default()),
+            }
+        }
+        return total + images * PER_IMAGE_TOKENS + 4;
+    }
+    // Text-only message (content is a string): whole-message char/4 — the
+    // common path, unchanged from before.
     let s = serde_json::to_string(m).unwrap_or_default();
     estimate_tokens(&s)
 }
@@ -147,9 +169,17 @@ impl TurnTimer {
         self.out_tokens_est = self.out_tokens_est.saturating_add(est_out);
         self.call_first_token = None;
     }
-    pub fn finalize(self, tokens_in: u64, tokens_out: u64, cached_tokens: u64, model: String) -> TurnMetrics {
+    pub fn finalize(
+        self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cached_tokens: u64,
+        model: String,
+    ) -> TurnMetrics {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        let ttft_ms = self.first_token.map(|t| t.duration_since(self.start).as_millis() as u64);
+        let ttft_ms = self
+            .first_token
+            .map(|t| t.duration_since(self.start).as_millis() as u64);
         // TPS = output tokens / generation time. Generation time is the sum of
         // each stream call's first-token→end window, so it excludes both the
         // prefill latency (TTFT) and the wall time spent waiting for tool calls
@@ -159,12 +189,28 @@ impl TurnTimer {
         // with the reported_tokens fallback) is kept for the metrics display;
         // the TPS uses the accumulated turn-wide totals.
         let tps = if self.gen_ms > 0 {
-            let n = if self.out_tokens > 0 { self.out_tokens } else { self.out_tokens_est };
-            if n > 0 { Some(n as f64 / (self.gen_ms as f64 / 1000.0)) } else { None }
+            let n = if self.out_tokens > 0 {
+                self.out_tokens
+            } else {
+                self.out_tokens_est
+            };
+            if n > 0 {
+                Some(n as f64 / (self.gen_ms as f64 / 1000.0))
+            } else {
+                None
+            }
         } else {
             None
         };
-        TurnMetrics { ttft_ms, elapsed_ms, tokens_in, tokens_out, cached_tokens, tps, model }
+        TurnMetrics {
+            ttft_ms,
+            elapsed_ms,
+            tokens_in,
+            tokens_out,
+            cached_tokens,
+            tps,
+            model,
+        }
     }
 }
 

@@ -23,7 +23,12 @@ pub fn read_git_context(workspace: &Path) -> Option<GitContext> {
     let remote_url = read_remote_url(&git_dir);
     let default_branch = read_default_branch(&git_dir);
 
-    Some(GitContext { branch, head_sha, remote_url, default_branch })
+    Some(GitContext {
+        branch,
+        head_sha,
+        remote_url,
+        default_branch,
+    })
 }
 
 /// Build a prompt injection string describing the git context.
@@ -112,7 +117,11 @@ fn read_remote_url(git_dir: &Path) -> Option<String> {
 }
 
 fn read_default_branch(git_dir: &Path) -> String {
-    let origin_head = git_dir.join("refs").join("remotes").join("origin").join("HEAD");
+    let origin_head = git_dir
+        .join("refs")
+        .join("remotes")
+        .join("origin")
+        .join("HEAD");
     if let Ok(content) = std::fs::read_to_string(&origin_head) {
         let first = content.lines().next().unwrap_or("").trim();
         if let Some(rest) = first.strip_prefix("ref: refs/remotes/origin/") {
@@ -187,11 +196,19 @@ mod tests {
 
     #[test]
     fn full_context() {
-        let d = tmp_git("feature/xyz", "abcd12345678901234567890", Some("git@github.com:user/repo.git"), "main");
+        let d = tmp_git(
+            "feature/xyz",
+            "abcd12345678901234567890",
+            Some("git@github.com:user/repo.git"),
+            "main",
+        );
         let ctx = read_git_context(&d).expect("should find .git");
         assert_eq!(ctx.branch, "feature/xyz");
         assert_eq!(ctx.head_sha, short("abcd12345678901234567890"));
-        assert_eq!(ctx.remote_url.as_deref(), Some("git@github.com:user/repo.git"));
+        assert_eq!(
+            ctx.remote_url.as_deref(),
+            Some("git@github.com:user/repo.git")
+        );
         assert_eq!(ctx.default_branch, "main");
     }
 

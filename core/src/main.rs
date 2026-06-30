@@ -18,25 +18,24 @@ mod provider;
 mod session;
 mod subagent;
 mod tools;
-mod workspace;
 mod vision;
+mod workspace;
 
-use config::{Config, Approval, PermissionRule};
+use config::{Approval, Config, PermissionRule};
+use git_ctx::{git_context_injection, read_git_context};
 use intercom::IntercomBus;
-use logging::{estimate_messages_tokens, estimate_message_tokens, Logger, TurnTimer};
-use protocol::{emit, Command, Event, ModelInfo};
-use plugins::{PluginManager, PLUGIN_DOCS};
-use vision::VisionConfig;
+use logging::{estimate_message_tokens, estimate_messages_tokens, Logger, TurnTimer};
 use memory::memory_injection;
-use git_ctx::{read_git_context, git_context_injection};
+use plugins::{PluginManager, PLUGIN_DOCS};
+use protocol::{emit, Command, Event, ModelInfo};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use vision::VisionConfig;
 
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
@@ -127,7 +126,9 @@ pub struct State {
     pub models: RwLock<Vec<ModelInfo>>,
     pub current: Mutex<Option<CancellationToken>>,
     pub handle: Mutex<Option<JoinHandle<()>>>,
-    pub pending: Mutex<Option<Arc<PendingApproval>>>,
+    /// Pending approval requests keyed by their unique approval id (see
+    /// APPROVAL_SEQ) so parallel subagents can't clobber each other's request.
+    pub pending: Mutex<std::collections::HashMap<String, Arc<PendingApproval>>>,
     pub logger: Logger,
     /// Token counts accumulated across the session (for the status bar).
     pub tokens_in: Mutex<u64>,
@@ -143,9 +144,9 @@ pub struct State {
     pub queued: Mutex<Option<QueuedPrompt>>,
     /// Plugin manager — scans, loads, and executes hooks.
     pub plugin_manager: PluginManager,
-	/// Vision-handoff config (curated vision models + preferred target), persisted
-	/// to .umans-harness/vision.json; merged into the pre_turn hook context.
-	pub vision: RwLock<VisionConfig>,
+    /// Vision-handoff config (curated vision models + preferred target), persisted
+    /// to .umans-harness/vision.json; merged into the pre_turn hook context.
+    pub vision: RwLock<VisionConfig>,
     /// Last time a turn completed (for idle compaction).
     pub last_turn_time: Mutex<std::time::Instant>,
     /// Incrementally maintained token estimate for the main conversation,
@@ -184,12 +185,35 @@ async fn main() {
     let logger = Logger::new(cfg.debug_log.as_deref());
     logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "base_url": cfg.base_url, "approval": cfg.approval.as_str() }));
 
-    // Resume session if configured and present.
-    let resumed: Vec<Value> = cfg
+    // Resume session if configured and present. A future-version session file
+    // returns Err (surfaced to the user via an `error` event at Init) rather
+    // than silently starting blank.
+    let (resumed, session_error): (Vec<Value>, Option<String>) = match cfg.session_file.as_ref() {
+        Some(p) => match session::load(p.as_path()) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        },
+        None => (Vec::new(), None),
+    };
+    // Persisted "always" approval escalations travel with the session file
+    // (sidecar <session>.escalations) so a restart doesn't un-gate kinds the
+    // user already approved.
+    let init_escalations: HashSet<&'static str> = cfg
         .session_file
         .as_ref()
-        .map(|p| session::load(p.as_path()))
-        .unwrap_or_default();
+        .map(|p| session::load_escalations(p.as_path()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| match s.as_str() {
+            "destructive" => Some("destructive"),
+            "readonly" => Some("readonly"),
+            _ => None,
+        })
+        .collect();
+    // Pre-clone values State::new needs before `cfg` is moved into the lock.
+    let plugin_dir = cfg.plugin_dir.clone();
+    let pm_workspace = cfg.workspace.clone();
+    let trust_project = cfg.trust_project_plugins;
 
     // Ensure the session file exists (header only) so the active session is
     // always listed by `list_sessions`, even before the first message lands.
@@ -212,14 +236,14 @@ async fn main() {
         models: RwLock::new(models),
         current: Mutex::new(None),
         handle: Mutex::new(None),
-        pending: Mutex::new(None),
+        pending: Mutex::new(std::collections::HashMap::new()),
         logger,
         tokens_in: Mutex::new(0),
         tokens_out: Mutex::new(0),
         cached_tokens: Mutex::new(0),
-        escalated_kinds: Mutex::new(HashSet::new()),
+        escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
-        plugin_manager: PluginManager::new(PathBuf::from(".umans-harness/plugins")),
+        plugin_manager: PluginManager::new(plugin_dir, pm_workspace, trust_project),
         vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
@@ -256,25 +280,34 @@ async fn main() {
                 let authed = state.api_key.read().await.is_some();
                 let cfg = state.cfg.read().await;
                 let conv_len = state.conversation.lock().await.len();
-                emit(&Event::new("ready")
+                emit(
+                    &Event::new("ready")
                         .with("models", json!(models))
                         .with("authed", json!(authed))
                         .with("workspace", json!(cfg.workspace.display().to_string()))
                         .with("approval", json!(cfg.approval.as_str()))
                         .with("base_url", json!(cfg.base_url))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
-                        .with("resumed_messages", json!(conv_len)));
+                        .with("resumed_messages", json!(conv_len)),
+                );
+                // Surface a future-version session-load error to the user.
+                if let Some(e) = session_error.as_ref() {
+                    emit(&Event::new("error").with("message", json!(e)));
+                }
                 // Replay any resumed conversation so the TUI shows prior history
                 // on launch instead of starting from an empty transcript.
                 if conv_len > 0 {
                     let conv = state.conversation.lock().await;
-                    let visible: Vec<&Value> = conv.iter()
+                    let visible: Vec<&Value> = conv
+                        .iter()
                         .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
                         .collect();
                     let est = estimate_messages_tokens(&conv);
-                    emit(&Event::new("history")
-                        .with("messages", json!(visible))
-                        .with("tokens_in", json!(est)));
+                    emit(
+                        &Event::new("history")
+                            .with("messages", json!(visible))
+                            .with("tokens_in", json!(est)),
+                    );
                 }
             }
             Command::SetKey { api_key } => {
@@ -284,14 +317,17 @@ async fn main() {
             Command::SetApproval { mode } => {
                 let new = Approval::parse(&mode);
                 state.cfg.write().await.approval = new.clone();
-                state.logger.log("set_approval", json!({ "mode": new.as_str() }));
+                state
+                    .logger
+                    .log("set_approval", json!({ "mode": new.as_str() }));
                 emit(&Event::new("approval_changed").with("mode", json!(new.as_str())));
             }
             Command::SetConfig { key, value } => {
                 // ponytail: minimal runtime knob setter for the two values the
                 // TUI settings modal edits. Coerce string-or-number to u64.
                 let as_u64 = |v: &Value| {
-                    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                 };
                 let mut cfg = state.cfg.write().await;
                 let out_key = key.clone();
@@ -305,13 +341,22 @@ async fn main() {
                     }
                     _ => {
                         drop(cfg);
-                        emit(&Event::new("error").with("message", json!(format!("unknown config key: {key}"))));
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("unknown config key: {key}"))),
+                        );
                         return;
                     }
                 }
-                state.logger.log("set_config", json!({ "key": out_key, "value": out_val }));
+                state
+                    .logger
+                    .log("set_config", json!({ "key": out_key, "value": out_val }));
                 drop(cfg);
-                emit(&Event::new("config_changed").with("key", json!(out_key)).with("value", json!(out_val)));
+                emit(
+                    &Event::new("config_changed")
+                        .with("key", json!(out_key))
+                        .with("value", json!(out_val)),
+                );
             }
             Command::Reset => {
                 state.conversation.lock().await.clear();
@@ -332,7 +377,10 @@ async fn main() {
                 // Walk back past trailing tool/assistant messages to the last user message.
                 while let Some(last) = conv.last() {
                     let role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    if role == "user" { conv.pop(); break; }
+                    if role == "user" {
+                        conv.pop();
+                        break;
+                    }
                     conv.pop();
                 }
                 if let Some(p) = state.cfg.read().await.session_file.as_ref() {
@@ -355,7 +403,11 @@ async fn main() {
                     if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                         session::rewrite(p, &messages);
                     }
-                    emit(&Event::new("compacted").with("before_tokens", json!(before_est)).with("after_tokens", json!(after_est)));
+                    emit(
+                        &Event::new("compacted")
+                            .with("before_tokens", json!(before_est))
+                            .with("after_tokens", json!(after_est)),
+                    );
                 } else {
                     emit(&Event::new("info").with("message", json!("nothing to compact yet")));
                 }
@@ -379,7 +431,9 @@ async fn main() {
                         }
                         let name = e.file_name().to_string_lossy().to_string();
                         let info = session::describe(&path);
-                        let mtime = e.metadata().ok()
+                        let mtime = e
+                            .metadata()
+                            .ok()
                             .and_then(|m| m.modified().ok())
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs())
@@ -388,7 +442,9 @@ async fn main() {
                             .as_ref()
                             .map(|n| *n == e.file_name())
                             .unwrap_or(false);
-                        let title = info.title.unwrap_or_else(|| "(no messages yet)".to_string());
+                        let title = info
+                            .title
+                            .unwrap_or_else(|| "(no messages yet)".to_string());
                         entries.push(json!({
                             "name": name,
                             "path": path.display().to_string(),
@@ -401,40 +457,65 @@ async fn main() {
                 }
                 // Most recently modified first.
                 entries.sort_by(|a, b| {
-                    b["mtime"].as_u64().unwrap_or(0).cmp(&a["mtime"].as_u64().unwrap_or(0))
+                    b["mtime"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .cmp(&a["mtime"].as_u64().unwrap_or(0))
                 });
-                let files: Vec<String> = entries.iter()
+                let files: Vec<String> = entries
+                    .iter()
                     .filter_map(|e| e["name"].as_str().map(|s| s.to_string()))
                     .collect();
-                emit(&Event::new("sessions")
-                    .with("sessions", json!(entries))
-                    .with("files", json!(files)));
+                emit(
+                    &Event::new("sessions")
+                        .with("sessions", json!(entries))
+                        .with("files", json!(files)),
+                );
             }
             Command::LoadSession { path } => {
                 let mut p = std::path::PathBuf::from(&path);
                 // Resolve relative paths against the sessions dir so the picker
                 // (which may send a bare filename) works.
                 if !p.is_absolute() {
-                    if let Some(sess_dir) = state.cfg.read().await.session_file.as_ref().and_then(|sf| sf.parent()) {
+                    if let Some(sess_dir) = state
+                        .cfg
+                        .read()
+                        .await
+                        .session_file
+                        .as_ref()
+                        .and_then(|sf| sf.parent())
+                    {
                         p = sess_dir.join(&p);
                     }
                 }
-                let loaded = session::load(&p);
+                let loaded = match session::load(&p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        emit(&Event::new("error").with("message", json!(e)));
+                        continue;
+                    }
+                };
                 *state.conversation.lock().await = loaded.clone();
                 // Point the session_file at the loaded path so future appends go there.
                 state.cfg.write().await.session_file = Some(p);
                 emit(&Event::new("reset"));
                 // Replay the loaded transcript so the TUI shows prior turns
                 // instead of an empty view after switching/resuming a session.
-                let visible: Vec<&Value> = loaded.iter()
+                let visible: Vec<&Value> = loaded
+                    .iter()
                     .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
                     .collect();
                 let est = estimate_messages_tokens(&loaded);
                 *state.estimated_tokens.lock().await = est;
-                emit(&Event::new("history")
-                    .with("messages", json!(visible))
-                    .with("tokens_in", json!(est)));
-                emit(&Event::new("info").with("message", json!(format!("loaded {} messages from {}", loaded.len(), path))));
+                emit(
+                    &Event::new("history")
+                        .with("messages", json!(visible))
+                        .with("tokens_in", json!(est)),
+                );
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!("loaded {} messages from {}", loaded.len(), path)),
+                ));
             }
             Command::NewSession { path } => {
                 // Start a fresh session file in the same project dir. The old
@@ -443,14 +524,26 @@ async fn main() {
                     Some(name) => {
                         let mut p = std::path::PathBuf::from(name);
                         if !p.is_absolute() {
-                            if let Some(sess_dir) = state.cfg.read().await.session_file.as_ref().and_then(|sf| sf.parent()) {
+                            if let Some(sess_dir) = state
+                                .cfg
+                                .read()
+                                .await
+                                .session_file
+                                .as_ref()
+                                .and_then(|sf| sf.parent())
+                            {
                                 p = sess_dir.join(&p);
                             }
                         }
                         p
                     }
                     None => {
-                        let dir = state.cfg.read().await.session_file.as_ref()
+                        let dir = state
+                            .cfg
+                            .read()
+                            .await
+                            .session_file
+                            .as_ref()
                             .and_then(|p| p.parent().map(|x| x.to_path_buf()))
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
                         dir.join(new_session_filename())
@@ -459,39 +552,51 @@ async fn main() {
                 session::ensure(&new_path);
                 *state.conversation.lock().await = Vec::new();
                 state.cfg.write().await.session_file = Some(new_path.clone());
-                state.logger.log("new_session", json!({ "path": new_path.display().to_string() }));
+                state.logger.log(
+                    "new_session",
+                    json!({ "path": new_path.display().to_string() }),
+                );
                 emit(&Event::new("reset"));
-                emit(&Event::new("info").with("message", json!(format!("started new session: {}", new_path.display()))));
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!("started new session: {}", new_path.display())),
+                ));
             }
             Command::Stats => {
                 let ti = *state.tokens_in.lock().await;
                 let to = *state.tokens_out.lock().await;
                 let cached = *state.cached_tokens.lock().await;
                 let turns = state.logger.turn_count();
-                emit(&Event::new("stats")
-                    .with("tokens_in", json!(ti))
-                    .with("tokens_out", json!(to))
-                    .with("tokens_total", json!(ti + to))
-                    .with("cached_tokens", json!(cached))
-                    .with("turns", json!(turns))
-                    .with("messages", json!(state.conversation.lock().await.len())));
+                emit(
+                    &Event::new("stats")
+                        .with("tokens_in", json!(ti))
+                        .with("tokens_out", json!(to))
+                        .with("tokens_total", json!(ti + to))
+                        .with("cached_tokens", json!(cached))
+                        .with("turns", json!(turns))
+                        .with("messages", json!(state.conversation.lock().await.len())),
+                );
             }
             Command::InstallPlugin { path } => {
                 let dir = std::path::PathBuf::from(&path);
                 match state.plugin_manager.install(&dir) {
                     Ok(plugin) => {
                         let hooks_list: Vec<String> = plugin.hooks.keys().cloned().collect();
-                        emit(&Event::new("plugin_installed")
-                            .with("name", json!(plugin.name))
-                            .with("version", json!(plugin.version))
-                            .with("description", json!(plugin.description))
-                            .with("hooks", json!(hooks_list))
-                            .with("path", json!(plugin.source_path.display().to_string())));
+                        emit(
+                            &Event::new("plugin_installed")
+                                .with("name", json!(plugin.name))
+                                .with("version", json!(plugin.version))
+                                .with("description", json!(plugin.description))
+                                .with("hooks", json!(hooks_list))
+                                .with("path", json!(plugin.source_path.display().to_string())),
+                        );
                     }
                     Err(e) => {
-                        emit(&Event::new("plugin_error")
-                            .with("name", json!(path))
-                            .with("message", json!(e)));
+                        emit(
+                            &Event::new("plugin_error")
+                                .with("name", json!(path))
+                                .with("message", json!(e)),
+                        );
                     }
                 }
             }
@@ -509,30 +614,43 @@ async fn main() {
             }
             Command::ListPlugins => {
                 let plugins = state.plugin_manager.list();
-                let entries: Vec<Value> = plugins.values().map(|p| {
-                    let hooks: Vec<String> = p.hooks.keys().cloned().collect();
-                    json!({
-                        "name": p.name,
-                        "version": p.version,
-                        "enabled": p.enabled,
-                        "description": p.description,
-                        "hooks": hooks,
+                let entries: Vec<Value> = plugins
+                    .values()
+                    .map(|p| {
+                        let hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        json!({
+                            "name": p.name,
+                            "version": p.version,
+                            "enabled": p.enabled,
+                            "description": p.description,
+                            "hooks": hooks,
+                        })
                     })
-                }).collect();
+                    .collect();
                 emit(&Event::new("plugins_list").with("plugins", json!(entries)));
             }
             Command::GetVisionConfig => {
                 let vc = state.vision.read().await.clone();
                 let models = state.models.read().await.clone();
-                let models_json: Vec<Value> = models.iter().map(|m| json!({
-                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
-                })).collect();
-                emit(&Event::new("vision_config")
-                    .with("vision_models", json!(vc.vision_models.clone()))
-                    .with("vision_model", json!(vc.vision_model.clone()))
-                    .with("models", json!(models_json)));
+                let models_json: Vec<Value> = models
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                        })
+                    })
+                    .collect();
+                emit(
+                    &Event::new("vision_config")
+                        .with("vision_models", json!(vc.vision_models.clone()))
+                        .with("vision_model", json!(vc.vision_model.clone()))
+                        .with("models", json!(models_json)),
+                );
             }
-            Command::SetVisionConfig { vision_models, vision_model } => {
+            Command::SetVisionConfig {
+                vision_models,
+                vision_model,
+            } => {
                 let vc = VisionConfig {
                     vision_models,
                     vision_model: vision_model.filter(|s| !s.is_empty()),
@@ -541,13 +659,20 @@ async fn main() {
                 vc.save(&workspace);
                 *state.vision.write().await = vc.clone();
                 let models = state.models.read().await.clone();
-                let models_json: Vec<Value> = models.iter().map(|m| json!({
-                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
-                })).collect();
-                emit(&Event::new("vision_config")
-                    .with("vision_models", json!(vc.vision_models.clone()))
-                    .with("vision_model", json!(vc.vision_model.clone()))
-                    .with("models", json!(models_json)));
+                let models_json: Vec<Value> = models
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                        })
+                    })
+                    .collect();
+                emit(
+                    &Event::new("vision_config")
+                        .with("vision_models", json!(vc.vision_models.clone()))
+                        .with("vision_model", json!(vc.vision_model.clone()))
+                        .with("models", json!(models_json)),
+                );
             }
             Command::RefreshMemory => {
                 let ws = state.cfg.read().await.workspace.clone();
@@ -577,22 +702,37 @@ async fn main() {
                     }
                 }
                 drop(conv);
-                emit(&Event::new("info").with("message", json!(format!("memory refreshed: {}", if mem.is_empty() { "no memories found" } else { "memories injected" }))));
-            }
-            Command::Approve { request_id, decision } => {
-                let pending = state.pending.lock().await.clone();
-                if let Some(p) = pending {
-                    if p.request_id == request_id {
-                        match decision.as_str() {
-                            "yes" => *p.granted.lock().await = Some(true),
-                            "always" => {
-                                *p.granted.lock().await = Some(true);
-                                *p.escalated.lock().await = true;
-                            }
-                            _ => *p.granted.lock().await = Some(false),
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!(
+                        "memory refreshed: {}",
+                        if mem.is_empty() {
+                            "no memories found"
+                        } else {
+                            "memories injected"
                         }
-                        p.notify.notify_one();
+                    )),
+                ));
+            }
+            Command::Approve {
+                request_id,
+                decision,
+            } => {
+                // Look up by the unique approval id (the request_id the TUI
+                // echoes back), not the tool-call id — concurrent approvals from
+                // parallel subagents (which may each use `call_1`) can't resolve
+                // to the wrong request.
+                let p = state.pending.lock().await.get(&request_id).cloned();
+                if let Some(p) = p {
+                    match decision.as_str() {
+                        "yes" => *p.granted.lock().await = Some(true),
+                        "always" => {
+                            *p.granted.lock().await = Some(true);
+                            *p.escalated.lock().await = true;
+                        }
+                        _ => *p.granted.lock().await = Some(false),
                     }
+                    p.notify.notify_one();
                 }
             }
             Command::IntercomReply { request_id, reply } => {
@@ -603,7 +743,10 @@ async fn main() {
                 if ok {
                     emit(&Event::new("info").with("message", json!("reply delivered to subagent")));
                 } else {
-                    emit(&Event::new("error").with("message", json!(format!("no pending intercom ask for id {request_id}"))));
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!("no pending intercom ask for id {request_id}")),
+                    ));
                 }
             }
             Command::Abort => {
@@ -614,13 +757,21 @@ async fn main() {
                     tok.cancel();
                 }
             }
-            Command::Send { prompt, model, reasoning_effort, images } => {
+            Command::Send {
+                prompt,
+                model,
+                reasoning_effort,
+                images,
+            } => {
                 let st = state.clone();
                 let client = client.clone();
                 let models = st.models.read().await.clone();
                 let valid = models.iter().any(|m| m.id == model);
                 if !valid {
-                    emit(&Event::new("error").with("message", json!(format!("unknown model: {model}"))));
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown model: {model}"))),
+                    );
                     continue;
                 }
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
@@ -630,26 +781,49 @@ async fn main() {
                 if already {
                     let mut q = st.queued.lock().await;
                     if q.is_some() {
-                        emit(&Event::new("error").with("message", json!("a prompt is already queued; send abort first or wait")));
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!("a prompt is already queued; send abort first or wait"),
+                        ));
                     } else {
-                        *q = Some(QueuedPrompt { prompt, model, effort });
-                        emit(&Event::new("info").with("message", json!("prompt queued; will run after the current turn")));
+                        *q = Some(QueuedPrompt {
+                            prompt,
+                            model,
+                            effort,
+                        });
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!("prompt queued; will run after the current turn"),
+                        ));
                     }
                     continue;
                 }
                 let tok = CancellationToken::new();
                 *st.current.lock().await = Some(tok.clone());
                 let handle = tokio::spawn(run_turn_and_drain(
-                    st.clone(), client.clone(), model, prompt, effort, images, tok,
+                    st.clone(),
+                    client.clone(),
+                    model,
+                    prompt,
+                    effort,
+                    images,
+                    tok,
                 ));
                 *st.handle.lock().await = Some(handle);
             }
-            Command::Steer { prompt, model, reasoning_effort } => {
+            Command::Steer {
+                prompt,
+                model,
+                reasoning_effort,
+            } => {
                 let st = state.clone();
                 let client_c = client.clone();
                 let models = st.models.read().await.clone();
                 if !models.iter().any(|m| m.id == model) {
-                    emit(&Event::new("error").with("message", json!(format!("unknown model: {model}"))));
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown model: {model}"))),
+                    );
                     continue;
                 }
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
@@ -660,7 +834,11 @@ async fn main() {
                 // in flight, steer degrades to a normal turn.
                 emit(&Event::new("steer").with("prompt", json!(prompt)));
                 if st.current.lock().await.is_some() {
-                    *st.queued.lock().await = Some(QueuedPrompt { prompt, model, effort });
+                    *st.queued.lock().await = Some(QueuedPrompt {
+                        prompt,
+                        model,
+                        effort,
+                    });
                     if let Some(tok) = st.current.lock().await.take() {
                         tok.cancel();
                     }
@@ -668,7 +846,13 @@ async fn main() {
                     let tok = CancellationToken::new();
                     *st.current.lock().await = Some(tok.clone());
                     let handle = tokio::spawn(run_turn_and_drain(
-                        st.clone(), client_c, model, prompt, effort, None, tok,
+                        st.clone(),
+                        client_c,
+                        model,
+                        prompt,
+                        effort,
+                        None,
+                        tok,
                     ));
                     *st.handle.lock().await = Some(handle);
                 }
@@ -699,9 +883,8 @@ pub(crate) fn tool_matches_rule(tool_name: &str, args: &Value, rule: &Permission
     // Use glob-style matching with * wildcards.
     let candidate = match tool_name {
         "bash" => args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-        "write_file" | "edit" | "patch" | "read_file" | "bulk_read" | "bulk_write" | "bulk_edit" => {
-            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
-        }
+        "write_file" | "edit" | "patch" | "read_file" | "bulk_read" | "bulk_write"
+        | "bulk_edit" => args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
         "grep" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         "glob" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
@@ -735,7 +918,6 @@ fn star_match_rule(pattern: &str, text: &str) -> bool {
     dp[p.len()][t.len()]
 }
 
-
 /// Run one assistant turn, then drain a queued prompt (one-deep) into another
 /// turn. Shared by `send` (idle start) and `steer` (idle fallback) so the
 /// queue-drain logic and the `current` token hand-off live in one place. A
@@ -764,7 +946,10 @@ fn run_turn_and_drain(
         dispatch_lifecycle(&st, "session_stop").await;
         st.current.lock().await.take();
         if let Err(_panic) = result {
-            emit(&Event::new("error").with("message", json!("turn terminated unexpectedly (panic); please retry")));
+            emit(&Event::new("error").with(
+                "message",
+                json!("turn terminated unexpectedly (panic); please retry"),
+            ));
             emit(&Event::new("done"));
             return;
         }
@@ -773,7 +958,13 @@ fn run_turn_and_drain(
             let tok2 = CancellationToken::new();
             *st.current.lock().await = Some(tok2.clone());
             tokio::spawn(run_turn_and_drain(
-                st.clone(), client.clone(), q.model, q.prompt, q.effort, None, tok2,
+                st.clone(),
+                client.clone(),
+                q.model,
+                q.prompt,
+                q.effort,
+                None,
+                tok2,
             ));
         }
     })
@@ -785,18 +976,19 @@ fn run_turn_and_drain(
 /// `allow`/`deny` is ignored; a failing/timed-out/missing hook is skipped, not
 /// fatal). This wires the hook points that were previously advertised in
 /// HOOK_POINTS but never dispatched.
-async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
+pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
     let (workspace, session_id) = {
         let cfg = st.cfg.read().await;
         (
             cfg.workspace.display().to_string(),
-            cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            cfg.session_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         )
     };
     for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook) {
-        let ctx = plugins::build_context(
-            hook, "", &workspace, None, &session_id, config.pass_args,
-        );
+        let ctx = plugins::build_context(hook, "", &workspace, None, &session_id, config.pass_args);
         let _ = plugins::execute_hook(hook, plugin_name, config, &ctx).await;
     }
 }
@@ -837,7 +1029,8 @@ async fn run_turn(
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
             let workspace = st.cfg.read().await.workspace.clone();
-            let sys_msg = json!({ "role": "system", "content": build_system_prompt(&workspace, true) });
+            let sys_msg =
+                json!({ "role": "system", "content": build_system_prompt(&workspace, true) });
             init_est_add += estimate_message_tokens(&sys_msg);
             conv.push(sys_msg);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -876,14 +1069,25 @@ async fn run_turn(
         let has_images = images.as_ref().is_some_and(|v| !v.is_empty());
         let image_count = images.as_ref().map_or(0, |v| v.len());
         let vc = st.vision.read().await.clone();
-        let models_json: Vec<Value> = st.models.read().await.iter().map(|m| json!({
-            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
-        })).collect();
+        let models_json: Vec<Value> = st
+            .models
+            .read()
+            .await
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                })
+            })
+            .collect();
         let (workspace, session_id) = {
             let cfg = st.cfg.read().await;
             (
                 cfg.workspace.display().to_string(),
-                cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                cfg.session_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             )
         };
         let original_model = model.clone();
@@ -896,7 +1100,12 @@ async fn run_turn(
                 "vision_model": vc.vision_model.clone(),
             });
             let ctx = plugins::build_context(
-                "pre_turn", "", &workspace, Some(&turn_args), &session_id, config.pass_args,
+                "pre_turn",
+                "",
+                &workspace,
+                Some(&turn_args),
+                &session_id,
+                config.pass_args,
             );
             let result = plugins::execute_hook("pre_turn", plugin_name, config, &ctx).await;
             if let Some(new_model) = result
@@ -906,24 +1115,37 @@ async fn run_turn(
                 .and_then(|v| v.as_str())
             {
                 if new_model != model.as_str() {
-                    let valid = st.models.read().await.iter().any(|m| m.id.as_str() == new_model);
+                    let valid = st
+                        .models
+                        .read()
+                        .await
+                        .iter()
+                        .any(|m| m.id.as_str() == new_model);
                     if valid {
                         let why = if result.reason.is_empty() {
                             "vision handoff".to_string()
                         } else {
                             result.reason.clone()
                         };
-                        emit(&Event::new("info").with("message", json!(format!(
-                            "vision handoff: {} → {} ({})", model, new_model, why
-                        ))));
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "vision handoff: {} → {} ({})",
+                                model, new_model, why
+                            )),
+                        ));
                         st.logger.log("vision_handoff", json!({
                             "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
                         }));
                         model = new_model.to_string();
                     } else {
-                        emit(&Event::new("info").with("message", json!(format!(
-                            "vision handoff ignored: '{}' is not a discovered model", new_model
-                        ))));
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "vision handoff ignored: '{}' is not a discovered model",
+                                new_model
+                            )),
+                        ));
                     }
                 }
             }
@@ -932,7 +1154,11 @@ async fn run_turn(
         // model. Surface it so the user knows to configure /vision (or that
         // no vision model is available) instead of silently parsing bytes.
         if has_images && model == original_model {
-            let current_has_vision = st.models.read().await.iter()
+            let current_has_vision = st
+                .models
+                .read()
+                .await
+                .iter()
                 .find(|m| m.id == model.as_str())
                 .map(|m| m.vision || vc.has_vision(m.id.as_str()))
                 .unwrap_or(false);
@@ -947,9 +1173,14 @@ async fn run_turn(
 
     // Main agent tool list: exclude the subagent-only intercom coordination tools
     // (contact_supervisor/intercom) — those are registered only inside child runs.
-    let tool_defs: Vec<Value> = tools::definitions().into_iter()
+    let tool_defs: Vec<Value> = tools::definitions()
+        .into_iter()
         .filter(|d| {
-            let n = d.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            let n = d
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             n != "contact_supervisor" && n != "intercom"
         })
         .collect();
@@ -961,26 +1192,39 @@ async fn run_turn(
     {
         let last = *st.last_turn_time.lock().await;
         if last.elapsed().as_secs() > 3600 {
-                let mut messages = st.conversation.lock().await.clone();
-                if messages.len() > 4 {
-                    dispatch_lifecycle(st, "pre_compact").await;
-                    let est = { *st.estimated_tokens.lock().await };
-                    let cfg = st.cfg.read().await.clone();
-                    match st.api_key.read().await.clone() {
-                        Some(key) => compact_with_summary(client, &cfg, &key, &model, &mut messages, &cancel, false).await,
-                        None => compact_conversation(&mut messages, 0),
+            let mut messages = st.conversation.lock().await.clone();
+            if messages.len() > 4 {
+                dispatch_lifecycle(st, "pre_compact").await;
+                let est = { *st.estimated_tokens.lock().await };
+                let cfg = st.cfg.read().await.clone();
+                match st.api_key.read().await.clone() {
+                    Some(key) => {
+                        compact_with_summary(
+                            client,
+                            &cfg,
+                            &key,
+                            &model,
+                            &mut messages,
+                            &cancel,
+                            false,
+                        )
+                        .await
                     }
-                    *st.conversation.lock().await = messages.clone();
-                    if let Some(p) = cfg.session_file.as_ref() {
-                        session::rewrite(p, &messages);
-                    }
-                    let after_est = estimate_messages_tokens(&messages);
-                    *st.estimated_tokens.lock().await = after_est;
-                    *st.needs_sanitize.lock().await = true;
-                    emit(&Event::new("compacted")
-                        .with("before_tokens", json!(est))
-                        .with("after_tokens", json!(after_est)));
+                    None => compact_conversation(&mut messages, 0),
                 }
+                *st.conversation.lock().await = messages.clone();
+                if let Some(p) = cfg.session_file.as_ref() {
+                    session::rewrite(p, &messages);
+                }
+                let after_est = estimate_messages_tokens(&messages);
+                *st.estimated_tokens.lock().await = after_est;
+                *st.needs_sanitize.lock().await = true;
+                emit(
+                    &Event::new("compacted")
+                        .with("before_tokens", json!(est))
+                        .with("after_tokens", json!(after_est)),
+                );
+            }
         }
     }
 
@@ -995,7 +1239,12 @@ async fn run_turn(
         if budget > 0 {
             let spent = *st.tokens_in.lock().await + *st.tokens_out.lock().await;
             if spent >= budget {
-                emit(&Event::new("error").with("message", json!(format!("session token budget exhausted ({spent} >= {budget}); start a new session"))));
+                emit(&Event::new("error").with(
+                    "message",
+                    json!(format!(
+                        "session token budget exhausted ({spent} >= {budget}); start a new session"
+                    )),
+                ));
                 emit(&Event::new("done"));
                 return;
             }
@@ -1006,7 +1255,10 @@ async fn run_turn(
             match k {
                 Some(k) => k,
                 None => {
-                    emit(&Event::new("error").with("message", json!("no API key set; use set_key first")));
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!("no API key set; use set_key first")),
+                    );
                     emit(&Event::new("done"));
                     return;
                 }
@@ -1049,17 +1301,31 @@ async fn run_turn(
                 }
                 est = estimate_messages_tokens(&messages);
                 *st.estimated_tokens.lock().await = est;
-                st.logger.log("digested", json!({ "results": changed, "before_tokens": before_est, "after_tokens": est }));
-                emit(&Event::new("digested")
-                    .with("results", json!(changed))
-                    .with("before_tokens", json!(before_est))
-                    .with("after_tokens", json!(est)));
+                st.logger.log(
+                    "digested",
+                    json!({ "results": changed, "before_tokens": before_est, "after_tokens": est }),
+                );
+                emit(
+                    &Event::new("digested")
+                        .with("results", json!(changed))
+                        .with("before_tokens", json!(before_est))
+                        .with("after_tokens", json!(est)),
+                );
             }
         }
         if est > threshold.min(hard_cap) && messages.len() > 4 {
             let force_summarize = est > hard_cap;
             dispatch_lifecycle(st, "pre_compact").await;
-            compact_with_summary(client, &cfg, &api_key, &model, &mut messages, &cancel, force_summarize).await;
+            compact_with_summary(
+                client,
+                &cfg,
+                &api_key,
+                &model,
+                &mut messages,
+                &cancel,
+                force_summarize,
+            )
+            .await;
             *st.conversation.lock().await = messages.clone();
             if let Some(p) = cfg.session_file.as_ref() {
                 session::rewrite(p, &messages);
@@ -1067,9 +1333,11 @@ async fn run_turn(
             let after_est = estimate_messages_tokens(&messages);
             *st.estimated_tokens.lock().await = after_est;
             *st.needs_sanitize.lock().await = true;
-            emit(&Event::new("compacted")
-                .with("before_tokens", json!(est))
-                .with("after_tokens", json!(after_est)));
+            emit(
+                &Event::new("compacted")
+                    .with("before_tokens", json!(est))
+                    .with("after_tokens", json!(after_est)),
+            );
         }
 
         // Sanitize orphaned tool calls right before the request (mirrors Umans extension).
@@ -1093,24 +1361,34 @@ async fn run_turn(
                 ))));
             }
         }
-        let (assistant, _finish, tokens_in, tokens_out, cached_tokens) = match provider::stream_turn(
-            client, &cfg, &api_key, &model, &messages, &tool_defs, &effort, &thinking_levels, &cancel, &mut timer,
-            false,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                st.logger.log("turn_error", json!({ "error": e }));
-                if e == "aborted" {
-                    emit(&Event::new("aborted"));
-                } else {
-                    emit(&Event::new("error").with("message", json!(e)));
+        let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
+            match provider::stream_turn(
+                client,
+                &cfg,
+                &api_key,
+                &model,
+                &messages,
+                &tool_defs,
+                &effort,
+                &thinking_levels,
+                &cancel,
+                &mut timer,
+                false,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    st.logger.log("turn_error", json!({ "error": e }));
+                    if e == "aborted" {
+                        emit(&Event::new("aborted"));
+                    } else {
+                        emit(&Event::new("error").with("message", json!(e)));
+                    }
+                    emit(&Event::new("done"));
+                    return;
                 }
-                emit(&Event::new("done"));
-                return;
-            }
-        };
+            };
 
         // Accumulate token counts for /stats. When the endpoint omits usage
         // (tokens come back zero) estimate from the exchanged messages so the
@@ -1118,7 +1396,15 @@ async fn run_turn(
         let (acc_in, acc_out) = if tokens_in > 0 || tokens_out > 0 {
             (tokens_in, tokens_out)
         } else {
-            ({ *st.estimated_tokens.lock().await }, estimate_message_tokens(&assistant))
+            // Endpoint omitted usage: estimate THIS turn's input as the prompt we
+            // sent (the whole messages array) and output as the assistant reply —
+            // NOT the accumulated session total, which would double-count every
+            // prior turn and trip --max-session-tokens after 1-2 turns on
+            // usage-less endpoints.
+            (
+                estimate_messages_tokens(&messages),
+                estimate_message_tokens(&assistant),
+            )
         };
         *st.tokens_in.lock().await += acc_in;
         *st.tokens_out.lock().await += acc_out;
@@ -1135,18 +1421,35 @@ async fn run_turn(
         }
         *st.estimated_tokens.lock().await += estimate_message_tokens(&assistant);
 
-        let tool_calls = assistant.get("tool_calls").and_then(|v| v.as_array()).cloned();
+        let tool_calls = assistant
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned();
         match tool_calls {
             Some(calls) if !calls.is_empty() => {
                 for tc in &calls {
-                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let func = tc.get("function");
-                    let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
-                    emit(&Event::new("tool_call")
-                        .with("id", json!(id))
-                        .with("name", json!(name))
-                        .with("args", json!(args_str)));
+                    let name = func
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args_str = func
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
+                    emit(
+                        &Event::new("tool_call")
+                            .with("id", json!(id))
+                            .with("name", json!(name))
+                            .with("args", json!(args_str)),
+                    );
                     let args: Value = match serde_json::from_str(&args_str) {
                         Ok(v) => v,
                         Err(_) => {
@@ -1163,8 +1466,14 @@ async fn run_turn(
                                 "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
                                 name
                             );
-                            emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                            let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            emit(
+                                &Event::new("tool_result")
+                                    .with("id", json!(id))
+                                    .with("ok", json!(false))
+                                    .with("output", json!(msg)),
+                            );
+                            let tool_result =
+                                json!({ "role": "tool", "tool_call_id": id, "content": msg });
                             let est = estimate_message_tokens(&tool_result);
                             let mut conv = st.conversation.lock().await;
                             conv.push(tool_result);
@@ -1179,7 +1488,10 @@ async fn run_turn(
                     // Approval gate for destructive tools.
                     let cfg = st.cfg.read().await.clone();
                     let kind = tools::classify(&name);
-                    let kind_str: &'static str = match kind { tools::ToolKind::ReadOnly => "readonly", tools::ToolKind::Destructive => "destructive" };
+                    let kind_str: &'static str = match kind {
+                        tools::ToolKind::ReadOnly => "readonly",
+                        tools::ToolKind::Destructive => "destructive",
+                    };
                     // Skip the gate if the user previously said "always" to this kind.
                     let escalated = st.escalated_kinds.lock().await.contains(kind_str);
 
@@ -1204,8 +1516,14 @@ async fn run_turn(
 
                     if force_deny {
                         let msg = format!("tool call '{}' denied by permission rule", name);
-                        emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                        let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        emit(
+                            &Event::new("tool_result")
+                                .with("id", json!(id))
+                                .with("ok", json!(false))
+                                .with("output", json!(msg)),
+                        );
+                        let tool_result =
+                            json!({ "role": "tool", "tool_call_id": id, "content": msg });
                         let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
@@ -1230,8 +1548,14 @@ async fn run_turn(
                             ApprovalResult::Granted => {}
                             ApprovalResult::Denied => {
                                 let msg = format!("tool call '{}' was denied by the user", name);
-                                emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                                let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                                emit(
+                                    &Event::new("tool_result")
+                                        .with("id", json!(id))
+                                        .with("ok", json!(false))
+                                        .with("output", json!(msg)),
+                                );
+                                let tool_result =
+                                    json!({ "role": "tool", "tool_call_id": id, "content": msg });
                                 let est = estimate_message_tokens(&tool_result);
                                 let mut conv = st.conversation.lock().await;
                                 conv.push(tool_result);
@@ -1257,8 +1581,14 @@ async fn run_turn(
                         None
                     };
                     if let Some(msg) = dangerous {
-                        emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                        let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        emit(
+                            &Event::new("tool_result")
+                                .with("id", json!(id))
+                                .with("ok", json!(false))
+                                .with("output", json!(msg)),
+                        );
+                        let tool_result =
+                            json!({ "role": "tool", "tool_call_id": id, "content": msg });
                         let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
@@ -1290,21 +1620,43 @@ async fn run_turn(
                     // exec_args starts as the original args and is amended in
                     // place by pre-hooks. Only clone when hooks will actually run,
                     // so large write payloads aren't copied in the common case.
-                    let mut exec_args = if pre_configs.is_empty() { args } else { args.clone() };
+                    let mut exec_args = if pre_configs.is_empty() {
+                        args
+                    } else {
+                        args.clone()
+                    };
                     let mut hook_notes: Vec<String> = Vec::new();
                     let mut denied_by_hook = false;
                     for (plugin_name, config) in &pre_configs {
-                        let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                        let session_id = cfg
+                            .session_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
                         let ctx = plugins::build_context(
-                            hook_name, &name, &cfg.workspace.display().to_string(),
-                            Some(&exec_args), &session_id, config.pass_args,
+                            hook_name,
+                            &name,
+                            &cfg.workspace.display().to_string(),
+                            Some(&exec_args),
+                            &session_id,
+                            config.pass_args,
                         );
-                        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+                        let result =
+                            plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
                         if !result.allow {
                             // Deny: skip the tool call and tell the model why.
-                            let msg = format!("tool call '{}' denied by plugin '{}' hook '{}': {}", name, plugin_name, hook_name, result.reason);
-                            emit(&Event::new("tool_result").with("id", json!(id)).with("ok", json!(false)).with("output", json!(msg)));
-                            let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            let msg = format!(
+                                "tool call '{}' denied by plugin '{}' hook '{}': {}",
+                                name, plugin_name, hook_name, result.reason
+                            );
+                            emit(
+                                &Event::new("tool_result")
+                                    .with("id", json!(id))
+                                    .with("ok", json!(false))
+                                    .with("output", json!(msg)),
+                            );
+                            let tool_result =
+                                json!({ "role": "tool", "tool_call_id": id, "content": msg });
                             let est = estimate_message_tokens(&tool_result);
                             let mut conv = st.conversation.lock().await;
                             conv.push(tool_result);
@@ -1326,23 +1678,155 @@ async fn run_turn(
                         // Remember non-empty reasons so the model is told its tool
                         // call was inspected/modified (and can react accordingly).
                         if !result.reason.is_empty() {
-                            hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
+                            hook_notes
+                                .push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
                         }
                     }
                     if denied_by_hook {
                         continue;
                     }
 
+                    // bulk inner-call gate: run the same permission deny-rules +
+                    // dangerous-path + plugin pre-hook gate on EACH inner call so
+                    // destructive ops can't evade the safety floor by hiding inside
+                    // a single `bulk` call (the outer deny/hook loop above only sees
+                    // the `bulk` call itself). Denied inner calls are recorded by
+                    // index and rendered by execute_bulk.
+                    let mut bulk_denied: std::collections::HashMap<usize, String> =
+                        std::collections::HashMap::new();
+                    if name == "bulk" {
+                        if let Some(calls) =
+                            exec_args.get_mut("calls").and_then(|v| v.as_array_mut())
+                        {
+                            for (i, c) in calls.iter_mut().enumerate() {
+                                let iname = c
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let iargs = c.get("args").cloned().unwrap_or(json!({}));
+                                let mut modified = iargs.clone();
+                                let mut dmsg: Option<String> = None;
+                                // permission deny-rules (ALLOW skips, DENY blocks)
+                                let mut force_allow = false;
+                                for rule in &cfg.allow_rules {
+                                    if tool_matches_rule(&iname, &iargs, rule) {
+                                        force_allow = true;
+                                        break;
+                                    }
+                                }
+                                if !force_allow {
+                                    for rule in &cfg.deny_rules {
+                                        if tool_matches_rule(&iname, &iargs, rule) {
+                                            dmsg = Some("denied by permission rule".into());
+                                            break;
+                                        }
+                                    }
+                                }
+                                // dangerous-path for write/edit (pre-hook)
+                                if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
+                                    if let Some(m) = workspace::check_dangerous_path(
+                                        iargs.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                                    ) {
+                                        dmsg = Some(m);
+                                    }
+                                }
+                                // plugin pre-hooks (the security-relevant ones)
+                                if dmsg.is_none() {
+                                    let hook_name = match iname.as_str() {
+                                        "bash" => "pre_bash",
+                                        "write_file" | "edit" => "pre_write",
+                                        "read_file" | "grep" | "glob" => "pre_read",
+                                        _ => "",
+                                    };
+                                    if !hook_name.is_empty() {
+                                        let configs = st.plugin_manager.get_hook_configs(hook_name);
+                                        for (pn, config) in &configs {
+                                            let session_id = cfg
+                                                .session_file
+                                                .as_ref()
+                                                .map(|p| p.display().to_string())
+                                                .unwrap_or_default();
+                                            let ctx = plugins::build_context(
+                                                hook_name,
+                                                &iname,
+                                                &cfg.workspace.display().to_string(),
+                                                Some(&modified),
+                                                &session_id,
+                                                config.pass_args,
+                                            );
+                                            let r =
+                                                plugins::execute_hook(hook_name, pn, config, &ctx)
+                                                    .await;
+                                            if !r.allow {
+                                                dmsg = Some(format!(
+                                                    "denied by plugin '{}' hook '{}': {}",
+                                                    pn, hook_name, r.reason
+                                                ));
+                                                break;
+                                            }
+                                            if let Some(m) = &r.modify {
+                                                plugins::apply_modify(&mut modified, m);
+                                            }
+                                        }
+                                        // re-check dangerous path after a hook may have rewritten it
+                                        if dmsg.is_none()
+                                            && (iname == "write_file" || iname == "edit")
+                                        {
+                                            if let Some(m) = workspace::check_dangerous_path(
+                                                modified
+                                                    .get("path")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or(""),
+                                            ) {
+                                                dmsg = Some(m);
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(m) = dmsg {
+                                    bulk_denied.insert(i, m);
+                                } else {
+                                    *c = json!({ "name": iname, "args": modified });
+                                }
+                            }
+                        }
+                    }
+
                     // Execute. bash/bulk/diagnostics/spawn are async; others sync.
+                    // The async ones are wrapped in a `select!` on the turn cancel
+                    // so /abort can interrupt them mid-flight — kill_on_drop frees
+                    // the spawned child when the future is dropped.
                     let mut outcome = if name == "bash" {
-                        let cmd = exec_args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        tools::execute_bash(cmd, &cfg).await
+                        let cmd = exec_args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        tokio::select! {
+                            o = tools::execute_bash(cmd, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
+                        }
                     } else if name == "bulk" {
-                        tools::execute_bulk(&exec_args, &cfg).await
+                        tokio::select! {
+                            o = tools::execute_bulk(&exec_args, &cfg, &bulk_denied) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("bulk aborted"),
+                        }
                     } else if name == "diagnostics" {
-                        tools::execute_diagnostics(&exec_args, &cfg).await
+                        tokio::select! {
+                            o = tools::execute_diagnostics(&exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("diagnostics aborted"),
+                        }
                     } else if name == "spawn" || name == "subagent" {
-                        subagent::execute(st.clone(), client.clone(), api_key.clone(), model.clone(), exec_args.clone(), cancel.clone(), 0).await
+                        subagent::execute(
+                            st.clone(),
+                            client.clone(),
+                            api_key.clone(),
+                            model.clone(),
+                            exec_args.clone(),
+                            cancel.clone(),
+                            0,
+                        )
+                        .await
                     } else {
                         tools::execute(&name, &exec_args, &cfg)
                     };
@@ -1357,16 +1841,28 @@ async fn run_turn(
                     if !post_hook.is_empty() {
                         let configs = st.plugin_manager.get_hook_configs(post_hook);
                         for (plugin_name, config) in &configs {
-                            let session_id = cfg.session_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                            let session_id = cfg
+                                .session_file
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
                             let ctx = plugins::build_context(
-                                post_hook, &name, &cfg.workspace.display().to_string(),
-                                Some(&exec_args), &session_id, config.pass_args,
+                                post_hook,
+                                &name,
+                                &cfg.workspace.display().to_string(),
+                                Some(&exec_args),
+                                &session_id,
+                                config.pass_args,
                             );
                             // Post-hooks can't block (the op already ran), but their
                             // reason is surfaced to the model as a note.
-                            let result = plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
+                            let result =
+                                plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
                             if !result.reason.is_empty() {
-                                hook_notes.push(format!("{}/{}: {}", plugin_name, post_hook, result.reason));
+                                hook_notes.push(format!(
+                                    "{}/{}: {}",
+                                    plugin_name, post_hook, result.reason
+                                ));
                             }
                         }
                     }
@@ -1376,15 +1872,20 @@ async fn run_turn(
                         *st.last_turn_time.lock().await = std::time::Instant::now();
                         let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                         let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                        emit(&Event::new("metrics")
-                            .with("ttft_ms", json!(metrics.ttft_ms))
-                            .with("elapsed_ms", json!(metrics.elapsed_ms))
-                            .with("tokens_in", json!(metrics.tokens_in.saturating_add(metrics.tokens_out)))
-                            .with("prompt_tokens", json!(metrics.tokens_in))
-                            .with("tokens_out", json!(metrics.tokens_out))
-                            .with("cached_tokens", json!(metrics.cached_tokens))
-                            .with("tps", json!(metrics.tps))
-                            .with("model", json!(metrics.model)));
+                        emit(
+                            &Event::new("metrics")
+                                .with("ttft_ms", json!(metrics.ttft_ms))
+                                .with("elapsed_ms", json!(metrics.elapsed_ms))
+                                .with(
+                                    "tokens_in",
+                                    json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
+                                )
+                                .with("prompt_tokens", json!(metrics.tokens_in))
+                                .with("tokens_out", json!(metrics.tokens_out))
+                                .with("cached_tokens", json!(metrics.cached_tokens))
+                                .with("tps", json!(metrics.tps))
+                                .with("model", json!(metrics.model)),
+                        );
                         st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                         st.logger.record_turn();
                         emit(&Event::new("done"));
@@ -1399,11 +1900,14 @@ async fn run_turn(
                         outcome.output.push_str(&hook_notes.join("\n- "));
                     }
                     st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
-                    emit(&Event::new("tool_result")
-                        .with("id", json!(id))
-                        .with("ok", json!(outcome.ok))
-                        .with("output", json!(outcome.output)));
-                    let tool_result = json!({ "role": "tool", "tool_call_id": id, "content": outcome.output });
+                    emit(
+                        &Event::new("tool_result")
+                            .with("id", json!(id))
+                            .with("ok", json!(outcome.ok))
+                            .with("output", json!(outcome.output)),
+                    );
+                    let tool_result =
+                        json!({ "role": "tool", "tool_call_id": id, "content": outcome.output });
                     let est = estimate_message_tokens(&tool_result);
                     let mut conv = st.conversation.lock().await;
                     conv.push(tool_result);
@@ -1419,15 +1923,20 @@ async fn run_turn(
                 *st.last_turn_time.lock().await = std::time::Instant::now();
                 let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                 let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                emit(&Event::new("metrics")
-                    .with("ttft_ms", json!(metrics.ttft_ms))
-                    .with("elapsed_ms", json!(metrics.elapsed_ms))
-                    .with("tokens_in", json!(metrics.tokens_in.saturating_add(metrics.tokens_out)))
-                    .with("prompt_tokens", json!(metrics.tokens_in))
-                    .with("tokens_out", json!(metrics.tokens_out))
-                    .with("cached_tokens", json!(metrics.cached_tokens))
-                    .with("tps", json!(metrics.tps))
-                    .with("model", json!(metrics.model)));
+                emit(
+                    &Event::new("metrics")
+                        .with("ttft_ms", json!(metrics.ttft_ms))
+                        .with("elapsed_ms", json!(metrics.elapsed_ms))
+                        .with(
+                            "tokens_in",
+                            json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
+                        )
+                        .with("prompt_tokens", json!(metrics.tokens_in))
+                        .with("tokens_out", json!(metrics.tokens_out))
+                        .with("cached_tokens", json!(metrics.cached_tokens))
+                        .with("tps", json!(metrics.tps))
+                        .with("model", json!(metrics.model)),
+                );
                 st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                 st.logger.record_turn();
                 emit(&Event::new("done"));
@@ -1443,10 +1952,26 @@ pub(crate) enum ApprovalResult {
     Aborted,
 }
 
+/// Monotonic generator for globally-unique approval ids so parallel subagents
+/// (which may each emit a tool call `call_1`) never collide on the shared
+/// pending-approval map. The id embeds the originating tool-call id for tracing.
+static APPROVAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ask the TUI to approve a tool call; block until answered or aborted.
 /// On "always", only the matched tool KIND is escalated (not the whole session).
-pub(crate) async fn request_approval(st: &Arc<State>, id: &str, name: &str, args: &str, kind_str: &'static str, cancel: &CancellationToken) -> ApprovalResult {
-    let request_id = id.to_string();
+pub(crate) async fn request_approval(
+    st: &Arc<State>,
+    id: &str,
+    name: &str,
+    args: &str,
+    kind_str: &'static str,
+    cancel: &CancellationToken,
+) -> ApprovalResult {
+    let request_id = format!(
+        "apv-{}-{}",
+        APPROVAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        id
+    );
     let notify = Arc::new(Notify::new());
     let pending = Arc::new(PendingApproval {
         request_id: request_id.clone(),
@@ -1457,17 +1982,22 @@ pub(crate) async fn request_approval(st: &Arc<State>, id: &str, name: &str, args
         escalated: Mutex::new(false),
     });
 
-    *st.pending.lock().await = Some(pending.clone());
-    emit(&Event::new("approval_request")
-        .with("request_id", json!(request_id))
-        .with("tool", json!(name))
-        .with("args", json!(args)));
+    st.pending
+        .lock()
+        .await
+        .insert(request_id.clone(), pending.clone());
+    emit(
+        &Event::new("approval_request")
+            .with("request_id", json!(request_id))
+            .with("tool", json!(name))
+            .with("args", json!(args)),
+    );
 
     // Wait for the approve command or abort.
     let granted = tokio::select! {
         _ = notify.notified() => pending.granted.lock().await.unwrap_or(false),
         _ = cancel.cancelled() => {
-            *st.pending.lock().await = None;
+            st.pending.lock().await.remove(&request_id);
             return ApprovalResult::Aborted;
         }
     };
@@ -1477,8 +2007,19 @@ pub(crate) async fn request_approval(st: &Arc<State>, id: &str, name: &str, args
     if *pending.escalated.lock().await {
         st.escalated_kinds.lock().await.insert(kind_str);
         emit(&Event::new("approval_changed").with("mode", json!(format!("{}:always", kind_str))));
+        // Persist the escalation so a restart doesn't un-gate this kind.
+        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+            let set: std::collections::HashSet<String> = st
+                .escalated_kinds
+                .lock()
+                .await
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            session::save_escalations(p, &set);
+        }
     }
-    *st.pending.lock().await = None;
+    st.pending.lock().await.remove(&request_id);
     if granted {
         ApprovalResult::Granted
     } else {
@@ -1509,20 +2050,33 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usiz
     }
     // Build tool_call_id -> (tool_name, args_json) from assistant tool_calls so
     // the digest records WHAT was read/run, not just the size.
-    let mut call_map: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let mut call_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     for m in messages.iter() {
         if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
             continue;
         }
         if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in calls {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if id.is_empty() {
                     continue;
                 }
                 let func = tc.get("function");
-                let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let args = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
                 call_map.insert(id, (name, args));
             }
         }
@@ -1540,7 +2094,11 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usiz
         if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
             continue;
         }
-        let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
         let lines = content.lines().count();
         let digest = make_digest(&name, &args_json, content.len(), lines);
@@ -1561,19 +2119,40 @@ fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String 
     let what = match tool {
         "read_file" => {
             if lines > 0 {
-                format!("read_file {:?} ({} lines, {} bytes)", get("path"), lines, len)
+                format!(
+                    "read_file {:?} ({} lines, {} bytes)",
+                    get("path"),
+                    lines,
+                    len
+                )
             } else {
                 format!("read_file {:?} ({} bytes)", get("path"), len)
             }
         }
         "bulk_read" => format!("bulk_read ({} bytes)", len),
-        "bash" => format!("bash {:?} ({} bytes)", truncate_str(get("command"), 80), len),
-        "grep" => format!("grep {:?} ({} bytes)", truncate_str(get("pattern"), 80), len),
-        "glob" => format!("glob {:?} ({} bytes)", truncate_str(get("pattern"), 80), len),
+        "bash" => format!(
+            "bash {:?} ({} bytes)",
+            truncate_str(get("command"), 80),
+            len
+        ),
+        "grep" => format!(
+            "grep {:?} ({} bytes)",
+            truncate_str(get("pattern"), 80),
+            len
+        ),
+        "glob" => format!(
+            "glob {:?} ({} bytes)",
+            truncate_str(get("pattern"), 80),
+            len
+        ),
         "diagnostics" => format!("diagnostics ({} bytes)", len),
         other => format!("{} ({} bytes)", other, len),
     };
-    let how = if tool == "bash" { "re-run if needed" } else { "re-run to recover full output" };
+    let how = if tool == "bash" {
+        "re-run if needed"
+    } else {
+        "re-run to recover full output"
+    };
     format!("[digested: {what} — {how}]")
 }
 
@@ -1643,7 +2222,9 @@ pub async fn compact_with_summary(
     let summary = provider::summarize(client, cfg, api_key, model, &to_summarize, cancel).await;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
-        compacted.push(json!({ "role": "system", "content": format!("[Summary of earlier turns]\n{s}") }));
+        compacted.push(
+            json!({ "role": "system", "content": format!("[Summary of earlier turns]\n{s}") }),
+        );
     } else {
         compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
     }
@@ -1675,13 +2256,34 @@ fn image_to_data_url(img: &str) -> String {
                 "image/gif"
             } else if bytes.starts_with(b"<svg") {
                 "image/svg+xml"
+            } else if bytes.starts_with(b"RIFF") && bytes.len() > 11 && &bytes[8..12] == b"WEBP" {
+                "image/webp"
+            } else if bytes.starts_with(&[0x42, 0x4d]) && bytes.len() > 1 {
+                // BMP (BM) — lenient; a non-image file almost never starts with BM
+                // followed by plausible header fields, so this is low false-positive risk.
+                "image/bmp"
             } else {
                 "application/octet-stream"
             };
+            if mime == "application/octet-stream" {
+                // Refuse to attach a non-image: /attach must only send actual
+                // images to the provider. This is the vision-trust boundary —
+                // a user typing `/attach ~/.ssh/id_rsa` (or any non-image) is
+                // rejected here rather than base64-encoded and leaked to the API.
+                return format!(
+                    "data:text/plain;base64,{}",
+                    base64_encode(
+                        b"refused: not a recognized image format (png/jpeg/gif/webp/bmp/svg)"
+                    )
+                );
+            }
             let b64 = base64_encode(&bytes);
             format!("data:{mime};base64,{b64}")
         }
-        Err(e) => format!("data:text/plain;base64,{}", base64_encode(format!("image read failed: {e}").as_bytes())),
+        Err(e) => format!(
+            "data:text/plain;base64,{}",
+            base64_encode(format!("image read failed: {e}").as_bytes())
+        ),
     }
 }
 
@@ -1691,7 +2293,7 @@ fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
-        let n = ((input[i] as u32) << 16) | ((input[i+1] as u32) << 8) | (input[i+2] as u32);
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
         out.push(T[((n >> 18) & 0x3f) as usize] as char);
         out.push(T[((n >> 12) & 0x3f) as usize] as char);
         out.push(T[((n >> 6) & 0x3f) as usize] as char);
@@ -1706,7 +2308,7 @@ fn base64_encode(input: &[u8]) -> String {
         out.push('=');
         out.push('=');
     } else if rem == 2 {
-        let n = ((input[i] as u32) << 16) | ((input[i+1] as u32) << 8);
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
         out.push(T[((n >> 18) & 0x3f) as usize] as char);
         out.push(T[((n >> 12) & 0x3f) as usize] as char);
         out.push(T[((n >> 6) & 0x3f) as usize] as char);
@@ -1732,17 +2334,29 @@ mod digest_tests {
         json!({ "role": "assistant", "content": t })
     }
 
-    fn big_content(n: usize) -> String { "x\n".repeat(n) }
+    fn big_content(n: usize) -> String {
+        "x\n".repeat(n)
+    }
 
     /// system + a stale large read result + padding + a recent large read result.
     fn fixture() -> Vec<Value> {
         let mut m = vec![json!({ "role": "system", "content": "sys" })];
-        m.push(asst_tool_call("call_1", "read_file", "{\"path\":\"src/big.rs\"}"));
+        m.push(asst_tool_call(
+            "call_1",
+            "read_file",
+            "{\"path\":\"src/big.rs\"}",
+        ));
         m.push(tool_result("call_1", &big_content(150))); // 300 bytes, 150 lines
-        // padding (assistant texts) to push call_1's result out of the keep window
-        for i in 1..=9 { m.push(asst_text(&format!("pad{i}"))); }
+                                                          // padding (assistant texts) to push call_1's result out of the keep window
+        for i in 1..=9 {
+            m.push(asst_text(&format!("pad{i}")));
+        }
         // a recent large read result that must stay verbatim (inside keep window)
-        m.push(asst_tool_call("call_2", "read_file", "{\"path\":\"src/recent.rs\"}"));
+        m.push(asst_tool_call(
+            "call_2",
+            "read_file",
+            "{\"path\":\"src/recent.rs\"}",
+        ));
         m.push(tool_result("call_2", &big_content(140))); // 280 bytes
         m.push(asst_text("final"));
         m
@@ -1761,12 +2375,21 @@ mod digest_tests {
         assert!(d.contains("lines"), "should report line count: {}", d);
         assert!(d.contains("re-run to recover full output"), "{}", d);
         // tool_call_id preserved so the assistant/tool pairing stays valid
-        assert_eq!(m[2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
+        assert_eq!(
+            m[2].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_1")
+        );
         // recent large result (inside the keep tail) is untouched
-        let r = m[m.len() - 2].get("content").and_then(|v| v.as_str()).unwrap();
+        let r = m[m.len() - 2]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert_eq!(r.len(), 280, "recent result kept full: {}", r);
         assert!(!r.starts_with("[digested:"));
-        assert_eq!(m[m.len() - 2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
+        assert_eq!(
+            m[m.len() - 2].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_2")
+        );
     }
 
     #[test]
@@ -1774,10 +2397,17 @@ mod digest_tests {
         let mut m = fixture();
         let n1 = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n1, 1);
-        let after = m[2].get("content").and_then(|v| v.as_str()).unwrap().to_string();
+        let after = m[2]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
         let n2 = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n2, 0, "second pass must find nothing to digest");
-        assert_eq!(m[2].get("content").and_then(|v| v.as_str()), Some(after.as_str()));
+        assert_eq!(
+            m[2].get("content").and_then(|v| v.as_str()),
+            Some(after.as_str())
+        );
     }
 
     #[test]
@@ -1788,10 +2418,15 @@ mod digest_tests {
             tool_result("c1", "applied 1 edit(s)"), // 17 bytes — under MIN_BYTES
         ];
         // pad to push it out of the keep window
-        for i in 0..12 { m.push(asst_text(&format!("p{i}"))); }
+        for i in 0..12 {
+            m.push(asst_text(&format!("p{i}")));
+        }
         let n = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n, 0, "small result must not be digested");
-        assert_eq!(m[2].get("content").and_then(|v| v.as_str()), Some("applied 1 edit(s)"));
+        assert_eq!(
+            m[2].get("content").and_then(|v| v.as_str()),
+            Some("applied 1 edit(s)")
+        );
     }
 
     #[test]
@@ -1803,7 +2438,10 @@ mod digest_tests {
         ];
         // only 3 messages, keep=10 → nothing eligible
         assert_eq!(digest_stale_tool_results(&mut m, 10), 0);
-        assert_eq!(m[2].get("content").and_then(|v| v.as_str()).unwrap().len(), 400);
+        assert_eq!(
+            m[2].get("content").and_then(|v| v.as_str()).unwrap().len(),
+            400
+        );
     }
 
     #[test]
@@ -1813,11 +2451,17 @@ mod digest_tests {
             asst_tool_call("c1", "bash", "{\"command\":\"cargo build\"}"),
             tool_result("c1", &big_content(150)),
         ];
-        for i in 0..12 { m.push(asst_text(&format!("p{i}"))); }
+        for i in 0..12 {
+            m.push(asst_text(&format!("p{i}")));
+        }
         digest_stale_tool_results(&mut m, 10);
         let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
         assert!(d.contains("bash"), "{}", d);
         assert!(d.contains("cargo build"), "{}", d);
-        assert!(d.contains("re-run if needed"), "bash digest should not promise side-effect-free recovery: {}", d);
+        assert!(
+            d.contains("re-run if needed"),
+            "bash digest should not promise side-effect-free recovery: {}",
+            d
+        );
     }
 }

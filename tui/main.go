@@ -216,7 +216,7 @@ func (s *session) startCore() tea.Cmd {
 	// debug log instead of the terminal — under the alt-screen TUI, raw stderr is
 	// buffered/lost and garbles the screen. The core appends its structured logs
 	// to the same file, so this is safe (append, no truncate race).
-	if f, ferr := os.OpenFile(debugLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
+	if f, ferr := os.OpenFile(debugLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); ferr == nil {
 		cmd.Stderr = f
 		defer f.Close() // child inherits the fd after Start; close our copy
 	} else {
@@ -276,6 +276,14 @@ func (s *session) startCore() tea.Cmd {
 				break
 			}
 		}
+		// Reap the core child process exactly once, after the stdout pipe has
+		// been fully read. Per os/exec: Wait must not be called before the pipe
+		// drain completes — the reader just hit EOF, so the process has exited
+		// and Wait only collects its status. This prevents the core from lingering
+		// as a zombie across the crash auto-restart (which spawns a fresh core
+		// each time) and on Ctrl+C quit. Uses the local cmd (not s.coreCmd, which
+		// is nilled during restart) to avoid racing the recovery handler.
+		_ = cmd.Wait()
 		close(s.coreEvents)
 	}()
 

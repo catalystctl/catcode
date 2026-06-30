@@ -27,7 +27,9 @@ const DANGEROUS_PATHS: &[&str] = &[
 pub fn check_dangerous_path(input: &str) -> Option<String> {
     for pattern in DANGEROUS_PATHS {
         if glob_match_path(pattern, input) {
-            return Some(format!("path {input:?} matches dangerous pattern '{pattern}'; write/edit blocked"));
+            return Some(format!(
+                "path {input:?} matches dangerous pattern '{pattern}'; write/edit blocked"
+            ));
         }
     }
     None
@@ -60,13 +62,23 @@ fn glob_match_path(pattern: &str, path: &str) -> bool {
             let suffix = parts[1];
             let suffix = suffix.trim_start_matches('/');
             if suffix.is_empty() {
-                // ** only — matches everything containing the prefix
-                return path.starts_with(prefix) || path.contains(prefix.trim_start_matches('/').trim_end_matches('/'));
+                // ** with a leading anchor (e.g. `.git/**`) — match the anchor
+                // as a path COMPONENT (anywhere in the tree), NOT as a substring.
+                // `.git/**` must match `.git/config` and `sub/.git/refs` but NOT
+                // `.github/workflows/ci.yml`, which merely contains the substring
+                // `.git` (a false-positive that blocked editing `.github/**`).
+                let anchor = prefix.trim_start_matches('/').trim_end_matches('/');
+                if anchor.is_empty() {
+                    return true; // bare `**` matches everything
+                }
+                return path.split('/').any(|seg| seg == anchor);
             }
             // Check if path starts with prefix and ends with suffix
             // For "**/.bashrc", match any path ending with /.bashrc
             if prefix.is_empty() {
-                return path == suffix || path.ends_with(&format!("/{suffix}")) || path == format!("/{suffix}");
+                return path == suffix
+                    || path.ends_with(&format!("/{suffix}"))
+                    || path == format!("/{suffix}");
             }
             if path.starts_with(prefix) {
                 return path.ends_with(suffix) || path.ends_with(&format!("/{suffix}"));
@@ -101,7 +113,9 @@ pub fn resolve(root: &Path, input: &str) -> Result<PathBuf, String> {
     let p = Path::new(input);
     // Reject absolute paths outright — the agent works inside the workspace.
     if p.is_absolute() {
-        return Err(format!("path {input:?} is absolute; only workspace-relative paths allowed"));
+        return Err(format!(
+            "path {input:?} is absolute; only workspace-relative paths allowed"
+        ));
     }
     // Reject any component that escapes via `..`.
     for comp in p.components() {
@@ -111,7 +125,9 @@ pub fn resolve(root: &Path, input: &str) -> Result<PathBuf, String> {
                 return Err(format!("path {input:?} escapes the workspace"));
             }
             ParentDir => {
-                return Err(format!("path {input:?} contains '..'; workspace escape denied"));
+                return Err(format!(
+                    "path {input:?} contains '..'; workspace escape denied"
+                ));
             }
             CurDir | Normal(_) => {}
         }
@@ -212,6 +228,13 @@ mod tests {
         assert!(check_dangerous_path("a/./.env").is_some());
         // A legit path that merely contains "git" (no leading dot) is NOT .git/**.
         assert!(check_dangerous_path("mygitthing/file").is_none());
+        // `.github/**` must NOT match `.git/**` (substring false-positive):
+        // `.github` is a path component, not the `.git` directory.
+        assert!(check_dangerous_path(".github/workflows/ci.yml").is_none());
+        assert!(check_dangerous_path(".github/ISSUE_TEMPLATE/foo.md").is_none());
+        // A nested `.git` directory IS blocked (component match anywhere).
+        assert!(check_dangerous_path("vendor/lib/.git/config").is_some());
+        assert!(check_dangerous_path("sub/.git/HEAD").is_some());
     }
 
     #[cfg(unix)]
@@ -220,9 +243,8 @@ mod tests {
         use std::os::unix::fs::symlink;
         let r = tmp_root();
         // `linkdir` is a symlink to a directory OUTSIDE the workspace.
-        let outside = std::env::temp_dir().join(format!(
-            "umans_harness_escape_{}", std::process::id()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("umans_harness_escape_{}", std::process::id()));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, r.join("linkdir")).unwrap();

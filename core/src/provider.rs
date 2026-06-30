@@ -2,7 +2,7 @@
 // Streams SSE chunks; emits delta/thinking/tool_call events. Retries on
 // transient HTTP errors with exponential backoff (honors Retry-After).
 use crate::config::Config;
-use crate::logging::{TurnTimer, estimate_messages_tokens, estimate_tokens};
+use crate::logging::{estimate_messages_tokens, estimate_tokens, TurnTimer};
 use crate::protocol::{emit, Event, ModelInfo};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -18,7 +18,23 @@ const CHAT_PATH: &str = "/chat/completions";
 /// fields (reasoning_effort, reasoning_content replay) that vanilla OpenAI
 /// servers reject with a 400 — gate those on this check.
 pub fn is_umans(base_url: &str) -> bool {
-    base_url.contains("umans.ai")
+    // Parse the HOST so a look-alike such as `https://api.umans.ai.evil.com/v1`
+    // (host `api.umans.ai.evil.com`) is NOT mistaken for Umans. A naive
+    // `contains("umans.ai")` substring match would enable Umans-only wire
+    // fields (reasoning_effort / reasoning_content) on the wrong endpoint and
+    // trigger 400s. Match `umans.ai` exactly or as a parent domain (subdomain).
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "umans.ai" || host.ends_with(".umans.ai")
 }
 
 /// The reasoning levels offered when a model advertises none of its own
@@ -47,6 +63,22 @@ pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
     levels[0].clone()
 }
 
+/// Build a compact, image-stripped string of a message for the summarization
+/// prompt. Re-serializing a multimodal message verbatim would POST megabytes
+/// of base64 image data to the model (costly, and it can blow the summary
+/// request's own context); image parts are replaced with a short placeholder.
+fn message_for_summary(m: &Value) -> String {
+    let mut clean = m.clone();
+    if let Some(arr) = clean.get_mut("content").and_then(|v| v.as_array_mut()) {
+        for part in arr.iter_mut() {
+            if part.get("type").and_then(|v| v.as_str()) == Some("image_url") {
+                *part = json!({ "type": "text", "text": "[image omitted in summary]" });
+            }
+        }
+    }
+    serde_json::to_string(&clean).unwrap_or_default()
+}
+
 /// Summarize a slice of messages into one system message. Used by context
 /// compaction so dropped turns become a short recap instead of vanishing.
 /// Non-streaming, cheap; returns None on any failure (caller keeps the
@@ -64,18 +96,25 @@ pub async fn summarize(
         "stream": false,
         "messages": [
             { "role": "system", "content": "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>" },
-            { "role": "user", "content": messages.iter().map(|m| serde_json::to_string(m).unwrap_or_default()).collect::<Vec<_>>().join("\n") }
+            { "role": "user", "content": messages.iter().map(message_for_summary).collect::<Vec<_>>().join("\n") }
         ]
     });
     let url = format!("{}{CHAT_PATH}", cfg.base_url);
-    let req = client.post(&url).bearer_auth(api_key).json(&body).timeout(Duration::from_secs(120));
+    let req = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .timeout(Duration::from_secs(120));
     let resp = tokio::select! {
         r = req.send() => r.ok()?,
         _ = cancel.cancelled() => return None,
     };
-    if !resp.status().is_success() { return None; }
+    if !resp.status().is_success() {
+        return None;
+    }
     let v: Value = resp.json().await.ok()?;
-    v.get("choices").and_then(|c| c.get(0))
+    v.get("choices")
+        .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
@@ -86,14 +125,67 @@ fn fallback_models() -> Vec<ModelInfo> {
     // ponytail: GLM chat template maps any effort except 'high' to 'max', which
     // degenerates thinking output. Advertise only ["high"] so resolve_effort
     // clamps to it — replacing the old hardcoded model-name sniff.
-    let std = || DEFAULT_THINKING_LEVELS.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let std = || {
+        DEFAULT_THINKING_LEVELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    };
     vec![
-        ModelInfo { id: "umans-coder".into(), name: "Umans Coder".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
-        ModelInfo { id: "umans-kimi-k2.5".into(), name: "Umans Kimi K2.5".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
-        ModelInfo { id: "umans-kimi-k2.6".into(), name: "Umans Kimi K2.6".into(), reasoning: true, context_window: 262144, max_tokens: 32768, thinking_levels: std(), vision: false },
-        ModelInfo { id: "umans-glm-5.1".into(), name: "Umans GLM 5.1".into(), reasoning: true, context_window: 202752, max_tokens: 131072, thinking_levels: vec!["high".to_string()], vision: false },
-        ModelInfo { id: "umans-glm-5.2".into(), name: "Umans GLM 5.2".into(), reasoning: true, context_window: 413696, max_tokens: 131072, thinking_levels: vec!["high".to_string()], vision: false },
-        ModelInfo { id: "umans-minimax-m2.5".into(), name: "Umans MiniMax M2.5".into(), reasoning: true, context_window: 204800, max_tokens: 8192, thinking_levels: std(), vision: false },
+        ModelInfo {
+            id: "umans-coder".into(),
+            name: "Umans Coder".into(),
+            reasoning: true,
+            context_window: 262144,
+            max_tokens: 32768,
+            thinking_levels: std(),
+            vision: false,
+        },
+        ModelInfo {
+            id: "umans-kimi-k2.5".into(),
+            name: "Umans Kimi K2.5".into(),
+            reasoning: true,
+            context_window: 262144,
+            max_tokens: 32768,
+            thinking_levels: std(),
+            vision: false,
+        },
+        ModelInfo {
+            id: "umans-kimi-k2.6".into(),
+            name: "Umans Kimi K2.6".into(),
+            reasoning: true,
+            context_window: 262144,
+            max_tokens: 32768,
+            thinking_levels: std(),
+            vision: false,
+        },
+        ModelInfo {
+            id: "umans-glm-5.1".into(),
+            name: "Umans GLM 5.1".into(),
+            reasoning: true,
+            context_window: 202752,
+            max_tokens: 131072,
+            thinking_levels: vec!["high".to_string()],
+            vision: false,
+        },
+        ModelInfo {
+            id: "umans-glm-5.2".into(),
+            name: "Umans GLM 5.2".into(),
+            reasoning: true,
+            context_window: 413696,
+            max_tokens: 131072,
+            thinking_levels: vec!["high".to_string()],
+            vision: false,
+        },
+        ModelInfo {
+            id: "umans-minimax-m2.5".into(),
+            name: "Umans MiniMax M2.5".into(),
+            reasoning: true,
+            context_window: 204800,
+            max_tokens: 8192,
+            thinking_levels: std(),
+            vision: false,
+        },
     ]
 }
 
@@ -108,7 +200,12 @@ pub async fn discover_models(client: &reqwest::Client, base_url: &str) -> Vec<Mo
 
     // 2. Fetch live from the endpoint.
     let url = format!("{base_url}{MODELS_INFO_PATH}");
-    let live = match client.get(&url).timeout(Duration::from_secs(5)).send().await {
+    let live = match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
             Ok(v) => v,
             Err(_) => {
@@ -177,16 +274,19 @@ fn write_models_cache(base_url: &str, models: &[ModelInfo]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let models_json: Vec<Value> = models.iter().map(|m| {
-        json!({
-            "id": m.id,
-            "name": m.name,
-            "context_window": m.context_window,
-            "max_tokens": m.max_tokens,
-            "thinking_levels": m.thinking_levels,
-            "vision": m.vision,
+    let models_json: Vec<Value> = models
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "context_window": m.context_window,
+                "max_tokens": m.max_tokens,
+                "thinking_levels": m.thinking_levels,
+                "vision": m.vision,
+            })
         })
-    }).collect();
+        .collect();
     let cache = json!({
         "base_url": base_url,
         "updated_at": now,
@@ -204,13 +304,30 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
         let context_window = m.get("context_window")?.as_u64()? as u32;
         let max_tokens = m.get("max_tokens")?.as_u64()? as u32;
         let vision = m.get("vision").and_then(|v| v.as_bool()).unwrap_or(false);
-        let thinking_levels = m.get("thinking_levels")
+        let thinking_levels = m
+            .get("thinking_levels")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        out.push(ModelInfo { id, name, reasoning: true, context_window, max_tokens, thinking_levels, vision });
+        out.push(ModelInfo {
+            id,
+            name,
+            reasoning: true,
+            context_window,
+            max_tokens,
+            thinking_levels,
+            vision,
+        });
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Parse the live /models/info response into ModelInfo vec.
@@ -219,12 +336,29 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
     if let Some(obj) = data.as_object() {
         for (id, info) in obj {
             let caps = info.get("capabilities");
-            let cw = caps.and_then(|c| c.get("context_window")).and_then(|v| v.as_u64()).unwrap_or(200_000) as u32;
-            let mt = caps.and_then(|c| c.get("recommended_max_tokens")).and_then(|v| v.as_u64()).unwrap_or(65000) as u32;
-            let vision = caps.and_then(|c| c.get("vision")).and_then(|v| v.as_bool()).unwrap_or(false);
-            let name = info.get("display_name").and_then(|v| v.as_str()).unwrap_or(id).to_string();
+            let cw = caps
+                .and_then(|c| c.get("context_window"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200_000) as u32;
+            let mt = caps
+                .and_then(|c| c.get("recommended_max_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(65000) as u32;
+            let vision = caps
+                .and_then(|c| c.get("vision"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let name = info
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
             let thinking_levels = caps
-                .and_then(|c| c.get("thinking_levels").or_else(|| c.get("reasoning_levels")).or_else(|| c.get("reasoning_efforts")))
+                .and_then(|c| {
+                    c.get("thinking_levels")
+                        .or_else(|| c.get("reasoning_levels"))
+                        .or_else(|| c.get("reasoning_efforts"))
+                })
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -233,10 +367,22 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            out.push(ModelInfo { id: id.clone(), name, reasoning: true, context_window: cw, max_tokens: mt, thinking_levels, vision });
+            out.push(ModelInfo {
+                id: id.clone(),
+                name,
+                reasoning: true,
+                context_window: cw,
+                max_tokens: mt,
+                thinking_levels,
+                vision,
+            });
         }
     }
-    if out.is_empty() { fallback_models() } else { out }
+    if out.is_empty() {
+        fallback_models()
+    } else {
+        out
+    }
 }
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
@@ -247,7 +393,8 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
 /// (validate that every assistant with tool_calls has corresponding tool results).
 #[allow(clippy::ptr_arg)]
 pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
-    let tool_call_ids: Vec<String> = messages
+    // All tool_call ids emitted by any assistant message in the kept history.
+    let call_ids: std::collections::HashSet<String> = messages
         .iter()
         .filter_map(|m| {
             if m.get("role").and_then(|v| v.as_str()) == Some("assistant") {
@@ -260,20 +407,45 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
         .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
         .collect();
 
+    // All tool_call ids that currently have a matching `role:"tool"` result.
     let result_ids: std::collections::HashSet<String> = messages
         .iter()
         .filter_map(|m| {
             if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-                m.get("tool_call_id").and_then(|v| v.as_str()).map(String::from)
+                m.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
             } else {
                 None
             }
         })
         .collect();
 
-    let orphaned: Vec<String> = tool_call_ids
-        .into_iter()
-        .filter(|id| !result_ids.contains(id))
+    // Drop orphaned RESULTS: a `tool` message whose `tool_call_id` is not
+    // emitted by any remaining assistant `tool_calls`. Compaction can keep a
+    // tool result while dropping (or summarizing) the assistant call that
+    // requested it — OpenAI APIs then reject the orphaned `tool` message with a
+    // 400 that bricks the turn (and persists into the next). This is the
+    // symmetric fix to the orphaned-CALL handling below.
+    messages.retain(|m| {
+        if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
+            m.get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|id| call_ids.contains(id))
+                .unwrap_or(false)
+        } else {
+            true
+        }
+    });
+
+    // Insert synthetic results for orphaned CALLS (assistant tool_calls with no
+    // matching tool message). Computed against the original result_ids — the
+    // retain above only removed results that had no matching call, so the set
+    // of calls-with-results is unchanged.
+    let orphaned: Vec<String> = call_ids
+        .iter()
+        .filter(|id| !result_ids.contains(*id))
+        .cloned()
         .collect();
     if orphaned.is_empty() {
         return;
@@ -282,8 +454,12 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
     // Insert synthetic tool results right after the assistant message that made each call.
     let mut i = 0;
     while i < messages.len() {
-        let is_assistant_with_calls = messages[i].get("role").and_then(|v| v.as_str()) == Some("assistant")
-            && messages[i].get("tool_calls").and_then(|v| v.as_array()).is_some();
+        let is_assistant_with_calls = messages[i].get("role").and_then(|v| v.as_str())
+            == Some("assistant")
+            && messages[i]
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .is_some();
         if !is_assistant_with_calls {
             i += 1;
             continue;
@@ -405,10 +581,13 @@ pub async fn stream_turn(
         // the set (e.g. GLM only accepts "high"). Empty levels => pass through.
         let resolved = resolve_effort(reasoning_effort, thinking_levels);
         if resolved != reasoning_effort && !quiet {
-            emit(&Event::new("info").with("message", json!(format!(
-                "reasoning effort '{}' not supported by model '{}'; using '{}'",
-                reasoning_effort, model, resolved
-            ))));
+            emit(&Event::new("info").with(
+                "message",
+                json!(format!(
+                    "reasoning effort '{}' not supported by model '{}'; using '{}'",
+                    reasoning_effort, model, resolved
+                )),
+            ));
         }
         body["reasoning_effort"] = json!(resolved);
     }
@@ -467,7 +646,10 @@ pub async fn stream_turn(
             let Some(chunk) = chunk else { break };
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) => { err = Some(format!("stream read: {}", fmt_chain(&e))); break; }
+                Err(e) => {
+                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    break;
+                }
             };
             buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -497,7 +679,10 @@ pub async fn stream_turn(
                 }
                 pending.push_str(data);
                 let obj = match serde_json::from_str::<Value>(&pending) {
-                    Ok(o) => { pending.clear(); o }
+                    Ok(o) => {
+                        pending.clear();
+                        o
+                    }
                     Err(_) => continue, // wait for more `data:` lines to complete the frame
                 };
 
@@ -512,15 +697,24 @@ pub async fn stream_turn(
                     }
                     // prompt_tokens_details.cached_tokens — the prefix-cache hit count.
                     // Absent on servers that don't support/report caching (stays 0).
-                    if let Some(c) = u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(token_count) {
+                    if let Some(c) = u
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(token_count)
+                    {
                         cached_tokens = c;
                     }
                 }
 
-                let Some(choice) = obj.get("choices").and_then(|c| c.get(0)) else { continue };
+                let Some(choice) = obj.get("choices").and_then(|c| c.get(0)) else {
+                    continue;
+                };
                 let delta = choice.get("delta");
 
-                if let Some(c) = delta.and_then(|d| d.get("content")).and_then(|v| v.as_str()) {
+                if let Some(c) = delta
+                    .and_then(|d| d.get("content"))
+                    .and_then(|v| v.as_str())
+                {
                     if !c.is_empty() {
                         if content.is_empty() {
                             timer.mark_first_token();
@@ -532,9 +726,14 @@ pub async fn stream_turn(
                         }
                     }
                 }
-                if let Some(r) = delta.and_then(|d| d.get("reasoning_content")).and_then(|v| v.as_str()) {
+                if let Some(r) = delta
+                    .and_then(|d| d.get("reasoning_content"))
+                    .and_then(|v| v.as_str())
+                {
                     if !r.is_empty() {
-                        if reasoning.is_empty() { timer.mark_first_token(); }
+                        if reasoning.is_empty() {
+                            timer.mark_first_token();
+                        }
                         reasoning.push_str(r);
                         if !quiet {
                             emitted = true;
@@ -542,7 +741,10 @@ pub async fn stream_turn(
                         }
                     }
                 }
-                if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|v| v.as_array()) {
+                if let Some(tcs) = delta
+                    .and_then(|d| d.get("tool_calls"))
+                    .and_then(|v| v.as_array())
+                {
                     for tc in tcs {
                         let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         while tool_calls.len() <= idx {
@@ -554,25 +756,42 @@ pub async fn stream_turn(
                                 acc.id = id.to_string();
                                 if !quiet {
                                     emitted = true;
-                                    emit(&Event::new("tool_call_start").with("id", json!(id)).with("index", json!(idx)));
+                                    emit(
+                                        &Event::new("tool_call_start")
+                                            .with("id", json!(id))
+                                            .with("index", json!(idx)),
+                                    );
                                 }
                             }
                         }
                         let func = tc.get("function");
-                        if let Some(name) = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                        if let Some(name) =
+                            func.and_then(|f| f.get("name")).and_then(|v| v.as_str())
+                        {
                             if acc.name.is_empty() {
                                 acc.name = name.to_string();
                                 if !quiet {
                                     emitted = true;
-                                    emit(&Event::new("tool_call_name").with("index", json!(idx)).with("name", json!(name)));
+                                    emit(
+                                        &Event::new("tool_call_name")
+                                            .with("index", json!(idx))
+                                            .with("name", json!(name)),
+                                    );
                                 }
                             }
                         }
-                        if let Some(args) = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                        if let Some(args) = func
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                        {
                             acc.args.push_str(args);
                             if !quiet {
                                 emitted = true;
-                                emit(&Event::new("tool_call_args").with("index", json!(idx)).with("args", json!(args)));
+                                emit(
+                                    &Event::new("tool_call_args")
+                                        .with("index", json!(idx))
+                                        .with("args", json!(args)),
+                                );
                             }
                         }
                     }
@@ -588,9 +807,11 @@ pub async fn stream_turn(
             // TUI's context + TPS move during the turn, not just at the end.
             // ponytail: char/4 estimate (same heuristic as the compaction threshold);
             // the real usage chunk at stream end overwrites these with exact values.
-			if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
+            if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
                 let now = Instant::now();
-                let due = last_stats.map(|t| now.duration_since(t) >= Duration::from_millis(400)).unwrap_or(true);
+                let due = last_stats
+                    .map(|t| now.duration_since(t) >= Duration::from_millis(400))
+                    .unwrap_or(true);
                 if due {
                     last_stats = Some(now);
                     let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
@@ -598,12 +819,19 @@ pub async fn stream_turn(
                     let mut ev = Event::new("metrics")
                         .with("tokens_in", json!(live_ctx))
                         .with("tokens_out", json!(est_out));
-                    if let Some(ttft) = timer.first_token.map(|t| t.duration_since(timer.start).as_millis() as u64) {
+                    if let Some(ttft) = timer
+                        .first_token
+                        .map(|t| t.duration_since(timer.start).as_millis() as u64)
+                    {
                         ev = ev.with("ttft_ms", json!(ttft));
                     }
                     if let Some(tps) = timer.call_first_token.and_then(|ft| {
                         let e = ft.elapsed().as_secs_f64();
-                        if e >= 0.2 { Some(est_out as f64 / e) } else { None }
+                        if e >= 0.2 {
+                            Some(est_out as f64 / e)
+                        } else {
+                            None
+                        }
                     }) {
                         ev = ev.with("tps", json!(tps));
                     }
@@ -621,10 +849,12 @@ pub async fn stream_turn(
             return Err(msg);
         }
         let backoff = backoff_ms(attempt, None);
-        emit(&Event::new("http_retry")
-            .with("attempt", json!(attempt))
-            .with("reason", json!("stream error before first token"))
-            .with("backoff_ms", json!(backoff)));
+        emit(
+            &Event::new("http_retry")
+                .with("attempt", json!(attempt))
+                .with("reason", json!("stream error before first token"))
+                .with("backoff_ms", json!(backoff)),
+        );
         // Reset accumulators for the fresh attempt.
         content.clear();
         reasoning.clear();
@@ -648,7 +878,14 @@ pub async fn stream_turn(
     // present and empty. reasoning_content is Umans-only (gated above).
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), json!("assistant"));
-    msg.insert("content".into(), if content.is_empty() { Value::Null } else { json!(content) });
+    msg.insert(
+        "content".into(),
+        if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        },
+    );
     if umans && !reasoning.is_empty() {
         msg.insert("reasoning_content".into(), json!(reasoning));
     }
@@ -669,7 +906,13 @@ pub async fn stream_turn(
         msg.insert("tool_calls".into(), json!(arr));
     }
 
-    Ok((Value::Object(msg), finish_reason, tokens_in, tokens_out, cached_tokens))
+    Ok((
+        Value::Object(msg),
+        finish_reason,
+        tokens_in,
+        tokens_out,
+        cached_tokens,
+    ))
 }
 
 /// POST with retry on 429/5xx. Exponential backoff: 0.5s, 1s, 2s, 4s (cap 8s),
@@ -689,10 +932,7 @@ async fn send_with_retry(
         // that streams >5 min gets aborted mid-stream with "operation timed out".
         // Stalls are caught by connect_timeout (connect phase, on the client) +
         // the per-chunk idle timeout in stream_turn (body phase).
-        let req = client
-            .post(url)
-            .bearer_auth(api_key)
-            .json(body);
+        let req = client.post(url).bearer_auth(api_key).json(body);
 
         let resp = tokio::select! {
             r = req.send() => r,
@@ -704,13 +944,18 @@ async fn send_with_retry(
             Err(e) => {
                 // Transport error: retry with backoff.
                 if attempt >= 4 {
-                    return Err(format!("request failed after {attempt} attempts: {}", fmt_chain(&e)));
+                    return Err(format!(
+                        "request failed after {attempt} attempts: {}",
+                        fmt_chain(&e)
+                    ));
                 }
                 let backoff = backoff_ms(attempt, None);
-                emit(&Event::new("http_retry")
-                    .with("attempt", json!(attempt))
-                    .with("reason", json!("transport error"))
-                    .with("backoff_ms", json!(backoff)));
+                emit(
+                    &Event::new("http_retry")
+                        .with("attempt", json!(attempt))
+                        .with("reason", json!("transport error"))
+                        .with("backoff_ms", json!(backoff)),
+                );
                 sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
                 continue;
             }
@@ -737,10 +982,12 @@ async fn send_with_retry(
         // Drain body before retry to free the connection.
         let _ = resp.text().await;
         let backoff = backoff_ms(attempt, retry_after);
-        emit(&Event::new("http_retry")
-            .with("attempt", json!(attempt))
-            .with("status", json!(status.as_u16()))
-            .with("backoff_ms", json!(backoff)));
+        emit(
+            &Event::new("http_retry")
+                .with("attempt", json!(attempt))
+                .with("status", json!(status.as_u16()))
+                .with("backoff_ms", json!(backoff)),
+        );
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
 }
@@ -760,23 +1007,41 @@ fn parse_retry_after(s: &str) -> Option<u64> {
         .ok()?
         .as_secs();
     let diff = date.saturating_sub(now);
-    if diff == 0 { None } else { Some(diff) }
+    if diff == 0 {
+        None
+    } else {
+        Some(diff)
+    }
 }
 
 /// Parse an HTTP IMF-fixdate ("Wed, 21 Oct 2025 07:28:00 GMT") into UNIX
 /// seconds. The weekday is ignored (servers sometimes send the wrong one).
 fn parse_http_date(s: &str) -> Option<u64> {
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 5 { return None; }
+    if parts.len() < 5 {
+        return None;
+    }
     let day: u32 = parts[1].trim_end_matches(',').parse().ok()?;
     let mon: u32 = match parts[2] {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     };
     let year: i32 = parts[3].parse().ok()?;
     let tparts: Vec<&str> = parts[4].split(':').collect();
-    if tparts.len() != 3 { return None; }
+    if tparts.len() != 3 {
+        return None;
+    }
     let h: u64 = tparts[0].parse().ok()?;
     let mi: u64 = tparts[1].parse().ok()?;
     let se: u64 = tparts[2].parse().ok()?;
@@ -794,7 +1059,9 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
     let doy = (153 * (m_shift as i64) + 2) / 5 + (d as i64) - 1;
     let doe = (yoe as i64) * 365 + (yoe as i64) / 4 - (yoe as i64) / 100 + doy;
     let days = (era as i64) * 146097 + doe - 719468;
-    if days < 0 { return None; }
+    if days < 0 {
+        return None;
+    }
     Some(days as u64)
 }
 
@@ -854,9 +1121,15 @@ mod tests {
         // P2-6: HTTP-date Retry-After parsing.
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         // 2025-01-01 00:00:00 UTC = 1735689600
-        assert_eq!(parse_http_date("Wed, 01 Jan 2025 00:00:00 GMT"), Some(1735689600));
+        assert_eq!(
+            parse_http_date("Wed, 01 Jan 2025 00:00:00 GMT"),
+            Some(1735689600)
+        );
         // weekday is ignored (servers sometimes send the wrong one)
-        assert_eq!(parse_http_date("Mon, 01 Jan 2025 00:00:00 GMT"), Some(1735689600));
+        assert_eq!(
+            parse_http_date("Mon, 01 Jan 2025 00:00:00 GMT"),
+            Some(1735689600)
+        );
     }
 
     #[test]
@@ -880,6 +1153,27 @@ mod tests {
         });
         assert!(has_result);
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn sanitize_drops_orphaned_results() {
+        // Compaction kept a `tool` result whose matching assistant `tool_calls`
+        // was dropped. The orphaned `tool` message must be removed (not left to
+        // 400 the request), and no synthetic call is inserted (there's no call
+        // to synthesize a result for).
+        let mut msgs = vec![
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"tool","tool_call_id":"ghost_call","content":"stale result"}),
+            json!({"role":"assistant","content":"ok"}),
+        ];
+        sanitize_orphaned_tool_calls(&mut msgs);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool")),
+            "orphaned tool result should be dropped: {msgs:?}"
+        );
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]
@@ -908,7 +1202,10 @@ mod tests {
         assert_eq!(n, 2, "only the two malformed calls should be fixed");
         let calls = msgs[0]["tool_calls"].as_array().unwrap();
         assert_eq!(calls[0]["function"]["arguments"].as_str().unwrap(), "{}");
-        assert_eq!(calls[1]["function"]["arguments"].as_str().unwrap(), "{\"command\":\"echo hi\"}");
+        assert_eq!(
+            calls[1]["function"]["arguments"].as_str().unwrap(),
+            "{\"command\":\"echo hi\"}"
+        );
         assert_eq!(calls[2]["function"]["arguments"].as_str().unwrap(), "{}");
         // every arguments field must now be valid JSON
         for tc in calls {
@@ -920,14 +1217,14 @@ mod tests {
     #[test]
     fn sanitize_args_coerces_nonstring_arguments() {
         // Some clients serialize `arguments` as a JSON object instead of a string.
-        let mut msgs = vec![
-            json!({"role":"assistant","tool_calls":[
-                {"id":"c1","type":"function","function":{"name":"bash","arguments":{"command":"echo hi"}}}
-            ]}),
-        ];
+        let mut msgs = vec![json!({"role":"assistant","tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"bash","arguments":{"command":"echo hi"}}}
+        ]})];
         let n = sanitize_tool_call_arguments(&mut msgs);
         assert_eq!(n, 1);
-        let args = msgs[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = msgs[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         assert_eq!(args, "{}");
     }
 
@@ -957,6 +1254,12 @@ mod tests {
         assert!(is_umans("https://umans.ai/v1"));
         assert!(!is_umans("https://api.openai.com/v1"));
         assert!(!is_umans("https://localhost:11434/v1"));
+        // Look-alike host must NOT be detected (substring `.contains` false-pos):
+        // `api.umans.ai.evil.com` is not a subdomain of umans.ai.
+        assert!(!is_umans("https://api.umans.ai.evil.com/v1"));
+        assert!(!is_umans("https://umans.ai.evil.com/v1"));
+        // port suffix is handled
+        assert!(is_umans("https://api.umans.ai:443/v1"));
     }
 
     #[test]
@@ -1009,7 +1312,10 @@ mod tests {
         }
         // a non-GLM model advertises the standard trio
         let coder = models.iter().find(|m| m.id == "umans-coder").unwrap();
-        assert_eq!(coder.thinking_levels, vec!["low".to_string(), "medium".to_string(), "high".to_string()]);
+        assert_eq!(
+            coder.thinking_levels,
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+        );
     }
 
     #[test]

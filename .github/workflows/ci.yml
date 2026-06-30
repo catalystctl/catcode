@@ -20,9 +20,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
-      - name: rustfmt check (advisory)
+      - name: rustfmt check
         working-directory: core
-        continue-on-error: true
         run: cargo fmt --all -- --check
       - name: clippy
         working-directory: core

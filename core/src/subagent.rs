@@ -147,58 +147,126 @@ fn builtin_agents() -> Vec<AgentConfig> {
               inherit_ctx: bool,
               default_ctx: Option<ContextKind>,
               prompt: &str| {
-                AgentConfig {
-                    name: name.to_string(),
-                    description: desc.to_string(),
-                    tools: tools.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    model: None,
-                    fallback_models: vec![],
-                    thinking: thinking.map(|s| s.to_string()),
-                    system_prompt_mode: if append { SystemPromptMode::Append } else { SystemPromptMode::Replace },
-                    inherit_project_context: inherit_ctx,
-                    inherit_skills: false,
-                    default_context: default_ctx,
-                    system_prompt: prompt.to_string(),
-                    source: AgentSource::Builtin,
-                    file_path: format!("<builtin:{name}>"),
-                    skills: vec![],
-                    output: if name == "scout" { Some("context.md".into()) } else { None },
-                    default_reads: if name == "worker" || name == "reviewer" {
-                        vec!["context.md".into(), "plan.md".into()]
-                    } else {
-                        vec![]
-                    },
-                    default_progress: name == "worker" || name == "scout",
-                    max_subagent_depth: None,
-                    completion_guard: false,
-                    disabled: false,
-                }
-            };
+        AgentConfig {
+            name: name.to_string(),
+            description: desc.to_string(),
+            tools: tools
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            model: None,
+            fallback_models: vec![],
+            thinking: thinking.map(|s| s.to_string()),
+            system_prompt_mode: if append {
+                SystemPromptMode::Append
+            } else {
+                SystemPromptMode::Replace
+            },
+            inherit_project_context: inherit_ctx,
+            inherit_skills: false,
+            default_context: default_ctx,
+            system_prompt: prompt.to_string(),
+            source: AgentSource::Builtin,
+            file_path: format!("<builtin:{name}>"),
+            skills: vec![],
+            output: if name == "scout" {
+                Some("context.md".into())
+            } else {
+                None
+            },
+            default_reads: if name == "worker" || name == "reviewer" {
+                vec!["context.md".into(), "plan.md".into()]
+            } else {
+                vec![]
+            },
+            default_progress: name == "worker" || name == "scout",
+            max_subagent_depth: None,
+            completion_guard: false,
+            disabled: false,
+        }
+    };
     vec![
-        mk("scout", "Fast codebase recon that returns compressed context for handoff",
-           "read_file, grep, glob, list_dir, bash, write_file, intercom", Some("low"),
-           false, true, None, SCOUT_PROMPT),
-        mk("researcher", "Web/docs research with sources and a concise research brief",
-           "read_file, grep, glob, list_dir, bash, write_file, intercom", Some("low"),
-           false, true, None, RESEARCHER_PROMPT),
-        mk("planner", "A concrete implementation plan from existing context; reads and plans, does not edit",
-           "read_file, grep, glob, list_dir, bash, intercom", Some("high"),
-           false, true, Some(ContextKind::Fork), PLANNER_PROMPT),
-        mk("worker", "Implementation agent for normal tasks and approved oracle handoffs",
-           "read_file, grep, glob, list_dir, bash, edit, write_file, contact_supervisor", Some("high"),
-           false, true, Some(ContextKind::Fork), WORKER_PROMPT),
-        mk("reviewer", "Code review and small fixes against the task/plan, tests, edge cases, simplicity",
-           "read_file, grep, glob, list_dir, bash, edit, write_file, intercom", Some("high"),
-           false, true, None, REVIEWER_PROMPT),
-        mk("context-builder", "Stronger setup pass before planning: gathers context and writes handoff material",
-           "read_file, grep, glob, list_dir, bash, write_file, intercom", Some("low"),
-           false, true, None, CONTEXT_BUILDER_PROMPT),
-        mk("oracle", "High-context decision-consistency oracle; challenges assumptions, prevents drift",
-           "read_file, grep, glob, list_dir, bash, intercom", Some("high"),
-           false, true, Some(ContextKind::Fork), ORACLE_PROMPT),
-        mk("delegate", "Lightweight general delegate that behaves close to the parent session",
-           "read_file, grep, glob, list_dir, bash, edit, write_file, contact_supervisor", None,
-           true, true, None, DELEGATE_PROMPT),
+        mk(
+            "scout",
+            "Fast codebase recon that returns compressed context for handoff",
+            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            Some("low"),
+            false,
+            true,
+            None,
+            SCOUT_PROMPT,
+        ),
+        mk(
+            "researcher",
+            "Web/docs research with sources and a concise research brief",
+            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            Some("low"),
+            false,
+            true,
+            None,
+            RESEARCHER_PROMPT,
+        ),
+        mk(
+            "planner",
+            "A concrete implementation plan from existing context; reads and plans, does not edit",
+            "read_file, grep, glob, list_dir, bash, intercom",
+            Some("high"),
+            false,
+            true,
+            Some(ContextKind::Fork),
+            PLANNER_PROMPT,
+        ),
+        mk(
+            "worker",
+            "Implementation agent for normal tasks and approved oracle handoffs",
+            "read_file, grep, glob, list_dir, bash, edit, write_file, contact_supervisor",
+            Some("high"),
+            false,
+            true,
+            Some(ContextKind::Fork),
+            WORKER_PROMPT,
+        ),
+        mk(
+            "reviewer",
+            "Code review and small fixes against the task/plan, tests, edge cases, simplicity",
+            "read_file, grep, glob, list_dir, bash, edit, write_file, intercom",
+            Some("high"),
+            false,
+            true,
+            None,
+            REVIEWER_PROMPT,
+        ),
+        mk(
+            "context-builder",
+            "Stronger setup pass before planning: gathers context and writes handoff material",
+            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            Some("low"),
+            false,
+            true,
+            None,
+            CONTEXT_BUILDER_PROMPT,
+        ),
+        mk(
+            "oracle",
+            "High-context decision-consistency oracle; challenges assumptions, prevents drift",
+            "read_file, grep, glob, list_dir, bash, intercom",
+            Some("high"),
+            false,
+            true,
+            Some(ContextKind::Fork),
+            ORACLE_PROMPT,
+        ),
+        mk(
+            "delegate",
+            "Lightweight general delegate that behaves close to the parent session",
+            "read_file, grep, glob, list_dir, bash, edit, write_file, contact_supervisor",
+            None,
+            true,
+            true,
+            None,
+            DELEGATE_PROMPT,
+        ),
     ]
 }
 
@@ -225,9 +293,19 @@ const DELEGATE_PROMPT: &str = "You are a delegated agent. Execute the assigned t
 /// Resolve an agent's intercom target name (stable per run).
 pub fn subagent_target(run_id: &str, agent: &str, index: Option<usize>) -> String {
     let suffix = index.map(|i| format!("-{}", i + 1)).unwrap_or_default();
-    let clean = |s: &str| s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect::<String>().to_lowercase();
+    let clean = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect::<String>()
+            .to_lowercase()
+    };
     let rid = run_id.replace('-', "");
-    format!("subagent-{}-{}{}", clean(agent), &rid[..rid.len().min(8)], suffix)
+    format!(
+        "subagent-{}-{}{}",
+        clean(agent),
+        &rid[..rid.len().min(8)],
+        suffix
+    )
 }
 
 /// Discover all agents: builtin (lowest) < user < project (project wins on name).
@@ -259,7 +337,9 @@ pub fn discover_agents(workspace: &Path, cfg: &SubagentConfig) -> Vec<AgentConfi
 }
 
 fn load_agent_dir(dir: &Path, source: AgentSource, by_name: &mut HashMap<String, AgentConfig>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -269,7 +349,9 @@ fn load_agent_dir(dir: &Path, source: AgentSource, by_name: &mut HashMap<String,
         if p.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&p) else { continue };
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         let (fm, body) = parse_frontmatter(&content);
         let name = match fm.get("name").and_then(|s| s.split_whitespace().next()) {
             Some(n) => n.to_string(),
@@ -279,16 +361,29 @@ fn load_agent_dir(dir: &Path, source: AgentSource, by_name: &mut HashMap<String,
         let a = AgentConfig {
             name: name.clone(),
             description: fm.get("description").cloned().unwrap_or_default(),
-            tools: tools_str.split(',').map(|s| AgentConfig::normalize_tool(s.trim()).to_string()).filter(|s| !s.is_empty()).collect(),
+            tools: tools_str
+                .split(',')
+                .map(|s| AgentConfig::normalize_tool(s.trim()).to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             model: fm.get("model").cloned(),
-            fallback_models: fm.get("fallbackModels").map(|s| s.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default(),
+            fallback_models: fm
+                .get("fallbackModels")
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                .unwrap_or_default(),
             thinking: fm.get("thinking").cloned(),
             system_prompt_mode: match fm.get("systemPromptMode").map(|s| s.as_str()) {
                 Some("append") => SystemPromptMode::Append,
                 _ => SystemPromptMode::Replace,
             },
-            inherit_project_context: fm.get("inheritProjectContext").map(|s| s == "true").unwrap_or(false),
-            inherit_skills: fm.get("inheritSkills").map(|s| s == "true").unwrap_or(false),
+            inherit_project_context: fm
+                .get("inheritProjectContext")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+            inherit_skills: fm
+                .get("inheritSkills")
+                .map(|s| s == "true")
+                .unwrap_or(false),
             default_context: match fm.get("defaultContext").map(|s| s.as_str()) {
                 Some("fork") => Some(ContextKind::Fork),
                 Some("fresh") => Some(ContextKind::Fresh),
@@ -297,12 +392,24 @@ fn load_agent_dir(dir: &Path, source: AgentSource, by_name: &mut HashMap<String,
             system_prompt: body,
             source: source.clone(),
             file_path: p.display().to_string(),
-            skills: fm.get("skills").map(|s| s.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default(),
+            skills: fm
+                .get("skills")
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                .unwrap_or_default(),
             output: fm.get("output").cloned(),
-            default_reads: fm.get("defaultReads").map(|s| s.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default(),
-            default_progress: fm.get("defaultProgress").map(|s| s == "true").unwrap_or(false),
+            default_reads: fm
+                .get("defaultReads")
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                .unwrap_or_default(),
+            default_progress: fm
+                .get("defaultProgress")
+                .map(|s| s == "true")
+                .unwrap_or(false),
             max_subagent_depth: fm.get("maxSubagentDepth").and_then(|s| s.parse().ok()),
-            completion_guard: fm.get("completionGuard").map(|s| s == "false").unwrap_or(false),
+            completion_guard: fm
+                .get("completionGuard")
+                .map(|s| s == "false")
+                .unwrap_or(false),
             disabled: fm.get("disabled").map(|s| s == "true").unwrap_or(false),
         };
         if !a.disabled {
@@ -313,10 +420,18 @@ fn load_agent_dir(dir: &Path, source: AgentSource, by_name: &mut HashMap<String,
 
 fn apply_overrides(a: &mut AgentConfig, cfg: &SubagentConfig) {
     if let Some(ov) = cfg.agent_overrides.get(&a.name) {
-        if let Some(m) = &ov.model { a.model = Some(m.clone()); }
-        if !ov.fallback_models.is_empty() { a.fallback_models = ov.fallback_models.clone(); }
-        if let Some(t) = &ov.thinking { a.thinking = Some(t.clone()); }
-        if ov.disabled { a.disabled = true; }
+        if let Some(m) = &ov.model {
+            a.model = Some(m.clone());
+        }
+        if !ov.fallback_models.is_empty() {
+            a.fallback_models = ov.fallback_models.clone();
+        }
+        if let Some(t) = &ov.thinking {
+            a.thinking = Some(t.clone());
+        }
+        if ov.disabled {
+            a.disabled = true;
+        }
     }
 }
 
@@ -335,15 +450,25 @@ fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
     let mut out: Vec<(String, String, String)> = Vec::new();
     let dirs = [
         (workspace.join(".umans-harness/skills"), true),
-        (crate::config::home_dir().map(|h| h.join(".umans-harness/skills")).unwrap_or_default(), false),
+        (
+            crate::config::home_dir()
+                .map(|h| h.join(".umans-harness/skills"))
+                .unwrap_or_default(),
+            false,
+        ),
     ];
     for (dir, _proj) in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let skill_md = e.path().join("SKILL.md");
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
                 let (fm, _) = parse_frontmatter(&content);
-                let name = fm.get("name").cloned().unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+                let name = fm
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
                 let desc = fm.get("description").cloned().unwrap_or_default();
                 out.push((name, desc, skill_md.display().to_string()));
             }
@@ -359,14 +484,18 @@ fn skills_injection(workspace: &Path, names: &[String]) -> String {
     let all = discover_skills(workspace);
     let mut blocks = String::new();
     for name in names {
-        if name == "false" { continue; }
+        if name == "false" {
+            continue;
+        }
         if let Some((n, d, loc)) = all.iter().find(|(n, _, _)| n == name) {
             blocks.push_str(&format!(
                 "  <skill>\n    <name>{n}</name>\n    <description>{d}</description>\n    <location>{loc}</location>\n  </skill>\n"
             ));
         }
     }
-    if blocks.is_empty() { return String::new(); }
+    if blocks.is_empty() {
+        return String::new();
+    }
     format!("The following skills are available to this subagent. Use read_file to load a skill file when the task matches its description.\n<available_skills>\n{blocks}</available_skills>")
 }
 
@@ -417,33 +546,90 @@ pub fn child_max_depth(parent: u32, agent: Option<u32>) -> u32 {
 
 fn all_tool_names() -> &'static [&'static str] {
     &[
-        "read_file", "edit", "write_file", "list_dir", "grep", "glob", "bash",
-        "bulk", "bulk_read", "bulk_write", "bulk_edit", "todo_write", "todo_read",
-        "finish", "patch", "diagnostics", "subagent", "contact_supervisor", "intercom",
+        "read_file",
+        "edit",
+        "write_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "bash",
+        "bulk",
+        "bulk_read",
+        "bulk_write",
+        "bulk_edit",
+        "todo_write",
+        "todo_read",
+        "finish",
+        "patch",
+        "diagnostics",
+        "subagent",
+        "contact_supervisor",
+        "intercom",
     ]
 }
 
 /// Build the tool-definition list a subagent may call, applying the agent's
 /// allowlist and the intercom bridge. `depth`/`max_depth` gate the `subagent`
 /// tool (nested fanout only when allowed and below the depth cap).
-pub fn subagent_tool_defs(agent: &AgentConfig, bridge: bool, depth: u32, max_depth: u32) -> Vec<Value> {
+pub fn subagent_tool_defs(
+    agent: &AgentConfig,
+    bridge: bool,
+    depth: u32,
+    max_depth: u32,
+) -> Vec<Value> {
     let all = tools::definitions();
     // name → def
     let by_name: HashMap<&str, &Value> = all
         .iter()
-        .map(|d| (d.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""), d))
+        .map(|d| {
+            (
+                d.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                d,
+            )
+        })
         .collect();
 
     // Resolve allowed tool names.
     let allow_subagent = agent.tools.iter().any(|t| t == "subagent") && depth + 1 < max_depth;
     let mut names: Vec<&str> = if agent.tools.is_empty() {
-        all_tool_names().to_vec()
+        // Omitting `tools:` defaults to READ-ONLY tools (all tools minus the
+        // destructive ones) — an agent whose frontmatter forgot to declare tools
+        // must not silently get bash/write/edit/subagent. Declare them explicitly.
+        all_tool_names()
+            .iter()
+            .copied()
+            .filter(|n| {
+                !matches!(
+                    *n,
+                    "bash"
+                        | "write_file"
+                        | "edit"
+                        | "patch"
+                        | "bulk"
+                        | "bulk_write"
+                        | "bulk_edit"
+                        | "subagent"
+                        | "spawn"
+                )
+            })
+            .collect()
     } else {
-        agent.tools.iter().filter_map(|t| {
-            let n = AgentConfig::normalize_tool(t);
-            // filter out subagent unless explicitly allowed + below depth
-            if n == "subagent" && !allow_subagent { None } else { Some(n) }
-        }).collect()
+        agent
+            .tools
+            .iter()
+            .filter_map(|t| {
+                let n = AgentConfig::normalize_tool(t);
+                // filter out subagent unless explicitly allowed + below depth
+                if n == "subagent" && !allow_subagent {
+                    None
+                } else {
+                    Some(n)
+                }
+            })
+            .collect()
     };
     // bridge tools
     if bridge {
@@ -462,7 +648,10 @@ pub fn subagent_tool_defs(agent: &AgentConfig, bridge: bool, depth: u32, max_dep
         names.push("finish");
     }
 
-    names.iter().filter_map(|n| by_name.get(n).map(|v| (*v).clone())).collect()
+    names
+        .iter()
+        .filter_map(|n| by_name.get(n).map(|v| (*v).clone()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -499,60 +688,119 @@ pub fn execute(
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>> {
     Box::pin(async move {
-    let workspace = st.cfg.read().await.workspace.clone();
-    let cfg = st.cfg.read().await.clone();
-    let max_depth = resolve_max_depth(&cfg.subagents);
+        let workspace = st.cfg.read().await.workspace.clone();
+        let cfg = st.cfg.read().await.clone();
+        let max_depth = resolve_max_depth(&cfg.subagents);
 
-    // Depth guard: a subagent calling subagent beyond the cap is blocked.
-    if depth >= max_depth {
-        return Outcome::err(format!(
+        // Depth guard: a subagent calling subagent beyond the cap is blocked.
+        if depth >= max_depth {
+            return Outcome::err(format!(
             "subagent nesting blocked at depth {depth} (max {max_depth}); complete the current task directly"
         ));
-    }
-
-    // Backward-compat: a bare {prompt} (legacy spawn) runs as a delegate.
-    if args.get("agent").is_none() && args.get("tasks").is_none() && args.get("chain").is_none() {
-        if let Some(prompt) = args.get("prompt").and_then(|v| v.as_str()) {
-            let agents = discover_agents(&workspace, &cfg.subagents);
-            let agent = find_agent(&agents, "delegate").cloned().unwrap_or_else(|| {
-                builtin_agents().into_iter().find(|a| a.name == "delegate").unwrap().clone()
-            });
-            let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
-            let run_id = next_run_id();
-            return run_single(&st, &client, &api_key, &parent_model, &agent, prompt, &run_id, model_override, ContextKind::Fresh, depth, &cancel).await;
         }
-    }
 
-    // Management / control actions.
-    if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
-        return handle_action(action, &args, &workspace, &cfg, &st, &cancel).await;
-    }
+        // Backward-compat: a bare {prompt} (legacy spawn) runs as a delegate.
+        if args.get("agent").is_none() && args.get("tasks").is_none() && args.get("chain").is_none()
+        {
+            if let Some(prompt) = args.get("prompt").and_then(|v| v.as_str()) {
+                let agents = discover_agents(&workspace, &cfg.subagents);
+                let agent = find_agent(&agents, "delegate").cloned().unwrap_or_else(|| {
+                    builtin_agents()
+                        .into_iter()
+                        .find(|a| a.name == "delegate")
+                        .unwrap()
+                        .clone()
+                });
+                let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
+                let run_id = next_run_id();
+                return run_single(
+                    &st,
+                    &client,
+                    &api_key,
+                    &parent_model,
+                    &agent,
+                    prompt,
+                    &run_id,
+                    model_override,
+                    ContextKind::Fresh,
+                    depth,
+                    &cancel,
+                )
+                .await;
+            }
+        }
 
-    // Single agent run.
-    if let Some(agent_name) = args.get("agent").and_then(|v| v.as_str()) {
-        let agents = discover_agents(&workspace, &cfg.subagents);
-        let agent = match find_agent(&agents, agent_name) {
-            Some(a) => a.clone(),
-            None => return Outcome::err(format!("unknown agent '{agent_name}'; use action:\"list\" to discover agents")),
-        };
-        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
-        let context = parse_context(&args, &agent);
-        let run_id = next_run_id();
-        return run_single(&st, &client, &api_key, &parent_model, &agent, &task, &run_id, model_override, context, depth, &cancel).await;
-    }
+        // Management / control actions.
+        if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+            return handle_action(action, &args, &workspace, &cfg, &st, &cancel).await;
+        }
 
-    // Parallel run.
-    if let Some(tasks) = args.get("tasks").and_then(|v| v.as_array()) {
-        return run_parallel(&st, &client, &api_key, &parent_model, tasks, &args, depth, &cancel).await;
-    }
+        // Single agent run.
+        if let Some(agent_name) = args.get("agent").and_then(|v| v.as_str()) {
+            let agents = discover_agents(&workspace, &cfg.subagents);
+            let agent = match find_agent(&agents, agent_name) {
+                Some(a) => a.clone(),
+                None => {
+                    return Outcome::err(format!(
+                        "unknown agent '{agent_name}'; use action:\"list\" to discover agents"
+                    ))
+                }
+            };
+            let task = args
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
+            let context = parse_context(&args, &agent);
+            let run_id = next_run_id();
+            return run_single(
+                &st,
+                &client,
+                &api_key,
+                &parent_model,
+                &agent,
+                &task,
+                &run_id,
+                model_override,
+                context,
+                depth,
+                &cancel,
+            )
+            .await;
+        }
 
-    // Chain run.
-    if let Some(chain) = args.get("chain").and_then(|v| v.as_array()) {
-        return run_chain(&st, &client, &api_key, &parent_model, chain, &args, depth, &cancel).await;
-    }
+        // Parallel run.
+        if let Some(tasks) = args.get("tasks").and_then(|v| v.as_array()) {
+            return run_parallel(
+                &st,
+                &client,
+                &api_key,
+                &parent_model,
+                tasks,
+                &args,
+                depth,
+                &cancel,
+            )
+            .await;
+        }
 
-    Outcome::err("subagent requires 'agent'+'task', 'tasks', 'chain', or 'action'")
+        // Chain run.
+        if let Some(chain) = args.get("chain").and_then(|v| v.as_array()) {
+            return run_chain(
+                &st,
+                &client,
+                &api_key,
+                &parent_model,
+                chain,
+                &args,
+                depth,
+                &cancel,
+            )
+            .await;
+        }
+
+        Outcome::err("subagent requires 'agent'+'task', 'tasks', 'chain', or 'action'")
     })
 }
 
@@ -597,17 +845,49 @@ async fn run_single(
         st.intercom.register_target(&my_target);
     }
 
-    // Register the run for status/interrupt.
-    let run_cancel = CancellationToken::new();
+    // Register the run for status/interrupt. run_cancel is a CHILD of the
+    // parent cancel: interrupt_action cancels THIS run only, and a parent
+    // /abort propagates automatically (a child token cancels when its parent
+    // does). Previously this was a detached token never wired into the loop, so
+    // interrupt was a no-op.
+    let run_cancel = cancel.child_token();
     let run = SubagentRun {
-        id: run_id.to_string(), mode: "single".into(), agent: Some(agent.name.clone()),
-        agents: vec![agent.name.clone()], state: "running".into(),
-        started_at: now_ms(), ended_at: None, depth, intercom_target: Some(my_target.clone()),
-        cancel: Some(Arc::new(run_cancel.clone())), children: vec![], summary: None,
+        id: run_id.to_string(),
+        mode: "single".into(),
+        agent: Some(agent.name.clone()),
+        agents: vec![agent.name.clone()],
+        state: "running".into(),
+        started_at: now_ms(),
+        ended_at: None,
+        depth,
+        intercom_target: Some(my_target.clone()),
+        cancel: Some(Arc::new(run_cancel.clone())),
+        children: vec![],
+        summary: None,
     };
-    st.subagent_runs.lock().await.insert(run_id.to_string(), run);
+    st.subagent_runs
+        .lock()
+        .await
+        .insert(run_id.to_string(), run);
 
-    let result = run_agent(st, client, api_key, parent_model, agent, task, &my_target, &orchestrator, run_id, model_override, context, depth, max_depth, bridge, cancel).await;
+    let result = run_agent(
+        st,
+        client,
+        api_key,
+        parent_model,
+        agent,
+        task,
+        &my_target,
+        &orchestrator,
+        run_id,
+        model_override,
+        context,
+        depth,
+        max_depth,
+        bridge,
+        &run_cancel,
+    )
+    .await;
 
     // Finalize run state.
     let mut runs = st.subagent_runs.lock().await;
@@ -643,7 +923,24 @@ pub async fn run_agent(
     cancel: &CancellationToken,
 ) -> Outcome {
     emit_subagent_progress(run_id, agent, "start", "", 0, 0, 0, 0, true);
-    let result = run_agent_inner(st, client, api_key, parent_model, agent, task, my_target, orchestrator, run_id, model_override, context, depth, max_depth, bridge, cancel).await;
+    let result = run_agent_inner(
+        st,
+        client,
+        api_key,
+        parent_model,
+        agent,
+        task,
+        my_target,
+        orchestrator,
+        run_id,
+        model_override,
+        context,
+        depth,
+        max_depth,
+        bridge,
+        cancel,
+    )
+    .await;
     emit_subagent_progress(run_id, agent, "done", "", 0, 0, 0, 0, result.ok);
     result
 }
@@ -686,7 +983,11 @@ async fn run_agent_inner(
         sys.push_str(&bridge_instruction(orchestrator));
     }
     // skills
-    let skill_names: Vec<String> = if !agent.skills.is_empty() { agent.skills.clone() } else { vec![] };
+    let skill_names: Vec<String> = if !agent.skills.is_empty() {
+        agent.skills.clone()
+    } else {
+        vec![]
+    };
     let sinj = skills_injection(&workspace, &skill_names);
     if !sinj.is_empty() {
         sys.push_str("\n\n");
@@ -698,25 +999,31 @@ async fn run_agent_inner(
     // --- forked context: parent conversation as reference ---
     if context == ContextKind::Fork {
         let parent = st.conversation.lock().await.clone();
-        let fork_msgs: Vec<Value> = parent.iter()
+        // Fork the MOST RECENT 40 qualifying messages (not the oldest 40, which
+        // dropped the live context the child most needs) and scrub secret
+        // leakage: drop ALL tool results (they may contain file contents / bash
+        // output with pasted credentials) and tool_call envelopes, then redact
+        // common secret patterns from the kept user/assistant prose before
+        // handing the transcript to a child whose own tools could exfiltrate it.
+        let filtered: Vec<Value> = parent
+            .iter()
             .filter(|m| {
                 let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                // drop system + subagent tool-call/result artifacts; keep prose
-                if role == "system" { return false; }
-                if role == "assistant" {
-                    // keep assistant prose, drop pure tool_call-only messages? keep them as reference
-                    return true;
+                if role == "system" {
+                    return false;
                 }
                 if role == "tool" {
-                    // drop tool results that came from the subagent/spawn tool
-                    let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    return !c.contains("spawn done") && !c.starts_with("subagent(");
+                    return false;
+                } // drop all tool results (secret/noise)
+                if role == "assistant" && m.get("tool_calls").is_some() {
+                    return false;
                 }
                 true
             })
-            .take(40)
-            .cloned()
+            .map(redact_message_secrets)
             .collect();
+        let start = filtered.len().saturating_sub(40);
+        let fork_msgs: Vec<Value> = filtered[start..].to_vec();
         if !fork_msgs.is_empty() {
             sub.push(json!({ "role": "system", "content": "You are running from a fork of the parent session. Treat the following inherited conversation as reference-only context, not a live thread to continue. Do not answer prior messages.\n\n--- inherited parent context ---" }));
             sub.extend(fork_msgs);
@@ -751,13 +1058,26 @@ async fn run_agent_inner(
     if candidates.is_empty() {
         return Outcome::err("no model resolved for subagent (set agent model or a default)");
     }
-    let effort = agent.thinking.clone().unwrap_or_else(|| "medium".to_string());
-    let thinking_levels = st.models.read().await.iter()
+    let effort = agent
+        .thinking
+        .clone()
+        .unwrap_or_else(|| "medium".to_string());
+    let thinking_levels = st
+        .models
+        .read()
+        .await
+        .iter()
         .find(|m| candidates.iter().any(|c| c == &m.id))
         .map(|m| m.thinking_levels.clone())
         .unwrap_or_default();
-    let model_ctx = st.models.read().await.iter().find(|m| candidates.iter().any(|c| c == &m.id))
-        .map(|m| m.context_window as u64).unwrap_or(200_000);
+    let model_ctx = st
+        .models
+        .read()
+        .await
+        .iter()
+        .find(|m| candidates.iter().any(|c| c == &m.id))
+        .map(|m| m.context_window as u64)
+        .unwrap_or(200_000);
     let mut timer = TurnTimer::new();
     let mut sub_in: u64 = 0;
     let mut sub_out: u64 = 0;
@@ -775,8 +1095,26 @@ async fn run_agent_inner(
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
         if est > threshold.min(hard_cap) && sub.len() > 4 {
-            crate::compact_with_summary(client, &cfg, api_key, candidates.first().unwrap(), &mut sub, cancel, est > hard_cap).await;
-            emit(&Event::new("compacted").with("scope", json!("subagent")).with("before_tokens", json!(est)).with("after_tokens", json!(estimate_messages_tokens(&sub))));
+            // Mirror the main loop: let pre_compact plugin hooks run before
+            // summarizing a subagent's context (otherwise subagent compaction
+            // silently bypasses the hook the user configured).
+            crate::dispatch_lifecycle(st, "pre_compact").await;
+            crate::compact_with_summary(
+                client,
+                &cfg,
+                api_key,
+                candidates.first().unwrap(),
+                &mut sub,
+                cancel,
+                est > hard_cap,
+            )
+            .await;
+            emit(
+                &Event::new("compacted")
+                    .with("scope", json!("subagent"))
+                    .with("before_tokens", json!(est))
+                    .with("after_tokens", json!(estimate_messages_tokens(&sub))),
+            );
         }
 
         crate::provider::sanitize_orphaned_tool_calls(&mut sub);
@@ -787,48 +1125,119 @@ async fn run_agent_inner(
         let _ = crate::provider::sanitize_tool_call_arguments(&mut sub);
 
         // stream with model fallback
-        let (assistant, _finish_reason, ti, to, cached) = match stream_with_fallback(
-            client, &cfg, api_key, &candidates, &sub, &tool_defs, &effort, &thinking_levels, cancel, &mut timer,
-        ).await {
+        let (assistant, _finish_reason, ti, to, cached, served_model) = match stream_with_fallback(
+            client,
+            &cfg,
+            api_key,
+            &candidates,
+            &sub,
+            &tool_defs,
+            &effort,
+            &thinking_levels,
+            cancel,
+            &mut timer,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
-                if e == "aborted" { emit(&Event::new("aborted")); }
+                if e == "aborted" {
+                    emit(&Event::new("aborted"));
+                }
                 return Outcome::err(format!("subagent stream error: {e}"));
             }
         };
-        last_model = Some(candidates[0].clone());
-        sub_in += ti; sub_out += to; sub_cached += cached;
+        // Report the model that actually served the last turn (on fallback this
+        // may be candidates[1+], not candidates[0]) so telemetry is accurate.
+        last_model = Some(served_model);
+        sub_in += ti;
+        sub_out += to;
+        sub_cached += cached;
+        if sub_in + sub_out > SUBAGENT_MAX_TOKENS {
+            emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
+            return Outcome::err(format!("subagent exceeded the per-run token budget ({SUBAGENT_MAX_TOKENS} cumulative in+out); aborting to bound cost."));
+        }
         *st.tokens_in.lock().await += ti;
         *st.tokens_out.lock().await += to;
         *st.cached_tokens.lock().await += cached;
         sub.push(assistant.clone());
-        emit_subagent_progress(run_id, agent, "streaming", "", tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, true);
+        emit_subagent_progress(
+            run_id,
+            agent,
+            "streaming",
+            "",
+            tool_count,
+            sub_in,
+            sub_out,
+            run_start.elapsed().as_millis() as u64,
+            true,
+        );
 
-        let Some(calls) = assistant.get("tool_calls").and_then(|v| v.as_array()).cloned() else {
+        let Some(calls) = assistant
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+        else {
             // done — finalize output
-            let text = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let text = assistant
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // optional output file
             if let Some(out_path) = &agent.output {
                 let p = workspace.join(out_path);
-                if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 let _ = std::fs::write(&p, &text);
             }
             emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
             return Outcome::ok(text);
         };
         if calls.is_empty() {
-            let text = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let text = assistant
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
             return Outcome::ok(text);
         }
 
         for call in &calls {
-            let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = call
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let func = call.get("function");
-            let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+            let name = func
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_str = func
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}")
+                .to_string();
             tool_count += 1;
-            emit_subagent_progress(run_id, agent, "tool", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, true);
+            if tool_count > SUBAGENT_MAX_TOOL_CALLS {
+                emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
+                return Outcome::err(format!("subagent exceeded the per-run tool-call cap ({SUBAGENT_MAX_TOOL_CALLS}); aborting to bound cost. Re-decompose into smaller subagent runs."));
+            }
+            emit_subagent_progress(
+                run_id,
+                agent,
+                "tool",
+                &name,
+                tool_count,
+                sub_in,
+                sub_out,
+                run_start.elapsed().as_millis() as u64,
+                true,
+            );
             let argsv: Value = match serde_json::from_str(&args_str) {
                 Ok(v) => v,
                 Err(_) => {
@@ -841,23 +1250,65 @@ async fn run_agent_inner(
                         "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
                         name
                     );
-                    emit_subagent_progress(run_id, agent, "tool_end", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, false);
+                    emit_subagent_progress(
+                        run_id,
+                        agent,
+                        "tool_end",
+                        &name,
+                        tool_count,
+                        sub_in,
+                        sub_out,
+                        run_start.elapsed().as_millis() as u64,
+                        false,
+                    );
                     sub.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
                     continue;
                 }
             };
 
-            let outcome = dispatch_subagent_tool(&name, &argsv, &id, &args_str, st, client, api_key, parent_model, my_target, agent, depth, max_depth, &cfg, cancel).await;
+            let outcome = dispatch_subagent_tool(
+                &name,
+                &argsv,
+                &id,
+                &args_str,
+                st,
+                client,
+                api_key,
+                parent_model,
+                my_target,
+                agent,
+                depth,
+                max_depth,
+                &cfg,
+                cancel,
+            )
+            .await;
 
-            emit_subagent_progress(run_id, agent, "tool_end", &name, tool_count, sub_in, sub_out, run_start.elapsed().as_millis() as u64, outcome.ok);
+            emit_subagent_progress(
+                run_id,
+                agent,
+                "tool_end",
+                &name,
+                tool_count,
+                sub_in,
+                sub_out,
+                run_start.elapsed().as_millis() as u64,
+                outcome.ok,
+            );
             sub.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
 
             // finish sentinel
             if name == "finish" && outcome.ok && outcome.output == "__finish__" {
-                let text = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = assistant
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if let Some(out_path) = &agent.output {
                     let p = workspace.join(out_path);
-                    if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+                    if let Some(parent) = p.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
                     let _ = std::fs::write(&p, &text);
                 }
                 emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
@@ -982,7 +1433,12 @@ async fn dispatch_subagent_tool(
         let workspace = cfg.workspace.display().to_string();
         for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook_name) {
             let ctx = crate::plugins::build_context(
-                hook_name, name, &workspace, Some(&exec_args), &session_id, config.pass_args,
+                hook_name,
+                name,
+                &workspace,
+                Some(&exec_args),
+                &session_id,
+                config.pass_args,
             );
             let result = crate::plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
             if !result.allow {
@@ -1000,22 +1456,145 @@ async fn dispatch_subagent_tool(
         }
     }
 
+    // bulk inner-call gate (mirror of the main-loop gate): permission deny-
+    // rules + dangerous-path + plugin pre-hooks run on EACH inner call so
+    // destructive ops can't evade the safety floor by hiding inside a bulk
+    // call. Denied inner calls are recorded by index and rendered by execute_bulk.
+    let mut bulk_denied: HashMap<usize, String> = HashMap::new();
+    if name == "bulk" {
+        if let Some(calls) = exec_args.get_mut("calls").and_then(|v| v.as_array_mut()) {
+            for (i, c) in calls.iter_mut().enumerate() {
+                let iname = c
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let iargs = c.get("args").cloned().unwrap_or(json!({}));
+                let mut modified = iargs.clone();
+                let mut dmsg: Option<String> = None;
+                let mut force_allow = false;
+                for rule in &cfg.allow_rules {
+                    if crate::tool_matches_rule(&iname, &iargs, rule) {
+                        force_allow = true;
+                        break;
+                    }
+                }
+                if !force_allow {
+                    for rule in &cfg.deny_rules {
+                        if crate::tool_matches_rule(&iname, &iargs, rule) {
+                            dmsg = Some("denied by permission rule".into());
+                            break;
+                        }
+                    }
+                }
+                if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
+                    if let Some(m) = crate::workspace::check_dangerous_path(
+                        iargs.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                    ) {
+                        dmsg = Some(m);
+                    }
+                }
+                if dmsg.is_none() {
+                    let ihook = match iname.as_str() {
+                        "bash" => "pre_bash",
+                        "write_file" | "edit" => "pre_write",
+                        "read_file" | "grep" | "glob" => "pre_read",
+                        _ => "",
+                    };
+                    if !ihook.is_empty() {
+                        let session_id = cfg
+                            .session_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let workspace = cfg.workspace.display().to_string();
+                        for (pn, config) in &st.plugin_manager.get_hook_configs(ihook) {
+                            let ctx = crate::plugins::build_context(
+                                ihook,
+                                &iname,
+                                &workspace,
+                                Some(&modified),
+                                &session_id,
+                                config.pass_args,
+                            );
+                            let r = crate::plugins::execute_hook(ihook, pn, config, &ctx).await;
+                            if !r.allow {
+                                dmsg = Some(format!(
+                                    "denied by plugin '{}' hook '{}': {}",
+                                    pn, ihook, r.reason
+                                ));
+                                break;
+                            }
+                            if let Some(m) = &r.modify {
+                                crate::plugins::apply_modify(&mut modified, m);
+                            }
+                        }
+                        if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
+                            if let Some(m) = crate::workspace::check_dangerous_path(
+                                modified.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                            ) {
+                                dmsg = Some(m);
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = dmsg {
+                    bulk_denied.insert(i, m);
+                } else {
+                    *c = json!({ "name": iname, "args": modified });
+                }
+            }
+        }
+    }
+
     // Execute. bash/bulk/diagnostics/subagent are async; others sync. Hooks that
-    // amended `exec_args` are honored here.
+    // amended `exec_args` are honored here. The async ones are wrapped in a
+    // `select!` on the turn cancel so /abort can interrupt them mid-flight.
     let mut outcome = match name {
         "bash" => {
-            let cmd = exec_args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            tools::execute_bash(cmd, cfg).await
+            let cmd = exec_args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            tokio::select! {
+                o = tools::execute_bash(cmd, cfg) => o,
+                _ = cancel.cancelled() => Outcome::err("bash aborted"),
+            }
         }
-        "bulk" => tools::execute_bulk(&exec_args, cfg).await,
-        "diagnostics" => tools::execute_diagnostics(&exec_args, cfg).await,
-        "contact_supervisor" => execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await,
+        "bulk" => {
+            tokio::select! {
+                o = tools::execute_bulk(&exec_args, cfg, &bulk_denied) => o,
+                _ = cancel.cancelled() => Outcome::err("bulk aborted"),
+            }
+        }
+        "diagnostics" => {
+            tokio::select! {
+                o = tools::execute_diagnostics(&exec_args, cfg) => o,
+                _ = cancel.cancelled() => Outcome::err("diagnostics aborted"),
+            }
+        }
+        "contact_supervisor" => {
+            execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await
+        }
         "intercom" => execute_intercom(&exec_args, &st.intercom, my_target, cancel).await,
         "subagent" | "spawn" => {
             if depth + 1 >= max_depth {
-                Outcome::err(format!("nested subagent blocked at depth {} (max {})", depth + 1, max_depth))
+                Outcome::err(format!(
+                    "nested subagent blocked at depth {} (max {})",
+                    depth + 1,
+                    max_depth
+                ))
             } else {
-                execute(st.clone(), client.clone(), api_key.to_string(), parent_model.to_string(), exec_args.clone(), cancel.clone(), depth + 1).await
+                execute(
+                    st.clone(),
+                    client.clone(),
+                    api_key.to_string(),
+                    parent_model.to_string(),
+                    exec_args.clone(),
+                    cancel.clone(),
+                    depth + 1,
+                )
+                .await
             }
         }
         _ => tools::execute(name, &exec_args, cfg),
@@ -1038,7 +1617,12 @@ async fn dispatch_subagent_tool(
         let workspace = cfg.workspace.display().to_string();
         for (plugin_name, config) in &st.plugin_manager.get_hook_configs(post_hook) {
             let ctx = crate::plugins::build_context(
-                post_hook, name, &workspace, Some(&exec_args), &session_id, config.pass_args,
+                post_hook,
+                name,
+                &workspace,
+                Some(&exec_args),
+                &session_id,
+                config.pass_args,
             );
             let result = crate::plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
             if !result.reason.is_empty() {
@@ -1053,12 +1637,25 @@ async fn dispatch_subagent_tool(
     outcome
 }
 
-fn resolve_model_candidates(agent: &AgentConfig, parent_model: &str, override_model: Option<String>, _st: &Arc<State>) -> Vec<String> {
+fn resolve_model_candidates(
+    agent: &AgentConfig,
+    parent_model: &str,
+    override_model: Option<String>,
+    _st: &Arc<State>,
+) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
-    if let Some(m) = override_model { cands.push(m); }
-    if let Some(m) = &agent.model { cands.push(m.clone()); }
-    for m in &agent.fallback_models { cands.push(m.clone()); }
-    if cands.is_empty() { cands.push(parent_model.to_string()); }
+    if let Some(m) = override_model {
+        cands.push(m);
+    }
+    if let Some(m) = &agent.model {
+        cands.push(m.clone());
+    }
+    for m in &agent.fallback_models {
+        cands.push(m.clone());
+    }
+    if cands.is_empty() {
+        cands.push(parent_model.to_string());
+    }
     // keep only models known to the registry, but keep unknowns too (they may
     // be valid ids the registry didn't list); just dedup preserving order.
     let mut seen = std::collections::HashSet::new();
@@ -1079,24 +1676,38 @@ async fn stream_with_fallback(
     thinking_levels: &[String],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
-) -> Result<(Value, String, u64, u64, u64), String> {
+) -> Result<(Value, String, u64, u64, u64, String), String> {
     let mut last_err = String::from("no model candidates");
     for (i, model) in candidates.iter().enumerate() {
-        let levels = if thinking_levels.is_empty() {
-            // re-resolve per model
-            Vec::new()
-        } else {
-            thinking_levels.to_vec()
-        };
-        match crate::provider::stream_turn(client, cfg, api_key, model, messages, tools, effort, &levels, cancel, timer, true).await {
-            Ok(v) => return Ok(v),
+        // Always re-resolve thinking_levels per candidate model (a fallback model
+        // may support different effort labels than the parent/primary). Passing
+        // empty lets stream_turn re-resolve from the registry for THIS model
+        // instead of reusing the parent's levels for every candidate.
+        let _ = thinking_levels;
+        let levels: Vec<String> = Vec::new();
+        match crate::provider::stream_turn(
+            client, cfg, api_key, model, messages, tools, effort, &levels, cancel, timer, true,
+        )
+        .await
+        {
+            Ok((assistant, fr, ti, to, cached)) => {
+                return Ok((assistant, fr, ti, to, cached, model.clone()))
+            }
             Err(e) => {
                 if e == "aborted" || cancel.is_cancelled() {
                     return Err(e);
                 }
                 last_err = format!("model {} failed: {e}", model);
                 if i + 1 < candidates.len() {
-                    emit(&Event::new("info").with("message", json!(format!("subagent model '{}' failed ({}); falling back to '{}'", model, e, candidates[i + 1]))));
+                    emit(&Event::new("info").with(
+                        "message",
+                        json!(format!(
+                            "subagent model '{}' failed ({}); falling back to '{}'",
+                            model,
+                            e,
+                            candidates[i + 1]
+                        )),
+                    ));
                 }
             }
         }
@@ -1104,31 +1715,121 @@ async fn stream_with_fallback(
     Err(last_err)
 }
 
-fn emit_subagent_progress(run_id: &str, agent: &AgentConfig, phase: &str, tool: &str, tool_count: u32, tokens_in: u64, tokens_out: u64, elapsed_ms: u64, ok: bool) {
-    emit(&Event::new("subagent_progress")
-        .with("run_id", json!(run_id))
-        .with("agent", json!(agent.name))
-        .with("phase", json!(phase))
-        .with("tool", json!(tool))
-        .with("tool_count", json!(tool_count))
-        .with("tokens_in", json!(tokens_in))
-        .with("tokens_out", json!(tokens_out))
-        .with("elapsed_ms", json!(elapsed_ms))
-        .with("ok", json!(ok)));
+fn emit_subagent_progress(
+    run_id: &str,
+    agent: &AgentConfig,
+    phase: &str,
+    tool: &str,
+    tool_count: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    elapsed_ms: u64,
+    ok: bool,
+) {
+    emit(
+        &Event::new("subagent_progress")
+            .with("run_id", json!(run_id))
+            .with("agent", json!(agent.name))
+            .with("phase", json!(phase))
+            .with("tool", json!(tool))
+            .with("tool_count", json!(tool_count))
+            .with("tokens_in", json!(tokens_in))
+            .with("tokens_out", json!(tokens_out))
+            .with("elapsed_ms", json!(elapsed_ms))
+            .with("ok", json!(ok)),
+    );
 }
 
 fn emit_subagent_summary(sub_in: u64, sub_out: u64, sub_cached: u64, last_model: &Option<String>) {
     let m = last_model.clone().unwrap_or_else(|| "?".into());
-    let pct = if sub_cached > 0 && sub_in > 0 { sub_cached * 100 / sub_in } else { 0 };
-    if sub_cached > 0 && sub_in > 0 {
-        emit(&Event::new("info").with("message", json!(format!("subagent done ({m}): {sub_in}+{sub_out}t ({pct}% cached)"))));
+    let pct = if sub_cached > 0 && sub_in > 0 {
+        sub_cached * 100 / sub_in
     } else {
-        emit(&Event::new("info").with("message", json!(format!("subagent done ({m}): {sub_in}+{sub_out}t"))));
+        0
+    };
+    if sub_cached > 0 && sub_in > 0 {
+        emit(&Event::new("info").with(
+            "message",
+            json!(format!(
+                "subagent done ({m}): {sub_in}+{sub_out}t ({pct}% cached)"
+            )),
+        ));
+    } else {
+        emit(&Event::new("info").with(
+            "message",
+            json!(format!("subagent done ({m}): {sub_in}+{sub_out}t")),
+        ));
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+/// Per-run caps to bound a runaway subagent's cost (no per-subagent
+/// max-session-tokens is otherwise enforced). A legit worker rarely hits these;
+/// a looping subagent stops here instead of spending unbounded tokens
+/// (multiplied across parallel fan-out).
+const SUBAGENT_MAX_TOOL_CALLS: u32 = 200;
+const SUBAGENT_MAX_TOKENS: u64 = 1_000_000;
+
+/// Best-effort redaction of common credential patterns from a forked
+/// transcript. Not exhaustive — the goal is to drop the obvious pasted
+/// secrets, not to be a perfect scanner. Quoted values ("key":"x") are not
+/// handled (the pattern avoids a literal quote so it stays a clean raw string);
+/// bare `key=value` / `key: value` and well-known token formats are masked.
+fn redact_secrets(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_\-]{35})|(Bearer\s+[A-Za-z0-9._\-]{20,})|((?:password|passwd|secret|api[_-]?key|apikey|token|authorization)\s*[:=]\s*)[A-Za-z0-9_\-+/=]{6,}"
+        ).unwrap()
+    });
+    re.replace_all(s, |caps: &regex::Captures| {
+        if caps.get(1).is_some() {
+            return "[REDACTED]".to_string();
+        }
+        if caps.get(2).is_some() {
+            return "Bearer [REDACTED]".to_string();
+        }
+        if let Some(p) = caps.get(3) {
+            return format!("{}[REDACTED]", p.as_str());
+        }
+        "[REDACTED]".to_string()
+    })
+    .to_string()
+}
+
+/// Redact secrets from a forked message's text content (string or multimodal).
+fn redact_message_secrets(m: &Value) -> Value {
+    let mut clean = m.clone();
+    if let Some(obj) = clean.as_object_mut() {
+        if let Some(content) = obj.get_mut("content") {
+            match content {
+                Value::String(s) => *s = redact_secrets(s),
+                Value::Array(arr) => {
+                    for part in arr.iter_mut() {
+                        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            let redacted = part
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(redact_secrets);
+                            if let (Some(r), Some(po)) = (redacted, part.as_object_mut()) {
+                                po.insert("text".into(), Value::String(r));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    clean
 }
 
 fn now_ms() -> u64 {
@@ -1158,9 +1859,17 @@ async fn run_parallel(
         return Outcome::err("parallel requires a non-empty 'tasks' array");
     }
     if tasks.len() as u32 > cfg.subagents.parallel_max_tasks {
-        return Outcome::err(format!("parallel has {} tasks (max {})", tasks.len(), cfg.subagents.parallel_max_tasks));
+        return Outcome::err(format!(
+            "parallel has {} tasks (max {})",
+            tasks.len(),
+            cfg.subagents.parallel_max_tasks
+        ));
     }
-    let concurrency = args.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(cfg.subagents.parallel_concurrency as u64).max(1) as usize;
+    let concurrency = args
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(cfg.subagents.parallel_concurrency as u64)
+        .max(1) as usize;
     let context = args.get("context").and_then(|v| v.as_str());
 
     // resolve agents up front (fail fast on a bad name)
@@ -1174,7 +1883,11 @@ async fn run_parallel(
             None => return Outcome::err(format!("parallel task {i}: unknown agent '{an}'")),
         };
         agent_names.push(agent.name.clone());
-        let task = t.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task = t
+            .get("task")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let model_override = t.get("model").and_then(|v| v.as_str()).map(String::from);
         let ctx = match context {
             Some("fork") => ContextKind::Fork,
@@ -1185,35 +1898,68 @@ async fn run_parallel(
     }
 
     let run_id = next_run_id();
+    // Child token so interrupt_action cancels just this batch (and a parent
+    // /abort propagates), not the whole orchestrator.
+    let run_cancel = cancel.child_token();
     let run = SubagentRun {
-        id: run_id.clone(), mode: "parallel".into(), agent: None, agents: agent_names.clone(),
-        state: "running".into(), started_at: now_ms(), ended_at: None, depth,
-        intercom_target: None, cancel: Some(Arc::new(cancel.clone())), children: vec![], summary: None,
+        id: run_id.clone(),
+        mode: "parallel".into(),
+        agent: None,
+        agents: agent_names.clone(),
+        state: "running".into(),
+        started_at: now_ms(),
+        ended_at: None,
+        depth,
+        intercom_target: None,
+        cancel: Some(Arc::new(run_cancel.clone())),
+        children: vec![],
+        summary: None,
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
 
-    // run all tasks with a concurrency semaphore; collect results in order
+    // run all tasks with a concurrency semaphore; collect results in order.
+    // Tasks run on JoinHandles (not a channel) so a panicking task is observed
+    // (JoinHandle::await -> Err(JoinError)) and reported as an error for its
+    // index, instead of silently dropped and mislabeled (P1-8).
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Outcome)>();
+    let mut handles: Vec<(usize, tokio::task::JoinHandle<Outcome>)> =
+        Vec::with_capacity(tasks.len());
     for (i, (agent, task, model_override, ctx)) in resolved.into_iter().enumerate() {
         let stc = st.clone();
         let clientc = client.clone();
         let apik = api_key.to_string();
         let pm = parent_model.to_string();
-        let cancelc = cancel.clone();
+        let cancelc = run_cancel.clone(); // child of parent; interrupt cancels just this batch
         let semc = sem.clone();
-        let txc = tx.clone();
         let rid = format!("{}-{}", run_id, i);
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             let _permit = semc.acquire().await.ok();
-            let o = run_single(&stc, &clientc, &apik, &pm, &agent, &task, &rid, model_override, ctx, depth, &cancelc).await;
-            let _ = txc.send((i, o));
+            run_single(
+                &stc,
+                &clientc,
+                &apik,
+                &pm,
+                &agent,
+                &task,
+                &rid,
+                model_override,
+                ctx,
+                depth,
+                &cancelc,
+            )
+            .await
         });
+        handles.push((i, h));
     }
-    drop(tx);
-    let mut collected: Vec<(usize, Outcome)> = Vec::with_capacity(tasks.len());
-    while let Some(item) = rx.recv().await {
-        collected.push(item);
+    let mut collected: Vec<(usize, Outcome)> = Vec::with_capacity(handles.len());
+    for (i, h) in handles {
+        match h.await {
+            Ok(o) => collected.push((i, o)),
+            Err(_) => collected.push((
+                i,
+                Outcome::err("parallel task panicked (internal error — see debug log)"),
+            )),
+        }
     }
     collected.sort_by_key(|(i, _)| *i);
 
@@ -1226,11 +1972,21 @@ async fn run_parallel(
 
     let mut blocks = String::new();
     let mut all_ok = true;
-    for (i, (_, o)) in collected.iter().enumerate() {
-        if !o.ok { all_ok = false; }
-        blocks.push_str(&format!("=== Parallel Task {} ({}) ===\n{}\n\n", i + 1, agent_names.get(i).cloned().unwrap_or_default(), o.output));
+    for (i, o) in collected.iter() {
+        if !o.ok {
+            all_ok = false;
+        }
+        blocks.push_str(&format!(
+            "=== Parallel Task {} ({}) ===\n{}\n\n",
+            i + 1,
+            agent_names.get(*i).cloned().unwrap_or_default(),
+            o.output
+        ));
     }
-    Outcome { ok: all_ok, output: blocks.trim().to_string() }
+    Outcome {
+        ok: all_ok,
+        output: blocks.trim().to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,10 +2017,21 @@ async fn run_chain(
     let mut previous = String::new();
 
     let run = SubagentRun {
-        id: run_id.clone(), mode: "chain".into(), agent: None,
-        agents: chain.iter().filter_map(|s| s.get("agent").and_then(|v| v.as_str()).map(String::from)).collect(),
-        state: "running".into(), started_at: now_ms(), ended_at: None, depth,
-        intercom_target: None, cancel: Some(Arc::new(cancel.clone())), children: vec![], summary: None,
+        id: run_id.clone(),
+        mode: "chain".into(),
+        agent: None,
+        agents: chain
+            .iter()
+            .filter_map(|s| s.get("agent").and_then(|v| v.as_str()).map(String::from))
+            .collect(),
+        state: "running".into(),
+        started_at: now_ms(),
+        ended_at: None,
+        depth,
+        intercom_target: None,
+        cancel: Some(Arc::new(cancel.clone())),
+        children: vec![],
+        summary: None,
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
 
@@ -1275,9 +2042,22 @@ async fn run_chain(
         // parallel group?
         if let Some(group) = step.get("parallel").and_then(|v| v.as_array()) {
             let group_args = json!({ "tasks": group, "context": args.get("context").and_then(|v| v.as_str()).unwrap_or("fresh"), "concurrency": step.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(cfg.subagents.parallel_concurrency as u64) });
-            let o = Box::pin(run_parallel(st, client, api_key, parent_model, group, &group_args, depth, cancel)).await;
+            let o = Box::pin(run_parallel(
+                st,
+                client,
+                api_key,
+                parent_model,
+                group,
+                &group_args,
+                depth,
+                cancel,
+            ))
+            .await;
             if !o.ok {
-                return Outcome::err(format!("chain step {step_i} (parallel group) failed: {}", o.output));
+                return Outcome::err(format!(
+                    "chain step {step_i} (parallel group) failed: {}",
+                    o.output
+                ));
             }
             previous = o.output.clone();
             if let Some(as_name) = step.get("as").and_then(|v| v.as_str()) {
@@ -1291,7 +2071,10 @@ async fn run_chain(
             Some(a) => a.clone(),
             None => return Outcome::err(format!("chain step {step_i}: unknown agent '{an}'")),
         };
-        let task_tmpl = step.get("task").and_then(|v| v.as_str()).unwrap_or("{previous}");
+        let task_tmpl = step
+            .get("task")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{previous}");
         let task = render_task(task_tmpl, &previous, &outputs, &chain_dir);
         let model_override = step.get("model").and_then(|v| v.as_str()).map(String::from);
         let context = match args.get("context").and_then(|v| v.as_str()) {
@@ -1300,10 +2083,33 @@ async fn run_chain(
             _ => agent.default_context.clone().unwrap_or(ContextKind::Fresh),
         };
         let step_id = format!("{run_id}-{step_i}");
-        emit(&Event::new("info").with("message", json!(format!("chain step {step_i}+1: {} — {}", agent.name, truncate(&task, 80)))));
-        let o = run_single(st, client, api_key, parent_model, &agent, &task, &step_id, model_override, context, depth, cancel).await;
+        emit(&Event::new("info").with(
+            "message",
+            json!(format!(
+                "chain step {step_i}+1: {} — {}",
+                agent.name,
+                truncate(&task, 80)
+            )),
+        ));
+        let o = run_single(
+            st,
+            client,
+            api_key,
+            parent_model,
+            &agent,
+            &task,
+            &step_id,
+            model_override,
+            context,
+            depth,
+            cancel,
+        )
+        .await;
         if !o.ok {
-            return Outcome::err(format!("chain step {step_i} ({}) failed: {}", agent.name, o.output));
+            return Outcome::err(format!(
+                "chain step {step_i} ({}) failed: {}",
+                agent.name, o.output
+            ));
         }
         previous = o.output.clone();
         if let Some(as_name) = step.get("as").and_then(|v| v.as_str()) {
@@ -1321,7 +2127,12 @@ async fn run_chain(
 
 /// Render a chain task template, substituting {previous}, {outputs.name},
 /// {task}, {chain_dir}.
-fn render_task(tmpl: &str, previous: &str, outputs: &HashMap<String, String>, chain_dir: &std::path::Path) -> String {
+fn render_task(
+    tmpl: &str,
+    previous: &str,
+    outputs: &HashMap<String, String>,
+    chain_dir: &std::path::Path,
+) -> String {
     let mut out = tmpl.replace("{previous}", previous);
     out = out.replace("{chain_dir}", &chain_dir.display().to_string());
     // {outputs.name}
@@ -1395,7 +2206,11 @@ async fn handle_action(
 }
 
 fn source_label(s: &AgentSource) -> &'static str {
-    match s { AgentSource::Builtin => "builtin", AgentSource::User => "user", AgentSource::Project => "project" }
+    match s {
+        AgentSource::Builtin => "builtin",
+        AgentSource::User => "user",
+        AgentSource::Project => "project",
+    }
 }
 
 fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
@@ -1404,23 +2219,44 @@ fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
         None => return Outcome::err("create requires 'config' with name + systemPrompt"),
     };
     let name = cfg.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    if name.is_empty() { return Outcome::err("create config requires 'name'"); }
-    let scope = cfg.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
+    if name.is_empty() {
+        return Outcome::err("create config requires 'name'");
+    }
+    let scope = cfg
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
     let dir = match scope {
-        "user" => crate::config::home_dir().map(|h| h.join(".umans-harness/agents")).unwrap_or_else(|| workspace.join(".umans-harness/agents")),
+        "user" => crate::config::home_dir()
+            .map(|h| h.join(".umans-harness/agents"))
+            .unwrap_or_else(|| workspace.join(".umans-harness/agents")),
         _ => workspace.join(".umans-harness/agents"),
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Outcome::err(format!("create mkdir failed: {e}"));
     }
     let path = dir.join(format!("{name}.md"));
-    let body = cfg.get("systemPrompt").and_then(|v| v.as_str()).unwrap_or("");
+    let body = cfg
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let mut fm = format!("---\nname: {name}\n");
-    if let Some(d) = cfg.get("description").and_then(|v| v.as_str()) { fm.push_str(&format!("description: {d}\n")); }
-    if let Some(t) = cfg.get("tools").and_then(|v| v.as_str()) { fm.push_str(&format!("tools: {t}\n")); }
-    if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) { fm.push_str(&format!("model: {m}\n")); }
-    if let Some(t) = cfg.get("thinking").and_then(|v| v.as_str()) { fm.push_str(&format!("thinking: {t}\n")); }
-    let mode = cfg.get("systemPromptMode").and_then(|v| v.as_str()).unwrap_or("replace");
+    if let Some(d) = cfg.get("description").and_then(|v| v.as_str()) {
+        fm.push_str(&format!("description: {d}\n"));
+    }
+    if let Some(t) = cfg.get("tools").and_then(|v| v.as_str()) {
+        fm.push_str(&format!("tools: {t}\n"));
+    }
+    if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) {
+        fm.push_str(&format!("model: {m}\n"));
+    }
+    if let Some(t) = cfg.get("thinking").and_then(|v| v.as_str()) {
+        fm.push_str(&format!("thinking: {t}\n"));
+    }
+    let mode = cfg
+        .get("systemPromptMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("replace");
     fm.push_str(&format!("systemPromptMode: {mode}\n"));
     fm.push_str("---\n\n");
     fm.push_str(body);
@@ -1432,42 +2268,80 @@ fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
 
 fn update_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-    if name.is_empty() { return Outcome::err("update requires 'agent'"); }
+    if name.is_empty() {
+        return Outcome::err("update requires 'agent'");
+    }
     // find the file
     let candidates = [
-        workspace.join(".umans-harness/agents").join(format!("{name}.md")),
-        crate::config::home_dir().map(|h| h.join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
+        workspace
+            .join(".umans-harness/agents")
+            .join(format!("{name}.md")),
+        crate::config::home_dir()
+            .map(|h| h.join(format!(".umans-harness/agents/{name}.md")))
+            .unwrap_or_default(),
     ];
     let path = candidates.iter().find(|p| p.exists()).cloned();
     let path = match path {
         Some(p) => p,
-        None => return Outcome::err(format!("agent '{name}' not found to update; create it first")),
+        None => {
+            return Outcome::err(format!(
+                "agent '{name}' not found to update; create it first"
+            ))
+        }
     };
     let cfg = match args.get("config") {
         Some(v) => v,
         None => return Outcome::err("update requires 'config'"),
     };
     let (mut fm, body) = parse_frontmatter(&std::fs::read_to_string(&path).unwrap_or_default());
-    if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) { fm.insert("model".into(), m.into()); }
-    if let Some(t) = cfg.get("thinking").and_then(|v| v.as_str()) { fm.insert("thinking".into(), t.into()); }
-    if let Some(d) = cfg.get("description").and_then(|v| v.as_str()) { fm.insert("description".into(), d.into()); }
-    if let Some(t) = cfg.get("tools").and_then(|v| v.as_str()) { fm.insert("tools".into(), t.into()); }
+    if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) {
+        fm.insert("model".into(), m.into());
+    }
+    if let Some(t) = cfg.get("thinking").and_then(|v| v.as_str()) {
+        fm.insert("thinking".into(), t.into());
+    }
+    if let Some(d) = cfg.get("description").and_then(|v| v.as_str()) {
+        fm.insert("description".into(), d.into());
+    }
+    if let Some(t) = cfg.get("tools").and_then(|v| v.as_str()) {
+        fm.insert("tools".into(), t.into());
+    }
     if let Some(b) = cfg.get("systemPrompt").and_then(|v| v.as_str()) {
-        let out = format!("---\n{}\n---\n\n{}", fm.iter().map(|(k,v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"), b);
+        let out = format!(
+            "---\n{}\n---\n\n{}",
+            fm.iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            b
+        );
         let _ = std::fs::write(&path, out);
         return Outcome::ok(format!("updated agent '{name}'"));
     }
-    let out = format!("---\n{}\n---\n\n{}", fm.iter().map(|(k,v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"), body);
+    let out = format!(
+        "---\n{}\n---\n\n{}",
+        fm.iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        body
+    );
     let _ = std::fs::write(&path, out);
     Outcome::ok(format!("updated agent '{name}'"))
 }
 
 fn delete_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-    if name.is_empty() { return Outcome::err("delete requires 'agent'"); }
+    if name.is_empty() {
+        return Outcome::err("delete requires 'agent'");
+    }
     let candidates = [
-        workspace.join(".umans-harness/agents").join(format!("{name}.md")),
-        crate::config::home_dir().map(|h| h.join(format!(".umans-harness/agents/{name}.md"))).unwrap_or_default(),
+        workspace
+            .join(".umans-harness/agents")
+            .join(format!("{name}.md")),
+        crate::config::home_dir()
+            .map(|h| h.join(format!(".umans-harness/agents/{name}.md")))
+            .unwrap_or_default(),
     ];
     for p in &candidates {
         if p.exists() {
@@ -1477,7 +2351,9 @@ fn delete_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
             return Outcome::ok(format!("deleted agent '{name}'"));
         }
     }
-    Outcome::err(format!("agent '{name}' not found (builtins cannot be deleted; override with disabled:true)"))
+    Outcome::err(format!(
+        "agent '{name}' not found (builtins cannot be deleted; override with disabled:true)"
+    ))
 }
 
 async fn status_action(args: &Value, st: &Arc<State>) -> Outcome {
@@ -1514,14 +2390,17 @@ async fn interrupt_action(args: &Value, st: &Arc<State>) -> Outcome {
 
 async fn resume_action(args: &Value, st: &Arc<State>, _cancel: &CancellationToken) -> Outcome {
     // Resume is acknowledged: a follow-up message is delivered to the child's
-    // intercom target if it is still registered, otherwise we report that the
-    // run has completed and suggest a new run.
+    // intercom target if it is still registered (targets() now excludes
+    // unregistered peers, so a finished run reports "no longer live" rather
+    // than falsely claiming delivery), otherwise we suggest a new run.
     let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-    let runs = st.subagent_runs.lock().await;
-    let r = match find_run_prefix(&runs, id) {
-        Some(r) => r.clone(),
-        None => return Outcome::err(format!("no run matching '{id}'")),
+    let r = {
+        let runs = st.subagent_runs.lock().await;
+        match find_run_prefix(&runs, id) {
+            Some(r) => r.clone(),
+            None => return Outcome::err(format!("no run matching '{id}'")),
+        }
     };
     if let Some(target) = &r.intercom_target {
         if st.intercom.targets().iter().any(|t| t == target) {
@@ -1534,39 +2413,84 @@ async fn resume_action(args: &Value, st: &Arc<State>, _cancel: &CancellationToke
                 ts: now_ms(),
                 ask_id: String::new(),
             };
-            let _ = st.intercom.post(msg);
-            return Outcome::ok(format!("resume message delivered to {target}"));
+            // Surface a delivery failure (e.g. the run ended between the
+            // liveness check and the post) instead of silently reporting success.
+            match st.intercom.post(msg) {
+                Ok(()) => return Outcome::ok(format!("resume message delivered to {target}")),
+                Err(e) => return Outcome::err(format!("resume delivery failed: {e}")),
+            }
         }
     }
-    Outcome::ok(format!("run {} is no longer live; start a new run to continue", r.id))
+    Outcome::ok(format!(
+        "run {} is no longer live; start a new run to continue",
+        r.id
+    ))
 }
 
-fn find_run_prefix<'a>(runs: &'a HashMap<String, SubagentRun>, id: &str) -> Option<&'a SubagentRun> {
-    runs.get(id).or_else(|| runs.values().find(|r| r.id.starts_with(id) || id.starts_with(&r.id)))
+fn find_run_prefix<'a>(
+    runs: &'a HashMap<String, SubagentRun>,
+    id: &str,
+) -> Option<&'a SubagentRun> {
+    runs.get(id).or_else(|| {
+        runs.values()
+            .find(|r| r.id.starts_with(id) || id.starts_with(&r.id))
+    })
 }
 
-fn find_run_prefix_mut<'a>(runs: &'a mut HashMap<String, SubagentRun>, id: &str) -> Option<&'a mut SubagentRun> {
+fn find_run_prefix_mut<'a>(
+    runs: &'a mut HashMap<String, SubagentRun>,
+    id: &str,
+) -> Option<&'a mut SubagentRun> {
     if runs.contains_key(id) {
         return runs.get_mut(id);
     }
-    let key = runs.values().find(|r| r.id.starts_with(id) || id.starts_with(&r.id)).map(|r| r.id.clone())?;
+    let key = runs
+        .values()
+        .find(|r| r.id.starts_with(id) || id.starts_with(&r.id))
+        .map(|r| r.id.clone())?;
     runs.get_mut(&key)
 }
 
 fn format_run(r: &SubagentRun) -> String {
-    let dur = r.ended_at.map(|e| e.saturating_sub(r.started_at) / 1000).unwrap_or(0);
-    format!("[{}] {} ({}) — {} — {}s — target: {}", r.state, r.id, r.mode, r.agents.join(","), dur, r.intercom_target.clone().unwrap_or("-".into()))
+    let dur = r
+        .ended_at
+        .map(|e| e.saturating_sub(r.started_at) / 1000)
+        .unwrap_or(0);
+    format!(
+        "[{}] {} ({}) — {} — {}s — target: {}",
+        r.state,
+        r.id,
+        r.mode,
+        r.agents.join(","),
+        dur,
+        r.intercom_target.clone().unwrap_or("-".into())
+    )
 }
 
 async fn doctor_action(workspace: &std::path::Path, cfg: &Config, st: &Arc<State>) -> Outcome {
     let agents = discover_agents(workspace, &cfg.subagents);
     let mut lines = Vec::new();
     lines.push(format!("agents discovered: {}", agents.len()));
-    lines.push(format!("max subagent depth: {}", resolve_max_depth(&cfg.subagents)));
-    lines.push(format!("intercom bridge mode: {}", cfg.subagents.intercom_bridge_mode.as_str()));
-    lines.push(format!("intercom known targets: {}", st.intercom.targets().join(", ")));
-    lines.push(format!("intercom pending asks: {}", st.intercom.pending_count()));
-    lines.push(format!("parallel: maxTasks={}, concurrency={}", cfg.subagents.parallel_max_tasks, cfg.subagents.parallel_concurrency));
+    lines.push(format!(
+        "max subagent depth: {}",
+        resolve_max_depth(&cfg.subagents)
+    ));
+    lines.push(format!(
+        "intercom bridge mode: {}",
+        cfg.subagents.intercom_bridge_mode.as_str()
+    ));
+    lines.push(format!(
+        "intercom known targets: {}",
+        st.intercom.targets().join(", ")
+    ));
+    lines.push(format!(
+        "intercom pending asks: {}",
+        st.intercom.pending_count()
+    ));
+    lines.push(format!(
+        "parallel: maxTasks={}, concurrency={}",
+        cfg.subagents.parallel_max_tasks, cfg.subagents.parallel_concurrency
+    ));
     let runs = st.subagent_runs.lock().await;
     lines.push(format!("tracked runs: {}", runs.len()));
     for r in runs.values() {
@@ -1581,7 +2505,8 @@ mod tests {
 
     #[test]
     fn frontmatter_parses() {
-        let (fm, body) = parse_frontmatter("---\nname: scout\ntools: read, grep\n---\n\nYou are a scout.");
+        let (fm, body) =
+            parse_frontmatter("---\nname: scout\ntools: read, grep\n---\n\nYou are a scout.");
         assert_eq!(fm.get("name").unwrap(), "scout");
         assert_eq!(fm.get("tools").unwrap(), "read, grep");
         assert!(body.starts_with("You are a scout."));
@@ -1591,7 +2516,16 @@ mod tests {
     fn builtin_agents_present() {
         let v = builtin_agents();
         let names: Vec<&str> = v.iter().map(|a| a.name.as_str()).collect();
-        for n in ["scout", "researcher", "planner", "worker", "reviewer", "context-builder", "oracle", "delegate"] {
+        for n in [
+            "scout",
+            "researcher",
+            "planner",
+            "worker",
+            "reviewer",
+            "context-builder",
+            "oracle",
+            "delegate",
+        ] {
             assert!(names.contains(&n), "missing builtin {n}");
         }
     }
@@ -1608,7 +2542,12 @@ mod tests {
     fn render_task_substitutes() {
         let mut outputs = HashMap::new();
         outputs.insert("context".into(), "CTX".into());
-        let r = render_task("plan from {outputs.context} and {previous}", "PREV", &outputs, std::path::Path::new("/tmp"));
+        let r = render_task(
+            "plan from {outputs.context} and {previous}",
+            "PREV",
+            &outputs,
+            std::path::Path::new("/tmp"),
+        );
         assert_eq!(r, "plan from CTX and PREV");
     }
 

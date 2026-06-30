@@ -8,14 +8,15 @@ use serde_json::{json, Value};
 /// ToolKind drives the approval gate in main.rs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolKind {
-    ReadOnly,   // read_file, list_dir, grep, glob — never gated
-    Destructive,// bash, write_file, edit — gated under Approval::Destructive
+    ReadOnly,    // read_file, list_dir, grep, glob — never gated
+    Destructive, // bash, write_file, edit — gated under Approval::Destructive
 }
 
 /// Classify a tool by name for approval purposes.
 pub fn classify(name: &str) -> ToolKind {
     match name {
-        "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics" | "finish" | "contact_supervisor" | "intercom" => ToolKind::ReadOnly,
+        "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
+        | "finish" | "contact_supervisor" | "intercom" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -79,6 +80,22 @@ pub fn definitions() -> Vec<Value> {
                         "reply": { "type": "string" }
                     },
                     "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file's plain content. Call this before editing so you see the exact text to copy verbatim into edit's search/replace. Paths are relative to the workspace root; absolute paths and \"..\" escapes are rejected. Refuses files larger than the configured byte/line limits; pass `offset` (1-indexed line) and `limit` (line count) to page large files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer", "description": "1-indexed line to start reading from (for pagination)" },
+                        "limit": { "type": "integer", "description": "max lines to return (for pagination)" }
+                    },
+                    "required": ["path"]
                 }
             }
         }),
@@ -401,10 +418,16 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
 
 impl Outcome {
     pub fn ok(msg: impl Into<String>) -> Self {
-        Self { ok: true, output: msg.into() }
+        Self {
+            ok: true,
+            output: msg.into(),
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, output: msg.into() }
+        Self {
+            ok: false,
+            output: msg.into(),
+        }
     }
 }
 
@@ -422,7 +445,8 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
     if meta.len() > cfg.max_read_bytes {
         return Outcome::err(format!(
             "read_file {input:?} is {} bytes (max {}); use grep to slice it or pass offset/limit",
-            meta.len(), cfg.max_read_bytes
+            meta.len(),
+            cfg.max_read_bytes
         ));
     }
     let content = match std::fs::read_to_string(&path) {
@@ -433,7 +457,10 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
     // Optional pagination: offset (1-indexed) + limit slice a window so
     // files >max_read_lines still load page-by-page instead of being refused.
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
     if offset > 0 || limit.is_some() {
         let start = offset.saturating_sub(1).min(lines.len());
         let end = match limit {
@@ -442,7 +469,12 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
         };
         let window = &lines[start..end];
         let mut out = String::new();
-        out.push_str(&format!("# {input} lines {}-{} of {}\n", start + 1, end, lines.len()));
+        out.push_str(&format!(
+            "# {input} lines {}-{} of {}\n",
+            start + 1,
+            end,
+            lines.len()
+        ));
         for l in window {
             out.push_str(l);
             out.push('\n');
@@ -452,13 +484,13 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
     if lines.len() > cfg.max_read_lines {
         return Outcome::err(format!(
             "read_file {input:?} has {} lines (max {}); pass offset/limit to page it",
-            lines.len(), cfg.max_read_lines
+            lines.len(),
+            cfg.max_read_lines
         ));
     }
     // Plain content: the model copies substrings verbatim for edit's search/replace.
     Outcome::ok(content)
 }
-
 
 fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
     // P0-3: enforce the dangerous-path blocklist inside the primitive so every
@@ -531,7 +563,8 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     // re-read, and only when context > 0.
     let mut records: Vec<(String, usize, String)> = Vec::new();
     let mut file_order: Vec<String> = Vec::new();
-    let mut per_file: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut per_file: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
     let mut dirs: Vec<std::path::PathBuf> = vec![root.clone()];
     let mut seen = 0u32;
     let mut capped = false;
@@ -553,7 +586,10 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
             if ft.is_dir() {
                 // ponytail: skip VCS/build dirs — noise.
                 let name = e.file_name().to_string_lossy().to_string();
-                if !matches!(name.as_str(), ".git" | "node_modules" | "target" | "dist" | "build" | ".venv") {
+                if !matches!(
+                    name.as_str(),
+                    ".git" | "node_modules" | "target" | "dist" | "build" | ".venv"
+                ) {
                     dirs.push(p);
                 }
                 continue;
@@ -561,16 +597,31 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
             if !ft.is_file() {
                 continue;
             }
-            if p.extension().and_then(|x| x.to_str()).map(|x| x.len()).unwrap_or(0) > 40 {
+            if p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.len())
+                .unwrap_or(0)
+                > 40
+            {
                 continue; // skip binary-ish extensions
             }
             // ponytail: size guard + content sniff so we don't slurp a 2GB log.
             let Ok(meta) = e.metadata() else { continue };
-            if meta.len() > 5_000_000 { continue; } // 5MB cap per file
-            let Ok(content) = std::fs::read_to_string(&p) else { continue };
+            if meta.len() > 5_000_000 {
+                continue;
+            } // 5MB cap per file
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             // binary sniff: NUL bytes mean binary — skip.
-            if content.contains('\0') { continue; }
-            let rel = p.strip_prefix(&cfg.workspace).unwrap_or(&p).display().to_string();
+            if content.contains('\0') {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&cfg.workspace)
+                .unwrap_or(&p)
+                .display()
+                .to_string();
             for (i, line) in content.lines().enumerate() {
                 if re.is_match(line) {
                     records.push((rel.clone(), i, line.to_string()));
@@ -617,7 +668,9 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     let mut total = 0usize;
     for rel in &file_order {
         let path = cfg.workspace.join(rel);
-        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let lines: Vec<&str> = content.lines().collect();
         let idxs = per_file.get(rel).cloned().unwrap_or_default();
         // Merge overlapping/adjacent [start, end] windows (0-based, inclusive).
@@ -675,7 +728,13 @@ fn glob(pattern: &str, cfg: &Config) -> Outcome {
 
 // ponytail: hand-rolled glob. Supports *, **, ?, and literal segments.
 // Not a full POSIX glob; covers the common **/*.ext and dir/*.rs patterns.
-fn walk_glob(root: &std::path::Path, dir: &std::path::Path, pattern: &str, out: &mut Vec<String>, depth: usize) {
+fn walk_glob(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    pattern: &str,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
     if out.len() >= 200 || depth > 15 {
         return;
     }
@@ -688,7 +747,10 @@ fn walk_glob(root: &std::path::Path, dir: &std::path::Path, pattern: &str, out: 
             break;
         }
         let name = e.file_name().to_string_lossy().to_string();
-        if matches!(name.as_str(), ".git" | "node_modules" | "target" | "dist" | "build" | ".venv") {
+        if matches!(
+            name.as_str(),
+            ".git" | "node_modules" | "target" | "dist" | "build" | ".venv"
+        ) {
             continue;
         }
         let p = e.path();
@@ -852,17 +914,27 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
     // UMANS_*, arbitrary PATH/HOME overrides) into bash — even inside a sandbox
     // these could subvert tool execution. Keep only the essentials.
     cmd.env_clear();
-    cmd.env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()));
-    if let Ok(home) = std::env::var("HOME") { cmd.env("HOME", home); }
-    if let Ok(tmp) = std::env::var("TMPDIR") { cmd.env("TMPDIR", tmp); }
-    if let Ok(user) = std::env::var("USER") { cmd.env("USER", user); }
+    cmd.env(
+        "PATH",
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+    );
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    if let Ok(tmp) = std::env::var("TMPDIR") {
+        cmd.env("TMPDIR", tmp);
+    }
+    if let Ok(user) = std::env::var("USER") {
+        cmd.env("USER", user);
+    }
 
     let child: tokio::process::Child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let hint = match cfg.sandbox {
-                crate::config::Sandbox::Firejail if e.kind() == std::io::ErrorKind::NotFound =>
-                    " (is firejail installed and on PATH?)",
+                crate::config::Sandbox::Firejail if e.kind() == std::io::ErrorKind::NotFound => {
+                    " (is firejail installed and on PATH?)"
+                }
                 _ => "",
             };
             return Outcome::err(format!("bash failed to spawn: {e}{hint}"));
@@ -892,23 +964,38 @@ pub async fn execute_bash(command: &str, cfg: &Config) -> Outcome {
             // (where errors usually are) survives.
             const CAP: usize = 32_768;
             if combined.len() > CAP {
-                let start = combined.len() - CAP;
+                let mut start = combined.len() - CAP;
+                // Walk `start` back to a UTF-8 char boundary so slicing a
+                // multibyte string (emoji/CJK command output) doesn't panic
+                // with "byte index N is not a char boundary". Advances <= 3 bytes.
+                while !combined.is_char_boundary(start) {
+                    start -= 1;
+                }
                 let mut cut = String::with_capacity(CAP + 64);
                 cut.push_str("...[head truncated, showing last 32KB]...\n");
                 cut.push_str(&combined[start..]);
                 combined = cut;
             }
-            Outcome { ok, output: combined }
+            Outcome {
+                ok,
+                output: combined,
+            }
         }
         Ok(Err(e)) => Outcome::err(format!("bash wait failed: {e}")),
-        Err(_) => Outcome::err(format!("bash timed out after {}s (killed)", cfg.bash_timeout_secs)),
+        Err(_) => Outcome::err(format!(
+            "bash timed out after {}s (killed)",
+            cfg.bash_timeout_secs
+        )),
     }
 }
 
 /// Build the tokio Command for a bash invocation, applying the configured
 /// sandbox. Returns (optional temp profile path, Command). The profile path
 /// is kept alive for the lifetime of the returned Command via the temp file.
-fn build_bash_command(command: &str, cfg: &Config) -> (Option<std::path::PathBuf>, tokio::process::Command) {
+fn build_bash_command(
+    command: &str,
+    cfg: &Config,
+) -> (Option<std::path::PathBuf>, tokio::process::Command) {
     use crate::config::Sandbox;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -933,17 +1020,28 @@ fn build_bash_command(command: &str, cfg: &Config) -> (Option<std::path::PathBuf
             if let Some(cached_path) = cache.get(&(ws_key.clone(), cfg.no_network)) {
                 if cached_path.exists() {
                     let mut c = tokio::process::Command::new("firejail");
-                    c.arg("--quiet").arg("--profile").arg(cached_path).arg("bash").arg("-c").arg(command);
+                    c.arg("--quiet")
+                        .arg("--profile")
+                        .arg(cached_path)
+                        .arg("bash")
+                        .arg("-c")
+                        .arg(command);
                     return (Some(cached_path.clone()), c);
                 }
             }
             // Not cached or file missing — generate fresh.
             let profile = firejail_profile(&cfg.workspace, cfg.no_network);
-            let path = std::env::temp_dir().join(format!("umans-harness-fj-{:x}.profile", fxhash(&ws_key)));
+            let path = std::env::temp_dir()
+                .join(format!("umans-harness-fj-{:x}.profile", fxhash(&ws_key)));
             let _ = std::fs::write(&path, &profile);
             cache.insert((ws_key, cfg.no_network), path.clone());
             let mut c = tokio::process::Command::new("firejail");
-            c.arg("--quiet").arg("--profile").arg(&path).arg("bash").arg("-c").arg(command);
+            c.arg("--quiet")
+                .arg("--profile")
+                .arg(&path)
+                .arg("bash")
+                .arg("-c")
+                .arg(command);
             (Some(path), c)
         }
     }
@@ -967,7 +1065,14 @@ fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
     s.push_str("# auto-generated by umans-harness-core\n");
     s.push_str("# ponytail: whitelist the workspace + shell paths; deny everything else.\n");
     // Shell + coreutils locations
-    for p in ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives", "/dev/null"] {
+    for p in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/etc/alternatives",
+        "/dev/null",
+    ] {
         s.push_str(&format!("read-only {p}\n"));
     }
     // Workspace is read-write
@@ -988,7 +1093,6 @@ fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
     s.push_str("private-tmp\n");
     s
 }
-
 
 // ---- search/replace edit ----
 
@@ -1029,7 +1133,9 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
         let search = ev.get("search").and_then(|v| v.as_str()).unwrap_or("");
         let replace = ev.get("replace").and_then(|v| v.as_str()).unwrap_or("");
         if search.is_empty() {
-            return Outcome::err(format!("edit #{i}: 'search' must not be empty (use write_file for new files)"));
+            return Outcome::err(format!(
+                "edit #{i}: 'search' must not be empty (use write_file for new files)"
+            ));
         }
         let count = new_content.matches(search).count();
         if count == 0 {
@@ -1045,7 +1151,11 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
             ));
         }
         new_content = new_content.replacen(search, replace, 1);
-        log.push(format!("replaced {} byte(s) with {} byte(s)", search.len(), replace.len()));
+        log.push(format!(
+            "replaced {} byte(s) with {} byte(s)",
+            search.len(),
+            replace.len()
+        ));
         applied += 1;
     }
 
@@ -1072,15 +1182,22 @@ fn bulk_read(args: &Value, cfg: &Config) -> Outcome {
     for (i, p) in paths.iter().enumerate() {
         let Some(path) = p.as_str() else {
             ok = false;
-            blocks.push(format!("### [{i}] <invalid path>
-error: path must be a string"));
+            blocks.push(format!(
+                "### [{i}] <invalid path>
+error: path must be a string"
+            ));
             continue;
         };
         let r = read_file(path, p, cfg);
-        if !r.ok { ok = false; }
+        if !r.ok {
+            ok = false;
+        }
         blocks.push(format!("### [{i}] {path}\n{}", r.output));
     }
-    Outcome { ok, output: blocks.join("\n\n") }
+    Outcome {
+        ok,
+        output: blocks.join("\n\n"),
+    }
 }
 
 /// Write many files. One status line per file; ok only if every write succeeded.
@@ -1102,10 +1219,15 @@ fn bulk_write(args: &Value, cfg: &Config) -> Outcome {
             continue;
         }
         let r = write_file(path, content, cfg);
-        if !r.ok { ok = false; }
+        if !r.ok {
+            ok = false;
+        }
         lines.push(format!("[{i}] {path}: {}", r.output));
     }
-    Outcome { ok, output: lines.join("\n") }
+    Outcome {
+        ok,
+        output: lines.join("\n"),
+    }
 }
 
 /// Apply edits to many files. Each file's edits apply atomically to one snapshot;
@@ -1139,16 +1261,25 @@ fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
         // Wrap as an edit tool call and reuse execute_edit.
         let wrapped = json!({ "path": path, "edits": file_edits });
         let r = execute("edit", &wrapped, cfg);
-        if !r.ok { ok = false; }
+        if !r.ok {
+            ok = false;
+        }
         blocks.push(format!("### [{i}] {path}\n{}", r.output));
     }
-    Outcome { ok, output: blocks.join("\n\n") }
+    Outcome {
+        ok,
+        output: blocks.join("\n\n"),
+    }
 }
 
 /// Run many tool calls in one round-trip. Dispatches any built-in tool,
 /// including bash (awaited per-call). One result block per call, in order.
 /// ok only if every call succeeded.
-pub async fn execute_bulk(args: &Value, cfg: &Config) -> Outcome {
+pub async fn execute_bulk(
+    args: &Value,
+    cfg: &Config,
+    denied: &std::collections::HashMap<usize, String>,
+) -> Outcome {
     let Some(calls) = args.get("calls").and_then(|v| v.as_array()) else {
         return Outcome::err("bulk requires a 'calls' array");
     };
@@ -1158,8 +1289,20 @@ pub async fn execute_bulk(args: &Value, cfg: &Config) -> Outcome {
     let mut blocks: Vec<String> = Vec::with_capacity(calls.len());
     let mut ok = true;
     for (i, c) in calls.iter().enumerate() {
-        let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = c
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let inner_args = c.get("args").cloned().unwrap_or(json!({}));
+        // Caller-side gate (permission deny-rules + dangerous-path + plugin
+        // pre-hooks) may have denied this inner call so destructive ops can't
+        // evade the safety floor by hiding inside a bulk call. Render + skip.
+        if let Some(msg) = denied.get(&i) {
+            ok = false;
+            blocks.push(format!("### [{i}] {name}\n⚠ denied: {msg}"));
+            continue;
+        }
         if name.is_empty() {
             ok = false;
             blocks.push(format!("### [{i}] <missing name>\nerror: missing 'name'"));
@@ -1168,19 +1311,29 @@ pub async fn execute_bulk(args: &Value, cfg: &Config) -> Outcome {
         // ponytail: nested bulk/bash would recurse; block it to keep the gate simple.
         if name == "bulk" || name == "bulk_read" || name == "bulk_write" || name == "bulk_edit" {
             ok = false;
-            blocks.push(format!("### [{i}] {name}\nerror: nested bulk calls are not allowed"));
+            blocks.push(format!(
+                "### [{i}] {name}\nerror: nested bulk calls are not allowed"
+            ));
             continue;
         }
         let r = if name == "bash" {
-            let cmd = inner_args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = inner_args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             execute_bash(cmd, cfg).await
         } else {
             execute(&name, &inner_args, cfg)
         };
-        if !r.ok { ok = false; }
+        if !r.ok {
+            ok = false;
+        }
         blocks.push(format!("### [{i}] {name}\n{}", r.output));
     }
-    Outcome { ok, output: blocks.join("\n\n") }
+    Outcome {
+        ok,
+        output: blocks.join("\n\n"),
+    }
 }
 
 // ---- todo / plan tracking (item 5) ----
@@ -1211,7 +1364,9 @@ fn todo_write(args: &Value, cfg: &Config) -> Outcome {
             return Outcome::err(format!("todo #{i}: missing 'subject'"));
         }
         if !matches!(status, "pending" | "in_progress" | "completed") {
-            return Outcome::err(format!("todo #{i}: status must be pending|in_progress|completed, got {status:?}"));
+            return Outcome::err(format!(
+                "todo #{i}: status must be pending|in_progress|completed, got {status:?}"
+            ));
         }
     }
     let p = todo_path(cfg);
@@ -1253,7 +1408,11 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
             if let Err(e) = std::fs::write(&resolved, &new) {
                 return Outcome::err(format!("patch write failed: {e}"));
             }
-            Outcome::ok(format!("applied patch to {path} ({} -> {} bytes)", original.len(), new.len()))
+            Outcome::ok(format!(
+                "applied patch to {path} ({} -> {} bytes)",
+                original.len(),
+                new.len()
+            ))
         }
         Err(e) => Outcome::err(format!("patch failed: {e}")),
     }
@@ -1270,34 +1429,62 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
     while i < patch_lines.len() {
         let l = patch_lines[i];
         // Skip file headers (--- / +++) and diff --git lines.
-        if l.starts_with("---") || l.starts_with("+++") || l.starts_with("diff --git") || l.starts_with("Index:") {
+        if l.starts_with("---")
+            || l.starts_with("+++")
+            || l.starts_with("diff --git")
+            || l.starts_with("Index:")
+        {
             i += 1;
             continue;
         }
         if let Some(rest) = l.strip_prefix("@@") {
-            // Parse @@ -start,count +start2,count2 @@ context
-            // We only need the old start.
-            let old_start = rest.split(' ').find_map(|tok| {
-                tok.strip_prefix('-').and_then(|s| s.split(',').next()).and_then(|n| n.parse::<usize>().ok())
-            }).ok_or_else(|| format!("bad hunk header: {l}"))?;
+            // Parse @@ -start[,count] +start2[,count2] @@. We use the old start
+            // to locate the hunk and the old count to guard against a malformed
+            // hunk over-consuming source lines (which would silently mis-apply).
+            let (old_start, old_count) = rest
+                .split(' ')
+                .find_map(|tok| {
+                    tok.strip_prefix('-').and_then(|s| {
+                        let mut parts = s.split(',');
+                        let start = parts.next()?.parse::<usize>().ok()?;
+                        let count = parts
+                            .next()
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        Some((start, count))
+                    })
+                })
+                .ok_or_else(|| format!("bad hunk header: {l}"))?;
             i += 1;
             let mut target = old_start.saturating_sub(1); // 1-indexed -> 0
+            let mut consumed_old = 0usize;
             // Apply lines until the next hunk or EOF.
             while i < patch_lines.len() && !patch_lines[i].starts_with("@@") {
                 let pl = patch_lines[i];
                 if let Some(content) = pl.strip_prefix(' ') {
                     // context: must match
                     if target < lines.len() && lines[target] != content {
-                        return Err(format!("context mismatch at line {}: expected {:?}, got {:?}", target + 1, lines[target], content));
+                        return Err(format!(
+                            "context mismatch at line {}: expected {:?}, got {:?}",
+                            target + 1,
+                            lines[target],
+                            content
+                        ));
                     }
                     target += 1;
+                    consumed_old += 1;
                 } else if let Some(content) = pl.strip_prefix('-') {
                     // removal
                     if target < lines.len() && lines[target] == content {
                         lines.remove(target);
                     } else {
-                        return Err(format!("removal mismatch at line {}: {:?} not found", target + 1, content));
+                        return Err(format!(
+                            "removal mismatch at line {}: {:?} not found",
+                            target + 1,
+                            content
+                        ));
                     }
+                    consumed_old += 1;
                 } else if let Some(content) = pl.strip_prefix('+') {
                     // addition. Clamp the insert index so a blank context line
                     // (below) that advanced `target` past the end can't make this
@@ -1305,19 +1492,35 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
                     lines.insert(target.min(lines.len()), content.to_string());
                     target += 1;
                 } else if pl.is_empty() {
-                    // blank context line (treat as context)
+                    // A truly-empty line is non-standard unified diff, but some
+                    // tools emit it as a blank context line. Validate it matches
+                    // an empty source line so a stray blank can't silently
+                    // advance `target` past a real line and mis-apply the hunk.
+                    // It is NOT counted toward `consumed_old` — the hunk header's
+                    // count covers standard ` `/`-`/`+` lines, not these blanks.
+                    if target < lines.len() && !lines[target].is_empty() {
+                        return Err(format!("context mismatch at line {}: expected {:?}, got a blank (empty) context line", target + 1, lines[target]));
+                    }
                     target += 1;
                 } else {
                     // unknown line (\\ No newline, etc.) — skip
                 }
                 i += 1;
             }
+            // Guard against over-consumption (a valid diff never consumes more
+            // source lines than its header claims). Under-consumption is allowed
+            // leniently to avoid rejecting quirky-but-valid patches.
+            if old_count > 0 && consumed_old > old_count {
+                return Err(format!("hunk @{old_start},{old_count} consumed {consumed_old} source lines (over-consumption — malformed patch?)"));
+            }
             continue;
         }
         i += 1;
     }
     let mut out = lines.join("\n");
-    if had_trailing_nl { out.push('\n'); }
+    if had_trailing_nl {
+        out.push('\n');
+    }
     Ok(out)
 }
 
@@ -1327,7 +1530,9 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
 
 pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let target = if path.is_empty() { cfg.workspace.clone() } else {
+    let target = if path.is_empty() {
+        cfg.workspace.clone()
+    } else {
         match workspace::resolve(&cfg.workspace, path) {
             Ok(p) => p,
             Err(e) => return Outcome::err(e),
@@ -1335,34 +1540,100 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     };
     // Pick checker by marker files present.
     let (cmd, label) = if target.join("Cargo.toml").exists() {
-        (vec!["cargo", "check", "--message-format=short"], "cargo check")
+        (
+            vec!["cargo", "check", "--message-format=short"],
+            "cargo check",
+        )
     } else if target.join("package.json").exists() {
         // try tsc, fall back to npm run build if no tsc
-        (vec!["sh", "-c", "npx --no-install tsc --noEmit 2>&1 || npm run --silent build 2>&1"], "tsc/npm build")
+        (
+            vec![
+                "sh",
+                "-c",
+                "npx --no-install tsc --noEmit 2>&1 || npm run --silent build 2>&1",
+            ],
+            "tsc/npm build",
+        )
     } else if target.join("go.mod").exists() {
         (vec!["go", "build", "./..."], "go build")
     } else if target.join("pyproject.toml").exists() || target.join("setup.py").exists() {
         (vec!["sh", "-c", "python -m py_compile $(find . -name '*.py' -not -path './.venv/*' | head -50) 2>&1"], "py_compile")
     } else {
-        return Outcome::err("no recognized project marker (Cargo.toml/package.json/go.mod/pyproject.toml)");
+        return Outcome::err(
+            "no recognized project marker (Cargo.toml/package.json/go.mod/pyproject.toml)",
+        );
     };
     let mut c = tokio::process::Command::new(cmd[0]);
     c.args(&cmd[1..]);
     c.current_dir(&target);
     c.stdin(std::process::Stdio::null());
-    let out = match c.output().await {
-        Ok(o) => o,
+    c.stdout(std::process::Stdio::piped());
+    c.stderr(std::process::Stdio::piped());
+    // Kill the checker if its future is dropped (e.g. /abort cancels the turn
+    // via the outer select) AND bound it with a timeout — previously
+    // `c.output().await` had neither, so a wedged `cargo check`/`tsc`/`go build`
+    // stalled the whole agent and /abort couldn't interrupt it.
+    c.kill_on_drop(true);
+    // Mirror bash's env hygiene: drop the parent env (no LD_PRELOAD / proxy
+    // leak) and re-add only what a build/checker needs. Diagnostics runs a
+    // fixed checker (not model-controlled bash), so the bash denylist doesn't
+    // apply; but a checker still shouldn't inherit arbitrary env.
+    c.env_clear();
+    if let Ok(p) = std::env::var("PATH") {
+        c.env("PATH", p);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        c.env("HOME", home);
+    }
+    if let Ok(tmp) = std::env::var("TMPDIR") {
+        c.env("TMPDIR", tmp);
+    }
+    for k in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOPATH",
+        "GOCACHE",
+        "GOTMPDIR",
+        "NODE_PATH",
+        "npm_config_cache",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            c.env(k, v);
+        }
+    }
+    let child = match c.spawn() {
+        Ok(ch) => ch,
         Err(e) => return Outcome::err(format!("{label} failed to run: {e}")),
     };
+    let timeout = std::time::Duration::from_secs(cfg.diag_timeout_secs.max(5));
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Outcome::err(format!("{label} wait failed: {e}")),
+        Err(_) => {
+            return Outcome::err(format!(
+                "{label} timed out after {}s (killed)",
+                timeout.as_secs()
+            ))
+        }
+    };
     let mut s = String::new();
-    if !out.stdout.is_empty() { s.push_str(&String::from_utf8_lossy(&out.stdout)); }
+    if !out.stdout.is_empty() {
+        s.push_str(&String::from_utf8_lossy(&out.stdout));
+    }
     if !out.stderr.is_empty() {
-        if !s.is_empty() { s.push_str("\n--- stderr ---\n"); }
+        if !s.is_empty() {
+            s.push_str("\n--- stderr ---\n");
+        }
         s.push_str(&String::from_utf8_lossy(&out.stderr));
     }
-    if s.is_empty() { s.push_str("(no diagnostics — clean)"); }
+    if s.is_empty() {
+        s.push_str("(no diagnostics — clean)");
+    }
     // ponytail: diagnostics "ok" is true only when the checker exits 0.
-    Outcome { ok: out.status.success(), output: format!("{label}\n{s}") }
+    Outcome {
+        ok: out.status.success(),
+        output: format!("{label}\n{s}"),
+    }
 }
 
 // ---- spawn (subagent) (item 8) ----
@@ -1402,7 +1673,10 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         // Plain content: no hash/line-number prefix, exact bytes the model can copy.
         assert_eq!(o.output, "alpha\nbeta\n", "{}", o.output);
-        assert!(!o.output.contains('│'), "should not contain a hash/line-number gutter");
+        assert!(
+            !o.output.contains('│'),
+            "should not contain a hash/line-number gutter"
+        );
     }
 
     #[test]
@@ -1412,7 +1686,10 @@ mod tests {
         let args = json!({ "path": "f.txt", "edits": [{ "search": "two", "replace": "TWO" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\nTWO\nthree\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
     }
 
     #[test]
@@ -1428,7 +1705,10 @@ mod tests {
         let args = json!({ "path": "f.txt", "edits": edits });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "P\na\nX\nY\nd\nZ\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "P\na\nX\nY\nd\nZ\n"
+        );
     }
 
     #[test]
@@ -1438,7 +1718,10 @@ mod tests {
         let args = json!({ "path": "f.txt", "edits": [{ "search": "kill\n", "replace": "" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "keep\nkeep2\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "keep\nkeep2\n"
+        );
     }
 
     #[test]
@@ -1450,7 +1733,10 @@ mod tests {
         assert!(!o.ok);
         assert!(o.output.contains("not found"), "{}", o.output);
         // file unchanged
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\ntwo\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "one\ntwo\n"
+        );
     }
 
     #[test]
@@ -1474,7 +1760,10 @@ mod tests {
         ] });
         let o = execute("edit", &args, &cfg);
         assert!(!o.ok);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "one\ntwo\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "one\ntwo\n"
+        );
     }
 
     #[test]
@@ -1494,7 +1783,10 @@ mod tests {
         let args = json!({ "path": "f.txt", "edits": [{ "search": "b", "replace": "b\nc" }] });
         let o = execute("edit", &args, &cfg);
         assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(), "a\nb\nc");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "a\nb\nc"
+        );
     }
 
     #[test]
@@ -1550,15 +1842,35 @@ mod tests {
         let (root, cfg) = tmp_ws();
         // Two matches 5 lines apart in one file; context=1 windows must not overlap
         // so a '...' separator appears between them.
-        fs::write(root.join("a.txt"), "l1\nl2\nMARK\nl4\nl5\nl6\nl7\nMARK\nl9\n").unwrap();
+        fs::write(
+            root.join("a.txt"),
+            "l1\nl2\nMARK\nl4\nl5\nl6\nl7\nMARK\nl9\n",
+        )
+        .unwrap();
         let o = execute("grep", &json!({"pattern":"MARK", "context": 1}), &cfg);
         assert!(o.ok, "{}", o.output);
         // match line uses ':' before the line number
-        assert!(o.output.contains("a.txt:3:MARK"), "match marker: {}", o.output);
-        assert!(o.output.contains("a.txt:8:MARK"), "match marker: {}", o.output);
+        assert!(
+            o.output.contains("a.txt:3:MARK"),
+            "match marker: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("a.txt:8:MARK"),
+            "match marker: {}",
+            o.output
+        );
         // context lines use '-' as the separator (GNU grep -C convention)
-        assert!(o.output.contains("a.txt-2-l2"), "context marker: {}", o.output);
-        assert!(o.output.contains("a.txt-4-l4"), "context marker: {}", o.output);
+        assert!(
+            o.output.contains("a.txt-2-l2"),
+            "context marker: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("a.txt-4-l4"),
+            "context marker: {}",
+            o.output
+        );
         // windows 5 apart (line 3 +/-1 and line 8 +/-1) do not overlap -> '...' between
         assert!(o.output.contains("..."), "group separator: {}", o.output);
     }
@@ -1572,7 +1884,11 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("a.txt:3:MARK"));
         assert!(o.output.contains("a.txt:4:MARK"));
-        assert!(!o.output.contains("..."), "merged window should have no separator: {}", o.output);
+        assert!(
+            !o.output.contains("..."),
+            "merged window should have no separator: {}",
+            o.output
+        );
     }
 
     #[test]
@@ -1634,13 +1950,19 @@ mod tests {
     async fn bulk_read_write_edit_roundtrip() {
         let (_root, cfg) = tmp_ws();
         // bulk_write three files
-        let w = bulk_write(&json!({ "files": [
+        let w = bulk_write(
+            &json!({ "files": [
             { "path": "a.txt", "content": "alpha\nbeta\n" },
             { "path": "sub/b.txt", "content": "one\ntwo\n" },
             { "path": "c.txt", "content": "x\ny\nz\n" }
-        ] }), &cfg);
+        ] }),
+            &cfg,
+        );
         assert!(w.ok, "{}", w.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("sub/b.txt")).unwrap(), "one\ntwo\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("sub/b.txt")).unwrap(),
+            "one\ntwo\n"
+        );
 
         // bulk_read them back; middle file via plain content
         let r = bulk_read(&json!({ "paths": ["a.txt","sub/b.txt","nope.txt"] }), &cfg);
@@ -1649,23 +1971,29 @@ mod tests {
         assert!(r.output.contains("### [2] nope.txt"), "{}", r.output);
 
         // bulk_edit: replace 'alpha' in a.txt, append 'END' after 'z' in c.txt
-        let e = bulk_edit(&json!({ "edits": [
+        let e = bulk_edit(
+            &json!({ "edits": [
             { "path": "a.txt", "edits": [{ "search": "alpha", "replace": "ALPHA" }] },
             { "path": "c.txt", "edits": [{ "search": "z", "replace": "z\nEND" }] }
-        ] }), &cfg);
+        ] }),
+            &cfg,
+        );
         assert!(e.ok, "{}", e.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("a.txt")).unwrap(), "ALPHA\nbeta\n");
-        assert_eq!(fs::read_to_string(cfg.workspace.join("c.txt")).unwrap(), "x\ny\nz\nEND\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("a.txt")).unwrap(),
+            "ALPHA\nbeta\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("c.txt")).unwrap(),
+            "x\ny\nz\nEND\n"
+        );
     }
 
     #[tokio::test]
     async fn bulk_dispatches_bash_and_read() {
         let (_root, cfg) = tmp_ws();
         fs::write(cfg.workspace.join("f.txt"), "hello\n").unwrap();
-        let o = execute_bulk(&json!({ "calls": [
-            { "name": "read_file", "args": { "path": "f.txt" } },
-            { "name": "bash", "args": { "command": "echo hi" } }
-        ] }), &cfg).await;
+        let o = execute_bulk(&json!({ "calls": [ { "name": "read_file", "args": { "path": "f.txt" } }, { "name": "bash", "args": { "command": "echo hi" } } ] }), &cfg, &std::collections::HashMap::new()).await;
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("hello"), "{}", o.output);
         assert!(o.output.contains("hi"), "{}", o.output);
@@ -1674,9 +2002,14 @@ mod tests {
     #[tokio::test]
     async fn bulk_rejects_nested_bulk() {
         let (_root, cfg) = tmp_ws();
-        let o = execute_bulk(&json!({ "calls": [
+        let o = execute_bulk(
+            &json!({ "calls": [
             { "name": "bulk_read", "args": { "paths": ["f.txt"] } }
-        ] }), &cfg).await;
+        ] }),
+            &cfg,
+            &std::collections::HashMap::new(),
+        )
+        .await;
         assert!(!o.ok);
         assert!(o.output.contains("nested bulk"), "{}", o.output);
     }
@@ -1684,17 +2017,25 @@ mod tests {
     #[test]
     fn todo_write_then_read_roundtrip() {
         let (_root, cfg) = tmp_ws();
-        let o = execute("todo_write", &json!({ "todos": [
+        let o = execute(
+            "todo_write",
+            &json!({ "todos": [
             { "subject": "step 1", "status": "completed" },
             { "subject": "step 2", "status": "in_progress", "content": "detail" }
-        ] }), &cfg);
+        ] }),
+            &cfg,
+        );
         assert!(o.ok, "{}", o.output);
         let r = execute("todo_read", &json!({}), &cfg);
         assert!(r.ok);
         assert!(r.output.contains("step 1"));
         assert!(r.output.contains("in_progress"));
         // bad status rejected
-        let bad = execute("todo_write", &json!({ "todos": [ { "subject": "x", "status": "bogus" } ] }), &cfg);
+        let bad = execute(
+            "todo_write",
+            &json!({ "todos": [ { "subject": "x", "status": "bogus" } ] }),
+            &cfg,
+        );
         assert!(!bad.ok);
     }
 
@@ -1705,7 +2046,10 @@ mod tests {
         let diff = "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
         let o = execute("patch", &json!({ "path": "p.txt", "patch": diff }), &cfg);
         assert!(o.ok, "{}", o.output);
-        assert_eq!(fs::read_to_string(cfg.workspace.join("p.txt")).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("p.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
     }
 
     #[test]
@@ -1723,7 +2067,11 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         let body: String = (1..=500).map(|n| format!("line {n}\n")).collect();
         fs::write(cfg.workspace.join("big.txt"), &body).unwrap();
-        let o = execute("read_file", &json!({ "path": "big.txt", "offset": 10, "limit": 3 }), &cfg);
+        let o = execute(
+            "read_file",
+            &json!({ "path": "big.txt", "offset": 10, "limit": 3 }),
+            &cfg,
+        );
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("lines 10-12 of 500"), "{}", o.output);
         assert!(o.output.contains("line 10"));
@@ -1757,7 +2105,11 @@ mod tests {
     fn write_file_blocks_dangerous_paths() {
         let (_root, cfg) = tmp_ws();
         // P0-3: the blocklist is enforced inside write_file itself.
-        let o = execute("write_file", &json!({"path":".git/config","content":"x"}), &cfg);
+        let o = execute(
+            "write_file",
+            &json!({"path":".git/config","content":"x"}),
+            &cfg,
+        );
         assert!(!o.ok, "{}", o.output);
         assert!(o.output.contains("dangerous pattern"), "{}", o.output);
         assert!(!cfg.workspace.join(".git/config").exists());
@@ -1767,11 +2119,20 @@ mod tests {
     fn bulk_write_blocks_dangerous_paths() {
         let (_root, cfg) = tmp_ws();
         // P0-3: bulk_write must NOT bypass the blocklist (it calls write_file).
-        let o = bulk_write(&json!({"files":[{"path":".env","content":"LEAK=1"},{"path":"ok.txt","content":"hi"}]}), &cfg);
+        let o = bulk_write(
+            &json!({"files":[{"path":".env","content":"LEAK=1"},{"path":"ok.txt","content":"hi"}]}),
+            &cfg,
+        );
         assert!(!o.ok, "{}", o.output);
         assert!(o.output.contains("dangerous pattern"), "{}", o.output);
-        assert!(!cfg.workspace.join(".env").exists(), ".env must not be written");
-        assert!(cfg.workspace.join("ok.txt").exists(), "non-dangerous file should still be written");
+        assert!(
+            !cfg.workspace.join(".env").exists(),
+            ".env must not be written"
+        );
+        assert!(
+            cfg.workspace.join("ok.txt").exists(),
+            "non-dangerous file should still be written"
+        );
     }
 
     #[test]
