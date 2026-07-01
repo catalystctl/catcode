@@ -271,24 +271,23 @@ fn scan_dir(dir: &Path) -> Vec<MemoryEntry> {
 /// closing `---` is the content.
 fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     let raw = std::fs::read_to_string(path).ok()?;
+    // Normalize CRLF -> LF up front. The byte-offset math below (slicing on
+    // `end_pos`, `body_start`, and find_frontmatter_end's `line.len() + 1`)
+    // all assume a single-byte '\n' terminator, but `str::lines()` strips a
+    // trailing '\r' — so on CRLF files every line shifted the closing-fence
+    // offset by one byte and silently corrupted the parsed fields and body.
+    let raw = raw.replace("\r\n", "\n");
     let trimmed = raw.trim_start();
-    if !trimmed.starts_with("---\n") && !trimmed.starts_with("---\r\n") {
+    if !trimmed.starts_with("---\n") {
         return None;
     }
     let after_open = &trimmed[3..];
-    let after_open = after_open
-        .strip_prefix('\n')
-        .or_else(|| after_open.strip_prefix("\r\n"))
-        .unwrap_or(after_open);
+    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
     let end_pos = find_frontmatter_end(after_open)?;
     let fm_block = &after_open[..end_pos];
     let body_start = end_pos + 3;
     let rest = &after_open[body_start..];
-    let content = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))
-        .unwrap_or(rest)
-        .to_string();
+    let content = rest.strip_prefix('\n').unwrap_or(rest).to_string();
 
     let mut name = String::new();
     let mut description = String::new();
@@ -653,6 +652,29 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test config");
         assert_eq!(entries[0].description, "some desc");
+        assert_eq!(entries[0].mem_type, "user");
+        assert_eq!(entries[0].content, "Here is the body.\nMultiline.\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_crlf_line_endings() {
+        // A memory file edited on Windows (CRLF) must parse identically to its
+        // LF counterpart. Previously find_frontmatter_end's `line.len() + 1`
+        // assumed a single-byte terminator while `str::lines()` strips the',
+        // so the closing-fence offset drifted and corrupted the body/fields.
+        let root = tmp_root();
+        let ws = fake_workspace("crlf");
+        let store = test_store(&root);
+        let dir = store.dir(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let md = "---\r\nname: win config\r\ndescription: crlf desc\r\ntype: user\r\n---\r\nHere is the body.\r\nMultiline.\r\n";
+        std::fs::write(dir.join("win.md"), md).unwrap();
+
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1, "CRLF file must still be discovered");
+        assert_eq!(entries[0].name, "win config");
+        assert_eq!(entries[0].description, "crlf desc");
         assert_eq!(entries[0].mem_type, "user");
         assert_eq!(entries[0].content, "Here is the body.\nMultiline.\n");
     }

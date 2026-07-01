@@ -2048,6 +2048,12 @@ async fn run_chain(
     let mut outputs: HashMap<String, String> = HashMap::new();
     let mut previous = String::new();
 
+    // Child token so interrupt_action cancels JUST this chain (and a parent
+    // /abort still propagates through it), not the parent orchestrator/turn
+    // and its siblings — matching run_single/run_parallel. Previously this
+    // stored `cancel.clone()` (the parent token), so interrupting a chain run
+    // cancelled the whole parent turn and every concurrent sibling.
+    let run_cancel = cancel.child_token();
     let run = SubagentRun {
         id: run_id.clone(),
         mode: "chain".into(),
@@ -2061,14 +2067,14 @@ async fn run_chain(
         ended_at: None,
         depth,
         intercom_target: None,
-        cancel: Some(Arc::new(cancel.clone())),
+        cancel: Some(Arc::new(run_cancel.clone())),
         children: vec![],
         summary: None,
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
 
     for (step_i, step) in chain.iter().enumerate() {
-        if cancel.is_cancelled() {
+        if run_cancel.is_cancelled() {
             return Outcome::ok("[chain aborted]");
         }
         // parallel group?
@@ -2082,7 +2088,7 @@ async fn run_chain(
                 group,
                 &group_args,
                 depth,
-                cancel,
+                &run_cancel,
             ))
             .await;
             if !o.ok {
@@ -2134,7 +2140,7 @@ async fn run_chain(
             model_override,
             context,
             depth,
-            cancel,
+            &run_cancel,
         )
         .await;
         if !o.ok {
