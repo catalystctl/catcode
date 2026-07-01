@@ -48,6 +48,8 @@ type block struct {
 	sub       bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
 	id        string          // blkTool: tool-call id, to match results out of order
 	expanded  bool            // blkTool / blkToolResult: full output shown (ctrl+o)
+	ok        bool            // blkTool: outcome.ok from tool_result (false on error/deny)
+	hasOk     bool            // blkTool: true once a result landed (distinguishes in-flight)
 	renderW   int             // P1-12: width the streaming block was last rendered at
 	renderLen int             // P1-12: text length at last render (throttle)
 	renderStr string          // P1-12: cached render of the streaming block
@@ -256,7 +258,7 @@ func (s *session) renderBlockFull(b *block, w int) string {
 			if b.text.Len() == 0 {
 				n = 0
 			}
-			return dimStyle.Render(fmt.Sprintf("▷ reasoning · %d line(s)  (ctrl+t expand)", n))
+			return dimStyle.Render(fmt.Sprintf("▷ reasoning · %d line%s  (ctrl+t expand)", n, pluralS(n)))
 		}
 		return roleLine("◇", "reasoning", "", c.dim) + "\n" +
 			thinkStyle.Render(renderMarkdown(b.text.String(), w))
@@ -264,19 +266,34 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		return s.renderToolBlock(b, w)
 	case blkToolResult:
 		return roleLine("▹", "result", "", c.success) + "\n" +
-			renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w)
+			renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w, "lines", false)
 	case blkSuccess:
 		return successStyle.Render("✓ ") + baseStyle.Render(b.text.String())
 	case blkWarn:
 		return warnStyle.Render("! ") + baseStyle.Render(b.text.String())
 	case blkError:
-		return errStyle.Render("✗ ") + baseStyle.Render(b.text.String())
+		// Multi-line errors (core crashes, stack traces) get a red rule panel so
+		// real failures stand out from the success/info toasts around them.
+		text := strings.TrimSpace(b.text.String())
+		if strings.Contains(text, "\n") {
+			parts := strings.SplitN(text, "\n", 2)
+			head := errStyle.Render("✗ ") + baseStyle.Render(parts[0])
+			if len(parts) > 1 {
+				head += "\n" + panelLines(parts[1], w, errRuleStyle, errOutStyle)
+			}
+			return head
+		}
+		return errStyle.Render("✗ ") + baseStyle.Render(text)
 	case blkInfo:
 		return mutedStyle.Render("· ") + mutedStyle.Render(b.text.String())
 	case blkApprove:
-		// compact history marker; the live decision is the sticky banner
-		head := warnStyle.Render("? approve ") + toolNameStyle.Render(b.name) +
-			toolDetailStyle.Render("("+truncate(b.args, 60)+")")
+		// compact history marker; the live decision is the sticky banner. Reuses
+		// the per-tool head grammar so the marker names the target, not a JSON blob.
+		head := warnStyle.Render("? approve ") +
+			toolNameStyleFor(b.name).Render(toolIcon(b.name)+" "+toolDisplayName(b.name))
+		if ka := keyArgFor(b.name, b.args); ka != "" {
+			head += toolDetailStyle.Render("  " + truncate(ka, 60))
+		}
 		head += dimStyle.Render("   [y]es  [n]o  [a]lways")
 		if strings.TrimSpace(b.diff) != "" {
 			head += "\n" + renderDiffPanel(b.diff, b.expanded, s.width)
@@ -288,85 +305,94 @@ func (s *session) renderBlockFull(b *block, w int) string {
 	return ""
 }
 
-// renderToolBlock: role line with name(args) · duration, then an output panel.
-// Sub-agent internal calls (spawn:*) collapse to a dim one-liner so a scout's
-// internal tool chatter doesn't drown the transcript. In-flight tools (no
-// result yet) render just the head; the active-tasks panel shows live elapsed
-// time for scouts.
+// renderToolBlock dispatches to a per-tool renderer so each call gets a layout
+// that surfaces its most relevant info (the bash command, the file path, the
+// grep pattern…) instead of a generic name(args) head. Sub-agent internal
+// calls (spawn:*) collapse to a dim one-liner so a scout's chatter stays tidy.
+// The shared header grammar (icon · name · keyarg … dur status) and the
+// status badge live in tool_blocks.go; this method just picks the renderer.
 func (s *session) renderToolBlock(b *block, w int) string {
 	if b.sub {
-		head := dimStyle.Render("  ┊ " + b.name)
-		if b.args != "" {
-			head += dimStyle.Render("(" + truncate(b.args, w-10) + ")")
-		}
-		if b.dur > 0 && !b.started.IsZero() {
-			head += dimStyle.Render(fmt.Sprintf(" · %.1fs", b.dur.Seconds()))
-		}
-		return head
+		return renderSubToolLine(b, w)
 	}
-	var head strings.Builder
-	head.WriteString(toolNameStyle.Render("▸ " + b.name))
-	if b.args != "" {
-		head.WriteString(toolDetailStyle.Render("(" + truncate(b.args, w-12) + ")"))
-	}
-	if b.dur > 0 && !b.started.IsZero() {
-		head.WriteString(dimStyle.Render(fmt.Sprintf(" · %.1fs", b.dur.Seconds())))
-	}
-	if b.dur == 0 {
-		return head.String() // in-flight: head only; live status is in the panel
-	}
-	// Prefer a unified-diff view when the core attached one (edit/patch/
-	// write_file); fall back to the plain output panel, then to "(no output)" only
-	// when both are empty. ctrl+o toggles b.expanded for either view.
-	body := ""
-	switch {
-	case strings.TrimSpace(b.diff) != "":
-		body = "\n" + renderDiffPanel(b.diff, b.expanded, w)
-	case strings.TrimSpace(b.output) != "":
-		body = "\n" + renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w)
+	switch b.name {
+	case "bash":
+		return renderBashBlock(b, w)
+	case "read_file":
+		return renderReadFileBlock(b, w)
+	case "write_file":
+		return renderWriteFileBlock(b, w)
+	case "edit":
+		return renderEditBlock(b, w)
+	case "patch":
+		return renderPatchBlock(b, w)
+	case "list_dir":
+		return renderListDirBlock(b, w)
+	case "grep":
+		return renderGrepBlock(b, w)
+	case "glob":
+		return renderGlobBlock(b, w)
+	case "git_status":
+		return renderGitStatusBlock(b, w)
+	case "git_log":
+		return renderGitLogBlock(b, w)
+	case "git_diff":
+		return renderGitDiffBlock(b, w)
+	case "git_add":
+		return renderGitAddBlock(b, w)
+	case "git_commit":
+		return renderGitCommitBlock(b, w)
+	case "todo_write":
+		return renderTodoWriteBlock(b, w)
+	case "todo_read":
+		return renderTodoReadBlock(b, w)
+	case "diagnostics":
+		return renderDiagnosticsBlock(b, w)
+	case "fetch":
+		return renderFetchBlock(b, w)
+	case "memory":
+		return renderMemoryBlock(b, w)
+	case "spawn", "subagent":
+		return renderSubagentBlock(b, w)
+	case "bulk":
+		return renderBulkBlock(b, w)
 	default:
-		body = "\n" + dimStyle.Italic(true).Render("│ (no output)")
+		return renderGenericToolBlock(b, w)
 	}
-	return head.String() + body
 }
 
 // renderOutputPanel wraps tool output, truncating to the first 3 lines
 // unless the block is expanded (ctrl+o). A dim hint line shows the toggle.
-// ponytail: 3-line truncation is the laziest answer to "too much output"; a
-// per-block expand key beats a global fold because users expand one call, not
-// all. Upgrade path: a viewport pager if outputs grow huge.
-func renderOutputPanel(output string, expanded bool, w int) string {
+// `unit` labels the hidden remainder ("lines"/"matches"/"entries"/…) and `err`
+// tints the panel red for failed calls. ctrl+o is per-block: users expand one
+// call, not all. Upgrade path: a viewport pager if outputs grow huge.
+func renderOutputPanel(output string, expanded bool, w int, unit string, err bool) string {
+	if unit == "" {
+		unit = "lines"
+	}
 	const headLines = 3
 	lines := strings.Split(output, "\n")
 	if len(lines) > headLines && !expanded {
 		more := len(lines) - headLines
 		shown := strings.Join(lines[:headLines], "\n")
 		hint := dimStyle.Italic(true).Render(
-			fmt.Sprintf("│ … +%d line(s)  (ctrl+o expand)", more))
-		return resultPanel(shown, w) + "\n" + hint
+			fmt.Sprintf("│ … +%d %s  (ctrl+o expand)", more, unit))
+		return resultPanel(shown, w, err) + "\n" + hint
 	}
-	panel := resultPanel(output, w)
+	panel := resultPanel(output, w, err)
 	if len(lines) > headLines && expanded {
 		panel += "\n" + dimStyle.Italic(true).Render("│ (ctrl+o collapse)")
 	}
 	return panel
 }
 
-// resultPanel renders tool/command output with a dim left rule, wrapped to fit.
-func resultPanel(output string, w int) string {
-	contentW := w - 3 // "│ " prefix + content
-	if contentW < 2 {
-		contentW = 2
+// resultPanel renders tool/command output with a left `│` rule, wrapped to fit.
+// The rule + content are tinted red when err is set so failures are scannable.
+func resultPanel(output string, w int, err bool) string {
+	if err {
+		return panelLines(output, w, errRuleStyle, errOutStyle)
 	}
-	rule := dimStyle.Render("│ ")
-	wrapped := wrapPlain(output, contentW)
-	var b strings.Builder
-	for _, l := range strings.Split(wrapped, "\n") {
-		b.WriteString(rule)
-		b.WriteString(resultStyle.Render(l))
-		b.WriteByte('\n')
-	}
-	return strings.TrimRight(b.String(), "\n")
+	return panelLines(output, w, dimStyle, resultStyle)
 }
 
 // lastToolOutputBlock returns the most recent block carrying tool output
@@ -413,6 +439,21 @@ func (s *session) removeSubProgress(runID string) {
 // isInFlight reports a top-level tool block still awaiting its result.
 func isInFlight(b *block) bool {
 	return b != nil && b.kind == blkTool && !b.sub && b.dur == 0
+}
+
+// hasLiveContent reports whether the transcript has content that changes over
+// time (a streaming block or an in-flight tool). Used to gate the per-tick
+// refresh so an idle session doesn't re-render the viewport every second.
+func (s *session) hasLiveContent() bool {
+	if s.cur != nil {
+		return true
+	}
+	for _, b := range s.blocks {
+		if b != nil && b.kind == blkTool && b.inFlight() {
+			return true
+		}
+	}
+	return false
 }
 
 // finalizeInFlight marks any still-running tool blocks as done so the

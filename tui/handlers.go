@@ -150,6 +150,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if match != nil {
 			match.output = out
 			match.diff = ev.get("diff")
+			match.ok = ev.get("ok") == "true"
+			match.hasOk = true
 			match.dur = time.Since(match.started)
 			s.cur = nil
 			wasScout := !match.sub && (match.name == "spawn" || match.name == "subagent")

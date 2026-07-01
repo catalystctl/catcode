@@ -79,7 +79,7 @@ func renderDiffPanel(diff string, expanded bool, w int) string {
 		more := len(rawLines) - headLines
 		panel := panelBody(rawLines[:headLines])
 		hint := dimStyle.Italic(true).Render(
-			fmt.Sprintf("│ … +%d line(s)  (ctrl+o expand)", more))
+			fmt.Sprintf("│ … +%d line%s  (ctrl+o expand)", more, pluralS(more)))
 		return panel + "\n" + hint
 	}
 	panel := panelBody(rawLines)

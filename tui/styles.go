@@ -71,6 +71,9 @@ var (
 	toolDiffRemoved    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	toolDiffContext    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
 	toolDiffMeta       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
+	roToolNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true) // read-only tools
+	errOutStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))               // failed tool output text
+	errRuleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))               // failed tool left rule
 )
 
 // pillStyle returns a solid-background pill chip style for header tags.
@@ -160,4 +163,126 @@ func truncate(s string, maxRunes int) string {
 		return "…"
 	}
 	return string(r[:maxRunes-1]) + "…"
+}
+
+// truncatePath front-truncates a filesystem path (keeps the last segments, the
+// part that identifies the file) so a deep cwd fits the header without losing
+// the current directory name.
+func truncatePath(p string, maxRunes int) string {
+	if maxRunes <= 3 {
+		return p
+	}
+	r := []rune(p)
+	if len(r) <= maxRunes {
+		return p
+	}
+	return "…" + string(r[len(r)-(maxRunes-1):])
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call styling primitives
+//
+// toolKind mirrors core/tools.rs::classify so the TUI can tint a tool's name
+// (and icon) by its approval kind: read-only tools render cyan, destructive
+// amber. This is display-only; the core remains the approval authority.
+// ---------------------------------------------------------------------------
+
+type toolKindT int
+
+const (
+	kindReadOnly toolKindT = iota
+	kindDestructive
+)
+
+// toolKindOf returns the approval kind of a tool, mirroring the core's
+// classify() so a glance at the header reveals whether the call mutates state.
+func toolKindOf(name string) toolKindT {
+	switch name {
+	case "read_file", "list_dir", "grep", "glob", "bulk_read", "todo_read",
+		"diagnostics", "finish", "contact_supervisor", "intercom",
+		"git_status", "git_diff", "git_log", "memory":
+		return kindReadOnly
+	default:
+		return kindDestructive
+	}
+}
+
+// toolNameStyleFor returns the name style tinted by kind: read-only → accent
+// (cyan), destructive → tool (amber).
+func toolNameStyleFor(name string) lipgloss.Style {
+	if toolKindOf(name) == kindReadOnly {
+		return roToolNameStyle
+	}
+	return toolNameStyle
+}
+
+// toolIcon returns a per-family glyph for a tool, used as the header marker.
+// One icon per family (not per tool) keeps the transcript scannable without
+// glyph noise.
+func toolIcon(name string) string {
+	switch name {
+	case "bash":
+		return "❯"
+	case "read_file", "bulk_read", "list_dir", "grep", "glob":
+		return "▤"
+	case "write_file", "edit", "patch", "bulk_write", "bulk_edit":
+		return "✎"
+	case "git_status", "git_diff", "git_log", "git_add", "git_commit":
+		return "⎇"
+	case "todo_write", "todo_read":
+		return "☑"
+	case "diagnostics":
+		return "⊕"
+	case "fetch":
+		return "↬"
+	case "memory":
+		return "❖"
+	case "subagent", "spawn":
+		return "◈"
+	case "finish":
+		return "✓"
+	case "contact_supervisor", "intercom":
+		return "✉"
+	default:
+		return "▸"
+	}
+}
+
+// toolDisplayName maps wire names to friendlier header labels (e.g.
+// git_status → "git status"). Falls back to the raw name.
+func toolDisplayName(name string) string {
+	switch name {
+	case "git_status":
+		return "git status"
+	case "git_diff":
+		return "git diff"
+	case "git_log":
+		return "git log"
+	case "git_add":
+		return "git add"
+	case "git_commit":
+		return "git commit"
+	case "contact_supervisor":
+		return "contact supervisor"
+	}
+	return name
+}
+
+// panelLines renders tool output with a left `│` rule (wrapped to fit), using
+// the given rule + content styles. resultPanel selects dim/err styling by the
+// `err` flag so a failed call's body reads red while scrolling.
+func panelLines(output string, w int, rule, content lipgloss.Style) string {
+	contentW := w - 3 // "│ " prefix + content
+	if contentW < 2 {
+		contentW = 2
+	}
+	r := rule.Render("│ ")
+	wrapped := wrapPlain(output, contentW)
+	var b strings.Builder
+	for _, l := range strings.Split(wrapped, "\n") {
+		b.WriteString(r)
+		b.WriteString(content.Render(l))
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

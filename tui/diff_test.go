@@ -79,7 +79,7 @@ func TestRenderDiffPanel(t *testing.T) {
 		t.Errorf("truncated diff missing expand hint:\n%s", trunc)
 	}
 	// 8 raw lines - 3 shown = 5 hidden.
-	if !strings.Contains(trunc, "+5 line(s)") {
+	if !strings.Contains(trunc, "+5 lines") {
 		t.Errorf("truncated diff missing hidden-line count:\n%s", trunc)
 	}
 	if strings.Contains(trunc, "+extra()") || strings.Contains(trunc, "+newLine()") {

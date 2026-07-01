@@ -81,7 +81,7 @@ func (s *session) renderHeader() string {
 	tagline := mutedStyle.Render("an OpenAI-compatible coding agent")
 	row1 := fitRow(s.width, brand, tagline)
 
-	cwd := dimStyle.Render(s.cwd)
+	cwd := dimStyle.Render(truncatePath(s.cwd, max(20, s.width-40)))
 	tip := dimStyle.Render("Tip: / for commands · ? for help")
 	row2 := fitRow(s.width, cwd, tip)
 	return row1 + "\n" + row2
@@ -131,13 +131,19 @@ func (s *session) renderPositionBar() string {
 }
 
 // approvalBanner: a full-width sticky bar shown while a decision is pending.
-// For write/edit/patch a unified-diff preview of the resulting change is
-// rendered below the bar (via the shared diff panel) so the human approves the
-// actual change, not just the raw search/replace blobs.
+// The head reuses the per-tool primitives (icon + name + parsed keyarg) so the
+// human approves the actual target ("src/main.rs · 3 replacements") instead
+// of a raw JSON blob. For write/edit/patch a unified-diff preview renders
+// below so the decision is on the real change, not the search/replace blobs.
 func (s *session) renderApprovalBanner() string {
 	a := s.pendingApproval
-	args := truncate(a.args, max(1, s.width-40))
-	msg := fmt.Sprintf("⚠  approve %s(%s)   [y]es   [n]o   [a]lways", a.tool, args)
+	avail := s.width - 52 // ⚠ approve + icon name + suffix + padding headroom
+	if avail < 8 {
+		avail = 8
+	}
+	summary := truncate(approvalSummary(a.tool, a.args), avail)
+	msg := "⚠  approve  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " +
+		summary + "   [y]es   [n]o   [a]lways"
 	banner := lipgloss.NewStyle().
 		Width(s.width).
 		Background(lipgloss.Color(c.warn)).
@@ -340,7 +346,22 @@ func (s *session) renderContext() string {
 	if pct < 1 && cur > 0 {
 		pct = 1
 	}
-	return fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks))
+	if pct > 100 {
+		pct = 100
+	}
+	// A 10-cell fill bar tinted by context pressure: green < 60%, amber < 85%,
+	// red ≥ 85% — so a glance at the footer shows how full the window is.
+	const cells = 10
+	filled := cells * pct / 100
+	bar := strings.Repeat("▰", filled) + strings.Repeat("▱", cells-filled)
+	barStyle := successStyle
+	switch {
+	case pct >= 85:
+		barStyle = errStyle
+	case pct >= 60:
+		barStyle = warnStyle
+	}
+	return barStyle.Render(bar) + " " + mutedStyle.Render(fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks)))
 }
 
 // renderInputBox wraps the chat input in a rounded border so it reads as a
@@ -385,7 +406,8 @@ func (s *session) renderActiveTasks(w int) string {
 		rows = append(rows, head)
 		if e.curTool != "" {
 			td := time.Since(e.toolStart)
-			marker := "  ▸ "
+			icon := toolIcon(e.curTool)
+			marker := "  " + icon + " "
 			if e.toolRunning && td > 30*time.Second {
 				rows = append(rows, warnStyle.Render(marker+"⚠ "+e.curTool+" STUCK "+formatDur(td)))
 			} else if e.toolRunning {

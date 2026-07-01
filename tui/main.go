@@ -359,6 +359,12 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	case tickMsg:
+		// Refresh the transcript while there's live content (a streaming block or
+		// an in-flight tool) so the in-flight badge `◷` and its elapsed timer tick.
+		// Finalized blocks are cached, so this is O(live) when idle it's a no-op.
+		if s.hasLiveContent() {
+			s.refresh()
+		}
 		return s, tick()
 
 	case spinner.TickMsg:
