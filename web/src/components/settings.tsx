@@ -5,8 +5,10 @@
 // preferences themselves are persisted by the parent (localStorage); this
 // modal just calls the supplied callbacks.
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { ModelInfo, ReadyPayload } from "@/lib/types";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, ModelIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
 
 interface Props {
@@ -30,25 +32,6 @@ const APPROVAL_HELP: Record<string, string> = {
   always: "ask for everything",
 };
 
-function useOutsideClose(onClose: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", h);
-    document.addEventListener("keydown", k);
-    return () => {
-      document.removeEventListener("mousedown", h);
-      document.removeEventListener("keydown", k);
-    };
-  }, [onClose]);
-  return ref;
-}
-
 function Section({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="mb-5">
@@ -59,7 +42,8 @@ function Section({ label, children }: { label: string; children: ReactNode }) {
 }
 
 export function SettingsModal(props: Props) {
-  const ref = useOutsideClose(props.onClose);
+  const closeRef = useOutsideClose(props.onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
   const current = props.models.find((m) => m.id === props.selectedModel) ?? props.models[0];
   const levels = current?.thinking_levels?.length ? current.thinking_levels : DEFAULT_LEVELS;
   const effLevels = current?.reasoning ? levels : ["off"];
@@ -71,8 +55,11 @@ export function SettingsModal(props: Props) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
-        ref={ref}
+        ref={mergeRefs(closeRef, trapRef)}
         className="flex max-h-[85vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Settings"
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">

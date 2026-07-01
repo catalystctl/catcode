@@ -77,17 +77,31 @@ export interface AgentApi {
   setVisionConfig: (vision_model: string | null, vision_models?: string[]) => Promise<void>;
   // ── Config ──
   setConfig: (key: string, value: string | number) => Promise<void>;
+  // ── Projects / workspace ──
+  switchWorkspace: (path: string) => Promise<void>;
+  renameSession: (name: string, title: string) => Promise<void>;
+  listProjects: () => Promise<void>;
+  addProject: (path: string) => Promise<void>;
+  removeProject: (path: string) => Promise<void>;
+  // ── Connection ──
+  reconnect: () => void;
+  // ── Utility ──
+  copyLastReply: () => void;
+  exportTranscript: () => string;
 }
 
 export function useAgent(): AgentApi {
   const [state, setState] = useState<AgentState>(initialState);
   const [connected, setConnected] = useState(false);
+  const [reconnectKey, setReconnectKey] = useState(0);
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
-  // Stream connection + reducer.
+  // Stream connection + reducer. Re-runs when reconnectKey changes (manual
+  // reconnect button). EventSource auto-reconnects on transient drops, but this
+  // gives the user an explicit way to force a fresh connection.
   useEffect(() => {
     const es = new EventSource("/api/stream");
     es.onopen = () => setConnected(true);
@@ -106,7 +120,7 @@ export function useAgent(): AgentApi {
       }
     };
     return () => es.close();
-  }, []);
+  }, [reconnectKey]);
 
   // Auto-select a model once they arrive and none is chosen. Prefer a saved
   // selection from localStorage so the user's last model persists across reloads.
@@ -327,6 +341,68 @@ export function useAgent(): AgentApi {
     [send],
   );
 
+  // ── Projects / workspace ──
+  const switchWorkspace = useCallback(
+    async (path: string) => {
+      // Optimistically mark switching so the UI shows a loading state.
+      setState((s) => reduce(s, { type: "_set_switching", switching: true }));
+      await send({ type: "switch_workspace", path });
+    },
+    [send],
+  );
+  const renameSession = useCallback(
+    (name: string, title: string) => send({ type: "rename_session", name, title }),
+    [send],
+  );
+  const listProjects = useCallback(() => send({ type: "list_projects" }), [send]);
+  const addProject = useCallback((path: string) => send({ type: "add_project", path }), [send]);
+  const removeProject = useCallback(
+    (path: string) => send({ type: "remove_project", path }),
+    [send],
+  );
+
+  // ── Connection ──
+  const reconnect = useCallback(() => setReconnectKey((k) => k + 1), []);
+
+  // ── Utility ──
+  const copyLastReply = useCallback(() => {
+    const msgs = stateRef.current.messages;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role === "assistant" && m.text.trim()) {
+        navigator.clipboard?.writeText(m.text).then(
+          () => {},
+          () => {},
+        );
+        return;
+      }
+    }
+  }, []);
+
+  const exportTranscript = useCallback((): string => {
+    const msgs = stateRef.current.messages;
+    const lines: string[] = [`# Umans Harness Transcript`, ``];
+    for (const m of msgs) {
+      if (m.role === "user") {
+        lines.push(`## You`, ``, m.text, ``);
+      } else if (m.role === "assistant") {
+        lines.push(`## Assistant${m.model ? ` (${m.model})` : ""}`, ``);
+        if (m.text) lines.push(m.text, ``);
+        for (const tc of m.toolCalls) {
+          lines.push(
+            `> **Tool: ${tc.name}**`,
+            `> \`\`\``,
+            `> ${(tc.argString || "").split("\n").join("\n> ")}`,
+            `> \`\`\``,
+            tc.result ? `> _${tc.result.ok ? "ok" : "error"}_` : `> _running_`,
+            ``,
+          );
+        }
+      }
+    }
+    return lines.join("\n");
+  }, []);
+
   return {
     state,
     connected,
@@ -360,5 +436,13 @@ export function useAgent(): AgentApi {
     getVisionConfig,
     setVisionConfig,
     setConfig,
+    switchWorkspace,
+    renameSession,
+    listProjects,
+    addProject,
+    removeProject,
+    reconnect,
+    copyLastReply,
+    exportTranscript,
   };
 }

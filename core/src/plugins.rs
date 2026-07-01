@@ -267,6 +267,12 @@ pub struct HookResult {
 /// Holds an in-memory registry behind a `RwLock`.
 pub struct PluginManager {
     plugins_dir: PathBuf,
+    /// Optional **global, user-owned** plugins dir (`~/.umans-harness/plugins`)
+    /// scanned before the project dir so globally-staged plugins load across
+    /// every project. `None` for the isolated `new()` constructor (used by
+    /// tests); `Some` for `new_with_global_plugins()` (used by the core at
+    /// startup). A project plugin with the same name overrides the global one.
+    user_plugins_dir: Option<PathBuf>,
     /// Workspace root — used to decide whether a plugin dir is project-scoped
     /// (inside the workspace) vs user-installed (outside it).
     workspace: PathBuf,
@@ -280,11 +286,63 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    /// Create a new manager and scan/load all plugins from `plugins_dir`.
-    /// `workspace` + `trust_project` gate project-scoped plugins (see struct).
+    /// Create a new manager and scan/load all plugins from `plugins_dir` only
+    /// (the project plugins dir). This is the **isolated** constructor used by
+    /// tests; it does NOT scan the global `~/.umans-harness/plugins` dir, so
+    /// tests are unaffected by the developer's real global plugins.
+    ///
+    /// Production code should use [`PluginManager::new_with_global_plugins`]
+    /// instead, which also loads globally-staged plugins.
     pub fn new(plugins_dir: PathBuf, workspace: PathBuf, trust_project: bool) -> Self {
         let mgr = PluginManager {
             plugins_dir,
+            user_plugins_dir: None,
+            workspace,
+            trust_project,
+            plugins: RwLock::new(HashMap::new()),
+            skipped_project: Mutex::new(Vec::new()),
+        };
+        mgr.scan_and_load();
+        mgr
+    }
+
+    /// Production constructor: like [`PluginManager::new`] but ALSO scans the
+    /// global, user-owned plugins dir (`~/.umans-harness/plugins`, staged on
+    /// first run) before the project dir. Globally-staged plugins (e.g. the
+    /// vision-handoff plugin) therefore load in every project without any
+    /// per-project setup; a same-named project plugin overrides the global one.
+    pub fn new_with_global_plugins(
+        plugins_dir: PathBuf,
+        workspace: PathBuf,
+        trust_project: bool,
+    ) -> Self {
+        let user_plugins_dir =
+            crate::config::home_dir().map(|h| h.join(".umans-harness/plugins"));
+        let mgr = PluginManager {
+            plugins_dir,
+            user_plugins_dir,
+            workspace,
+            trust_project,
+            plugins: RwLock::new(HashMap::new()),
+            skipped_project: Mutex::new(Vec::new()),
+        };
+        mgr.scan_and_load();
+        mgr
+    }
+
+    /// Test-only constructor that scans an explicit user (global) plugins dir
+    /// in addition to the project dir, so global-scan behavior can be exercised
+    /// deterministically without touching the real `~/.umans-harness/plugins`.
+    #[cfg(test)]
+    fn new_with_user_plugins_dir(
+        plugins_dir: PathBuf,
+        user_plugins_dir: Option<PathBuf>,
+        workspace: PathBuf,
+        trust_project: bool,
+    ) -> Self {
+        let mgr = PluginManager {
+            plugins_dir,
+            user_plugins_dir,
             workspace,
             trust_project,
             plugins: RwLock::new(HashMap::new()),
@@ -300,26 +358,63 @@ impl PluginManager {
         self.skipped_project.lock().unwrap().clone()
     }
 
-    /// Re-scan the plugins directory and load/reload all valid plugins.
-    /// Invalid plugins are skipped with a log message to stderr but never crash.
-    /// Project-scoped plugins (dir inside the workspace) are skipped unless
-    /// `trust_project` is true; their names are recorded in `skipped_project`.
+    /// Re-scan the plugin directories and load/reload all valid plugins.
+    ///
+    /// Two directories are scanned:
+    /// 1. the **global, user-owned** plugins dir `~/.umans-harness/plugins`
+    ///    (staged on first run; shared across every project; loads always —
+    ///    these are plugins *you* installed, outside the workspace), then
+    /// 2. the **project** plugins dir (`plugins_dir`, default
+    ///    `.umans-harness/plugins` inside the workspace; gated by
+    ///    `trust_project`).
+    ///
+    /// On a name collision the project plugin wins, so a project's own
+    /// `.umans-harness/plugins/<name>` overrides the global one for that
+    /// project only — matching the agent/skill override model.
+    ///
+    /// Invalid plugins are skipped with a log message to stderr but never
+    /// crash. Project-scoped plugins (dir inside the workspace) are skipped
+    /// unless `trust_project` is true; their names are recorded in
+    /// `skipped_project`.
     fn scan_and_load(&self) {
-        let _ = std::fs::create_dir_all(&self.plugins_dir);
         let canon_ws =
             std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
         let mut plugins = self.plugins.write().unwrap();
         plugins.clear();
         let mut skipped_local: Vec<String> = Vec::new();
 
-        let rd = match std::fs::read_dir(&self.plugins_dir) {
-            Ok(r) => r,
-            Err(_) => {
-                *self.skipped_project.lock().unwrap() = skipped_local;
-                return;
-            }
-        };
+        // 1) Global, user-owned plugins (~/.umans-harness/plugins) when this
+        //    manager was constructed to scan them (production). Outside the
+        //    workspace, so `is_project` is false and they load unconditionally.
+        //    Skipped entirely for the isolated `new()` constructor (tests).
+        if let Some(ref user_dir) = self.user_plugins_dir {
+            self.scan_dir(user_dir, &canon_ws, &mut plugins, &mut skipped_local);
+        }
 
+        // 2) Project plugins. Scanned last so a same-named project plugin
+        //    overrides the global one. Created on demand so the dir existing
+        //    never errors.
+        let _ = std::fs::create_dir_all(&self.plugins_dir);
+        self.scan_dir(&self.plugins_dir, &canon_ws, &mut plugins, &mut skipped_local);
+
+        *self.skipped_project.lock().unwrap() = skipped_local;
+    }
+
+    /// Scan one plugin directory and load every valid plugin in it into
+    /// `plugins` (later inserts override earlier ones on name collision).
+    /// `skipped` collects project-scoped plugin names that were gated off by
+    /// `trust_project`. A missing or unreadable directory is a silent no-op.
+    fn scan_dir(
+        &self,
+        dir: &std::path::Path,
+        canon_ws: &std::path::Path,
+        plugins: &mut HashMap<String, Plugin>,
+        skipped: &mut Vec<String>,
+    ) {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -338,7 +433,7 @@ impl PluginManager {
             // regardless. `trust_project` is read only from env/CLI, never a
             // project config file, so a repo can't self-enable.
             let canon_plugin = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let is_project = canon_plugin.starts_with(&canon_ws);
+            let is_project = canon_plugin.starts_with(canon_ws);
             if is_project && !self.trust_project {
                 let name = std::fs::read_to_string(&manifest_path)
                     .ok()
@@ -353,7 +448,7 @@ impl PluginManager {
                 eprintln!(
                     "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / UMANS_HARNESS_TRUST_PROJECT_PLUGINS=1 to enable"
                 );
-                skipped_local.push(name);
+                skipped.push(name);
                 continue;
             }
             match Self::load_plugin_from_dir(&path) {
@@ -368,7 +463,6 @@ impl PluginManager {
                 }
             }
         }
-        *self.skipped_project.lock().unwrap() = skipped_local;
     }
 
     /// Load a single plugin from a directory containing plugin.json.
@@ -1143,6 +1237,61 @@ mod tests {
         let mgr2 = PluginManager::new(plugins_dir, tmp.path.clone(), true);
         assert_eq!(mgr2.list().len(), 1);
         assert!(mgr2.skipped_project_plugins().is_empty());
+    }
+
+    #[test]
+    fn global_user_plugins_load_alongside_project() {
+        // A plugin in the user (global) plugins dir loads regardless of
+        // trust_project (it lives outside the workspace), and a same-named
+        // project plugin overrides it.
+        let ws = TmpDir::new("glob_ws");
+        let global = TmpDir::new("glob_user_plugins");
+        let proj_plugins = ws.path.join(".umans-harness/plugins");
+
+        // Global plugin "vision-fake" (outside the workspace).
+        let gdir = global.path.join("vision-fake");
+        fs::create_dir_all(gdir.join("hooks")).unwrap();
+        write_hook_script(&gdir.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
+        write_plugin(&gdir, "vision-fake", "1.0.0", r#"{"pre_turn":{"script":"hooks/h.sh"}}"#);
+
+        // trust_project=false, no project plugins present: global loads, none skipped.
+        let mgr = PluginManager::new_with_user_plugins_dir(
+            proj_plugins.clone(),
+            Some(global.path.clone()),
+            ws.path.clone(),
+            false,
+        );
+        assert!(mgr.list().contains_key("vision-fake"));
+        assert!(mgr.skipped_project_plugins().is_empty());
+
+        // Add a same-named project plugin inside the workspace.
+        let pdir = proj_plugins.join("vision-fake");
+        fs::create_dir_all(pdir.join("hooks")).unwrap();
+        write_hook_script(&pdir.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
+        write_plugin(&pdir, "vision-fake", "9.9.9", r#"{"pre_turn":{"script":"hooks/h.sh"}}"#);
+
+        // trust_project=true: project plugin loads and OVERRIDES the global one.
+        let mgr2 = PluginManager::new_with_user_plugins_dir(
+            proj_plugins.clone(),
+            Some(global.path.clone()),
+            ws.path.clone(),
+            true,
+        );
+        assert_eq!(mgr2.list().get("vision-fake").unwrap().version, "9.9.9");
+
+        // trust_project=false: the project plugin is skipped (recorded), and
+        // the global one still loads.
+        let mgr3 = PluginManager::new_with_user_plugins_dir(
+            proj_plugins,
+            Some(global.path.clone()),
+            ws.path.clone(),
+            false,
+        );
+        assert_eq!(mgr3.list().get("vision-fake").unwrap().version, "1.0.0");
+        assert_eq!(
+            mgr3.skipped_project_plugins(),
+            vec!["vision-fake".to_string()]
+        );
     }
 
     #[test]

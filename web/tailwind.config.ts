@@ -11,26 +11,29 @@ const config: Config = {
         mono: ["var(--font-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
       },
       colors: {
-        // Refined dark surface scale (zinc-tuned, slightly cooler)
+        // Refined dark surface scale (zinc-tuned, slightly cooler).
+        // Defined as CSS variables (RGB triplets) so the light theme can override
+        // them via [data-theme="light"] in globals.css. The <alpha-value>
+        // placeholder keeps Tailwind's /80 opacity modifiers working.
         ink: {
-          950: "#08080a",
-          925: "#0c0c10",
-          900: "#101015",
-          850: "#15151c",
-          800: "#1b1b23",
-          750: "#22222c",
-          700: "#2a2a35",
-          600: "#3a3a47",
-          500: "#52525f",
-          400: "#6e6e7e",
-          300: "#9a9aa8",
-          200: "#c4c4cf",
-          100: "#e6e6ec",
+          950: "rgb(var(--ink-950) / <alpha-value>)",
+          925: "rgb(var(--ink-925) / <alpha-value>)",
+          900: "rgb(var(--ink-900) / <alpha-value>)",
+          850: "rgb(var(--ink-850) / <alpha-value>)",
+          800: "rgb(var(--ink-800) / <alpha-value>)",
+          750: "rgb(var(--ink-750) / <alpha-value>)",
+          700: "rgb(var(--ink-700) / <alpha-value>)",
+          600: "rgb(var(--ink-600) / <alpha-value>)",
+          500: "rgb(var(--ink-500) / <alpha-value>)",
+          400: "rgb(var(--ink-400) / <alpha-value>)",
+          300: "rgb(var(--ink-300) / <alpha-value>)",
+          200: "rgb(var(--ink-200) / <alpha-value>)",
+          100: "rgb(var(--ink-100) / <alpha-value>)",
         },
         accent: {
-          DEFAULT: "#8b7cff",
-          soft: "#a99cff",
-          deep: "#6d5ce6",
+          DEFAULT: "rgb(var(--accent) / <alpha-value>)",
+          soft: "rgb(var(--accent-soft) / <alpha-value>)",
+          deep: "rgb(var(--accent-deep) / <alpha-value>)",
         },
       },
       keyframes: {

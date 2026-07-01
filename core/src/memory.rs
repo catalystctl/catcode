@@ -1,13 +1,15 @@
 // persistent memory system. Stores named memories as markdown files with
 // YAML-like frontmatter under ~/.config/umans-harness/memory/<project-hash>/.
 // Memories are scoped per workspace (hashed canonical path) and injected into
-// the system prompt when relevant keyword matches are found in the user's prompt.
+// the standing system prompt so learnings persist across sessions.
 // ponytail: no DB, no extra crate — just markdown files on disk.
 //
-// Only memory_injection is wired (main.rs). The save/scan/hash half (Store::save,
-// rebuild_index, slugify, scan_memories, save_memory, project_hash) is a staged
-// feature not yet bound to a Command; keep it + its tests but silence dead-code
-// until it's wired so clippy stays clean.
+// Wired end-to-end: the `memory` AI tool (tools.rs) exposes save/append/list/
+// forget to the model; the TUI slash commands (/remember /memory /forget) map
+// to the SaveMemory/ListMemory/ForgetMemory core commands; memory_injection is
+// spliced into the system prompt (main.rs). append_memory also runs at
+// compaction to preserve durable facts. `project_hash` is a standalone helper
+// kept for potential external use, hence the module-level dead-code allow.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -220,7 +222,15 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
     if memories.is_empty() {
         return String::new();
     }
-    let relevant: Vec<&MemoryEntry> = memories.iter().filter(|m| is_relevant(m, prompt)).collect();
+    // An empty prompt means we're building the standing system prompt (no
+    // specific query to filter by): include ALL memories so the model always
+    // carries forward what it learned in prior sessions. A non-empty prompt
+    // (per-turn relevance, reserved for future use) filters to keyword matches.
+    let relevant: Vec<&MemoryEntry> = if prompt.is_empty() {
+        memories.iter().collect()
+    } else {
+        memories.iter().filter(|m| is_relevant(m, prompt)).collect()
+    };
     if relevant.is_empty() {
         return String::new();
     }
@@ -608,6 +618,30 @@ mod tests {
     }
 
     #[test]
+    fn memory_injection_empty_prompt_injects_all() {
+        // The standing system prompt is built with an empty prompt: ALL memories
+        // must be injected so prior-session learnings carry forward, not filtered
+        // by keyword relevance (which would match nothing on an empty prompt).
+        let root = tmp_root();
+        let ws = fake_workspace("empty");
+        let store = test_store(&root);
+
+        store
+            .save(&ws, "rust rules", "no unsafe", "project", "safe Rust only")
+            .unwrap();
+        store
+            .save(&ws, "indent", "always use tabs", "user", "tab width 4")
+            .unwrap();
+        let memories = store.scan(&ws);
+        let injection = build_injection(&memories, "");
+        assert!(injection.contains("[PERSISTENT MEMORIES]"));
+        assert!(injection.contains("rust rules"));
+        assert!(injection.contains("safe Rust only"));
+        // an unrelated memory must still appear under the empty-prompt standing prompt
+        assert!(injection.contains("indent"));
+    }
+
+    #[test]
     fn save_overwrites_existing() {
         let root = tmp_root();
         let ws = fake_workspace("over");
@@ -660,8 +694,9 @@ mod tests {
     fn frontmatter_parses_crlf_line_endings() {
         // A memory file edited on Windows (CRLF) must parse identically to its
         // LF counterpart. Previously find_frontmatter_end's `line.len() + 1`
-        // assumed a single-byte terminator while `str::lines()` strips the',
-        // so the closing-fence offset drifted and corrupted the body/fields.
+        // assumed a single-byte terminator while `str::lines()` strips the
+        // trailing carriage return, so the closing-fence offset drifted and
+        // corrupted the body/fields.
         let root = tmp_root();
         let ws = fake_workspace("crlf");
         let store = test_store(&root);

@@ -13,25 +13,8 @@ import { useEffect, useRef, useState } from "react";
 import type { IntercomEntry, IntercomPrompt } from "@/lib/types";
 import { relativeTime } from "@/lib/format";
 import { DotIcon, SendIcon, XIcon } from "./icons";
-
-function useOutsideClose(onClose: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", h);
-    document.addEventListener("keydown", k);
-    return () => {
-      document.removeEventListener("mousedown", h);
-      document.removeEventListener("keydown", k);
-    };
-  }, [onClose]);
-  return ref;
-}
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 function QuestionIcon(props: { width?: number; height?: number; className?: string }) {
   const { width = 16, height = 16, className } = props;
@@ -142,14 +125,18 @@ const KIND_COLOR: Record<IntercomEntry["kind"], string> = {
 };
 
 export function SubagentPanel({ log, onClose }: PanelProps) {
-  const ref = useOutsideClose(onClose);
+  const closeRef = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
   const entries = [...log].sort((a, b) => b.ts - a.ts);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
-        ref={ref}
+        ref={mergeRefs(closeRef, trapRef)}
         className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Subagent activity"
       >
         <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
           <span className="text-[15px] font-semibold text-ink-100">Subagent activity</span>

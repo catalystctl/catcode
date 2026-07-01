@@ -17,6 +17,7 @@ mod plugins;
 mod protocol;
 mod provider;
 mod session;
+mod staging;
 mod subagent;
 mod tools;
 mod vision;
@@ -63,7 +64,13 @@ Tool-call hygiene — keep tool arguments small and valid JSON:
 
 All paths are relative to the workspace root; absolute paths and ".." are rejected.
 Work step by step: read/search before changing, make the smallest correct change, then verify with a command.
-Be concise. Prefer standard tools. When done, summarize what you did in two lines."#;
+Be concise. Prefer standard tools. When done, summarize what you did in two lines.
+
+Self-learning — you compound knowledge across sessions, so future you starts smarter:
+- The `memory` tool (actions: save/append/list/forget) persists durable facts scoped to this workspace. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
+- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia.
+- Reusable skills live as markdown + YAML frontmatter under `.umans-harness/skills/<name>/SKILL.md`. Discover them with `list_dir .umans-harness/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in.
+- `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
 
 /// Build the full system prompt by appending git context, memory context,
 /// and the plugin self-bootstrapping docs.
@@ -197,6 +204,18 @@ fn new_session_filename() -> String {
 
 #[tokio::main]
 async fn main() {
+    // Stage the harness's global defaults (agents, orchestrator skill,
+    // vision-handoff plugin) into ~/.umans-harness/ on first run — shared
+    // across every project, editable once, never per-project by default. Done
+    // before config/plugin loading so staged files are picked up this run.
+    let stage = staging::stage_if_needed();
+    if stage.first_run {
+        eprintln!(
+            "[staging] first run: staged {} default file(s) into {}",
+            stage.written.len(),
+            stage.home.display()
+        );
+    }
     let cfg = config::load();
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -269,7 +288,7 @@ async fn main() {
         cached_tokens: Mutex::new(0),
         escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
-        plugin_manager: PluginManager::new(plugin_dir, pm_workspace, trust_project),
+        plugin_manager: PluginManager::new_with_global_plugins(plugin_dir, pm_workspace, trust_project),
         vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
@@ -320,6 +339,21 @@ async fn main() {
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("resumed_messages", json!(conv_len)),
                 );
+                // Tell the user when the harness staged its global defaults
+                // (first run) so the global ~/.umans-harness/ layout is
+                // discoverable.
+                if stage.first_run {
+                    emit(
+                        &Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "First run: staged {} default file(s) into {} — agents, the pi-subagents skill, and the vision-handoff plugin now live globally and are shared across all projects. Edit them there to customize; drop a file in a project's own .umans-harness/ to override for that project only.",
+                                stage.written.len(),
+                                stage.home.display()
+                            )),
+                        ),
+                    );
+                }
                 // Surface a future-version session-load error to the user.
                 if let Some(e) = session_error.as_ref() {
                     emit(&Event::new("error").with("message", json!(e)));

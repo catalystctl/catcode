@@ -1,0 +1,81 @@
+"use client";
+
+// HelpModal — keybindings + slash-command reference. Opened via /help or the
+// sidebar. Uses the shared command catalog so it stays in sync with the flyout.
+
+import { COMMANDS } from "@/lib/commands";
+import { useOutsideClose } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+import { XIcon } from "./icons";
+
+const KEYBINDS: Array<[string, string]> = [
+  ["Enter", "Send message"],
+  ["Shift + Enter", "Newline"],
+  ["/", "Open command menu"],
+  ["@", "Mention a file"],
+  ["↑ / ↓", "Navigate flyout"],
+  ["Tab / ↵", "Confirm flyout selection"],
+  ["Esc", "Close flyout / modal"],
+  ["Double-click session", "Rename session"],
+];
+
+export function HelpModal({ onClose }: { onClose: () => void }) {
+  const ref = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <div
+        ref={(el) => {
+          (ref as React.MutableRefObject<HTMLDivElement | null>).current = el;
+          (trapRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+        }}
+        className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Help"
+      >
+        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+          <h2 className="text-[15px] font-semibold text-ink-100">Help & Keybindings</h2>
+          <button
+            onClick={onClose}
+            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+          >
+            <XIcon width={16} height={16} />
+          </button>
+        </div>
+        <div className="overflow-y-auto px-5 py-4">
+          {/* Keybindings */}
+          <div className="mb-5">
+            <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">
+              Keyboard
+            </div>
+            <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+              {KEYBINDS.map(([key, desc]) => (
+                <div key={key} className="flex items-center gap-2 text-[12px]">
+                  <kbd className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
+                    {key}
+                  </kbd>
+                  <span className="text-ink-400">{desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {/* Commands */}
+          <div>
+            <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">
+              Slash Commands
+            </div>
+            <div className="space-y-0.5">
+              {COMMANDS.map((c) => (
+                <div key={c.label} className="flex items-baseline gap-2 text-[12px]">
+                  <span className="shrink-0 font-mono text-accent-soft">{c.label}</span>
+                  <span className="text-ink-500">{c.desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

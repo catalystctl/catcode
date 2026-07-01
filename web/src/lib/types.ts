@@ -55,6 +55,15 @@ export interface SessionEntry {
   name: string;
   mtime: number;
   size?: number;
+  /** Auto-derived title (first user message) from the core. May be overridden
+   *  by the bridge's session-titles overlay (user-defined rename). */
+  title?: string;
+  /** Absolute path to the .jsonl session file. */
+  path?: string;
+  /** Message count in the session file. */
+  messages?: number;
+  /** True when this is the currently-active session. */
+  current?: boolean;
 }
 
 export interface Stats {
@@ -151,6 +160,10 @@ export type CoreEvent =
   | { type: "plugin_error"; name?: string; message: string }
   // ── Vision ──
   | { type: "vision_config"; vision_models: string[]; vision_model: string | null }
+  // ── Projects / workspace ──
+  | { type: "projects"; projects: ProjectEntry[] }
+  | { type: "workspace_changed"; workspace: string; projects: ProjectEntry[] }
+  | { type: "session_renamed"; name: string; title: string }
   // ── Compaction / config ──
   | { type: "digested"; count?: number; what?: string }
   | { type: "config_changed"; key: string; value: string | number };
@@ -189,7 +202,13 @@ export type CoreCommand =
   | { type: "list_plugins" }
   // ── Vision ──
   | { type: "get_vision_config" }
-  | { type: "set_vision_config"; vision_models?: string[]; vision_model?: string | null };
+  | { type: "set_vision_config"; vision_models?: string[]; vision_model?: string | null }
+  // ── Projects / workspace ──
+  | { type: "switch_workspace"; path: string }
+  | { type: "rename_session"; name: string; title: string }
+  | { type: "list_projects" }
+  | { type: "add_project"; path: string }
+  | { type: "remove_project"; path: string };
 
 /** Synthetic events produced by the bridge/client (not from the core). */
 export type SyntheticEvent =
@@ -200,7 +219,11 @@ export type SyntheticEvent =
   | { type: "_select_model"; id: string }
   | { type: "_set_thinking"; level: string }
   // A toast was dismissed by the UI.
-  | { type: "_dismiss_toast"; id: string };
+  | { type: "_dismiss_toast"; id: string }
+  // Optimistic: the bridge is (re)spawning the core after a workspace switch.
+  | { type: "_set_switching"; switching: boolean }
+  // A custom session title was set/removed (web-layer rename overlay).
+  | { type: "_session_title"; name: string; title: string };
 
 export type AgentEvent = CoreEvent | SyntheticEvent;
 
@@ -226,6 +249,11 @@ export interface UserMsg {
   role: "user";
   text: string;
   ts: number;
+  /** True when this message was a steer (redirect of an in-flight turn),
+   *  not a fresh prompt. Drives a visual "steering" badge. */
+  steer?: boolean;
+  /** Images attached to this message (data URLs). */
+  images?: string[];
 }
 
 export interface AssistantMsg {
@@ -260,7 +288,26 @@ export interface Toast {
   message: string;
 }
 
+/** A workspace file entry for the @-mention flyout. */
+export interface FileEntry {
+  /** Path relative to the workspace root. */
+  path: string;
+  /** Just the filename. */
+  name: string;
+  /** True if this is a directory. */
+  dir: boolean;
+}
+
 // ─── Agent state (the reducer output) ───────────────────────────────────────
+
+export interface ProjectEntry {
+  /** Absolute workspace path. */
+  path: string;
+  /** Display name (basename). */
+  name: string;
+  /** Last-accessed timestamp (ms). */
+  lastUsed: number;
+}
 
 export interface AgentState {
   ready: ReadyPayload | null;
@@ -271,6 +318,8 @@ export interface AgentState {
   approvalMode: string;
   escalatedKinds: string[];
   workspace: string;
+  /** Known workspace projects (for the project picker). */
+  projects: ProjectEntry[];
   selectedModel: string | null;
   thinkingLevel: string;
   messages: UIMessage[];
@@ -288,6 +337,8 @@ export interface AgentState {
   pendingIntercom: IntercomPrompt | null;
   intercomLog: IntercomEntry[];
   visionConfig: VisionConfig | null;
+  /** True while the bridge is (re)spawning the core after a workspace switch. */
+  switching: boolean;
 }
 
 /** Sent to a freshly-connected client to hydrate the full current state. */

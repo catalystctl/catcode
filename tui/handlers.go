@@ -349,6 +349,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.refresh()
 
 	case "info":
+		// Informational notices from the core (first-run staging, subagent
+		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
+		if msg := ev.get("message"); msg != "" {
+			s.logInfo(msg)
+		}
 
 	case "steer":
 		// Core acknowledged a steer: the running turn was interrupted and the
@@ -1197,6 +1202,33 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.sendCore(map[string]any{"type": "forget_memory", "id": parts[1]})
 			return nil
+		case "/index":
+			// Bootstrap learning on this repo: walk the structure and persist durable
+			// knowledge as memories + note candidate skills. Pure delegation to the
+			// orchestrator (it has read/grep/glob/bash + the memory tool); no core
+			// command needed. --full re-indexes from scratch; --incremental only
+			// covers files changed since the last index (detected via git).
+			mode := "full"
+			for _, a := range parts[1:] {
+				if a == "--incremental" || a == "-i" {
+					mode = "incremental"
+				} else if a == "--full" || a == "-f" {
+					mode = "full"
+				}
+			}
+			var task string
+			if mode == "incremental" {
+				task = "Run an incremental knowledge index of this repository. Use `git status` + `git diff --name-only` to find files changed since the last index; for each changed area, read it and use the `memory` tool (action: append) to UPDATE the relevant existing memories — architecture, conventions, APIs, gotchas — rather than creating duplicates. If a changed file reveals a new subsystem with no memory yet, save a new one. Then list the memories you touched. Be concise: only persist what genuinely changed."
+			} else {
+				task = "Run a full knowledge index of this repository to bootstrap learning. Walk the top-level layout, read README/package-manifest/entry points/config/tests, and identify the architecture, major subsystems, conventions, reusable patterns, build/test/deploy steps, and gotchas. Use the `memory` tool (action: save) to persist each as a durable, named memory (types: architecture/convention/api/gotcha/build). Then use `list_dir .umans-harness/skills/` and, for any reusable workflow you solved 2+ times that has no skill yet, write a candidate SKILL.md under `.umans-harness/skills/<name>/` with write_file (frontmatter: name/description; body: when-to-use + steps + example). End by listing the memories and any candidate skills you created, and name one area you are least confident about."
+			}
+			return s.sendDelegation(task, "/index")
+		case "/reflect":
+			// Deliberate end-of-task learning pass: critique the recent work in this
+			// session and persist durable takeaways via the memory tool. Pure
+			// delegation — no core command needed.
+			task := "Reflect on the work done in this session so far. Identify: (1) any convention, architecture fact, decision, or gotcha worth persisting so future sessions don't rediscover it, and (2) any repetitive pattern you performed more than once that should become a reusable skill under `.umans-harness/skills/`. Use the `memory` tool (action: append if a topic memory exists, else save) to persist durable facts only — skip transient task state. If you wrote a skill, name it. Finish with a two-line summary: what you learned and what you persisted."
+			return s.sendDelegation(task, "/reflect")
 		case "/sessions":
 			s.sendCore(map[string]any{"type": "list_sessions"})
 			return nil

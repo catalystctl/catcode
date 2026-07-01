@@ -148,3 +148,41 @@ export const DotIcon = (p: P) => (
     <circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" />
   </svg>
 );
+
+export const PencilIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+  </svg>
+);
+
+export const FolderPlusIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+    <path d="M12 11v4M10 13h4" />
+  </svg>
+);
+
+export const SearchIcon = (p: P) => (
+  <svg {...base(p)}>
+    <circle cx="11" cy="11" r="8" />
+    <path d="M21 21l-4.35-4.35" />
+  </svg>
+);
+
+export const DownloadIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <path d="M7 10l5 5 5-5" />
+    <path d="M12 15V3" />
+  </svg>
+);
+
+export const RefreshIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 12a9 9 0 1 1-3-6.7" />
+    <path d="M21 3v5h-5" />
+  </svg>
+);
+
+export const EditIcon = PencilIcon;

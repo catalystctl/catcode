@@ -28,6 +28,7 @@ export const initialState: AgentState = {
   approvalMode: "destructive",
   escalatedKinds: [],
   workspace: "",
+  projects: [],
   selectedModel: null,
   thinkingLevel: "medium",
   messages: [],
@@ -45,6 +46,7 @@ export const initialState: AgentState = {
   pendingIntercom: null,
   intercomLog: [],
   visionConfig: null,
+  switching: false,
 };
 
 let counter = 0;
@@ -260,7 +262,13 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
   switch (ev.type) {
     // ── Synthetic events ──
     case "_user": {
-      const msg: UIMessage = { id: newId("u"), role: "user", text: ev.text, ts: Date.now() };
+      const msg: UIMessage = {
+        id: newId("u"),
+        role: "user",
+        text: ev.text,
+        ts: Date.now(),
+        steer: ev.steer,
+      };
       return {
         ...state,
         messages: [...state.messages, msg],
@@ -274,6 +282,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, thinkingLevel: ev.level };
     case "_dismiss_toast":
       return { ...state, toasts: state.toasts.filter((t) => t.id !== ev.id) };
+    case "_set_switching":
+      return { ...state, switching: ev.switching };
+    case "_session_title": {
+      const sessions = state.sessions.map((s) =>
+        s.name === ev.name ? { ...s, title: ev.title || undefined } : s,
+      );
+      return { ...state, sessions };
+    }
 
     // ── Core events ──
     case "ready":
@@ -481,6 +497,30 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     // ── Vision ──
     case "vision_config":
       return { ...state, visionConfig: { vision_models: ev.vision_models ?? [], vision_model: ev.vision_model ?? null } };
+
+    // ── Projects / workspace ──
+    case "projects":
+      return { ...state, projects: Array.isArray(ev.projects) ? ev.projects : [] };
+    case "workspace_changed":
+      return {
+        ...state,
+        workspace: ev.workspace,
+        projects: Array.isArray(ev.projects) ? ev.projects : state.projects,
+        switching: false,
+        messages: [],
+        currentAssistantId: null,
+        streaming: false,
+        pendingApproval: null,
+        sessions: [],
+        currentSessionFile: null,
+        stats: null,
+      };
+    case "session_renamed": {
+      const sessions = state.sessions.map((s) =>
+        s.name === ev.name ? { ...s, title: ev.title || undefined } : s,
+      );
+      return { ...state, sessions };
+    }
 
     // ── Compaction / config ──
     case "digested":

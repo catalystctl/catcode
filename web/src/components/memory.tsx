@@ -3,8 +3,10 @@
 // MemoryPanel — list/create/forget persisted workspace memories.
 // Memories are injected into the agent's system prompt across sessions.
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import type { MemoryEntry } from "@/lib/types";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { BrainIcon, PlusIcon, TrashIcon, XIcon } from "./icons";
 
 interface Props {
@@ -14,29 +16,11 @@ interface Props {
   onClose: () => void;
 }
 
-function useOutsideClose(onClose: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", h);
-    document.addEventListener("keydown", k);
-    return () => {
-      document.removeEventListener("mousedown", h);
-      document.removeEventListener("keydown", k);
-    };
-  }, [onClose]);
-  return ref;
-}
-
 export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
   const [text, setText] = useState("");
   const [tags, setTags] = useState("");
-  const ref = useOutsideClose(onClose);
+  const closeRef = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
 
   const save = () => {
     const t = text.trim();
@@ -53,8 +37,11 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
-        ref={ref}
+        ref={mergeRefs(closeRef, trapRef)}
         className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Memories"
       >
         <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
           <div className="flex items-center gap-2">

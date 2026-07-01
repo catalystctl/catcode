@@ -4,9 +4,10 @@
 // approval-mode toggle, live metrics, and a connection indicator. Collapses
 // the secondary controls on small screens.
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import type { Metrics } from "@/lib/types";
 import { formatTokens, formatTps, formatMs, basename } from "@/lib/format";
+import { useOutsideClose } from "@/lib/use-outside-close";
 import {
   ChevronDown,
   CheckIcon,
@@ -16,6 +17,7 @@ import {
   DotIcon,
   FolderIcon,
   MenuIcon,
+  RefreshIcon,
 } from "./icons";
 
 interface Props {
@@ -30,29 +32,14 @@ interface Props {
   streaming: boolean;
   retrying: boolean;
   sessionFile: string | null;
+  switching?: boolean;
+  theme?: string;
   onMenuClick?: () => void;
   onSelectModel: (id: string) => void;
   onSelectThinking: (level: string) => void;
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
-}
-
-function useOutsideClose(onClose: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", h);
-    document.addEventListener("keydown", k);
-    return () => {
-      document.removeEventListener("mousedown", h);
-      document.removeEventListener("keydown", k);
-    };
-  }, [onClose]);
-  return ref;
+  onReconnect?: () => void;
+  onToggleTheme?: () => void;
 }
 
 const ALL_LEVELS = ["off", "low", "medium", "high"];
@@ -215,19 +202,57 @@ export function Header(props: Props) {
             {m.ttft_ms != null && <span title="time to first token">ttft {formatMs(m.ttft_ms)}</span>}
           </div>
         )}
+        {/* Theme toggle */}
+        {props.onToggleTheme && (
+          <button
+            onClick={props.onToggleTheme}
+            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
+            title={`Theme: ${props.theme ?? "dark"} (click to toggle)`}
+            aria-label="Toggle theme"
+          >
+            {props.theme === "light" ? (
+              <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="5" />
+                <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+              </svg>
+            ) : (
+              <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+              </svg>
+            )}
+          </button>
+        )}
         <span
           className={`flex items-center gap-1 text-[11px] ${props.connected ? "text-emerald-400" : "text-ink-500"}`}
           title={props.connected ? "connected" : "disconnected"}
         >
           <DotIcon
             className={`${props.connected ? "text-emerald-400" : "text-ink-600"} ${
-              props.streaming || props.retrying ? "animate-pulse" : ""
+              props.streaming || props.retrying || props.switching ? "animate-pulse" : ""
             }`}
           />
           <span className="hidden capitalize sm:inline">
-            {props.retrying ? "retrying" : props.streaming ? "working" : props.connected ? "ready" : "offline"}
+            {props.switching
+              ? "switching"
+              : props.retrying
+                ? "retrying"
+                : props.streaming
+                  ? "working"
+                  : props.connected
+                    ? "ready"
+                    : "offline"}
           </span>
         </span>
+        {/* Reconnect button when disconnected */}
+        {!props.connected && props.onReconnect && !props.switching && (
+          <button
+            onClick={props.onReconnect}
+            className="flex items-center gap-1 rounded-md border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
+            title="Reconnect to umans-core"
+          >
+            <RefreshIcon width={12} height={12} /> Reconnect
+          </button>
+        )}
       </div>
     </header>
   );

@@ -1,0 +1,266 @@
+//! First-run global staging.
+//!
+//! The harness ships a set of *default* subagent files — the built-in agent
+//! definitions (`agents/*.md`), the orchestrator delegation skill
+//! (`skills/pi-subagents/SKILL.md`), and the vision-handoff plugin. These are
+//! the things every project needs for the agent system to work, and they
+//! should NOT be copied into each project's `.umans-harness/`. Instead they are
+//! materialized once, at a single **global, user-owned** location —
+//! `~/.umans-harness/` — so they are shared across every project and editable in
+//! one place.
+//!
+//! A project's own `.umans-harness/` remains a deliberate **override**: any file
+//! placed there shadows the global default for that project only. Nothing is
+//! staged per-project by default.
+//!
+//! Staging is:
+//! - **idempotent** — re-running only fills in files that are still missing;
+//! - **non-clobbering** — a file the user edited (or deleted then recreated) is
+//!   never overwritten;
+//! - **versioned** — a marker file (`.staged`) records the staging schema so a
+//!   bump can fill in newly-added defaults, while still leaving existing files
+//!   untouched.
+
+use crate::config::home_dir;
+use std::path::PathBuf;
+
+/// Bump when the bundled default set changes meaningfully. The marker file
+/// stores this; on a version mismatch we re-scan for *missing* files (existing
+/// user files are still never overwritten) and then re-stamp the marker.
+pub const STAGING_VERSION: u32 = 1;
+
+/// `~/.umans-harness` — the global, user-owned home for harness defaults.
+/// All staged files live under here (agents/, skills/, plugins/, README.md).
+pub fn global_home() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".umans-harness")
+}
+
+/// What `stage_if_needed` did, for logging / surfacing to the user.
+#[derive(Debug, Default)]
+pub struct StageResult {
+    /// True the first time the harness runs (no `.staged` marker at the
+    /// current version). Also true after a version bump.
+    pub first_run: bool,
+    /// Relative paths (e.g. `agents/scout.md`) written this run. Empty on a
+    /// no-op run where everything was already present.
+    pub written: Vec<String>,
+    /// The global home that was staged into.
+    pub home: PathBuf,
+}
+
+/// The bundled default files, as `(relative_path, content)` pairs. The content
+/// is embedded into the core binary at build time via `include_str!`, so the
+/// binary is self-sufficient — staging needs no external files on disk.
+///
+/// `include_str!` paths are relative to *this* source file (`core/src/`), so
+/// `../../.umans-harness/...` resolves to the repo-root `.umans-harness/`,
+/// which is the canonical source for these defaults.
+fn bundled_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        // --- Built-in agent definitions (override templates for the 8
+        // builtins; the binary also carries embedded fallback prompts, so
+        // agents work even if these are deleted). ---
+        ("agents/scout.md", include_str!("../../.umans-harness/agents/scout.md")),
+        ("agents/researcher.md", include_str!("../../.umans-harness/agents/researcher.md")),
+        ("agents/planner.md", include_str!("../../.umans-harness/agents/planner.md")),
+        ("agents/worker.md", include_str!("../../.umans-harness/agents/worker.md")),
+        ("agents/reviewer.md", include_str!("../../.umans-harness/agents/reviewer.md")),
+        ("agents/context-builder.md", include_str!("../../.umans-harness/agents/context-builder.md")),
+        ("agents/oracle.md", include_str!("../../.umans-harness/agents/oracle.md")),
+        ("agents/delegate.md", include_str!("../../.umans-harness/agents/delegate.md")),
+        // --- Orchestrator delegation skill (required for the parent agent to
+        // know how to use the `subagent` tool + intercom). ---
+        ("skills/pi-subagents/SKILL.md", include_str!("../../.umans-harness/skills/pi-subagents/SKILL.md")),
+        // --- vision-handoff plugin (required for image-bearing turns to route
+        // to a vision-capable model). ---
+        ("plugins/vision-handoff/plugin.json", include_str!("../../.umans-harness/plugins/vision-handoff/plugin.json")),
+        ("plugins/vision-handoff/hooks/pre_turn.py", include_str!("../../.umans-harness/plugins/vision-handoff/hooks/pre_turn.py")),
+        ("plugins/vision-handoff/README.md", include_str!("../../.umans-harness/plugins/vision-handoff/README.md")),
+        // --- A short guide to the global layout + override model. ---
+        ("README.md", GLOBAL_README),
+    ]
+}
+
+/// Files that must be marked executable on Unix (hook scripts).
+fn executable_rel_paths() -> &'static [&'static str] {
+    &["plugins/vision-handoff/hooks/pre_turn.py"]
+}
+
+/// Ensure the global default files exist under `~/.umans-harness/`. Writes only
+/// files that are missing; never overwrites. Returns what it did.
+///
+/// Safe to call on every startup: the per-file `exists()` check makes it a cheap
+/// no-op once everything is staged. The `.staged` marker records the schema
+/// version so a bump can backfill newly-added defaults.
+pub fn stage_if_needed() -> StageResult {
+    let home = global_home();
+    // Best-effort: create the tree up front; individual file parents are also
+    // created below, but this guarantees the top-level dir exists for the marker.
+    let _ = std::fs::create_dir_all(&home);
+
+    let marker = home.join(".staged");
+    // Single source of truth: the marker stores the numeric staging version as
+    // a string. A mismatch (missing marker, or an older version) means this is
+    // a "first run" for messaging / backfill purposes.
+    let version = STAGING_VERSION.to_string();
+    let current_marker = std::fs::read_to_string(&marker).ok();
+    let first_run = current_marker.as_deref() != Some(version.as_str());
+
+    let mut written = Vec::new();
+    for (rel, content) in bundled_files() {
+        let path = home.join(rel);
+        // Non-clobbering: skip anything already present (user-edited or not).
+        if path.exists() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, content).is_ok() {
+            written.push(rel.to_string());
+            #[cfg(unix)]
+            if executable_rel_paths().contains(&rel) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
+    }
+
+    // Stamp the marker at the current version so subsequent runs short-circuit
+    // `first_run` (we still re-scan for missing files above, but this keeps the
+    // "is this the very first run" signal stable for user-facing messaging).
+    let _ = std::fs::write(&marker, &version);
+
+    StageResult {
+        first_run,
+        written,
+        home,
+    }
+}
+
+/// Staged into `~/.umans-harness/README.md` on first run.
+const GLOBAL_README: &str = r#"# umans-harness — global home
+
+This directory (`~/.umans-harness/`) is the **global, user-owned** home for the
+harness's default agent files. It is shared across every project you run the
+harness in, so defaults are configured once here — not copied into each
+project.
+
+## Layout
+
+    ~/.umans-harness/
+    ├── agents/            # built-in subagent definitions (*.md)
+    ├── skills/
+    │   └── pi-subagents/  # orchestrator delegation skill (parent-only)
+    ├── plugins/
+    │   └── vision-handoff/# routes image turns to a vision-capable model
+    ├── README.md          # this file
+    └── .staged            # staging schema version marker (do not edit)
+
+## Overrides
+
+Defaults live here, globally. To override for a **single project**, place the
+file under that project's own `.umans-harness/` — it shadows the global one for
+that project only. For example, to customize the `scout` agent in one project:
+
+    <project>/.umans-harness/agents/scout.md
+
+Project files never modify the global defaults, and nothing is staged into a
+project automatically.
+
+## Editing the global defaults
+
+Edit any file here to change a default for *every* project. The harness never
+overwrites a file that already exists, so your edits are safe across upgrades;
+delete a file to restore its bundled default on the next run.
+
+## Agents vs. the embedded fallbacks
+
+The eight agent definitions under `agents/` are override templates. The harness
+binary also carries embedded fallback prompts, so agents keep working even if
+you delete these files — they just lose your customizations.
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_is_idempotent_and_nonclobbering() {
+        let tmp = tempfile_dir();
+        let home = tmp.join(".umans-harness");
+        std::env::set_var("HOME", &tmp);
+
+        // First run: everything missing → all staged, first_run true.
+        let r1 = stage_if_needed();
+        assert!(r1.first_run, "first run should be marked first_run");
+        assert!(!r1.written.is_empty(), "first run should write defaults");
+        assert!(home.join("agents/scout.md").exists());
+        assert!(home.join("skills/pi-subagents/SKILL.md").exists());
+        assert!(home.join("plugins/vision-handoff/plugin.json").exists());
+        assert!(home.join("plugins/vision-handoff/hooks/pre_turn.py").exists());
+        assert!(home.join(".staged").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".staged")).unwrap(),
+            STAGING_VERSION.to_string(),
+            "marker must record the current staging version"
+        );
+
+        // Second run: marker present → not first_run, nothing re-written.
+        let r2 = stage_if_needed();
+        assert!(!r2.first_run, "second run should not be first_run");
+        assert!(r2.written.is_empty(), "second run should write nothing");
+
+        // User edits are preserved (non-clobbering): mutate a file, re-stage,
+        // confirm the edit survives.
+        let scout = home.join("agents/scout.md");
+        std::fs::write(&scout, "USER EDITED").unwrap();
+        let r3 = stage_if_needed();
+        assert_eq!(std::fs::read_to_string(&scout).unwrap(), "USER EDITED");
+        assert!(
+            !r3.written.contains(&"agents/scout.md".to_string()),
+            "existing file must not be re-written"
+        );
+
+        // A deleted file is restored on the next run (backfill), while the
+        // marker/first_run stays stable.
+        let skill = home.join("skills/pi-subagents/SKILL.md");
+        std::fs::remove_file(&skill).unwrap();
+        let r4 = stage_if_needed();
+        assert!(skill.exists(), "deleted default should be restored");
+        assert!(r4.written.contains(&"skills/pi-subagents/SKILL.md".to_string()));
+        assert!(!r4.first_run, "backfill is not a first_run");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.join("plugins/vision-handoff/hooks/pre_turn.py"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "hook script must be executable");
+        }
+
+        std::env::remove_var("HOME");
+    }
+
+    /// A fresh temp dir to use as a fake $HOME for the staging test. Uses
+    /// `std::env::temp_dir` + a unique subdir so tests don't collide.
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "umans-staging-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

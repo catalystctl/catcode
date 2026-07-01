@@ -453,15 +453,15 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Persist, list, or forget durable memories scoped to this workspace. Memories survive across sessions and are injected into the system prompt when relevant. Use `save` to record conventions, structure, decisions, or gotchas worth remembering. Read-only (no workspace side effects).",
+                "description": "Persist, list, or forget durable memories scoped to this workspace. Memories survive across sessions and are injected into the system prompt so prior learnings carry forward. Use `save` to record conventions, structure, decisions, or gotchas worth remembering; use `append` to add facts to an existing memory (accumulates, oldest trimmed when it exceeds a rolling cap) instead of overwriting it. Read-only (no workspace side effects).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["save", "list", "forget"], "description": "save a new memory, list memories, or forget one by id" },
-                        "name": { "type": "string", "description": "(save) short memory name; becomes the file slug and the id" },
-                        "content": { "type": "string", "description": "(save) the memory body" },
-                        "type": { "type": "string", "description": "(save) memory type, e.g. note/convention/decision (default note)" },
-                        "description": { "type": "string", "description": "(save) one-line description shown in the injection" },
+                        "action": { "type": "string", "enum": ["save", "append", "list", "forget"], "description": "save a new memory, append facts to an existing one, list memories, or forget one by id" },
+                        "name": { "type": "string", "description": "(save/append) short memory name; becomes the file slug and the id. append looks up the same name to accumulate onto" },
+                        "content": { "type": "string", "description": "(save/append) the memory body (save) or the facts to append (append)" },
+                        "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision (default note)" },
+                        "description": { "type": "string", "description": "(save/append) one-line description shown in the injection" },
                         "id": { "type": "string", "description": "(forget) the memory id (slug or name) to remove" }
                     },
                     "required": ["action"]
@@ -2379,6 +2379,38 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                 Err(e) => Outcome::err(e),
             }
         }
+        "append" => {
+            // Accumulate facts onto an existing memory (creating it if absent)
+            // instead of overwriting. The store trims the oldest facts when the
+            // rolling cap is exceeded, so accumulated knowledge stays bounded.
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if name.trim().is_empty() {
+                return Outcome::err("memory append requires 'name'");
+            }
+            if content.trim().is_empty() {
+                return Outcome::err("memory append requires 'content'");
+            }
+            match crate::memory::append_memory(
+                &cfg.workspace,
+                name,
+                content,
+                mem_type,
+                description,
+                8192,
+            ) {
+                Ok(p) => {
+                    let id = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Outcome::ok(format!("appended to memory '{name}' (id: {id})"))
+                }
+                Err(e) => Outcome::err(e),
+            }
+        }
         "list" => {
             let entries = crate::memory::scan_memories(&cfg.workspace);
             if entries.is_empty() {
@@ -3169,5 +3201,35 @@ mod tests {
         // list is safe (read-only); tolerate empty store
         let l = execute("memory", &json!({ "action": "list" }), &cfg);
         assert!(l.ok, "list should always succeed: {}", l.output);
+    }
+
+    #[test]
+    fn memory_tool_append_accumulates() {
+        // append must accumulate onto a memory instead of overwriting it, so
+        // repeated learnings about the same topic compound rather than clobber.
+        let (_root, cfg) = tmp_ws();
+        let save = execute(
+            "memory",
+            &json!({ "action": "save", "name": "conventions", "content": "use tabs", "type": "convention" }),
+            &cfg,
+        );
+        assert!(save.ok, "save should succeed: {}", save.output);
+        let ap = execute(
+            "memory",
+            &json!({ "action": "append", "name": "conventions", "content": "no unwrap in prod" }),
+            &cfg,
+        );
+        assert!(ap.ok, "append should succeed: {}", ap.output);
+        // Inspect the stored memory directly: the `list` action truncates to a
+        // 3-line preview, which would hide a 4th-line appended fact.
+        let entries = crate::memory::scan_memories(&cfg.workspace);
+        assert_eq!(entries.len(), 1, "should be one accumulated memory");
+        let c = &entries[0].content;
+        assert!(c.contains("use tabs"), "original fact must survive: {c}");
+        assert!(c.contains("no unwrap in prod"), "appended fact must be present: {c}");
+        assert!(c.contains("--- appended ---"), "append marker must be present: {c}");
+        // append validates the same way save does
+        assert!(!execute("memory", &json!({ "action": "append", "content": "x" }), &cfg).ok);
+        assert!(!execute("memory", &json!({ "action": "append", "name": "x" }), &cfg).ok);
     }
 }

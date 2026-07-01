@@ -303,6 +303,8 @@ func (s *session) commandItems() []listItem {
 		{label: "/remember", desc: "save a memory note (persisted across sessions)"},
 		{label: "/memory", desc: "list saved memories"},
 		{label: "/forget", desc: "forget a memory by id"},
+		{label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
+		{label: "/reflect", desc: "reflect on this session, persist durable learnings"},
 	}
 }
 

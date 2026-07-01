@@ -5,16 +5,16 @@
 //   assistant → markdown text + collapsible reasoning + tool-call cards + metrics
 //   tool      → standalone fallback card (when no matching tool call was found)
 
-import { memo, useState } from "react";
+import { memo, useState, useEffect, useRef } from "react";
 import type { ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AssistantMsg, ToolMsg, UserMsg } from "@/lib/types";
+import type { AssistantMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { Markdown } from "./markdown";
 import { Thinking } from "./thinking";
 import { ToolCallCard } from "./tool-call";
-import { DotIcon, CopyIcon, CheckIcon } from "./icons";
+import { DotIcon, CopyIcon, CheckIcon, PencilIcon, RefreshIcon } from "./icons";
 
 // Lightweight streaming markdown: while the assistant is still producing tokens
 // we render markdown WITHOUT rehype-highlight (re-highlighting every code block
@@ -58,22 +58,103 @@ function CopyBtn({ text }: { text: string }) {
   );
 }
 
-function UserMessage({ m }: { m: UserMsg }) {
+function UserMessage({
+  m,
+  canEdit,
+  onEdit,
+}: {
+  m: UserMsg;
+  canEdit?: boolean;
+  onEdit?: (text: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(m.text);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (editing) {
+      setDraft(m.text);
+      requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (el) {
+          el.focus();
+          el.setSelectionRange(el.value.length, el.value.length);
+        }
+      });
+    }
+  }, [editing, m.text]);
+
+  const commit = () => {
+    const t = draft.trim();
+    if (t && t !== m.text && onEdit) onEdit(t);
+    setEditing(false);
+  };
+
   return (
     <div className="group flex justify-end px-4 py-2 sm:px-6">
       <div className="relative max-w-[85%]">
-        <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-ink-700/60 bg-ink-800/70 px-4 py-2.5 text-[14px] leading-relaxed text-ink-100">
-          {m.text}
-        </div>
-        <div className="absolute -left-9 top-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+        {editing ? (
+          <div className="rounded-2xl rounded-tr-sm border border-accent/40 bg-ink-800/70 p-2">
+            <textarea
+              ref={inputRef}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  commit();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  setEditing(false);
+                }
+              }}
+              onBlur={commit}
+              rows={Math.min(8, draft.split("\n").length + 1)}
+              className="w-full resize-none bg-transparent px-2 py-1 text-[14px] leading-relaxed text-ink-100 focus:outline-none"
+            />
+            <div className="flex justify-end gap-1.5 px-2 pb-1 text-[10px] text-ink-500">
+              <kbd className="rounded bg-ink-900 px-1 font-mono">↵</kbd> save{" "}
+              <kbd className="rounded bg-ink-900 px-1 font-mono">Esc</kbd> cancel
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-ink-700/60 bg-ink-800/70 px-4 py-2.5 text-[14px] leading-relaxed text-ink-100">
+              {m.text}
+            </div>
+            {m.steer && (
+              <span className="absolute -top-2 right-2 rounded-full border border-amber-500/40 bg-ink-950 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-300">
+                ↳ steer
+              </span>
+            )}
+          </>
+        )}
+        <div className="absolute -left-9 top-1.5 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <CopyBtn text={m.text} />
+          {canEdit && onEdit && !editing && (
+            <button
+              onClick={() => setEditing(true)}
+              className="flex items-center rounded-md px-1.5 py-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+              aria-label="Edit message"
+              title="Edit & resend"
+            >
+              <PencilIcon width={12} height={12} />
+            </button>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function AssistantMessage({ m }: { m: AssistantMsg }) {
+function AssistantMessage({
+  m,
+  canRegenerate,
+  onRegenerate,
+}: {
+  m: AssistantMsg;
+  canRegenerate?: boolean;
+  onRegenerate?: () => void;
+}) {
   return (
     <div className="group px-4 py-2 sm:px-6">
       <div className="flex items-center gap-2 pb-1">
@@ -87,7 +168,17 @@ function AssistantMessage({ m }: { m: AssistantMsg }) {
             <DotIcon className="animate-pulse" /> streaming
           </span>
         )}
-        <span className="ml-auto opacity-0 transition-opacity group-hover:opacity-100">
+        <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          {canRegenerate && onRegenerate && !m.streaming && (
+            <button
+              onClick={onRegenerate}
+              className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+              aria-label="Regenerate response"
+              title="Regenerate"
+            >
+              <RefreshIcon width={12} height={12} />
+            </button>
+          )}
           <CopyBtn text={m.text} />
         </span>
       </div>
@@ -147,8 +238,28 @@ function ToolMessage({ m }: { m: ToolMsg }) {
   );
 }
 
-export const Message = memo(function Message({ m }: { m: UserMsg | AssistantMsg | ToolMsg }) {
-  if (m.role === "user") return <UserMessage m={m} />;
-  if (m.role === "assistant") return <AssistantMessage m={m} />;
+export const Message = memo(function Message({
+  m,
+  onEditUser,
+  onRegenerate,
+  canEdit,
+  canRegenerate,
+}: {
+  m: UIMessage;
+  onEditUser?: (text: string) => void;
+  onRegenerate?: () => void;
+  canEdit?: boolean;
+  canRegenerate?: boolean;
+}) {
+  if (m.role === "user")
+    return <UserMessage m={m} canEdit={canEdit} onEdit={onEditUser} />;
+  if (m.role === "assistant")
+    return (
+      <AssistantMessage
+        m={m}
+        canRegenerate={canRegenerate}
+        onRegenerate={onRegenerate}
+      />
+    );
   return <ToolMessage m={m} />;
 });
