@@ -77,6 +77,7 @@ core/                 Rust core (stdio JSON-RPC server)
   src/vision.rs       vision model config + image attachment helpers
   src/session.rs      append-only JSONL session persistence
 tui/                  Go Bubble Tea TUI
+web/                  Next.js web frontend (SSE bridge to the core) — see web/README.md
 .github/workflows/    CI (core clippy/test, tui vet/test/build, docker image)
 ```
 

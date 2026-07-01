@@ -1,0 +1,95 @@
+# Umans Harness — Web
+
+A browser frontend for the [umans-harness](..) coding agent, built with Next.js.
+It is the web equivalent of the Go Bubble Tea TUI: instead of spawning the core
+in a terminal, the Next server spawns it once (via the `@umans-harness/coding-agent`
+SDK's low-level `CoreProcess`) and streams its events to the browser over
+Server-Sent Events. The browser renders a full agentic UI — streaming markdown,
+reasoning, tool calls, approvals, metrics, sessions — and sends commands back.
+
+```
+Browser ──SSE──▶ /api/stream ──▶ HarnessBridge ──stdio JSONL──▶ umans-core ──▶ Umans API
+Browser ──POST─▶ /api/command ─▶ HarnessBridge ─▶ (stdin)
+```
+
+## Run
+
+```bash
+cd web
+bun install                 # or: npm install / pnpm install
+
+bun run dev                 # http://localhost:3000  (NODE_ENV=development matters — see below)
+# production:
+bun run build && bun run start
+```
+
+> The dev script runs `next dev`. If your shell exports `NODE_ENV=production`,
+> start the dev server with it overridden: `NODE_ENV=development bun run dev`.
+> `next dev` expects development mode; a production `NODE_ENV` corrupts the build.
+
+**Runtime.** This project runs on [Bun](https://bun.sh) (`bun install`, `bun run`).
+It also works under Node — just replace `bun` with `node`/`npm run`.
+
+## The core binary
+
+The server spawns `umans-core` (the Rust binary). It is resolved, in order:
+
+1. `UMANS_CORE` env var (absolute path — use this in production).
+2. A dev build found by walking up from the server cwd: `<…>/core/target/release/core`.
+3. `core` / `umans-core` on `PATH`.
+
+The harness repo ships a built core at `../core/target/release/core`, so it is
+found automatically when running from `web/`. To point at a different build, set
+`UMANS_CORE=/path/to/core`.
+
+## API key & workspace
+
+- **API key**: read from the TUI's `~/.config/umans-harness/settings.json` (`api_key`)
+  on startup and forwarded to the core via `UMANS_API_KEY`, so the web app
+  authenticates with the same key the TUI uses — no re-entry. If none is found, a
+  key-entry overlay is shown; submit it there (sends the `set_key` command).
+  You can also set `UMANS_API_KEY` in the environment.
+- **Workspace**: defaults to the repo root (the directory containing the located
+  `core/` binary). Override with `UMANS_HARNESS_WORKSPACE=/path/to/project`. The
+  workspace constrains all file/bash operations the agent performs.
+
+## Architecture
+
+| Path | Role |
+|------|------|
+| `src/server/core-bridge.ts` | The `HarnessBridge` singleton: owns one `CoreProcess` for the server lifetime, reduces the raw event stream into `AgentState`, fans events to SSE subscribers, forwards POST commands. Auto-loads `settings.json` + respawns on crash. |
+| `src/app/api/stream/route.ts` | `GET` — Server-Sent Events. Ensures the core, sends a `_snapshot` of the current state, then streams every live core event. |
+| `src/app/api/command/route.ts` | `POST` — forwards a raw core command to the core stdin. Responses arrive over SSE. |
+| `src/lib/reducer.ts` | The single agent-state reducer (mirrors the SDK's `AgentSession` message-assembly logic). Shared by the bridge (snapshots) and the client (live events). |
+| `src/lib/types.ts` | Typed wire contract (core events + commands) and the UI message model. |
+| `src/lib/use-agent.ts` | The client hook: opens the SSE stream, hydrates from the snapshot, reduces live events, exposes typed actions (prompt, steer, abort, approve, setKey, …). |
+| `src/components/*` | The UI: chat shell, message list, markdown, tool-call cards, reasoning, approval gate, composer, header (model/thinking/approval/metrics), session sidebar, toasts. |
+
+### Why the low-level `CoreProcess` (not the PI-compatible `AgentSession`)?
+
+The SDK ships two layers. The high-level `AgentSession` is a PI-compatibility
+adapter (its value is drop-in swap-in for pi-web) — but it routes approvals
+through a boolean `confirm()` that can only return yes/no, losing the core's
+per-tool-kind **"always"** escalation. The low-level `CoreProcess` speaks the raw
+newline-delimited JSON protocol and gives full yes/no/always approval control,
+direct session/model/stats commands, and every event (`delta`, `thinking`,
+`tool_call`, `tool_result`, `metrics`, `approval_request`, …). For a custom web
+frontend this is the simpler, more capable layer — fewer abstractions, more
+control. The message transcript is assembled by the shared reducer.
+
+## Wire protocol
+
+The SSE stream emits `data: <json>\n\n` lines: one `_snapshot` (full
+`AgentState`) on connect, then raw core events (`ready`, `delta`, `thinking`,
+`tool_call`, `tool_result`, `approval_request`, `metrics`, `done`, `sessions`,
+`stats`, `history`, …). The browser POSTs raw core commands to `/api/command`
+(`send`, `steer`, `abort`, `approve`, `set_key`, `set_approval`, `list_sessions`,
+`load_session`, `new_session`, `stats`, `compact`, `reset`, …). See
+`core/src/protocol.rs` for the canonical command/event set.
+
+## Status
+
+Production-built and end-to-end verified (dev + prod) against a live Umans
+endpoint: streaming markdown, reasoning, multi-step tool loops (tool_call →
+tool_result → follow-up assistant), metrics, session resume, and the approval
+gate.
