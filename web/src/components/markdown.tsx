@@ -23,7 +23,7 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
     );
   };
   return (
-    <div className="group/code my-3 overflow-hidden rounded-xl border border-ink-800 bg-[#0a0a0c]">
+    <div className="group/code my-3 overflow-hidden rounded-xl border border-ink-800 bg-ink-950">
       <div className="flex items-center justify-between border-b border-ink-800/80 bg-ink-925/60 px-3 py-1.5">
         <span className="font-mono text-[11px] uppercase tracking-wider text-ink-400">{lang}</span>
         <button

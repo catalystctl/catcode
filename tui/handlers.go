@@ -129,6 +129,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		b := s.logTool(name, ev.get("args"), sub)
 		b.id = ev.get("id")
+		if name == "todo_write" {
+			// Capture the latest todo list so the pinned panel always reflects
+			// current state (the agent rewrites the full list each call).
+			s.captureTodos(b.args)
+			s.layout() // todo panel may have appeared/grown
+		}
 		if !sub && (name == "spawn" || name == "subagent") {
 			s.layout() // a scout started: make room for the active-tasks panel
 		}
@@ -170,6 +176,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			// A follow-up or steer turn begins right after this one; stay busy so the
 			// footer keeps streaming and the input stays live.
 			s.queuedNext = false
+			s.queued = nil
 			s.cur = nil
 			s.finalizeInFlight("")
 			s.layout()
@@ -184,6 +191,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.logSuccess(fmt.Sprintf("turn %d complete", s.turnCount))
 			s.input.Focus()
 		}
+		// Refresh the discoverable-skills list so a skill created mid-turn
+		// (e.g. by /reflect or /index) shows up in the /skill:<name> autocomplete.
+		s.sendCore(map[string]any{"type": "list_skills"})
 
 	case "aborted":
 		s.subProgress = nil
@@ -193,6 +203,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			// to the else branch and clears `busy` — otherwise `busy` stays true
 			// forever and the TUI wedges (only Ctrl+C recovers) (P0-5).
 			s.queuedNext = false
+			s.queued = nil
 			s.cur = nil
 			s.finalizeInFlight("")
 			s.layout()
@@ -211,8 +222,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.contextTokens = 0
 		s.lastCachePct = 0
 		s.subProgress = nil
+		s.todos = nil
+		s.queued = nil
+		s.queuedNext = false
 		s.follow = true
 		s.invalidateAll()
+		s.layout()
 		s.logInfo("conversation reset")
 
 	case "history":
@@ -237,9 +252,18 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if ev.get("scope") == "subagent" {
 			break // subagent-internal compaction; don't clutter the main transcript
 		}
+		// The footer's context budget is driven by metrics events, which only
+		// fire at turn end. Reflect the post-compaction size now so the bar
+		// doesn't keep showing a stale, over-full count after a compact/digest.
+		if at, err := strconv.ParseUint(ev.get("after_tokens"), 10, 64); err == nil {
+			s.contextTokens = at
+		}
 		s.logInfo(fmt.Sprintf("context compacted: %s → %s tokens", ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "digested":
+		if at, err := strconv.ParseUint(ev.get("after_tokens"), 10, 64); err == nil {
+			s.contextTokens = at
+		}
 		s.logInfo(fmt.Sprintf("context digested: %s result(s), %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "approval_changed":
@@ -480,6 +504,18 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				s.openVisionPicker()
 			}
 		}
+	case "skills":
+		// Discoverable skills list (name + description + body content). Populates
+		// the /skill:<name> command-palette entries; the body is inlined into the
+		// apply_skill prompt by the core, so the TUI only needs name/desc here.
+		var skills []skillInfo
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(ev.Raw, &m); err == nil {
+			if raw, ok := m["skills"]; ok {
+				_ = json.Unmarshal(raw, &skills)
+			}
+		}
+		s.skillsList = skills
 	}
 	return waitForEvent(s.coreEvents)
 }
@@ -732,6 +768,8 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 	s.logUser(prompt + "  ↳ steer")
 	s.pushHistory(prompt)
 	s.queuedNext = true
+	s.queued = &queuedMsg{kind: "steer", text: prompt, at: time.Now()}
+	s.layout()
 	s.sendCore(s.withImages(map[string]any{
 		"type":             "steer",
 		"prompt":           prompt,
@@ -768,6 +806,8 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 	s.logUser(text + "  ↳ queued")
 	s.pushHistory(text)
 	s.queuedNext = true
+	s.queued = &queuedMsg{kind: "follow-up", text: text, at: time.Now()}
+	s.layout()
 	s.sendCore(s.withImages(map[string]any{
 		"type":             "send",
 		"prompt":           text,
@@ -903,7 +943,24 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// input opens the command palette mid-turn too (like the @ flyout).
 		switch msg.String() {
 		case "esc":
-			// Esc aborts the turn and drops any queued follow-up/steer.
+			// Esc peels off layers: if a follow-up/steer is queued, first Esc just
+			// drops the queued message (the in-flight turn keeps running); a
+			// second Esc then aborts the running turn. This matches the user's
+			// mental model of "cancel the queued thing" without nuking the
+			// whole in-flight chat.
+			if s.queued != nil {
+				kind := s.queued.kind
+				s.queued = nil
+				s.queuedNext = false
+				s.sendCore(map[string]any{"type": "clear_queue"})
+				s.layout() // release the queue banner
+				if kind == "steer" {
+					s.logInfo("steer cancelled (the running turn was already interrupted)")
+				} else {
+					s.logInfo("queued follow-up cancelled — turn continues")
+				}
+				return s, nil
+			}
 			s.queuedNext = false
 			s.sendCore(map[string]any{"type": "abort"})
 			s.logWarn("aborting…")
@@ -1024,6 +1081,12 @@ func (s *session) handleScrollKey(msg tea.KeyMsg) bool {
 func (s *session) handleUserLine(text string) tea.Cmd {
 	if strings.HasPrefix(text, "/") {
 		parts := strings.Fields(text)
+		// /skill:<name> [optional task] — invoke a discoverable skill. Handled
+		// before the switch because the command token is dynamic (/skill:<x>
+		// has no fixed case). The core reads the SKILL.md and runs the turn.
+		if strings.HasPrefix(parts[0], "/skill:") {
+			return s.handleSkillCommand(parts)
+		}
 		switch parts[0] {
 		case "/key":
 			if len(parts) < 2 {
@@ -1085,6 +1148,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/abort":
 			s.queuedNext = false
+			s.queued = nil
 			s.sendCore(map[string]any{"type": "abort"})
 			return nil
 		case "/steer":
@@ -1322,6 +1386,61 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, text))
+	s.busy = true
+	return nil
+}
+
+// handleSkillCommand dispatches "/skill:<name> [optional task]". It resolves the
+// skill from the cached skills list and sends an apply_skill command to the
+// core, which reads the SKILL.md (resolving project > user scope, bypassing
+// read_file's path restriction so global skills work too) and runs a turn that
+// applies it. The displayed user line is the concise "/skill:<name> [task]";
+// the full skill body is injected by the core, not shown in the transcript.
+func (s *session) handleSkillCommand(parts []string) tea.Cmd {
+	token := parts[0] // "/skill:<name>"
+	name := strings.TrimPrefix(token, "/skill:")
+	if name == "" {
+		s.logError("usage: /skill:<name> [optional task]")
+		return nil
+	}
+	var found *skillInfo
+	for i := range s.skillsList {
+		if strings.EqualFold(s.skillsList[i].Name, name) {
+			found = &s.skillsList[i]
+			break
+		}
+	}
+	if found == nil {
+		s.logError("unknown skill: " + name)
+		return nil
+	}
+	if !s.authed {
+		s.logError("not authenticated — run /key sk-... first")
+		return nil
+	}
+	if len(s.models) == 0 {
+		s.logError("no models loaded yet")
+		return nil
+	}
+	model := s.models[s.modelIdx].ID
+	task := strings.TrimSpace(strings.Join(parts[1:], " "))
+	display := token
+	if task != "" {
+		display = token + " " + task
+	}
+	s.follow = true
+	s.logUser(display)
+	s.pushHistory(display)
+	cmd := map[string]any{
+		"type":             "apply_skill",
+		"name":             found.Name,
+		"model":            model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}
+	if task != "" {
+		cmd["task"] = task
+	}
+	s.sendCore(cmd)
 	s.busy = true
 	return nil
 }

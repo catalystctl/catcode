@@ -78,4 +78,10 @@ plan.html
 .intentionally-empty-file.o
 sdk/node_modules/
 .umans-harness/*
+# ...but the shipped subagent / plugin / skill trees DO ship (see the comment
+# above): un-ignore those three directories so new files track normally
+# instead of being silently swallowed (which requires `git add -f`).
+!.umans-harness/agents
+!.umans-harness/plugins
+!.umans-harness/skills
 core/.config

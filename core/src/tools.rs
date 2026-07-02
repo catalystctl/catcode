@@ -18,8 +18,8 @@ pub enum ToolKind {
 pub fn classify(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
-        | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff"
-        | "git_log" | "memory" => ToolKind::ReadOnly,
+        | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
+        | "memory" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -1071,11 +1071,7 @@ pub(crate) fn smart_truncate(output: &str, cap: usize) -> String {
 /// firejail profile that whitelists only the workspace; --no-network adds
 /// `unshare -n` so the command can't phone home. Both are belt-and-suspenders
 /// on top of the denylist tripwire.
-pub async fn execute_bash(
-    command: &str,
-    cfg: &Config,
-    timeout_override: Option<u64>,
-) -> Outcome {
+pub async fn execute_bash(command: &str, cfg: &Config, timeout_override: Option<u64>) -> Outcome {
     // ponytail: denylist is a tripwire, not a sandbox. It blocks the most
     // catastrophic obvious commands; a determined model bypasses it.
     // Normalize whitespace first so `rm  -rf  /` (extra spaces) can't slip past
@@ -1383,7 +1379,12 @@ fn find_matches(content: &str, search: &str, normalize: bool) -> Vec<(usize, usi
             // whitespace the normalizer trimmed (e.g. a final newline) isn't
             // consumed by the replacement.
             let last_start = map[p + nlen - 1];
-            last_start + content[last_start..].chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+            last_start
+                + content[last_start..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0)
         };
         out.push((start_orig, end_orig));
         from = p + nlen;
@@ -1403,7 +1404,10 @@ fn closest_hint(content: &str, search: &str) -> String {
     let mut best: Option<(usize, usize, &str)> = None; // (overlap, lineno, line)
     for (idx, line) in content.lines().enumerate() {
         let line_tokens: std::collections::HashSet<&str> = line.split_whitespace().collect();
-        let overlap = search_tokens.iter().filter(|t| line_tokens.contains(*t)).count();
+        let overlap = search_tokens
+            .iter()
+            .filter(|t| line_tokens.contains(*t))
+            .count();
         if overlap == 0 {
             continue;
         }
@@ -1414,9 +1418,7 @@ fn closest_hint(content: &str, search: &str) -> String {
     match best {
         Some((o, lineno, line)) => {
             let snip: String = line.chars().take(120).collect();
-            format!(
-                "closest match: line {lineno} ({o} token(s) in common): {snip}"
-            )
+            format!("closest match: line {lineno} ({o} token(s) in common): {snip}")
         }
         None => String::new(),
     }
@@ -1438,8 +1440,8 @@ fn plan_edit(
         return Err(msg);
     }
     let path = workspace::resolve(&cfg.workspace, input)?;
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
     let mut new_content = content.clone();
 
     for (i, ev) in edits.iter().enumerate() {
@@ -2144,7 +2146,9 @@ pub fn make_unified_diff(old: &str, new: &str, path: &str, context: usize) -> St
                 Op::Ins => new_count += 1,
             }
         }
-        out.push_str(&format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"));
+        out.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
         for k in start..end {
             if emitted >= cap {
                 out.push_str(&format!("… (diff truncated; {m}→{n} lines) …\n"));
@@ -2256,11 +2260,15 @@ fn git_rel_path(p: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     if p.starts_with('/') || p.starts_with('\\') || (p.len() >= 2 && p.as_bytes()[1] == b':') {
-        return Err(format!("git path must be workspace-relative, got absolute: {p:?}"));
+        return Err(format!(
+            "git path must be workspace-relative, got absolute: {p:?}"
+        ));
     }
     for comp in p.split(['/', '\\']) {
         if comp == ".." {
-            return Err(format!("git path must not escape the workspace (..): {p:?}"));
+            return Err(format!(
+                "git path must not escape the workspace (..): {p:?}"
+            ));
         }
     }
     Ok(p.to_string())
@@ -2277,7 +2285,10 @@ fn git_status(args: &Value, cfg: &Config) -> Outcome {
 
 fn git_diff(args: &Value, cfg: &Config) -> Outcome {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+    let staged = args
+        .get("staged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     match git_rel_path(path) {
         Err(e) => Outcome::err(e),
         Ok(p) => {
@@ -2361,7 +2372,10 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if name.trim().is_empty() {
                 return Outcome::err("memory save requires 'name'");
             }
@@ -2386,7 +2400,10 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if name.trim().is_empty() {
                 return Outcome::err("memory append requires 'name'");
             }
@@ -2428,7 +2445,10 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                 } else {
                     format!(": {}", m.description)
                 };
-                out.push_str(&format!("- {} [id: {}] ({}){}\n", m.name, id, m.mem_type, desc));
+                out.push_str(&format!(
+                    "- {} [id: {}] ({}){}\n",
+                    m.name, id, m.mem_type, desc
+                ));
                 if !m.content.is_empty() {
                     for l in m.content.lines().take(3) {
                         out.push_str(&format!("    {l}\n"));
@@ -2447,7 +2467,9 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                 Err(e) => Outcome::err(e),
             }
         }
-        other => Outcome::err(format!("memory: unknown action '{other}' (save|list|forget)")),
+        other => Outcome::err(format!(
+            "memory: unknown action '{other}' (save|append|list|forget)"
+        )),
     }
 }
 
@@ -2595,7 +2617,11 @@ mod tests {
     fn edit_normalize_whitespace_tolerates_drift() {
         let (_root, cfg) = tmp_ws();
         // file uses tabs + extra spaces; search uses single spaces
-        fs::write(cfg.workspace.join("f.txt"), "fn  main() {\n\tif (x)  return;\n}\n").unwrap();
+        fs::write(
+            cfg.workspace.join("f.txt"),
+            "fn  main() {\n\tif (x)  return;\n}\n",
+        )
+        .unwrap();
         let args = json!({ "path": "f.txt", "edits": [
             { "search": "if (x) return;", "replace": "if (x) { return; }", "normalize_whitespace": true }
         ] });
@@ -2625,7 +2651,11 @@ mod tests {
     #[test]
     fn edit_not_found_gives_closest_hint() {
         let (_root, cfg) = tmp_ws();
-        fs::write(cfg.workspace.join("f.txt"), "alpha beta gamma\ndelta epsilon\n").unwrap();
+        fs::write(
+            cfg.workspace.join("f.txt"),
+            "alpha beta gamma\ndelta epsilon\n",
+        )
+        .unwrap();
         let args = json!({ "path": "f.txt", "edits": [
             { "search": "alpha gamma", "replace": "x" }
         ] });
@@ -2672,8 +2702,15 @@ mod tests {
         head.push_str("final tail line here\n");
         let out = smart_truncate(&head, 4096);
         assert!(out.contains("final tail line here"), "tail must survive");
-        assert!(out.contains("error[E0308]"), "error line from head must be salvaged");
-        assert!(out.contains("salvaged"), "must note salvaged lines: {}", out);
+        assert!(
+            out.contains("error[E0308]"),
+            "error line from head must be salvaged"
+        );
+        assert!(
+            out.contains("salvaged"),
+            "must note salvaged lines: {}",
+            out
+        );
     }
 
     #[test]
@@ -3162,7 +3199,11 @@ mod tests {
 
         let l = execute("git_log", &json!({}), &cfg);
         assert!(l.ok, "git_log: {}", l.output);
-        assert!(l.output.contains("init"), "git_log missing commit: {}", l.output);
+        assert!(
+            l.output.contains("init"),
+            "git_log missing commit: {}",
+            l.output
+        );
 
         // modify → unstaged diff shows the change
         std::fs::write(cfg.workspace.join("README.md"), "hello world\n").unwrap();
@@ -3226,10 +3267,23 @@ mod tests {
         assert_eq!(entries.len(), 1, "should be one accumulated memory");
         let c = &entries[0].content;
         assert!(c.contains("use tabs"), "original fact must survive: {c}");
-        assert!(c.contains("no unwrap in prod"), "appended fact must be present: {c}");
-        assert!(c.contains("--- appended ---"), "append marker must be present: {c}");
+        assert!(
+            c.contains("no unwrap in prod"),
+            "appended fact must be present: {c}"
+        );
+        assert!(
+            c.contains("--- appended ---"),
+            "append marker must be present: {c}"
+        );
         // append validates the same way save does
-        assert!(!execute("memory", &json!({ "action": "append", "content": "x" }), &cfg).ok);
+        assert!(
+            !execute(
+                "memory",
+                &json!({ "action": "append", "content": "x" }),
+                &cfg
+            )
+            .ok
+        );
         assert!(!execute("memory", &json!({ "action": "append", "name": "x" }), &cfg).ok);
     }
 }

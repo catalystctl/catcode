@@ -8,13 +8,24 @@
 //     search; selecting a file inserts its path into the prompt.
 //   • Draft persistence: unsent text + images survive a reload (sessionStorage).
 //   • Steer vs. send: while the agent is streaming, Enter steers (redirects).
+//
+// Exposes an imperative handle ({ focus, insert, openAttach }) so the shell can
+// drive it from slash commands (/steer focuses, /run/parallel/chain insert a
+// template, /attach opens the image picker).
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import { SendIcon, StopIcon, BoltIcon } from "./icons";
-import { ImageAttach, fileToDataUrl } from "./attach";
+import { ImageAttach, fileToDataUrl, type ImageAttachHandle } from "./attach";
 import { Flyout, type FlyoutItem } from "./flyout";
 import { COMMANDS, filterCommands } from "@/lib/commands";
-import type { FileEntry } from "@/lib/types";
+import type { FileEntry, SkillInfo } from "@/lib/types";
 
 interface Props {
   streaming: boolean;
@@ -23,12 +34,27 @@ interface Props {
   thinkingLevel: string;
   modelLabel: string;
   images: string[];
+  workspace: string;
   onAddImage: (url: string) => void;
   onRemoveImage: (i: number) => void;
   onPrompt: (text: string, images?: string[]) => void;
   onSteer: (text: string) => void;
   onAbort: () => void;
   onCommand: (name: string) => void;
+  /** Discoverable skills (drives the /skill:<name> autocomplete entries). */
+  skills: SkillInfo[];
+  /** Invoke a skill by name with an optional follow-up task. */
+  onSkill: (name: string, task?: string) => void;
+}
+
+/** Imperative handle so Chat can drive the composer from slash commands. */
+export interface ComposerHandle {
+  /** Focus the textarea (and place the caret at the end). */
+  focus: () => void;
+  /** Replace the textarea value with `text` and focus it (for /run etc.). */
+  insert: (text: string) => void;
+  /** Open the image-attachment file picker. */
+  openAttach: () => void;
 }
 
 const DRAFT_KEY = "umans:draft";
@@ -69,26 +95,45 @@ function detectMention(text: string, caret: number): { start: number; query: str
 
 /** True when the text is a single-line slash-command search (for the flyout). */
 function isCommandSearch(text: string): boolean {
-  return text.startsWith("/") && !text.includes("\n") && text.length <= 32;
+  return text.startsWith("/") && !text.includes("\n") && text.length <= 64;
 }
 
-export function Composer({
-  streaming,
-  connected,
-  canSend,
-  thinkingLevel,
-  modelLabel,
-  images,
-  onAddImage,
-  onRemoveImage,
-  onPrompt,
-  onSteer,
-  onAbort,
-  onCommand,
-}: Props) {
+export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
+  {
+    streaming,
+    connected,
+    canSend,
+    thinkingLevel,
+    modelLabel,
+    images,
+    workspace,
+    onAddImage,
+    onRemoveImage,
+    onPrompt,
+    onSteer,
+    onAbort,
+    onCommand,
+    skills,
+    onSkill,
+  },
+  ref,
+) {
   const [text, setText] = useState("");
-  const [imagesState, setImagesState] = useState<string[]>(images);
-  const ref = useRef<HTMLTextAreaElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const attachRef = useRef<ImageAttachHandle>(null);
+
+  // Bumped on caret-only movement (clicks / arrow keys) so the @-mention flyout
+  // re-evaluates even when `text` hasn't changed. Text changes already re-run
+  // the effect via the `text` dep; this covers cursor moves within existing text.
+  const [caretTick, setCaretTick] = useState(0);
+  useEffect(() => {
+    const handler = () => {
+      const el = taRef.current;
+      if (el && document.activeElement === el) setCaretTick((t) => t + 1);
+    };
+    document.addEventListener("selectionchange", handler);
+    return () => document.removeEventListener("selectionchange", handler);
+  }, []);
 
   // ── Flyout state ──
   const [cmdItems, setCmdItems] = useState<FlyoutItem[]>([]);
@@ -101,12 +146,36 @@ export function Composer({
   const mentionRef = useRef<{ start: number; query: string } | null>(null);
   const fetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Sync external images prop into local state (for draft persistence).
-  useEffect(() => {
-    setImagesState(images);
-  }, [images]);
+  // ── Imperative handle (stable — only refs/setState are touched) ──
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => {
+        const el = taRef.current;
+        if (!el) return;
+        el.focus();
+        const end = el.value.length;
+        el.setSelectionRange(end, end);
+      },
+      insert: (t: string) => {
+        setText(t);
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          const end = el.value.length;
+          el.setSelectionRange(end, end);
+        });
+      },
+      openAttach: () => attachRef.current?.pick(),
+    }),
+    [],
+  );
 
   // ── Draft persistence: restore on mount, save on change ──
+  // Text + images are owned by the parent (props); we restore by feeding the
+  // saved values back through the parent callbacks so there is a single source
+  // of truth (no divergent local image state).
   useEffect(() => {
     const saved = lsGet(DRAFT_KEY);
     if (saved) setText(saved);
@@ -114,7 +183,12 @@ export function Composer({
     if (savedImgs) {
       try {
         const arr = JSON.parse(savedImgs);
-        if (Array.isArray(arr) && arr.length) onAddImage(arr[0]); // restore first
+        if (Array.isArray(arr)) {
+          // Restore ALL saved images (not just the first).
+          for (const url of arr) {
+            if (typeof url === "string" && url) onAddImage(url);
+          }
+        }
       } catch {
         /* ignore */
       }
@@ -127,12 +201,12 @@ export function Composer({
   }, [text]);
 
   useEffect(() => {
-    lsSet(DRAFT_IMG_KEY, JSON.stringify(imagesState));
-  }, [imagesState]);
+    lsSet(DRAFT_IMG_KEY, JSON.stringify(images));
+  }, [images]);
 
   // Auto-grow.
   useEffect(() => {
-    const el = ref.current;
+    const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 240) + "px";
@@ -144,19 +218,31 @@ export function Composer({
       setCmdOpen(false);
       return;
     }
-    const filtered = filterCommands(text).map((c) => ({
+    const q = text.toLowerCase();
+    const cmdFiltered = filterCommands(text).map((c) => ({
       id: c.label,
       label: c.label,
       desc: c.desc,
     }));
+    // Append /skill:<name> entries for discoverable skills so they autocomplete
+    // like the built-in commands. Match on the full "/skill:<name>" label or
+    // the skill description.
+    const skillFiltered = skills
+      .map((s) => ({
+        id: `/skill:${s.name}`,
+        label: `/skill:${s.name}`,
+        desc: s.description || "apply skill",
+      }))
+      .filter((s) => s.label.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q));
+    const filtered = [...cmdFiltered, ...skillFiltered];
     setCmdItems(filtered);
     setCmdIndex(0);
     setCmdOpen(filtered.length > 0);
-  }, [text]);
+  }, [text, skills]);
 
   // ── File-mention flyout: debounced fetch from /api/files ──
   useEffect(() => {
-    const el = ref.current;
+    const el = taRef.current;
     const caret = el ? el.selectionStart : 0;
     const mention = detectMention(text, caret);
     mentionRef.current = mention;
@@ -168,11 +254,11 @@ export function Composer({
     if (fetchTimer.current) clearTimeout(fetchTimer.current);
     fetchTimer.current = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/files?q=${encodeURIComponent(mention.query)}`);
+        const res = await fetch(`/api/files?q=${encodeURIComponent(mention.query)}&workspace=${encodeURIComponent(workspace)}`);
         if (!res.ok) return;
         const data = (await res.json()) as { files: FileEntry[] };
         // Re-check the caret is still in a mention (user may have moved).
-        const el2 = ref.current;
+        const el2 = taRef.current;
         const caret2 = el2 ? el2.selectionStart : 0;
         const still = detectMention(text, caret2);
         if (!still) return;
@@ -193,7 +279,7 @@ export function Composer({
     return () => {
       if (fetchTimer.current) clearTimeout(fetchTimer.current);
     };
-  }, [text]);
+  }, [text, workspace, caretTick]);
 
   const closeFlyouts = useCallback(() => {
     setCmdOpen(false);
@@ -202,7 +288,7 @@ export function Composer({
 
   const submit = useCallback(() => {
     const t = text.trim();
-    if (!t && imagesState.length === 0) return;
+    if (!t && images.length === 0) return;
     // Exact slash-command match → execute (legacy fast path).
     const exact = COMMANDS.find((c) => c.label === t);
     if (exact) {
@@ -211,22 +297,46 @@ export function Composer({
       closeFlyouts();
       return;
     }
-    const imgs = imagesState.length ? imagesState : undefined;
+    // "/skill:<name> [task]" — invoke a discoverable skill. Handles both the
+    // bare token (selected from the flyout) and a typed invocation with an
+    // optional follow-up task appended after the skill name.
+    if (t.startsWith("/skill:")) {
+      const rest = t.slice("/skill:".length).trim();
+      if (rest) {
+        const sp = rest.indexOf(" ");
+        const name = sp === -1 ? rest : rest.slice(0, sp);
+        const task = sp === -1 ? undefined : rest.slice(sp + 1).trim();
+        if (name) {
+          onSkill(name, task || undefined);
+        }
+      }
+      setText("");
+      closeFlyouts();
+      return;
+    }
+    const imgs = images.length ? images : undefined;
     if (streaming) {
       onSteer(t);
     } else {
       onPrompt(t, imgs);
     }
     setText("");
-    setImagesState([]);
     closeFlyouts();
-  }, [text, imagesState, streaming, onCommand, onSteer, onPrompt, closeFlyouts]);
+  }, [text, images, streaming, onCommand, onSteer, onPrompt, onSkill, closeFlyouts]);
 
   // Run a command from the flyout by action key.
   const runCommand = useCallback(
     (index: number) => {
       const item = cmdItems[index];
       if (!item) return;
+      // /skill:<name> entries are dynamic (not in the static COMMANDS set);
+      // dispatch them through onSkill directly.
+      if (item.id.startsWith("/skill:")) {
+        onSkill(item.id.slice("/skill:".length));
+        setText("");
+        closeFlyouts();
+        return;
+      }
       const def = COMMANDS.find((c) => c.label === item.id);
       if (def) {
         onCommand(def.action);
@@ -234,7 +344,7 @@ export function Composer({
         closeFlyouts();
       }
     },
-    [cmdItems, onCommand, closeFlyouts],
+    [cmdItems, onCommand, onSkill, closeFlyouts],
   );
 
   // Insert a file mention: replace @query with the file path.
@@ -242,7 +352,7 @@ export function Composer({
     (index: number) => {
       const item = fileItems[index];
       if (!item) return;
-      const el = ref.current;
+      const el = taRef.current;
       const caret = el ? el.selectionStart : text.length;
       const mention = mentionRef.current ?? detectMention(text, caret);
       if (!mention) return;
@@ -253,7 +363,7 @@ export function Composer({
       setFileOpen(false);
       // Restore caret after the inserted path + space.
       requestAnimationFrame(() => {
-        const e = ref.current;
+        const e = taRef.current;
         if (!e) return;
         const pos = before.length + item.label.length + 2; // @path<space>
         e.setSelectionRange(pos, pos);
@@ -360,9 +470,9 @@ export function Composer({
           )}
 
           <div className="flex items-end gap-2 rounded-2xl border border-ink-700/70 bg-ink-900/80 p-2 shadow-lg shadow-black/20 transition-colors focus-within:border-accent/50 focus-within:shadow-glow">
-            <ImageAttach images={images} onAdd={onAddImage} onRemove={onRemoveImage} />
+            <ImageAttach ref={attachRef} images={images} onAdd={onAddImage} onRemove={onRemoveImage} />
             <textarea
-              ref={ref}
+              ref={taRef}
               rows={1}
               value={text}
               aria-label="Message the agent"
@@ -427,4 +537,4 @@ export function Composer({
       </div>
     </div>
   );
-}
+});

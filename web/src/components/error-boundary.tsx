@@ -35,7 +35,7 @@ export class ErrorBoundary extends Component<Props, State> {
               <span>⚠</span>
               <span>Something broke rendering{this.props.label ? ` the ${this.props.label}` : ""}.</span>
             </div>
-            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-[#08080a] p-2 text-[11px] text-ink-400">
+            <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-ink-950 p-2 text-[11px] text-ink-400">
               {this.state.error.message}
             </pre>
             <button

@@ -43,6 +43,7 @@ export const initialState: AgentState = {
   toasts: [],
   memories: [],
   plugins: [],
+  skills: [],
   pendingIntercom: null,
   intercomLog: [],
   visionConfig: null,
@@ -198,6 +199,18 @@ function asThinking(m: any): string {
   return "";
 }
 
+/** Extract image data URLs from a multimodal user message content array. */
+function asImages(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const out: string[] = [];
+  for (const c of content as any[]) {
+    if (c?.type === "image_url" && c.image_url?.url) {
+      out.push(String(c.image_url.url));
+    }
+  }
+  return out;
+}
+
 /** Convert an OpenAI-style history array (from the core's `history` event) into
  *  the UI message model. Tool results attach to their tool call when possible. */
 function historyToMessages(raw: unknown[]): UIMessage[] {
@@ -209,7 +222,8 @@ function historyToMessages(raw: unknown[]): UIMessage[] {
     const role = m.role;
     const ts = typeof m.timestamp === "number" ? m.timestamp : Date.now();
     if (role === "user") {
-      out.push({ id: newId("u"), role: "user", text: asText(m.content), ts });
+      const imgs = asImages(m.content);
+      out.push({ id: newId("u"), role: "user", text: asText(m.content), ts, ...(imgs.length ? { images: imgs } : {}) });
     } else if (role === "assistant") {
       const toolCalls: UIToolCall[] = (Array.isArray(m.tool_calls) ? m.tool_calls : []).map(
         (tc: any) => {
@@ -239,7 +253,9 @@ function historyToMessages(raw: unknown[]): UIMessage[] {
         out[ownerIdx] = {
           ...a,
           toolCalls: a.toolCalls.map((t) =>
-            t.id === tcId ? { ...t, result: { ok: true, output: content } } : t,
+            // History carries no ok/error flag, so mark the result unknown —
+            // the card renders a neutral badge instead of a green “ok”.
+            t.id === tcId ? { ...t, result: { ok: true, output: content, unknown: true } } : t,
           ),
         };
       } else {
@@ -493,6 +509,10 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
     case "plugin_error":
       return { ...state, toasts: pushToast(state.toasts, "error", ev.message) };
+
+    // ── Skills ──
+    case "skills":
+      return { ...state, skills: Array.isArray(ev.skills) ? ev.skills : [] };
 
     // ── Vision ──
     case "vision_config":

@@ -72,6 +72,16 @@ type memoryEntry struct {
 	Tags []string `json:"tags"`
 }
 
+// skillInfo mirrors one element of the core's "skills" event array. The
+// content (SKILL.md body) is sent by the core so /skill:<name> can apply a
+// skill without the read_file path restriction blocking global skills.
+type skillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Location    string `json:"location"`
+	Content     string `json:"content"`
+}
+
 // coreEvent is one newline-delimited JSON line from the core.
 type coreEvent struct {
 	Type string          `json:"type"`

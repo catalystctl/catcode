@@ -157,6 +157,11 @@ pub struct Config {
     /// Name of the active provider. None = use the first configured provider, or
     /// the legacy default when none are configured.
     pub active_provider: Option<String>,
+    /// Per-provider API keys persisted by the TUI (settings.json `provider_keys`
+    /// + the legacy `api_key` under "default"). Seeded into `State::api_keys` at
+    /// startup so they override config/env keys (runtime keys win in provider
+    /// resolution) and survive restarts — this is what makes `/key` sticky.
+    pub persisted_keys: std::collections::HashMap<String, String>,
 }
 
 /// Intercom bridge mode: controls whether subagents get a coordination channel
@@ -376,9 +381,7 @@ impl Config {
             .get(&p.name)
             .cloned()
             .or_else(|| p.api_key.clone())
-            .or_else(|| {
-                p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok())
-            })
+            .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
             .filter(|s| !s.is_empty());
         ResolvedProvider {
             name: p.name.clone(),
@@ -435,6 +438,7 @@ impl Default for Config {
             subagents: SubagentConfig::default(),
             providers: Vec::new(),
             active_provider: None,
+            persisted_keys: std::collections::HashMap::new(),
         }
     }
 }
@@ -904,7 +908,28 @@ fn apply_json(c: &mut Config, v: &Value) {
             }
         }
     }
+    // Per-provider API keys persisted by the TUI (settings.json `provider_keys`)
+    // and the legacy single `api_key`. These seed the runtime key map at
+    // startup (see main.rs) so a key set via `/key` or the settings modal
+    // survives a restart and overrides config/env keys (runtime keys win).
+    if let Some(obj) = v.get("provider_keys").and_then(|x| x.as_object()) {
+        for (name, key) in obj {
+            if let Some(k) = key.as_str().filter(|s| !s.is_empty()) {
+                c.persisted_keys.insert(name.clone(), k.to_string());
+            }
+        }
+    }
+    if let Some(k) = s("api_key").filter(|x| !x.is_empty()) {
+        // Legacy single key applies to the default provider; only seed
+        // "default" when no per-provider key already named it.
+        c.persisted_keys.entry("default".to_string()).or_insert(k);
+    }
+    // Active provider: accept the TUI's snake_case `active_provider` as well as
+    // the camelCase form used by core-owned config files.
     if let Some(name) = v.get("activeProvider").and_then(|x| x.as_str()) {
+        c.active_provider = Some(name.to_string());
+    }
+    if let Some(name) = v.get("active_provider").and_then(|x| x.as_str()) {
         c.active_provider = Some(name.to_string());
     }
 }
@@ -1071,7 +1096,10 @@ mod tests {
         assert_eq!(p.base_url, "https://api.anthropic.com/v1");
         assert_eq!(p.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(p.api_key.is_none());
-        assert_eq!(p.headers, vec![("anthropic-version".into(), "2023-06-01".into())]);
+        assert_eq!(
+            p.headers,
+            vec![("anthropic-version".into(), "2023-06-01".into())]
+        );
     }
 
     #[test]
@@ -1098,8 +1126,11 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert!(h.contains(&("X-A".into(), "1".into())));
         // array of [k,v]
-        let h = parse_headers(Some(&json!([["K","V"],["K2","V2"]])));
-        assert_eq!(h, vec![("K".into(), "V".into()), ("K2".into(), "V2".into())]);
+        let h = parse_headers(Some(&json!([["K", "V"], ["K2", "V2"]])));
+        assert_eq!(
+            h,
+            vec![("K".into(), "V".into()), ("K2".into(), "V2".into())]
+        );
         // array of {name,value}
         let h = parse_headers(Some(&json!([{"name":"N","value":"V"}])));
         assert_eq!(h, vec![("N".into(), "V".into())]);
@@ -1204,5 +1235,62 @@ mod tests {
         assert_eq!(c.providers[1].name, "anthropic");
         assert!(c.providers[1].kind.is_anthropic());
         assert_eq!(c.active_provider.as_deref(), Some("anthropic"));
+    }
+
+    // The TUI persists API keys to settings.json as `provider_keys` (a
+    // name->key map) + the legacy `api_key`, and the active provider as
+    // snake_case `active_provider`. The core must read these so a key set via
+    // /key survives a restart and overrides config/env (it seeds runtime
+    // keys, which win in resolution).
+    #[test]
+    fn apply_json_loads_tui_persisted_keys() {
+        let mut c = Config::default();
+        let v = json!({
+            "providers": [
+                {"name":"glm","kind":"openai","base_url":"https://open.bigmodel.cn/api/paas/v4","api_key_env":"GLM_API_KEY"}
+            ],
+            "provider_keys": {"glm": "sk-tui-saved"},
+            "api_key": "sk-legacy",
+            "active_provider": "glm"
+        });
+        apply_json(&mut c, &v);
+        assert_eq!(
+            c.persisted_keys.get("glm").map(|s| s.as_str()),
+            Some("sk-tui-saved")
+        );
+        // legacy key seeds "default" but does NOT clobber a named provider key
+        assert_eq!(
+            c.persisted_keys.get("default").map(|s| s.as_str()),
+            Some("sk-legacy")
+        );
+        assert_eq!(c.active_provider.as_deref(), Some("glm"));
+    }
+
+    // A persisted TUI key (seeded into runtime_keys at startup) must override
+    // both the provider's config `api_key` and its `api_key_env` env var.
+    #[test]
+    fn persisted_tui_key_overrides_config_and_env() {
+        let mut c = Config::default();
+        let v = json!({
+            "providers": [
+                {"name":"p","kind":"openai","base_url":"https://x/v1","api_key":"sk-config","api_key_env":"P_API_KEY"}
+            ],
+            "active_provider": "p",
+            "provider_keys": {"p": "sk-tui-new"}
+        });
+        apply_json(&mut c, &v);
+        // config key alone (no runtime override, no env)
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            c.resolve_provider(&empty).api_key.as_deref(),
+            Some("sk-config")
+        );
+        // runtime override (seeded from persisted_keys) wins over config + env
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("p".to_string(), "sk-tui-new".to_string());
+        assert_eq!(
+            c.resolve_provider(&keys).api_key.as_deref(),
+            Some("sk-tui-new")
+        );
     }
 }

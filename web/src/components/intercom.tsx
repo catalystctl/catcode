@@ -78,7 +78,7 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
         </span>
       </div>
       <div className="px-4 py-3">
-        <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-ink-800 bg-[#08080a] p-2.5 text-[12px] leading-relaxed text-ink-200">
+        <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-ink-800 bg-ink-950 p-2.5 text-[12px] leading-relaxed text-ink-200">
           <code>{prompt.message}</code>
         </pre>
         <textarea

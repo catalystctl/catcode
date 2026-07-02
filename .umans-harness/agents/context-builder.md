@@ -1,7 +1,7 @@
 ---
 name: context-builder
 description: Stronger setup pass before planning; gathers context and writes handoff material
-tools: read_file, grep, glob, list_dir, bash, write_file, intercom
+tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom
 thinking: low
 systemPromptMode: replace
 inheritProjectContext: true

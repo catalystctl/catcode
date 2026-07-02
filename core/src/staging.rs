@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// Bump when the bundled default set changes meaningfully. The marker file
 /// stores this; on a version mismatch we re-scan for *missing* files (existing
 /// user files are still never overwritten) and then re-stamp the marker.
-pub const STAGING_VERSION: u32 = 1;
+pub const STAGING_VERSION: u32 = 2;
 
 /// `~/.umans-harness` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
@@ -62,22 +62,72 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
         // --- Built-in agent definitions (override templates for the 8
         // builtins; the binary also carries embedded fallback prompts, so
         // agents work even if these are deleted). ---
-        ("agents/scout.md", include_str!("../../.umans-harness/agents/scout.md")),
-        ("agents/researcher.md", include_str!("../../.umans-harness/agents/researcher.md")),
-        ("agents/planner.md", include_str!("../../.umans-harness/agents/planner.md")),
-        ("agents/worker.md", include_str!("../../.umans-harness/agents/worker.md")),
-        ("agents/reviewer.md", include_str!("../../.umans-harness/agents/reviewer.md")),
-        ("agents/context-builder.md", include_str!("../../.umans-harness/agents/context-builder.md")),
-        ("agents/oracle.md", include_str!("../../.umans-harness/agents/oracle.md")),
-        ("agents/delegate.md", include_str!("../../.umans-harness/agents/delegate.md")),
+        (
+            "agents/scout.md",
+            include_str!("../../.umans-harness/agents/scout.md"),
+        ),
+        (
+            "agents/researcher.md",
+            include_str!("../../.umans-harness/agents/researcher.md"),
+        ),
+        (
+            "agents/planner.md",
+            include_str!("../../.umans-harness/agents/planner.md"),
+        ),
+        (
+            "agents/worker.md",
+            include_str!("../../.umans-harness/agents/worker.md"),
+        ),
+        (
+            "agents/reviewer.md",
+            include_str!("../../.umans-harness/agents/reviewer.md"),
+        ),
+        (
+            "agents/context-builder.md",
+            include_str!("../../.umans-harness/agents/context-builder.md"),
+        ),
+        (
+            "agents/oracle.md",
+            include_str!("../../.umans-harness/agents/oracle.md"),
+        ),
+        (
+            "agents/delegate.md",
+            include_str!("../../.umans-harness/agents/delegate.md"),
+        ),
         // --- Orchestrator delegation skill (required for the parent agent to
         // know how to use the `subagent` tool + intercom). ---
-        ("skills/pi-subagents/SKILL.md", include_str!("../../.umans-harness/skills/pi-subagents/SKILL.md")),
+        (
+            "skills/pi-subagents/SKILL.md",
+            include_str!("../../.umans-harness/skills/pi-subagents/SKILL.md"),
+        ),
         // --- vision-handoff plugin (required for image-bearing turns to route
         // to a vision-capable model). ---
-        ("plugins/vision-handoff/plugin.json", include_str!("../../.umans-harness/plugins/vision-handoff/plugin.json")),
-        ("plugins/vision-handoff/hooks/pre_turn.py", include_str!("../../.umans-harness/plugins/vision-handoff/hooks/pre_turn.py")),
-        ("plugins/vision-handoff/README.md", include_str!("../../.umans-harness/plugins/vision-handoff/README.md")),
+        (
+            "plugins/vision-handoff/plugin.json",
+            include_str!("../../.umans-harness/plugins/vision-handoff/plugin.json"),
+        ),
+        (
+            "plugins/vision-handoff/hooks/pre_turn.py",
+            include_str!("../../.umans-harness/plugins/vision-handoff/hooks/pre_turn.py"),
+        ),
+        (
+            "plugins/vision-handoff/README.md",
+            include_str!("../../.umans-harness/plugins/vision-handoff/README.md"),
+        ),
+        // --- telemetry plugin (aggregates per-turn metrics into a per-workspace
+        // telemetry summary; fires on the session_stop lifecycle hook). ---
+        (
+            "plugins/telemetry/plugin.json",
+            include_str!("../../.umans-harness/plugins/telemetry/plugin.json"),
+        ),
+        (
+            "plugins/telemetry/hooks/session_stop.py",
+            include_str!("../../.umans-harness/plugins/telemetry/hooks/session_stop.py"),
+        ),
+        (
+            "plugins/telemetry/README.md",
+            include_str!("../../.umans-harness/plugins/telemetry/README.md"),
+        ),
         // --- A short guide to the global layout + override model. ---
         ("README.md", GLOBAL_README),
     ]
@@ -85,7 +135,10 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
 
 /// Files that must be marked executable on Unix (hook scripts).
 fn executable_rel_paths() -> &'static [&'static str] {
-    &["plugins/vision-handoff/hooks/pre_turn.py"]
+    &[
+        "plugins/vision-handoff/hooks/pre_turn.py",
+        "plugins/telemetry/hooks/session_stop.py",
+    ]
 }
 
 /// Ensure the global default files exist under `~/.umans-harness/`. Writes only
@@ -123,10 +176,7 @@ pub fn stage_if_needed() -> StageResult {
             #[cfg(unix)]
             if executable_rel_paths().contains(&rel) {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
             }
         }
     }
@@ -203,7 +253,16 @@ mod tests {
         assert!(home.join("agents/scout.md").exists());
         assert!(home.join("skills/pi-subagents/SKILL.md").exists());
         assert!(home.join("plugins/vision-handoff/plugin.json").exists());
-        assert!(home.join("plugins/vision-handoff/hooks/pre_turn.py").exists());
+        assert!(home
+            .join("plugins/vision-handoff/hooks/pre_turn.py")
+            .exists());
+        assert!(
+            home.join("plugins/telemetry/plugin.json").exists(),
+            "telemetry plugin should be staged on first run"
+        );
+        assert!(home
+            .join("plugins/telemetry/hooks/session_stop.py")
+            .exists());
         assert!(home.join(".staged").exists());
         assert_eq!(
             std::fs::read_to_string(home.join(".staged")).unwrap(),
@@ -233,7 +292,9 @@ mod tests {
         std::fs::remove_file(&skill).unwrap();
         let r4 = stage_if_needed();
         assert!(skill.exists(), "deleted default should be restored");
-        assert!(r4.written.contains(&"skills/pi-subagents/SKILL.md".to_string()));
+        assert!(r4
+            .written
+            .contains(&"skills/pi-subagents/SKILL.md".to_string()));
         assert!(!r4.first_run, "backfill is not a first_run");
 
         #[cfg(unix)]
@@ -244,6 +305,14 @@ mod tests {
                 .permissions()
                 .mode();
             assert!(mode & 0o111 != 0, "hook script must be executable");
+            let mode = std::fs::metadata(home.join("plugins/telemetry/hooks/session_stop.py"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "telemetry hook script must be executable"
+            );
         }
 
         std::env::remove_var("HOME");

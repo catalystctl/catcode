@@ -8,6 +8,7 @@ import { useMemo } from "react";
 import type { ApprovalRequest } from "@/lib/types";
 import { isDangerousTool, toolIcon } from "@/lib/format";
 import { CheckIcon, XIcon, ShieldIcon } from "./icons";
+import { Diff } from "./diff";
 
 interface Props {
   approval: ApprovalRequest;
@@ -44,18 +45,11 @@ export function Approval({ approval, onApprove }: Props) {
       </div>
       <div className="px-4 py-3">
         {args && (
-          <pre className="mb-3 max-h-56 overflow-auto rounded-lg border border-ink-800 bg-[#08080a] p-2.5 text-[12px] leading-relaxed text-ink-200">
+          <pre className="mb-3 max-h-56 overflow-auto rounded-lg border border-ink-800 bg-ink-950 p-2.5 text-[12px] leading-relaxed text-ink-200">
             <code>{args}</code>
           </pre>
         )}
-        {approval.diff && (
-          <pre className="mb-3 max-h-56 overflow-auto rounded-lg border border-ink-800 bg-[#08080a] p-2.5 text-[12px] leading-relaxed">
-            {approval.diff.split("\n").map((l, i) => {
-              const cls = l.startsWith("+") && !l.startsWith("+++") ? "diff-line-add" : l.startsWith("-") && !l.startsWith("---") ? "diff-line-del" : l.startsWith("@@") ? "diff-line-hunk" : "";
-              return <div key={i} className={`${cls} px-1`}>{l || " "}</div>;
-            })}
-          </pre>
-        )}
+        {approval.diff && <Diff diff={approval.diff} className="mb-3" />}
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => onApprove("yes")}

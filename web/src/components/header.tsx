@@ -90,6 +90,7 @@ export function Header(props: Props) {
       <div className="relative ml-auto" ref={modelRef}>
         <button
           onClick={() => setModelOpen((o) => !o)}
+          aria-haspopup="menu"
           aria-expanded={modelOpen}
           className="flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/70 px-2.5 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850"
         >
@@ -98,13 +99,14 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {modelOpen && (
-          <div className="absolute right-0 z-30 mt-1 max-h-72 w-64 overflow-auto rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
+          <div role="menu" className="absolute right-0 z-30 mt-1 max-h-72 w-64 overflow-auto rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
             {props.models.length === 0 && (
               <div className="px-3 py-2 text-[12px] text-ink-500">No models — set an API key.</div>
             )}
             {props.models.map((mo) => (
               <button
                 key={mo.id}
+                role="menuitem"
                 onClick={() => {
                   props.onSelectModel(mo.id);
                   setModelOpen(false);
@@ -129,6 +131,7 @@ export function Header(props: Props) {
       <div className="relative hidden sm:block" ref={thinkRef}>
         <button
           onClick={() => setThinkOpen((o) => !o)}
+          aria-haspopup="menu"
           aria-expanded={thinkOpen}
           className="flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/70 px-2.5 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850"
         >
@@ -137,10 +140,11 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {thinkOpen && (
-          <div className="absolute right-0 z-30 mt-1 w-32 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
+          <div role="menu" className="absolute right-0 z-30 mt-1 w-32 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
             {effLevels.map((lv) => (
               <button
                 key={lv}
+                role="menuitem"
                 onClick={() => {
                   props.onSelectThinking(lv);
                   setThinkOpen(false);
@@ -159,6 +163,7 @@ export function Header(props: Props) {
       <div className="relative" ref={approvRef}>
         <button
           onClick={() => setApprovOpen((o) => !o)}
+          aria-haspopup="menu"
           aria-expanded={approvOpen}
           className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12px] font-medium transition-colors ${
             props.approvalMode === "always"
@@ -174,10 +179,11 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {approvOpen && (
-          <div className="absolute right-0 z-30 mt-1 w-40 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
+          <div role="menu" className="absolute right-0 z-30 mt-1 w-40 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
             {approvalModes.map((mode) => (
               <button
                 key={mode}
+                role="menuitem"
                 onClick={() => {
                   props.onSetApproval(mode);
                   setApprovOpen(false);

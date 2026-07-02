@@ -8,29 +8,7 @@ import { useState } from "react";
 import type { UIToolCall } from "@/lib/types";
 import { isDangerousTool, prettyArgs, toolIcon, truncate } from "@/lib/format";
 import { ChevronRight, CheckIcon, XIcon, CopyIcon } from "./icons";
-
-function Diff({ diff }: { diff: string }) {
-  const lines = diff.split("\n");
-  return (
-    <pre className="mt-2 overflow-x-auto rounded-lg border border-ink-800 bg-[#0a0a0c] p-3 text-[12px] leading-relaxed">
-      {lines.map((l, i) => {
-        const cls =
-          l.startsWith("+") && !l.startsWith("+++")
-            ? "diff-line-add"
-            : l.startsWith("-") && !l.startsWith("---")
-              ? "diff-line-del"
-              : l.startsWith("@@")
-                ? "diff-line-hunk"
-                : "";
-        return (
-          <div key={i} className={`${cls} px-2`}>
-            {l || " "}
-          </div>
-        );
-      })}
-    </pre>
-  );
-}
+import { Diff } from "./diff";
 
 export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   const [open, setOpen] = useState(false);
@@ -38,6 +16,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   const danger = isDangerousTool(tc.name);
   const running = !tc.result;
   const ok = tc.result?.ok;
+  const unknown = tc.result?.unknown;
 
   const copy = () => {
     navigator.clipboard?.writeText(tc.result?.output ?? "").then(
@@ -76,6 +55,11 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent-soft" />
               running
             </span>
+          ) : unknown ? (
+            <span className="flex items-center gap-1 text-[11px] text-ink-500">
+              <span className="h-1.5 w-1.5 rounded-full bg-ink-600" />
+              loaded
+            </span>
           ) : ok ? (
             <span className="flex items-center gap-1 text-[11px] text-emerald-400">
               <CheckIcon width={12} height={12} /> ok
@@ -89,7 +73,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
       </button>
 
       {open && (
-        <div className="border-t border-ink-800/70 bg-[#08080a]">
+        <div className="border-t border-ink-800/70 bg-ink-950">
           {tc.argString && (
             <div className="px-3 py-2">
               <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">arguments</div>
@@ -113,7 +97,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
               {tc.result.diff && <Diff diff={tc.result.diff} />}
               <pre
                 className={`mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed ${
-                  ok ? "text-ink-200" : "text-rose-300"
+                  ok || unknown ? "text-ink-200" : "text-rose-300"
                 }`}
               >
                 {tc.result.output || "(no output)"}

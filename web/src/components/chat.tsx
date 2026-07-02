@@ -11,7 +11,7 @@ import { basename } from "@/lib/format";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { Message } from "./message";
-import { Composer } from "./composer";
+import { Composer, type ComposerHandle } from "./composer";
 import { Toasts } from "./toasts";
 import { Approval } from "./approval";
 import { IntercomPrompt, SubagentPanel } from "./intercom";
@@ -50,11 +50,29 @@ export function Chat() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [keyInput, setKeyInput] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
+  const [keyDismissed, setKeyDismissed] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<null | "memory" | "plugins" | "settings" | "subagents" | "help">(null);
   const [images, setImages] = useState<string[]>([]);
   const [theme, setTheme] = useState<string>(() => lsGet("umans:theme") ?? "dark");
+
+  // Refs so the edit/regenerate/command callbacks can stay stable (empty deps)
+  // — this keeps <Message> memoized: only the streaming message re-renders on
+  // each token, not the whole conversation.
+  const agentRef = useRef(agent);
+  useEffect(() => {
+    agentRef.current = agent;
+  }, [agent]);
+  const msgsRef = useRef(state.messages);
+  useEffect(() => {
+    msgsRef.current = state.messages;
+  }, [state.messages]);
+  const streamingRef = useRef(state.streaming);
+  useEffect(() => {
+    streamingRef.current = state.streaming;
+  }, [state.streaming]);
 
   // Theme: toggle a data-theme attribute + persist. CSS variables adjust.
   useEffect(() => {
@@ -78,7 +96,7 @@ export function Chat() {
 
   // ── Export transcript as a downloadable markdown file ──
   const doExport = useCallback(() => {
-    const md = agent.exportTranscript();
+    const md = agentRef.current.exportTranscript();
     const blob = new Blob([md], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -88,73 +106,89 @@ export function Chat() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  }, [agent]);
+  }, []);
 
   // ── Slash-command dispatch (single switch; the catalog is the source of truth) ──
-  const onCommand = useCallback(
-    (name: string) => {
-      switch (name) {
-        case "reset":
-          return agent.reset();
-        case "compact":
-          return agent.compact();
-        case "new":
-          return agent.newSession();
-        case "abort":
-          return agent.abort();
-        case "stats":
-          return agent.stats();
-        case "sessions":
-          return agent.listSessions();
-        case "undo":
-          return agent.undo();
-        case "clear":
-          return agent.clear();
-        case "memory":
-        case "remember":
-        case "forget":
-          agent.listMemory();
-          return setModal("memory");
-        case "plugins":
-          agent.listPlugins();
-          return setModal("plugins");
-        case "settings":
-        case "model":
-        case "reasoning":
-        case "approval":
-        case "vision":
-          return setModal("settings");
-        case "subagents":
-          return setModal("subagents");
-        case "help":
-          return setModal("help");
-        case "copy":
-          return agent.copyLastReply();
-        case "export":
-          return doExport();
-        case "theme":
-          return setTheme((t) => (t === "dark" ? "light" : "dark"));
-        case "key": {
-          const key = window.prompt("Enter API key:");
-          if (key?.trim()) void agent.setKey(key.trim());
-          return;
-        }
-        case "steer":
-          // Focus the composer for a steer; the placeholder guides the user.
-          return setSidebarOpen(false);
-        case "run":
-          return agent.prompt("Delegate to a subagent: ");
-        case "parallel":
-          return agent.prompt("Run subagents in parallel: ");
-        case "chain":
-          return agent.prompt("Run a subagent chain: ");
-        default:
-          return;
+  // Uses refs so this callback is stable — the Composer never re-renders from it.
+  const onCommand = useCallback((name: string) => {
+    const a = agentRef.current;
+    switch (name) {
+      case "reset":
+        if (window.confirm("Reset the conversation and session file? This cannot be undone."))
+          return a.reset();
+        return;
+      case "compact":
+        return a.compact();
+      case "new":
+        return a.newSession();
+      case "abort":
+        return a.abort();
+      case "stats":
+        return a.stats();
+      case "sessions":
+        return a.listSessions();
+      case "undo":
+        return a.undo();
+      case "clear":
+        if (window.confirm("Clear the conversation view? The session file is kept."))
+          return a.clear();
+        return;
+      case "memory":
+        a.listMemory();
+        return setModal("memory");
+      case "remember": {
+        // Quick inline save, then open the panel so the user can tag/forget.
+        const note = window.prompt("Remember what? A durable note for future sessions.");
+        if (note?.trim()) void a.saveMemory(note.trim());
+        a.listMemory();
+        return setModal("memory");
       }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [agent],
-  );
+      case "forget":
+        a.listMemory();
+        return setModal("memory");
+      case "plugins":
+        a.listPlugins();
+        return setModal("plugins");
+      case "settings":
+      case "model":
+      case "reasoning":
+      case "approval":
+      case "vision":
+        return setModal("settings");
+      case "subagents":
+        return setModal("subagents");
+      case "help":
+        return setModal("help");
+      case "copy":
+        return a.copyLastReply();
+      case "export":
+        return doExport();
+      case "theme":
+        return setTheme((t) => (t === "dark" ? "light" : "dark"));
+      case "key": {
+        const key = window.prompt("Enter API key:");
+        if (key?.trim()) void a.setKey(key.trim());
+        return;
+      }
+      case "steer":
+        // Focus the composer so the user can type a steer (Enter steers while streaming).
+        setSidebarOpen(false);
+        return composerRef.current?.focus();
+      case "attach":
+        return composerRef.current?.openAttach();
+      case "run":
+        composerRef.current?.insert("Delegate to a subagent: ");
+        return;
+      case "parallel":
+        composerRef.current?.insert("Run these subagents in parallel: ");
+        return;
+      case "chain":
+        composerRef.current?.insert("Run a subagent chain: ");
+        return;
+      default:
+        return;
+    }
+  }, [doExport]);
 
   const onAddImage = (url: string) => setImages((prev) => [...prev, url]);
   const onRemoveImage = (i: number) => setImages((prev) => prev.filter((_, idx) => idx !== i));
@@ -172,27 +206,27 @@ export function Chat() {
   };
 
   // ── Edit a user message: undo the last turn, then re-send the edited text ──
-  const onEditUser = useCallback(
-    (newText: string) => {
-      void agent.undo().then(() => agent.prompt(newText));
-    },
-    [agent],
-  );
+  // Stable (empty deps) via refs so <Message> memo isn't defeated.
+  const onEditUser = useCallback((newText: string) => {
+    const a = agentRef.current;
+    void a.undo().then(() => a.prompt(newText));
+  }, []);
 
   // ── Regenerate: undo the last turn, re-send the same prompt ──
   const onRegenerate = useCallback(() => {
-    const msgs = state.messages;
+    const a = agentRef.current;
+    const msgs = msgsRef.current;
     let lastUserText = "";
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === "user") {
-        lastUserText = (msgs[i as number] as { text: string }).text;
+        lastUserText = (msgs[i] as { text: string }).text;
         break;
       }
     }
     if (lastUserText) {
-      void agent.undo().then(() => agent.prompt(lastUserText));
+      void a.undo().then(() => a.prompt(lastUserText));
     }
-  }, [agent, state.messages]);
+  }, []);
 
   // Compute indices for edit/regenerate affordances (only the latest of each).
   const messages = state.messages;
@@ -204,7 +238,7 @@ export function Chat() {
     if (lastUserIdx >= 0 && lastAssistantIdx >= 0) break;
   }
 
-  const needKey = state.ready != null && state.authed === false;
+  const needKey = state.ready != null && state.authed === false && !keyDismissed;
   const currentModel = state.models.find((m) => m.id === state.selectedModel) ?? state.models[0];
   const modelLabel = currentModel?.name ?? currentModel?.id ?? "no model";
   const empty = state.messages.length === 0;
@@ -238,7 +272,8 @@ export function Chat() {
           setModal(p as "memory" | "plugins" | "settings" | "subagents" | "help");
         }}
         onSwitchWorkspace={(p) => agent.switchWorkspace(p)}
-        onAddProject={(p) => agent.addProject(p)}
+        onRemoveProject={(p) => agent.removeProject(p)}
+        onDeleteSession={(p) => agent.deleteSession(p)}
         onRenameSession={(name, title) => agent.renameSession(name, title)}
       />
 
@@ -298,7 +333,7 @@ export function Chat() {
                   <IntercomPrompt
                     prompt={state.pendingIntercom}
                     onReply={agent.intercomReply}
-                    onDismiss={() => agent.intercomReply("")}
+                    onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
                   />
                 </div>
               )}
@@ -321,18 +356,22 @@ export function Chat() {
         </div>
 
         <Composer
+          ref={composerRef}
           streaming={state.streaming}
           connected={agent.connected}
           canSend={!!currentModel}
           thinkingLevel={state.thinkingLevel}
           modelLabel={modelLabel}
           images={images}
+          workspace={state.workspace}
           onAddImage={onAddImage}
           onRemoveImage={onRemoveImage}
           onPrompt={sendPrompt}
           onSteer={(t) => agent.steer(t)}
           onAbort={agent.abort}
           onCommand={onCommand}
+          skills={state.skills}
+          onSkill={(name, task) => agent.applySkill(name, task)}
         />
       </div>
 
@@ -376,7 +415,13 @@ export function Chat() {
       {modal === "help" && <HelpModal onClose={() => setModal(null)} />}
 
       {needKey && (
-        <KeyOverlay value={keyInput} busy={keyBusy} onChange={setKeyInput} onSubmit={submitKey} />
+        <KeyOverlay
+          value={keyInput}
+          busy={keyBusy}
+          onChange={setKeyInput}
+          onSubmit={submitKey}
+          onDismiss={() => setKeyDismissed(true)}
+        />
       )}
     </div>
   );
@@ -401,7 +446,7 @@ function EmptyState({
       <h1 className="text-2xl font-semibold tracking-tight text-ink-100">Umans Harness</h1>
       <p className="mt-2 max-w-md text-[14px] text-ink-400">
         {switching ? (
-          "Switching workspace…"
+          "Loading session…"
         ) : (
           <>
             An agentic coding companion running on{" "}
@@ -436,15 +481,25 @@ function KeyOverlay({
   busy,
   onChange,
   onSubmit,
+  onDismiss,
 }: {
   value: string;
   busy: boolean;
   onChange: (v: string) => void;
   onSubmit: () => void;
+  onDismiss: () => void;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl animate-fade-in">
+      <div className="relative w-full max-w-md rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl animate-fade-in">
+        <button
+          onClick={onDismiss}
+          className="absolute right-3 top-3 rounded-md p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          aria-label="Dismiss"
+          title="Dismiss (use /key to enter a key later)"
+        >
+          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+        </button>
         <div className="mb-4 flex items-center gap-3">
           <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent/15 text-accent-soft">
             <ShieldIcon width={18} height={18} />

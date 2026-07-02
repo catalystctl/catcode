@@ -13,6 +13,15 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
+
+/// Serializes all memory write operations (save/append/forget) across the
+/// orchestrator and any in-process subagents. `append_memory` is a
+/// read-modify-write, so two parallel subagents appending to the same memory
+/// name would otherwise race and silently drop facts. Writes are rare and fast,
+/// so a single global lock is the ponytail fix (no per-file lock map) and is
+/// correct for one core process — the only writer to a memory dir.
+static WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
 #[derive(Clone, Debug)]
 pub struct MemoryEntry {
@@ -85,6 +94,9 @@ impl Store {
         std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create memory dir: {e}"))?;
 
         let slug = slugify(name);
+        if slug.is_empty() {
+            return Err("memory name must contain at least one alphanumeric character".to_string());
+        }
         let filename = format!("{}.md", slug);
         let path = dir.join(&filename);
 
@@ -93,8 +105,13 @@ impl Store {
             name, description, mem_type, content
         );
 
-        std::fs::write(&path, &body)
+        // Atomic write (temp + rename) so a crash mid-write can't leave a
+        // truncated/empty memory file — memories are durable learnings.
+        let tmp = path.with_file_name(format!("{filename}.tmp"));
+        std::fs::write(&tmp, &body)
             .map_err(|e| format!("failed to write memory file {filename:?}: {e}"))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("failed to commit memory file {filename:?}: {e}"))?;
 
         rebuild_index(&dir)?;
 
@@ -120,6 +137,7 @@ pub fn save_memory(
     mem_type: &str,
     description: &str,
 ) -> Result<PathBuf, String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Store::new(Store::default_root()).save(workspace, name, content, mem_type, description)
 }
 
@@ -136,8 +154,33 @@ pub fn append_memory(
     description: &str,
     max_bytes: usize,
 ) -> Result<PathBuf, String> {
-    append_memory_into(
+    append_memory_locked(
         &Store::new(Store::default_root()),
+        workspace,
+        name,
+        new_facts,
+        mem_type,
+        description,
+        max_bytes,
+    )
+}
+
+/// Like `append_memory` but against a provided store, and the testable seam for
+/// the write lock: acquires `WRITE_LOCK` across the whole read-modify-write so
+/// concurrent appends to the same memory name (e.g. from parallel subagents)
+/// can't interleave and drop facts.
+fn append_memory_locked(
+    store: &Store,
+    workspace: &Path,
+    name: &str,
+    new_facts: &str,
+    mem_type: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    append_memory_into(
+        store,
         workspace,
         name,
         new_facts,
@@ -159,9 +202,10 @@ fn append_memory_into(
     let dir = store.dir(workspace);
     let slug = slugify(name);
     let path = dir.join(format!("{slug}.md"));
-    let mut combined = match parse_memory_file(&path) {
+    let existing = parse_memory_file(&path);
+    let mut combined = match &existing {
         Some(m) if !m.content.is_empty() => {
-            let mut s = m.content;
+            let mut s = m.content.clone();
             if !s.ends_with('\n') {
                 s.push('\n');
             }
@@ -185,7 +229,15 @@ fn append_memory_into(
             &combined[start..]
         );
     }
-    store.save(workspace, name, &combined, mem_type, description)
+    // Appending preserves the existing memory's type/description; the caller's
+    // values only apply when creating a NEW memory, so `append` can never
+    // silently wipe a memory's metadata (the tool defaults description="",
+    // type="note").
+    let (final_type, final_desc) = match &existing {
+        Some(m) if !m.content.is_empty() => (m.mem_type.as_str(), m.description.as_str()),
+        _ => (mem_type, description),
+    };
+    store.save(workspace, name, &combined, final_type, final_desc)
 }
 
 /// Delete a memory by its slug/id (the filename stem) and rebuild the index.
@@ -197,6 +249,7 @@ pub fn forget_memory(workspace: &Path, id: &str) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("memory id must not be empty".to_string());
     }
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let store = Store::new(Store::default_root());
     let dir = store.dir(workspace);
     let slug = slugify(id);
@@ -270,6 +323,9 @@ fn scan_dir(dir: &Path) -> Vec<MemoryEntry> {
             entries.push(entry);
         }
     }
+    // Deterministic order (by name) so the injected memory block — and the
+    // system prompt built from it — is stable across runs (prefix-cache safe).
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
 
@@ -661,6 +717,47 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_do_not_lose_facts() {
+        // Parallel subagents appending to the SAME memory name must not drop
+        // facts: WRITE_LOCK serializes the read-modify-write. Without it two
+        // threads reading the same content then both writing would lose one.
+        let root = tmp_root();
+        let ws = fake_workspace("concurrent");
+        let store = test_store(&root);
+        let n = 8usize;
+        let mut handles = vec![];
+        for i in 0..n {
+            let store_root = root.clone();
+            let ws2 = ws.clone();
+            handles.push(std::thread::spawn(move || {
+                let s = Store::new(store_root);
+                append_memory_locked(
+                    &s,
+                    &ws2,
+                    "shared",
+                    &format!("fact-{i}"),
+                    "note",
+                    "desc",
+                    1_000_000,
+                )
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1, "one memory named 'shared'");
+        let content = &entries[0].content;
+        for i in 0..n {
+            assert!(
+                content.contains(&format!("fact-{i}")),
+                "fact-{i} missing from appended memory: {content}"
+            );
+        }
+    }
+
+    #[test]
     fn slugify_produces_safe_filenames() {
         assert_eq!(slugify("user preferences"), "user-preferences");
         assert_eq!(slugify("TypeScript Rules!"), "typescript-rules");
@@ -668,7 +765,42 @@ mod tests {
         assert_eq!(slugify("a/b:c"), "a-b-c");
         // traversal chars are stripped, so a crafted id can't escape the memory dir
         assert_eq!(slugify("../../etc/passwd"), "etc-passwd");
-        assert!(!slugify("../../etc/passwd").contains('/') && !slugify("../../etc/passwd").contains('.'));
+        assert!(
+            !slugify("../../etc/passwd").contains('/')
+                && !slugify("../../etc/passwd").contains('.')
+        );
+    }
+
+    #[test]
+    fn append_preserves_existing_description_and_type() {
+        // Appending must NOT clobber an existing memory's description/type —
+        // the memory tool defaults description="" type="note", so a naive append
+        // would wipe the metadata. The caller's values only apply to NEW memories.
+        let root = tmp_root();
+        let ws = fake_workspace("preserve");
+        let store = test_store(&root);
+        store
+            .save(&ws, "skill", "body", "convention", "How we do X")
+            .unwrap();
+        append_memory_locked(&store, &ws, "skill", "more facts", "", "", 1_000_000).unwrap();
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].description, "How we do X");
+        assert_eq!(entries[0].mem_type, "convention");
+        assert!(entries[0].content.contains("body"));
+        assert!(entries[0].content.contains("more facts"));
+    }
+
+    #[test]
+    fn save_rejects_empty_or_punctuation_only_name() {
+        // slugify("") and slugify("!!!") both yield "" — must be rejected, not
+        // written as a hidden ".md" file (which scan would silently skip).
+        let root = tmp_root();
+        let ws = fake_workspace("emptyslug");
+        let store = test_store(&root);
+        assert!(store.save(&ws, "", "x", "note", "d").is_err());
+        assert!(store.save(&ws, "!!!", "x", "note", "d").is_err());
+        assert!(store.scan(&ws).is_empty());
     }
 
     #[test]
@@ -738,7 +870,11 @@ mod tests {
         let _ = append_memory_into(&store, &ws, "facts", "fact A", "note", "d", 4096).unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].content.contains("fact A"), "{}", entries[0].content);
+        assert!(
+            entries[0].content.contains("fact A"),
+            "{}",
+            entries[0].content
+        );
 
         // second append: accumulates onto the first (does NOT overwrite)
         let _ = append_memory_into(&store, &ws, "facts", "fact B", "note", "d", 4096).unwrap();
@@ -749,12 +885,24 @@ mod tests {
         assert!(c.contains("fact B"), "new fact must be present: {c}");
 
         // third append exceeds the cap -> oldest facts trimmed, newest survive
-        let _ = append_memory_into(&store, &ws, "facts", &"new big fact ".repeat(400), "note", "d", 4096).unwrap();
+        let _ = append_memory_into(
+            &store,
+            &ws,
+            "facts",
+            &"new big fact ".repeat(400),
+            "note",
+            "d",
+            4096,
+        )
+        .unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         let c = &entries[0].content;
         assert!(c.contains("trimmed to fit"), "must note trimming: {c}");
-        assert!(c.contains("new big fact"), "newest must survive trimming: {c}");
+        assert!(
+            c.contains("new big fact"),
+            "newest must survive trimming: {c}"
+        );
         assert!(!c.contains("fact A"), "oldest should be trimmed away: {c}");
     }
 }

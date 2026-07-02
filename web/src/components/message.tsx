@@ -32,7 +32,7 @@ function StreamingMarkdown({ children }: { children: string }) {
 
 const streamComponents: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] = {
   pre({ children }) {
-    return <pre className="!my-2 !border !border-ink-800 !rounded-lg !bg-[#0a0a0c]">{children}</pre>;
+    return <pre className="!my-2 !border !border-ink-800 !rounded-lg !bg-ink-950">{children}</pre>;
   },
 };
 

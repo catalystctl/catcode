@@ -7,7 +7,7 @@
 // approve, setKey, …) that POST a raw core command to /api/command and apply the
 // optimistic `_user` event locally (the bridge tracks it for snapshots).
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { reduce, initialState } from "./reducer";
 import type { AgentState, CoreCommand, CoreEvent, ModelInfo } from "./types";
 
@@ -72,6 +72,9 @@ export interface AgentApi {
   enablePlugin: (name: string) => Promise<void>;
   disablePlugin: (name: string) => Promise<void>;
   listPlugins: () => Promise<void>;
+  // ── Skills ──
+  listSkills: () => Promise<void>;
+  applySkill: (name: string, task?: string) => Promise<void>;
   // ── Vision ──
   getVisionConfig: () => Promise<void>;
   setVisionConfig: (vision_model: string | null, vision_models?: string[]) => Promise<void>;
@@ -83,6 +86,8 @@ export interface AgentApi {
   listProjects: () => Promise<void>;
   addProject: (path: string) => Promise<void>;
   removeProject: (path: string) => Promise<void>;
+  // ── Session lifecycle ──
+  deleteSession: (path: string) => Promise<void>;
   // ── Connection ──
   reconnect: () => void;
   // ── Utility ──
@@ -99,11 +104,31 @@ export function useAgent(): AgentApi {
     stateRef.current = state;
   }, [state]);
 
-  // Stream connection + reducer. Re-runs when reconnectKey changes (manual
-  // reconnect button). EventSource auto-reconnects on transient drops, but this
-  // gives the user an explicit way to force a fresh connection.
+  // Multi-session: the client views ONE session at a time but many can be live
+  // server-side. `streamSessionId` is the session the SSE stream is connected to
+  // (null = the default workspace session); changing it reopens the stream.
+  // `activeRef`/`workspaceRef` route commands to the viewed session and are kept
+  // in sync from snapshots WITHOUT reopening the stream.
+  const [streamSessionId, setStreamSessionId] = useState<string | null>(null);
+  const activeRef = useRef<string | null>(null);
+  const workspaceRef = useRef<string>("");
   useEffect(() => {
-    const es = new EventSource("/api/stream");
+    if (state.workspace) workspaceRef.current = state.workspace;
+    if (state.currentSessionFile) activeRef.current = state.currentSessionFile;
+  }, [state.workspace, state.currentSessionFile]);
+
+  // Stream connection + reducer. Re-runs when the viewed session changes
+  // (streamSessionId) or on manual reconnect. EventSource auto-reconnects on
+  // transient drops; reconnectKey gives the user an explicit force-fresh option.
+  useEffect(() => {
+    let url = "/api/stream";
+    if (streamSessionId) {
+      const params = new URLSearchParams();
+      params.set("session", streamSessionId);
+      if (workspaceRef.current) params.set("workspace", workspaceRef.current);
+      url = `/api/stream?${params.toString()}`;
+    }
+    const es = new EventSource(url);
     es.onopen = () => setConnected(true);
     es.onerror = () => setConnected(false);
     es.onmessage = (e) => {
@@ -114,13 +139,24 @@ export function useAgent(): AgentApi {
         return;
       }
       if (ev.type === "_snapshot") {
-        setState((ev as { state: AgentState }).state);
+        const snap = (ev as { state: AgentState }).state;
+        // Preserve the user's UI prefs (model/thinking) across session switches:
+        // each session's core reports its own (default) values, but the choice
+        // is global (localStorage).
+        const t = lsGet("umans:thinking");
+        const m = lsGet("umans:model");
+        setState({
+          ...snap,
+          thinkingLevel: t ?? snap.thinkingLevel,
+          selectedModel:
+            m && snap.models.some((x) => x.id === m) ? m : snap.selectedModel,
+        });
       } else {
         setState((s) => reduce(s, ev as CoreEvent));
       }
     };
     return () => es.close();
-  }, [reconnectKey]);
+  }, [streamSessionId, reconnectKey]);
 
   // Auto-select a model once they arrive and none is chosen. Prefer a saved
   // selection from localStorage so the user's last model persists across reloads.
@@ -150,17 +186,64 @@ export function useAgent(): AgentApi {
     }
   }, []);
 
-  const post = useCallback(async (cmd: CoreCommand) => {
-    try {
-      await fetch("/api/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cmd),
-      });
-    } catch {
-      /* surfaced via the stream's error events */
-    }
-  }, []);
+  const post = useCallback(
+    async (
+      cmd: CoreCommand,
+    ): Promise<{ ok?: boolean; session?: string; workspace?: string; error?: string }> => {
+      // Attach routing metadata so the bridge targets the viewed session.
+      const body: Record<string, unknown> = { ...cmd };
+      if (activeRef.current) body.session = activeRef.current;
+      if (workspaceRef.current) body.workspace = workspaceRef.current;
+      try {
+        const res = await fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          session?: string;
+          workspace?: string;
+          error?: string;
+        };
+      } catch {
+        /* surfaced via the stream's error events */
+        return {};
+      }
+    },
+    [],
+  );
+
+  // Switch the viewed session: reopen the SSE stream for it (the bridge starts
+  // its core if it isn't already live) and re-apply the user's global approval
+  // preference to the new session's core. Other live sessions keep running.
+  const switchToSession = useCallback(
+    (sessionFile: string, workspace?: string) => {
+      activeRef.current = sessionFile;
+      if (workspace) workspaceRef.current = workspace;
+      // Optimistically blank the view while the new session's snapshot loads.
+      setState((s) => ({
+        ...s,
+        messages: [],
+        currentAssistantId: null,
+        streaming: false,
+        retrying: false,
+        pendingApproval: null,
+        pendingIntercom: null,
+        sessions: [],
+        currentSessionFile: sessionFile,
+        switching: true,
+        workspace: workspace ?? s.workspace,
+      }));
+      setStreamSessionId(sessionFile);
+      // Re-apply the user's approval preference to this session's core.
+      const a = lsGet("umans:approval");
+      if (a === "never" || a === "destructive" || a === "always") {
+        void post({ type: "set_approval", mode: a });
+      }
+    },
+    [post],
+  );
 
   const send = useCallback(
     async (cmd: CoreCommand) => {
@@ -179,8 +262,19 @@ export function useAgent(): AgentApi {
     [post],
   );
 
+  // Refresh the discoverable-skills list when a turn ends (streaming → idle)
+  // so a skill created mid-session (e.g. by /reflect or /index) shows up in the
+  // /skill:<name> autocomplete without a reconnect. Skips the initial false→false.
+  const wasStreamingRef = useRef(false);
+  useEffect(() => {
+    if (wasStreamingRef.current && !state.streaming) {
+      post({ type: "list_skills" }).catch(() => {});
+    }
+    wasStreamingRef.current = state.streaming;
+  }, [state.streaming, post]);
+
   const effortFor = useCallback((level: string): string | undefined => {
-    return level === "off" || level === "minimal" ? undefined : level;
+    return level === "off" ? undefined : level;
   }, []);
 
   const prompt = useCallback(
@@ -252,8 +346,17 @@ export function useAgent(): AgentApi {
     [send],
   );
 
-  const newSession = useCallback(() => send({ type: "new_session" }), [send]);
-  const loadSession = useCallback((path: string) => send({ type: "load_session", path }), [send]);
+  const newSession = useCallback(async () => {
+    const r = await post({ type: "new_session" });
+    if (r.session) switchToSession(r.session, r.workspace);
+  }, [post, switchToSession]);
+  const loadSession = useCallback(
+    (path: string): Promise<void> => {
+      switchToSession(path);
+      return Promise.resolve();
+    },
+    [switchToSession],
+  );
   const listSessions = useCallback(() => send({ type: "list_sessions" }), [send]);
   const compact = useCallback(() => send({ type: "compact" }), [send]);
   const reset = useCallback(() => send({ type: "reset" }), [send]);
@@ -327,6 +430,25 @@ export function useAgent(): AgentApi {
   );
   const listPlugins = useCallback(() => send({ type: "list_plugins" }), [send]);
 
+  // ── Skills ──
+  const listSkills = useCallback(() => send({ type: "list_skills" }), [send]);
+  const applySkill = useCallback(
+    async (name: string, task?: string) => {
+      const s = stateRef.current;
+      const model = s.selectedModel ?? s.models[0]?.id ?? "";
+      const cmd: CoreCommand = { type: "apply_skill", name, model };
+      const eff = effortFor(s.thinkingLevel);
+      if (eff) cmd.reasoning_effort = eff;
+      if (task && task.trim()) cmd.task = task.trim();
+      // Optimistic user line: show the concise /skill:<name> [task] the user
+      // invoked (the core inlines the full skill body into the actual prompt).
+      const display = task && task.trim() ? `/skill:${name} ${task.trim()}` : `/skill:${name}`;
+      setState((st) => reduce(st, { type: "_user", text: display, model, steer: false }));
+      await post(cmd);
+    },
+    [post, effortFor],
+  );
+
   // ── Vision ──
   const getVisionConfig = useCallback(() => send({ type: "get_vision_config" }), [send]);
   const setVisionConfig = useCallback(
@@ -344,11 +466,10 @@ export function useAgent(): AgentApi {
   // ── Projects / workspace ──
   const switchWorkspace = useCallback(
     async (path: string) => {
-      // Optimistically mark switching so the UI shows a loading state.
-      setState((s) => reduce(s, { type: "_set_switching", switching: true }));
-      await send({ type: "switch_workspace", path });
+      const r = await post({ type: "switch_workspace", path });
+      if (r.session) switchToSession(r.session, r.workspace ?? path);
     },
-    [send],
+    [post, switchToSession],
   );
   const renameSession = useCallback(
     (name: string, title: string) => send({ type: "rename_session", name, title }),
@@ -359,6 +480,19 @@ export function useAgent(): AgentApi {
   const removeProject = useCallback(
     (path: string) => send({ type: "remove_project", path }),
     [send],
+  );
+
+  // ── Session lifecycle ──
+  const deleteSession = useCallback(
+    async (path: string) => {
+      const r = await post({ type: "delete_session", path });
+      // If we deleted the session currently being viewed, switch to the
+      // next most-recent one (returned by the bridge) so the view stays live.
+      if (activeRef.current && activeRef.current === path && r.session) {
+        switchToSession(r.session, r.workspace);
+      }
+    },
+    [post, switchToSession],
   );
 
   // ── Connection ──
@@ -397,52 +531,64 @@ export function useAgent(): AgentApi {
             tc.result ? `> _${tc.result.ok ? "ok" : "error"}_` : `> _running_`,
             ``,
           );
+          if (tc.result?.output) {
+            lines.push(`> \`\`\``, `> ${tc.result.output.split("\n").join("\n> ")}`, `> \`\`\``, ``);
+          }
         }
       }
     }
     return lines.join("\n");
   }, []);
 
-  return {
-    state,
-    connected,
-    send,
-    prompt,
-    steer,
-    abort,
-    approve,
-    setKey,
-    setModel,
-    setThinking,
-    setApproval,
-    newSession,
-    loadSession,
-    listSessions,
-    compact,
-    reset,
-    stats,
-    dismissToast,
-    intercomReply,
-    undo,
-    clear,
-    saveMemory,
-    listMemory,
-    forgetMemory,
-    installPlugin,
-    removePlugin,
-    enablePlugin,
-    disablePlugin,
-    listPlugins,
-    getVisionConfig,
-    setVisionConfig,
-    setConfig,
-    switchWorkspace,
-    renameSession,
-    listProjects,
-    addProject,
-    removeProject,
-    reconnect,
-    copyLastReply,
-    exportTranscript,
-  };
+  return useMemo(
+    () => ({
+      state,
+      connected,
+      send,
+      prompt,
+      steer,
+      abort,
+      approve,
+      setKey,
+      setModel,
+      setThinking,
+      setApproval,
+      newSession,
+      loadSession,
+      listSessions,
+      compact,
+      reset,
+      stats,
+      dismissToast,
+      intercomReply,
+      undo,
+      clear,
+      saveMemory,
+      listMemory,
+      forgetMemory,
+      installPlugin,
+      removePlugin,
+      enablePlugin,
+      disablePlugin,
+      listPlugins,
+      listSkills,
+      applySkill,
+      getVisionConfig,
+      setVisionConfig,
+      setConfig,
+      switchWorkspace,
+      renameSession,
+      listProjects,
+      addProject,
+      removeProject,
+      deleteSession,
+      reconnect,
+      copyLastReply,
+      exportTranscript,
+    }),
+    // Every action above is a useCallback with stable deps (refs/empty), so the
+    // returned object identity only changes when `state` or `connected` do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state, connected],
+  );
 }

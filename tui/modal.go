@@ -236,7 +236,7 @@ func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (s *session) sessionItems() []listItem {
 	items := make([]listItem, len(s.sessionList))
 	for i, e := range s.sessionList {
-		label := truncateRunes(e.Title, 48)
+		label := truncateRunes(e.Title, 200) // fitListRow truncates to the actual row width
 		if e.Current {
 			label = label + "  (current)"
 		}
@@ -271,7 +271,7 @@ func (s *session) closeModal() {
 // ---------------------------------------------------------------------------
 
 func (s *session) commandItems() []listItem {
-	return []listItem{
+	items := []listItem{
 		{label: "/key", desc: "set API key"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
@@ -306,6 +306,17 @@ func (s *session) commandItems() []listItem {
 		{label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
 		{label: "/reflect", desc: "reflect on this session, persist durable learnings"},
 	}
+	// Append one /skill:<name> entry per discoverable skill so skills created
+	// manually or by the learning system are invocable from the palette with
+	// autocomplete like the built-in commands.
+	for _, sk := range s.skillsList {
+		desc := sk.Description
+		if desc == "" {
+			desc = "apply skill"
+		}
+		items = append(items, listItem{label: "/skill:" + sk.Name, desc: desc})
+	}
+	return items
 }
 
 func (s *session) modelItems() []listItem {
@@ -574,15 +585,16 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	switch commands[i].label {
 	case "/key":
 		s.openSettings()
-		s.modal.fieldIdx = 0
-		s.startEditField(0)
-		return nil
+		idx := s.settingsFieldIndex("API Key")
+		s.modal.fieldIdx = idx
+		_, cmd := s.activateField(idx)
+		return cmd
 	case "/model":
 		s.openModelPicker()
 		return nil
 	case "/approval":
 		s.openSettings()
-		s.modal.fieldIdx = 1
+		s.modal.fieldIdx = s.settingsFieldIndex("Approval")
 		return nil
 	case "/reasoning":
 		s.openReasoningPicker()
@@ -657,6 +669,21 @@ func boolStr(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// settingsFieldIndex returns the index of the settings field whose label
+// matches, or -1 if none. Palette shortcuts (/key, /approval) use this so
+// they target the correct row regardless of the field ordering in
+// settingsFields() — hard-coded indices broke when "Provider" was added at
+// index 0 (e.g. /key landed on Provider instead of API Key, and the typed
+// key was then dropped on commit since Provider has no edit handler).
+func (s *session) settingsFieldIndex(label string) int {
+	for i, f := range s.settingsFields() {
+		if f.label == label {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *session) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -995,7 +1022,7 @@ func helpText() string {
 		"  ctrl+o            expand / collapse last tool output",
 		"  ctrl+r            set reasoning effort (per model)",
 		"  ctrl+c            quit",
-		"  esc               close modal / deny approval / abort turn",
+		"  esc               close modal / deny approval / drop queued · abort turn",
 		"",
 		"Scrolling the transcript",
 		"  pgup / pgdn       scroll a page",
@@ -1012,7 +1039,7 @@ func helpText() string {
 		"While a turn is running (in-flight)",
 		"  enter             queue a follow-up message",
 		"  ctrl+enter        steer (interrupt + redirect the model)",
-		"  esc               abort the turn",
+		"  esc               drop the queued message, or abort if none queued",
 		"  /steer <msg>      steer (works on every terminal)",
 		"",
 		"Approval (when prompted)",
@@ -1134,14 +1161,23 @@ func fitListRow(marker, label, desc string, markerW, width int) string {
 	return row
 }
 
-func (s *session) renderListModal(title string, items []listItem, showFilter bool) string {
-	w := 52
-	if s.width-4 < w {
-		w = s.width - 4
+// modalWidth returns a responsive modal width: as wide as the terminal
+// allows (minus margins) up to cap, floored at 28. Replaces the old fixed
+// 52/60 so longer content — session names especially — stays visible instead
+// of being truncated.
+func (s *session) modalWidth(cap int) int {
+	w := s.width - 4
+	if w > cap {
+		w = cap
 	}
 	if w < 28 {
 		w = 28
 	}
+	return w
+}
+
+func (s *session) renderListModal(title string, items []listItem, showFilter bool) string {
+	w := s.modalWidth(110)
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
 
@@ -1227,13 +1263,7 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 }
 
 func (s *session) renderSettingsModal() string {
-	w := 52
-	if s.width-4 < w {
-		w = s.width - 4
-	}
-	if w < 30 {
-		w = 30
-	}
+	w := s.modalWidth(72)
 	fields := s.settingsFields()
 	var lines []string
 	lines = append(lines, accentStyle.Render("◆ Settings"))
@@ -1258,13 +1288,7 @@ func (s *session) renderSettingsModal() string {
 }
 
 func (s *session) renderHelpModal() string {
-	w := 60
-	if s.width-4 < w {
-		w = s.width - 4
-	}
-	if w < 30 {
-		w = 30
-	}
+	w := s.modalWidth(80)
 	h := s.height - 6
 	if h < 6 {
 		h = 6

@@ -6,7 +6,7 @@
 // delta/thinking/tool_call events. Retries on transient HTTP errors with
 // exponential backoff (honors Retry-After).
 use crate::config::{ProviderKind, ResolvedProvider};
-use crate::logging::{estimate_messages_tokens, estimate_tokens, TurnTimer};
+use crate::logging::{estimate_tokens, TurnTimer};
 use crate::protocol::{emit, Event, ModelInfo};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -242,7 +242,6 @@ async fn anthropic_complete(
         })
 }
 
-
 fn fallback_models() -> Vec<ModelInfo> {
     // ponytail: GLM chat template maps any effort except 'high' to 'max', which
     // degenerates thinking output. Advertise only ["high"] so resolve_effort
@@ -318,7 +317,10 @@ fn fallback_models() -> Vec<ModelInfo> {
 /// provider's wire protocol: OpenAI-compatible (`/models/info`) or Anthropic
 /// (`/v1/models`). Results are cached to disk, keyed by base URL + kind so an
 /// OpenAI and an Anthropic endpoint at the same host don't collide.
-pub async fn discover_models(client: &reqwest::Client, provider: &ResolvedProvider) -> Vec<ModelInfo> {
+pub async fn discover_models(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+) -> Vec<ModelInfo> {
     let cache_key = provider_cache_key(provider);
     match provider.kind {
         ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key).await,
@@ -745,19 +747,45 @@ pub async fn stream_turn(
     max_tokens: u32,
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
+    prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     match provider.kind {
-        ProviderKind::OpenAI => stream_turn_openai(
-            client, provider, idle_timeout_secs, model, messages, tools, reasoning_effort,
-            thinking_levels, cancel, timer, quiet,
-        )
-        .await,
-        ProviderKind::Anthropic => stream_turn_anthropic(
-            client, provider, idle_timeout_secs, model, messages, tools, reasoning_effort,
-            thinking_levels, max_tokens, cancel, timer, quiet,
-        )
-        .await,
+        ProviderKind::OpenAI => {
+            stream_turn_openai(
+                client,
+                provider,
+                idle_timeout_secs,
+                model,
+                messages,
+                tools,
+                reasoning_effort,
+                thinking_levels,
+                cancel,
+                timer,
+                prompt_est,
+                quiet,
+            )
+            .await
+        }
+        ProviderKind::Anthropic => {
+            stream_turn_anthropic(
+                client,
+                provider,
+                idle_timeout_secs,
+                model,
+                messages,
+                tools,
+                reasoning_effort,
+                thinking_levels,
+                max_tokens,
+                cancel,
+                timer,
+                prompt_est,
+                quiet,
+            )
+            .await
+        }
     }
 }
 
@@ -775,6 +803,7 @@ async fn stream_turn_openai(
     thinking_levels: &[String],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
+    prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     // ponytail: reasoning_effort + reasoning_content replay are Umans-specific.
@@ -830,11 +859,13 @@ async fn stream_turn_openai(
     // Configurable because reasoning models can think >60s before the first token.
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
 
-    // Live stats: estimate the prompt's token count once (the prompt is fixed for
-    // this request) so the footer can show a growing context + live TPS as output
-    // streams in. The real usage chunk at stream end overwrites these.
-    // ponytail: char/4 estimate — same heuristic the compaction threshold uses.
-    let est_prompt = estimate_messages_tokens(messages);
+    // Live stats: the prompt's token count drives the footer's context budget
+    // while output streams in (the real `usage` chunk at stream end then
+    // overwrites it with exact values). The caller passes the best pre-stream
+    // estimate — grounded on the endpoint's last real `prompt_tokens` when one
+    // is available, else a char/4 of the whole prompt — so the live percentage
+    // tracks reality instead of a whole-conversation char/4 guess.
+    let est_prompt = prompt_est;
     let mut last_stats: Option<Instant> = None;
 
     let mut attempt = 0u32;
@@ -1467,7 +1498,9 @@ pub fn build_anthropic_request(
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
-            "system" => push_content_str(m.get("content").unwrap_or(&Value::Null), &mut system_parts),
+            "system" => {
+                push_content_str(m.get("content").unwrap_or(&Value::Null), &mut system_parts)
+            }
             "user" => {
                 let blocks = anthropic_content_blocks(m.get("content").unwrap_or(&Value::Null));
                 push_or_merge(&mut out, "user", blocks);
@@ -1499,7 +1532,10 @@ pub fn build_anthropic_request(
                         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
                         let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let args = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        let args = func
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
                         let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
                         blocks.push(json!({
                             "type": "tool_use",
@@ -1556,7 +1592,10 @@ pub fn build_anthropic_request(
         if wants {
             let resolved = resolve_effort(reasoning_effort, thinking_levels);
             if let Some(budget) = anthropic_thinking_budget(&resolved, max_tokens) {
-                body.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
+                body.insert(
+                    "thinking".into(),
+                    json!({ "type": "enabled", "budget_tokens": budget }),
+                );
             }
         }
     }
@@ -1640,7 +1679,10 @@ async fn send_anthropic_request(
             }
             Err(e) => {
                 if attempt >= 4 {
-                    return Err(format!("request failed after {attempt} attempts: {}", fmt_chain(&e)));
+                    return Err(format!(
+                        "request failed after {attempt} attempts: {}",
+                        fmt_chain(&e)
+                    ));
                 }
                 let backoff = backoff_ms(attempt, None);
                 emit(
@@ -1670,15 +1712,25 @@ async fn stream_turn_anthropic(
     max_tokens: u32,
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
+    prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     let mt = if max_tokens == 0 { 8192 } else { max_tokens };
-    let mut body = build_anthropic_request(messages, tools, model, reasoning_effort, thinking_levels, mt);
+    let mut body = build_anthropic_request(
+        messages,
+        tools,
+        model,
+        reasoning_effort,
+        thinking_levels,
+        mt,
+    );
     body["stream"] = json!(true);
 
     let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
-    let est_prompt = estimate_messages_tokens(messages);
+    // Live stats: same grounded prompt estimate as the OpenAI path; the real
+    // `usage` at stream end overwrites the footer with exact values.
+    let est_prompt = prompt_est;
     let mut last_stats: Option<Instant> = None;
 
     let mut content = String::new();
@@ -1765,7 +1817,8 @@ async fn stream_turn_anthropic(
                             if let Some(p) = u.get("input_tokens").and_then(token_count) {
                                 tokens_in = p;
                             }
-                            if let Some(c) = u.get("cache_read_input_tokens").and_then(token_count) {
+                            if let Some(c) = u.get("cache_read_input_tokens").and_then(token_count)
+                            {
                                 cached_tokens = c;
                             }
                         }
@@ -1776,12 +1829,24 @@ async fn stream_turn_anthropic(
                             blocks.push(AnthropicBlock::default());
                         }
                         let cb = obj.get("content_block").cloned().unwrap_or(Value::Null);
-                        let btype = cb.get("type").and_then(|t| t.as_str()).unwrap_or("text").to_string();
+                        let btype = cb
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("text")
+                            .to_string();
                         let b = &mut blocks[idx];
                         b.kind = btype.clone();
                         if btype == "tool_use" {
-                            b.tool_id = cb.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            b.tool_name = cb.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            b.tool_id = cb
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            b.tool_name = cb
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if let Some(input) = cb.get("input") {
                                 if let Some(s) = input.as_str() {
                                     b.tool_args.push_str(s);
@@ -1791,13 +1856,17 @@ async fn stream_turn_anthropic(
                             }
                             if !quiet {
                                 emitted = true;
-                                emit(&Event::new("tool_call_start")
-                                    .with("id", json!(b.tool_id))
-                                    .with("index", json!(idx)));
+                                emit(
+                                    &Event::new("tool_call_start")
+                                        .with("id", json!(b.tool_id))
+                                        .with("index", json!(idx)),
+                                );
                                 if !b.tool_name.is_empty() {
-                                    emit(&Event::new("tool_call_name")
-                                        .with("index", json!(idx))
-                                        .with("name", json!(b.tool_name)));
+                                    emit(
+                                        &Event::new("tool_call_name")
+                                            .with("index", json!(idx))
+                                            .with("name", json!(b.tool_name)),
+                                    );
                                 }
                             }
                         }
@@ -1807,7 +1876,9 @@ async fn stream_turn_anthropic(
                         while blocks.len() <= idx {
                             blocks.push(AnthropicBlock::default());
                         }
-                        let Some(delta) = obj.get("delta") else { continue };
+                        let Some(delta) = obj.get("delta") else {
+                            continue;
+                        };
                         let dtype = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match dtype {
                             "text_delta" => {
@@ -1841,7 +1912,8 @@ async fn stream_turn_anthropic(
                                 }
                             }
                             "input_json_delta" => {
-                                if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str())
+                                {
                                     let b = &mut blocks[idx];
                                     if b.kind.is_empty() {
                                         b.kind = "tool_use".into();
@@ -1849,9 +1921,11 @@ async fn stream_turn_anthropic(
                                     b.tool_args.push_str(pj);
                                     if !quiet {
                                         emitted = true;
-                                        emit(&Event::new("tool_call_args")
-                                            .with("index", json!(idx))
-                                            .with("args", json!(pj)));
+                                        emit(
+                                            &Event::new("tool_call_args")
+                                                .with("index", json!(idx))
+                                                .with("args", json!(pj)),
+                                        );
                                     }
                                 }
                             }
@@ -1946,7 +2020,11 @@ async fn stream_turn_anthropic(
     msg.insert("role".into(), json!("assistant"));
     msg.insert(
         "content".into(),
-        if content.is_empty() { Value::Null } else { json!(content) },
+        if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        },
     );
     let tool_calls: Vec<Value> = blocks
         .iter()
@@ -1970,7 +2048,13 @@ async fn stream_turn_anthropic(
         msg.insert("tool_calls".into(), json!(tool_calls));
     }
 
-    Ok((Value::Object(msg), finish_reason, tokens_in, tokens_out, cached_tokens))
+    Ok((
+        Value::Object(msg),
+        finish_reason,
+        tokens_in,
+        tokens_out,
+        cached_tokens,
+    ))
 }
 
 /// Discover models from an Anthropic-compatible endpoint (`GET /v1/models`).
@@ -2035,7 +2119,7 @@ fn parse_anthropic_models(data: &Value) -> Vec<ModelInfo> {
 /// extended-thinking support, vision). Unknown ids get conservative defaults
 /// (thinking off, vision on — Claude has had vision since 3.0).
 #[allow(clippy::if_same_then_else)] // families share caps today but are kept
-// distinct for readability + future divergence as models gain new caps.
+                                    // distinct for readability + future divergence as models gain new caps.
 fn anthropic_model_caps(id: &str, name: &str) -> ModelInfo {
     let l = id.to_ascii_lowercase();
     let (ctx, max, thinking, vision) = if l.contains("opus-4") {
@@ -2064,7 +2148,10 @@ fn anthropic_model_caps(id: &str, name: &str) -> ModelInfo {
         context_window: ctx,
         max_tokens: max,
         thinking_levels: if thinking {
-            DEFAULT_THINKING_LEVELS.iter().map(|s| s.to_string()).collect()
+            DEFAULT_THINKING_LEVELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         } else {
             Vec::new()
         },
@@ -2363,7 +2450,12 @@ mod tests {
         );
         assert_eq!(
             by_id["umans-flash"].thinking_levels,
-            vec!["none".to_string(), "low".to_string(), "medium".to_string(), "high".to_string()]
+            vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ]
         );
         assert!(by_id["umans-kimi-k2.7"].thinking_levels.is_empty());
         // reasoning flag follows reasoning.supported
@@ -2403,10 +2495,14 @@ mod tests {
     #[test]
     fn cache_version_gate() {
         // A cache with the current version is accepted.
-        assert!(cache_version_ok(&json!({ "version": MODELS_CACHE_VERSION })));
+        assert!(cache_version_ok(
+            &json!({ "version": MODELS_CACHE_VERSION })
+        ));
         // A pre-versioning cache (no version field) is rejected so a parser fix
         // isn't masked by stale data for the TTL window.
-        assert!(!cache_version_ok(&json!({ "base_url": "x", "updated_at": 0 })));
+        assert!(!cache_version_ok(
+            &json!({ "base_url": "x", "updated_at": 0 })
+        ));
         // A future / mismatched version is rejected.
         assert!(!cache_version_ok(&json!({ "version": 99 })));
     }
@@ -2479,7 +2575,8 @@ mod tests {
             { "role": "system", "content": "You are a coder." },
             { "role": "user", "content": "hi" }
         ]);
-        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let req =
+            build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
         assert_eq!(req["system"], "You are a coder.");
         assert_eq!(req["model"], "claude-x");
         assert_eq!(req["max_tokens"], 4096);
@@ -2523,7 +2620,8 @@ mod tests {
             ]},
             { "role": "tool", "tool_call_id": "call_1", "content": "contents of foo" }
         ]);
-        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let req =
+            build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
         let m = req["messages"].as_array().unwrap();
         // user, assistant(tool_use), user(tool_result)
         assert_eq!(m.len(), 3);
@@ -2549,7 +2647,8 @@ mod tests {
             { "role": "assistant", "content": "hello", "reasoning_content": "secret thoughts" },
             { "role": "user", "content": "again" }
         ]);
-        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let req =
+            build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
         let m = req["messages"].as_array().unwrap();
         let asst = &m[1];
         assert_eq!(asst["role"], "assistant");
@@ -2570,7 +2669,8 @@ mod tests {
             { "role": "tool", "tool_call_id": "a", "content": "r1" },
             { "role": "tool", "tool_call_id": "b", "content": "r2" }
         ]);
-        let req = build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
+        let req =
+            build_anthropic_request(msgs.as_array().unwrap(), &[], "claude-x", "none", &[], 4096);
         let m = req["messages"].as_array().unwrap();
         // user, assistant, user(2 tool_results)
         assert_eq!(m.len(), 3);
@@ -2584,18 +2684,34 @@ mod tests {
         // thinking-capable model advertises levels -> thinking present
         let levels: Vec<String> = vec!["low".into(), "medium".into(), "high".into()];
         let req = build_anthropic_request(
-            msgs.as_array().unwrap(), &[], "claude-sonnet-4", "medium", &levels, 100_000,
+            msgs.as_array().unwrap(),
+            &[],
+            "claude-sonnet-4",
+            "medium",
+            &levels,
+            100_000,
         );
         assert_eq!(req["thinking"]["type"], "enabled");
         assert_eq!(req["thinking"]["budget_tokens"], 12288);
         // non-thinking model (empty levels) -> no thinking even with effort set
         let req2 = build_anthropic_request(
-            msgs.as_array().unwrap(), &[], "claude-3-5-sonnet", "high", &[], 100_000,
+            msgs.as_array().unwrap(),
+            &[],
+            "claude-3-5-sonnet",
+            "high",
+            &[],
+            100_000,
         );
         assert!(req2.get("thinking").is_none());
         // effort "none" with thinking-capable -> no thinking
         let req3 = build_anthropic_request(
-            msgs.as_array().unwrap(), &[], "claude-sonnet-4", "none", &levels, 100_000);
+            msgs.as_array().unwrap(),
+            &[],
+            "claude-sonnet-4",
+            "none",
+            &levels,
+            100_000,
+        );
         assert!(req3.get("thinking").is_none());
     }
 
@@ -2679,7 +2795,7 @@ mod tests {
             let clen = header_str
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|l| l.split(':').nth(1))
+                .and_then(|l| l.split(':').nth(1))
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             let body_start = header_end + 4;
@@ -2737,7 +2853,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let msgs = vec![json!({ "role": "user", "content": "hello" })];
         let out = extract_facts(&client, &provider, "mock-model", &msgs, &cancel).await;
-        assert!(out.is_none(), "a 'none' reply must not be persisted as a fact");
+        assert!(
+            out.is_none(),
+            "a 'none' reply must not be persisted as a fact"
+        );
     }
 
     #[tokio::test]

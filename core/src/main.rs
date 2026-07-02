@@ -26,7 +26,10 @@ mod workspace;
 use config::{Approval, Config, PermissionRule, ResolvedProvider};
 use git_ctx::{git_context_injection, read_git_context};
 use intercom::IntercomBus;
-use logging::{estimate_message_tokens, estimate_messages_tokens, Logger, TurnTimer};
+use logging::{
+    estimate_message_tokens, estimate_messages_tokens, grounded_estimate, Logger, TurnMetrics,
+    TurnTimer,
+};
 use memory::memory_injection;
 use plugins::{PluginManager, PLUGIN_DOCS};
 use protocol::{emit, Command, Event, ModelInfo};
@@ -96,6 +99,15 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
             prompt.push_str("\n\n");
             prompt.push_str(&skill);
         }
+        // One-line manifest of opt-in skills (name + description) so the
+        // orchestrator can discover them without a `list_dir` round-trip.
+        // Excludes pi-subagents (already injected in full above). Empty (so the
+        // prompt + its prefix cache are untouched) when no opt-in skills exist.
+        let manifest = skill_manifest_injection(workspace);
+        if !manifest.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&manifest);
+        }
     }
     prompt
 }
@@ -114,6 +126,72 @@ fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// One-line manifest of opt-in skills (name + description) discovered under
+/// `.umans-harness/skills/` (project then user scope). Spliced into the
+/// orchestrator's stable system prompt so available skills are visible without a
+/// `list_dir` round-trip. Excludes `pi-subagents` (already injected in full) and
+/// deduplicates by name (project wins). Returns an empty string when no opt-in
+/// skills exist, so a fresh install's prompt — and its provider prefix cache —
+/// is left untouched.
+fn skill_manifest_injection(workspace: &std::path::Path) -> String {
+    let skills = subagent::discover_skills(workspace);
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let lines: Vec<String> = skills
+        .iter()
+        .filter(|(name, _, _)| name.as_str() != "pi-subagents")
+        .filter_map(|(name, desc, loc)| {
+            // Use the skill DIRECTORY name (parsed from the SKILL.md path) as the
+            // identifier, so the header's `read .umans-harness/skills/<name>/SKILL.md`
+            // always resolves — frontmatter `name` can drift from the dirname.
+            let n = std::path::Path::new(loc)
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| name.trim());
+            if n.is_empty() || !seen.insert(n) {
+                return None;
+            }
+            let d = desc.trim();
+            if d.is_empty() {
+                Some(format!("- {n}"))
+            } else {
+                Some(format!("- {n}: {d}"))
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Available opt-in skills — read the matching .umans-harness/skills/<name>/SKILL.md with read_file when a task fits one:\n{}",
+        lines.join("\n")
+    )
+}
+
+/// Build and emit a `skills` event listing every discoverable skill (project
+/// then user scope) with its name, description, location, and parsed body
+/// content. The TUI/web use name+description for the `/skill:<name>`
+/// autocomplete; `apply_skill` re-reads the body from disk at invocation time,
+/// so the body here lets a frontend optionally inline content without a second
+/// round-trip. Called on `init` and `list_skills`.
+fn emit_skills_event(workspace: &std::path::Path) {
+    let skills = subagent::discover_skills_full(workspace);
+    let arr: Vec<Value> = skills
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "location": s.location,
+                "content": s.body,
+            })
+        })
+        .collect();
+    emit(&Event::new("skills").with("skills", json!(arr)));
 }
 
 /// A pending approval request the TUI must answer before the tool runs.
@@ -167,6 +245,29 @@ pub struct State {
     /// Incrementally maintained token estimate for the main conversation,
     /// updated on every push + recalculated after compaction.
     pub estimated_tokens: Mutex<u64>,
+    /// Real `prompt_tokens` from the endpoint's most recent `usage` chunk — the
+    /// authoritative count of the conversation exactly as the model tokenized it
+    /// (system prompt + messages + tool-call framing the char/4 heuristic
+    /// cannot see). Anchors `grounded_estimate` so the compaction trigger and the
+    /// footer percentage reflect reality instead of a whole-history char/4 guess.
+    /// `None` until the first request that reports usage, and reset whenever
+    /// history is rewritten (compaction/digest/reset/undo/load/refresh) so the
+    /// baseline never describes stale content.
+    pub last_real_prompt_tokens: Mutex<Option<u64>>,
+    /// Conversation length (message count) captured when
+    /// `last_real_prompt_tokens` was recorded. `grounded_estimate` only
+    /// char/4-estimates the messages added since this index, keeping the real
+    /// baseline accurate across tool-use loop iterations.
+    pub conv_len_at_last_real: Mutex<usize>,
+    /// The model id the user last sent a turn with. Used by the manual `/compact`
+    /// command to pick the right context window (instead of a hardcoded 200k)
+    /// and to size the reclaim budget. `None` until the first turn.
+    pub last_model: Mutex<Option<String>>,
+    /// Metrics from the most recently completed turn (tokens, TTFT, TPS, cache
+    /// hits). Surfaced to `session_stop` lifecycle hooks so a telemetry plugin
+    /// can aggregate per-turn signal out-of-the-box (without the debug log).
+    /// `None` until the first turn completes.
+    pub last_turn_metrics: Mutex<Option<TurnMetrics>>,
     /// True after compaction until the next sanitization pass.
     pub needs_sanitize: Mutex<bool>,
     /// Intercom bus: in-process mailboxes for subagent ↔ orchestrator and
@@ -188,6 +289,49 @@ impl State {
         let active = self.active_provider.read().await.clone();
         let keys = self.api_keys.read().await.clone();
         cfg.resolve_provider_with(&keys, active.as_deref())
+    }
+
+    /// Drop the real-usage baseline so estimates fall back to a full char/4 of
+    /// the conversation until the next request re-establishes it. Call this
+    /// whenever history is rewritten/replaced — compaction, soft-digest, reset,
+    /// clear, new-session, undo, load-session, memory refresh — because the old
+    /// `prompt_tokens` baseline no longer describes the (now-changed) messages.
+    pub async fn invalidate_real_token_baseline(&self) {
+        *self.last_real_prompt_tokens.lock().await = None;
+        *self.conv_len_at_last_real.lock().await = 0;
+    }
+
+    /// Build the `args` payload handed to `session_stop` lifecycle hooks (when
+    /// `pass_args: true`): the cumulative session totals plus the
+    /// just-completed turn's metrics. Lets a telemetry plugin aggregate
+    /// per-turn signal without the JSONL debug log (off by default). `turn`
+    /// is null until the first turn completes.
+    pub async fn session_stop_hook_args(&self) -> Value {
+        let session = json!({
+            "turns": self.logger.turn_count(),
+            "tokens_in": *self.tokens_in.lock().await,
+            "tokens_out": *self.tokens_out.lock().await,
+            "cached_tokens": *self.cached_tokens.lock().await,
+            "model": self.last_model.lock().await.clone().unwrap_or_default(),
+        });
+        let turn = self
+            .last_turn_metrics
+            .lock()
+            .await
+            .as_ref()
+            .map(|m| {
+                json!({
+                    "tokens_in": m.tokens_in,
+                    "tokens_out": m.tokens_out,
+                    "cached_tokens": m.cached_tokens,
+                    "ttft_ms": m.ttft_ms,
+                    "elapsed_ms": m.elapsed_ms,
+                    "tps": m.tps,
+                    "model": m.model,
+                })
+            })
+            .unwrap_or(Value::Null);
+        json!({ "session": session, "turn": turn })
     }
 }
 
@@ -288,10 +432,18 @@ async fn main() {
         cached_tokens: Mutex::new(0),
         escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
-        plugin_manager: PluginManager::new_with_global_plugins(plugin_dir, pm_workspace, trust_project),
+        plugin_manager: PluginManager::new_with_global_plugins(
+            plugin_dir,
+            pm_workspace,
+            trust_project,
+        ),
         vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
+        last_real_prompt_tokens: Mutex::new(None),
+        conv_len_at_last_real: Mutex::new(0),
+        last_model: Mutex::new(None),
+        last_turn_metrics: Mutex::new(None),
         needs_sanitize: Mutex::new(sanitize_on_resume),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
@@ -302,6 +454,22 @@ async fn main() {
         let cfg = state.cfg.read().await;
         for name in &cfg.plugins_disabled {
             let _ = state.plugin_manager.disable(name);
+        }
+    }
+
+    // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
+    // (read from settings.json by Config::load). A key set via `/key` or the
+    // settings modal is saved by the TUI into settings.json; loading it here
+    // makes it survive a restart and take precedence over provider config/env
+    // keys (runtime keys are checked first in provider resolution).
+    {
+        let cfg = state.cfg.read().await;
+        for (name, key) in cfg.persisted_keys.iter() {
+            state
+                .api_keys
+                .write()
+                .await
+                .insert(name.clone(), key.clone());
         }
     }
 
@@ -358,6 +526,9 @@ async fn main() {
                 if let Some(e) = session_error.as_ref() {
                     emit(&Event::new("error").with("message", json!(e)));
                 }
+                // Publish the discoverable-skills list so the TUI/web can
+                // populate their `/skill:<name>` autocomplete immediately.
+                emit_skills_event(&cfg.workspace);
                 // Replay any resumed conversation so the TUI shows prior history
                 // on launch instead of starting from an empty transcript.
                 if conv_len > 0 {
@@ -384,7 +555,11 @@ async fn main() {
                 };
                 state.api_keys.write().await.insert(name.clone(), api_key);
                 state.logger.log("set_key", json!({ "provider": name }));
-                emit(&Event::new("authed").with("ok", json!(true)).with("provider", json!(name)));
+                emit(
+                    &Event::new("authed")
+                        .with("ok", json!(true))
+                        .with("provider", json!(name)),
+                );
             }
             Command::SetProvider { name } => {
                 // Switch the active provider at runtime, then re-discover models
@@ -392,12 +567,10 @@ async fn main() {
                 {
                     let cfg = state.cfg.read().await;
                     if cfg.find_provider(&name).is_none() {
-                        emit(
-                            &Event::new("error").with(
-                                "message",
-                                json!(format!("unknown provider '{name}'; not switching")),
-                            ),
-                        );
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!("unknown provider '{name}'; not switching")),
+                        ));
                         return;
                     }
                 }
@@ -470,11 +643,13 @@ async fn main() {
                 if let Some(p) = cfg.session_file.as_ref() {
                     session::rewrite(p, &[]);
                 }
+                state.invalidate_real_token_baseline().await;
                 emit(&Event::new("reset"));
             }
             Command::Clear => {
                 // In-memory only: keep the session file so a restart can still resume.
                 state.conversation.lock().await.clear();
+                state.invalidate_real_token_baseline().await;
                 emit(&Event::new("reset"));
             }
             Command::Undo => {
@@ -493,6 +668,8 @@ async fn main() {
                     session::rewrite(p, &conv);
                 }
                 drop(conv);
+                // The dropped turn invalidates the real baseline's length anchor.
+                state.invalidate_real_token_baseline().await;
                 emit(&Event::new("reset")); // TUI clears blocks; core keeps the trimmed conv
             }
             Command::Compact => {
@@ -501,10 +678,23 @@ async fn main() {
                 if messages.len() > 2 {
                     dispatch_lifecycle(&state, "pre_compact").await;
                     let before_est = estimate_messages_tokens(&messages);
-                    compact_conversation(&mut messages, 200_000);
+                    // Size the reclaim against the user's actual model window,
+                    // not a hardcoded 200k — and let compact_conversation digest
+                    // oversized tool results when the tail alone is too big.
+                    let model_ctx = {
+                        let last = state.last_model.lock().await.clone();
+                        let models = state.models.read().await;
+                        last.as_deref()
+                            .and_then(|m| models.iter().find(|mi| mi.id == m))
+                            .map(|m| m.context_window as u64)
+                            .unwrap_or(200_000)
+                    };
+                    compact_conversation(&mut messages, model_ctx);
                     *state.conversation.lock().await = messages.clone();
                     let after_est = estimate_messages_tokens(&messages);
                     *state.estimated_tokens.lock().await = after_est;
+                    // Manual compaction rewrote history; drop the stale baseline.
+                    state.invalidate_real_token_baseline().await;
                     *state.needs_sanitize.lock().await = true;
                     if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                         session::rewrite(p, &messages);
@@ -613,6 +803,9 @@ async fn main() {
                     .collect();
                 let est = estimate_messages_tokens(&loaded);
                 *state.estimated_tokens.lock().await = est;
+                // Loaded history has no known real token count yet; the next
+                // request's `usage` will re-establish the baseline.
+                state.invalidate_real_token_baseline().await;
                 emit(
                     &Event::new("history")
                         .with("messages", json!(visible))
@@ -657,6 +850,7 @@ async fn main() {
                 };
                 session::ensure(&new_path);
                 *state.conversation.lock().await = Vec::new();
+                state.invalidate_real_token_baseline().await;
                 state.cfg.write().await.session_file = Some(new_path.clone());
                 state.logger.log(
                     "new_session",
@@ -789,13 +983,58 @@ async fn main() {
                         .with("models", json!(models_json)),
                 );
             }
+            Command::ListSkills => {
+                // Re-publish the discoverable-skills list (project then user
+                // scope). The TUI/web request this after a turn ends so a skill
+                // created mid-session (e.g. by /reflect or /index) shows up in
+                // the `/skill:<name>` autocomplete without a restart.
+                let ws = state.cfg.read().await.workspace.clone();
+                emit_skills_event(&ws);
+            }
+            Command::ApplySkill {
+                name,
+                task,
+                model,
+                reasoning_effort,
+            } => {
+                let st = state.clone();
+                let client = client.clone();
+                let models = st.models.read().await.clone();
+                if !models.iter().any(|m| m.id == model) {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown model: {model}"))),
+                    );
+                    continue;
+                }
+                let ws = st.cfg.read().await.workspace.clone();
+                let skills = subagent::discover_skills_full(&ws);
+                let skill = skills
+                    .into_iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&name));
+                let Some(skill) = skill else {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "unknown skill '{name}' — use /skill:<name> with a name from the autocomplete"
+                        )),
+                    ));
+                    continue;
+                };
+                let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
+                let prompt = build_skill_prompt(&skill, task.as_deref());
+                start_turn(&st, &client, model, prompt, effort, None).await;
+            }
             Command::RefreshMemory => {
                 let msg = refresh_memory_injection(&state).await;
                 emit(&Event::new("info").with("message", json!(msg)));
             }
             Command::SaveMemory { text, tags } => {
                 if text.trim().is_empty() {
-                    emit(&Event::new("error").with("message", json!("save_memory: 'text' must not be empty")));
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!("save_memory: 'text' must not be empty")),
+                    );
                 } else {
                     // Derive a name from the text (first words + timestamp) so
                     // the slug/filename is unique and human-readable.
@@ -831,7 +1070,10 @@ async fn main() {
                             );
                         }
                         Err(e) => {
-                            emit(&Event::new("error").with("message", json!(format!("save_memory failed: {e}"))));
+                            emit(
+                                &Event::new("error")
+                                    .with("message", json!(format!("save_memory failed: {e}"))),
+                            );
                         }
                     }
                 }
@@ -878,7 +1120,10 @@ async fn main() {
                         );
                     }
                     Err(e) => {
-                        emit(&Event::new("error").with("message", json!(format!("forget_memory failed: {e}"))));
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("forget_memory failed: {e}"))),
+                        );
                     }
                 }
             }
@@ -925,6 +1170,22 @@ async fn main() {
                     tok.cancel();
                 }
             }
+            Command::ClearQueue => {
+                // Drop a queued follow-up/steer but leave the running turn alone —
+                // the TUI's Esc uses this to cancel just the queued message.
+                // (If a steer already cancelled the in-flight turn, that turn's
+                // `aborted` will still fire; clearing here means the steer won't
+                // run and the loop winds down to idle.)
+                let had = state.queued.lock().await.take().is_some();
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(if had {
+                        "queue cleared"
+                    } else {
+                        "queue already empty"
+                    }),
+                ));
+            }
             Command::Send {
                 prompt,
                 model,
@@ -945,39 +1206,7 @@ async fn main() {
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
                 // If a turn is already running, buffer this prompt (one-deep) instead
                 // of dropping it. It drains when the running turn emits `done`.
-                let already = st.current.lock().await.is_some();
-                if already {
-                    let mut q = st.queued.lock().await;
-                    if q.is_some() {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!("a prompt is already queued; send abort first or wait"),
-                        ));
-                    } else {
-                        *q = Some(QueuedPrompt {
-                            prompt,
-                            model,
-                            effort,
-                        });
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!("prompt queued; will run after the current turn"),
-                        ));
-                    }
-                    continue;
-                }
-                let tok = CancellationToken::new();
-                *st.current.lock().await = Some(tok.clone());
-                let handle = tokio::spawn(run_turn_and_drain(
-                    st.clone(),
-                    client.clone(),
-                    model,
-                    prompt,
-                    effort,
-                    images,
-                    tok,
-                ));
-                *st.handle.lock().await = Some(handle);
+                start_turn(&st, &client, model, prompt, effort, images).await;
             }
             Command::Steer {
                 prompt,
@@ -1086,6 +1315,67 @@ fn star_match_rule(pattern: &str, text: &str) -> bool {
     dp[p.len()][t.len()]
 }
 
+/// Build the user-message prompt for an `apply_skill` invocation: instructs
+/// the model to read and follow the named skill, inlining the skill body (the
+/// core reads it from disk so global skills under ~/.umans-harness/skills
+/// work despite read_file's path restriction), and appending an optional task.
+fn build_skill_prompt(skill: &subagent::SkillEntry, task: Option<&str>) -> String {
+    let mut p = format!(
+        "Apply the \"{}\" skill. Read and follow the procedure in the skill file below.\n\n<skill name=\"{}\">\n{}\n</skill>\n",
+        skill.name, skill.name, skill.body
+    );
+    if let Some(t) = task.map(str::trim).filter(|t| !t.is_empty()) {
+        p.push_str(&format!("\nTask: {}\n", t));
+    }
+    p
+}
+
+/// Start (or queue) an assistant turn for `prompt`. Shared by `send` and
+/// `apply_skill`: if a turn is already running, buffer this prompt one-deep
+/// (the running turn's drain picks it up); otherwise spawn run_turn_and_drain.
+async fn start_turn(
+    state: &Arc<State>,
+    client: &reqwest::Client,
+    model: String,
+    prompt: String,
+    effort: String,
+    images: Option<Vec<String>>,
+) {
+    let already = state.current.lock().await.is_some();
+    if already {
+        let mut q = state.queued.lock().await;
+        if q.is_some() {
+            emit(&Event::new("error").with(
+                "message",
+                json!("a prompt is already queued; send abort first or wait"),
+            ));
+        } else {
+            *q = Some(QueuedPrompt {
+                prompt,
+                model,
+                effort,
+            });
+            emit(&Event::new("info").with(
+                "message",
+                json!("prompt queued; will run after the current turn"),
+            ));
+        }
+        return;
+    }
+    let tok = CancellationToken::new();
+    *state.current.lock().await = Some(tok.clone());
+    let handle = tokio::spawn(run_turn_and_drain(
+        state.clone(),
+        client.clone(),
+        model,
+        prompt,
+        effort,
+        images,
+        tok,
+    ));
+    *state.handle.lock().await = Some(handle);
+}
+
 /// Run one assistant turn, then drain a queued prompt (one-deep) into another
 /// turn. Shared by `send` (idle start) and `steer` (idle fallback) so the
 /// queue-drain logic and the `current` token hand-off live in one place. A
@@ -1113,6 +1403,11 @@ fn run_turn_and_drain(
         // the current-token slot unconditionally so new turns can start.
         dispatch_lifecycle(&st, "session_stop").await;
         st.current.lock().await.take();
+        // A turn freed several conversation clones + tool-result buffers
+        // (compaction alone drops the old history). glibc malloc keeps those
+        // freed bytes in its arenas, so RSS creeps up and never falls — trim the
+        // heap back to the OS once per turn to bound long-session growth.
+        trim_heap();
         if let Err(_panic) = result {
             emit(&Event::new("error").with(
                 "message",
@@ -1125,7 +1420,10 @@ fn run_turn_and_drain(
         if let Some(q) = st.queued.lock().await.take() {
             let tok2 = CancellationToken::new();
             *st.current.lock().await = Some(tok2.clone());
-            tokio::spawn(run_turn_and_drain(
+            // Store the handle so stdin EOF (which awaits state.handle) waits for
+            // this drained turn too — otherwise it may tear the runtime down
+            // while a queued follow-up/steer is still running.
+            *st.handle.lock().await = Some(tokio::spawn(run_turn_and_drain(
                 st.clone(),
                 client.clone(),
                 q.model,
@@ -1133,7 +1431,7 @@ fn run_turn_and_drain(
                 q.effort,
                 None,
                 tok2,
-            ));
+            )));
         }
     })
 }
@@ -1155,8 +1453,24 @@ pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
                 .unwrap_or_default(),
         )
     };
+    // For session_stop, attach cumulative + last-turn metrics so a telemetry
+    // plugin can aggregate per-turn signal out-of-the-box, without the
+    // (off-by-default) JSONL debug log. Built once; each plugin's pass_args
+    // decides whether it is included in its context.
+    let metrics_args: Option<Value> = if hook == "session_stop" {
+        Some(st.session_stop_hook_args().await)
+    } else {
+        None
+    };
     for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook) {
-        let ctx = plugins::build_context(hook, "", &workspace, None, &session_id, config.pass_args);
+        let ctx = plugins::build_context(
+            hook,
+            "",
+            &workspace,
+            metrics_args.as_ref(),
+            &session_id,
+            config.pass_args,
+        );
         let _ = plugins::execute_hook(hook, plugin_name, config, &ctx).await;
     }
 }
@@ -1183,9 +1497,19 @@ async fn run_turn(
     images: Option<Vec<String>>,
     cancel: CancellationToken,
 ) {
+    // Remember the model the user selected so the manual `/compact` command
+    // can size its reclaim budget against the right context window.
+    *st.last_model.lock().await = Some(model.clone());
     // Lifecycle hook: notify plugins a session/turn is starting. Best-effort
     // and never blocks the turn.
     dispatch_lifecycle(st, "session_start").await;
+
+    // Clear the last-turn metrics at turn entry so a panic before finalization
+    // can't leak the PRIOR turn's numbers to this turn's `session_stop` hook
+    // (which fires unconditionally from the panic guard). A completed turn sets
+    // it fresh at finalization; a failed turn leaves it None and the telemetry
+    // plugin skips rather than recording a phantom turn.
+    *st.last_turn_metrics.lock().await = None;
 
     // Vision handoff (pre_turn) and other plugins may remap the model for
     // this turn; keep a mutable binding so a swap propagates to the request loop.
@@ -1395,6 +1719,8 @@ async fn run_turn(
                 }
                 let after_est = estimate_messages_tokens(&messages);
                 *st.estimated_tokens.lock().await = after_est;
+                // Idle compaction rewrote history; the old real baseline is stale.
+                st.invalidate_real_token_baseline().await;
                 *st.needs_sanitize.lock().await = true;
                 emit(
                     &Event::new("compacted")
@@ -1434,16 +1760,13 @@ async fn run_turn(
             match rp.api_key.as_ref() {
                 Some(_) => rp,
                 None => {
-                    emit(
-                        &Event::new("error")
-                            .with(
-                                "message",
-                                json!(format!(
-                                    "no API key set for provider '{}'; use set_key first",
-                                    rp.name
-                                )),
-                            ),
-                    );
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "no API key set for provider '{}'; use set_key first",
+                            rp.name
+                        )),
+                    ));
                     emit(&Event::new("done"));
                     return;
                 }
@@ -1462,9 +1785,26 @@ async fn run_turn(
             .await
             .iter()
             .find(|m| m.id == model)
-            .map(|m| (m.context_window as u64, m.thinking_levels.clone(), m.max_tokens))
+            .map(|m| {
+                (
+                    m.context_window as u64,
+                    m.thinking_levels.clone(),
+                    m.max_tokens,
+                )
+            })
             .unwrap_or((200_000, Vec::new(), 8_192));
-        let mut est = { *st.estimated_tokens.lock().await };
+        // Anchor on the endpoint's REAL `prompt_tokens` from the last request
+        // (the authoritative count of the conversation as the model tokenized it —
+        // system + messages + tool-call framing the char/4 heuristic cannot see)
+        // and only char/4-estimate the messages appended since. This is far more
+        // accurate than re-estimating the whole history every loop iteration, so
+        // compaction fires at the right time instead of drifting late into a
+        // context-window 400. Falls back to a full char/4 estimate when no real
+        // usage has been seen yet (first turn) or right after compaction.
+        let last_real = *st.last_real_prompt_tokens.lock().await;
+        let len_at = *st.conv_len_at_last_real.lock().await;
+        let mut est = grounded_estimate(&messages, last_real, len_at);
+        *st.estimated_tokens.lock().await = est;
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
         // Soft digest: collapse stale, large tool results into one-line digests
@@ -1486,6 +1826,9 @@ async fn run_turn(
                 }
                 est = estimate_messages_tokens(&messages);
                 *st.estimated_tokens.lock().await = est;
+                // Digest rewrote message contents, so the real prompt_tokens
+                // baseline no longer matches — drop it until the next request.
+                st.invalidate_real_token_baseline().await;
                 st.logger.log(
                     "digested",
                     json!({ "results": changed, "before_tokens": before_est, "after_tokens": est }),
@@ -1518,6 +1861,8 @@ async fn run_turn(
             }
             let after_est = estimate_messages_tokens(&messages);
             *st.estimated_tokens.lock().await = after_est;
+            // Compaction rewrote history; the old real baseline is stale.
+            st.invalidate_real_token_baseline().await;
             *st.needs_sanitize.lock().await = true;
             emit(
                 &Event::new("compacted")
@@ -1547,6 +1892,15 @@ async fn run_turn(
                 ))));
             }
         }
+        // Best pre-stream estimate of this request's prompt size, grounded on the
+        // endpoint's last real `prompt_tokens` when available. Passed to
+        // stream_turn so the live footer percentage tracks reality while output
+        // streams in (the real `usage` chunk at stream end then overwrites it).
+        let prompt_est = grounded_estimate(
+            &messages,
+            *st.last_real_prompt_tokens.lock().await,
+            *st.conv_len_at_last_real.lock().await,
+        );
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
             match provider::stream_turn(
                 client,
@@ -1560,6 +1914,7 @@ async fn run_turn(
                 max_tokens,
                 &cancel,
                 &mut timer,
+                prompt_est,
                 false,
             )
             .await
@@ -1576,6 +1931,18 @@ async fn run_turn(
                     return;
                 }
             };
+
+        // Anchor all future estimates on the endpoint's REAL `prompt_tokens` —
+        // the exact count of `messages` as the model tokenized it (system +
+        // history + tool-call framing). `messages` is exactly what we sent, so its
+        // length marks where the real baseline stops and the char/4 delta begins;
+        // the compaction trigger and live footer then reflect reality instead of
+        // a whole-history char/4 guess. Only when the endpoint actually reports
+        // usage (some don't); otherwise we keep the previous baseline.
+        if tokens_in > 0 {
+            *st.last_real_prompt_tokens.lock().await = Some(tokens_in);
+            *st.conv_len_at_last_real.lock().await = messages.len();
+        }
 
         // Accumulate token counts for /stats. When the endpoint omits usage
         // (tokens come back zero) estimate from the exchanged messages so the
@@ -1989,9 +2356,7 @@ async fn run_turn(
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let timeout_override = exec_args
-                            .get("timeout")
-                            .and_then(|v| v.as_u64());
+                        let timeout_override = exec_args.get("timeout").and_then(|v| v.as_u64());
                         tokio::select! {
                             o = tools::execute_bash(cmd, &cfg, timeout_override) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
@@ -2025,6 +2390,22 @@ async fn run_turn(
                     } else {
                         tools::execute(&name, &exec_args, &cfg)
                     };
+
+                    // Milestone 1.1: a memory save/append/forget via the AI
+                    // tool must be visible to subsequent turns in THIS session,
+                    // so rebuild the memory slice of the system prompt now (no-op
+                    // + prefix-cache-safe when unchanged). The /memory,
+                    // /save-memory and /forget-memory commands refresh from their
+                    // own handlers; this covers the model's tool path.
+                    if name == "memory" {
+                        let action = exec_args
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if matches!(action, "save" | "append" | "forget") {
+                            refresh_memory_injection(st).await;
+                        }
+                    }
 
                     // Dispatch post-execution hooks for this tool.
                     let post_hook = match name.as_str() {
@@ -2067,6 +2448,7 @@ async fn run_turn(
                         *st.last_turn_time.lock().await = std::time::Instant::now();
                         let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                         let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
+                        *st.last_turn_metrics.lock().await = Some(metrics.clone());
                         emit(
                             &Event::new("metrics")
                                 .with("ttft_ms", json!(metrics.ttft_ms))
@@ -2124,6 +2506,7 @@ async fn run_turn(
                 *st.last_turn_time.lock().await = std::time::Instant::now();
                 let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                 let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
+                *st.last_turn_metrics.lock().await = Some(metrics.clone());
                 emit(
                     &Event::new("metrics")
                         .with("ttft_ms", json!(metrics.ttft_ms))
@@ -2347,6 +2730,90 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usiz
 }
 
 /// Build a one-line digest for a tool result, preserving enough to navigate
+/// Last-resort token reclaim for compaction: collapse oversized `role:"tool"`
+/// results into one-line digests until `messages` fits under `budget` tokens.
+/// Unlike `digest_stale_tool_results` (which only touches results older than a
+/// keep-window and bails on small conversations), this digests ANY eligible
+/// tool result — including recent ones — oldest-first, stopping as soon as the
+/// budget is met so the most recent results stay verbatim when possible.
+///
+/// This is what makes compaction effective when a few huge tool results (large
+/// file reads, verbose command output) dominate the context: dropping old
+/// turns can't reclaim enough because the bulk lives in the kept tail, but
+/// collapsing those results to a one-liner (with a re-run hint) drops 100k+
+/// tokens at a time. `tool_call_id` + `role` are preserved, so tool-call/result
+/// pairing and orphan-sanitization stay intact. Returns the count digested.
+fn digest_to_budget(messages: &mut [Value], budget: u64) -> usize {
+    if estimate_messages_tokens(messages) <= budget {
+        return 0;
+    }
+    // tool_call_id -> (tool_name, args_json) from assistant tool_calls, so the
+    // digest records WHAT was read/run, not just the size.
+    let mut call_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for m in messages.iter() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in calls {
+                let id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let func = tc.get("function");
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
+                call_map.insert(id, (name, args));
+            }
+        }
+    }
+    // Walk oldest-first, collapsing oversized tool results until the budget is
+    // met. Recent results are processed last and so stay verbatim when earlier
+    // digests already reached the budget.
+    let mut changed = 0usize;
+    for i in 0..messages.len() {
+        if estimate_messages_tokens(messages) <= budget {
+            break;
+        }
+        if messages[i].get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let content = match messages[i].get("content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+        if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
+            continue;
+        }
+        let id = messages[i]
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
+        let lines = content.lines().count();
+        let digest = make_digest(&name, &args_json, content.len(), lines);
+        if let Some(obj) = messages[i].as_object_mut() {
+            obj.insert("content".into(), Value::String(digest));
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// back to the content: the tool name, its key argument, and the size/line
 /// count. The suffix tells the model how to recover the full output.
 fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String {
@@ -2428,6 +2895,8 @@ async fn refresh_memory_injection(state: &State) -> String {
             *first = json!({ "role": "system", "content": new_system });
             *state.needs_sanitize.lock().await = true;
             *state.estimated_tokens.lock().await = estimate_messages_tokens(&conv);
+            // System prompt changed; the real baseline's system portion is stale.
+            state.invalidate_real_token_baseline().await;
             if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                 session::rewrite(p, &conv);
             }
@@ -2475,8 +2944,31 @@ fn token_budget_tail_start(messages: &[Value], context_window: u64) -> usize {
 /// Naive compaction fallback: keep the system prompt + a token-budgeted tail
 /// verbatim, drop the middle with a marker. `context_window` sizes the tail
 /// (0/unset → the 6k floor). Used when summarization is disabled or unavailable.
+/// Hint the system allocator to release freed heap pages back to the OS.
+///
+/// Rust's default allocator on glibc Linux does NOT eagerly return freed memory:
+/// a turn clones the conversation several times (lock-across-await forces
+/// clones) and compaction drops the old copies, but the freed bytes stay in
+/// malloc's arenas, so RSS creeps up over a long session and never falls back
+/// (the "starts at 11M, now 27M" symptom). `malloc_trim(0)` releases the free
+/// top-of-arena pages. Called once per turn — negligible vs a multi-second
+/// model turn. No-op on non-glibc targets (musl/macOS/Windows return freed
+/// memory to the OS far more eagerly on their own).
+#[cfg(all(unix, target_env = "gnu"))]
+fn trim_heap() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(unix, target_env = "gnu")))]
+fn trim_heap() {}
+
 pub fn compact_conversation(messages: &mut Vec<Value>, context_window: u64) {
-    if messages.len() <= 12 {
+    if messages.len() <= 2 {
         return;
     }
     let system = messages[0].clone();
@@ -2485,6 +2977,12 @@ pub fn compact_conversation(messages: &mut Vec<Value>, context_window: u64) {
     let mut compacted = vec![system];
     compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped.]" }));
     compacted.extend(tail);
+    // The kept tail can still hold the bulk of the tokens when a few tool
+    // results are huge (large file reads, verbose command output). Dropping old
+    // turns reclaims nothing there; collapse those oversized results into
+    // one-line digests until the conversation fits under half the window.
+    let budget = ((context_window as f32) * 0.5) as u64;
+    digest_to_budget(&mut compacted, budget);
     *messages = compacted;
 }
 
@@ -2505,7 +3003,7 @@ pub async fn compact_with_summary(
     force_summarize: bool,
     context_window: u64,
 ) {
-    if messages.len() <= 4 {
+    if messages.len() <= 2 {
         return;
     }
     if !cfg.summarize_on_compact && !force_summarize {
@@ -2546,7 +3044,12 @@ pub async fn compact_with_summary(
             );
         }
     }
+    // The kept tail can still hold the bulk of the tokens when a few recent
+    // tool results are huge. Collapse them so the compacted conversation
+    // actually fits the window instead of no-op'ing back to its original size.
     compacted.extend(kept);
+    let budget = ((context_window as f32) * 0.5) as u64;
+    digest_to_budget(&mut compacted, budget);
     *messages = compacted;
 }
 
@@ -2633,6 +3136,92 @@ fn base64_encode(input: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+#[cfg(test)]
+mod skill_manifest_tests {
+    use super::*;
+
+    fn write_skill(dir: &std::path::Path, name: &str, desc: &str) {
+        write_skill_raw(dir, name, &format!("name: {name}\ndescription: {desc}\n"))
+    }
+
+    /// Write a SKILL.md with arbitrary extra frontmatter lines (for deprecated, etc.).
+    fn write_skill_raw(dir: &std::path::Path, name: &str, frontmatter_body: &str) {
+        let p = dir
+            .join(".umans-harness/skills")
+            .join(name)
+            .join("SKILL.md");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("---\n{frontmatter_body}---\nbody\n")).unwrap();
+    }
+
+    fn fresh_workspace() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "umans-skill-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn manifest_lists_opt_in_skills_excludes_pi_subagents() {
+        let ws = fresh_workspace();
+        write_skill(&ws, "foo", "Foo skill");
+        write_skill(&ws, "nodesc", "");
+        write_skill(&ws, "pi-subagents", "should be excluded (injected in full)");
+        let m = skill_manifest_injection(&ws);
+        assert!(m.contains("foo"), "manifest should list foo: {m}");
+        assert!(
+            m.contains("Foo skill"),
+            "manifest should include description: {m}"
+        );
+        // A skill with no description renders without a colon-suffix.
+        assert!(m.contains("- nodesc"), "manifest should list nodesc: {m}");
+        assert!(
+            !m.lines().any(|l| l.starts_with("- pi-subagents")),
+            "pi-subagents must be excluded from the manifest: {m}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn manifest_excludes_deprecated_skills_and_uses_dirname() {
+        let ws = fresh_workspace();
+        write_skill(&ws, "active", "An active skill");
+        write_skill_raw(
+            &ws,
+            "old",
+            "name: old\ndescription: A deprecated skill\ndeprecated: true\n",
+        );
+        // frontmatter `name` deliberately != dir name; the manifest must use the
+        // DIR name (the resolvable path component), not the frontmatter name.
+        write_skill_raw(
+            &ws,
+            "realdir",
+            "name: pretty-display-name\ndescription: uses a fancy name\n",
+        );
+        let m = skill_manifest_injection(&ws);
+        assert!(m.contains("active"), "active skill should appear: {m}");
+        assert!(
+            !m.lines().any(|l| l.starts_with("- old")),
+            "deprecated skill must be excluded: {m}"
+        );
+        assert!(
+            m.contains("- realdir:"),
+            "manifest must use the dir name, not the frontmatter name: {m}"
+        );
+        assert!(
+            !m.contains("pretty-display-name"),
+            "frontmatter name should not leak into the manifest path: {m}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }
 
 #[cfg(test)]
@@ -2825,6 +3414,110 @@ mod compact_tests {
         }
         m.push(json!({ "role": "tool", "content": "x".repeat(50_000) }));
         let s = token_budget_tail_start(&m, 1000); // floor budget 6k
-        assert!(s >= m.len() - 7 && s <= m.len() - 6, "kept the giant result + min tail: {s}");
+        assert!(
+            s >= m.len() - 7 && s <= m.len() - 6,
+            "kept the giant result + min tail: {s}"
+        );
+    }
+
+    fn asst_tool_call(id: &str, name: &str, args: &str) -> Value {
+        json!({ "role": "assistant", "tool_calls": [ {
+            "id": id, "type": "function",
+            "function": { "name": name, "arguments": args }
+        } ] })
+    }
+    fn tool_result(id: &str, content: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": id, "content": content })
+    }
+
+    #[test]
+    fn digest_to_budget_collapses_oversized_results() {
+        // Few messages but huge tokens — the case that used to no-op compaction.
+        // ~250k chars ≈ 62k tokens each; two of them exceed a 100k-token budget.
+        let huge = "x\n".repeat(125_000);
+        let mut m = vec![
+            sys(),
+            asst_tool_call("c1", "read_file", "{\"path\":\"old.rs\"}"),
+            tool_result("c1", &huge),
+            asst_tool_call("c2", "read_file", "{\"path\":\"recent.rs\"}"),
+            tool_result("c2", &huge),
+            user("go"),
+        ];
+        let before = estimate_messages_tokens(&m);
+        assert!(before > 100_000, "fixture should be large: {before}");
+        // Digest oldest-first until under budget; the recent result is processed
+        // last and stays verbatim once the older one already fit the budget.
+        let n = digest_to_budget(&mut m, 100_000);
+        assert_eq!(n, 1, "only the older result needs digesting: {n}");
+        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(d.starts_with("[digested:"), "{d}");
+        assert!(d.contains("old.rs"), "{d}");
+        assert_eq!(
+            m[2].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("c1")
+        );
+        assert!(
+            !m[4]
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("[digested:"),
+            "recent result kept verbatim"
+        );
+        let after = estimate_messages_tokens(&m);
+        assert!(
+            after < before - 80_000,
+            "must reclaim a huge result: {after} vs {before}"
+        );
+    }
+
+    #[test]
+    fn digest_to_budget_noop_under_budget() {
+        let mut m = vec![
+            sys(),
+            asst_tool_call("c1", "read_file", "{\"path\":\"a.rs\"}"),
+            tool_result("c1", &"x\n".repeat(125_000)),
+        ];
+        // ~62k tokens, budget 100k → already fits, nothing digested.
+        assert_eq!(digest_to_budget(&mut m, 100_000), 0);
+        assert!(!m[2]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .starts_with("[digested:"));
+    }
+
+    #[test]
+    fn compact_conversation_reclaims_few_huge_messages() {
+        // Regression: a conversation with only 6 messages but ~125k tokens used
+        // to bail out of compaction entirely (the old `len <= 12` guard left
+        // before == after), so the next request hit a context-window 400.
+        let huge = "x\n".repeat(125_000);
+        let mut m = vec![
+            sys(),
+            asst_tool_call("c1", "read_file", "{\"path\":\"a.rs\"}"),
+            tool_result("c1", &huge),
+            asst_tool_call("c2", "read_file", "{\"path\":\"b.rs\"}"),
+            tool_result("c2", &huge),
+            user("continue"),
+        ];
+        let before = estimate_messages_tokens(&m);
+        compact_conversation(&mut m, 200_000);
+        let after = estimate_messages_tokens(&m);
+        assert!(
+            after < before,
+            "compaction must reduce tokens (was a no-op): {before} -> {after}"
+        );
+        assert!(
+            after < 100_000,
+            "should be well under half the window: {after}"
+        );
+        // Both tool messages survive (pairing intact); the older one is digested.
+        assert_eq!(
+            m.iter()
+                .filter(|x| x.get("role").and_then(|v| v.as_str()) == Some("tool"))
+                .count(),
+            2
+        );
     }
 }

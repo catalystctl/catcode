@@ -23,6 +23,16 @@ import (
 // Model
 // ---------------------------------------------------------------------------
 
+// queuedMsg is the single buffered follow-up/steer prompt shown in a pinned
+// banner while a turn runs. kind is "follow-up" (queued via Enter) or "steer"
+// (Ctrl+Enter / /steer). Cleared when the queued turn starts, when it is
+// dequeued via Esc, or on full abort.
+type queuedMsg struct {
+	kind string // "follow-up" | "steer"
+	text string
+	at   time.Time
+}
+
 // session is the Bubble Tea model: it owns the core subprocess, the structured
 // list of message blocks, and the viewport/input/spinner.
 type session struct {
@@ -36,12 +46,15 @@ type session struct {
 	modelIdx            int
 	busy                bool
 	queuedNext          bool // a follow-up/steer turn is chained after the current one
+	queued              *queuedMsg // the currently-queued follow-up/steer (drives the pinned banner + Esc-dequeue)
+	todos               []map[string]json.RawMessage // latest todo_write state (pinned panel)
 	turnCount           int
 	pendingApproval     *approvalPrompt
 	pendingIntercom     *intercomPrompt
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
 	sessionList         []sessionEntry
+	skillsList          []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
 	coreBashTimeout     int
 	coreRestarts        int
 	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)

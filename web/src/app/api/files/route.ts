@@ -40,8 +40,8 @@ const MAX_RESULTS = 50;
 export async function GET(req: Request) {
   if (!authorized(req)) return Response.json({ error: "unauthorized" }, { status: 401 });
   const bridge = getBridge();
-  const workspace = bridge.getWorkspace();
   const url = new URL(req.url);
+  const workspace = url.searchParams.get("workspace") ?? bridge.getDefaultWorkspace();
   const q = (url.searchParams.get("q") ?? "").toLowerCase().trim();
   const base = url.searchParams.get("path") ?? "";
 

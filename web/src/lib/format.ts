@@ -42,7 +42,7 @@ export function shortPath(p: string | null | undefined): string {
 }
 
 export function basename(p: string | null | undefined): string {
-  if (!p) return "—";
+  if (!p) return "";
   const parts = p.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || p;
 }
@@ -53,13 +53,20 @@ export function truncate(s: string, n = 80): string {
   return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
 }
 
+// Mirrors the core's ToolKind::Destructive classification (core/src/tools.rs
+// classify()). Read-only tools (read_file, grep, glob, …) are intentionally
+// absent — only tools that write/execute get the destructive badge + amber
+// approval styling.
 const DANGEROUS_TOOLS = new Set([
   "bash",
   "write_file",
-  "writeFile",
   "edit",
   "patch",
-  "bulk",
+  "bulk_write",
+  "bulk_edit",
+  "todo_write",
+  "spawn",
+  "subagent",
 ]);
 
 export function isDangerousTool(name: string): boolean {
@@ -68,19 +75,29 @@ export function isDangerousTool(name: string): boolean {
 
 const TOOL_ICONS: Record<string, string> = {
   read_file: "📄",
-  write_file: "✍️",
-  edit: "✎",
-  bash: "⌘",
+  list_dir: "📁",
   grep: "🔍",
   glob: "🗂",
-  list_dir: "📁",
-  finish: "✓",
-  todo: "☑",
-  spawn: "↳",
+  bulk_read: "📚",
+  write_file: "✍️",
+  edit: "✎",
   patch: "✎",
-  bulk: "▤",
+  bulk_write: "📝",
+  bulk_edit: "📝",
+  bash: "⌘",
   diagnostics: "✦",
+  todo_write: "☑",
+  todo_read: "☑",
+  finish: "✓",
+  spawn: "↳",
+  subagent: "↳",
+  contact_supervisor: "💬",
+  intercom: "💬",
+  memory: "🧠",
   fetch: "🌐",
+  git_status: "⎇",
+  git_diff: "⎇",
+  git_log: "⎇",
 };
 
 export function toolIcon(name: string): string {

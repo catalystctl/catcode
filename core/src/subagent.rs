@@ -19,7 +19,7 @@
 
 use crate::config::{Config, ResolvedProvider, SubagentConfig};
 use crate::intercom::{execute_contact_supervisor, execute_intercom};
-use crate::logging::{estimate_messages_tokens, TurnTimer};
+use crate::logging::{estimate_messages_tokens, grounded_estimate, TurnTimer};
 use crate::protocol::{emit, Event, ModelInfo};
 use crate::tools::{self, Outcome};
 use crate::State;
@@ -190,7 +190,7 @@ fn builtin_agents() -> Vec<AgentConfig> {
         mk(
             "scout",
             "Fast codebase recon that returns compressed context for handoff",
-            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            "read_file, grep, glob, list_dir, bash, write_file, memory, intercom",
             Some("low"),
             false,
             true,
@@ -200,7 +200,7 @@ fn builtin_agents() -> Vec<AgentConfig> {
         mk(
             "researcher",
             "Web/docs research with sources and a concise research brief",
-            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            "read_file, grep, glob, list_dir, bash, write_file, memory, intercom",
             Some("low"),
             false,
             true,
@@ -240,7 +240,7 @@ fn builtin_agents() -> Vec<AgentConfig> {
         mk(
             "context-builder",
             "Stronger setup pass before planning: gathers context and writes handoff material",
-            "read_file, grep, glob, list_dir, bash, write_file, intercom",
+            "read_file, grep, glob, list_dir, bash, write_file, memory, intercom",
             Some("low"),
             false,
             true,
@@ -445,7 +445,7 @@ pub fn find_agent<'a>(agents: &'a [AgentConfig], name: &str) -> Option<&'a Agent
 // Skills (SKILL.md discovery + injection)
 // ---------------------------------------------------------------------------
 
-fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
+pub(crate) fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
     // (name, description, location) — project first, then user.
     let mut out: Vec<(String, String, String)> = Vec::new();
     let dirs = [
@@ -465,12 +465,87 @@ fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
             let skill_md = e.path().join("SKILL.md");
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
                 let (fm, _) = parse_frontmatter(&content);
+                // Skip skills explicitly marked `deprecated: true` in their
+                // frontmatter (docs/SELF_LEARNING.md §8) — they should not be
+                // advertised for use. (`replaced_by` resolution is a future
+                // enhancement; for now a deprecated skill is simply hidden.)
+                if fm
+                    .get("deprecated")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let name = fm
                     .get("name")
                     .cloned()
                     .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
                 let desc = fm.get("description").cloned().unwrap_or_default();
                 out.push((name, desc, skill_md.display().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// A discoverable skill with its parsed body content — used by the `skills`
+/// event and `apply_skill` command so the core (which has unrestricted FS
+/// access) can read global skills under ~/.umans-harness/skills that the
+/// read_file tool cannot reach (it rejects absolute / `..` paths).
+#[derive(Clone)]
+pub(crate) struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub location: String,
+    pub body: String,
+}
+
+/// Like `discover_skills` but also returns the parsed SKILL.md body (frontmatter
+/// stripped). Same precedence (project then user; first wins on name) and the
+/// same deprecated-skill filter.
+pub(crate) fn discover_skills_full(workspace: &Path) -> Vec<SkillEntry> {
+    let mut out: Vec<SkillEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let dirs = [
+        (workspace.join(".umans-harness/skills"), true),
+        (
+            crate::config::home_dir()
+                .map(|h| h.join(".umans-harness/skills"))
+                .unwrap_or_default(),
+            false,
+        ),
+    ];
+    for (dir, _proj) in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let skill_md = e.path().join("SKILL.md");
+            if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                let (fm, body) = parse_frontmatter(&content);
+                if fm
+                    .get("deprecated")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let name = fm
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+                // First scope wins on name (project > user), mirroring discover_skills.
+                let key = name.to_lowercase();
+                if !seen.insert(key) {
+                    continue;
+                }
+                let desc = fm.get("description").cloned().unwrap_or_default();
+                out.push(SkillEntry {
+                    name,
+                    description: desc,
+                    location: skill_md.display().to_string(),
+                    body,
+                });
             }
         }
     }
@@ -565,6 +640,7 @@ fn all_tool_names() -> &'static [&'static str] {
         "subagent",
         "contact_supervisor",
         "intercom",
+        "memory",
     ]
 }
 
@@ -672,6 +748,38 @@ pub struct SubagentRun {
     pub cancel: Option<Arc<CancellationToken>>,
     pub children: Vec<SubagentRun>,
     pub summary: Option<String>,
+}
+
+/// Maximum number of *terminal* (completed/failed/paused) run records kept for
+/// `status`/history. Still-running runs are always retained. Without this cap
+/// the map grew without bound over a long session — every subagent invocation
+/// (single/parallel/chain) left a permanent entry pinning an
+/// `Arc<CancellationToken>` (and its parent chain), so RSS crept up the longer
+/// the process stayed up.
+const MAX_TERMINAL_RUNS: usize = 64;
+
+/// Evict old terminal runs so `subagent_runs` stays bounded. Always keeps every
+/// still-running run; trims terminal runs to the most recent `MAX_TERMINAL_RUNS`
+/// by end time (`ended_at`, falling back to `started_at`). Call after a run is
+/// finalized. `resume` checks liveness via `intercom targets()`, so a pruned
+/// completed run is simply absent rather than misreported as live.
+fn prune_terminal_runs(runs: &mut HashMap<String, SubagentRun>) {
+    if runs.len() <= MAX_TERMINAL_RUNS {
+        return;
+    }
+    let mut terminal: Vec<(u64, String)> = runs
+        .iter()
+        .filter(|(_, r)| r.state != "running")
+        .map(|(id, r)| (r.ended_at.unwrap_or(r.started_at), id.clone()))
+        .collect();
+    if terminal.len() <= MAX_TERMINAL_RUNS {
+        return; // running runs dominate the count; nothing safe to drop
+    }
+    terminal.sort_unstable_by_key(|(t, _)| *t);
+    let drop = terminal.len().saturating_sub(MAX_TERMINAL_RUNS);
+    for (_, id) in terminal.into_iter().take(drop) {
+        runs.remove(&id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -837,10 +945,7 @@ async fn run_single(
     cancel: &CancellationToken,
 ) -> Outcome {
     let cfg = st.cfg.read().await.clone();
-    let max_depth = child_max_depth(
-        resolve_max_depth(&cfg.subagents),
-        agent.max_subagent_depth,
-    );
+    let max_depth = child_max_depth(resolve_max_depth(&cfg.subagents), agent.max_subagent_depth);
     let bridge = bridge_active(&cfg.subagents.intercom_bridge_mode, Some(&context));
     let my_target = subagent_target(run_id, &agent.name, None);
     let orchestrator = st.intercom.orchestrator_target();
@@ -899,6 +1004,7 @@ async fn run_single(
         r.ended_at = Some(now_ms());
         r.summary = Some(result.output.chars().take(200).collect());
     }
+    prune_terminal_runs(&mut runs);
     if bridge {
         st.intercom.unregister(&my_target);
     }
@@ -1085,13 +1191,21 @@ async fn run_agent_inner(
     let mut last_model: Option<String> = None;
     let run_start = std::time::Instant::now();
     let mut tool_count: u32 = 0;
+    // Real `prompt_tokens` from the subagent's last request + the `sub` length
+    // captured then. Anchors the compaction gate on the endpoint's real count
+    // (system + history + tool framing) instead of a whole-history char/4 guess,
+    // mirroring the main loop. Reset whenever compaction rewrites `sub`.
+    let mut last_real: Option<u64> = None;
+    let mut len_at_real: usize = 0;
 
     loop {
         if cancel.is_cancelled() {
             return Outcome::ok("[subagent aborted]");
         }
-        // compaction gate
-        let est = estimate_messages_tokens(&sub);
+        // compaction gate — anchor on the endpoint's real prompt_tokens when
+        // available so compaction fires at the right context level, not a
+        // whole-history char/4 guess that drifts late.
+        let est = grounded_estimate(&sub, last_real, len_at_real);
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
         if est > threshold.min(hard_cap) && sub.len() > 4 {
@@ -1110,6 +1224,9 @@ async fn run_agent_inner(
                 model_ctx,
             )
             .await;
+            // Compaction rewrote `sub`; the real baseline no longer applies.
+            last_real = None;
+            len_at_real = 0;
             emit(
                 &Event::new("compacted")
                     .with("scope", json!("subagent"))
@@ -1155,9 +1272,13 @@ async fn run_agent_inner(
         sub_in += ti;
         sub_out += to;
         sub_cached += cached;
-        if sub_in + sub_out > SUBAGENT_MAX_TOKENS {
-            emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
-            return Outcome::err(format!("subagent exceeded the per-run token budget ({SUBAGENT_MAX_TOKENS} cumulative in+out); aborting to bound cost."));
+        // Anchor the next compaction gate on the real prompt_tokens when the
+        // endpoint reported usage. `sub` here is exactly what we sent (the
+        // assistant + tool results are appended below), so its length marks
+        // where the real baseline stops and the char/4 delta begins.
+        if ti > 0 {
+            last_real = Some(ti);
+            len_at_real = sub.len();
         }
         *st.tokens_in.lock().await += ti;
         *st.tokens_out.lock().await += to;
@@ -1558,9 +1679,7 @@ async fn dispatch_subagent_tool(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let timeout_override = exec_args
-                .get("timeout")
-                .and_then(|v| v.as_u64());
+            let timeout_override = exec_args.get("timeout").and_then(|v| v.as_u64());
             tokio::select! {
                 o = tools::execute_bash(cmd, cfg, timeout_override) => o,
                 _ = cancel.cancelled() => Outcome::err("bash aborted"),
@@ -1717,6 +1836,9 @@ async fn stream_with_fallback(
             max_tokens,
             cancel,
             timer,
+            // Subagent turns stream quietly (no live footer), so est_prompt is
+            // unused mid-stream; pass a char/4 of the prompt for correctness.
+            estimate_messages_tokens(messages),
             true,
         )
         .await
@@ -1801,12 +1923,13 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Per-run caps to bound a runaway subagent's cost (no per-subagent
-/// max-session-tokens is otherwise enforced). A legit worker rarely hits these;
-/// a looping subagent stops here instead of spending unbounded tokens
-/// (multiplied across parallel fan-out).
+/// Per-run backstop to catch a runaway/looping subagent (no per-subagent
+/// max-session-tokens is otherwise enforced). There is intentionally NO token
+/// budget — a subagent runs until it finishes the task (relying on its own
+/// context compaction to stay within the window); only an infinite tool-call
+/// loop stops here, since that never completes a task (and is multiplied
+/// across parallel fan-out).
 const SUBAGENT_MAX_TOOL_CALLS: u32 = 200;
-const SUBAGENT_MAX_TOKENS: u64 = 1_000_000;
 
 /// Best-effort redaction of common credential patterns from a forked
 /// transcript. Not exhaustive — the goal is to drop the obvious pasted
@@ -2000,6 +2123,7 @@ async fn run_parallel(
         r.state = "completed".into();
         r.ended_at = Some(now_ms());
     }
+    prune_terminal_runs(&mut runs);
 
     let mut blocks = String::new();
     let mut all_ok = true;
@@ -2160,6 +2284,7 @@ async fn run_chain(
         r.state = "completed".into();
         r.ended_at = Some(now_ms());
     }
+    prune_terminal_runs(&mut runs);
     Outcome::ok(previous)
 }
 
@@ -2609,5 +2734,70 @@ mod tests {
     fn depth_guard_clamps() {
         assert_eq!(child_max_depth(2, Some(1)), 1);
         assert_eq!(child_max_depth(2, None), 2);
+    }
+
+    fn tool_name(def: &Value) -> &str {
+        def.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn all_tool_names_includes_memory() {
+        // Milestone 1.2: the memory tool is part of the subagent default
+        // (read-only) allowlist so info-gathering agents can persist learnings.
+        assert!(
+            all_tool_names().contains(&"memory"),
+            "memory must be in the default subagent tool allowlist"
+        );
+    }
+
+    #[test]
+    fn default_tools_include_memory_and_exclude_destructive() {
+        // An agent with no declared `tools:` gets the read-only default set,
+        // which must include `memory` (read-only) but not `bash`/`write_file`
+        // (destructive).
+        let mut a = builtin_agents()
+            .into_iter()
+            .find(|a| a.name == "delegate")
+            .unwrap()
+            .clone();
+        a.tools = vec![];
+        let defs = subagent_tool_defs(&a, false, 0, 2);
+        let names: Vec<&str> = defs.iter().map(tool_name).collect();
+        assert!(
+            names.contains(&"memory"),
+            "default agent should get memory: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bash"),
+            "default agent must not get bash: {names:?}"
+        );
+        assert!(
+            !names.contains(&"write_file"),
+            "default agent must not get write_file: {names:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_tools_control_memory_presence() {
+        // scout/researcher/context-builder declare `memory` explicitly so they
+        // get it; planner does not declare it so it must not.
+        let agents = builtin_agents();
+        let scout = agents.iter().find(|a| a.name == "scout").unwrap();
+        let planner = agents.iter().find(|a| a.name == "planner").unwrap();
+        let scout_defs = subagent_tool_defs(scout, false, 0, 2);
+        let scout_names: Vec<&str> = scout_defs.iter().map(tool_name).collect();
+        let planner_defs = subagent_tool_defs(planner, false, 0, 2);
+        let planner_names: Vec<&str> = planner_defs.iter().map(tool_name).collect();
+        assert!(
+            scout_names.contains(&"memory"),
+            "scout should have memory: {scout_names:?}"
+        );
+        assert!(
+            !planner_names.contains(&"memory"),
+            "planner should not have memory: {planner_names:?}"
+        );
     }
 }

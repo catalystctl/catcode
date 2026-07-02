@@ -67,6 +67,11 @@ pub enum Command {
     },
     #[serde(rename = "abort")]
     Abort,
+    /// Drop a queued follow-up/steer prompt WITHOUT aborting the running
+    /// turn. Lets the TUI's Esc cancel just the queued message and leave the
+    /// in-flight chat running (vs Abort which cancels both).
+    #[serde(rename = "clear_queue")]
+    ClearQueue,
     #[serde(rename = "reset")]
     Reset,
     /// Clear the in-memory conversation but keep the session file (vs Reset which wipes both).
@@ -160,6 +165,25 @@ pub enum Command {
         vision_models: Vec<String>,
         #[serde(default)]
         vision_model: Option<String>,
+    },
+    /// List discoverable skills (project then user scope). Emits a `skills`
+    /// event with each skill's name, description, and location — used by the
+    /// TUI/web to populate the `/skill:<name>` autocomplete.
+    #[serde(rename = "list_skills")]
+    ListSkills,
+    /// Invoke a skill by name: the core reads the matching SKILL.md (resolving
+    /// project > user scope, bypassing the read_file path restriction so global
+    /// skills under ~/.umans-harness/skills work too), builds a prompt that
+    /// instructs the model to apply it, and runs a normal assistant turn.
+    /// `task` is an optional follow-up appended to the skill instructions.
+    #[serde(rename = "apply_skill")]
+    ApplySkill {
+        name: String,
+        #[serde(default)]
+        task: Option<String>,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
     },
 }
 

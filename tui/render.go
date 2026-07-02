@@ -31,7 +31,6 @@ import (
 const (
 	headerLines      = 3 // brand row + cwd row + separator
 	positionBarLines = 1 // scroll-position / new-messages bar
-	footerLines      = 5 // bordered input (3) + two status lines (identity, metrics/context)
 	minBodyLines     = 3
 )
 
@@ -47,7 +46,8 @@ func (s *session) layout() {
 		extra++
 	}
 	extra += s.mentionFlyoutHeight()
-	h := s.height - headerLines - positionBarLines - footerLines - extra
+	extra += s.todoPanelHeight() + s.queueBannerHeight()
+	h := s.height - headerLines - positionBarLines - s.footerHeight() - extra
 	if h < minBodyLines {
 		h = minBodyLines
 	}
@@ -365,22 +365,176 @@ func (s *session) renderContext() string {
 }
 
 // renderInputBox wraps the chat input in a rounded border so it reads as a
-// distinct chat composer (matching the reference design). The prompt glyph is
-// dropped; the box itself is the affordance.
+// distinct chat composer. Unlike a plain textinput (which scrolls the line
+// horizontally when it overflows), the value is soft-wrapped to the box width
+// and the box grows downward so the whole message stays visible. The cursor
+// is placed on the correct wrapped line via the textinput's own cursor.Model
+// (blink / focus-blur behavior stays identical to the stock textinput).
 func (s *session) renderInputBox() string {
 	w := s.width
 	if w < 6 {
 		w = 6
 	}
-	inner := s.input.View()
 	innerW := w - 4 // "│ " + content + " │"
-	if lipgloss.Width(inner) != innerW {
-		inner = lipgloss.NewStyle().Width(innerW).MaxWidth(innerW).Render(inner)
-	}
+	content := s.inputContent(innerW)
+	lines := strings.Split(content, "\n")
 	top := "╭" + strings.Repeat("─", w-2) + "╮"
-	row := "│ " + inner + " │"
 	bot := "╰" + strings.Repeat("─", w-2) + "╯"
-	return top + "\n" + row + "\n" + bot
+	var b strings.Builder
+	b.WriteString(top)
+	for _, ln := range lines {
+		pad := innerW - lipgloss.Width(ln)
+		if pad < 0 {
+			pad = 0
+		}
+		b.WriteString("\n│ " + ln + strings.Repeat(" ", pad) + " │")
+	}
+	b.WriteString("\n" + bot)
+	return b.String()
+}
+
+// maxInputLines caps the input box height: a very long message shows a
+// cursor-centered window (with … markers) instead of consuming the screen.
+const maxInputLines = 8
+
+// inputContent renders the chat input value soft-wrapped to width w, with the
+// textinput cursor cell placed on the correct wrapped line. Returns the
+// placeholder when the value is empty. Reuses s.input.Cursor so blink and
+// focus/blur behavior are identical to the stock textinput (which also calls
+// Cursor.SetChar + Cursor.View() per render).
+func (s *session) inputContent(w int) string {
+	if w < 1 {
+		w = 1
+	}
+	value := s.input.Value()
+	if value == "" {
+		ph := s.input.Placeholder
+		if ph == "" {
+			return ""
+		}
+		return s.input.PlaceholderStyle.Render(truncateRunes(ph, w))
+	}
+	pos := s.input.Position()
+	r := []rune(value)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(r) {
+		pos = len(r)
+	}
+	before := r[:pos]
+	after := r[pos:] // after[0] is the char under the cursor (if any)
+
+	beforeLines := wrapRunes(before, w)
+	cLine := len(beforeLines) - 1
+	cCol := len(beforeLines[cLine])
+	// If the last before-line is exactly full, the cursor wraps to a fresh line.
+	if cCol >= w {
+		beforeLines = append(beforeLines, []rune{})
+		cLine++
+		cCol = 0
+	}
+	curChar := " "
+	rest := []rune(nil)
+	if len(after) > 0 {
+		curChar = string(after[0])
+		rest = after[1:]
+	}
+	// How much of `rest` fits on the cursor line (after the cursor cell).
+	avail := w - cCol - 1
+	if avail < 0 {
+		avail = 0
+	}
+	var restAfter []rune
+	if len(rest) > avail {
+		restAfter = rest[avail:]
+	}
+	restLines := wrapRunes(restAfter, w)
+	if len(restAfter) == 0 {
+		restLines = nil // no continuation lines when nothing overflows
+	}
+
+	styleText := s.input.TextStyle.Inline(true).Render
+	out := make([]string, 0, cLine+1+len(restLines)+1)
+	for i := 0; i < cLine; i++ {
+		out = append(out, styleText(string(beforeLines[i])))
+	}
+	// cursor line: text before cursor + cursor cell + text after (on this line)
+	line := styleText(string(beforeLines[cLine]))
+	restOnLine := rest
+	if len(restOnLine) > avail {
+		restOnLine = restOnLine[:avail]
+	}
+	s.input.Cursor.SetChar(curChar)
+	line += s.input.Cursor.View()
+	if len(restOnLine) > 0 {
+		line += styleText(string(restOnLine))
+	}
+	out = append(out, line)
+	for _, rl := range restLines {
+		out = append(out, styleText(string(rl)))
+	}
+	// Cap the box height: if the wrapped message is very long, show a window
+	// centered on the cursor line so the box never eats the whole screen
+	// (the cursor always stays visible). “…” markers flag hidden content.
+	cursorIdx := cLine
+	if len(out) > maxInputLines {
+		half := maxInputLines / 2
+		start := cursorIdx - half
+		if start < 0 {
+			start = 0
+		}
+		end := start + maxInputLines
+		if end > len(out) {
+			end = len(out)
+			start = max(0, end-maxInputLines)
+		}
+		var capped []string
+		if start > 0 {
+			capped = append(capped, dimStyle.Render("…"))
+		}
+		capped = append(capped, out[start:end]...)
+		if end < len(out) {
+			capped = append(capped, dimStyle.Render("…"))
+		}
+		out = capped
+	}
+	return strings.Join(out, "\n")
+}
+
+// wrapRunes hard-wraps a rune slice to at most w runes per line. Hard (not
+// word) wrapping keeps the cursor column math exact for the input box.
+func wrapRunes(r []rune, w int) [][]rune {
+	if w < 1 {
+		w = 1
+	}
+	var lines [][]rune
+	for len(r) > 0 {
+		n := w
+		if n > len(r) {
+			n = len(r)
+		}
+		line := make([]rune, n)
+		copy(line, r[:n])
+		lines = append(lines, line)
+		r = r[n:]
+	}
+	if len(lines) == 0 {
+		lines = [][]rune{{}}
+	}
+	return lines
+}
+
+// inputBoxHeight is the rendered input box height so layout() reserves the
+// right number of lines as the box grows with wrapping. Measured from the
+// actual render so it can never disagree with View().
+func (s *session) inputBoxHeight() int {
+	return lipgloss.Height(s.renderInputBox())
+}
+
+// footerHeight is the input box + the status rail beneath it.
+func (s *session) footerHeight() int {
+	return s.inputBoxHeight() + lipgloss.Height(s.renderFooter())
 }
 
 // renderActiveTasks draws a bordered "active tasks" panel listing in-flight
@@ -449,6 +603,97 @@ func (s *session) approvalHeight() int {
 	return lipgloss.Height(s.renderApprovalBanner())
 }
 
+// maxPinnedTodos caps the always-visible todo panel so a long list never eats
+// the whole screen (overflow collapses to a "… +N more" hint).
+const maxPinnedTodos = 5
+
+// renderTodoPanel draws a persistent, always-visible checklist of the latest
+// todo_write state so the plan/progress is glanceable without scrolling the
+// transcript. Returns "" when there are no todos.
+func (s *session) renderTodoPanel() string {
+	todos := s.todos
+	if len(todos) == 0 {
+		return ""
+	}
+	done, pend, run := countTodoStatuses(todos)
+	head := accentStyle.Render("tasks") +
+		dimStyle.Render(fmt.Sprintf("  · %d items (%d✓ %d○ %d•)", len(todos), done, run, pend))
+	// inner content width = boxW - 2(border) - 2(padding); each row indents 2 + "[✓] " 4.
+	cw := s.width - 2 - 4 - 2 - 4
+	if cw < 4 {
+		cw = 4
+	}
+	rows := make([]string, 0, len(todos))
+	for _, t := range todos {
+		ck, st := todoCheckbox(get(t, "status"))
+		rows = append(rows, "  "+st.Render(ck+" ")+baseStyle.Render(truncate(get(t, "subject"), cw)))
+	}
+	more := 0
+	if len(rows) > maxPinnedTodos {
+		more = len(rows) - maxPinnedTodos
+		rows = rows[:maxPinnedTodos]
+	}
+	body := head
+	for _, r := range rows {
+		body += "\n" + r
+	}
+	if more > 0 {
+		body += "\n" + dimStyle.Italic(true).Render(fmt.Sprintf("  … +%d more", more))
+	}
+	boxW := s.width - 2
+	if boxW < 20 {
+		boxW = 20
+	}
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.dim)).
+		Padding(0, 1).
+		Width(boxW).
+		Render(body)
+}
+
+func (s *session) todoPanelHeight() int {
+	p := s.renderTodoPanel()
+	if p == "" {
+		return 0
+	}
+	return lipgloss.Height(p)
+}
+
+// renderQueueBanner is a one-line sticky banner shown while a follow-up or
+// steer prompt is buffered (one-deep) behind the running turn. It labels the
+// kind and reminds the user Esc cancels just the queued message (vs a bare
+// abort). Returns "" when nothing is queued.
+func (s *session) renderQueueBanner() string {
+	q := s.queued
+	if q == nil {
+		return ""
+	}
+	label := "⏳ queued follow-up"
+	if q.kind == "steer" {
+		label = "⤴ queued steer"
+	}
+	avail := s.width - len(label) - 24
+	if avail < 6 {
+		avail = 6
+	}
+	msg := fmt.Sprintf("%s: %s   esc to cancel", label, truncate(q.text, avail))
+	return lipgloss.NewStyle().
+		Width(s.width).
+		Background(lipgloss.Color(c.user)).
+		Foreground(lipgloss.Color(c.bg)).
+		Bold(true).
+		Padding(0, 1).
+		Render(msg)
+}
+
+func (s *session) queueBannerHeight() int {
+	if s.queued == nil {
+		return 0
+	}
+	return 1
+}
+
 func (s *session) View() string {
 	if !s.ready {
 		return baseStyle.Render("starting core…")
@@ -458,6 +703,12 @@ func (s *session) View() string {
 		s.renderSeparator(),
 		s.viewport.View(),
 		s.renderPositionBar(),
+	}
+	if p := s.renderTodoPanel(); p != "" {
+		parts = append(parts, p)
+	}
+	if q := s.renderQueueBanner(); q != "" {
+		parts = append(parts, q)
 	}
 	if s.pendingApproval != nil {
 		parts = append(parts, s.renderApprovalBanner())

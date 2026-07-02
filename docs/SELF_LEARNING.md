@@ -714,25 +714,73 @@ inheritProjectContext: true
 
 All core tests (206) and TUI tests pass; both build clean.
 
-### Milestone 1 — Mid-session visibility (next, small)
+### ✅ Milestone 1 — Mid-session visibility (done)
 
-- Refresh the memory injection after a `memory` tool save/forget so a saved
-  fact is visible to subsequent turns *within the same session* (currently
-  visible next session). Gated to avoid prefix-cache churn on every save.
-- Add `"memory"` to the subagent `all_tool_names()` allowlist so research/scout
-  subagents can persist learnings directly (enables `/index` via subagent).
+- **Refresh after save/forget** (`main.rs::refresh_memory_injection`): a saved or
+  forgotten memory is rebuilt into the standing system prompt and visible to
+  the very next turn *within the same session*. It is a no-op when the prompt is
+  unchanged, so it preserves the provider prefix cache (it does not churn on
+  every save). Wired into both the `SaveMemory`/`ForgetMemory` commands and the
+  `memory` AI tool.
+- **`memory` on subagents** (`subagent.rs`): added `"memory"` to
+  `all_tool_names()` (the read-only default) and to the explicit `tools:` of
+  the scout / researcher / context-builder agents (both the `.md` override
+  templates and the embedded builtin fallbacks), so recon/research subagents
+  persist learnings directly instead of handing text back for the orchestrator
+  to re-process. `memory` is classified `ReadOnly`, so it never trips the
+  approval gate.
+- **Concurrency** (`memory.rs`): a process-wide `WRITE_LOCK`
+  (`std::sync::Mutex`) now serializes `save_memory` / `append_memory` /
+  `forget_memory`. `append_memory` is a read-modify-write, so two parallel
+  subagents appending to the same memory name could previously race and drop a
+  fact; the lock makes that impossible. (`+test` spawning 8 threads.)
 
-### Milestone 2 — Skill discovery (when skill count grows)
+### ✅ Milestone 2 — Skill discovery (done)
 
-- Auto-generate a one-line skill manifest (name + description) in the system
-  prompt from `.umans-harness/skills/*/SKILL.md`, so the model sees available
-  skills without a `list_dir` round-trip.
+- **Skill manifest in the system prompt** (`main.rs::skill_manifest_injection`):
+  a one-line-per-skill list (name + description) discovered under
+  `.umans-harness/skills/*/SKILL.md` (project then user scope) is spliced into
+  the orchestrator's standing prompt, so available opt-in skills are visible
+  without a `list_dir` round-trip. It excludes `pi-subagents` (already injected
+  in full) and dedups by name (project wins). It returns `""` when no opt-in
+  skills exist, so a fresh install's prompt — and its prefix cache — is left
+  untouched. It is gated to the orchestrator (`with_skill`) so subagent prompts
+  stay lean. (`+test`)
 
-### Milestone 3 — Measurement (when a goal is stated)
+### ✅ Milestone 3 — Measurement (done)
 
-- A `session_stop` telemetry plugin that aggregates the existing `metrics` +
-  JSONL signals into a `telemetry/` summary (skill utilization, token trends,
-  `/undo` correction rate). No core changes — pure plugin.
+- **Telemetry plugin** (`.umans-harness/plugins/telemetry/`): a `session_stop`
+  lifecycle hook that aggregates per-turn metrics into a per-workspace summary
+  under `~/.config/umans-harness/telemetry/<workspace-hash>/`:
+  `turns.jsonl` (one record per turn), `summary.json` (incremental aggregates —
+  totals, cache-hit rate, avg/min/max TTFT, avg TPS, per-model breakdown), and
+  `summary.md` (human-readable). It is robust (always exits 0, emits one JSON
+  line, skips cleanly on bad/empty/malformed input and null TTFT/TPS) and writes
+  atomically. It captures the signals the design marks available (token trends,
+  latency, throughput, cache effectiveness, per-model); skill-utilization and
+  `/undo` correction rate remain deferred (§12) — they need the JSONL debug log
+  or session-file parsing.
+- **Small core enhancement** (`main.rs`): the design said "no core changes —
+  pure plugin", but the JSONL debug log it assumed as the source is **off by
+  default** (`debug_log: None`), so a pure plugin could not capture token/TTFT/TPS
+  out-of-the-box. The minimal fix exposes the already-computed metrics through
+  the existing hook seam: `State.last_turn_metrics` is set at turn finalization
+  (and cleared at turn entry so a panicking turn can't leak the prior turn's
+  numbers), and `dispatch_lifecycle` attaches `{session, turn}` metrics to the
+  `session_stop` context (consumed when a plugin sets `pass_args: true`). No
+  new infrastructure — just routing existing numbers to the existing hook.
+- **Global staging** (`staging.rs`): the plugin is staged into
+  `~/.umans-harness/plugins/telemetry/` on first run (added to `bundled_files()`
+  + `executable_rel_paths()`; `STAGING_VERSION` bumped 1 → 2 so existing users
+  backfill it). Staging is non-clobbering, so users who already have a staged
+  `agents/scout.md` (etc.) keep their copy; to pick up the memory-enabled agent
+  defaults globally, delete the file and it is restored on next run:
+  `rm ~/.umans-harness/agents/{scout,researcher,context-builder}.md`. Project
+  copies (`.umans-harness/agents/*.md`) always win, so this repo gets them
+  immediately.
+
+All core tests (221) and TUI tests pass; core is `cargo fmt`/`clippy` clean
+(only pre-existing `config.rs` lints remain); both build clean.
 
 ### Milestone 4 — Retrieval at scale (only if triggered)
 

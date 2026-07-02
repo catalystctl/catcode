@@ -6,7 +6,7 @@
 // with per-image remove. `fileToDataUrl` is exported so the composer can reuse
 // it for clipboard-paste handling.
 
-import { useRef, useState } from "react";
+import { forwardRef, useImperativeHandle, useRef, useState } from "react";
 import { XIcon } from "./icons";
 
 /** Read a File into a data URL string (FileReader.readAsDataURL). */
@@ -25,11 +25,21 @@ interface Props {
   onRemove: (i: number) => void;
 }
 
-export function ImageAttach({ images, onAdd, onRemove }: Props) {
+/** Imperative handle so the Composer (and /attach command) can open the picker. */
+export interface ImageAttachHandle {
+  pick: () => void;
+}
+
+export const ImageAttach = forwardRef<ImageAttachHandle, Props>(function ImageAttach(
+  { images, onAdd, onRemove },
+  ref,
+) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
 
   const pick = () => inputRef.current?.click();
+
+  useImperativeHandle(ref, () => ({ pick }), []);
 
   const onChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
@@ -115,4 +125,4 @@ export function ImageAttach({ images, onAdd, onRemove }: Props) {
       </button>
     </div>
   );
-}
+});

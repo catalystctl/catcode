@@ -93,6 +93,17 @@ export interface PluginEntry {
   error?: string;
 }
 
+/** A discoverable skill (project then user scope). `content` is the parsed
+ *  SKILL.md body — sent by the core so `/skill:<name>` can apply a skill even
+ *  when it lives under ~/.umans-harness/skills (outside the workspace, which
+ *  the read_file tool cannot reach). */
+export interface SkillInfo {
+  name: string;
+  description: string;
+  location: string;
+  content: string;
+}
+
 /** An intercom message from a subagent to the orchestrator. `need_decision`
  *  asks are surfaced as a blocking prompt; other traffic is logged. */
 export interface IntercomPrompt {
@@ -166,7 +177,9 @@ export type CoreEvent =
   | { type: "session_renamed"; name: string; title: string }
   // ── Compaction / config ──
   | { type: "digested"; count?: number; what?: string }
-  | { type: "config_changed"; key: string; value: string | number };
+  | { type: "config_changed"; key: string; value: string | number }
+  // ── Skills ──
+  | { type: "skills"; skills: SkillInfo[] };
 
 /** Core commands (client → server → core stdin). A typed subset. */
 export type CoreCommand =
@@ -208,7 +221,12 @@ export type CoreCommand =
   | { type: "rename_session"; name: string; title: string }
   | { type: "list_projects" }
   | { type: "add_project"; path: string }
-  | { type: "remove_project"; path: string };
+  | { type: "remove_project"; path: string }
+  // ── Session lifecycle ──
+  | { type: "delete_session"; path: string }
+  // ── Skills ──
+  | { type: "list_skills" }
+  | { type: "apply_skill"; name: string; task?: string; model: string; reasoning_effort?: string };
 
 /** Synthetic events produced by the bridge/client (not from the core). */
 export type SyntheticEvent =
@@ -233,6 +251,9 @@ export interface ToolResult {
   ok: boolean;
   output: string;
   diff?: string;
+  /** True when the result was reconstructed from session history (no live
+   *  ok/error known). Renders a neutral badge instead of green "ok". */
+  unknown?: boolean;
 }
 
 export interface UIToolCall {
@@ -334,6 +355,7 @@ export interface AgentState {
   toasts: Toast[];
   memories: MemoryEntry[];
   plugins: PluginEntry[];
+  skills: SkillInfo[];
   pendingIntercom: IntercomPrompt | null;
   intercomLog: IntercomEntry[];
   visionConfig: VisionConfig | null;

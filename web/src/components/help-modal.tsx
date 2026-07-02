@@ -4,7 +4,7 @@
 // sidebar. Uses the shared command catalog so it stays in sync with the flyout.
 
 import { COMMANDS } from "@/lib/commands";
-import { useOutsideClose } from "@/lib/use-outside-close";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { XIcon } from "./icons";
 
@@ -20,15 +20,12 @@ const KEYBINDS: Array<[string, string]> = [
 ];
 
 export function HelpModal({ onClose }: { onClose: () => void }) {
-  const ref = useOutsideClose(onClose);
+  const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
-        ref={(el) => {
-          (ref as React.MutableRefObject<HTMLDivElement | null>).current = el;
-          (trapRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
-        }}
+        ref={mergeRefs(closeRef, trapRef)}
         className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
         role="dialog"
         aria-modal="true"

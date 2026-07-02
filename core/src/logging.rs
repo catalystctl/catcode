@@ -103,6 +103,35 @@ pub fn estimate_message_tokens(m: &Value) -> u64 {
     estimate_tokens(&s)
 }
 
+/// Real-usage-anchored token estimate for a whole message list.
+///
+/// The endpoint reports the *real* `prompt_tokens` in its final `usage` chunk —
+/// the authoritative count of the conversation exactly as the model tokenized
+/// it (system prompt + every message + tool-call syntax + role framing that
+/// the char/4 heuristic cannot see). When we have that number (`last_real`), use
+/// it as the baseline and only char/4-estimate the messages appended *since*
+/// (`len_at_real` onward). The delta is small (one assistant turn + a few tool
+/// results), so its estimation error is tiny versus re-estimating the entire
+/// history — which is what makes compaction fire at the right time and the
+/// footer percentage track reality instead of drifting ±15-30%.
+///
+/// Falls back to a full `estimate_messages_tokens` when no real usage has been
+/// seen yet (first turn) or right after compaction rewrites history (the old
+/// baseline no longer describes the current messages).
+pub fn grounded_estimate(messages: &[Value], last_real: Option<u64>, len_at_real: usize) -> u64 {
+    match last_real {
+        Some(real) => {
+            // Clamp: a rewrite (undo/digest/compaction) may have shrunk the
+            // list below the recorded index. When that happens the baseline is
+            // stale and the caller should have invalidated it; clamp to len so
+            // we never slice out of range, yielding just the baseline.
+            let start = len_at_real.min(messages.len());
+            real.saturating_add(estimate_messages_tokens(&messages[start..]))
+        }
+        None => estimate_messages_tokens(messages),
+    }
+}
+
 pub fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -222,6 +251,48 @@ mod tests {
         assert!(estimate_tokens("hello world foo bar") > 0);
         let m = vec![json!({"role":"user","content":"hello world"})];
         assert!(estimate_messages_tokens(&m) > 0);
+    }
+
+    #[test]
+    fn grounded_estimate_uses_real_baseline_plus_delta() {
+        // 4 messages; real prompt_tokens was recorded when the list had 2.
+        let msgs = vec![
+            json!({"role":"system","content":"sys prompt here"}),
+            json!({"role":"user","content":"first user message"}),
+            json!({"role":"assistant","content":"assistant reply that grew the turn"}),
+            json!({"role":"tool","tool_call_id":"x","content":"tool output payload"}),
+        ];
+        let real = 1_000u64;
+        // Baseline covers msgs[0..2]; only msgs[2..4] should be char/4-estimated.
+        let grounded = grounded_estimate(&msgs, Some(real), 2);
+        let delta = estimate_messages_tokens(&msgs[2..]);
+        assert_eq!(grounded, real + delta);
+        // Must be strictly larger than re-estimating the whole list when the
+        // real count exceeds the whole-list char/4 guess (which omits tool-call
+        // framing, role tags, etc.) — i.e. the real baseline is authoritative.
+        assert!(grounded > estimate_messages_tokens(&msgs));
+    }
+
+    #[test]
+    fn grounded_estimate_falls_back_when_no_real_usage() {
+        let msgs = vec![json!({"role":"user","content":"hello world"})];
+        // No real baseline (first turn): behaves as a full char/4 estimate.
+        assert_eq!(
+            grounded_estimate(&msgs, None, 0),
+            estimate_messages_tokens(&msgs)
+        );
+    }
+
+    #[test]
+    fn grounded_estimate_clamps_stale_length() {
+        // Baseline recorded at length 10, but a rewrite shrank the list to 2.
+        // Must clamp (never slice out of range) and yield just the baseline.
+        let msgs = vec![
+            json!({"role":"user","content":"a"}),
+            json!({"role":"assistant","content":"b"}),
+        ];
+        let real = 500u64;
+        assert_eq!(grounded_estimate(&msgs, Some(real), 10), real);
     }
 
     #[test]

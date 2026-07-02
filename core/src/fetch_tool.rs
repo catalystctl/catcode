@@ -16,9 +16,7 @@ fn parse_http_host(url: &str) -> Option<(String, String)> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let end = rest
-        .find(&['/', '?', '#', ':'][..])
-        .unwrap_or(rest.len());
+    let end = rest.find(&['/', '?', '#', ':'][..]).unwrap_or(rest.len());
     let host = rest[..end].to_ascii_lowercase();
     if host.is_empty() {
         return None;
@@ -170,7 +168,9 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
     }
 
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(cfg.fetch_timeout_secs.max(1)))
+        .timeout(std::time::Duration::from_secs(
+            cfg.fetch_timeout_secs.max(1),
+        ))
         .connect_timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent("umans-harness-fetch/0.1")
@@ -362,8 +362,11 @@ mod tests {
             fetch_allowlist: vec!["docs.rs".into(), "*.rust-lang.org".into()],
             ..crate::config::Config::default()
         };
-        let out =
-            execute_fetch(&serde_json::json!({ "url": "https://evil.example.com/x" }), &cfg).await;
+        let out = execute_fetch(
+            &serde_json::json!({ "url": "https://evil.example.com/x" }),
+            &cfg,
+        )
+        .await;
         assert!(!out.ok);
         assert!(out.output.contains("not in the allowlist"));
     }
@@ -376,8 +379,7 @@ mod tests {
             fetch_allowlist: Vec::new(),
             ..crate::config::Config::default()
         };
-        let out =
-            execute_fetch(&serde_json::json!({ "url": "https://example.com/x" }), &cfg).await;
+        let out = execute_fetch(&serde_json::json!({ "url": "https://example.com/x" }), &cfg).await;
         assert!(!out.ok);
         assert!(out.output.contains("--no-network"));
         assert!(out.output.contains("fetch_allowlist"));

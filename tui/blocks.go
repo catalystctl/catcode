@@ -73,7 +73,14 @@ func (s *session) push(kind blockKind) *block {
 		// no longer matches the shifted indices). `s.cur` is always the newest
 		// block, so it's never trimmed.
 		trim := len(s.blocks) - maxBlocks
-		s.blocks = s.blocks[trim:]
+		// Copy into a fresh backing slice instead of slicing (s.blocks[trim:]).
+		// Slicing alone keeps the old backing array — and the *block pointers in
+		// its dropped prefix — alive for the whole session, pinning the trimmed
+		// blocks' rendered strings and slowly creeping RSS. A fresh copy lets the
+		// GC reclaim the old array and its stale prefix.
+		kept := make([]*block, 0, maxBlocks+8)
+		kept = append(kept, s.blocks[trim:]...)
+		s.blocks = kept
 		s.invalidateAll()
 	}
 	if kind == blkAssistant || kind == blkThinking {
@@ -187,6 +194,20 @@ func (s *session) logTool(name, args string, sub bool) *block {
 	b.started = time.Now()
 	s.refresh()
 	return b
+}
+
+// captureTodos parses a todo_write args blob and stores the latest todo list in
+// s.todos so the pinned panel always shows current state. The agent rewrites
+// the full list on every todo_write, so the latest call wins.
+func (s *session) captureTodos(args string) {
+	todos := argObjArrField(args, "todos")
+	if todos == nil {
+		return
+	}
+	// Stash a copy so later block mutations can't alias it.
+	cp := make([]map[string]json.RawMessage, len(todos))
+	copy(cp, todos)
+	s.todos = cp
 }
 
 func (s *session) logToolResult(output string) {
@@ -643,6 +664,9 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 						b.id = id
 						b.started = time.Time{} // historical: no timing
 						b.dur = 1               // >0 => finalized, not in-flight
+						if disp == "todo_write" {
+							s.captureTodos(args) // last todo_write wins
+						}
 						if id != "" {
 							pending[id] = b
 						}

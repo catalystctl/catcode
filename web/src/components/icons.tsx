@@ -105,8 +105,9 @@ export const TrashIcon = (p: P) => (
 );
 
 export const SparkIcon = (p: P) => (
-  <svg {...base(p)}>
-    <path d="M12 2v6M12 16v6M2 12h6M16 12h6M5 5l4 4M15 15l4 4M19 5l-4 4M9 15l-4 4" />
+  <svg {...base(p)} fill="currentColor" stroke="none">
+    {/* 4-point concave sparkle (classic AI-spark shape) */}
+    <path d="M12 2 C12.8 7.2 16.8 11.2 22 12 C16.8 12.8 12.8 16.8 12 22 C11.2 16.8 7.2 12.8 2 12 C7.2 11.2 11.2 7.2 12 2 Z" />
   </svg>
 );
 

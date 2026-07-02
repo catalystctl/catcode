@@ -33,7 +33,8 @@ interface Props {
   onStats: () => void;
   onOpenPanel: (panel: string) => void;
   onSwitchWorkspace: (path: string) => void;
-  onAddProject: (path: string) => void;
+  onRemoveProject: (path: string) => void;
+  onDeleteSession: (path: string) => void;
   onRenameSession: (name: string, title: string) => void;
 }
 
@@ -115,21 +116,35 @@ export function Sidebar(props: Props) {
               {props.projects.map((p) => {
                 const active = p.path === props.workspace;
                 return (
-                  <button
+                  <div
                     key={p.path}
-                    onClick={() => {
-                      if (!active) props.onSwitchWorkspace(p.path);
-                      setProjectOpen(false);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors hover:bg-ink-800"
+                    className="group/proj flex items-center gap-1 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-ink-800"
                   >
-                    <FolderIcon width={13} height={13} className={active ? "text-accent-soft" : "text-ink-500"} />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-[12px] font-medium text-ink-100">{p.name}</div>
-                      <div className="truncate font-mono text-[10px] text-ink-500">{p.path}</div>
-                    </div>
-                    {active && <CheckIcon width={13} height={13} className="shrink-0 text-accent-soft" />}
-                  </button>
+                    <button
+                      onClick={() => {
+                        if (!active) props.onSwitchWorkspace(p.path);
+                        setProjectOpen(false);
+                      }}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    >
+                      <FolderIcon width={13} height={13} className={active ? "text-accent-soft" : "text-ink-500"} />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[12px] font-medium text-ink-100">{p.name}</div>
+                        <div className="truncate font-mono text-[10px] text-ink-500">{p.path}</div>
+                      </div>
+                      {active && <CheckIcon width={13} height={13} className="shrink-0 text-accent-soft" />}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        props.onRemoveProject(p.path);
+                      }}
+                      className="shrink-0 rounded p-0.5 text-ink-600 opacity-0 transition-opacity hover:bg-rose-500/10 hover:text-rose-400 group/proj:opacity-100"
+                      title="Remove from list"
+                    >
+                      <XIcon width={12} height={12} />
+                    </button>
+                  </div>
                 );
               })}
               {/* Add project */}
@@ -219,7 +234,7 @@ export function Sidebar(props: Props) {
                 return (
                   <li key={s.name} className="group relative">
                     <button
-                      onClick={() => !isRenaming && props.onLoadSession(s.name)}
+                      onClick={() => !isRenaming && props.onLoadSession(s.path ?? s.name)}
                       className={`flex w-full items-start gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors ${
                         active ? "bg-accent/10 text-ink-100" : "text-ink-300 hover:bg-ink-850"
                       }`}
@@ -262,18 +277,35 @@ export function Sidebar(props: Props) {
                         )}
                       </div>
                     </button>
-                    {/* Rename button (hover) */}
+                    {/* Rename + delete buttons (hover) */}
                     {!isRenaming && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          startRename(s);
-                        }}
-                        className="absolute right-1.5 top-1.5 hidden rounded p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-100 group-hover:block"
-                        title="Rename session"
-                      >
-                        <PencilIcon width={11} height={11} />
-                      </button>
+                      <div className="absolute right-1.5 top-1.5 hidden items-center gap-0.5 group-hover:flex">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRename(s);
+                          }}
+                          className="rounded p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-100"
+                          title="Rename session"
+                        >
+                          <PencilIcon width={11} height={11} />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (
+                              window.confirm(
+                                `Delete session "${displayTitle}"? The .jsonl file will be permanently removed.`,
+                              )
+                            )
+                              props.onDeleteSession(s.path ?? s.name);
+                          }}
+                          className="rounded p-0.5 text-ink-600 hover:bg-rose-500/10 hover:text-rose-400"
+                          title="Delete session"
+                        >
+                          <TrashIcon width={11} height={11} />
+                        </button>
+                      </div>
                     )}
                   </li>
                 );

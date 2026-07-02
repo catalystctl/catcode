@@ -316,8 +316,7 @@ impl PluginManager {
         workspace: PathBuf,
         trust_project: bool,
     ) -> Self {
-        let user_plugins_dir =
-            crate::config::home_dir().map(|h| h.join(".umans-harness/plugins"));
+        let user_plugins_dir = crate::config::home_dir().map(|h| h.join(".umans-harness/plugins"));
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir,
@@ -395,7 +394,12 @@ impl PluginManager {
         //    overrides the global one. Created on demand so the dir existing
         //    never errors.
         let _ = std::fs::create_dir_all(&self.plugins_dir);
-        self.scan_dir(&self.plugins_dir, &canon_ws, &mut plugins, &mut skipped_local);
+        self.scan_dir(
+            &self.plugins_dir,
+            &canon_ws,
+            &mut plugins,
+            &mut skipped_local,
+        );
 
         *self.skipped_project.lock().unwrap() = skipped_local;
     }
@@ -1252,7 +1256,12 @@ mod tests {
         let gdir = global.path.join("vision-fake");
         fs::create_dir_all(gdir.join("hooks")).unwrap();
         write_hook_script(&gdir.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
-        write_plugin(&gdir, "vision-fake", "1.0.0", r#"{"pre_turn":{"script":"hooks/h.sh"}}"#);
+        write_plugin(
+            &gdir,
+            "vision-fake",
+            "1.0.0",
+            r#"{"pre_turn":{"script":"hooks/h.sh"}}"#,
+        );
 
         // trust_project=false, no project plugins present: global loads, none skipped.
         let mgr = PluginManager::new_with_user_plugins_dir(
@@ -1268,7 +1277,12 @@ mod tests {
         let pdir = proj_plugins.join("vision-fake");
         fs::create_dir_all(pdir.join("hooks")).unwrap();
         write_hook_script(&pdir.join("hooks"), "h.sh", r#"{"allow":true}"#, 0);
-        write_plugin(&pdir, "vision-fake", "9.9.9", r#"{"pre_turn":{"script":"hooks/h.sh"}}"#);
+        write_plugin(
+            &pdir,
+            "vision-fake",
+            "9.9.9",
+            r#"{"pre_turn":{"script":"hooks/h.sh"}}"#,
+        );
 
         // trust_project=true: project plugin loads and OVERRIDES the global one.
         let mgr2 = PluginManager::new_with_user_plugins_dir(

@@ -225,3 +225,46 @@ describe("reset", () => {
     expect(s.currentAssistantId).toBeNull();
   });
 });
+
+describe("history replay", () => {
+  test("extracts images from multimodal user messages", () => {
+    const s = ev({
+      type: "history",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What is this?" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+          ],
+        },
+      ],
+    });
+    expect(s.messages).toHaveLength(1);
+    const u = s.messages[0];
+    expect(u.role).toBe("user");
+    if (!isUser(u)) throw new Error("expected user");
+    expect(u.text).toBe("What is this?");
+    expect(u.images).toEqual(["data:image/png;base64,abc"]);
+  });
+
+  test("marks replayed tool results as unknown (no live ok/error)", () => {
+    const s = ev({
+      type: "history",
+      messages: [
+        { role: "user", content: "list files" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "t1", type: "function", function: { name: "list_dir", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "t1", content: "a\nb\nc" },
+      ],
+    });
+    const a = s.messages.find((m) => m.role === "assistant");
+    if (!a || !isAssistant(a)) throw new Error("expected assistant");
+    expect(a.toolCalls).toHaveLength(1);
+    expect(a.toolCalls[0].result?.output).toBe("a\nb\nc");
+    expect(a.toolCalls[0].result?.unknown).toBe(true);
+  });
+});
