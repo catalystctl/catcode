@@ -2,7 +2,7 @@
 // Precedence: CLI > env > settings.local.json > settings.json
 //   > ~/.config/settings.json > managed-settings.json > managed-settings.d/*.json
 // Arrays concatenate+deduplicate; objects deep merge; null means delete.
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -330,8 +330,233 @@ impl ResolvedProvider {
     }
 }
 
+/// A built-in first-party provider template: a known endpoint + the standard
+/// API-key env var for that vendor, so a user can add the provider with a
+/// single action (`add_provider`) instead of hand-editing JSON. Presets cover
+/// the major vendors. The harness always keeps the conversation in OpenAI
+/// chat-completions shape internally; a preset's `kind` only decides the wire
+/// translation at the HTTP boundary (Gemini exposes an OpenAI-compatible
+/// endpoint, so it maps to `OpenAI`).
+#[derive(Clone, Debug)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub kind: ProviderKind,
+    pub base_url: &'static str,
+    /// Primary env var holding the API key (e.g. `OPENAI_API_KEY`).
+    pub api_key_env: &'static str,
+    /// Alternate env vars checked in order if the primary is unset
+    /// (e.g. Gemini accepts `GOOGLE_API_KEY` too).
+    pub alt_envs: &'static [&'static str],
+    pub description: &'static str,
+}
+
+/// The first-party provider presets. Order is the order shown in pickers.
+/// Umans (the default/original provider) is listed first.
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "umans",
+        label: "Umans (GLM-5.2)",
+        kind: ProviderKind::OpenAI,
+        // The default Umans endpoint. is_umans() matches `umans.ai` as a parent
+        // domain, so the GLM-specific wire logic (reasoning_effort,
+        // /models/info discovery) still applies to this preset's turns.
+        base_url: "https://api.code.umans.ai/v1",
+        api_key_env: "UMANS_API_KEY",
+        alt_envs: &[],
+        description: "Umans — GLM-5.2, the default provider. Uses your UMANS_API_KEY (https://app.umans.ai/billing → API Keys).",
+    },
+    ProviderPreset {
+        id: "openai",
+        label: "OpenAI (Codex)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.openai.com/v1",
+        api_key_env: "OPENAI_API_KEY",
+        alt_envs: &[],
+        description: "OpenAI API — GPT-5 Codex, o-series, GPT-4.1. Uses your OPENAI_API_KEY.",
+    },
+    ProviderPreset {
+        id: "gemini",
+        label: "Google Gemini",
+        kind: ProviderKind::OpenAI,
+        // Gemini's OpenAI-compatible shim: {base}/chat/completions + {base}/models.
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key_env: "GEMINI_API_KEY",
+        alt_envs: &["GOOGLE_API_KEY"],
+        description: "Google Gemini via its OpenAI-compatible endpoint — Gemini 2.5 Pro/Flash. Uses GEMINI_API_KEY (or GOOGLE_API_KEY).",
+    },
+    ProviderPreset {
+        id: "anthropic",
+        label: "Anthropic Claude",
+        kind: ProviderKind::Anthropic,
+        base_url: "https://api.anthropic.com/v1",
+        api_key_env: "ANTHROPIC_API_KEY",
+        alt_envs: &[],
+        description: "Anthropic API — Claude Opus/Sonnet/Haiku 4. Uses your ANTHROPIC_API_KEY.",
+    },
+];
+
+/// Look up a first-party preset by id.
+pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|p| p.id == id)
+}
+
+impl ProviderPreset {
+    /// Resolve an API key for this preset from its env vars (primary first,
+    /// then alternates). None when none are set.
+    pub fn env_key(&self) -> Option<String> {
+        std::env::var(self.api_key_env)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.alt_envs
+                    .iter()
+                    .find_map(|e| std::env::var(e).ok().filter(|s| !s.is_empty()))
+            })
+    }
+
+    /// The env var name that actually held a key, or the primary env var when
+    /// none are set (so a future `export` Just Works without re-adding).
+    pub fn resolved_env(&self) -> &'static str {
+        if std::env::var(self.api_key_env)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some()
+        {
+            return self.api_key_env;
+        }
+        for e in self.alt_envs {
+            if std::env::var(e).ok().filter(|s| !s.is_empty()).is_some() {
+                return e;
+            }
+        }
+        self.api_key_env
+    }
+
+    /// Build a `ProviderConfig` from this preset. When `api_key` is given it is
+    /// stored as a literal (user entered it); otherwise the key is read from the
+    /// preset's env var and only the env-var NAME is persisted (the secret stays
+    /// in the environment, never copied into the config file).
+    pub fn to_provider_config(&self, api_key: Option<String>) -> ProviderConfig {
+        let (api_key, api_key_env) = match api_key {
+            Some(k) => (Some(k), None),
+            None => (None, Some(self.resolved_env().to_string())),
+        };
+        ProviderConfig {
+            name: self.id.to_string(),
+            kind: self.kind.clone(),
+            base_url: self.base_url.to_string(),
+            api_key,
+            api_key_env,
+            headers: Vec::new(),
+        }
+    }
+}
+
+/// Serialize a `ProviderConfig` back to JSON for persistence. Only writes
+/// non-default fields so the file stays readable.
+pub fn provider_to_json(p: &ProviderConfig) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("name".into(), json!(p.name));
+    o.insert("kind".into(), json!(p.kind.as_str()));
+    o.insert("base_url".into(), json!(p.base_url));
+    if let Some(k) = &p.api_key {
+        o.insert("api_key".into(), json!(k));
+    }
+    if let Some(e) = &p.api_key_env {
+        o.insert("api_key_env".into(), json!(e));
+    }
+    if !p.headers.is_empty() {
+        let h: serde_json::Map<String, Value> = p
+            .headers
+            .iter()
+            .cloned()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+        o.insert("headers".into(), Value::Object(h));
+    }
+    Value::Object(o)
+}
+
+/// Path of the core-owned config file (`~/.config/umans-harness/config.json`),
+/// where first-party providers added at runtime are persisted. The TUI does
+/// NOT write this file (it owns `settings.json`), so there is no clobber.
+pub fn user_config_path() -> Option<PathBuf> {
+    Some(home_dir()?.join(".config/umans-harness/config.json"))
+}
+
+/// Persist `providers` (+ optional active provider) into the core-owned config
+/// file, merging with any existing JSON so other keys are preserved. Atomic
+/// (temp + rename) with 0600 perms. Best-effort: returns an io error on failure.
+pub fn save_providers_config(
+    providers: &[ProviderConfig],
+    active: Option<&str>,
+) -> std::io::Result<()> {
+    let path = user_config_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Read existing config.json (if any) and merge so other keys survive.
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if root.as_object().is_none() {
+        root = json!({});
+    }
+    let arr: Vec<Value> = providers.iter().map(provider_to_json).collect();
+    root["providers"] = json!(arr);
+    if let Some(a) = active {
+        root["activeProvider"] = json!(a);
+    }
+    let data = serde_json::to_string_pretty(&root).unwrap_or_default();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Auto-log-in to every first-party preset whose API key is already available
+/// in the environment (e.g. `UMANS_API_KEY`, `OPENAI_API_KEY`, ...). For each
+/// such preset that isn't already explicitly configured, add a provider entry
+/// keyed by its env-var NAME (the secret stays in the environment, never copied
+/// into a config file). This makes "set the env var and it just works" true: the
+/// provider shows as logged in and its models appear in `/models` without a
+/// manual `/login` step. Already-configured providers are left untouched (a user
+/// who logged out keeps their choice for this process). Returns the names added.
+/// NOT persisted — env presence drives it every launch, so logging out then
+/// re-launching re-adds only if the env var is still set (intended).
+pub fn auto_login_env_presets(cfg: &mut Config) -> Vec<String> {
+    let mut added = Vec::new();
+    for p in PROVIDER_PRESETS {
+        if cfg.find_provider(p.id).is_some() {
+            continue; // already configured (explicit login or prior session) — leave it.
+        }
+        if p.env_key().is_some() {
+            let mut pc = p.to_provider_config(None);
+            // For Umans, honor a custom cfg.base_url (e.g. UMANS_BASE_URL)
+            // instead of the preset's default URL, so a custom proxy isn't
+            // silently overwritten.
+            if p.id == "umans" && !cfg.base_url.is_empty() {
+                pc.base_url = cfg.base_url.clone();
+            }
+            cfg.providers.push(pc);
+            added.push(p.id.to_string());
+        }
+    }
+    // If no active provider is set, prefer Umans (the default), else the first.
+    if cfg.active_provider.is_none() && !cfg.providers.is_empty() {
+        if cfg.find_provider("umans").is_some() {
+            cfg.active_provider = Some("umans".to_string());
+        } else {
+            cfg.active_provider = Some(cfg.providers[0].name.clone());
+        }
+    }
+    added
+}
+
 impl Config {
-    /// Find a configured provider by name (case-sensitive).
     pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.name == name)
     }

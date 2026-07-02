@@ -2,7 +2,7 @@
 // TUI -> Core commands (stdin), Core -> TUI events (stdout).
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -21,6 +21,12 @@ pub struct ModelInfo {
     /// Drives the vision-handoff (pre_turn plugin) routing.
     #[serde(default)]
     pub vision: bool,
+    /// The provider name that owns this model (e.g. "openai", "gemini",
+    /// "anthropic"). Populated by the aggregation layer so a turn can be routed
+    /// to the correct endpoint per-model when multiple providers are logged in.
+    /// Empty for legacy single-provider models (routes to the active provider).
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// Commands read from stdin.
@@ -43,6 +49,30 @@ pub enum Command {
     /// fresh `models` event. Unknown names are ignored (stays on current).
     #[serde(rename = "set_provider")]
     SetProvider { name: String },
+    /// List the built-in first-party provider presets (OpenAI/Codex, Gemini,
+    /// Anthropic). Emits a `provider_presets` event so the TUI/web can render a
+    /// one-click "login" picker. Each entry carries whether a key is already
+    /// available (env var set) and whether the provider is logged in.
+    #[serde(rename = "list_provider_presets")]
+    ListProviderPresets,
+    /// Log in to a first-party provider (`openai` | `gemini` | `anthropic`):
+    /// create the provider config, set its API key, persist, and re-aggregate
+    /// models so the provider's models appear in `/models` alongside any others
+    /// already logged in. An optional `api_key` overrides the preset's standard
+    /// env var; when omitted the key is read from the env var. Multiple
+    /// providers can be logged in at once; each turn routes to the selected
+    /// model's provider.
+    #[serde(rename = "login")]
+    Login {
+        preset: String,
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// Log out of a provider: drop its runtime key, remove it from the
+    /// configured providers, persist the change, and re-aggregate models so its
+    /// models disappear from `/models`. No-op (error event) when not logged in.
+    #[serde(rename = "logout")]
+    Logout { provider: String },
     #[serde(rename = "send")]
     Send {
         prompt: String,

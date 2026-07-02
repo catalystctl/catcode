@@ -170,6 +170,56 @@ export function Chat() {
         if (key?.trim()) void a.setKey(key.trim());
         return;
       }
+      case "login": {
+        // Pick a preset to log in to. After choosing, prompt for the key only
+        // when none is available from the environment (the core resolves env
+        // keys automatically when no key is passed). A logged-in provider can
+        // be re-keyed here to override a bad env var (e.g. fix a 401).
+        a.listProviderPresets();
+        const presets = a.state?.providerPresets ?? [];
+        const opts = presets
+          .map((p) => `${p.loggedIn ? "✓ " : "  "}${p.label} — ${p.description}`)
+          .join("\n");
+        const idx = window.prompt(
+          `Log in / switch provider. Pick by number:\n\n${opts}`,
+        );
+        const n = Number(idx);
+        if (Number.isNaN(n) || n < 0 || n >= presets.length) return;
+        const p = presets[n];
+        if (p.loggedIn) {
+          // Already logged in — offer to override the key (empty = just switch).
+          const key = window.prompt(
+            `${p.label} is logged in. Paste a new key to OVERRIDE it\n` +
+              `(e.g. to fix a bad ${p.envVar} that caused a 401).\n` +
+              `Leave blank to just switch to it.`,
+          );
+          if (key === null) return; // cancelled
+          if (key.trim()) {
+            void a.login(p.id, key.trim());
+          } else {
+            void a.setProvider?.(p.id);
+          }
+          return;
+        }
+        const key = p.hasKey ? undefined : window.prompt(`Paste ${p.envVar}:`);
+        if (!p.hasKey && !key?.trim()) return;
+        void a.login(p.id, key?.trim() || undefined);
+        return;
+      }
+      case "logout": {
+        const presets = a.state?.providerPresets ?? [];
+        const loggedIn = presets.filter((p) => p.loggedIn);
+        if (loggedIn.length === 0) {
+          window.alert("Not logged into any provider.");
+          return;
+        }
+        const opts = loggedIn.map((p) => `  ${p.label}`).join("\n");
+        const idx = window.prompt(`Log out of which provider? Pick by number:\n\n${opts}`);
+        const n = Number(idx);
+        if (Number.isNaN(n) || n < 0 || n >= loggedIn.length) return;
+        void a.logout(loggedIn[n].id);
+        return;
+      }
       case "steer":
         // Focus the composer so the user can type a steer (Enter steers while streaming).
         setSidebarOpen(false);

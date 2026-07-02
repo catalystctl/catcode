@@ -50,6 +50,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			if raw, ok := m["providers"]; ok {
 				_ = json.Unmarshal(raw, &s.providers)
 			}
+			if raw, ok := m["providerPresets"]; ok {
+				_ = json.Unmarshal(raw, &s.providerPresets)
+			}
 			s.providerHasKey = s.authed // ready's authed reflects the active provider's key
 		}
 		s.applyModels(models)
@@ -86,6 +89,26 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.authed = true
 		s.providerHasKey = true
 		s.logSuccess("authenticated")
+
+	case "provider_presets":
+		// The core advertises the first-party presets (and refreshes them after
+		// add_provider so Configured/HasKey flip). Keep the picker open if it's
+		// up so the list updates live.
+		var presets []providerPreset
+		if raw := ev.get("presets"); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &presets)
+		} else {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(ev.Raw, &m); err == nil {
+				if raw, ok := m["presets"]; ok {
+					_ = json.Unmarshal(raw, &presets)
+				}
+			}
+		}
+		s.providerPresets = presets
+		if s.modal.kind == modalProviders {
+			s.refresh()
+		}
 
 	case "models":
 		// The core emits this after a provider switch (and on demand). Re-apply the
@@ -596,6 +619,18 @@ func (s *session) providerKey(name string) string {
 	return ""
 }
 
+// deleteProviderKey drops a provider's persisted key from the per-provider map
+// (and the legacy single APIKey when it was the active/default provider). Used
+// by /logout so the TUI side and the core agree the provider is logged out.
+func (s *session) deleteProviderKey(name string) {
+	if s.settings.ProviderKeys != nil {
+		delete(s.settings.ProviderKeys, name)
+	}
+	if s.settings.APIKey != "" && (name == s.activeProvider || name == "default") {
+		s.settings.APIKey = ""
+	}
+}
+
 // sendProviderKey sends `set_key` for a named provider (or the active one when
 // name is empty). Only sent when a key is actually available.
 func (s *session) sendProviderKey(name string) bool {
@@ -1102,25 +1137,23 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return s.handleSkillCommand(parts)
 		}
 		switch parts[0] {
-		case "/key":
-			if len(parts) < 2 {
-				s.logError("usage: /key sk-...")
+		case "/login":
+			s.openLoginPicker()
+			return nil
+		case "/logout":
+			if len(parts) >= 2 {
+				// /logout <provider> — direct logout without the picker.
+				name := parts[1]
+				s.sendCore(map[string]any{"type": "logout", "provider": name})
+				s.deleteProviderKey(name)
+				if s.settings.ActiveProvider == name {
+					s.settings.ActiveProvider = ""
+				}
+				_ = s.settings.save()
+				s.logInfo("logged out of " + name)
 				return nil
 			}
-			key := parts[1]
-			// Scope the key to the active provider (per-provider keys). Also keep the
-			// legacy single APIKey field in sync for the default/active provider.
-			if s.activeProvider == "" {
-				s.activeProvider = "default"
-			}
-			if s.settings.ProviderKeys == nil {
-				s.settings.ProviderKeys = map[string]string{}
-			}
-			s.settings.ProviderKeys[s.activeProvider] = key
-			s.settings.APIKey = key
-			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_key", "provider": s.activeProvider, "api_key": key})
-			s.logInfo(fmt.Sprintf("sending key for provider '%s'…", s.activeProvider))
+			s.openLogoutPicker()
 			return nil
 		case "/model":
 			if len(parts) < 2 {

@@ -31,6 +31,8 @@ const (
 	modalPlugins
 	modalReasoning
 	modalVision
+	modalProviders
+	modalLogout
 )
 
 type modal struct {
@@ -72,6 +74,8 @@ type listItem struct {
 	label string
 	desc  string
 	tag   string // left marker (e.g. "▸" for selected)
+	meta  string // opaque payload for executeListSelect (e.g. preset id)
+	meta2 string // opaque kind hint for executeListSelect (e.g. "preset"/"provider")
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +130,111 @@ func (s *session) openVisionPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalVision
 	s.modal.cursor = 0
+}
+
+// openLoginPicker opens the /login picker. It lists the first-party presets
+// (OpenAI/Codex, Gemini, Anthropic) plus any other configured providers, so
+// the user can log in to one or switch to an already-logged-in one. Logging in
+// to a preset whose key is in the env just sends `login`; one with no key
+// prompts the user to paste a key inline, then sends `login {preset,api_key}`.
+// Multiple providers can be logged in at once; their models all appear in
+// /models and each turn routes to the selected model's provider.
+func (s *session) openLoginPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalProviders
+	s.modal.cursor = 0
+	s.pendingLogin = ""
+	// Make sure we have the latest preset list (configured/hasKey/loggedIn flags).
+	s.sendCore(map[string]any{"type": "list_provider_presets"})
+}
+
+// openLogoutPicker opens the /logout picker: lists only providers that are
+// currently logged in (presets with LoggedIn + configured non-preset providers
+// with a key). Selecting one sends `logout` and re-aggregates models.
+func (s *session) openLogoutPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalLogout
+	s.modal.cursor = 0
+	s.pendingLogin = ""
+}
+
+// providerItems builds the /login picker list: first-party presets followed by
+// any other configured providers. `meta` carries the preset/provider id and
+// `meta2` the kind ("preset"/"provider") so selectProviderItem can dispatch.
+func (s *session) providerItems() []listItem {
+	items := make([]listItem, 0, len(s.providerPresets)+len(s.providers))
+	for _, p := range s.providerPresets {
+		label := p.Label
+		desc := p.Description
+		switch {
+		case p.LoggedIn:
+			label = "✓ " + p.Label
+			if p.ID == s.activeProvider {
+				desc = "logged in · active · enter to override key (empty = switch) · " + desc
+			} else {
+				desc = "logged in · enter to override key (empty = switch) · " + desc
+			}
+		case p.HasKey:
+			label = "▸ " + p.Label
+			desc = "ready (key in " + p.EnvVar + ") · enter to log in · " + desc
+		default:
+			label = "▸ " + p.Label
+			desc = "enter key to log in · needs " + p.EnvVar + " · " + desc
+		}
+		items = append(items, listItem{label: label, desc: desc, meta: p.ID, meta2: "preset"})
+	}
+	// Configured providers not covered by a preset (e.g. custom/local).
+	for _, name := range s.providers {
+		if s.presetByID(name) != nil {
+			continue
+		}
+		label := name
+		if name == s.activeProvider {
+			label = name + "  (active)"
+		}
+		items = append(items, listItem{label: label, desc: "switch · configured", meta: name, meta2: "provider"})
+	}
+	return items
+}
+
+// logoutItems builds the /logout picker list: only providers that are logged in.
+func (s *session) logoutItems() []listItem {
+	items := make([]listItem, 0, len(s.providerPresets)+len(s.providers))
+	for _, p := range s.providerPresets {
+		if !p.LoggedIn {
+			continue
+		}
+		label := p.Label
+		if p.ID == s.activeProvider {
+			label = p.Label + "  (active)"
+		}
+		items = append(items, listItem{label: label, desc: "log out", meta: p.ID, meta2: "preset"})
+	}
+	for _, name := range s.providers {
+		if s.presetByID(name) != nil {
+			continue
+		}
+		// Non-preset configured providers: include if it has a persisted key.
+		if s.providerKey(name) == "" {
+			continue
+		}
+		label := name
+		if name == s.activeProvider {
+			label = name + "  (active)"
+		}
+		items = append(items, listItem{label: label, desc: "log out", meta: name, meta2: "provider"})
+	}
+	return items
+}
+
+// presetByID returns the matching preset for an id, or nil.
+func (s *session) presetByID(id string) *providerPreset {
+	for i := range s.providerPresets {
+		if s.providerPresets[i].ID == id {
+			return &s.providerPresets[i]
+		}
+	}
+	return nil
 }
 
 func (s *session) visionItems() []listItem {
@@ -272,7 +381,8 @@ func (s *session) closeModal() {
 
 func (s *session) commandItems() []listItem {
 	items := []listItem{
-		{label: "/key", desc: "set API key"},
+		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
+		{label: "/logout", desc: "log out of a provider"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
 		{label: "/reasoning", desc: "set reasoning effort (per model)"},
@@ -328,8 +438,14 @@ func (s *session) modelItems() []listItem {
 		if len(m.ThinkingLevels) > 0 {
 			desc += " · think:" + strings.Join(m.ThinkingLevels, "/")
 		}
+		// Tag the owning provider so a multi-login /models can mix providers
+		// (e.g. gpt-5-codex [openai], gemini-2.5-pro [gemini], claude-... [anthropic]).
+		label := m.ID
+		if m.Provider != "" {
+			label = fmt.Sprintf("%s  [%s]", m.ID, m.Provider)
+		}
 		items[i] = listItem{
-			label: m.ID,
+			label: label,
 			desc:  desc,
 		}
 	}
@@ -449,7 +565,7 @@ func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch s.modal.kind {
-	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning:
+	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning, modalProviders, modalLogout:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
@@ -476,6 +592,10 @@ func (s *session) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items = s.pluginItems()
 	case modalReasoning:
 		items = s.reasoningItems()
+	case modalProviders:
+		items = s.providerItems()
+	case modalLogout:
+		items = s.logoutItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -571,12 +691,113 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.closeModal()
 		return s, nil
+	case modalProviders:
+		return s.selectProviderItem(abs)
+	case modalLogout:
+		return s.selectLogoutItem(abs)
 	}
 	s.closeModal()
 	return s, nil
 }
 
-// runCommandByIndex maps a command-palette index to its action.
+// selectProviderItem handles a pick in the provider modal: a preset entry adds
+// the first-party provider (add_provider), a configured-provider entry switches
+// to it (set_provider). The modal closes on add; on switch it relies on the
+// core's provider_changed event to update state (mirrors cycleProvider).
+func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
+	items := s.providerItems()
+	if abs < 0 || abs >= len(items) {
+		return s, nil
+	}
+	it := items[abs]
+	switch it.meta2 {
+	case "preset":
+		name := it.meta
+		preset := s.presetByID(name)
+		if preset == nil {
+			s.closeModal()
+			return s, nil
+		}
+		// Already logged in: let the user OVERRIDE the key (e.g. fix a bad env
+		// var that caused a 401). Opens the inline key-entry box; an empty submit
+		// just switches to it instead of overriding. A pasted key replaces the
+		// provider's config with a literal key that takes precedence over the
+		// env var and is persisted, so the override survives restarts.
+		if preset.LoggedIn {
+			s.pendingLogin = name
+			s.modal.editing = true
+			s.modal.editBuf.SetValue("")
+			s.modal.editBuf.Placeholder = "paste new key to override (empty = just switch)"
+			s.modal.editBuf.Focus()
+			s.modal.editBuf.CursorEnd()
+			return s, nil
+		}
+		// A key is available from the env var: log in immediately, no prompt.
+		if preset.HasKey {
+			s.sendCore(map[string]any{"type": "login", "preset": name})
+			s.logInfo("logging in to " + preset.Label)
+			s.closeModal()
+			return s, nil
+		}
+		// No key anywhere: prompt the user to paste one inline. The modal
+		// switches to the key-entry box (renderLoginKeyBox) and the next Enter
+		// sends `login {preset,api_key}` via the editing-key handler.
+		s.pendingLogin = name
+		s.modal.editing = true
+		s.modal.editBuf.SetValue("")
+		s.modal.editBuf.Placeholder = "paste " + preset.EnvVar + " value"
+		s.modal.editBuf.Focus()
+		s.modal.editBuf.CursorEnd()
+		return s, nil
+	case "provider":
+		name := it.meta
+		s.settings.ActiveProvider = name
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_provider", "name": name})
+		s.logInfo("switching provider: " + name)
+		s.closeModal()
+		return s, nil
+	}
+	s.closeModal()
+	return s, nil
+}
+
+// selectLogoutItem handles a pick in the /logout modal: send `logout` for the
+// chosen provider, then drop its persisted key on the TUI side and save. The
+// core re-aggregates models (refresh_models) so the provider's models vanish.
+func (s *session) selectLogoutItem(abs int) (tea.Model, tea.Cmd) {
+	items := s.logoutItems()
+	if abs < 0 || abs >= len(items) {
+		return s, nil
+	}
+	it := items[abs]
+	name := it.meta
+	s.sendCore(map[string]any{"type": "logout", "provider": name})
+	s.deleteProviderKey(name)
+	if s.settings.ActiveProvider == name {
+		s.settings.ActiveProvider = ""
+	}
+	_ = s.settings.save()
+	s.logInfo("logged out of " + name)
+	s.closeModal()
+	return s, nil
+}
+
+// renderLoginKeyBox renders the inline API-key entry box used by the /login
+// modal when a preset has no key in the environment. Mirrors the settings
+// modal's secret-field rendering (masked).
+func (s *session) renderLoginKeyBox() string {
+	label := "API Key"
+	if p := s.presetByID(s.pendingLogin); p != nil {
+		label = p.Label + " API Key (" + p.EnvVar + ")"
+	}
+	val := s.modal.editBuf.Value()
+	masked := strings.Repeat("•", len(val))
+	return s.renderListModal("Log in: "+label, []listItem{{
+		label: masked,
+		desc: "paste your key, then Enter (Esc to cancel)",
+	}}, true)
+}
 func (s *session) runCommandByIndex(i int) tea.Cmd {
 	commands := s.commandItems()
 	if i < 0 || i >= len(commands) {
@@ -596,12 +817,12 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 		return s.input.Focus()
 	}
 	switch label {
-	case "/key":
-		s.openSettings()
-		idx := s.settingsFieldIndex("API Key")
-		s.modal.fieldIdx = idx
-		_, cmd := s.activateField(idx)
-		return cmd
+	case "/login":
+		s.openLoginPicker()
+		return nil
+	case "/logout":
+		s.openLogoutPicker()
+		return nil
 	case "/model":
 		s.openModelPicker()
 		return nil
@@ -812,6 +1033,42 @@ func (s *session) handleSettingsEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (s *session) commitEditField() (tea.Model, tea.Cmd) {
+	// /login inline key entry: a preset was picked with no env key, so the
+	// modal captured a pasted key in the edit buffer. Commit sends `login`
+	// with that key and closes the modal.
+	if s.pendingLogin != "" {
+		name := s.pendingLogin
+		key := strings.TrimSpace(s.modal.editBuf.Value())
+		s.pendingLogin = ""
+		s.modal.editing = false
+		if key == "" {
+			// Empty submit: if the provider is already logged in, treat as a
+			// switch (no override); otherwise cancel.
+			if p := s.presetByID(name); p != nil && p.LoggedIn {
+				s.settings.ActiveProvider = name
+				_ = s.settings.save()
+				s.sendCore(map[string]any{"type": "set_provider", "name": name})
+				s.logInfo("switching to " + p.Label)
+				s.closeModal()
+				return s, nil
+			}
+			s.logError("no key entered; cancelled login")
+			s.closeModal()
+			return s, nil
+		}
+		// Persist the key on the TUI side so it survives restart.
+		if s.settings.ProviderKeys == nil {
+			s.settings.ProviderKeys = map[string]string{}
+		}
+		s.settings.ProviderKeys[name] = key
+		_ = s.settings.save()
+		if p := s.presetByID(name); p != nil {
+			s.logInfo("logging in to " + p.Label)
+		}
+		s.sendCore(map[string]any{"type": "login", "preset": name, "api_key": key})
+		s.closeModal()
+		return s, nil
+	}
 	fields := s.settingsFields()
 	idx := s.modal.fieldIdx
 	val := s.modal.editBuf.Value()
@@ -1061,7 +1318,8 @@ func helpText() string {
 		"  n                 deny",
 		"",
 		"Slash commands",
-		"  /key sk-...       set API key",
+		"  /login           log in / switch provider (OpenAI · Gemini · Anthropic)",
+		"  /logout          log out of a provider",
 		"  /model [N|substr] list or switch model",
 		"  /approval <mode>  never | destructive | always",
 		"  /reasoning        set reasoning effort (per model)",
@@ -1134,6 +1392,13 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Plugins", s.pluginItems(), false)
 	case modalReasoning:
 		return s.renderListModal("Reasoning Effort", s.reasoningItems(), true)
+	case modalProviders:
+		if s.modal.editing {
+			return s.renderLoginKeyBox()
+		}
+		return s.renderListModal("Log in / switch provider", s.providerItems(), true)
+	case modalLogout:
+		return s.renderListModal("Log out", s.logoutItems(), true)
 	case modalVision:
 		return s.renderListModal("Vision Models", s.visionItems(), true)
 	case modalSettings:

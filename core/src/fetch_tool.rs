@@ -119,10 +119,33 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Shared egress decision for HTTP tools (fetch, web_search). Returns
+/// Some(err_msg) if the request must be denied per --no-network /
+/// fetch_allowlist, else None. Reused by web_search so it honors the SAME
+/// security model as fetch (no surprise bypass of --no-network).
+pub(crate) fn egress_check(label: &str, url: &str, cfg: &Config) -> Option<String> {
+    let (_scheme, host) = match parse_http_host(url) {
+        Some(v) => v,
+        None => return Some(format!("{label}: url must be an absolute http(s) URL")),
+    };
+    if cfg.no_network && cfg.fetch_allowlist.is_empty() {
+        return Some(format!(
+            "{label}: network egress is disabled (--no-network) and no fetch_allowlist is configured; populate fetch_allowlist to opt specific hosts in for {label} while keeping bash offline"
+        ));
+    }
+    if !host_allowed(&host, &cfg.fetch_allowlist) {
+        return Some(format!(
+            "{label}: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it, or leave the allowlist empty to allow any host",
+            cfg.fetch_allowlist.len()
+        ));
+    }
+    None
+}
+
 /// Very light HTML-to-text: drop script/style blocks, strip tags, collapse
 /// whitespace, decode common entities. Not a real parser — just enough that a
 /// fetched doc page is readable instead of a wall of markup.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let s = cut_blocks(html, "<script", "</script>");
     let s = cut_blocks(&s, "<style", "</style>");
     let mut out = String::with_capacity(s.len());

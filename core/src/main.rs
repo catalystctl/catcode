@@ -16,6 +16,7 @@ mod memory;
 mod plugins;
 mod protocol;
 mod provider;
+mod search_tool;
 mod session;
 mod staging;
 mod subagent;
@@ -194,6 +195,38 @@ fn emit_skills_event(workspace: &std::path::Path) {
     emit(&Event::new("skills").with("skills", json!(arr)));
 }
 
+/// Build the JSON array of first-party provider presets for the `ready` and
+/// `provider_presets` events. Each entry tells the client whether a key is
+/// already available (env var set, or a literal key in the provider config)
+/// and whether the provider is already logged in — so a picker can show
+/// "log in" vs "log out" and warn when a key is missing.
+fn provider_presets_json(cfg: &Config) -> Vec<Value> {
+    config::PROVIDER_PRESETS
+        .iter()
+        .map(|p| {
+            let configured = cfg.find_provider(p.id).is_some();
+            let has_key = p.env_key().is_some()
+                || cfg
+                    .find_provider(p.id)
+                    .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
+                    .is_some();
+            let logged_in = configured && has_key;
+            json!({
+                "id": p.id,
+                "label": p.label,
+                "kind": p.kind.as_str(),
+                "base_url": p.base_url,
+                "envVar": p.api_key_env,
+                "altEnvs": p.alt_envs,
+                "description": p.description,
+                "hasKey": has_key,
+                "configured": configured,
+                "loggedIn": logged_in,
+            })
+        })
+        .collect()
+}
+
 /// A pending approval request the TUI must answer before the tool runs.
 #[allow(dead_code)]
 pub struct PendingApproval {
@@ -297,6 +330,78 @@ impl State {
         cfg.resolve_provider_with(&keys, active.as_deref())
     }
 
+    /// Resolve a named provider into a `ResolvedProvider` (key included when
+    /// available). Returns None when no configured provider matches the name.
+    /// Used by per-model routing: a model carries its owning provider name, and
+    /// the turn is sent to THAT provider's endpoint regardless of which is
+    /// "active", so multiple providers can be logged in and used simultaneously.
+    pub async fn resolve_provider_by_name(&self, name: &str) -> Option<ResolvedProvider> {
+        let cfg = self.cfg.read().await;
+        let p = cfg.find_provider(name)?.clone();
+        let keys = self.api_keys.read().await;
+        Some(resolve_provider_from_config(&p, &keys))
+    }
+
+    /// Resolve the provider that should serve a turn for `model`: look up the
+    /// model in the aggregated list, route to its owning provider; fall back to
+    /// the active/legacy provider when the model has no provider tag (legacy
+    /// single-provider models) or its provider isn't configured. This is the
+    /// per-model routing seam that lets `/models` mix models from several
+    /// logged-in providers.
+    pub async fn resolve_provider_for_model(&self, model: &str) -> ResolvedProvider {
+        let provider_name = self
+            .models
+            .read()
+            .await
+            .iter()
+            .find(|m| m.id == model)
+            .map(|m| m.provider.clone())
+            .filter(|s| !s.is_empty());
+        if let Some(name) = provider_name {
+            if let Some(rp) = self.resolve_provider_by_name(&name).await {
+                return rp;
+            }
+        }
+        self.resolved_provider().await
+    }
+
+    /// The set of provider names that are "logged in": configured providers
+    /// with a usable key (runtime key -> config literal -> env var). The
+    /// aggregation layer discovers models only for these, so `/models` shows
+    /// exactly the providers the user has authenticated. The legacy default
+    /// (Umans, when no providers are configured) is included when it has a key.
+    pub async fn logged_in_providers(&self) -> Vec<String> {
+        let cfg = self.cfg.read().await;
+        let keys = self.api_keys.read().await;
+        logged_in_providers_for(&cfg, &keys)
+    }
+
+    /// Aggregate models across ALL logged-in providers, tagging each model with
+    /// its owning provider name so per-model routing works. Deduplicates by
+    /// (provider, id). When no provider is logged in, falls back to a single
+    /// discovery of the active/legacy provider (so first-run still shows a model
+    /// list before logging in, and the unauthenticated Umans default keeps working).
+    pub async fn aggregate_models(&self, client: &reqwest::Client) -> Vec<ModelInfo> {
+        let cfg = self.cfg.read().await.clone();
+        let keys = self.api_keys.read().await.clone();
+        let active = self.active_provider.read().await.clone();
+        aggregate_models_for(&cfg, &keys, active.as_deref(), client).await
+    }
+
+    /// Re-aggregate models, store them, and emit a `models` event + a refreshed
+    /// `provider_presets` event. Shared by login/logout/set_key/set_provider so
+    /// every auth change keeps `/models` in sync across all logged-in providers.
+    pub async fn refresh_models(&self, client: &reqwest::Client) {
+        let models = self.aggregate_models(client).await;
+        *self.models.write().await = models.clone();
+        emit(&Event::new("models").with("models", json!(models)));
+        let presets = {
+            let cfg = self.cfg.read().await;
+            provider_presets_json(&cfg)
+        };
+        emit(&Event::new("provider_presets").with("presets", json!(presets)));
+    }
+
     /// Drop the real-usage baseline so estimates fall back to a full char/4 of
     /// the conversation until the next request re-establishes it. Call this
     /// whenever history is rewritten/replaced — compaction, soft-digest, reset,
@@ -339,6 +444,105 @@ impl State {
             .unwrap_or(Value::Null);
         json!({ "session": session, "turn": turn })
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-provider aggregation + per-model routing (free functions)
+//
+// These take a `&Config` + `&HashMap<String,String>` runtime keys (and an
+// optional active-provider override) so they can run BEFORE the `State` exists
+// (init discovery) as well as on the live state. The State wrappers above are
+// thin facades over these. The harness keeps the conversation in OpenAI
+// chat-completions shape internally; a provider's `kind` only decides the wire
+// translation at the HTTP boundary, so routing a turn to a different provider
+// needs no other change.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Resolve a `ProviderConfig` into a `ResolvedProvider` against the runtime key
+/// map (runtime key -> config literal -> config env var). Empty keys are dropped.
+pub fn resolve_provider_from_config(
+    p: &config::ProviderConfig,
+    keys: &HashMap<String, String>,
+) -> ResolvedProvider {
+    let api_key = keys
+        .get(&p.name)
+        .cloned()
+        .or_else(|| p.api_key.clone())
+        .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
+        .filter(|s| !s.is_empty());
+    ResolvedProvider {
+        name: p.name.clone(),
+        kind: p.kind.clone(),
+        base_url: p.base_url.clone(),
+        api_key,
+        headers: p.headers.clone(),
+    }
+}
+
+/// Names of providers that are "logged in": configured providers with a usable
+/// key. The aggregation layer discovers models only for these, so `/models`
+/// shows exactly the providers the user has authenticated. When no providers are
+/// configured (legacy single-endpoint Umans setup) this returns empty so that
+/// `aggregate_models_for`'s `names.is_empty()` branch handles the legacy
+/// default discovery — returning a synthetic "default" name here would break,
+/// because `find_provider("default")` finds no explicit entry to resolve.
+pub fn logged_in_providers_for(cfg: &Config, keys: &HashMap<String, String>) -> Vec<String> {
+    if cfg.providers.is_empty() {
+        return Vec::new();
+    }
+    cfg.providers
+        .iter()
+        .filter(|p| {
+            keys.get(&p.name)
+                .cloned()
+                .or_else(|| p.api_key.clone())
+                .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
+                .is_some()
+        })
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// Aggregate models across ALL logged-in providers, tagging each model with its
+/// owning provider name so per-model routing works. Deduplicates by (provider,
+/// id). When no provider is logged in, falls back to a single discovery of the
+/// active/legacy provider (first-run before login, unauthenticated Umans default).
+pub async fn aggregate_models_for(
+    cfg: &Config,
+    keys: &HashMap<String, String>,
+    active: Option<&str>,
+    client: &reqwest::Client,
+) -> Vec<ModelInfo> {
+    let names = logged_in_providers_for(cfg, keys);
+    if names.is_empty() {
+        let rp = cfg.resolve_provider_with(keys, active);
+        let mut models = provider::discover_models(client, &rp).await;
+        // Legacy/default models get the resolved provider tag so they route
+        // correctly; models already tagged (e.g. by an earlier aggregation run
+        // round-tripped through the session) keep their tag.
+        for m in &mut models {
+            if m.provider.is_empty() {
+                m.provider = rp.name.clone();
+            }
+        }
+        return models;
+    }
+    let mut merged: Vec<ModelInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for name in &names {
+        let Some(pc) = cfg.find_provider(name) else {
+            continue;
+        };
+        let rp = resolve_provider_from_config(pc, keys);
+        let mut discovered = provider::discover_models(client, &rp).await;
+        for m in &mut discovered {
+            m.provider = rp.name.clone();
+            if seen.insert((m.provider.clone(), m.id.clone())) {
+                merged.push(m.clone());
+            }
+        }
+    }
+    merged
 }
 
 // ============================================================================
@@ -661,16 +865,27 @@ async fn main() {
             stage.home.display()
         );
     }
-    let cfg = config::load();
+    let mut cfg = config::load();
+    // Auto-log-in to every first-party preset whose key is already in the
+    // environment (UMANS_API_KEY, OPENAI_API_KEY, ...), so providers show as
+    // logged in and their models appear in /models without a manual /login.
+    let auto_logged = config::auto_login_env_presets(&mut cfg);
+    if !auto_logged.is_empty() {
+        eprintln!("[umans] auto-logged in: {}", auto_logged.join(", "));
+    }
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("client");
 
-    // Discover models up front for the active provider (live endpoint, snapshot
-    // fallback). At init there are no runtime keys yet, so resolve from config.
+    // Discover models up front. In the multi-login model, models are aggregated
+    // across all logged-in providers (configured + key available) so `/models`
+    // can mix providers. At init there are no runtime keys yet beyond the
+    // persisted ones already in cfg, so this resolves from config/env.
     let init_provider = cfg.resolve_provider(&HashMap::new());
-    let models = provider::discover_models(&client, &init_provider).await;
+    let init_keys = cfg.persisted_keys.clone();
+    let models =
+        aggregate_models_for(&cfg, &init_keys, cfg.active_provider.as_deref(), &client).await;
     let logger = Logger::new(cfg.debug_log.as_deref());
     logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
 
@@ -815,6 +1030,7 @@ async fn main() {
                         .with("provider", json!(rp.name))
                         .with("providerKind", json!(rp.kind.as_str()))
                         .with("providers", json!(cfg.provider_names()))
+                        .with("providerPresets", json!(provider_presets_json(&cfg)))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("resumed_messages", json!(conv_len)),
                 );
@@ -859,7 +1075,9 @@ async fn main() {
             Command::SetKey { api_key, provider } => {
                 // Apply the key to a named provider, or to the active provider
                 // when no name is given (backward-compatible with the pre-provider
-                // single-key flow, which lands in the "default" slot).
+                // single-key flow, which lands in the "default" slot). Setting a
+                // key "logs in" that provider, so re-aggregate models so its
+                // models appear in `/models` alongside any others logged in.
                 let name = match provider {
                     Some(p) => p,
                     None => state.resolved_provider().await.name,
@@ -871,10 +1089,14 @@ async fn main() {
                         .with("ok", json!(true))
                         .with("provider", json!(name)),
                 );
+                state.refresh_models(&client).await;
             }
             Command::SetProvider { name } => {
-                // Switch the active provider at runtime, then re-discover models
-                // for the new endpoint. Unknown names are ignored (stays put).
+                // Set the default/fallback provider. In the multi-login model a
+                // turn routes to the selected model's provider; this only matters
+                // for model-less operations (compaction summarize) and legacy
+                // models without a provider tag. Re-aggregate (don't wipe other
+                // providers' models). Unknown names are ignored (stays put).
                 {
                     let cfg = state.cfg.read().await;
                     if cfg.find_provider(&name).is_none() {
@@ -887,10 +1109,6 @@ async fn main() {
                 }
                 *state.active_provider.write().await = Some(name.clone());
                 let rp = state.resolved_provider().await;
-                // Re-discover models for the new provider (bypass cache freshness
-                // by relying on the 8h TTL; switching is rare so a cache hit is fine).
-                let models = provider::discover_models(&client, &rp).await;
-                *state.models.write().await = models.clone();
                 state.logger.log(
                     "set_provider",
                     json!({ "provider": rp.name, "kind": rp.kind.as_str(), "base_url": rp.base_url }),
@@ -902,7 +1120,143 @@ async fn main() {
                         .with("base_url", json!(rp.base_url))
                         .with("has_key", json!(rp.api_key.is_some())),
                 );
-                emit(&Event::new("models").with("models", json!(models)));
+                state.refresh_models(&client).await;
+            }
+            Command::ListProviderPresets => {
+                let cfg = state.cfg.read().await;
+                emit(
+                    &Event::new("provider_presets")
+                        .with("presets", json!(provider_presets_json(&cfg))),
+                );
+            }
+            Command::Login { preset, api_key } => {
+                // Log in to a first-party provider from a preset: resolve the key
+                // (explicit arg → preset env var), insert/replace into config,
+                // seed the runtime key, persist, and re-aggregate models across
+                // all logged-in providers so this provider's models join `/models`.
+                // Multiple providers can be logged in at once.
+                let Some(p) = config::find_preset(&preset) else {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "unknown provider preset '{preset}'; available: openai, gemini, anthropic"
+                        )),
+                    ));
+                    return;
+                };
+                let key = api_key.or_else(|| p.env_key());
+                let pc = p.to_provider_config(key.clone());
+                let name = pc.name.clone();
+                // Insert or replace the provider in config.
+                {
+                    let mut cfg = state.cfg.write().await;
+                    if let Some(i) = cfg.providers.iter().position(|x| x.name == name) {
+                        cfg.providers[i] = pc.clone();
+                    } else {
+                        cfg.providers.push(pc.clone());
+                    }
+                }
+                // Seed the runtime key so the immediate turn works without a
+                // restart (only when a key was actually resolved).
+                if let Some(k) = &key {
+                    state.api_keys.write().await.insert(name.clone(), k.clone());
+                }
+                // Make the newly logged-in provider the default/fallback (used
+                // for model-less compaction and legacy models). This does NOT
+                // restrict routing — the selected model still routes to its own
+                // provider; it only picks the fallback.
+                *state.active_provider.write().await = Some(name.clone());
+                // Persist to the core-owned config.json (best-effort).
+                {
+                    let cfg = state.cfg.read().await;
+                    if let Err(e) = config::save_providers_config(&cfg.providers, Some(&name)) {
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "logged into '{}' for this session (could not persist to config.json: {e})",
+                                p.label
+                            )),
+                        ));
+                    }
+                }
+                let rp = state.resolved_provider().await;
+                state.logger.log(
+                    "login",
+                    json!({ "provider": name, "kind": p.kind.as_str(), "base_url": p.base_url, "has_key": key.is_some() }),
+                );
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(if key.is_some() {
+                        format!("logged into {} (key from {}).", p.label, p.resolved_env())
+                    } else {
+                        format!("logged into {}, but no API key found — export {} or /login again with a key.", p.label, p.resolved_env())
+                    }),
+                ));
+                emit(
+                    &Event::new("provider_changed")
+                        .with("provider", json!(rp.name))
+                        .with("kind", json!(rp.kind.as_str()))
+                        .with("base_url", json!(rp.base_url))
+                        .with("has_key", json!(rp.api_key.is_some())),
+                );
+                emit(
+                    &Event::new("authed")
+                        .with("ok", json!(key.is_some()))
+                        .with("provider", json!(name)),
+                );
+                state.refresh_models(&client).await;
+            }
+            Command::Logout { provider } => {
+                // Log out of a provider: drop its runtime key, remove it from the
+                // configured providers, persist, and re-aggregate models so its
+                // models disappear from `/models`. The persisted TUI key (in
+                // settings.json) is cleared by the TUI side.
+                let existed;
+                {
+                    let mut cfg = state.cfg.write().await;
+                    let before = cfg.providers.len();
+                    cfg.providers.retain(|p| p.name != provider);
+                    existed = cfg.providers.len() != before;
+                }
+                state.api_keys.write().await.remove(&provider);
+                if !existed && provider != "default" {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("not logged into '{provider}'"))),
+                    );
+                    return;
+                }
+                // If the active provider was the one logged out, clear the
+                // override so the fallback resolves to the first remaining / legacy.
+                {
+                    let active = state.active_provider.read().await.clone();
+                    if active.as_deref() == Some(provider.as_str()) {
+                        *state.active_provider.write().await = None;
+                    }
+                }
+                // Persist the trimmed provider list (keep the prior active if still present).
+                {
+                    let cfg = state.cfg.read().await;
+                    let active = cfg
+                        .find_provider(&provider)
+                        .map(|_| provider.clone())
+                        .or_else(|| cfg.providers.first().map(|p| p.name.clone()));
+                    let _ = config::save_providers_config(&cfg.providers, active.as_deref());
+                }
+                state.logger.log("logout", json!({ "provider": provider }));
+                emit(
+                    &Event::new("info")
+                        .with("message", json!(format!("logged out of '{}'", provider))),
+                );
+                let rp = state.resolved_provider().await;
+                emit(
+                    &Event::new("provider_changed")
+                        .with("provider", json!(rp.name))
+                        .with("kind", json!(rp.kind.as_str()))
+                        .with("base_url", json!(rp.base_url))
+                        .with("has_key", json!(rp.api_key.is_some())),
+                );
+                state.refresh_models(&client).await;
             }
             Command::SetApproval { mode } => {
                 let new = Approval::parse(&mode);
@@ -2038,7 +2392,7 @@ async fn run_turn(
                 dispatch_lifecycle(st, "pre_compact").await;
                 let est = { *st.estimated_tokens.lock().await };
                 let cfg = st.cfg.read().await.clone();
-                let rp = st.resolved_provider().await;
+                let rp = st.resolve_provider_for_model(&model).await;
                 let idle_ctx = st
                     .models
                     .read()
@@ -2102,17 +2456,20 @@ async fn run_turn(
             }
         }
 
-        // Resolve the active provider for this turn. Errors out if no API key is
-        // available for it (runtime override -> config literal -> env var).
+        // Resolve the provider for this turn. In the multi-login model the
+        // turn routes to the selected model's owning provider (so `/models`
+        // can mix providers); falls back to the active/legacy provider for
+        // models without a provider tag. Errors out if no API key is available
+        // for the resolved provider (runtime key -> config literal -> env var).
         let provider = {
-            let rp = st.resolved_provider().await;
+            let rp = st.resolve_provider_for_model(&model).await;
             match rp.api_key.as_ref() {
                 Some(_) => rp,
                 None => {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "no API key set for provider '{}'; use set_key first",
+                            "no API key set for provider '{}'; use /login to log in",
                             rp.name
                         )),
                     ));
@@ -2737,6 +3094,11 @@ async fn run_turn(
                         tokio::select! {
                             o = tools::execute_fetch(&exec_args, &cfg) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("fetch aborted"),
+                        }
+                    } else if name == "web_search" {
+                        tokio::select! {
+                            o = tools::execute_web_search(&exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("web_search aborted"),
                         }
                     } else if name == "diagnostics" {
                         tokio::select! {

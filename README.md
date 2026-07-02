@@ -104,7 +104,8 @@ below for each toolchain's requirements.
 ```
 
 In the TUI:
-- `/key sk-...`          set your Umans API key (https://app.umans.ai/billing → API Keys)
+- `/login`              log in / switch provider — OpenAI (Codex), Google Gemini, Anthropic
+- `/logout`             log out of a provider
 - `/model [N|substr]`    list models, or switch (`/model 3`, `/model glm-5.2`)
 - `/approval <mode>`     never | destructive | always
 - `/reset`               wipe conversation + current session file
@@ -115,6 +116,33 @@ In the TUI:
 - `Ctrl+C`               quit
 - when `⚠ APPROVE?` shows: `y` approve once · `a` approve and stop asking · `n` deny
 - anything else          sent as a prompt to the current model
+
+## Providers & login
+
+First-party providers are built-in and one click to set up. `/login` opens a
+picker of the bundled presets:
+
+| Preset | Kind | Endpoint | Key env var |
+|---|---|---|---|
+| **Umans (GLM-5.2)** | OpenAI | `api.code.umans.ai/v1` | `UMANS_API_KEY` |
+| **OpenAI (Codex)** | OpenAI | `api.openai.com/v1` | `OPENAI_API_KEY` |
+| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) |
+| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
+
+Picking a preset:
+- **key in the env var** → logs in instantly (`/login` sends `login` with no key);
+- **no key** → prompts you to paste one, then logs in.
+
+**Multiple simultaneous logins.** You can be logged into several providers at
+once — e.g. OpenAI + Gemini + Anthropic. `/models` then lists every logged-in
+provider's models, each tagged `[openai]`, `[gemini]`, `[anthropic]`. Select any
+model and that turn is routed to its provider's endpoint, so you can mix
+subscription models in one session. `/logout` drops a provider (its models
+leave `/models`). The original Umans provider still works as the default when no
+other is logged in.
+
+Keys are persisted per-provider (the env-var *name* is stored when a key came
+from the environment, so the secret never lands in a config file).
 
 ## Windows install (`ucli`)
 
@@ -149,7 +177,7 @@ msiexec /i ucli-<ver>-windows.msi /quiet     # silent
 
 The MSI is per-user (no admin), writes a clean Add/Remove Programs entry,
 and supports in-place upgrades (fixed `UpgradeCode`). Open a new PowerShell
-window after install and run `ucli` from any directory. First run: `/key sk-...`
+window after install and run `ucli` from any directory. First run: `/login`
 then `/model`.
 
 Prefer no install? Run the standalone `.exe` from anywhere — double-click
@@ -195,7 +223,7 @@ chmod +x umans-harness-0.2.0-macos-arm64
 # or: open ucli-0.2.0-macos-arm64.dmg, then double-click "Install ucli.command"
 ```
 
-Then `/key sk-...`, `/model`, and type a prompt. The workspace is the directory
+Then `/login`, `/model`, and type a prompt. The workspace is the directory
 you launched from — rerun from another folder to work on a different project.
 
 Build it yourself on Linux (zig is the macOS linker; no Xcode/SDK needed):
@@ -253,7 +281,7 @@ ELF you can rename and place on PATH, just like the standalone):
 sudo install -m 0755 ucli-0.2.0-x86_64.AppImage /usr/local/bin/ucli   # then run: ucli
 ```
 
-Then `/key sk-...`, `/model`, and type a prompt. The workspace is the directory
+Then `/login`, `/model`, and type a prompt. The workspace is the directory
 you launched from — rerun from another folder to work on a different project.
 
 `release-linux.sh` builds the core natively (`cargo --release`), embeds it into
@@ -275,8 +303,9 @@ Core reads commands from stdin, writes events to stdout, one JSON object per lin
 Commands (stdin):
 ```json
 {"type":"init"}
-{"type":"set_key","api_key":"sk-..."}
+{"type":"login","preset":"openai","api_key":"sk-..."}
 {"type":"send","prompt":"...","model":"umans-glm-5.2","reasoning_effort":"high"}
+{"type":"logout","provider":"openai"}
 {"type":"abort"}
 {"type":"reset"}
 {"type":"approve","request_id":"<id>","decision":"yes|no|always"}

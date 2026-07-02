@@ -200,7 +200,7 @@ fn builtin_agents() -> Vec<AgentConfig> {
         mk(
             "researcher",
             "Web/docs research with sources and a concise research brief",
-            "read_file, grep, glob, list_dir, bash, write_file, memory, intercom",
+            "read_file, grep, glob, list_dir, bash, write_file, memory, intercom, fetch, web_search",
             Some("low"),
             false,
             true,
@@ -637,6 +637,7 @@ fn all_tool_names() -> &'static [&'static str] {
         "patch",
         "diagnostics",
         "fetch",
+        "web_search",
         "subagent",
         "contact_supervisor",
         "intercom",
@@ -1701,6 +1702,12 @@ async fn dispatch_subagent_tool(
             tokio::select! {
                 o = tools::execute_fetch(&exec_args, cfg) => o,
                 _ = cancel.cancelled() => Outcome::err("fetch aborted"),
+            }
+        }
+        "web_search" => {
+            tokio::select! {
+                o = tools::execute_web_search(&exec_args, cfg) => o,
+                _ = cancel.cancelled() => Outcome::err("web_search aborted"),
             }
         }
         "contact_supervisor" => {

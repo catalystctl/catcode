@@ -29,6 +29,7 @@ export const initialState: AgentState = {
   escalatedKinds: [],
   workspace: "",
   projects: [],
+  providerPresets: [],
   selectedModel: null,
   thinkingLevel: "medium",
   messages: [],
@@ -318,9 +319,12 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         providerKind: ev.providerKind,
         approvalMode: ev.approval,
         workspace: ev.workspace,
+        providerPresets: ev.providerPresets ?? state.providerPresets,
       };
     case "models":
       return { ...state, models: ev.models ?? [] };
+    case "provider_presets":
+      return { ...state, providerPresets: ev.presets ?? [] };
     case "authed":
       return { ...state, authed: ev.ok };
     case "provider_changed":

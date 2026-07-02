@@ -6,6 +6,7 @@ use crate::workspace;
 use serde_json::{json, Value};
 
 pub use crate::fetch_tool::execute_fetch;
+pub use crate::search_tool::execute_web_search;
 
 /// ToolKind drives the approval gate in main.rs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,6 +21,7 @@ pub fn classify(name: &str) -> ToolKind {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
         | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
         | "memory" => ToolKind::ReadOnly,
+        "web_search" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -212,7 +214,7 @@ pub fn definitions() -> Vec<Value> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash","fetch"] },
+                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash","fetch","web_search"] },
                                     "args": { "type": "object" }
                                 },
                                 "required": ["name","args"]
@@ -382,6 +384,22 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "web_search",
+                "description": "Search the web via DuckDuckGo Lite (no API key, no JS). Returns the top results as a numbered list (title, url, snippet) plus a compact JSON array. Honors the same egress rules as fetch (--no-network / fetch_allowlist). Use for ad-hoc web research; pair with the fetch tool to read a result's full page. Read-only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "search query" },
+                        "count": { "type": "integer", "description": "max results to return (default 8, clamped 1-20)" },
+                        "region": { "type": "string", "description": "DDG region/locale code, e.g. us-en (default) or uk-en" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git_status",
                 "description": "Show the working-tree status (staged, unstaged, untracked) as `git status --short --branch`. Optional relative `path` limits the scope. Read-only.",
                 "parameters": {
@@ -510,6 +528,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "patch" => apply_patch(args, cfg),
         "diagnostics" => Outcome::err("diagnostics must be dispatched through execute_diagnostics (async)"),
         "fetch" => Outcome::err("fetch must be dispatched through execute_fetch (async)"),
+        "web_search" => Outcome::err("web_search must be dispatched through execute_web_search (async)"),
         "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
         "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
         "edit" => {
@@ -1706,6 +1725,8 @@ pub async fn execute_bulk(
             execute_bash(cmd, cfg, timeout_override).await
         } else if name == "fetch" {
             execute_fetch(&inner_args, cfg).await
+        } else if name == "web_search" {
+            execute_web_search(&inner_args, cfg).await
         } else {
             execute(&name, &inner_args, cfg)
         };

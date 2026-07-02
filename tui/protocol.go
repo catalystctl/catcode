@@ -26,6 +26,10 @@ type modelInfo struct {
 	// capabilities.supports_vision; only boolean true counts — "via-handoff"
 	// is not native client-side vision). Drives the vision-handoff plugin's routing.
 	Vision bool `json:"vision"`
+	// Provider is the owning provider name (e.g. "openai", "gemini",
+	// "anthropic"), populated by the core's multi-provider aggregation so
+	// /models can mix providers and each turn routes to the right endpoint.
+	Provider string `json:"provider"`
 }
 
 type intercomPrompt struct {
@@ -33,6 +37,23 @@ type intercomPrompt struct {
 	from      string
 	reason    string
 	message   string
+}
+
+// providerPreset is a built-in first-party provider template (OpenAI/Codex,
+// Gemini, Anthropic) advertised by the core via the `provider_presets` event
+// (and embedded in `ready`). The /login + /logout pickers use HasKey/Configured/
+// LoggedIn to show the right action and prompt for a key when none is set.
+type providerPreset struct {
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Kind        string   `json:"kind"`
+	BaseURL     string   `json:"base_url"`
+	EnvVar      string   `json:"envVar"`
+	AltEnvs     []string `json:"altEnvs"`
+	Description string   `json:"description"`
+	HasKey      bool     `json:"hasKey"`
+	Configured  bool     `json:"configured"`
+	LoggedIn    bool     `json:"loggedIn"`
 }
 
 type approvalPrompt struct {

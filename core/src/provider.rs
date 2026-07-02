@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 #[allow(dead_code)]
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
 const MODELS_INFO_PATH: &str = "/models/info";
+/// Standard OpenAI `/models` list endpoint (first-party OpenAI + Gemini's
+/// OpenAI-compatible shim). Used as a fallback when `/models/info` (Umans)
+/// isn't served by the endpoint.
+const OPENAI_MODELS_PATH: &str = "/models";
 const CHAT_PATH: &str = "/chat/completions";
 /// Anthropic Messages API requires an `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -261,6 +265,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 32768,
             thinking_levels: std(),
             vision: false,
+
+            ..Default::default()
         },
         ModelInfo {
             id: "umans-kimi-k2.5".into(),
@@ -270,6 +276,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 32768,
             thinking_levels: std(),
             vision: false,
+
+            ..Default::default()
         },
         ModelInfo {
             id: "umans-kimi-k2.6".into(),
@@ -279,6 +287,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 32768,
             thinking_levels: std(),
             vision: false,
+
+            ..Default::default()
         },
         ModelInfo {
             id: "umans-glm-5.1".into(),
@@ -288,6 +298,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 131072,
             thinking_levels: vec!["high".to_string()],
             vision: false,
+
+            ..Default::default()
         },
         ModelInfo {
             id: "umans-glm-5.2".into(),
@@ -297,6 +309,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 131072,
             thinking_levels: vec!["high".to_string()],
             vision: false,
+
+            ..Default::default()
         },
         ModelInfo {
             id: "umans-minimax-m2.5".into(),
@@ -306,6 +320,8 @@ fn fallback_models() -> Vec<ModelInfo> {
             max_tokens: 8192,
             thinking_levels: std(),
             vision: false,
+
+            ..Default::default()
         },
     ]
 }
@@ -350,6 +366,11 @@ async fn discover_models_openai(
     // 2. Fetch live from the endpoint. Auth is optional here (Umans /models/info
     // is public; custom OpenAI-compatible endpoints may gate it). Send the key
     // only when one is configured so an unauthenticated default still works.
+    //
+    // `/models/info` is Umans-specific (rich capabilities). First-party and
+    // other vanilla OpenAI-compatible endpoints don't serve it, so on a miss
+    // we fall back to the standard OpenAI `/models` list and synthesize
+    // ModelInfo with curated per-id capabilities.
     let url = format!("{}{MODELS_INFO_PATH}", provider.base_url);
     let mut req = client.get(&url).timeout(Duration::from_secs(5));
     if let Some(k) = provider.api_key.as_deref() {
@@ -358,16 +379,40 @@ async fn discover_models_openai(
     let live = match req.send().await {
         Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
             Ok(v) => v,
-            Err(_) => {
-                // HTTP ok but JSON parse failed — fall back to stale cache.
-                return read_models_cache_stale(cache_key).unwrap_or_else(fallback_models);
-            }
+            Err(_) => Value::Null,
         }),
-        _ => {
-            // HTTP failed — fall back to stale cache.
-            return read_models_cache_stale(cache_key).unwrap_or_else(fallback_models);
-        }
+        _ => Vec::new(),
     };
+
+    // 2b. /models/info miss (non-Umans endpoint) → standard OpenAI `/models`.
+    if live.is_empty() {
+        let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
+        let mut req = client.get(&url).timeout(Duration::from_secs(8));
+        if let Some(k) = provider.api_key.as_deref() {
+            req = req.bearer_auth(k);
+        }
+        for (k, v) in &provider.headers {
+            req = req.header(k, v);
+        }
+        if let Ok(r) = req.send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    let listed = parse_openai_models_list(&v);
+                    if !listed.is_empty() {
+                        write_models_cache(cache_key, &listed);
+                        return listed;
+                    }
+                }
+            }
+        }
+    }
+
+    if live.is_empty() {
+        // Neither endpoint served a usable list — stale cache, else curated
+        // fallbacks for the vendor (Gemini host → Gemini models, else Umans).
+        return read_models_cache_stale(cache_key)
+            .unwrap_or_else(|| openai_fallback_models(&provider.base_url));
+    }
 
     // 3. Write fresh data to disk cache.
     write_models_cache(cache_key, &live);
@@ -490,6 +535,8 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
             max_tokens,
             thinking_levels,
             vision,
+
+            ..Default::default()
         });
     }
     if out.is_empty() {
@@ -564,14 +611,127 @@ fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                 max_tokens: mt,
                 thinking_levels,
                 vision,
+
+                ..Default::default()
             });
         }
     }
     if out.is_empty() {
-        fallback_models()
+        Vec::new()
     } else {
         out
     }
+}
+
+/// Parse the standard OpenAI `GET /models` list (`{data:[{id,...}]}`) into
+/// ModelInfo, applying curated per-id capabilities for known OpenAI and Gemini
+/// model families. The `/models` endpoint returns only ids (no context window /
+/// max tokens), so we synthesize those from known families and fall back to
+/// conservative defaults for unknown ids. `base_url` selects curated fallbacks.
+fn parse_openai_models_list(data: &Value) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = m
+                .get("name")
+                .or_else(|| m.get("display_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            Some(openai_model_caps(&id, &name))
+        })
+        .collect();
+    if out.is_empty() {
+        return Vec::new();
+    }
+    // de-dup by id, preserve order
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
+/// Curated capabilities for an OpenAI- or Gemini-family model id. Returns
+/// conservative defaults (ctx 200k, max 8k, reasoning true, vision false) for
+/// unknown ids so an unrecognized model still works.
+#[allow(clippy::if_same_then_else)]
+fn openai_model_caps(id: &str, name: &str) -> ModelInfo {
+    let l = id.to_ascii_lowercase();
+    let std_levels: Vec<String> = DEFAULT_THINKING_LEVELS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    // (context_window, max_tokens, reasoning, vision, thinking_levels)
+    let (ctx, max, reasoning, vision, levels): (u32, u32, bool, bool, Vec<String>) =
+        if l.contains("gpt-5-codex") {
+            (272_144, 163_840, true, true, std_levels.clone())
+        } else if l.contains("gpt-5") {
+            (272_144, 128_000, true, true, std_levels.clone())
+        } else if l.contains("o4-mini") {
+            (200_000, 100_000, true, true, std_levels.clone())
+        } else if l.starts_with("o4") || l.contains("o4-") {
+            (200_000, 100_000, true, true, std_levels.clone())
+        } else if l.starts_with("o3") || l.contains("o3-") {
+            (200_000, 100_000, true, false, std_levels.clone())
+        } else if l.contains("o1") {
+            (200_000, 100_000, true, false, vec!["high".to_string()])
+        } else if l.contains("gpt-4.1") {
+            (1_047_576, 32_768, false, true, Vec::new())
+        } else if l.contains("gpt-4o") {
+            (128_000, 16_384, false, true, Vec::new())
+        } else if l.contains("gemini-2.5-pro") || l.contains("gemini-2.5") {
+            (1_048_576, 65_536, true, true, std_levels.clone())
+        } else if l.contains("gemini-2.5-flash") {
+            (1_048_576, 65_536, true, true, std_levels.clone())
+        } else if l.contains("gemini-2.0-flash") {
+            (1_048_576, 8_192, false, true, Vec::new())
+        } else if l.contains("gemini") {
+            (1_048_576, 8_192, false, true, Vec::new())
+        } else {
+            (200_000, 8_192, true, false, Vec::new())
+        };
+    ModelInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        reasoning,
+        context_window: ctx,
+        max_tokens: max,
+        thinking_levels: levels,
+        vision,
+        ..Default::default()
+    }
+}
+
+/// True when the base URL points at Google's Gemini OpenAI-compatible endpoint.
+fn is_gemini_endpoint(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "generativelanguage.googleapis.com"
+}
+
+/// Curated fallback models for an OpenAI-compatible endpoint that served no
+/// list at all. Gemini host → Gemini models; otherwise the Umans default list.
+fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
+    if is_gemini_endpoint(base_url) {
+        return gemini_fallback_models();
+    }
+    fallback_models()
+}
+
+/// Static Gemini model list used when the Gemini OpenAI-compatible endpoint
+/// is unreachable.
+fn gemini_fallback_models() -> Vec<ModelInfo> {
+    let ids = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"];
+    ids.iter().map(|id| openai_model_caps(id, id)).collect()
 }
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
@@ -2156,6 +2316,7 @@ fn anthropic_model_caps(id: &str, name: &str) -> ModelInfo {
             Vec::new()
         },
         vision,
+        ..Default::default()
     }
 }
 

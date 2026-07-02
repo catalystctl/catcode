@@ -34,7 +34,8 @@ export const COMMANDS: CommandDef[] = [
   { label: "/approval", desc: "never · destructive · always", category: "config", action: "approval" },
   { label: "/settings", desc: "open settings modal", category: "config", action: "settings" },
   { label: "/theme", desc: "switch colour theme", category: "config", action: "theme" },
-  { label: "/key", desc: "set API key", category: "config", action: "key" },
+  { label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)", category: "config", action: "login" },
+  { label: "/logout", desc: "log out of a provider", category: "config", action: "logout" },
 
   // ── Agent ──
   { label: "/steer", desc: "steer an in-flight turn", category: "agent", action: "steer", streaming: true },

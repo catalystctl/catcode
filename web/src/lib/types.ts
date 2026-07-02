@@ -17,6 +17,24 @@ export interface ModelInfo {
   /** Thinking levels the model advertises (e.g. ["low","medium","high"]). */
   thinking_levels: string[];
   vision: boolean;
+  /** Owning provider name (e.g. "openai", "gemini", "anthropic"), populated by
+   * the core's multi-provider aggregation so a turn routes to the right endpoint
+   * when multiple providers are logged in. Empty for legacy single-provider models. */
+  provider?: string;
+}
+
+/** A built-in first-party provider template advertised by the core. */
+export interface ProviderPreset {
+  id: string;
+  label: string;
+  kind: string;
+  base_url: string;
+  envVar: string;
+  altEnvs?: string[];
+  description: string;
+  hasKey: boolean;
+  configured: boolean;
+  loggedIn: boolean;
 }
 
 export interface ReadyPayload {
@@ -29,6 +47,7 @@ export interface ReadyPayload {
   provider: string;
   providerKind: string;
   providers: string[];
+  providerPresets?: ProviderPreset[];
   bash_timeout_secs: number;
   resumed_messages: number;
 }
@@ -140,6 +159,7 @@ export interface VisionConfig {
 export type CoreEvent =
   | ReadyPayload
   | { type: "models"; models: ModelInfo[] }
+  | { type: "provider_presets"; presets: ProviderPreset[] }
   | { type: "authed"; ok: boolean; provider: string }
   | { type: "provider_changed"; provider: string; kind: string; base_url: string; has_key: boolean }
   | { type: "approval_changed"; mode: string } // "destructive" | "always" | "<kind>:always"
@@ -200,6 +220,9 @@ export type CoreCommand =
   | { type: "set_approval"; mode: "never" | "destructive" | "always" }
   | { type: "set_key"; api_key: string; provider?: string }
   | { type: "set_provider"; name: string }
+  | { type: "list_provider_presets" }
+  | { type: "login"; preset: string; api_key?: string }
+  | { type: "logout"; provider: string }
   | { type: "list_sessions" }
   | { type: "load_session"; path: string }
   | { type: "new_session"; path?: string }
@@ -348,6 +371,9 @@ export interface AgentState {
   workspace: string;
   /** Known workspace projects (for the project picker). */
   projects: ProjectEntry[];
+  /** First-party provider presets (OpenAI/Codex, Gemini, Anthropic) from the
+   * core, used by the /login + /logout pickers. */
+  providerPresets: ProviderPreset[];
   selectedModel: string | null;
   thinkingLevel: string;
   messages: UIMessage[];

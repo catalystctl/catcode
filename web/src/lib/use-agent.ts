@@ -47,6 +47,10 @@ export interface AgentApi {
   abort: () => Promise<void>;
   approve: (decision: "yes" | "no" | "always") => Promise<void>;
   setKey: (key: string) => Promise<void>;
+  setProvider: (name: string) => Promise<void>;
+  login: (preset: string, key?: string) => Promise<void>;
+  logout: (provider: string) => Promise<void>;
+  listProviderPresets: () => Promise<void>;
   setModel: (id: string) => void;
   setThinking: (level: string) => void;
   setApproval: (mode: "never" | "destructive" | "always") => Promise<void>;
@@ -328,6 +332,33 @@ export function useAgent(): AgentApi {
     [send, post],
   );
 
+  // Log in to a first-party provider (OpenAI/Codex, Gemini, Anthropic). When
+  // no key is passed the core reads it from the preset's standard env var.
+  // Multiple providers can be logged in at once; the core re-aggregates models
+  // so the provider's models appear in /models alongside any others.
+  const login = useCallback(
+    async (preset: string, key?: string) => {
+      await send({ type: "login", preset, api_key: key });
+    },
+    [send],
+  );
+
+  // Switch the default/fallback provider (a turn still routes per-model, but
+  // compaction/legacy fallback uses this one).
+  const setProvider = useCallback(async (name: string) => {
+    await send({ type: "set_provider", name });
+  }, [send]);
+
+  // Log out of a provider: the core drops its key/config and re-aggregates.
+  const logout = useCallback(async (provider: string) => {
+    await send({ type: "logout", provider });
+  }, [send]);
+
+  // Ask the core for the latest preset list (configured/hasKey/loggedIn flags).
+  const listProviderPresets = useCallback(async () => {
+    await post({ type: "list_provider_presets" });
+  }, [post]);
+
   const setModel = useCallback((id: string) => {
     lsSet("umans:model", id);
     setState((s) => reduce(s, { type: "_select_model", id }));
@@ -550,6 +581,10 @@ export function useAgent(): AgentApi {
       abort,
       approve,
       setKey,
+      setProvider,
+      login,
+      logout,
+      listProviderPresets,
       setModel,
       setThinking,
       setApproval,

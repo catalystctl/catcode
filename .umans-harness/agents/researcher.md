@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Web/docs research with sources and a concise research brief
-tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom
+tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom, fetch, web_search
 thinking: low
 systemPromptMode: replace
 inheritProjectContext: true

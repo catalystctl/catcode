@@ -69,6 +69,8 @@ type session struct {
 	providerKind    string
 	providers       []string
 	providerHasKey  bool
+	providerPresets []providerPreset
+	pendingLogin   string // preset id awaiting a pasted API key in the /login modal
 
 	settings *settingsStore
 	modal    modal
