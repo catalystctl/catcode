@@ -329,12 +329,21 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     (index: number) => {
       const item = cmdItems[index];
       if (!item) return;
-      // /skill:<name> entries are dynamic (not in the static COMMANDS set);
-      // dispatch them through onSkill directly.
+      // /skill:<name> — insert into the composer (with a trailing space) instead
+      // of dispatching immediately, so the user can append a task message and
+      // send them as one turn. Press Enter again to run the bare skill with no
+      // task. (The submit() path parses "/skill:<name> [task]" on Enter, so the
+      // bare token and token+task both work once it's in the input.)
       if (item.id.startsWith("/skill:")) {
-        onSkill(item.id.slice("/skill:".length));
-        setText("");
+        const inserted = `/skill:${item.id.slice("/skill:".length)} `;
+        setText(inserted);
         closeFlyouts();
+        requestAnimationFrame(() => {
+          const e = taRef.current;
+          if (!e) return;
+          e.setSelectionRange(inserted.length, inserted.length);
+          e.focus();
+        });
         return;
       }
       const def = COMMANDS.find((c) => c.label === item.id);
@@ -344,7 +353,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         closeFlyouts();
       }
     },
-    [cmdItems, onCommand, onSkill, closeFlyouts],
+    [cmdItems, onCommand, closeFlyouts],
   );
 
   // Insert a file mention: replace @query with the file path.

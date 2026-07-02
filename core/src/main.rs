@@ -270,6 +270,12 @@ pub struct State {
     pub last_turn_metrics: Mutex<Option<TurnMetrics>>,
     /// True after compaction until the next sanitization pass.
     pub needs_sanitize: Mutex<bool>,
+    /// Rolling, KV-cache-aware work-state summary (goal / done / in-progress /
+    /// next / recent files). Maintained incrementally from conversation signals
+    /// and injected as a TRANSIENT tail system message before every request —
+    /// never persisted — so it never invalidates the cached conversation prefix.
+    /// See the `WorkState` block comment for the full cache strategy.
+    pub work_state: Mutex<WorkState>,
     /// Intercom bus: in-process mailboxes for subagent ↔ orchestrator and
     /// subagent ↔ subagent coordination.
     pub intercom: IntercomBus,
@@ -335,6 +341,301 @@ impl State {
     }
 }
 
+// ============================================================================
+// Rolling, KV-cache-aware work-state summary
+// ============================================================================
+// A live summary of what the session is working on (goal / done / in-progress
+// / next / recently-touched files), maintained incrementally from conversation
+// signals — `todo_write` (the structured backbone), the user's first substantive
+// message (the goal), and file-edit tool calls — with NO model call, so it is
+// free and deterministic.
+//
+// It is injected as a TRANSIENT tail `system` message right before every model
+// request, then stripped: never stored in `conversation`, never persisted to
+// the session file. This is the KV-cache strategy:
+//
+//   * The persisted conversation is strictly append-only from the provider's
+//     point of view, so its prefix `[system][u1][a1]…]` is byte-identical turn
+//     to turn → the provider's prefix cache hits on everything already sent.
+//   * The work-state is the LAST message each turn, so updating it invalidates
+//     nothing earlier in the prefix; only the small work-state (~200-400
+//     tokens) plus the new turn are prefilled. Contrast with injecting it into
+//     the system prompt (position 0), which would invalidate the ENTIRE cache
+//     on every change.
+//   * Because it is transient, a resumed session never accumulates a trail of
+//     stale summaries; the live state is rebuilt from the next signals.
+//
+// The compaction summary (model-generated, in the prefix) covers dropped
+// history; this rolling state covers the CURRENT state. They complement each
+// other: the deep summary is cached and changes only on compaction; the
+// rolling state changes often but lives at the cheap tail.
+
+/// Rolling work-state summary. See the block comment above for the cache
+/// strategy. Updated by the signal helpers below and rendered into the
+/// transient tail message by `work_state_message`.
+#[derive(Clone, Default)]
+pub struct WorkState {
+    pub goal: String,
+    pub done: Vec<String>,
+    pub in_progress: Vec<String>,
+    pub next: Vec<String>,
+    pub recent_files: Vec<String>,
+    pub last_activity: String,
+    pub version: u64,
+}
+
+impl WorkState {
+    /// Render as a compact, model-facing system block. Empty sections are
+    /// omitted so the block stays minimal; each list is capped so a runaway
+    /// plan can't bloat every request.
+    pub fn render(&self) -> String {
+        const MAX_LIST: usize = 6;
+        const MAX_FILES: usize = 8;
+        let mut out = String::from(
+            "[Work state — ambient status the harness keeps current via todo_write \
+             and file edits. Use it as context; respond to the user's latest message, \
+             not to this block. Keep it accurate by updating todos as you work.]",
+        );
+        out.push_str("\nGoal: ");
+        let goal = if self.goal.is_empty() {
+            "(not yet stated)".to_string()
+        } else {
+            truncate_str(self.goal.as_str(), 240)
+        };
+        out.push_str(&goal);
+        {
+            let mut section = |label: &str, items: &[String]| {
+                if items.is_empty() {
+                    return;
+                }
+                out.push('\n');
+                out.push_str(label);
+                for it in items.iter().take(MAX_LIST) {
+                    out.push_str("\n- ");
+                    out.push_str(&truncate_str(it, 160));
+                }
+                if items.len() > MAX_LIST {
+                    out.push_str(&format!("\n- … +{} more", items.len() - MAX_LIST));
+                }
+            };
+            section("Done:", &self.done);
+            section("In progress:", &self.in_progress);
+            section("Next:", &self.next);
+        }
+        if !self.recent_files.is_empty() {
+            out.push_str("\nRecently touched: ");
+            let files: Vec<String> = self
+                .recent_files
+                .iter()
+                .take(MAX_FILES)
+                .map(|s| truncate_str(s, 120))
+                .collect();
+            out.push_str(&files.join(", "));
+        }
+        if !self.last_activity.is_empty() {
+            out.push_str("\nLast: ");
+            out.push_str(&truncate_str(&self.last_activity, 160));
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.goal.is_empty()
+            && self.done.is_empty()
+            && self.in_progress.is_empty()
+            && self.next.is_empty()
+            && self.recent_files.is_empty()
+            && self.last_activity.is_empty()
+    }
+
+    fn touch(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Partition a `todo_write` payload into done/in-progress/next. Pure logic
+    /// (no locking/emit) so it is unit-testable; the async wrapper adds those.
+    pub fn sync_from_todos(&mut self, todos: &[Value]) {
+        let mut done = Vec::new();
+        let mut in_progress = Vec::new();
+        let mut next = Vec::new();
+        for t in todos {
+            let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            if subject.is_empty() {
+                continue;
+            }
+            match t.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                "completed" => done.push(subject.to_string()),
+                "in_progress" => in_progress.push(subject.to_string()),
+                _ => next.push(subject.to_string()),
+            }
+        }
+        self.done = done;
+        self.in_progress = in_progress;
+        self.next = next;
+        self.touch();
+    }
+
+    /// Record file paths touched (most-recent-first, deduped, capped) and a
+    /// short last-activity note. Pure logic; the async wrapper extracts paths.
+    pub fn record_files(&mut self, tool: &str, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        // Iterate in reverse so the FIRST-listed (primary) path lands at the
+        // front of the most-recent-first list — "Recently touched: a.rs, b.rs"
+        // reads naturally when a.rs was the edit's primary target.
+        for p in paths.iter().rev() {
+            if let Some(pos) = self.recent_files.iter().position(|x| x == p) {
+                self.recent_files.remove(pos);
+            }
+            self.recent_files.insert(0, p.clone());
+        }
+        self.recent_files.truncate(8);
+        let act = format!("{} {}", tool, paths.join(", "));
+        self.last_activity = truncate_str(&act, 160);
+        self.touch();
+    }
+}
+
+/// Emit a `work_state` event with the current rolling summary so the TUI/web
+/// can render a live status panel alongside the conversation.
+async fn emit_work_state(st: &State) {
+    let ws = st.work_state.lock().await.clone();
+    emit(
+        &Event::new("work_state")
+            .with("version", json!(ws.version))
+            .with("goal", json!(ws.goal))
+            .with("done", json!(ws.done))
+            .with("in_progress", json!(ws.in_progress))
+            .with("next", json!(ws.next))
+            .with("recent_files", json!(ws.recent_files))
+            .with("last_activity", json!(ws.last_activity)),
+    );
+}
+
+/// Seed the work-state goal from a user prompt (the first substantive message).
+/// Subsequent calls are no-ops once a goal is set, so the goal reflects the
+/// session's original intent rather than every follow-up. Slash commands and
+/// trivially short prompts are ignored so they don't pin the goal.
+async fn maybe_seed_work_state_goal(st: &State, prompt: &str) {
+    let p = prompt.trim();
+    if p.is_empty() || p.starts_with('/') || p.chars().count() < 8 {
+        return;
+    }
+    let mut ws = st.work_state.lock().await;
+    if !ws.goal.is_empty() {
+        return;
+    }
+    ws.goal = truncate_str(p.lines().next().unwrap_or(p), 240);
+    ws.touch();
+    drop(ws);
+    emit_work_state(st).await;
+}
+
+/// Mirror a `todo_write` payload into the work-state's done/in-progress/next
+/// lists. The todo list IS the structured work state; this keeps the rolling
+/// summary in sync so the model sees current progress every turn without a
+/// `todo_read` round-trip.
+async fn sync_work_state_from_todos(st: &State, args: &Value) {
+    let Some(todos) = args.get("todos").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let mut ws = st.work_state.lock().await;
+    ws.sync_from_todos(todos);
+    drop(ws);
+    emit_work_state(st).await;
+}
+
+/// Record a file touch from a write/edit/patch/bulk_* call into the work-state
+/// recent-files list (most-recent-first, deduped, capped). Keeps the rolling
+/// summary aware of what the session has actually changed.
+async fn record_file_touch(st: &State, tool: &str, args: &Value) {
+    let paths: Vec<String> = match tool {
+        "bulk_write" | "bulk_edit" => args
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("path").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let mut ws = st.work_state.lock().await;
+    ws.record_files(tool, &paths);
+    drop(ws);
+    emit_work_state(st).await;
+}
+
+/// Build the transient work-state system message, or `None` when disabled or
+/// when there is no state to show yet. The caller pushes it as the LAST message
+/// before the model request and pops it right after, so it never reaches the
+/// persisted conversation or the session file — the conversation prefix stays
+/// byte-identical turn to turn and the provider's prefix cache is never
+/// invalidated by it.
+async fn work_state_message(st: &State) -> Option<Value> {
+    if !st.cfg.read().await.rolling_state {
+        return None;
+    }
+    let ws = st.work_state.lock().await;
+    if ws.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": "system", "content": ws.render() }))
+}
+
+/// Reset the rolling work-state (new session / reset / clear / undo / load).
+/// Emits an empty `work_state` so frontends clear their panel.
+async fn clear_work_state(st: &State) {
+    *st.work_state.lock().await = WorkState::default();
+    emit_work_state(st).await;
+}
+
+/// Persist cumulative session stats to the `<session>.stats` sidecar so `/stats`
+/// survives a restart. Called at turn completion (after `record_turn`).
+async fn persist_stats(st: &State) {
+    let Some(p) = st.cfg.read().await.session_file.clone() else {
+        return;
+    };
+    let stats = session::SessionStats {
+        tokens_in: *st.tokens_in.lock().await,
+        tokens_out: *st.tokens_out.lock().await,
+        cached_tokens: *st.cached_tokens.lock().await,
+        turns: st.logger.turn_count(),
+    };
+    session::save_stats(&p, &stats);
+}
+
+/// Zero the cumulative stats in memory and on the sidecar (reset / clear /
+/// new session) so a fresh conversation doesn't carry a prior session's totals.
+async fn reset_stats(st: &State) {
+    *st.tokens_in.lock().await = 0;
+    *st.tokens_out.lock().await = 0;
+    *st.cached_tokens.lock().await = 0;
+    st.logger.set_turns(0);
+    if let Some(p) = st.cfg.read().await.session_file.clone() {
+        session::save_stats(&p, &session::SessionStats::default());
+    }
+}
+
+/// Restore cumulative stats from a session's sidecar into memory (load_session /
+/// init), so switching/resuming a session shows its real totals.
+async fn restore_stats(st: &State, session_path: &std::path::Path) {
+    let s = session::load_stats(session_path);
+    *st.tokens_in.lock().await = s.tokens_in;
+    *st.tokens_out.lock().await = s.tokens_out;
+    *st.cached_tokens.lock().await = s.cached_tokens;
+    st.logger.set_turns(s.turns);
+}
+
 /// Generate a unique filename for a new session file. std has no date
 /// formatting; the picker shows the derived title, not the filename, so a
 /// monotonic nanos id is fine. Used only as a fallback when the TUI does not
@@ -383,6 +684,15 @@ async fn main() {
         },
         None => (Vec::new(), None),
     };
+    // Persisted cumulative stats travel with the session file (sidecar
+    // <session>.stats) so `/stats` survives a restart — previously in-memory
+    // only, so reopening showed zeros for tokens/turns.
+    let init_stats: session::SessionStats = cfg
+        .session_file
+        .as_ref()
+        .map(|p| session::load_stats(p.as_path()))
+        .unwrap_or_default();
+    logger.set_turns(init_stats.turns);
     // Persisted "always" approval escalations travel with the session file
     // (sidecar <session>.escalations) so a restart doesn't un-gate kinds the
     // user already approved.
@@ -427,9 +737,9 @@ async fn main() {
         handle: Mutex::new(None),
         pending: Mutex::new(std::collections::HashMap::new()),
         logger,
-        tokens_in: Mutex::new(0),
-        tokens_out: Mutex::new(0),
-        cached_tokens: Mutex::new(0),
+        tokens_in: Mutex::new(init_stats.tokens_in),
+        tokens_out: Mutex::new(init_stats.tokens_out),
+        cached_tokens: Mutex::new(init_stats.cached_tokens),
         escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
         plugin_manager: PluginManager::new_with_global_plugins(
@@ -445,6 +755,7 @@ async fn main() {
         last_model: Mutex::new(None),
         last_turn_metrics: Mutex::new(None),
         needs_sanitize: Mutex::new(sanitize_on_resume),
+        work_state: Mutex::new(WorkState::default()),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
     });
@@ -644,12 +955,16 @@ async fn main() {
                     session::rewrite(p, &[]);
                 }
                 state.invalidate_real_token_baseline().await;
+                clear_work_state(&state).await;
+                reset_stats(&state).await;
                 emit(&Event::new("reset"));
             }
             Command::Clear => {
                 // In-memory only: keep the session file so a restart can still resume.
                 state.conversation.lock().await.clear();
                 state.invalidate_real_token_baseline().await;
+                clear_work_state(&state).await;
+                reset_stats(&state).await;
                 emit(&Event::new("reset"));
             }
             Command::Undo => {
@@ -670,6 +985,7 @@ async fn main() {
                 drop(conv);
                 // The dropped turn invalidates the real baseline's length anchor.
                 state.invalidate_real_token_baseline().await;
+                clear_work_state(&state).await;
                 emit(&Event::new("reset")); // TUI clears blocks; core keeps the trimmed conv
             }
             Command::Compact => {
@@ -792,6 +1108,9 @@ async fn main() {
                     }
                 };
                 *state.conversation.lock().await = loaded.clone();
+                // Restore the loaded session's cumulative stats so `/stats` shows
+                // its real totals, not the prior session's.
+                restore_stats(&state, &p).await;
                 // Point the session_file at the loaded path so future appends go there.
                 state.cfg.write().await.session_file = Some(p);
                 emit(&Event::new("reset"));
@@ -806,6 +1125,7 @@ async fn main() {
                 // Loaded history has no known real token count yet; the next
                 // request's `usage` will re-establish the baseline.
                 state.invalidate_real_token_baseline().await;
+                clear_work_state(&state).await;
                 emit(
                     &Event::new("history")
                         .with("messages", json!(visible))
@@ -851,7 +1171,10 @@ async fn main() {
                 session::ensure(&new_path);
                 *state.conversation.lock().await = Vec::new();
                 state.invalidate_real_token_baseline().await;
+                clear_work_state(&state).await;
                 state.cfg.write().await.session_file = Some(new_path.clone());
+                // Fresh session: zero the cumulative stats (in memory + sidecar).
+                reset_stats(&state).await;
                 state.logger.log(
                     "new_session",
                     json!({ "path": new_path.display().to_string() }),
@@ -863,10 +1186,30 @@ async fn main() {
                 ));
             }
             Command::Stats => {
-                let ti = *state.tokens_in.lock().await;
-                let to = *state.tokens_out.lock().await;
+                // Cumulative REAL usage (billing totals — accurate by construction:
+                // each turn adds the endpoint's actual prompt/completion tokens).
+                let ti = *state.tokens_in.lock().await; // cumulative prompt
+                let to = *state.tokens_out.lock().await; // cumulative output
                 let cached = *state.cached_tokens.lock().await;
                 let turns = state.logger.turn_count();
+                let cache_hit_ratio = if ti > 0 {
+                    cached as f64 / ti as f64
+                } else {
+                    0.0
+                };
+                // `tokens_in` = the CURRENT real context — the SAME grounded
+                // estimate the footer uses (real prompt_tokens + small delta) — so
+                // /stats "in" matches the footer instead of the cumulative prompt,
+                // which re-sums the whole prefix every turn and looks inflated next
+                // to it. The cumulative prompt is still exposed as `total_in` for
+                // billing and the cache ratio.
+                let ctx = {
+                    let conv = state.conversation.lock().await;
+                    let last_real = *state.last_real_prompt_tokens.lock().await;
+                    let len_at = *state.conv_len_at_last_real.lock().await;
+                    grounded_estimate(&conv, last_real, len_at)
+                };
+                let msg_count = state.conversation.lock().await.len();
                 let session_file = state
                     .cfg
                     .read()
@@ -877,12 +1220,14 @@ async fn main() {
                     .unwrap_or_default();
                 emit(
                     &Event::new("stats")
-                        .with("tokens_in", json!(ti))
-                        .with("tokens_out", json!(to))
-                        .with("tokens_total", json!(ti + to))
+                        .with("tokens_in", json!(ctx)) // current context (footer match)
+                        .with("tokens_out", json!(to)) // cumulative output
+                        .with("total_in", json!(ti)) // cumulative prompt (billing)
+                        .with("tokens_total", json!(ti + to)) // cumulative in+out
                         .with("cached_tokens", json!(cached))
+                        .with("cache_hit_ratio", json!(cache_hit_ratio))
                         .with("turns", json!(turns))
-                        .with("messages", json!(state.conversation.lock().await.len()))
+                        .with("messages", json!(msg_count))
                         .with("session_file", json!(session_file)),
                 );
             }
@@ -1553,6 +1898,10 @@ async fn run_turn(
         *st.estimated_tokens.lock().await += init_est_add;
     }
 
+    // Seed the rolling work-state's goal from the user's first substantive
+    // prompt. No-op once a goal is set; slash commands / tiny prompts ignored.
+    maybe_seed_work_state_goal(st, &prompt).await;
+
     // Vision handoff (pre_turn hook): let plugins inspect the upcoming turn
     // (model + attached images) and optionally remap the model before the first
     // request. Advisory — a broken/missing hook or `allow:false` never blocks
@@ -1901,6 +2250,15 @@ async fn run_turn(
             *st.last_real_prompt_tokens.lock().await,
             *st.conv_len_at_last_real.lock().await,
         );
+        // KV-cache-aware rolling work-state: inject as a TRANSIENT tail system
+        // message (never persisted) so the conversation prefix stays byte-identical
+        // turn to turn and the provider's prefix cache is never invalidated by
+        // it. It is the LAST message, so updating it invalidates nothing earlier
+        // in the prefix; only the small work-state + the new turn are prefilled.
+        let ws_msg = work_state_message(st).await;
+        if let Some(msg) = &ws_msg {
+            messages.push(msg.clone());
+        }
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
             match provider::stream_turn(
                 client,
@@ -1931,6 +2289,15 @@ async fn run_turn(
                     return;
                 }
             };
+
+        // Strip the transient work-state before recording the token baseline so
+        // conv_len_at_last_real reflects the persisted conversation length
+        // (without the transient message) and grounded_estimate's delta slice
+        // stays correct. On the error path above we `return` first, so the
+        // transient message is simply dropped along with `messages`.
+        if ws_msg.is_some() {
+            messages.pop();
+        }
 
         // Anchor all future estimates on the endpoint's REAL `prompt_tokens` —
         // the exact count of `messages` as the model tokenized it (system +
@@ -2407,6 +2774,20 @@ async fn run_turn(
                         }
                     }
 
+                    // Rolling work-state: mirror todo_write + file edits into the
+                    // KV-cache-aware summary so the model sees current work state
+                    // every turn without a tool call. Only on success so a failed
+                    // write doesn't pollute the recent-files list.
+                    if outcome.ok {
+                        match name.as_str() {
+                            "todo_write" => sync_work_state_from_todos(st, &exec_args).await,
+                            "write_file" | "edit" | "patch" | "bulk_write" | "bulk_edit" => {
+                                record_file_touch(st, &name, &exec_args).await
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Dispatch post-execution hooks for this tool.
                     let post_hook = match name.as_str() {
                         "bash" => "post_bash",
@@ -2465,6 +2846,7 @@ async fn run_turn(
                         );
                         st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                         st.logger.record_turn();
+                        persist_stats(st).await;
                         emit(&Event::new("done"));
                         return;
                     }
@@ -2523,6 +2905,7 @@ async fn run_turn(
                 );
                 st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                 st.logger.record_turn();
+                persist_stats(st).await;
                 emit(&Event::new("done"));
                 return;
             }
@@ -3519,5 +3902,119 @@ mod compact_tests {
                 .count(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod work_state_tests {
+    use super::*;
+
+    fn todo(subject: &str, status: &str) -> Value {
+        json!({ "subject": subject, "status": status })
+    }
+
+    #[test]
+    fn render_empty_shows_placeholder_and_omits_sections() {
+        let ws = WorkState::default();
+        assert!(ws.is_empty());
+        let r = ws.render();
+        assert!(r.contains("Goal: (not yet stated)"));
+        // Empty lists must not emit their headers.
+        assert!(!r.contains("Done:"));
+        assert!(!r.contains("In progress:"));
+        assert!(!r.contains("Next:"));
+        assert!(!r.contains("Recently touched:"));
+    }
+
+    #[test]
+    fn render_includes_all_populated_sections() {
+        let ws = WorkState {
+            goal: "ship context management".into(),
+            done: vec!["design".into()],
+            in_progress: vec!["implement".into()],
+            next: vec!["test".into(), "doc".into()],
+            recent_files: vec!["core/src/main.rs".into()],
+            last_activity: "edit core/src/main.rs".into(),
+            ..Default::default()
+        };
+        let r = ws.render();
+        assert!(r.contains("Goal: ship context management"));
+        assert!(r.contains("Done:"));
+        assert!(r.contains("- design"));
+        assert!(r.contains("In progress:"));
+        assert!(r.contains("- implement"));
+        assert!(r.contains("Next:"));
+        assert!(r.contains("- test"));
+        assert!(r.contains("- doc"));
+        assert!(r.contains("Recently touched: core/src/main.rs"));
+        assert!(r.contains("Last: edit core/src/main.rs"));
+        // Framing so the model treats it as ambient, not a prompt to answer.
+        assert!(r.contains("respond to the user's latest message"));
+    }
+
+    #[test]
+    fn render_caps_long_lists() {
+        let ws = WorkState {
+            goal: "g".into(),
+            done: (0..10).map(|i| format!("item {i}")).collect(),
+            ..Default::default()
+        };
+        let r = ws.render();
+        // Only the first MAX_LIST (6) entries appear verbatim ...
+        assert!(r.contains("- item 0"));
+        assert!(r.contains("- item 5"));
+        assert!(!r.contains("- item 6"));
+        // ... and the overflow is summarized.
+        assert!(r.contains("… +4 more"));
+    }
+
+    #[test]
+    fn sync_from_todos_partitions_by_status() {
+        let mut ws = WorkState {
+            goal: "g".into(),
+            ..Default::default()
+        };
+        let todos = vec![
+            todo("design", "completed"),
+            todo("implement", "in_progress"),
+            todo("test", "pending"),
+            todo("doc", "pending"),
+        ];
+        ws.sync_from_todos(&todos);
+        assert_eq!(ws.done, vec!["design"]);
+        assert_eq!(ws.in_progress, vec!["implement"]);
+        assert_eq!(ws.next, vec!["test", "doc"]);
+        assert!(ws.version > 0);
+    }
+
+    #[test]
+    fn sync_from_todos_skips_empty_subjects() {
+        let mut ws = WorkState::default();
+        let todos = vec![todo("", "completed"), todo("real", "in_progress")];
+        ws.sync_from_todos(&todos);
+        assert!(ws.done.is_empty());
+        assert_eq!(ws.in_progress, vec!["real"]);
+    }
+
+    #[test]
+    fn record_files_dedup_and_mru_order() {
+        let mut ws = WorkState::default();
+        ws.record_files("edit", &["a.rs".into(), "b.rs".into()]);
+        assert_eq!(ws.recent_files, vec!["a.rs", "b.rs"]);
+        // Touching an existing file moves it to the front (most-recent-first).
+        ws.record_files("edit", &["a.rs".into()]);
+        assert_eq!(ws.recent_files, vec!["a.rs", "b.rs"]);
+        assert_eq!(ws.last_activity, "edit a.rs");
+    }
+
+    #[test]
+    fn record_files_caps_at_eight() {
+        let mut ws = WorkState::default();
+        for i in 0..12 {
+            ws.record_files("edit", &[format!("f{i}.rs")]);
+        }
+        assert_eq!(ws.recent_files.len(), 8);
+        // Most-recent (f11) is at the front.
+        assert_eq!(ws.recent_files[0], "f11.rs");
     }
 }

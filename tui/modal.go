@@ -582,7 +582,20 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	if i < 0 || i >= len(commands) {
 		return nil
 	}
-	switch commands[i].label {
+	label := commands[i].label
+	// /skill:<name> — insert into the input box (with a trailing space) instead
+	// of dispatching immediately, so the user can append a task message and send
+	// them as one turn. Press Enter again to run the bare skill with no task.
+	// Other commands are instant actions (they take no inline argument), so
+	// they still dispatch right away.
+	if strings.HasPrefix(label, "/skill:") {
+		s.closeModal()
+		s.input.SetValue(label + " ")
+		s.input.CursorEnd()
+		s.evalMention()
+		return s.input.Focus()
+	}
+	switch label {
 	case "/key":
 		s.openSettings()
 		idx := s.settingsFieldIndex("API Key")

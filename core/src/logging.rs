@@ -39,6 +39,12 @@ impl Logger {
     pub fn record_turn(&self) {
         self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Restore the turn counter from a persisted session (see `session::load_stats`)
+    /// so `/stats` shows the real cumulative turn count after a restart instead of
+    /// resetting to zero.
+    pub fn set_turns(&self, n: u64) {
+        self.turns.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
 
     /// Append one structured record. `kind` is a short tag (e.g. "tool", "http_retry").
     pub fn log(&self, kind: &str, payload: Value) {

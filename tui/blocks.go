@@ -210,6 +210,18 @@ func (s *session) captureTodos(args string) {
 	s.todos = cp
 }
 
+// allTodosComplete reports whether every captured todo is marked completed.
+// Used to auto-dismiss the pinned tasks panel once the whole plan is done — a
+// finished plan shouldn't linger as a permanent fixture. A later todo_write
+// (new work) re-shows it.
+func (s *session) allTodosComplete() bool {
+	if len(s.todos) == 0 {
+		return false
+	}
+	done, pend, run := countTodoStatuses(s.todos)
+	return pend == 0 && run == 0 && done == len(s.todos)
+}
+
 func (s *session) logToolResult(output string) {
 	b := s.push(blkToolResult)
 	b.output = output

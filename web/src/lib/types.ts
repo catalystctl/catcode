@@ -68,10 +68,17 @@ export interface SessionEntry {
 
 export interface Stats {
   type: "stats";
+  /** Current real context size (matches the footer) — NOT cumulative. */
   tokens_in: number;
+  /** Cumulative output tokens (total produced this session). */
   tokens_out: number;
+  /** Cumulative prompt tokens (billing total input; drives cache_hit_ratio). */
+  total_in?: number;
+  /** Cumulative in + out (billing total). */
   tokens_total: number;
   cached_tokens: number;
+  /** cached_tokens / total_in — fraction of cumulative prompt that was a cache hit. */
+  cache_hit_ratio?: number;
   turns: number;
   messages: number;
   session_file: string;

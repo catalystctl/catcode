@@ -172,6 +172,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "done":
 		s.subProgress = nil
+		// When every task is complete, dismiss the pinned tasks panel — a
+		// finished plan shouldn't linger as a permanent fixture. Done before
+		// the layout() calls below so the cleared state renders immediately.
+		// A later todo_write (new work) re-shows it.
+		if s.allTodosComplete() {
+			s.todos = nil
+		}
 		if s.queuedNext {
 			// A follow-up or steer turn begins right after this one; stay busy so the
 			// footer keeps streaming and the input stays live.
@@ -403,26 +410,33 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "stats":
+		// tokens_in is the CURRENT real context (matches the footer); tokens_out
+		// is cumulative output. total_in is the cumulative prompt (billing) and
+		// drives the cache ratio.
 		ti := ev.get("tokens_in")
 		to := ev.get("tokens_out")
-		tt := ev.get("tokens_total")
+		totalIn := ev.get("total_in")
 		cached := ev.get("cached_tokens")
+		ratio := ev.get("cache_hit_ratio")
 		turns := ev.get("turns")
 		msgs := ev.get("messages")
 		sessionFile := ev.get("session_file")
-		s.logInfo(fmt.Sprintf("stats: %s in / %s out (%s total) · %s turns · %s msgs", ti, to, tt, turns, msgs))
+		s.logInfo(fmt.Sprintf("stats: %s in / %s out · %s turns · %s msgs", ti, to, turns, msgs))
+		if totalIn != "" && totalIn != "0" {
+			s.logInfo(fmt.Sprintf("totals: %s prompt in / %s out (cumulative)", totalIn, to))
+		}
 		if sessionFile != "" {
 			s.logInfo(fmt.Sprintf("session: %s", sessionFile))
 		}
 		if cached != "" && cached != "0" {
-			// Show cache effectiveness as cached/total-prompt-in (%).
-			if tiN, err := strconv.ParseUint(ti, 10, 64); err == nil && tiN > 0 {
-				if cN, err := strconv.ParseUint(cached, 10, 64); err == nil {
-					pct := float64(cN) * 100.0 / float64(tiN)
-					s.logSuccess(fmt.Sprintf("cache: %s/%s prompt tokens hit (%.0f%%)", cached, ti, pct))
+			if ratio != "" {
+				if r, err := strconv.ParseFloat(ratio, 64); err == nil {
+					s.logSuccess(fmt.Sprintf("cache: %s cached · %.0f%% hit", cached, r*100))
+				} else {
+					s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
 				}
 			} else {
-				s.logInfo(fmt.Sprintf("cache: %s tokens hit", cached))
+				s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
 			}
 		}
 

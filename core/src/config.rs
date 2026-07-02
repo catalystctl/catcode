@@ -136,6 +136,7 @@ pub struct Config {
     pub idle_timeout_secs: u64,     // per-chunk SSE idle timeout
     pub max_session_tokens: u64,    // hard session token budget (0 = unlimited)
     pub summarize_on_compact: bool, // use a model call to summarize dropped turns
+    pub rolling_state: bool,        // inject a transient tail work-state summary (KV-cache-aware)
     pub allow_vision: bool,         // accept image_url content in send
     // --- permission rules (item 1) ---
     pub allow_rules: Vec<PermissionRule>,
@@ -426,6 +427,7 @@ impl Default for Config {
             idle_timeout_secs: 120, // some reasoning models think >60s before first token
             max_session_tokens: 0,
             summarize_on_compact: true,
+            rolling_state: true,
             allow_vision: true,
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -797,6 +799,9 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(b) = v.get("summarize_on_compact").and_then(|x| x.as_bool()) {
         c.summarize_on_compact = b;
+    }
+    if let Some(b) = v.get("rolling_state").and_then(|x| x.as_bool()) {
+        c.rolling_state = b;
     }
     if let Some(f) = v.get("context_digest_at").and_then(|x| x.as_f64()) {
         c.context_digest_at = f as f32;

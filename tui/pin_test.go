@@ -148,6 +148,46 @@ func TestCaptureTodosLatestWins(t *testing.T) {
 	}
 }
 
+// TestTodosDismissWhenAllComplete: a `done` event clears the pinned tasks
+// panel once every task is marked completed, so a finished plan doesn't linger.
+func TestTodosDismissWhenAllComplete(t *testing.T) {
+	s := newBusySession()
+	// Capture a fully-complete plan.
+	args := `{"todos":[{"subject":"A","status":"completed"},{"subject":"B","status":"completed"}]}`
+	raw, _ := json.Marshal(map[string]any{"type": "tool_call", "id": "c1", "name": "todo_write", "args": args})
+	s.handleCoreEvent(&coreEvent{Type: "tool_call", Raw: raw})
+	if !s.allTodosComplete() {
+		t.Fatal("all todos should be complete after a fully-completed todo_write")
+	}
+	if h := s.todoPanelHeight(); h == 0 {
+		t.Fatal("panel should be visible while the turn is still busy")
+	}
+	// Turn ends -> panel is dismissed.
+	s.handleCoreEvent(&coreEvent{Type: "done"})
+	if len(s.todos) != 0 {
+		t.Fatalf("todos should be cleared on done when all complete; got %d", len(s.todos))
+	}
+	if h := s.todoPanelHeight(); h != 0 {
+		t.Fatalf("panel should be hidden after done; height=%d", h)
+	}
+}
+
+// TestTodosPersistWhenSomeIncomplete: a `done` event leaves the panel alone
+// when tasks remain pending/in-progress.
+func TestTodosPersistWhenSomeIncomplete(t *testing.T) {
+	s := newBusySession()
+	args := `{"todos":[{"subject":"A","status":"completed"},{"subject":"B","status":"pending"}]}`
+	raw, _ := json.Marshal(map[string]any{"type": "tool_call", "id": "c1", "name": "todo_write", "args": args})
+	s.handleCoreEvent(&coreEvent{Type: "tool_call", Raw: raw})
+	s.handleCoreEvent(&coreEvent{Type: "done"})
+	if len(s.todos) != 2 {
+		t.Fatalf("todos should persist when some incomplete; got %d", len(s.todos))
+	}
+	if h := s.todoPanelHeight(); h == 0 {
+		t.Fatal("panel should remain visible when work is unfinished")
+	}
+}
+
 // TestQueueBannerLabelsKind: the pinned queue banner names follow-up vs steer.
 func TestQueueBannerLabelsKind(t *testing.T) {
 	s := newBusySession()

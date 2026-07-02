@@ -143,6 +143,55 @@ pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<S
     let _ = std::fs::rename(&tmp, &p);
 }
 
+/// Cumulative session stats persisted beside the session file (sidecar
+/// `<session>.stats`) so `/stats` survives a restart — previously these were
+/// in-memory only, so reopening the harness showed zeros for tokens/turns.
+#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SessionStats {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cached_tokens: u64,
+    pub turns: u64,
+}
+
+fn stats_path(session_path: &Path) -> PathBuf {
+    let mut p = session_path.as_os_str().to_os_string();
+    p.push(".stats");
+    PathBuf::from(p)
+}
+
+/// Load persisted cumulative stats (all-zero if absent/unreadable).
+pub fn load_stats(session_path: &Path) -> SessionStats {
+    let p = stats_path(session_path);
+    let Ok(content) = std::fs::read_to_string(&p) else {
+        return SessionStats::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Persist cumulative stats atomically (temp + fsync + rename) so a crash never
+/// truncates them — same durability story as `save_escalations`.
+pub fn save_stats(session_path: &Path, stats: &SessionStats) {
+    let p = stats_path(session_path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = p.with_extension("tmp");
+    let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{}", serde_json::to_string(stats).unwrap_or_default());
+    let _ = f.flush();
+    let _ = f.sync_all();
+    drop(f); // release before rename (Windows)
+    let _ = std::fs::rename(&tmp, &p);
+}
+
 /// Truncate/replace the whole session file with `messages` (used on reset /
 /// compaction), re-writing the version header first. Atomic: writes a sibling
 /// temp file, fsyncs it, then renames it over the target, so a crash mid-
@@ -378,5 +427,42 @@ mod tests {
         append(&p, &json!({"role":"user","content":long}));
         let info = describe(&p);
         assert_eq!(info.title.as_deref().map(|s| s.len()), Some(80));
+    }
+
+    #[test]
+    fn stats_roundtrip_survives_restart() {
+        let dir = std::env::temp_dir().join("umans_harness_session_stats_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        // No sidecar yet → all zeros.
+        let s = load_stats(&p);
+        assert_eq!(
+            (s.tokens_in, s.tokens_out, s.cached_tokens, s.turns),
+            (0, 0, 0, 0)
+        );
+        // Persist some cumulative usage.
+        save_stats(
+            &p,
+            &SessionStats {
+                tokens_in: 12345,
+                tokens_out: 678,
+                cached_tokens: 9000,
+                turns: 7,
+            },
+        );
+        // “Reopen” → the sidecar restores the same totals.
+        let s = load_stats(&p);
+        assert_eq!(s.tokens_in, 12345);
+        assert_eq!(s.tokens_out, 678);
+        assert_eq!(s.cached_tokens, 9000);
+        assert_eq!(s.turns, 7);
+        // Garbage in the sidecar degrades to zeros (never panics).
+        std::fs::write(stats_path(&p), "not json").unwrap();
+        let s = load_stats(&p);
+        assert_eq!(
+            (s.tokens_in, s.tokens_out, s.cached_tokens, s.turns),
+            (0, 0, 0, 0)
+        );
     }
 }
