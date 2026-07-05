@@ -40,6 +40,12 @@ type settingsStore struct {
 	// supersedes the legacy single APIKey when set. Stored in this 0600 file.
 	ActiveProvider string            `json:"active_provider,omitempty"`
 	ProviderKeys   map[string]string `json:"provider_keys,omitempty"`
+
+	// Custom keybindings (TUI-only). Maps action name → canonical key (the
+	// string tea.KeyMsg.String() produces). Only user overrides are stored; the
+	// full effective map (defaults + overrides) is computed at startup via
+	// effectiveKeybinds(). See keybinds.go.
+	Keybinds map[string]string `json:"keybinds,omitempty"`
 }
 
 func configDir() string {
@@ -183,6 +189,16 @@ func loadSettings() *settingsStore {
 	for k, v := range onDisk.ProviderKeys {
 		if v != "" {
 			s.ProviderKeys[k] = v
+		}
+	}
+	// Custom keybinds: store only the user overrides (non-default bindings).
+	// Empty string is a valid override meaning "disabled" (kb returns false),
+	// so we keep it rather than falling back to the default.
+	// The full effective map is computed in initialSession via effectiveKeybinds().
+	if onDisk.Keybinds != nil {
+		s.Keybinds = map[string]string{}
+		for k, v := range onDisk.Keybinds {
+			s.Keybinds[k] = v // keep empty (disabled) values
 		}
 	}
 	return s

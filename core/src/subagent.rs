@@ -960,13 +960,14 @@ async fn run_single(
     // does). Previously this was a detached token never wired into the loop, so
     // interrupt was a no-op.
     let run_cancel = cancel.child_token();
+    let started = now_ms();
     let run = SubagentRun {
         id: run_id.to_string(),
         mode: "single".into(),
         agent: Some(agent.name.clone()),
         agents: vec![agent.name.clone()],
         state: "running".into(),
-        started_at: now_ms(),
+        started_at: started,
         ended_at: None,
         depth,
         intercom_target: Some(my_target.clone()),
@@ -978,6 +979,17 @@ async fn run_single(
         .lock()
         .await
         .insert(run_id.to_string(), run);
+
+    emit_subagent_start(
+        run_id,
+        "single",
+        Some(agent.name.as_str()),
+        &[agent.name.clone()],
+        task,
+        depth,
+        started,
+    );
+    emit_subagent_message(run_id, "user", task);
 
     let result = run_agent(
         st,
@@ -999,16 +1011,23 @@ async fn run_single(
     .await;
 
     // Finalize run state.
+    let final_state = if result.ok { "completed" } else { "failed" };
     let mut runs = st.subagent_runs.lock().await;
+    let mut done_ended: u64 = started;
+    let mut done_summary: Option<String> = None;
     if let Some(r) = runs.get_mut(run_id) {
-        r.state = if result.ok { "completed" } else { "failed" }.into();
+        r.state = final_state.into();
         r.ended_at = Some(now_ms());
         r.summary = Some(result.output.chars().take(200).collect());
+        done_ended = r.ended_at.unwrap_or(started);
+        done_summary = r.summary.clone();
     }
     prune_terminal_runs(&mut runs);
+    drop(runs);
     if bridge {
         st.intercom.unregister(&my_target);
     }
+    emit_subagent_done(run_id, final_state, done_summary.as_deref(), done_ended);
     result
 }
 
@@ -1296,6 +1315,14 @@ async fn run_agent_inner(
             run_start.elapsed().as_millis() as u64,
             true,
         );
+        let asst_text = assistant
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !asst_text.is_empty() {
+            emit_subagent_message(run_id, "assistant", &truncate(&asst_text, 16000));
+        }
 
         let Some(calls) = assistant
             .get("tool_calls")
@@ -1385,10 +1412,14 @@ async fn run_agent_inner(
                         run_start.elapsed().as_millis() as u64,
                         false,
                     );
+                    emit_subagent_tool_call(run_id, &id, &name, &json!({}), tool_count);
+                    emit_subagent_tool_result(run_id, &id, &name, &truncate(&msg, 8000), false);
                     sub.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
                     continue;
                 }
             };
+
+            emit_subagent_tool_call(run_id, &id, &name, &argsv, tool_count);
 
             let outcome = dispatch_subagent_tool(
                 &name,
@@ -1417,6 +1448,13 @@ async fn run_agent_inner(
                 sub_in,
                 sub_out,
                 run_start.elapsed().as_millis() as u64,
+                outcome.ok,
+            );
+            emit_subagent_tool_result(
+                run_id,
+                &id,
+                &name,
+                &truncate(&outcome.output, 8000),
                 outcome.ok,
             );
             sub.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
@@ -1900,6 +1938,70 @@ fn emit_subagent_progress(
     );
 }
 
+fn emit_subagent_start(
+    run_id: &str,
+    mode: &str,
+    agent: Option<&str>,
+    agents: &[String],
+    task: &str,
+    depth: u32,
+    started_at: u64,
+) {
+    let mut ev = Event::new("subagent_start")
+        .with("run_id", json!(run_id))
+        .with("mode", json!(mode))
+        .with("agents", json!(agents))
+        .with("task", json!(task))
+        .with("depth", json!(depth))
+        .with("started_at", json!(started_at));
+    if let Some(a) = agent {
+        ev = ev.with("agent", json!(a));
+    }
+    emit(&ev);
+}
+
+fn emit_subagent_message(run_id: &str, role: &str, content: &str) {
+    emit(
+        &Event::new("subagent_message")
+            .with("run_id", json!(run_id))
+            .with("role", json!(role))
+            .with("content", json!(content)),
+    );
+}
+
+fn emit_subagent_tool_call(run_id: &str, call_id: &str, name: &str, args: &Value, tool_count: u32) {
+    emit(
+        &Event::new("subagent_tool_call")
+            .with("run_id", json!(run_id))
+            .with("call_id", json!(call_id))
+            .with("name", json!(name))
+            .with("args", args.clone())
+            .with("tool_count", json!(tool_count)),
+    );
+}
+
+fn emit_subagent_tool_result(run_id: &str, call_id: &str, name: &str, result: &str, ok: bool) {
+    emit(
+        &Event::new("subagent_tool_result")
+            .with("run_id", json!(run_id))
+            .with("call_id", json!(call_id))
+            .with("name", json!(name))
+            .with("result", json!(result))
+            .with("ok", json!(ok)),
+    );
+}
+
+fn emit_subagent_done(run_id: &str, state: &str, summary: Option<&str>, ended_at: u64) {
+    let mut ev = Event::new("subagent_done")
+        .with("run_id", json!(run_id))
+        .with("state", json!(state))
+        .with("ended_at", json!(ended_at));
+    if let Some(s) = summary {
+        ev = ev.with("summary", json!(s));
+    }
+    emit(&ev);
+}
+
 fn emit_subagent_summary(sub_in: u64, sub_out: u64, sub_cached: u64, last_model: &Option<String>) {
     let m = last_model.clone().unwrap_or_else(|| "?".into());
     let pct = if sub_cached > 0 && sub_in > 0 {
@@ -2062,13 +2164,14 @@ async fn run_parallel(
     // Child token so interrupt_action cancels just this batch (and a parent
     // /abort propagates), not the whole orchestrator.
     let run_cancel = cancel.child_token();
+    let started = now_ms();
     let run = SubagentRun {
         id: run_id.clone(),
         mode: "parallel".into(),
         agent: None,
         agents: agent_names.clone(),
         state: "running".into(),
-        started_at: now_ms(),
+        started_at: started,
         ended_at: None,
         depth,
         intercom_target: None,
@@ -2077,6 +2180,15 @@ async fn run_parallel(
         summary: None,
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
+    emit_subagent_start(
+        &run_id,
+        "parallel",
+        None,
+        &agent_names,
+        &format!("parallel ({} tasks)", tasks.len()),
+        depth,
+        started,
+    );
 
     // run all tasks with a concurrency semaphore; collect results in order.
     // Tasks run on JoinHandles (not a channel) so a panicking task is observed
@@ -2123,21 +2235,23 @@ async fn run_parallel(
         }
     }
     collected.sort_by_key(|(i, _)| *i);
+    let all_ok = collected.iter().all(|(_, o)| o.ok);
 
     // finalize run
+    let final_state = if all_ok { "completed" } else { "failed" };
     let mut runs = st.subagent_runs.lock().await;
+    let mut done_ended: u64 = started;
     if let Some(r) = runs.get_mut(&run_id) {
-        r.state = "completed".into();
+        r.state = final_state.into();
         r.ended_at = Some(now_ms());
+        done_ended = r.ended_at.unwrap_or(started);
     }
     prune_terminal_runs(&mut runs);
+    drop(runs);
+    emit_subagent_done(&run_id, final_state, None, done_ended);
 
     let mut blocks = String::new();
-    let mut all_ok = true;
     for (i, o) in collected.iter() {
-        if !o.ok {
-            all_ok = false;
-        }
         blocks.push_str(&format!(
             "=== Parallel Task {} ({}) ===\n{}\n\n",
             i + 1,
@@ -2185,16 +2299,18 @@ async fn run_chain(
     // stored `cancel.clone()` (the parent token), so interrupting a chain run
     // cancelled the whole parent turn and every concurrent sibling.
     let run_cancel = cancel.child_token();
+    let chain_agents: Vec<String> = chain
+        .iter()
+        .filter_map(|s| s.get("agent").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let started = now_ms();
     let run = SubagentRun {
         id: run_id.clone(),
         mode: "chain".into(),
         agent: None,
-        agents: chain
-            .iter()
-            .filter_map(|s| s.get("agent").and_then(|v| v.as_str()).map(String::from))
-            .collect(),
+        agents: chain_agents.clone(),
         state: "running".into(),
-        started_at: now_ms(),
+        started_at: started,
         ended_at: None,
         depth,
         intercom_target: None,
@@ -2203,6 +2319,15 @@ async fn run_chain(
         summary: None,
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
+    emit_subagent_start(
+        &run_id,
+        "chain",
+        None,
+        &chain_agents,
+        &format!("chain ({} steps)", chain.len()),
+        depth,
+        started,
+    );
 
     for (step_i, step) in chain.iter().enumerate() {
         if run_cancel.is_cancelled() {
@@ -2286,12 +2411,17 @@ async fn run_chain(
         }
     }
 
+    let final_state = "completed";
     let mut runs = st.subagent_runs.lock().await;
+    let mut done_ended: u64 = started;
     if let Some(r) = runs.get_mut(&run_id) {
-        r.state = "completed".into();
+        r.state = final_state.into();
         r.ended_at = Some(now_ms());
+        done_ended = r.ended_at.unwrap_or(started);
     }
     prune_terminal_runs(&mut runs);
+    drop(runs);
+    emit_subagent_done(&run_id, final_state, None, done_ended);
     Outcome::ok(previous)
 }
 

@@ -149,6 +149,46 @@ export interface IntercomEntry {
   ts: number;
 }
 
+/** A single item in a subagent run's live chat transcript: either a
+ *  user/assistant message or a tool call with its (later-arriving) result. */
+export interface SubagentChatItem {
+  /** Generated unique id (NOT the tool call_id, which can be empty/duplicate). */
+  id: string;
+  kind: "message" | "tool";
+  ts: number;
+  // message
+  role?: "user" | "assistant";
+  content?: string;
+  // tool
+  callId?: string;
+  name?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  ok?: boolean;
+}
+
+/** A live subagent run: lifecycle metadata + a per-run chat transcript the
+ *  SubagentsPanel drills into. Keyed by run_id in `AgentState.subagentRuns`. */
+export interface SubagentRunView {
+  id: string;
+  mode: string; // single | parallel | chain
+  agent?: string;
+  agents: string[];
+  task: string;
+  state: string; // running | completed | failed | paused
+  depth: number;
+  startedAt: number;
+  endedAt?: number;
+  summary?: string;
+  phase?: string; // last progress phase
+  tool?: string; // current tool name
+  toolCount: number;
+  tokensIn: number;
+  tokensOut: number;
+  elapsedMs: number;
+  items: SubagentChatItem[];
+}
+
 /** Vision-handoff configuration (curated vision-capable models + target). */
 export interface VisionConfig {
   vision_models: string[];
@@ -184,8 +224,13 @@ export type CoreEvent =
   | { type: "info"; message: string }
   | { type: "steer"; prompt: string }
   // ── Subagent / intercom ──
-  | { type: "intercom_message"; request_id: string; from: string; message: string; reason?: string; to?: string }
-  | { type: "subagent_progress"; message: string; agent?: string; phase?: string }
+  | { type: "intercom_message"; id: string; from: string; message: string; reason?: string; to?: string }
+  | { type: "subagent_progress"; run_id: string; agent: string; phase: string; tool: string; tool_count: number; tokens_in: number; tokens_out: number; elapsed_ms: number; ok: boolean }
+  | { type: "subagent_start"; run_id: string; mode: string; agent?: string; agents: string[]; task: string; depth: number; started_at: number }
+  | { type: "subagent_message"; run_id: string; role: string; content: string }
+  | { type: "subagent_tool_call"; run_id: string; call_id: string; name: string; args: Record<string, unknown>; tool_count: number }
+  | { type: "subagent_tool_result"; run_id: string; call_id: string; name: string; result: string; ok: boolean }
+  | { type: "subagent_done"; run_id: string; state: string; summary?: string; ended_at: number }
   // ── Memory ──
   | { type: "memory_saved"; id?: string; text?: string; deleted?: boolean; message?: string }
   | { type: "memory_list"; memories: MemoryEntry[] }
@@ -391,6 +436,8 @@ export interface AgentState {
   skills: SkillInfo[];
   pendingIntercom: IntercomPrompt | null;
   intercomLog: IntercomEntry[];
+  /** Live subagent runs keyed by run_id — the SubagentsPanel list + drill-in chat. */
+  subagentRuns: Record<string, SubagentRunView>;
   visionConfig: VisionConfig | null;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;

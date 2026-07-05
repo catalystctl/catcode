@@ -14,7 +14,8 @@ import { Message } from "./message";
 import { Composer, type ComposerHandle } from "./composer";
 import { Toasts } from "./toasts";
 import { Approval } from "./approval";
-import { IntercomPrompt, SubagentPanel } from "./intercom";
+import { IntercomPrompt } from "./intercom";
+import { SubagentsPanel } from "./subagents";
 import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
 import { SettingsModal } from "./settings";
@@ -446,7 +447,7 @@ export function Chat() {
         />
       )}
       {modal === "subagents" && (
-        <SubagentPanel log={state.intercomLog} onClose={() => setModal(null)} />
+        <SubagentsPanel runs={state.subagentRuns} onClose={() => setModal(null)} />
       )}
       {modal === "settings" && (
         <SettingsModal
@@ -546,7 +547,7 @@ function KeyOverlay({
           onClick={onDismiss}
           className="absolute right-3 top-3 rounded-md p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
           aria-label="Dismiss"
-          title="Dismiss (use /key to enter a key later)"
+          title="Dismiss (use /login to enter a key later)"
         >
           <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
         </button>

@@ -144,6 +144,37 @@ other is logged in.
 Keys are persisted per-provider (the env-var *name* is stored when a key came
 from the environment, so the secret never lands in a config file).
 
+### Subscription login (OAuth) — no API key needed
+
+ChatGPT Plus/Pro (Codex), Google One AI (Gemini), and Claude Pro/Max
+subscriptions are accessed via **OAuth login**, not an API key. You don't need
+the official CLI: `/login` performs the OAuth flow itself.
+
+- **Gemini**: `/login` → pick **Google Gemini** runs Google's
+  **authorization-code + PKCE + loopback-redirect** flow — it opens your browser
+  to accounts.google.com; approve, and the harness captures the token via a
+  local callback server. (Uses gcloud's public Desktop-app client credentials;
+  the device-code grant doesn't work with Desktop clients — it 401s. If you
+  already ran `gcloud auth application-default login`, that token is reused
+  automatically.)
+- **Anthropic Claude**: `/login` → pick **Anthropic Claude** runs the
+  **authorize + PKCE + loopback-redirect** flow — it opens your browser to
+  claude.ai; approve, and the harness captures the token. (If you already
+  logged in via the `claude` CLI, that token is reused automatically.)
+- **OpenAI Codex**: ⚠️ not yet wired — the ChatGPT token works only against the
+  `chatgpt.com` Responses API (a different request shape than chat-completions).
+  Codex stays on `OPENAI_API_KEY` until a Responses-API integration is added.
+
+Tokens from `/login` are stored at `~/.config/umans-harness/oauth/<id>.json`
+(0600) and refreshed automatically. The OAuth client credentials used are the
+vendors' public installed-app client IDs (gcloud's for Google, Claude Code's
+for Anthropic).
+
+Everything falls back gracefully: if no OAuth token is present the harness
+uses the API-key path, and an explicit API key (env var or pasted via `/login`)
+always takes precedence over OAuth — so `/login` → pick the provider → paste a
+key overrides a bad OAuth credential.
+
 ## Windows install (`ucli`)
 
 `release-windows.sh` cross-compiles for Windows x86_64 and produces two

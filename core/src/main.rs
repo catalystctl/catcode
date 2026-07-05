@@ -13,6 +13,8 @@ mod git_ctx;
 mod intercom;
 mod logging;
 mod memory;
+mod oauth;
+mod pattern_log;
 mod plugins;
 mod protocol;
 mod provider;
@@ -72,8 +74,8 @@ Be concise. Prefer standard tools. When done, summarize what you did in two line
 
 Self-learning — you compound knowledge across sessions, so future you starts smarter:
 - The `memory` tool (actions: save/append/list/forget) persists durable facts scoped to this workspace. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
-- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia.
-- Reusable skills live as markdown + YAML frontmatter under `.umans-harness/skills/<name>/SKILL.md`. Discover them with `list_dir .umans-harness/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in.
+- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation before `finish` exits and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `UMANS_HARNESS_AUTO_REFLECT=0`).
+- Reusable skills live as markdown + YAML frontmatter under `.umans-harness/skills/<name>/SKILL.md`. Discover them with `list_dir .umans-harness/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
 - `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
 
 /// Build the full system prompt by appending git context, memory context,
@@ -205,11 +207,21 @@ fn provider_presets_json(cfg: &Config) -> Vec<Value> {
         .iter()
         .map(|p| {
             let configured = cfg.find_provider(p.id).is_some();
+            // Auth available = API key (env/config literal) OR reusable OAuth
+            // creds. OpenAI/Codex uses only this app's OAuth store; no
+            // ~/.codex/auth.json auto-detect.
+            let has_oauth = match p.id {
+                "openai" => oauth::has_codex_creds(),
+                "gemini" => oauth::has_google_creds(),
+                "anthropic" => oauth::has_claude_creds(),
+                _ => false,
+            };
             let has_key = p.env_key().is_some()
                 || cfg
                     .find_provider(p.id)
                     .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
-                    .is_some();
+                    .is_some()
+                || has_oauth;
             let logged_in = configured && has_key;
             json!({
                 "id": p.id,
@@ -222,6 +234,7 @@ fn provider_presets_json(cfg: &Config) -> Vec<Value> {
                 "hasKey": has_key,
                 "configured": configured,
                 "loggedIn": logged_in,
+                "supportsOauth": oauth::supports_login(p.id),
             })
         })
         .collect()
@@ -240,6 +253,10 @@ pub struct PendingApproval {
 
 pub struct State {
     pub cfg: RwLock<Config>,
+    /// The shared HTTP client. Held on State so per-turn resolution can do
+    /// async OAuth token refresh (Gemini gcloud ADC / Claude CLI creds) without
+    /// threading the client through every call site.
+    pub client: reqwest::Client,
     /// Per-provider runtime API keys (set via `set_key {provider,api_key}`).
     /// Keyed by provider name; the active provider's key (if present) wins over
     /// config literals/env vars during resolution. The "default" slot holds the
@@ -314,6 +331,49 @@ pub struct State {
     pub intercom: IntercomBus,
     /// Tracked subagent runs for status/interrupt/resume (keyed by run id).
     pub subagent_runs: Mutex<std::collections::HashMap<String, subagent::SubagentRun>>,
+    /// Pending no-browser OAuth login state (PKCE verifier + redirect_uri),
+    /// set when `/login` picks the manual flow (SSH/headless) and consumed by
+    /// the `oauth_code` command when the user pastes the code.
+    pub pending_oauth: Mutex<Option<oauth::PendingOauth>>,
+}
+
+/// Shared tail of `login_oauth` (web flow) and `oauth_code` (manual flow):
+/// ensure the provider is configured (no api_key — the token is resolved +
+/// refreshed at turn time by enrich_oauth), set it active, persist, emit the
+/// success + provider_changed events, and refresh the model list.
+async fn finalize_oauth(
+    state: &State,
+    client: &reqwest::Client,
+    emit: &dyn Fn(&Event),
+    preset: &str,
+    label: &str,
+) {
+    {
+        let mut cfg = state.cfg.write().await;
+        if cfg.find_provider(preset).is_none() {
+            if let Some(p) = config::find_preset(preset) {
+                cfg.providers.push(p.to_provider_config(None));
+            }
+        }
+    }
+    *state.active_provider.write().await = Some(preset.to_string());
+    {
+        let cfg = state.cfg.read().await;
+        let _ = config::save_providers_config(&cfg.providers, Some(preset));
+    }
+    state
+        .logger
+        .log("login_oauth", json!({ "provider": preset }));
+    emit(&Event::new("info").with("message", json!(format!("logged into {label} via OAuth."))));
+    let rp = state.resolved_provider().await;
+    emit(
+        &Event::new("provider_changed")
+            .with("provider", json!(rp.name))
+            .with("kind", json!(rp.kind.as_str()))
+            .with("base_url", json!(rp.base_url))
+            .with("has_key", json!(true)),
+    );
+    state.refresh_models(client).await;
 }
 
 impl State {
@@ -359,10 +419,11 @@ impl State {
             .filter(|s| !s.is_empty());
         if let Some(name) = provider_name {
             if let Some(rp) = self.resolve_provider_by_name(&name).await {
-                return rp;
+                return oauth::enrich_oauth(rp, &self.client).await;
             }
         }
-        self.resolved_provider().await
+        let rp = self.resolved_provider().await;
+        oauth::enrich_oauth(rp, &self.client).await
     }
 
     /// The set of provider names that are "logged in": configured providers
@@ -476,6 +537,7 @@ pub fn resolve_provider_from_config(
         base_url: p.base_url.clone(),
         api_key,
         headers: p.headers.clone(),
+        oauth: false,
     }
 }
 
@@ -493,14 +555,35 @@ pub fn logged_in_providers_for(cfg: &Config, keys: &HashMap<String, String>) -> 
     cfg.providers
         .iter()
         .filter(|p| {
+            // Logged in = has an API key (runtime/config/env), OR is an OAuth-capable
+            // provider with reusable OAuth credentials. OpenAI/Codex only uses
+            // this app's OAuth store; no ~/.codex/auth.json auto-detect.
             keys.get(&p.name)
                 .cloned()
                 .or_else(|| p.api_key.clone())
                 .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
                 .is_some()
+                || oauth_creds_for_provider(p)
         })
         .map(|p| p.name.clone())
         .collect()
+}
+
+/// True when a provider's reusable OAuth credentials exist (cheap sync file
+/// check, no refresh). Used by `logged_in_providers_for` to gate OAuth-only
+/// providers into aggregation. The actual token refresh happens at turn/
+/// discovery time via `oauth::enrich_oauth`.
+fn oauth_creds_for_provider(p: &config::ProviderConfig) -> bool {
+    if p.kind == config::ProviderKind::Anthropic {
+        return oauth::has_claude_creds();
+    }
+    if provider::is_codex_endpoint(&p.base_url) {
+        return oauth::has_codex_creds();
+    }
+    if provider::is_gemini_endpoint(&p.base_url) {
+        return oauth::has_google_creds();
+    }
+    false
 }
 
 /// Aggregate models across ALL logged-in providers, tagging each model with its
@@ -534,6 +617,9 @@ pub async fn aggregate_models_for(
             continue;
         };
         let rp = resolve_provider_from_config(pc, keys);
+        // Enrich with an OAuth subscription token (gcloud/`claude` CLI) when the
+        // provider has no API key, so OAuth-only providers can discover models.
+        let rp = oauth::enrich_oauth(rp, client).await;
         let mut discovered = provider::discover_models(client, &rp).await;
         for m in &mut discovered {
             m.provider = rp.name.clone();
@@ -944,6 +1030,7 @@ async fn main() {
     let vision_cfg = VisionConfig::load(&cfg.workspace);
     let state = Arc::new(State {
         cfg: RwLock::new(cfg),
+        client: client.clone(),
         api_keys: RwLock::new(HashMap::new()),
         active_provider: RwLock::new(None),
         conversation: Mutex::new(resumed),
@@ -973,6 +1060,7 @@ async fn main() {
         work_state: Mutex::new(WorkState::default()),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
+        pending_oauth: Mutex::new(None),
     });
 
     // Apply disabled plugin list from config.
@@ -1134,32 +1222,40 @@ async fn main() {
                 // (explicit arg → preset env var), insert/replace into config,
                 // seed the runtime key, persist, and re-aggregate models across
                 // all logged-in providers so this provider's models join `/models`.
-                // Multiple providers can be logged in at once.
+                // Multiple providers can be logged in at once. Most presets create
+                // one config; OpenCode Go creates two (OpenAI-kind +
+                // Anthropic-kind) sharing the base URL + key.
                 let Some(p) = config::find_preset(&preset) else {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "unknown provider preset '{preset}'; available: openai, gemini, anthropic"
+                            "unknown provider preset '{preset}'; available: umans, openai, gemini, anthropic, opencode-go"
                         )),
                     ));
                     return;
                 };
                 let key = api_key.or_else(|| p.env_key());
-                let pc = p.to_provider_config(key.clone());
-                let name = pc.name.clone();
-                // Insert or replace the provider in config.
+                let configs = config::preset_provider_configs(p, key.clone());
+                let name = configs[0].name.clone();
+                // Insert or replace each provider config (e.g. opencode-go +
+                // opencode-go-anthropic for the OpenCode Go preset).
                 {
                     let mut cfg = state.cfg.write().await;
-                    if let Some(i) = cfg.providers.iter().position(|x| x.name == name) {
-                        cfg.providers[i] = pc.clone();
-                    } else {
-                        cfg.providers.push(pc.clone());
+                    for pc in &configs {
+                        if let Some(i) = cfg.providers.iter().position(|x| x.name == pc.name) {
+                            cfg.providers[i] = pc.clone();
+                        } else {
+                            cfg.providers.push(pc.clone());
+                        }
                     }
                 }
-                // Seed the runtime key so the immediate turn works without a
-                // restart (only when a key was actually resolved).
+                // Seed the runtime key for every config so the immediate turn
+                // works without a restart (only when a key was actually resolved).
                 if let Some(k) = &key {
-                    state.api_keys.write().await.insert(name.clone(), k.clone());
+                    let mut keys = state.api_keys.write().await;
+                    for pc in &configs {
+                        keys.insert(pc.name.clone(), k.clone());
+                    }
                 }
                 // Make the newly logged-in provider the default/fallback (used
                 // for model-less compaction and legacy models). This does NOT
@@ -1211,14 +1307,29 @@ async fn main() {
                 // configured providers, persist, and re-aggregate models so its
                 // models disappear from `/models`. The persisted TUI key (in
                 // settings.json) is cleared by the TUI side.
+                //
+                // OpenCode Go is one subscription backed by two provider configs
+                // (opencode-go + opencode-go-anthropic); logging out either drops
+                // both so the user doesn't strand a half-configured subscription.
+                let to_remove: Vec<String> =
+                    if provider == "opencode-go" || provider == "opencode-go-anthropic" {
+                        vec![
+                            "opencode-go".to_string(),
+                            "opencode-go-anthropic".to_string(),
+                        ]
+                    } else {
+                        vec![provider.clone()]
+                    };
                 let existed;
                 {
                     let mut cfg = state.cfg.write().await;
                     let before = cfg.providers.len();
-                    cfg.providers.retain(|p| p.name != provider);
+                    cfg.providers.retain(|p| !to_remove.contains(&p.name));
                     existed = cfg.providers.len() != before;
                 }
-                state.api_keys.write().await.remove(&provider);
+                for n in &to_remove {
+                    state.api_keys.write().await.remove(n);
+                }
                 if !existed && provider != "default" {
                     emit(
                         &Event::new("error")
@@ -1226,21 +1337,23 @@ async fn main() {
                     );
                     return;
                 }
-                // If the active provider was the one logged out, clear the
+                // If the active provider was one of those logged out, clear the
                 // override so the fallback resolves to the first remaining / legacy.
                 {
                     let active = state.active_provider.read().await.clone();
-                    if active.as_deref() == Some(provider.as_str()) {
+                    if active
+                        .as_deref()
+                        .map(|a| to_remove.iter().any(|n| n == a))
+                        .unwrap_or(false)
+                    {
                         *state.active_provider.write().await = None;
                     }
                 }
-                // Persist the trimmed provider list (keep the prior active if still present).
+                // Persist the trimmed provider list (fall back to the first
+                // remaining provider, else legacy).
                 {
                     let cfg = state.cfg.read().await;
-                    let active = cfg
-                        .find_provider(&provider)
-                        .map(|_| provider.clone())
-                        .or_else(|| cfg.providers.first().map(|p| p.name.clone()));
+                    let active = cfg.providers.first().map(|p| p.name.clone());
                     let _ = config::save_providers_config(&cfg.providers, active.as_deref());
                 }
                 state.logger.log("logout", json!({ "provider": provider }));
@@ -1257,6 +1370,100 @@ async fn main() {
                         .with("has_key", json!(rp.api_key.is_some())),
                 );
                 state.refresh_models(&client).await;
+            }
+            Command::LoginOauth { preset } => {
+                // Perform the interactive OAuth subscription login (no official
+                // CLI needed). Runs the flow (Google device-code / Claude
+                // authorize+PKCE+loopback), emitting `oauth_prompt` events with
+                // the URL/code to visit, stores the token, ensures the provider is
+                // configured, and re-aggregates so its models appear in /models.
+                if !oauth::supports_login(&preset) {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "'{}' has no OAuth login flow yet; use /login with an API key instead",
+                            preset
+                        )),
+                    ));
+                    return;
+                }
+                let label = config::find_preset(&preset)
+                    .map(|p| p.label.to_string())
+                    .unwrap_or_else(|| preset.clone());
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!("starting OAuth login for {label}…")),
+                ));
+                let prompt_emit = |p: oauth::OAuthPrompt| {
+                    emit(
+                        &Event::new("oauth_prompt")
+                            .with("url", json!(p.url))
+                            .with("code", json!(p.code))
+                            .with("message", json!(p.message)),
+                    );
+                };
+                match oauth::login(&preset, &client, &prompt_emit).await {
+                    Ok(oauth::LoginOutcome::Done) => {
+                        finalize_oauth(&state, &client, &emit, &preset, &label).await;
+                    }
+                    Ok(oauth::LoginOutcome::AwaitingCode { pending }) => {
+                        // No-browser (SSH/headless) flow: the prompt was already
+                        // emitted; stash the PKCE verifier + redirect_uri and
+                        // wait for the user to paste the code/redirect URL via
+                        // the `oauth_code` command.
+                        let is_openai = pending.kind == "openai";
+                        *state.pending_oauth.lock().await = Some(pending);
+                        let msg = if is_openai {
+                            "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>."
+                        } else {
+                            "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>."
+                        };
+                        emit(&Event::new("info").with("message", json!(msg)));
+                    }
+                    Err(e) => {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("OAuth login failed: {e}"))),
+                        );
+                    }
+                }
+            }
+            Command::OauthCode { code } => {
+                // Complete a pending no-browser (manual-code) OAuth login — the
+                // SSH/headless path. The PKCE verifier was stashed by the
+                // `login_oauth` AwaitingCode arm; exchange the pasted code,
+                // store the token, then finalize exactly like the web flow.
+                let pending = state.pending_oauth.lock().await.take();
+                let pending = match pending {
+                    Some(p) => p,
+                    None => {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!("No pending OAuth login. Run /login first — the no-browser flow prints a URL; paste its code here with /oauth-code <code>."),
+                        ));
+                        return;
+                    }
+                };
+                let preset = pending.kind.clone();
+                let label = config::find_preset(&preset)
+                    .map(|p| p.label.to_string())
+                    .unwrap_or_else(|| preset.clone());
+                match oauth::complete_oauth(&preset, &client, &pending, &code).await {
+                    Ok(_) => {
+                        finalize_oauth(&state, &client, &emit, &preset, &label).await;
+                    }
+                    Err(e) => {
+                        // Restore the pending state so the user can retry with a
+                        // corrected code without restarting /login.
+                        *state.pending_oauth.lock().await = Some(pending);
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "OAuth code exchange failed: {e} (pending login restored — try /oauth-code again with the correct code)"
+                            )),
+                        ));
+                    }
+                }
             }
             Command::SetApproval { mode } => {
                 let new = Approval::parse(&mode);
@@ -2187,6 +2394,113 @@ async fn reported_tokens(st: &Arc<State>, usage_in: u64, usage_out: u64) -> (u64
     ({ *st.estimated_tokens.lock().await }, 0)
 }
 
+/// Whether a turn's originating prompt is itself a learning delegation
+/// (`/reflect` or `/index`), which is exempt from auto-reflect — it IS the
+/// reflection. NB: these prefixes must stay in sync with the TUI's
+/// `sendDelegation` prompts for `/reflect` and `/index` (handlers.go).
+fn is_learning_turn(prompt: &str) -> bool {
+    let p = prompt.trim();
+    p.starts_with("Reflect on the work done in this session")
+        || p.starts_with("Run a full knowledge index of this repository")
+        || p.starts_with("Run an incremental knowledge index of this repository")
+}
+
+/// Build the reflection text injected before completion. Includes recurring
+/// patterns (if any) so the model can decide whether to write a skill — the
+/// recurrence signal that makes the "solve the same shape 2+ times" rule
+/// evaluable instead of a vibes check the model can't track across sessions.
+fn build_reflect_text(recurring: &[(usize, String)]) -> String {
+    let mut s = String::from(
+        "[auto-reflect] Before completing, take one reflection step. \n\
+         (1) If you learned a durable convention, architecture fact, decision, \n\
+         or gotcha, persist it with the `memory` tool (action: append if a topic \n\
+         memory exists, else save) — skip transient task state. \n\
+         (2) If you just performed a reusable workflow, consider writing a skill \n\
+         under `.umans-harness/skills/<name>/SKILL.md` (run \n\
+         `list_dir .umans-harness/skills/` first to extend rather than duplicate). \n\
+         Then call `finish` to complete.",
+    );
+    if !recurring.is_empty() {
+        s.push_str("\n\nRecurring patterns detected (performed 2+ times across sessions):");
+        for (count, label) in recurring.iter().take(5) {
+            s.push_str(&format!("\n- {label} ({count} times)"));
+        }
+        s.push_str("\nIf no existing skill covers a recurring pattern, write one.");
+    }
+    s
+}
+
+/// Extract file categories from a tool call's arguments, for shape analysis.
+/// Only file-writing tools contribute a stable path signal (bash etc. do not).
+fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
+    let args: Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let paths: Vec<String> = match tool {
+        "write_file" | "edit" | "patch" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+        "bulk_write" => args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "bulk_edit" => args
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    paths
+        .into_iter()
+        .map(|p| pattern_log::file_category(&p))
+        .collect()
+}
+
+/// Auto-reflect gate + prompt builder. Returns `(reflect_text, recurrence_count)`
+/// if auto-reflect should fire for this turn, else `None`. As a side effect,
+/// records the turn's shape to the pattern log so recurrence is tracked.
+/// Callers guard with `!reflected` (one reflection per turn).
+async fn maybe_reflect_prompt(
+    st: &Arc<State>,
+    prompt: &str,
+    turn_tool_calls: u32,
+    shape_tools: &[String],
+    shape_files: &[String],
+    cancelled: bool,
+) -> Option<(String, usize)> {
+    let cfg = st.cfg.read().await;
+    if !cfg.auto_reflect || cancelled {
+        return None;
+    }
+    if turn_tool_calls < cfg.auto_reflect_min_tool_calls {
+        return None;
+    }
+    if is_learning_turn(prompt) {
+        return None;
+    }
+    let workspace = cfg.workspace.clone();
+    drop(cfg);
+    let sig = pattern_log::shape_signature(shape_tools, shape_files);
+    let label = prompt.lines().next().unwrap_or(prompt);
+    pattern_log::append_pattern(&workspace, &sig, label);
+    let recurring = pattern_log::recurring_patterns(&workspace);
+    let text = build_reflect_text(&recurring);
+    Some((text, recurring.len()))
+}
+
 async fn run_turn(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -2213,6 +2527,17 @@ async fn run_turn(
     // Vision handoff (pre_turn) and other plugins may remap the model for
     // this turn; keep a mutable binding so a swap propagates to the request loop.
     let mut model = model;
+
+    // Auto-reflect turn-local state (SELF_LEARNING §11 deterministic seam). The
+    // shape (tool names + file categories) is accumulated as tools run; at the
+    // first `finish`/natural completion of a non-trivial turn it is logged to
+    // the recurrence store and a reflection continuation is injected so durable
+    // facts/patterns get persisted without relying on the model remembering to.
+    // `reflected` prevents re-entry: the reflect's own `finish` exits for real.
+    let mut reflected = false;
+    let mut turn_tool_calls: u32 = 0;
+    let mut shape_tools: Vec<String> = Vec::new();
+    let mut shape_files: Vec<String> = Vec::new();
 
     // Ensure system prompt is present; persist every finalized message to the session file.
     let mut init_est_add = 0u64;
@@ -2401,7 +2726,7 @@ async fn run_turn(
                     .find(|m| m.id == model)
                     .map(|m| m.context_window as u64)
                     .unwrap_or(200_000);
-                if rp.api_key.is_some() {
+                let summary_chars = if rp.api_key.is_some() {
                     compact_with_summary(
                         client,
                         &cfg,
@@ -2414,8 +2739,9 @@ async fn run_turn(
                     )
                     .await
                 } else {
-                    compact_conversation(&mut messages, idle_ctx)
-                }
+                    compact_conversation(&mut messages, idle_ctx);
+                    0
+                };
                 *st.conversation.lock().await = messages.clone();
                 if let Some(p) = cfg.session_file.as_ref() {
                     session::rewrite(p, &messages);
@@ -2428,7 +2754,8 @@ async fn run_turn(
                 emit(
                     &Event::new("compacted")
                         .with("before_tokens", json!(est))
-                        .with("after_tokens", json!(after_est)),
+                        .with("after_tokens", json!(after_est))
+                        .with("summary_chars", json!(summary_chars)),
                 );
             }
         }
@@ -2550,7 +2877,7 @@ async fn run_turn(
         if est > threshold.min(hard_cap) && messages.len() > 4 {
             let force_summarize = est > hard_cap;
             dispatch_lifecycle(st, "pre_compact").await;
-            compact_with_summary(
+            let summary_chars = compact_with_summary(
                 client,
                 &cfg,
                 &provider,
@@ -2573,7 +2900,8 @@ async fn run_turn(
             emit(
                 &Event::new("compacted")
                     .with("before_tokens", json!(est))
-                    .with("after_tokens", json!(after_est)),
+                    .with("after_tokens", json!(after_est))
+                    .with("summary_chars", json!(summary_chars)),
             );
         }
 
@@ -2728,6 +3056,15 @@ async fn run_turn(
                             .with("name", json!(name))
                             .with("args", json!(args_str)),
                     );
+                    // Accumulate the turn's work-shape for auto-reflect (skip
+                    // `finish` — it signals completion, not work).
+                    if name != "finish" {
+                        turn_tool_calls = turn_tool_calls.saturating_add(1);
+                        shape_tools.push(name.clone());
+                        for cat in extract_file_categories(&name, &args_str) {
+                            shape_files.push(cat);
+                        }
+                    }
                     let args: Value = match serde_json::from_str(&args_str) {
                         Ok(v) => v,
                         Err(_) => {
@@ -3188,29 +3525,59 @@ async fn run_turn(
 
                     // finish sentinel: the model signaled completion.
                     if name == "finish" && outcome.ok && outcome.output == "__finish__" {
-                        *st.last_turn_time.lock().await = std::time::Instant::now();
-                        let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
-                        let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                        *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                        emit(
-                            &Event::new("metrics")
-                                .with("ttft_ms", json!(metrics.ttft_ms))
-                                .with("elapsed_ms", json!(metrics.elapsed_ms))
-                                .with(
-                                    "tokens_in",
-                                    json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
-                                )
-                                .with("prompt_tokens", json!(metrics.tokens_in))
-                                .with("tokens_out", json!(metrics.tokens_out))
-                                .with("cached_tokens", json!(metrics.cached_tokens))
-                                .with("tps", json!(metrics.tps))
-                                .with("model", json!(metrics.model)),
-                        );
-                        st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
-                        st.logger.record_turn();
-                        persist_stats(st).await;
-                        emit(&Event::new("done"));
-                        return;
+                        // Auto-reflect gate: before the first `finish` exits a
+                        // non-trivial turn, inject a reflection continuation (the
+                        // deterministic seam SELF_LEARNING §11 deferred) instead
+                        // of completing. Falls through to the normal tool-result
+                        // push + re-stream; `reflected` prevents re-entry.
+                        let mut do_reflect = false;
+                        let mut recurrence = 0usize;
+                        if !reflected {
+                            if let Some((nudge, rec)) = maybe_reflect_prompt(
+                                st,
+                                &prompt,
+                                turn_tool_calls,
+                                &shape_tools,
+                                &shape_files,
+                                cancel.is_cancelled(),
+                            )
+                            .await
+                            {
+                                reflected = true;
+                                outcome.output = nudge;
+                                recurrence = rec;
+                                do_reflect = true;
+                            }
+                        }
+                        if do_reflect {
+                            emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
+                            // Fall through → the finish tool_result (carrying
+                            // the nudge) is pushed below and the loop re-streams.
+                        } else {
+                            *st.last_turn_time.lock().await = std::time::Instant::now();
+                            let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
+                            let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
+                            *st.last_turn_metrics.lock().await = Some(metrics.clone());
+                            emit(
+                                &Event::new("metrics")
+                                    .with("ttft_ms", json!(metrics.ttft_ms))
+                                    .with("elapsed_ms", json!(metrics.elapsed_ms))
+                                    .with(
+                                        "tokens_in",
+                                        json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
+                                    )
+                                    .with("prompt_tokens", json!(metrics.tokens_in))
+                                    .with("tokens_out", json!(metrics.tokens_out))
+                                    .with("cached_tokens", json!(metrics.cached_tokens))
+                                    .with("tps", json!(metrics.tps))
+                                    .with("model", json!(metrics.model)),
+                            );
+                            st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
+                            st.logger.record_turn();
+                            persist_stats(st).await;
+                            emit(&Event::new("done"));
+                            return;
+                        }
                     }
                     // Surface plugin hook feedback to the model. Any pre-hook that
                     // modified args or posted a reason, and any post-hook that
@@ -3246,30 +3613,67 @@ async fn run_turn(
                 // Loop back for the model to continue.
             }
             _ => {
-                // Turn complete: emit metrics + done.
-                *st.last_turn_time.lock().await = std::time::Instant::now();
-                let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
-                let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                emit(
-                    &Event::new("metrics")
-                        .with("ttft_ms", json!(metrics.ttft_ms))
-                        .with("elapsed_ms", json!(metrics.elapsed_ms))
-                        .with(
-                            "tokens_in",
-                            json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
-                        )
-                        .with("prompt_tokens", json!(metrics.tokens_in))
-                        .with("tokens_out", json!(metrics.tokens_out))
-                        .with("cached_tokens", json!(metrics.cached_tokens))
-                        .with("tps", json!(metrics.tps))
-                        .with("model", json!(metrics.model)),
-                );
-                st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
-                st.logger.record_turn();
-                persist_stats(st).await;
-                emit(&Event::new("done"));
-                return;
+                // Turn complete — or, on a non-trivial turn, inject a reflect
+                // continuation before the real completion (auto-reflect gate).
+                let mut do_reflect = false;
+                let mut recurrence = 0usize;
+                let mut reflect_prompt = String::new();
+                if !reflected {
+                    if let Some((p, rec)) = maybe_reflect_prompt(
+                        st,
+                        &prompt,
+                        turn_tool_calls,
+                        &shape_tools,
+                        &shape_files,
+                        cancel.is_cancelled(),
+                    )
+                    .await
+                    {
+                        reflected = true;
+                        reflect_prompt = p;
+                        recurrence = rec;
+                        do_reflect = true;
+                    }
+                }
+                if do_reflect {
+                    // Push the reflect prompt as a user message and re-stream.
+                    let msg = json!({ "role": "user", "content": reflect_prompt });
+                    let est = estimate_message_tokens(&msg);
+                    let mut conv = st.conversation.lock().await;
+                    conv.push(msg);
+                    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                        session::append(p, conv.last().unwrap());
+                    }
+                    *st.estimated_tokens.lock().await += est;
+                    drop(conv);
+                    emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
+                    // Don't return → the outer loop re-streams the reflection.
+                } else {
+                    // Turn complete: emit metrics + done.
+                    *st.last_turn_time.lock().await = std::time::Instant::now();
+                    let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
+                    let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
+                    *st.last_turn_metrics.lock().await = Some(metrics.clone());
+                    emit(
+                        &Event::new("metrics")
+                            .with("ttft_ms", json!(metrics.ttft_ms))
+                            .with("elapsed_ms", json!(metrics.elapsed_ms))
+                            .with(
+                                "tokens_in",
+                                json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
+                            )
+                            .with("prompt_tokens", json!(metrics.tokens_in))
+                            .with("tokens_out", json!(metrics.tokens_out))
+                            .with("cached_tokens", json!(metrics.cached_tokens))
+                            .with("tps", json!(metrics.tps))
+                            .with("model", json!(metrics.model)),
+                    );
+                    st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
+                    st.logger.record_turn();
+                    persist_stats(st).await;
+                    emit(&Event::new("done"));
+                    return;
+                }
             }
         }
     }
@@ -3747,27 +4151,32 @@ pub async fn compact_with_summary(
     cancel: &CancellationToken,
     force_summarize: bool,
     context_window: u64,
-) {
+) -> usize {
+    // Returns the character count of the produced summary system message (0
+    // when no summary was generated — naive drop-oldest fallback or a
+    // failed/too-small summarize). Surfaced on the `compacted` event so the
+    // TUI can show how big the rolling summary is.
     if messages.len() <= 2 {
-        return;
+        return 0;
     }
     if !cfg.summarize_on_compact && !force_summarize {
         compact_conversation(messages, context_window);
-        return;
+        return 0;
     }
     let tail_start = token_budget_tail_start(messages, context_window).max(1);
     if tail_start <= 1 {
         compact_conversation(messages, context_window);
-        return;
+        return 0;
     }
     let to_summarize: Vec<Value> = messages[1..tail_start].to_vec();
     let kept: Vec<Value> = messages[tail_start..].to_vec();
     let summary = provider::summarize(client, provider, model, &to_summarize, cancel).await;
+    let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
-        compacted.push(
-            json!({ "role": "system", "content": format!("[Summary of earlier turns]\n{s}") }),
-        );
+        let content = format!("[Summary of earlier turns]\n{s}");
+        summary_chars = content.chars().count();
+        compacted.push(json!({ "role": "system", "content": content }));
     } else {
         compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
     }
@@ -3796,6 +4205,7 @@ pub async fn compact_with_summary(
     let budget = ((context_window as f32) * 0.5) as u64;
     digest_to_budget(&mut compacted, budget);
     *messages = compacted;
+    summary_chars
 }
 
 /// Turn an image reference into a data URL. Accepts:
@@ -4378,5 +4788,71 @@ mod work_state_tests {
         assert_eq!(ws.recent_files.len(), 8);
         // Most-recent (f11) is at the front.
         assert_eq!(ws.recent_files[0], "f11.rs");
+    }
+}
+
+#[cfg(test)]
+mod auto_reflect_tests {
+    use super::*;
+
+    #[test]
+    fn learning_turns_are_exempt() {
+        // The prefixes the TUI's /reflect and /index delegations produce.
+        assert!(is_learning_turn(
+            "Reflect on the work done in this session so far…"
+        ));
+        assert!(is_learning_turn(
+            "Run a full knowledge index of this repository now."
+        ));
+        assert!(is_learning_turn(
+            "  Run an incremental knowledge index of this repository"
+        ));
+        // A normal user task is not exempt.
+        assert!(!is_learning_turn("Add a release packaging flow"));
+        assert!(!is_learning_turn("fix the typo in README"));
+    }
+
+    #[test]
+    fn reflect_text_mentions_memory_and_skills() {
+        let txt = build_reflect_text(&[]);
+        assert!(txt.contains("[auto-reflect]"));
+        assert!(txt.contains("memory"));
+        assert!(txt.contains("skills/<name>/SKILL.md"));
+        assert!(txt.contains("finish"));
+        // No recurrence → no recurring-patterns section.
+        assert!(!txt.contains("Recurring patterns detected"));
+    }
+
+    #[test]
+    fn reflect_text_lists_recurring_patterns() {
+        let rec = vec![
+            (3, "add a core tool".into()),
+            (2, "add a tui renderer".into()),
+        ];
+        let txt = build_reflect_text(&rec);
+        assert!(txt.contains("Recurring patterns detected"));
+        assert!(txt.contains("add a core tool (3 times)"));
+        assert!(txt.contains("add a tui renderer (2 times)"));
+    }
+
+    #[test]
+    fn extract_file_categories_for_file_tools() {
+        let cats = extract_file_categories("edit", r#"{"path":"core/src/main.rs"}"#);
+        assert_eq!(cats, vec!["core/src/*.rs".to_string()]);
+        // bulk_write: one category per file, deduped by shape_signature later.
+        let cats = extract_file_categories(
+            "bulk_write",
+            r#"{"files":[{"path":"tui/render.go"},{"path":"tui/handlers.go"}]}"#,
+        );
+        assert_eq!(cats.len(), 2);
+        assert!(cats.iter().all(|c| c == "tui/*.go"));
+    }
+
+    #[test]
+    fn extract_file_categories_empty_for_non_file_tools() {
+        assert!(extract_file_categories("bash", r#"{"command":"ls"}"#).is_empty());
+        assert!(extract_file_categories("grep", r#"{"pattern":"x"}"#).is_empty());
+        // Malformed JSON is tolerated (no panic, no categories).
+        assert!(extract_file_categories("edit", "not json").is_empty());
     }
 }

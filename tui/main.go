@@ -73,6 +73,7 @@ type session struct {
 	pendingLogin   string // preset id awaiting a pasted API key in the /login modal
 
 	settings *settingsStore
+	keybinds map[string]string // effective keymap (defaults + user overrides); see keybinds.go
 	modal    modal
 	history  []string
 	histIdx  int
@@ -91,6 +92,8 @@ type session struct {
 	welcomeIdx    int                 // welcome-screen example cursor (empty conversation)
 	contextTokens uint64              // live context size from the last metrics event (drives the footer budget)
 	lastCachePct  int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
+	tokensSaved   uint64              // cumulative tokens reclaimed by digest + compaction (shown next to "cached" in the footer)
+	summaryChars  int                 // character count of the current rolling compaction summary (0 until a summary is produced)
 	subProgress   []*subProgressEntry // live subagent runs (drives the progress panel)
 	cwd           string              // working dir, shown in the header as ~/
 
@@ -114,6 +117,7 @@ func initialSession() *session {
 	s := &session{}
 
 	s.settings = loadSettings()
+	s.keybinds = effectiveKeybinds(s.settings.Keybinds)
 	if s.settings.Theme != "" {
 		setTheme(s.settings.Theme)
 	}
@@ -128,6 +132,7 @@ func initialSession() *session {
 	s.input.PlaceholderStyle = placeholderStyle
 	s.input.Prompt = ""
 	s.input.Focus()
+	s.enableMultilineInput() // keep typed/pasted newlines (see extras.go)
 
 	s.viewport = viewport.New(80, 20)
 	s.viewport.SetContent("")
@@ -436,10 +441,33 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		// bubbletea v1.3 can't decode modified-Enter (the Key type carries no
 		// modifier bits), so terminals send Ctrl+Enter as an unrecognized CSI sequence.
-		// Intercept it here to honor the steer binding; terminals that send a plain
-		// CR for Ctrl+Enter instead receive it as a normal "enter" (follow-up).
-		if s.modal.kind == modalNone && isCtrlEnterUnknownCSI(msg) {
-			return s, s.steerFromInput()
+		// Intercept it here so the user can both bind it (in /keybinds capture mode)
+		// and use it for steer. Terminals that send a plain CR for Ctrl+Enter instead
+		// receive it as a normal "enter" (follow-up).
+		if isCtrlEnterUnknownCSI(msg) {
+			// /keybinds capture mode: assign ctrl+enter to the selected action.
+			if s.modal.kind == modalKeybinds && s.modal.editing {
+				s.captureKeybind("ctrl+enter")
+				return s, nil
+			}
+			// Steer only if ctrl+enter is still the bound steer key (the user may
+			// have rebound it to something else via /keybinds).
+			if s.modal.kind == modalNone && s.keybinds["steer"] == "ctrl+enter" {
+				return s, s.steerFromInput()
+			}
+		}
+		// Shift+Enter arrives the same way (a modified-Enter CSI) and inserts a
+		// line break in the input box so the user can compose multi-line
+		// messages. Like ctrl+enter it can only ever fire for its one action.
+		if isShiftEnterUnknownCSI(msg) {
+			if s.modal.kind == modalKeybinds && s.modal.editing {
+				s.captureKeybind("shift+enter")
+				return s, nil
+			}
+			if s.modal.kind == modalNone && s.keybinds["newline"] == "shift+enter" {
+				s.insertNewline()
+				return s, nil
+			}
 		}
 	}
 	return s, nil

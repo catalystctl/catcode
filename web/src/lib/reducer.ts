@@ -14,6 +14,8 @@ import type {
   AssistantMsg,
   CoreEvent,
   IntercomEntry,
+  SubagentChatItem,
+  SubagentRunView,
   Toast,
   UIMessage,
   UIToolCall,
@@ -47,6 +49,7 @@ export const initialState: AgentState = {
   skills: [],
   pendingIntercom: null,
   intercomLog: [],
+  subagentRuns: {},
   visionConfig: null,
   switching: false,
 };
@@ -61,6 +64,35 @@ function pushToast(toasts: Toast[], kind: Toast["kind"], message: string): Toast
   const next = [...toasts, { id: newId("t"), kind, message }];
   // ponytail: keep the last 6 toasts so the stack can't grow unbounded.
   return next.length > 6 ? next.slice(next.length - 6) : next;
+}
+
+/** Get-or-create a subagent run view for a run_id, then apply a mutation. Used
+ *  by every subagent_* event so ordering gaps (a progress arriving before its
+ *  start) never crash — a missing run is created as a running stub. */
+function upsertRun(
+  state: AgentState,
+  runId: string,
+  fn: (r: SubagentRunView) => SubagentRunView,
+): AgentState {
+  const prev: SubagentRunView =
+    state.subagentRuns[runId] ?? {
+      id: runId,
+      mode: "",
+      agents: [],
+      task: "",
+      state: "running",
+      depth: 0,
+      startedAt: 0,
+      toolCount: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      elapsedMs: 0,
+      items: [],
+    };
+  return {
+    ...state,
+    subagentRuns: { ...state.subagentRuns, [runId]: fn(prev) },
+  };
 }
 
 /** Begin a new assistant message if none is in flight. */
@@ -470,21 +502,102 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         intercomLog: log,
         pendingIntercom: needsDecision
-          ? { request_id: ev.request_id, from: ev.from || "subagent", message: ev.message, reason: ev.reason }
+          ? { request_id: ev.id, from: ev.from || "subagent", message: ev.message, reason: ev.reason }
           : state.pendingIntercom,
         toasts: needsDecision ? pushToast(state.toasts, "info", `Subagent asks: ${msg}`) : state.toasts,
       };
     }
     case "subagent_progress": {
+      // Live phase/tokens/tool counters, keyed by run_id. Also keep a log line
+      // (the old reducer read `message`, which the core never emits for progress).
+      const phase = ev.phase ?? "";
       const entry: IntercomEntry = {
         id: newId("sp"),
         kind: "status",
         from: ev.agent,
-        message: ev.message,
+        message: ev.tool ? `${phase}: ${ev.tool}` : phase,
         ts: Date.now(),
       };
-      return { ...state, intercomLog: [entry, ...state.intercomLog].slice(0, 50) };
+      const withLog = { ...state, intercomLog: [entry, ...state.intercomLog].slice(0, 50) };
+      return upsertRun(withLog, ev.run_id, (r) => ({
+        ...r,
+        agent: ev.agent ?? r.agent,
+        phase,
+        tool: ev.tool ?? r.tool,
+        toolCount: ev.tool_count ?? r.toolCount,
+        tokensIn: ev.tokens_in ?? r.tokensIn,
+        tokensOut: ev.tokens_out ?? r.tokensOut,
+        elapsedMs: ev.elapsed_ms ?? r.elapsedMs,
+        state: r.state === "running" && phase === "done" ? "completed" : r.state,
+      }));
     }
+    case "subagent_start":
+      return upsertRun(state, ev.run_id, (r) => ({
+        ...r,
+        mode: ev.mode,
+        agent: ev.agent ?? r.agent,
+        agents: ev.agents ?? r.agents,
+        task: ev.task ?? r.task,
+        depth: ev.depth ?? r.depth,
+        startedAt: ev.started_at ?? r.startedAt,
+        state: "running",
+      }));
+    case "subagent_message": {
+      const item: SubagentChatItem = {
+        id: newId("sm"),
+        kind: "message",
+        role: ev.role === "user" || ev.role === "assistant" ? ev.role : "assistant",
+        content: ev.content,
+        ts: Date.now(),
+      };
+      return upsertRun(state, ev.run_id, (r) => ({ ...r, items: [...r.items, item] }));
+    }
+    case "subagent_tool_call": {
+      const item: SubagentChatItem = {
+        id: newId("st"),
+        kind: "tool",
+        callId: ev.call_id,
+        name: ev.name,
+        args: ev.args,
+        ts: Date.now(),
+      };
+      return upsertRun(state, ev.run_id, (r) => ({
+        ...r,
+        items: [...r.items, item],
+        toolCount: ev.tool_count ?? r.toolCount,
+      }));
+    }
+    case "subagent_tool_result":
+      return upsertRun(state, ev.run_id, (r) => {
+        // Match by call_id when present; otherwise the most recent tool item
+        // still awaiting a result (covers models that emit empty tool-call ids).
+        let matched = false;
+        const items = r.items.map((it) => {
+          if (matched || it.kind !== "tool" || it.result !== undefined) return it;
+          if (ev.call_id && it.callId === ev.call_id) {
+            matched = true;
+            return { ...it, result: ev.result, ok: ev.ok };
+          }
+          return it;
+        });
+        if (!matched) {
+          for (let i = items.length - 1; i >= 0; i--) {
+            if (items[i].kind === "tool" && items[i].result === undefined) {
+              items[i] = { ...items[i], result: ev.result, ok: ev.ok };
+              matched = true;
+              break;
+            }
+          }
+        }
+        return { ...r, items };
+      });
+    case "subagent_done":
+      return upsertRun(state, ev.run_id, (r) => ({
+        ...r,
+        state: ev.state ?? r.state,
+        summary: ev.summary ?? r.summary,
+        endedAt: ev.ended_at ?? r.endedAt,
+      }));
 
     // ── Memory ──
     case "memory_list":

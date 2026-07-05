@@ -137,7 +137,17 @@ pub struct Config {
     pub max_session_tokens: u64,    // hard session token budget (0 = unlimited)
     pub summarize_on_compact: bool, // use a model call to summarize dropped turns
     pub rolling_state: bool,        // inject a transient tail work-state summary (KV-cache-aware)
-    pub allow_vision: bool,         // accept image_url content in send
+    /// Auto-reflect: on a non-trivial turn (≥ `auto_reflect_min_tool_calls` tool
+    /// calls), inject a reflection continuation before `finish` exits so durable
+    /// facts get persisted (memory) and recurring patterns get written as skills
+    /// — without relying on the model remembering to reflect. The deterministic
+    /// seam SELF_LEARNING.md §11 deferred. Skips reflect/index turns and trivial
+    /// turns. Default on.
+    pub auto_reflect: bool,
+    /// Minimum non-trivial tool-call count for auto-reflect to fire. 1 = any
+    /// real work. 0 is treated as 1 (a no-work turn should never reflect).
+    pub auto_reflect_min_tool_calls: u32,
+    pub allow_vision: bool, // accept image_url content in send
     // --- permission rules (item 1) ---
     pub allow_rules: Vec<PermissionRule>,
     pub deny_rules: Vec<PermissionRule>,
@@ -304,6 +314,12 @@ pub struct ResolvedProvider {
     pub base_url: String,
     pub api_key: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// When true (Anthropic OAuth), the streaming/discovery path uses
+    /// `Authorization: Bearer <api_key>` + the `anthropic-beta: oauth-2025-04-20`
+    /// header instead of `x-api-key`. Set by `oauth::enrich_oauth` when a Claude
+    /// subscription token is used. (Gemini OAuth needs no flag: it reuses the
+    /// OpenAI Bearer path unchanged.)
+    pub oauth: bool,
 }
 
 impl ResolvedProvider {
@@ -326,6 +342,7 @@ impl ResolvedProvider {
             base_url: cfg.base_url.clone(),
             api_key,
             headers: Vec::new(),
+            oauth: false,
         }
     }
 }
@@ -370,10 +387,10 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: "openai",
         label: "OpenAI (Codex)",
         kind: ProviderKind::OpenAI,
-        base_url: "https://api.openai.com/v1",
+        base_url: "https://chatgpt.com/backend-api/codex",
         api_key_env: "OPENAI_API_KEY",
         alt_envs: &[],
-        description: "OpenAI API — GPT-5 Codex, o-series, GPT-4.1. Uses your OPENAI_API_KEY.",
+        description: "OpenAI Codex via ChatGPT subscription OAuth (or OPENAI_API_KEY for API-key mode)."
     },
     ProviderPreset {
         id: "gemini",
@@ -383,7 +400,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         api_key_env: "GEMINI_API_KEY",
         alt_envs: &["GOOGLE_API_KEY"],
-        description: "Google Gemini via its OpenAI-compatible endpoint — Gemini 2.5 Pro/Flash. Uses GEMINI_API_KEY (or GOOGLE_API_KEY).",
+        description: "Google Gemini via its OpenAI-compatible endpoint — Gemini 2.5 Pro/Flash. Uses GEMINI_API_KEY (or GOOGLE_API_KEY), or `/login` for an OAuth subscription login (matches the `gemini` CLI exactly — supports both regular Google accounts and Google Cloud/ADC/service-account credentials).",
     },
     ProviderPreset {
         id: "anthropic",
@@ -393,6 +410,21 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_env: "ANTHROPIC_API_KEY",
         alt_envs: &[],
         description: "Anthropic API — Claude Opus/Sonnet/Haiku 4. Uses your ANTHROPIC_API_KEY.",
+    },
+    ProviderPreset {
+        id: "opencode-go",
+        label: "OpenCode Go",
+        kind: ProviderKind::OpenAI,
+        // OpenCode Go is one subscription/key that serves some models via an
+        // OpenAI-compatible `/v1/chat/completions` endpoint and others via an
+        // Anthropic `/v1/messages` endpoint. preset_provider_configs()
+        // expands this preset into TWO provider configs (opencode-go +
+        // opencode-go-anthropic) sharing this base URL + key, so each model
+        // routes to its correct wire protocol. See provider::is_opencode_go.
+        base_url: "https://opencode.ai/zen/go/v1",
+        api_key_env: "OPENCODE_GO_API_KEY",
+        alt_envs: &[],
+        description: "OpenCode Go — low-cost subscription for popular open coding models (GLM, Kimi, DeepSeek, MiMo, MiniMax, Qwen). One API key; models route to the OpenAI-compatible or Anthropic endpoint automatically. Uses your OPENCODE_GO_API_KEY.",
     },
 ];
 
@@ -450,6 +482,37 @@ impl ProviderPreset {
             api_key_env,
             headers: Vec::new(),
         }
+    }
+}
+
+/// The provider config(s) to create when logging in to a preset. Most presets
+/// map to a single config; OpenCode Go maps to TWO — one OpenAI-kind (for its
+/// `/v1/chat/completions` models: GLM, Kimi, DeepSeek, MiMo) and one
+/// Anthropic-kind (for its `/v1/messages` models: MiniMax, Qwen) — because
+/// OpenCode Go serves models over both wire protocols under one API key, and
+/// the harness's per-provider `kind` decides the wire translation at the HTTP
+/// boundary. Both configs share the preset's base URL + key. The first config
+/// is the "primary" (used as the active provider + preset identity).
+pub fn preset_provider_configs(p: &ProviderPreset, api_key: Option<String>) -> Vec<ProviderConfig> {
+    if p.id == "opencode-go" {
+        let (api_key_lit, api_key_env) = match api_key {
+            Some(k) => (Some(k), None),
+            None => (None, Some(p.resolved_env().to_string())),
+        };
+        let make = |name: &str, kind: ProviderKind| ProviderConfig {
+            name: name.to_string(),
+            kind,
+            base_url: p.base_url.to_string(),
+            api_key: api_key_lit.clone(),
+            api_key_env: api_key_env.clone(),
+            headers: Vec::new(),
+        };
+        vec![
+            make("opencode-go", ProviderKind::OpenAI),
+            make("opencode-go-anthropic", ProviderKind::Anthropic),
+        ]
+    } else {
+        vec![p.to_provider_config(api_key)]
     }
 }
 
@@ -518,30 +581,39 @@ pub fn save_providers_config(
 }
 
 /// Auto-log-in to every first-party preset whose API key is already available
-/// in the environment (e.g. `UMANS_API_KEY`, `OPENAI_API_KEY`, ...). For each
-/// such preset that isn't already explicitly configured, add a provider entry
-/// keyed by its env-var NAME (the secret stays in the environment, never copied
-/// into a config file). This makes "set the env var and it just works" true: the
-/// provider shows as logged in and its models appear in `/models` without a
-/// manual `/login` step. Already-configured providers are left untouched (a user
-/// who logged out keeps their choice for this process). Returns the names added.
-/// NOT persisted — env presence drives it every launch, so logging out then
-/// re-launching re-adds only if the env var is still set (intended).
+/// in the environment (`UMANS_API_KEY`, `OPENAI_API_KEY`, ...). Gemini/Claude
+/// may also reuse their CLI OAuth stores; OpenAI/Codex deliberately does not —
+/// use this app's OAuth login so account selection is explicit. For each such
+/// preset that isn't already explicitly configured, add a provider entry. API-key
+/// providers store the env-var NAME only (the secret stays in the environment);
+/// OAuth providers store no key at all (the token is resolved + refreshed at
+/// turn time by `oauth::enrich_oauth`). Already-configured providers are left
+/// untouched. Returns the names added. NOT persisted — presence (env var / cred
+/// file) drives it every launch.
 pub fn auto_login_env_presets(cfg: &mut Config) -> Vec<String> {
     let mut added = Vec::new();
     for p in PROVIDER_PRESETS {
         if cfg.find_provider(p.id).is_some() {
             continue; // already configured (explicit login or prior session) — leave it.
         }
-        if p.env_key().is_some() {
-            let mut pc = p.to_provider_config(None);
-            // For Umans, honor a custom cfg.base_url (e.g. UMANS_BASE_URL)
-            // instead of the preset's default URL, so a custom proxy isn't
-            // silently overwritten.
-            if p.id == "umans" && !cfg.base_url.is_empty() {
-                pc.base_url = cfg.base_url.clone();
+        // Auth available without a manual step?
+        let has_env_key = p.env_key().is_some();
+        let has_oauth = preset_has_oauth_creds(p);
+        if has_env_key || has_oauth {
+            // Most presets → one config; OpenCode Go → two (OpenAI-kind +
+            // Anthropic-kind) sharing the base URL + key.
+            let configs = preset_provider_configs(p, None);
+            for mut pc in configs {
+                // For Umans, honor a custom cfg.base_url (e.g. UMANS_BASE_URL)
+                // instead of the preset's default URL, so a custom proxy isn't
+                // silently overwritten.
+                if p.id == "umans" && !cfg.base_url.is_empty() {
+                    pc.base_url = cfg.base_url.clone();
+                }
+                if cfg.find_provider(&pc.name).is_none() {
+                    cfg.providers.push(pc);
+                }
             }
-            cfg.providers.push(pc);
             added.push(p.id.to_string());
         }
     }
@@ -554,6 +626,16 @@ pub fn auto_login_env_presets(cfg: &mut Config) -> Vec<String> {
         }
     }
     added
+}
+
+/// True when a preset's reusable OAuth credentials exist (cheap sync file
+/// check). OpenAI/Codex is intentionally excluded: no Codex CLI auto-detect.
+fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
+    match p.id {
+        "gemini" => crate::oauth::has_google_creds(),
+        "anthropic" => crate::oauth::has_claude_creds(),
+        _ => false,
+    }
 }
 
 impl Config {
@@ -615,6 +697,7 @@ impl Config {
             base_url: p.base_url.clone(),
             api_key,
             headers: p.headers.clone(),
+            oauth: false,
         }
     }
 }
@@ -653,6 +736,8 @@ impl Default for Config {
             max_session_tokens: 0,
             summarize_on_compact: true,
             rolling_state: true,
+            auto_reflect: true,
+            auto_reflect_min_tool_calls: 1,
             allow_vision: true,
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -918,6 +1003,20 @@ pub fn load() -> Config {
             c.max_session_tokens = n;
         }
     }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_AUTO_REFLECT") {
+        let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
+        let off = v == "0" || v.eq_ignore_ascii_case("false");
+        if off {
+            c.auto_reflect = false;
+        } else if on {
+            c.auto_reflect = true;
+        }
+    }
+    if let Ok(v) = std::env::var("UMANS_HARNESS_AUTO_REFLECT_MIN_TOOL_CALLS") {
+        if let Ok(n) = v.parse::<u32>() {
+            c.auto_reflect_min_tool_calls = n.max(1);
+        }
+    }
 
     // Custom providers. `UMANS_PROVIDERS` is a JSON array of provider objects
     // (same shape as the config-file `providers` field); merged after the file
@@ -1027,6 +1126,15 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(b) = v.get("rolling_state").and_then(|x| x.as_bool()) {
         c.rolling_state = b;
+    }
+    if let Some(b) = v.get("auto_reflect").and_then(|x| x.as_bool()) {
+        c.auto_reflect = b;
+    }
+    if let Some(n) = v
+        .get("auto_reflect_min_tool_calls")
+        .and_then(|x| x.as_u64())
+    {
+        c.auto_reflect_min_tool_calls = n.max(1) as u32;
     }
     if let Some(f) = v.get("context_digest_at").and_then(|x| x.as_f64()) {
         c.context_digest_at = f as f32;
@@ -1522,5 +1630,42 @@ mod tests {
             c.resolve_provider(&keys).api_key.as_deref(),
             Some("sk-tui-new")
         );
+    }
+
+    // OpenCode Go is one subscription/key serving models over TWO wire
+    // protocols. preset_provider_configs() must expand the single preset into
+    // two provider configs (OpenAI-kind + Anthropic-kind) sharing the base URL
+    // + key, while every other preset stays a single config.
+    #[test]
+    fn preset_provider_configs_opencode_go_expands_to_two() {
+        let p = find_preset("opencode-go").expect("opencode-go preset exists");
+        // with an explicit key -> stored as a literal on both configs
+        let configs = preset_provider_configs(p, Some("sk-go".to_string()));
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "opencode-go");
+        assert!(configs[0].kind.is_openai());
+        assert_eq!(configs[1].name, "opencode-go-anthropic");
+        assert!(configs[1].kind.is_anthropic());
+        for c in &configs {
+            assert_eq!(c.base_url, "https://opencode.ai/zen/go/v1");
+            assert_eq!(c.api_key.as_deref(), Some("sk-go"));
+            assert!(c.api_key_env.is_none());
+        }
+        // without a key -> env-var NAME persisted (secret stays in env), both
+        // configs reference the same env var.
+        let configs = preset_provider_configs(p, None);
+        assert_eq!(configs.len(), 2);
+        for c in &configs {
+            assert_eq!(c.api_key_env.as_deref(), Some("OPENCODE_GO_API_KEY"));
+            assert!(c.api_key.is_none());
+        }
+    }
+
+    #[test]
+    fn preset_provider_configs_single_for_other_presets() {
+        let p = find_preset("openai").expect("openai preset exists");
+        let configs = preset_provider_configs(p, Some("sk".to_string()));
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "openai");
     }
 }

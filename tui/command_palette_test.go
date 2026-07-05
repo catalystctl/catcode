@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 // TestSkillPaletteInsertsIntoInput: selecting a /skill:<name> entry from the
 // command palette must INSERT the token (+ trailing space) into the input box
@@ -34,6 +38,35 @@ func TestSkillPaletteInsertsIntoInput(t *testing.T) {
 	}
 	if s.busy {
 		t.Fatal("selecting a skill should NOT dispatch a turn (no in-flight request)")
+	}
+}
+
+// TestEnterSelectsEvenWhenSelectUnbound: the list modals (command palette,
+// models, theme, …) must keep a hardcoded "enter" fallback for selecting, so
+// clearing the "select" binding via /keybinds can never trap the user out of
+// the palette. Mirrors the guarantee the keybinds modal already makes.
+func TestEnterSelectsEvenWhenSelectUnbound(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.authed = true
+	s.width, s.height = 80, 24
+	s.models = []modelInfo{{ID: "m1", Name: "Model 1"}}
+	s.modelIdx = 0
+	s.openCommandPalette()
+
+	// Disable the select binding entirely (as /keybinds Delete would).
+	s.keybinds["select"] = ""
+
+	// Enter must still fire the select. The first palette entry is /keybinds,
+	// which opens the keybinds modal — so the assertion is that the palette
+	// dispatched the selection (modal left modalCommand), not that it closed.
+	before := s.modal.kind
+	if before != modalCommand {
+		t.Fatalf("precondition: palette should be open; kind=%v", before)
+	}
+	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if s.modal.kind == modalCommand {
+		t.Fatal("enter should select in the palette even with select unbound; palette stayed open")
 	}
 }
 

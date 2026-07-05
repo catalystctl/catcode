@@ -73,6 +73,21 @@ pub enum Command {
     /// models disappear from `/models`. No-op (error event) when not logged in.
     #[serde(rename = "logout")]
     Logout { provider: String },
+    /// Perform the interactive OAuth subscription login for a preset (`gemini` |
+    /// `anthropic`) — no official CLI needed. The core runs the OAuth flow
+    /// (Google device-code / Claude authorize+PKCE+loopback), emitting
+    /// `oauth_prompt` events with the URL/code to visit, stores the resulting
+    /// token, then re-aggregates models. Codex (Responses API) is not supported
+    /// here yet. Use `login` for an API-key login instead.
+    #[serde(rename = "login_oauth")]
+    LoginOauth { preset: String },
+    /// Complete a pending no-browser (manual-code) OAuth login by submitting the
+    /// authorization code the user pasted after visiting the URL from a prior
+    /// `oauth_prompt` (the SSH/headless Google flow). The core holds the PKCE
+    /// verifier from that prompt; this exchanges the code, stores the token,
+    /// and re-aggregates models. No-op (error event) when no login is pending.
+    #[serde(rename = "oauth_code")]
+    OauthCode { code: String },
     #[serde(rename = "send")]
     Send {
         prompt: String,

@@ -358,6 +358,13 @@ async fn discover_models_openai(
     provider: &ResolvedProvider,
     cache_key: &str,
 ) -> Vec<ModelInfo> {
+    // OpenCode Go: the single /v1/models endpoint serves every model over both
+    // wire protocols with no protocol field, so fetch it live and filter to
+    // this provider's protocol (OpenAI chat/completions here). See
+    // opencode_go_discover_models for the family-prefix partition + caching.
+    if is_opencode_go(&provider.base_url) {
+        return opencode_go_discover_models(client, provider, cache_key, true).await;
+    }
     // 1. Try disk cache (fresh: < 8 hours old).
     if let Some(models) = read_models_cache(cache_key) {
         return models;
@@ -386,7 +393,25 @@ async fn discover_models_openai(
 
     // 2b. /models/info miss (non-Umans endpoint) → standard OpenAI `/models`.
     if live.is_empty() {
-        let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
+        let url = if is_codex_endpoint(&provider.base_url) {
+            // The Codex `/models` endpoint REQUIRES `client_version` and filters
+            // the catalog by each model's `minimal_client_version`: a value too
+            // low (e.g. our own CARGO_PKG_VERSION "0.2.0") returns an EMPTY
+            // list, so discovery falls back to a stale hardcoded list and the
+            // user ends up sending a slug the backend rejects. The official
+            // `codex` CLI sends its own version (>= the latest models' minimum);
+            // dev builds send "0.0.0", which the backend special-cases to return
+            // the FULL account catalog regardless of minimums. We are not the
+            // codex CLI, so use the "0.0.0" dev sentinel — it reliably yields the
+            // models this account can actually use (verified: returns 4 models
+            // vs 0 for a low non-zero version).
+            format!(
+                "{}{OPENAI_MODELS_PATH}?client_version=0.0.0",
+                provider.base_url
+            )
+        } else {
+            format!("{}{OPENAI_MODELS_PATH}", provider.base_url)
+        };
         let mut req = client.get(&url).timeout(Duration::from_secs(8));
         if let Some(k) = provider.api_key.as_deref() {
             req = req.bearer_auth(k);
@@ -397,7 +422,11 @@ async fn discover_models_openai(
         if let Ok(r) = req.send().await {
             if r.status().is_success() {
                 if let Ok(v) = r.json::<Value>().await {
-                    let listed = parse_openai_models_list(&v);
+                    let listed = if is_codex_endpoint(&provider.base_url) {
+                        parse_codex_models_response(&v)
+                    } else {
+                        parse_openai_models_list(&v)
+                    };
                     if !listed.is_empty() {
                         write_models_cache(cache_key, &listed);
                         return listed;
@@ -426,7 +455,7 @@ const MODELS_CACHE_TTL: u64 = 28800;
 /// cache written by an older parser (e.g. one that stored empty thinking_levels
 /// or wrong vision flags because it read the wrong field) is treated as a miss
 /// and refreshed, instead of masking the fix for up to the TTL window.
-const MODELS_CACHE_VERSION: u64 = 4;
+const MODELS_CACHE_VERSION: u64 = 5;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -493,6 +522,7 @@ fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
             json!({
                 "id": m.id,
                 "name": m.name,
+                "reasoning": m.reasoning,
                 "context_window": m.context_window,
                 "max_tokens": m.max_tokens,
                 "thinking_levels": m.thinking_levels,
@@ -530,7 +560,7 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
         out.push(ModelInfo {
             id,
             name,
-            reasoning: true,
+            reasoning: m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(true),
             context_window,
             max_tokens,
             thinking_levels,
@@ -654,6 +684,83 @@ fn parse_openai_models_list(data: &Value) -> Vec<ModelInfo> {
     out
 }
 
+/// Parse ChatGPT Codex `GET /backend-api/codex/models` (`{models:[...]}`).
+/// This is the subscription catalog, so it is the source of truth for which
+/// ChatGPT models the logged-in account can actually use.
+fn parse_codex_models_response(data: &Value) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(Option<u64>, ModelInfo)> = arr
+        .iter()
+        .filter(|m| {
+            // The Codex catalog marks internal/auto models with
+            // `visibility: "hide"` (e.g. `codex-auto-review`). These must
+            // never be offered or picked as the default — they aren't meant
+            // for direct user turns. The official codex CLI excludes them the
+            // same way (only `visibility == "list"` models appear in the picker).
+            m.get("supported_in_api")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+                && m.get("visibility").and_then(|v| v.as_str()) != Some("hide")
+        })
+        .filter_map(|m| {
+            let id = m
+                .get("slug")
+                .or_else(|| m.get("id"))
+                .and_then(|v| v.as_str())?;
+            let name = m
+                .get("display_name")
+                .or_else(|| m.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(id);
+            let mut info = openai_model_caps(id, name);
+            if let Some(ctx) = m
+                .get("context_window")
+                .or_else(|| m.get("max_context_window"))
+                .and_then(|v| v.as_u64())
+            {
+                info.context_window = ctx.min(u32::MAX as u64) as u32;
+            }
+            let levels = m
+                .get("supported_reasoning_levels")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| {
+                            x.get("effort")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| x.as_str())
+                                .map(String::from)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !levels.is_empty() {
+                info.thinking_levels = levels;
+                info.reasoning = true;
+            }
+            info.vision = m
+                .get("supports_image_detail_original")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(info.vision);
+            let priority = m.get("priority").and_then(|v| v.as_u64());
+            Some((priority, info))
+        })
+        .collect();
+    // Sort by the catalog's `priority` ascending so the flagship (lowest
+    // priority number, e.g. gpt-5.5) lands first and becomes the
+    // default-selected model. The official codex CLI picks its default via a
+    // separate server `is_default` flag that isn't exposed in this response;
+    // priority-ascending is a faithful proxy. Models lacking a priority sort
+    // last (stable).
+    out.sort_by_key(|(p, _)| p.unwrap_or(u64::MAX));
+    let mut out: Vec<ModelInfo> = out.into_iter().map(|(_, m)| m).collect();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
 /// Curated capabilities for an OpenAI- or Gemini-family model id. Returns
 /// conservative defaults (ctx 200k, max 8k, reasoning true, vision false) for
 /// unknown ids so an unrecognized model still works.
@@ -706,7 +813,7 @@ fn openai_model_caps(id: &str, name: &str) -> ModelInfo {
 }
 
 /// True when the base URL points at Google's Gemini OpenAI-compatible endpoint.
-fn is_gemini_endpoint(base_url: &str) -> bool {
+pub fn is_gemini_endpoint(base_url: &str) -> bool {
     let host = base_url
         .split("://")
         .nth(1)
@@ -718,13 +825,350 @@ fn is_gemini_endpoint(base_url: &str) -> bool {
     host == "generativelanguage.googleapis.com"
 }
 
+/// True when the base URL points at ChatGPT's Codex subscription backend.
+pub fn is_codex_endpoint(base_url: &str) -> bool {
+    let host_path = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    host_path == "chatgpt.com/backend-api/codex"
+        || host_path == "chat.openai.com/backend-api/codex"
+        || host_path == "chatgpt-staging.com/backend-api/codex"
+}
+
+/// True if the base URL points at an OpenCode Go endpoint. OpenCode Go is a
+/// single subscription that serves some models via an OpenAI-compatible
+/// `/v1/chat/completions` endpoint and others via an Anthropic `/v1/messages`
+/// endpoint — all under one API key at `https://opencode.ai/zen/go/v1`. The
+/// harness models this as TWO provider configs (one OpenAI-kind, one
+/// Anthropic-kind) sharing the base URL + key; discovery returns a curated,
+/// protocol-specific model list for each (see `opencode_go_openai_models` /
+/// `opencode_go_anthropic_models`).
+pub fn is_opencode_go(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "opencode.ai" && base_url.to_ascii_lowercase().contains("/zen/go/")
+}
+
+/// Capabilities for an OpenCode Go model id. The OpenCode Go `/v1/models`
+/// endpoint returns only ids (no context window / max tokens / reasoning /
+/// vision), and does NOT indicate which wire protocol each model uses — that
+/// mapping lives in the OpenCode docs, not the API — so the harness curates
+/// the list. The per-model (context_window, max_tokens, vision) values come
+/// from the **Models.dev** registry (`https://models.dev/models.json`) — the
+/// same registry OpenCode itself uses — keyed by each model's upstream provider
+/// entry (e.g. `zhipuai/glm-5.2`, `minimax/MiniMax-M3`). The OpenCode Go
+/// endpoint exposes no richer endpoint of its own (`/v1/models/info` and
+/// `/v1/models/{id}` both 404), so Models.dev is the authoritative source.
+/// `max_tokens` is the model's max OUTPUT: for the Anthropic-served models
+/// (MiniMax/Qwen) the harness sends it as the request `max_tokens` (Anthropic
+/// requires the field), so an accurate value avoids truncating long replies;
+/// for the OpenAI-served models `max_tokens` is metadata only (the OpenAI path
+/// does not send it, so the server applies its own default). `context_window`
+/// drives the harness's compaction threshold, so an accurate value keeps
+/// compaction from firing far too early on the million-token models.
+///
+/// Reasoning: for Anthropic-served models (MiniMax/Qwen, per
+/// [`opencode_go_model_protocol`]), `thinking_levels` is set to
+/// `["low", "medium", "high"]` which enables the standard Anthropic
+/// `thinking` block (budgets: 4 096 / 12 288 / 24 576 tokens, clamped below
+/// `max_tokens`). The block is only sent when the user picks an effort >
+/// "none". For OpenAI-served models (GLM / Kimi / DeepSeek / MiMo),
+/// reasoning stays false + levels empty — the OpenAI path only sends
+/// `reasoning_effort` for Umans endpoints, and opencode-go is not Umans.
+/// For ids not in the table (a model the registry hasn't indexed), fall back
+/// to conservative flat defaults.
+fn opencode_go_model_caps(id: &str, name: &str) -> ModelInfo {
+    let (context_window, max_tokens, vision) =
+        opencode_go_caps(id).unwrap_or((200_000, 8_192, false));
+    let reasoning;
+    let thinking_levels;
+    if opencode_go_model_protocol(id) == Some(false) {
+        // Anthropic-served models: enable extended thinking via the standard
+        // Anthropic `thinking` block. Budgets: low=4096, medium=12288, high=24576
+        // (capped below max_tokens by anthropic_thinking_budget).
+        reasoning = true;
+        thinking_levels = vec!["low".into(), "medium".into(), "high".into()];
+    } else {
+        // OpenAI-served models: reasoning_effort is only sent for Umans
+        // endpoints (opencode-go is not Umans), so no reasoning.
+        reasoning = false;
+        thinking_levels = Vec::new();
+    }
+    ModelInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        reasoning,
+        context_window,
+        max_tokens,
+        thinking_levels,
+        vision,
+        ..Default::default()
+    }
+}
+
+/// Real `(context_window, max_tokens, vision)` for each documented OpenCode Go
+/// model id, sourced from Models.dev (`https://models.dev/models.json`). Values
+/// are the upstream model's limits (OpenCode Go passes the upstream context
+/// through, per its tiered pricing for the 256K+/1M models). `vision` is true
+/// when the upstream entry's `modalities.input` includes `image`. Returns
+/// `None` for ids the registry hasn't indexed; the caller then uses flat
+/// defaults. Keep this in sync with [`opencode_go_known_models`] (ids + display
+/// names) and [`opencode_go_model_protocol`] (family→wire-protocol routing).
+fn opencode_go_caps(id: &str) -> Option<(u32, u32, bool)> {
+    let l = id.to_ascii_lowercase();
+    Some(match l.as_str() {
+        // OpenAI-compatible /v1/chat/completions (zhipu / moonshot / deepseek / xiaomi)
+        "glm-5.2" => (1_000_000, 131_072, false),
+        "glm-5.1" => (200_000, 131_072, false),
+        "kimi-k2.7-code" => (262_144, 262_144, true),
+        "kimi-k2.6" => (262_144, 262_144, true),
+        "deepseek-v4-pro" => (1_000_000, 384_000, false),
+        "deepseek-v4-flash" => (1_000_000, 384_000, false),
+        "mimo-v2.5" => (1_048_576, 131_072, true),
+        "mimo-v2.5-pro" => (1_048_576, 131_072, false),
+        // Anthropic /v1/messages (minimax / alibaba)
+        "minimax-m3" => (512_000, 128_000, true),
+        "minimax-m2.7" => (204_800, 131_072, false),
+        "minimax-m2.5" => (204_800, 131_072, false),
+        "qwen3.7-max" => (1_000_000, 65_536, false),
+        "qwen3.7-plus" => (1_000_000, 64_000, true),
+        "qwen3.6-plus" => (1_000_000, 65_536, true),
+        _ => return None,
+    })
+}
+
+/// All OpenCode Go model ids documented in the OpenCode Go docs endpoint
+/// table, paired with their display names. The live `/v1/models` endpoint
+/// returns ids without display names or a protocol field, so this table
+/// supplies both: the display name (for known ids) and, via the family prefix
+/// in [`opencode_go_model_protocol`], the wire protocol. It is also the
+/// offline fallback when the endpoint is unreachable.
+fn opencode_go_known_models() -> &'static [(&'static str, &'static str)] {
+    &[
+        // OpenAI-compatible /v1/chat/completions
+        ("glm-5.2", "GLM-5.2"),
+        ("glm-5.1", "GLM-5.1"),
+        ("kimi-k2.7-code", "Kimi K2.7 Code"),
+        ("kimi-k2.6", "Kimi K2.6"),
+        ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+        ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+        ("mimo-v2.5", "MiMo-V2.5"),
+        ("mimo-v2.5-pro", "MiMo-V2.5-Pro"),
+        // Anthropic /v1/messages
+        ("minimax-m3", "MiniMax M3"),
+        ("minimax-m2.7", "MiniMax M2.7"),
+        ("minimax-m2.5", "MiniMax M2.5"),
+        ("qwen3.7-max", "Qwen3.7 Max"),
+        ("qwen3.7-plus", "Qwen3.7 Plus"),
+        ("qwen3.6-plus", "Qwen3.6 Plus"),
+    ]
+}
+
+/// The wire protocol an OpenCode Go model id is served over, inferred from its
+/// family prefix. The `/v1/models` endpoint exposes no protocol field, but the
+/// OpenCode Go docs endpoint table partitions cleanly by family:
+/// `glm`/`kimi`/`deepseek`/`mimo` → OpenAI (`/v1/chat/completions`);
+/// `minimax`/`qwen` → Anthropic (`/v1/messages`). Returns `None` for ids whose
+/// family is unknown to the docs (e.g. `hy3-preview`) — those are dropped
+/// during discovery rather than misrouted to a protocol they may not speak.
+fn opencode_go_model_protocol(id: &str) -> Option<bool> {
+    let l = id.to_ascii_lowercase();
+    if l.starts_with("glm-")
+        || l.starts_with("kimi-")
+        || l.starts_with("deepseek-")
+        || l.starts_with("mimo-")
+    {
+        Some(true)
+    } else if l.starts_with("minimax-") || l.starts_with("qwen") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Display name for an OpenCode Go model id: the curated name from the docs
+/// table when known, else synthesized as `Brand <rest>` from the family prefix
+/// (so newly-added ids the docs table hasn't caught up to still get a readable
+/// name instead of a raw slug).
+fn opencode_go_display_name(id: &str) -> String {
+    let l = id.to_ascii_lowercase();
+    if let Some((_, name)) = opencode_go_known_models().iter().find(|(k, _)| *k == l) {
+        return name.to_string();
+    }
+    let (rest, brand) = if let Some(r) = l.strip_prefix("glm-") {
+        (r, "GLM")
+    } else if let Some(r) = l.strip_prefix("kimi-") {
+        (r, "Kimi")
+    } else if let Some(r) = l.strip_prefix("deepseek-") {
+        (r, "DeepSeek")
+    } else if let Some(r) = l.strip_prefix("mimo-") {
+        (r, "MiMo")
+    } else if let Some(r) = l.strip_prefix("minimax-") {
+        (r, "MiniMax")
+    } else if let Some(r) = l.strip_prefix("qwen") {
+        (r, "Qwen")
+    } else {
+        return id.to_string();
+    };
+    let rest_str: String = rest
+        .split('-')
+        .map(|tok| {
+            let mut c = tok.chars();
+            match c.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rest_str.is_empty() {
+        brand.to_string()
+    } else {
+        format!("{brand} {rest_str}")
+    }
+}
+
+/// Parse an OpenCode Go `/v1/models` response (`{data:[{id,...}]}`) and keep
+/// only the ids served over the given wire protocol, mapping each to curated
+/// capabilities. The endpoint lists every model with no protocol field, so we
+/// partition by family prefix (see [`opencode_go_model_protocol`]); ids whose
+/// family is unknown are dropped (we can't safely route them).
+fn opencode_go_filter_models(data: &Value, openai: bool) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?;
+            if opencode_go_model_protocol(id) != Some(openai) {
+                return None;
+            }
+            let name = opencode_go_display_name(id);
+            Some(opencode_go_model_caps(id, &name))
+        })
+        .collect();
+    // de-dup by id, preserve order
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
+/// Discover OpenCode Go models by fetching the single `/v1/models` endpoint
+/// (which lists every model over both wire protocols, with no protocol field),
+/// filtering to `openai`-protocol models, and caching the result. Falls back to
+/// the stale disk cache, then the hardcoded curated list, when the endpoint is
+/// unreachable.
+///
+/// OpenCode Go is modeled as TWO provider configs sharing one base URL + key
+/// (OpenAI-kind + Anthropic-kind); this is called for each with `openai`
+/// selecting the protocol. The cache key already encodes the kind, so the two
+/// partitions never collide.
+async fn opencode_go_discover_models(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    cache_key: &str,
+    openai: bool,
+) -> Vec<ModelInfo> {
+    // 1. Fresh disk cache (< 8h TTL).
+    if let Some(models) = read_models_cache(cache_key) {
+        return models;
+    }
+    // 2. Fetch the live OpenAI-style /v1/models list. The endpoint serves every
+    //    model here regardless of wire protocol; auth is optional (the list is
+    //    public) but we send the key when configured.
+    let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
+    let mut req = client.get(&url).timeout(Duration::from_secs(8));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.bearer_auth(k);
+    }
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
+    let live = match req.send().await {
+        Ok(r) if r.status().is_success() => {
+            opencode_go_filter_models(&r.json::<Value>().await.unwrap_or(Value::Null), openai)
+        }
+        _ => Vec::new(),
+    };
+    if !live.is_empty() {
+        write_models_cache(cache_key, &live);
+        return live;
+    }
+    // 3. Stale cache, else the hardcoded curated list for this protocol.
+    read_models_cache_stale(cache_key).unwrap_or_else(|| opencode_go_fallback_models(openai))
+}
+
+/// Hardcoded curated list for one protocol — the offline fallback when the
+/// OpenCode Go `/v1/models` endpoint is unreachable. Derived from
+/// [`opencode_go_known_models`] filtered to the protocol family.
+fn opencode_go_fallback_models(openai: bool) -> Vec<ModelInfo> {
+    opencode_go_known_models()
+        .iter()
+        .filter(|(id, _)| opencode_go_model_protocol(id) == Some(openai))
+        .map(|(id, name)| opencode_go_model_caps(id, name))
+        .collect()
+}
+
+/// OpenCode Go models served via the OpenAI-compatible `/v1/chat/completions`
+/// endpoint — the offline fallback for the `opencode-go` (OpenAI-kind) provider
+/// config. Derived from [`opencode_go_known_models`] filtered to the OpenAI
+/// protocol family.
+#[allow(dead_code)]
+fn opencode_go_openai_models() -> Vec<ModelInfo> {
+    opencode_go_fallback_models(true)
+}
+
+/// OpenCode Go models served via the Anthropic `/v1/messages` endpoint — the
+/// offline fallback for the `opencode-go-anthropic` (Anthropic-kind) provider
+/// config. Derived from [`opencode_go_known_models`] filtered to the Anthropic
+/// protocol family.
+#[allow(dead_code)]
+fn opencode_go_anthropic_models() -> Vec<ModelInfo> {
+    opencode_go_fallback_models(false)
+}
+
 /// Curated fallback models for an OpenAI-compatible endpoint that served no
 /// list at all. Gemini host → Gemini models; otherwise the Umans default list.
 fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
+    if is_codex_endpoint(base_url) {
+        return codex_fallback_models();
+    }
     if is_gemini_endpoint(base_url) {
         return gemini_fallback_models();
     }
     fallback_models()
+}
+
+fn codex_fallback_models() -> Vec<ModelInfo> {
+    // Current ChatGPT-subscription Codex model slugs (from the official codex
+    // CLI's bundled models.json). These are the source of truth when the live
+    // `/backend-api/codex/models` catalog can't be reached. The OLD list
+    // (gpt-5.2-codex / gpt-5.1-codex-max / gpt-5-codex) are STALE slugs the
+    // backend rejects with "model is not supported when using Codex with a
+    // ChatGPT account". Ordered flagship-first so the first entry is the default.
+    [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+        "gpt-5.2",
+    ]
+    .iter()
+    .map(|id| openai_model_caps(id, id))
+    .collect()
 }
 
 /// Static Gemini model list used when the Gemini OpenAI-compatible endpoint
@@ -912,21 +1356,38 @@ pub async fn stream_turn(
 ) -> Result<(Value, String, u64, u64, u64), String> {
     match provider.kind {
         ProviderKind::OpenAI => {
-            stream_turn_openai(
-                client,
-                provider,
-                idle_timeout_secs,
-                model,
-                messages,
-                tools,
-                reasoning_effort,
-                thinking_levels,
-                cancel,
-                timer,
-                prompt_est,
-                quiet,
-            )
-            .await
+            if is_codex_endpoint(&provider.base_url) {
+                stream_turn_codex(
+                    client,
+                    provider,
+                    idle_timeout_secs,
+                    model,
+                    messages,
+                    tools,
+                    reasoning_effort,
+                    cancel,
+                    timer,
+                    prompt_est,
+                    quiet,
+                )
+                .await
+            } else {
+                stream_turn_openai(
+                    client,
+                    provider,
+                    idle_timeout_secs,
+                    model,
+                    messages,
+                    tools,
+                    reasoning_effort,
+                    thinking_levels,
+                    cancel,
+                    timer,
+                    prompt_est,
+                    quiet,
+                )
+                .await
+            }
         }
         ProviderKind::Anthropic => {
             stream_turn_anthropic(
@@ -947,6 +1408,263 @@ pub async fn stream_turn(
             .await
         }
     }
+}
+
+async fn stream_turn_codex(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    reasoning_effort: &str,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    prompt_est: u64,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
+    let api_key = provider.api_key.as_deref().unwrap_or("");
+    let (instructions, input) = codex_responses_input(messages);
+    let body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "tools": codex_responses_tools(tools),
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": { "effort": reasoning_effort, "summary": "auto" },
+        "store": false,
+        "stream": true,
+        "include": ["reasoning.encrypted_content"],
+    });
+    let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
+    let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut calls: Vec<ToolAccum> = Vec::new();
+    let mut tokens_in = 0;
+    let mut tokens_out = 0;
+    let mut cached_tokens = 0;
+    let idle = Duration::from_secs(idle_timeout_secs.max(10));
+    let mut last_stats: Option<Instant> = None;
+
+    loop {
+        let chunk = tokio::select! {
+            c = tokio::time::timeout(idle, stream.next()) => c.map_err(|_| format!("stream idle timeout ({}s with no data)", idle_timeout_secs))?,
+            _ = cancel.cancelled() => return Err("aborted".into()),
+        };
+        let Some(chunk) = chunk else { break };
+        let chunk = chunk.map_err(|e| format!("stream read: {}", fmt_chain(&e)))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim().to_string();
+            buf.drain(..=nl);
+            let data = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"));
+            let Some(data) = data else { continue };
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(t) = obj.get("delta").and_then(|v| v.as_str()) {
+                        if content.is_empty() {
+                            timer.mark_first_token();
+                        }
+                        content.push_str(t);
+                        if !quiet {
+                            emit(&Event::new("delta").with("text", json!(t)));
+                        }
+                    }
+                }
+                "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                    if let Some(t) = obj.get("delta").and_then(|v| v.as_str()) {
+                        if reasoning.is_empty() {
+                            timer.mark_first_token();
+                        }
+                        reasoning.push_str(t);
+                        if !quiet {
+                            emit(&Event::new("thinking").with("text", json!(t)));
+                        }
+                    }
+                }
+                "response.output_item.done" => {
+                    if let Some(item) = obj.get("item") {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let args = item
+                                .get("arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}")
+                                .to_string();
+                            let idx = calls.len();
+                            if !quiet {
+                                emit(
+                                    &Event::new("tool_call_start")
+                                        .with("id", json!(call_id))
+                                        .with("index", json!(idx)),
+                                );
+                                emit(
+                                    &Event::new("tool_call_name")
+                                        .with("index", json!(idx))
+                                        .with("name", json!(name)),
+                                );
+                                emit(
+                                    &Event::new("tool_call_args")
+                                        .with("index", json!(idx))
+                                        .with("args", json!(args)),
+                                );
+                            }
+                            calls.push(ToolAccum {
+                                id: call_id,
+                                name,
+                                args,
+                            });
+                        }
+                    }
+                }
+                "response.completed" => {
+                    if let Some(u) = obj.get("response").and_then(|r| r.get("usage")) {
+                        if let Some(p) = u.get("input_tokens").and_then(token_count) {
+                            tokens_in = p;
+                        }
+                        if let Some(o) = u.get("output_tokens").and_then(token_count) {
+                            tokens_out = o;
+                        }
+                        if let Some(c) = u
+                            .get("input_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(token_count)
+                        {
+                            cached_tokens = c;
+                        }
+                    }
+                }
+                "response.failed" => return Err(format!("Responses API failed: {obj}")),
+                _ => {}
+            }
+            if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
+                let now = Instant::now();
+                if last_stats
+                    .map(|t| now.duration_since(t).as_millis() >= 400)
+                    .unwrap_or(true)
+                {
+                    last_stats = Some(now);
+                    emit(
+                        &Event::new("metrics")
+                            .with("tokens_in", json!(tokens_in.max(prompt_est)))
+                            .with("tokens_out", json!(tokens_out))
+                            .with("cached_tokens", json!(cached_tokens)),
+                    );
+                }
+            }
+        }
+    }
+    timer.end_call(tokens_out, estimate_tokens(&content));
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.args }
+            })
+        })
+        .collect();
+    let mut msg = serde_json::Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    if !tool_calls.is_empty() {
+        msg.insert("content".into(), Value::Null);
+        msg.insert("tool_calls".into(), Value::Array(tool_calls));
+    } else {
+        msg.insert("content".into(), json!(content));
+    }
+    Ok((
+        Value::Object(msg),
+        if calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        }
+        .into(),
+        tokens_in,
+        tokens_out,
+        cached_tokens,
+    ))
+}
+
+fn codex_responses_input(messages: &[Value]) -> (String, Vec<Value>) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for m in messages {
+        match m.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+            "system" => instructions.push(content_text(m.get("content").unwrap_or(&Value::Null))),
+            "user" => input.push(json!({"type":"message","role":"user","content":[{"type":"input_text","text":content_text(m.get("content").unwrap_or(&Value::Null))}]})),
+            "assistant" => {
+                if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in calls {
+                        input.push(json!({
+                            "type":"function_call",
+                            "call_id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "name": tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
+                            "arguments": tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}"),
+                        }));
+                    }
+                } else {
+                    let text = content_text(m.get("content").unwrap_or(&Value::Null));
+                    if !text.is_empty() { input.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})); }
+                }
+            }
+            "tool" => input.push(json!({
+                "type":"function_call_output",
+                "call_id": m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                "output": content_text(m.get("content").unwrap_or(&Value::Null)),
+            })),
+            _ => {}
+        }
+    }
+    (instructions.join("\n\n"), input)
+}
+
+fn content_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        _ => v.to_string(),
+    }
+}
+
+fn codex_responses_tools(tools: &[Value]) -> Vec<Value> {
+    tools.iter().filter_map(|t| {
+        let f = t.get("function")?;
+        Some(json!({
+            "type": "function",
+            "name": f.get("name").cloned().unwrap_or(Value::Null),
+            "description": f.get("description").cloned().unwrap_or(Value::Null),
+            "parameters": f.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
+            "strict": false,
+        }))
+    }).collect()
 }
 
 /// OpenAI-compatible streaming turn. Emits the same delta/thinking/tool_call
@@ -1031,7 +1749,7 @@ async fn stream_turn_openai(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let resp = send_with_retry(client, &url, api_key, &body, cancel).await?;
+        let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         // P2-3: accumulator for a JSON object split across several `data:`
@@ -1328,6 +2046,7 @@ async fn send_with_retry(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
+    headers: &[(String, String)],
     body: &Value,
     cancel: &CancellationToken,
 ) -> Result<reqwest::Response, String> {
@@ -1339,7 +2058,10 @@ async fn send_with_retry(
         // that streams >5 min gets aborted mid-stream with "operation timed out".
         // Stalls are caught by connect_timeout (connect phase, on the client) +
         // the per-chunk idle timeout in stream_turn (body phase).
-        let req = client.post(url).bearer_auth(api_key).json(body);
+        let mut req = client.post(url).bearer_auth(api_key).json(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
 
         let resp = tokio::select! {
             r = req.send() => r,
@@ -1783,6 +2505,30 @@ struct AnthropicBlock {
     tool_args: String,
 }
 
+/// Initialize a `tool_use` block from a `content_block_start` event's
+/// `content_block` object — sets the tool id + name ONLY. The streamed
+/// arguments arrive separately via `input_json_delta` fragments (handled in
+/// the `content_block_delta` arm), so the start event's `input` field — which
+/// Anthropic's streaming API always sends as the empty placeholder `{}` for a
+/// tool_use — must NOT be captured here. Prepending it would corrupt the
+/// assembled arguments as `{}{...}` (e.g. `{}{"command":"ls"}`), which the
+/// tool dispatcher then rejects as malformed JSON. This was observed with
+/// MiniMax-M3 over the OpenCode Go Anthropic `/v1/messages` path. Empty args
+/// are substituted with `"{}"` downstream when finalizing tool_calls, so
+/// leaving `tool_args` empty here is correct.
+fn init_tool_use_block(b: &mut AnthropicBlock, cb: &Value) {
+    b.tool_id = cb
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    b.tool_name = cb
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+}
+
 /// POST an Anthropic request with retry on 429/5xx (same policy as the OpenAI
 /// path). Auth is `x-api-key` (not Bearer); `anthropic-version` + any provider
 /// headers are attached. Cancellation-aware.
@@ -1801,7 +2547,14 @@ async fn send_anthropic_request(
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(body);
-        if let Some(k) = provider.api_key.as_deref() {
+        if provider.oauth {
+            // Claude.ai subscription (OAuth): Bearer token + the oauth beta header
+            // instead of x-api-key, reusing the same Messages endpoint.
+            if let Some(k) = provider.api_key.as_deref() {
+                req = req.header("authorization", format!("Bearer {k}"));
+            }
+            req = req.header("anthropic-beta", "oauth-2025-04-20");
+        } else if let Some(k) = provider.api_key.as_deref() {
             req = req.header("x-api-key", k);
         }
         for (k, v) in &provider.headers {
@@ -1997,23 +2750,9 @@ async fn stream_turn_anthropic(
                         let b = &mut blocks[idx];
                         b.kind = btype.clone();
                         if btype == "tool_use" {
-                            b.tool_id = cb
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            b.tool_name = cb
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if let Some(input) = cb.get("input") {
-                                if let Some(s) = input.as_str() {
-                                    b.tool_args.push_str(s);
-                                } else {
-                                    b.tool_args.push_str(&input.to_string());
-                                }
-                            }
+                            // tool id + name only; the streamed `input` arrives
+                            // via input_json_delta (see init_tool_use_block).
+                            init_tool_use_block(b, &cb);
                             if !quiet {
                                 emitted = true;
                                 emit(
@@ -2225,12 +2964,24 @@ async fn discover_models_anthropic(
     provider: &ResolvedProvider,
     cache_key: &str,
 ) -> Vec<ModelInfo> {
+    // OpenCode Go: the single /v1/models endpoint serves every model over both
+    // wire protocols with no protocol field, so fetch it live and filter to
+    // this provider's protocol (Anthropic /v1/messages here). See
+    // opencode_go_discover_models for the family-prefix partition + caching.
+    if is_opencode_go(&provider.base_url) {
+        return opencode_go_discover_models(client, provider, cache_key, false).await;
+    }
     if let Some(models) = read_models_cache(cache_key) {
         return models;
     }
     let url = format!("{}{ANTHROPIC_MODELS_PATH}", provider.base_url);
     let mut req = client.get(&url).timeout(Duration::from_secs(8));
-    if let Some(k) = provider.api_key.as_deref() {
+    if provider.oauth {
+        if let Some(k) = provider.api_key.as_deref() {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        req = req.header("anthropic-beta", "oauth-2025-04-20");
+    } else if let Some(k) = provider.api_key.as_deref() {
         req = req.header("x-api-key", k);
     }
     req = req.header("anthropic-version", ANTHROPIC_VERSION);
@@ -2337,6 +3088,250 @@ fn anthropic_fallback_models() -> Vec<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_opencode_go_matches_zen_go_path() {
+        assert!(is_opencode_go("https://opencode.ai/zen/go/v1"));
+        assert!(is_opencode_go("https://opencode.ai/zen/go/v1/"));
+        // host must be opencode.ai AND path must include /zen/go/
+        assert!(!is_opencode_go("https://opencode.ai/zen/v1"));
+        assert!(!is_opencode_go("https://evil.com/zen/go/v1"));
+        // a look-alike host is not mistaken for opencode.ai
+        assert!(!is_opencode_go("https://opencode.ai.evil.com/zen/go/v1"));
+        // not umans (must not trigger Umans-only wire fields)
+        assert!(!is_umans("https://opencode.ai/zen/go/v1"));
+    }
+
+    #[test]
+    fn opencode_go_curated_lists_partition_by_protocol() {
+        let openai = opencode_go_openai_models();
+        let anth = opencode_go_anthropic_models();
+        // the OpenCode Go docs map exactly these models to each protocol
+        assert_eq!(
+            openai.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![
+                "glm-5.2",
+                "glm-5.1",
+                "kimi-k2.7-code",
+                "kimi-k2.6",
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "mimo-v2.5",
+                "mimo-v2.5-pro",
+            ]
+        );
+        assert_eq!(
+            anth.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![
+                "minimax-m3",
+                "minimax-m2.7",
+                "minimax-m2.5",
+                "qwen3.7-max",
+                "qwen3.7-plus",
+                "qwen3.6-plus",
+            ]
+        );
+        // no model appears in both lists (each routes to exactly one protocol)
+        let mut all: Vec<String> = openai
+            .iter()
+            .chain(anth.iter())
+            .map(|m| m.id.clone())
+            .collect();
+        all.sort();
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(
+            all.len(),
+            deduped.len(),
+            "model id duplicated across protocols"
+        );
+        // conservative, honest capabilities: no advertised thinking levels (so
+        // no reasoning_effort/thinking block is ever sent over this endpoint)
+        // OpenAI-served models: no reasoning (reasoning_effort is Umans-only)
+        for m in &openai {
+            assert!(
+                m.thinking_levels.is_empty(),
+                "OpenAI {} has thinking levels",
+                m.id
+            );
+            assert!(!m.reasoning, "OpenAI {} marked reasoning", m.id);
+            assert!(m.context_window > 0 && m.max_tokens > 0);
+        }
+        // Anthropic-served models: extended thinking enabled
+        for m in &anth {
+            assert!(
+                !m.thinking_levels.is_empty(),
+                "Anthropic {} has no thinking levels",
+                m.id
+            );
+            assert!(m.reasoning, "Anthropic {} not marked reasoning", m.id);
+            assert!(m.context_window > 0 && m.max_tokens > 0);
+        }
+    }
+
+    #[test]
+    fn opencode_go_model_protocol_partitions_by_family() {
+        // OpenAI chat/completions families (incl. ids the docs table hasn't
+        // caught up to).
+        for id in [
+            "glm-5.2",
+            "glm-5",
+            "kimi-k2.7-code",
+            "kimi-k2.5",
+            "deepseek-v4-pro",
+            "mimo-v2.5",
+            "mimo-v2-omni",
+        ] {
+            assert_eq!(
+                opencode_go_model_protocol(id),
+                Some(true),
+                "{id} should be OpenAI"
+            );
+        }
+        // Anthropic /v1/messages families.
+        for id in [
+            "minimax-m3",
+            "minimax-m2.7",
+            "qwen3.7-max",
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+        ] {
+            assert_eq!(
+                opencode_go_model_protocol(id),
+                Some(false),
+                "{id} should be Anthropic"
+            );
+        }
+        // Unknown family → None (dropped, not misrouted).
+        assert_eq!(opencode_go_model_protocol("hy3-preview"), None);
+    }
+
+    #[test]
+    fn opencode_go_filter_models_partitions_live_endpoint_payload() {
+        // Shape returned by https://opencode.ai/zen/go/v1/models (OpenAI-style
+        // {data:[{id,...}]}; no display name, no protocol field). Includes ids
+        // beyond the docs table (kimi-k2.5, glm-5, qwen3.5-plus, mimo-v2-pro,
+        // mimo-v2-omni) and one unknown-family id (hy3-preview).
+        let payload = json!({
+            "object": "list",
+            "data": [
+                {"id":"minimax-m3","object":"model","owned_by":"opencode"},
+                {"id":"minimax-m2.7","object":"model","owned_by":"opencode"},
+                {"id":"minimax-m2.5","object":"model","owned_by":"opencode"},
+                {"id":"kimi-k2.7-code","object":"model","owned_by":"opencode"},
+                {"id":"kimi-k2.6","object":"model","owned_by":"opencode"},
+                {"id":"kimi-k2.5","object":"model","owned_by":"opencode"},
+                {"id":"glm-5.2","object":"model","owned_by":"opencode"},
+                {"id":"glm-5.1","object":"model","owned_by":"opencode"},
+                {"id":"glm-5","object":"model","owned_by":"opencode"},
+                {"id":"deepseek-v4-pro","object":"model","owned_by":"opencode"},
+                {"id":"deepseek-v4-flash","object":"model","owned_by":"opencode"},
+                {"id":"qwen3.7-max","object":"model","owned_by":"opencode"},
+                {"id":"qwen3.7-plus","object":"model","owned_by":"opencode"},
+                {"id":"qwen3.6-plus","object":"model","owned_by":"opencode"},
+                {"id":"qwen3.5-plus","object":"model","owned_by":"opencode"},
+                {"id":"mimo-v2-pro","object":"model","owned_by":"opencode"},
+                {"id":"mimo-v2-omni","object":"model","owned_by":"opencode"},
+                {"id":"mimo-v2.5-pro","object":"model","owned_by":"opencode"},
+                {"id":"mimo-v2.5","object":"model","owned_by":"opencode"},
+                {"id":"hy3-preview","object":"model","owned_by":"opencode"}
+            ]
+        });
+        let openai = opencode_go_filter_models(&payload, true);
+        let anth = opencode_go_filter_models(&payload, false);
+        // OpenAI partition: glm/kimi/deepseek/mimo families (order preserved).
+        assert_eq!(
+            openai.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![
+                "kimi-k2.7-code",
+                "kimi-k2.6",
+                "kimi-k2.5",
+                "glm-5.2",
+                "glm-5.1",
+                "glm-5",
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "mimo-v2-pro",
+                "mimo-v2-omni",
+                "mimo-v2.5-pro",
+                "mimo-v2.5",
+            ]
+        );
+        // Anthropic partition: minimax/qwen families.
+        assert_eq!(
+            anth.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![
+                "minimax-m3",
+                "minimax-m2.7",
+                "minimax-m2.5",
+                "qwen3.7-max",
+                "qwen3.7-plus",
+                "qwen3.6-plus",
+                "qwen3.5-plus",
+            ]
+        );
+        // No overlap between partitions.
+        let mut all: Vec<String> = openai
+            .iter()
+            .chain(anth.iter())
+            .map(|m| m.id.clone())
+            .collect();
+        all.sort();
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(all.len(), deduped.len(), "id in both partitions");
+        // hy3-preview (unknown family) is dropped, not misrouted.
+        assert!(!openai.iter().any(|m| m.id == "hy3-preview"));
+        assert!(!anth.iter().any(|m| m.id == "hy3-preview"));
+        // Known ids keep their curated display name; new ids get a synthesized one.
+        assert_eq!(
+            openai.iter().find(|m| m.id == "glm-5.2").unwrap().name,
+            "GLM-5.2"
+        );
+        assert_eq!(
+            openai.iter().find(|m| m.id == "kimi-k2.5").unwrap().name,
+            "Kimi K2.5"
+        );
+        assert_eq!(
+            anth.iter().find(|m| m.id == "qwen3.5-plus").unwrap().name,
+            "Qwen 3.5 Plus"
+        );
+        // Capabilities: OpenAI-served no reasoning; Anthropic-served have thinking.
+        for m in &openai {
+            assert!(
+                m.thinking_levels.is_empty(),
+                "OpenAI {} has thinking levels",
+                m.id
+            );
+            assert!(!m.reasoning, "OpenAI {} marked reasoning", m.id);
+        }
+        for m in &anth {
+            assert!(
+                !m.thinking_levels.is_empty(),
+                "Anthropic {} has no thinking levels",
+                m.id
+            );
+            assert!(m.reasoning, "Anthropic {} not marked reasoning", m.id);
+        }
+        // Malformed payload → empty (no panic).
+        assert!(opencode_go_filter_models(&json!({}), true).is_empty());
+        assert!(opencode_go_filter_models(&json!({"data":[]}), true).is_empty());
+    }
+
+    #[test]
+    fn opencode_go_display_name_synthesizes_unknown_ids() {
+        // Known → curated exact name.
+        assert_eq!(opencode_go_display_name("glm-5.2"), "GLM-5.2");
+        assert_eq!(opencode_go_display_name("kimi-k2.7-code"), "Kimi K2.7 Code");
+        assert_eq!(opencode_go_display_name("qwen3.7-max"), "Qwen3.7 Max");
+        // Unknown → synthesized "Brand <Rest>".
+        assert_eq!(opencode_go_display_name("kimi-k2.5"), "Kimi K2.5");
+        assert_eq!(opencode_go_display_name("glm-5"), "GLM 5");
+        assert_eq!(opencode_go_display_name("qwen3.5-plus"), "Qwen 3.5 Plus");
+        assert_eq!(opencode_go_display_name("mimo-v2-omni"), "MiMo V2 Omni");
+        // Totally unknown family → raw id.
+        assert_eq!(opencode_go_display_name("hy3-preview"), "hy3-preview");
+    }
 
     #[test]
     fn token_count_handles_int_float_and_string() {
@@ -2575,6 +3570,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_models_response_uses_subscription_catalog() {
+        let data = json!({
+            "models": [
+                {
+                    "slug": "chatgpt-remote-only",
+                    "display_name": "ChatGPT Remote Only",
+                    "supported_in_api": true,
+                    "supported_reasoning_levels": [
+                        {"effort": "max", "description": "Maximum"},
+                        {"effort": "focused", "description": "Focused"}
+                    ],
+                    "context_window": 272000,
+                    "supports_image_detail_original": true
+                },
+                {"slug": "hidden", "supported_in_api": false}
+            ]
+        });
+        let models = parse_codex_models_response(&data);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "chatgpt-remote-only");
+        assert_eq!(models[0].name, "ChatGPT Remote Only");
+        assert_eq!(models[0].context_window, 272000);
+        assert_eq!(
+            models[0].thinking_levels,
+            vec!["max".to_string(), "focused".to_string()]
+        );
+        assert!(models[0].vision);
+    }
+
+    #[test]
     fn modelinfo_vision_defaults_false_when_absent() {
         let j = r#"{"id":"x","name":"X","context_window":1,"max_tokens":1}"#;
         let m: ModelInfo = serde_json::from_str(j).unwrap();
@@ -2800,6 +3825,26 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_use_start_ignores_empty_input_placeholder() {
+        // Anthropic streaming: content_block_start always carries `input: {}`
+        // for a tool_use; the real args arrive via input_json_delta. The start
+        // handler must NOT capture that placeholder — doing so prepends "{}"
+        // and corrupts the assembled args as `{}{...}` (regression observed
+        // with MiniMax-M3 over the opencode-go Anthropic path).
+        let mut b = AnthropicBlock::default();
+        init_tool_use_block(
+            &mut b,
+            &json!({"type":"tool_use","id":"toolu_1","name":"bash","input":{}}),
+        );
+        assert_eq!(b.tool_id, "toolu_1");
+        assert_eq!(b.tool_name, "bash");
+        assert_eq!(b.tool_args, ""); // placeholder was NOT captured
+                                     // simulate input_json_delta fragments appending the real args
+        b.tool_args.push_str(r#"{"command":"ls -la"}"#);
+        assert_eq!(b.tool_args, r#"{"command":"ls -la"}"#); // no leading "{}"
+    }
+
+    #[test]
     fn build_anthropic_drops_reasoning_content() {
         // Prior Umans reasoning must NOT be replayed: Anthropic rejects raw
         // thinking blocks without signatures (400). Verify it's stripped.
@@ -2987,6 +4032,7 @@ mod tests {
             base_url: base,
             api_key: Some("test-key".into()),
             headers: Vec::new(),
+            oauth: false,
         }
     }
 

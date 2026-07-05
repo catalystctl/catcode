@@ -261,6 +261,21 @@ func (s *session) renderMetrics() string {
 			out = cacheStr
 		}
 	}
+	// Context-management reclaim: cumulative tokens freed by digest + compaction
+	// and the current rolling summary's size, shown next to the cache stat so the
+	// cost/benefit of compaction is visible at a glance.
+	if s.tokensSaved > 0 {
+		if out != "" {
+			out += " · "
+		}
+		out += fmt.Sprintf("%s saved", compactTokens(s.tokensSaved))
+	}
+	if s.summaryChars > 0 {
+		if out != "" {
+			out += " · "
+		}
+		out += fmt.Sprintf("summary %s chars", compactTokens(uint64(s.summaryChars)))
+	}
 	return out
 }
 
@@ -425,7 +440,11 @@ func (s *session) inputContent(w int) string {
 	before := r[:pos]
 	after := r[pos:] // after[0] is the char under the cursor (if any)
 
-	beforeLines := wrapRunes(before, w)
+	// beforeLines are the display lines strictly above the cursor's line.
+	// wrapRunesMultiline splits on literal '\n' first, then width-wraps each
+	// segment, so typed/pasted line breaks render as their own rows instead
+	// of being treated as width-1 runes (which broke the box + cursor math).
+	beforeLines := wrapRunesMultiline(before, w)
 	cLine := len(beforeLines) - 1
 	cCol := len(beforeLines[cLine])
 	// If the last before-line is exactly full, the cursor wraps to a fresh line.
@@ -434,24 +453,54 @@ func (s *session) inputContent(w int) string {
 		cLine++
 		cCol = 0
 	}
+	// The cursor cell + the remainder after it. When the cursor sits directly on
+	// a line break, show an empty cell and force everything that follows onto
+	// subsequent display lines (the '\n' just ends the current line).
 	curChar := " "
 	rest := []rune(nil)
+	newlineConsumed := false
 	if len(after) > 0 {
-		curChar = string(after[0])
-		rest = after[1:]
+		if after[0] == '\n' {
+			newlineConsumed = true
+			rest = after[1:]
+		} else {
+			curChar = string(after[0])
+			rest = after[1:]
+		}
 	}
-	// How much of `rest` fits on the cursor line (after the cursor cell).
+	// How much of `rest` fits on the cursor line (after the cursor cell). It
+	// also must not cross a '\n' (a line break ends the cursor line).
 	avail := w - cCol - 1
 	if avail < 0 {
 		avail = 0
 	}
-	var restAfter []rune
-	if len(rest) > avail {
-		restAfter = rest[avail:]
+	limit := avail
+	for i, ch := range rest {
+		if ch == '\n' {
+			if i < limit {
+				limit = i
+			}
+			break
+		}
 	}
-	restLines := wrapRunes(restAfter, w)
-	if len(restAfter) == 0 {
-		restLines = nil // no continuation lines when nothing overflows
+	if limit > len(rest) {
+		limit = len(rest)
+	}
+	restOnLine := rest[:limit]
+	var restAfter []rune
+	if limit < len(rest) && rest[limit] == '\n' {
+		// The line break ends the cursor line; consume it so it doesn't render
+		// as a spurious empty row. The content after it starts the next line.
+		newlineConsumed = true
+		restAfter = rest[limit+1:]
+	} else {
+		restAfter = rest[limit:]
+	}
+	// Display lines below the cursor line. A consumed newline guarantees at
+	// least one following line (even when empty) so the break stays visible.
+	var restLines [][]rune
+	if newlineConsumed || len(restAfter) > 0 {
+		restLines = wrapRunesMultiline(restAfter, w)
 	}
 
 	styleText := s.input.TextStyle.Inline(true).Render
@@ -461,10 +510,6 @@ func (s *session) inputContent(w int) string {
 	}
 	// cursor line: text before cursor + cursor cell + text after (on this line)
 	line := styleText(string(beforeLines[cLine]))
-	restOnLine := rest
-	if len(restOnLine) > avail {
-		restOnLine = restOnLine[:avail]
-	}
 	s.input.Cursor.SetChar(curChar)
 	line += s.input.Cursor.View()
 	if len(restOnLine) > 0 {
@@ -500,6 +545,29 @@ func (s *session) inputContent(w int) string {
 		out = capped
 	}
 	return strings.Join(out, "\n")
+}
+
+// wrapRunesMultiline splits r on literal '\n' then width-wraps each segment
+// via wrapRunes, producing the full set of display rows for a value that may
+// contain typed/pasted line breaks. A trailing newline yields a final empty
+// row (so the user sees the blank line they entered). Never returns empty.
+func wrapRunesMultiline(r []rune, w int) [][]rune {
+	if w < 1 {
+		w = 1
+	}
+	var out [][]rune
+	start := 0
+	for i, ch := range r {
+		if ch == '\n' {
+			out = append(out, wrapRunes(r[start:i], w)...)
+			start = i + 1
+		}
+	}
+	out = append(out, wrapRunes(r[start:], w)...)
+	if len(out) == 0 {
+		out = [][]rune{{}}
+	}
+	return out
 }
 
 // wrapRunes hard-wraps a rune slice to at most w runes per line. Hard (not

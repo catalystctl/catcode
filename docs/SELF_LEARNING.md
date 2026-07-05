@@ -473,10 +473,32 @@ Why in-band and not a separate reflection daemon?
 
 - **Explainable**: the user sees the reflection in the transcript and can steer it.
 - **No extra model calls**: a background reflection daemon doubles token cost.
-- **Deterministic seam exists if needed:** the `session_stop` hook fires after
-  *every* turn (despite the "session" name, it is turn-scoped — `session_start`
-  fires at `run_turn` entry, `session_stop` at exit). A plugin can hook
-  `session_stop` to log telemetry or run a side reflection without touching core.
+- **Deterministic seam — now WIRED (auto-reflect):** the `session_stop` hook
+  fires after *every* turn (despite the "session" name, it is turn-scoped —
+  `session_start` fires at `run_turn` entry, `session_stop` at exit). On top
+  of the prompt-driven protocol, the core now injects an **auto-reflect
+  continuation** at the first `finish`/natural completion of any non-trivial
+  turn (≥ `auto_reflect_min_tool_calls` tool calls): instead of exiting, it
+  nudges the model with a reflect prompt (persist durable facts → `memory`;
+  write a skill if a pattern recurs) and re-streams. `reflected` prevents
+  re-entry (the reflect's own `finish` exits for real). `/reflect` and `/index`
+  turns are exempt (they ARE reflections); trivial turns (no real work) are
+  exempt by the tool-call gate. Disable with the `auto_reflect` config (env
+  `UMANS_HARNESS_AUTO_REFLECT=0`). This closes the asymmetry noted in §5:
+  memories already had a deterministic compaction hook (`extract_facts`);
+  skills now have a deterministic reflection hook.
+
+### Recurrence signal (makes the "seen ≥2×" rule evaluable)
+
+The "write a skill when you solve the same shape ≥2×" rule was previously
+un-trackable — the model has no cross-session recurrence counter. The
+auto-reflect seam records one entry per non-trivial turn to a per-workspace log
+`~/.config/umans-harness/patterns/<hash>.jsonl` (capped at 200 entries). The
+"shape" is a signature of the action tools used (bash/edit/write/patch/bulk_*/
+todo_write/spawn/subagent — recon tools excluded) plus the file areas touched
+(`core/src/*.rs`, `tui/*.go`, …). On each reflect, recurring shapes (count ≥ 2)
+are read back and named in the nudge, so the model can decide whether to write
+a skill. `core/src/pattern_log.rs`.
 
 `/reflect` is the explicit, user-triggered version of the same pass.
 

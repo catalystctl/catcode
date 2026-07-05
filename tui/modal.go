@@ -33,6 +33,8 @@ const (
 	modalVision
 	modalProviders
 	modalLogout
+	modalKeybinds
+	modalOauthCode
 )
 
 type modal struct {
@@ -179,13 +181,17 @@ func (s *session) providerItems() []listItem {
 			desc = "ready (key in " + p.EnvVar + ") · enter to log in · " + desc
 		default:
 			label = "▸ " + p.Label
-			desc = "enter key to log in · needs " + p.EnvVar + " · " + desc
+			if p.SupportsOauth {
+				desc = "enter to log in via OAuth (browser) · or set " + p.EnvVar + " · " + desc
+			} else {
+				desc = "enter key to log in · needs " + p.EnvVar + " · " + desc
+			}
 		}
 		items = append(items, listItem{label: label, desc: desc, meta: p.ID, meta2: "preset"})
 	}
 	// Configured providers not covered by a preset (e.g. custom/local).
 	for _, name := range s.providers {
-		if s.presetByID(name) != nil {
+		if s.presetByID(name) != nil || isPresetCompanion(name) {
 			continue
 		}
 		label := name
@@ -211,7 +217,7 @@ func (s *session) logoutItems() []listItem {
 		items = append(items, listItem{label: label, desc: "log out", meta: p.ID, meta2: "preset"})
 	}
 	for _, name := range s.providers {
-		if s.presetByID(name) != nil {
+		if s.presetByID(name) != nil || isPresetCompanion(name) {
 			continue
 		}
 		// Non-preset configured providers: include if it has a persisted key.
@@ -225,6 +231,16 @@ func (s *session) logoutItems() []listItem {
 		items = append(items, listItem{label: label, desc: "log out", meta: name, meta2: "provider"})
 	}
 	return items
+}
+
+// isPresetCompanion reports whether a configured provider name is a non-primary
+// companion of a first-party preset (e.g. "opencode-go-anthropic" backs the
+// "opencode-go" preset). OpenCode Go is one subscription served over two wire
+// protocols, so the core creates two provider configs from one preset; these
+// companions are hidden from the login/logout pickers so the user only sees the
+// single preset entry, while the core still creates/removes both together.
+func isPresetCompanion(name string) bool {
+	return name == "opencode-go-anthropic"
 }
 
 // presetByID returns the matching preset for an id, or nil.
@@ -285,16 +301,16 @@ func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	items := s.visionItems()
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
-	switch msg.String() {
-	case "up", "k":
+	switch {
+	case msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
 		if n > 0 {
 			s.modal.cursor = (s.modal.cursor - 1 + n) % n
 		}
-	case "down", "j":
+	case msg.String() == "down" || s.kbAny(msg, "nav_down", "nav_down_alt"):
 		if n > 0 {
 			s.modal.cursor = (s.modal.cursor + 1) % n
 		}
-	case " ":
+	case msg.String() == " " || s.kb(msg, "vision_toggle"):
 		if n > 0 && s.modal.cursor < n {
 			abs := idx[s.modal.cursor]
 			if abs < len(s.models) {
@@ -306,7 +322,7 @@ func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				s.saveVisionConfig()
 			}
 		}
-	case "enter":
+	case msg.String() == "enter" || s.kb(msg, "select"):
 		if n > 0 && s.modal.cursor < n {
 			abs := idx[s.modal.cursor]
 			if abs < len(s.models) {
@@ -320,13 +336,13 @@ func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				s.saveVisionConfig()
 			}
 		}
-	case "backspace":
+	case msg.String() == "backspace":
 		if len(s.modal.filter) > 0 {
 			r := []rune(s.modal.filter)
 			s.modal.filter = string(r[:len(r)-1])
 			s.modal.cursor = 0
 		}
-	case "ctrl+w":
+	case s.kb(msg, "filter_clear"):
 		s.modal.filter = ""
 		s.modal.cursor = 0
 	default:
@@ -383,6 +399,7 @@ func (s *session) commandItems() []listItem {
 	items := []listItem{
 		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
 		{label: "/logout", desc: "log out of a provider"},
+		{label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
 		{label: "/reasoning", desc: "set reasoning effort (per model)"},
@@ -396,6 +413,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/abort", desc: "stop running turn (or Esc)"},
 		{label: "/steer", desc: "steer an in-flight turn (or Ctrl+Enter)"},
 		{label: "/settings", desc: "open settings modal"},
+		{label: "/keybinds", desc: "view & customize keybindings"},
 		{label: "/theme", desc: "switch colour theme"},
 		{label: "/help", desc: "keybindings & commands"},
 		{label: "/copy", desc: "copy last assistant reply"},
@@ -551,13 +569,18 @@ func filterList(items []listItem, q string) []int {
 // ---------------------------------------------------------------------------
 
 func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// While editing a settings field, route keys to the edit buffer.
+	// The keybinds modal has its own capture mode (editing flag) and navigation;
+	// route to it first so capture works even while editing is active.
+	if s.modal.kind == modalKeybinds {
+		return s.handleKeybindsKey(msg)
+	}
+	// While editing a settings field (or the login key box), route keys to the
+	// edit buffer.
 	if s.modal.editing {
 		return s.handleSettingsEditKey(msg)
 	}
 
-	switch msg.String() {
-	case "esc", "ctrl+c":
+	if s.kbAny(msg, "close", "quit") {
 		if s.modal.kind != modalNone {
 			s.closeModal()
 			return s, nil
@@ -600,16 +623,19 @@ func (s *session) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
 
-	switch msg.String() {
-	case "up", "k":
+	switch {
+	case msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
+		// hardcoded "up" fallback + keymap binding — stays usable even if nav is disabled
 		if n > 0 {
 			s.modal.cursor = (s.modal.cursor - 1 + n) % n
 		}
-	case "down", "j":
+	case msg.String() == "down" || s.kbAny(msg, "nav_down", "nav_down_alt"):
+		// hardcoded "down" fallback + keymap binding
 		if n > 0 {
 			s.modal.cursor = (s.modal.cursor + 1) % n
 		}
-	case "enter":
+	case msg.String() == "enter" || s.kb(msg, "select"):
+		// hardcoded "enter" fallback + keymap binding — never trap yourself out of selecting
 		if n == 0 {
 			return s, nil
 		}
@@ -618,13 +644,13 @@ func (s *session) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		abs := idx[s.modal.cursor]
 		return s.executeListSelect(abs)
-	case "backspace":
+	case msg.String() == "backspace":
 		if len(s.modal.filter) > 0 {
 			r := []rune(s.modal.filter)
 			s.modal.filter = string(r[:len(r)-1])
 			s.modal.cursor = 0
 		}
-	case "ctrl+w":
+	case s.kb(msg, "filter_clear"):
 		s.modal.filter = ""
 		s.modal.cursor = 0
 	default:
@@ -739,9 +765,16 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 			s.closeModal()
 			return s, nil
 		}
-		// No key anywhere: prompt the user to paste one inline. The modal
-		// switches to the key-entry box (renderLoginKeyBox) and the next Enter
-		// sends `login {preset,api_key}` via the editing-key handler.
+		// No key: if the preset supports an OAuth subscription login (Gemini/
+		// Claude), run it in-browser — no official CLI or API key needed. Otherwise
+		// (Umans/Codex) prompt for an API key to paste.
+		if preset.SupportsOauth {
+			s.sendCore(map[string]any{"type": "login_oauth", "preset": name})
+			s.logInfo("OAuth login: " + preset.Label + " — follow the prompt to log in")
+			s.closeModal()
+			return s, nil
+		}
+		// No key anywhere and no OAuth flow: prompt the user to paste one inline.
 		s.pendingLogin = name
 		s.modal.editing = true
 		s.modal.editBuf.SetValue("")
@@ -795,9 +828,31 @@ func (s *session) renderLoginKeyBox() string {
 	masked := strings.Repeat("•", len(val))
 	return s.renderListModal("Log in: "+label, []listItem{{
 		label: masked,
-		desc: "paste your key, then Enter (Esc to cancel)",
+		desc:  "paste your key, then Enter (Esc to cancel)",
 	}}, true)
 }
+func (s *session) openOauthCodeModal() {
+	s.modal.kind = modalOauthCode
+	s.modal.editing = true
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.Placeholder = "paste the code from codeassist.google.com"
+	ti.Focus()
+	s.modal.editBuf = ti
+}
+
+// renderOauthCodeModal renders the "paste your Google OAuth code" box. The long
+// auth code is awkward to paste inline after /oauth-code (the command input
+// mangles/truncates it), so bare /oauth-code opens this modal — a focused text
+// field the user pastes into, then Enter to submit.
+func (s *session) renderOauthCodeModal() string {
+	val := s.modal.editBuf.Value()
+	return s.renderListModal("Paste Google OAuth Code", []listItem{{
+		label: val,
+		desc:  "paste the code from codeassist.google.com, then Enter (Esc to cancel)",
+	}}, true)
+}
+
 func (s *session) runCommandByIndex(i int) tea.Cmd {
 	commands := s.commandItems()
 	if i < 0 || i >= len(commands) {
@@ -845,6 +900,9 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 		return nil
 	case "/settings":
 		s.openSettings()
+		return nil
+	case "/keybinds":
+		s.openKeybindsModal()
 		return nil
 	case "/theme":
 		s.openThemePicker()
@@ -923,19 +981,21 @@ func (s *session) settingsFieldIndex(label string) int {
 func (s *session) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	fields := s.settingsFields()
 	n := len(fields)
-	switch msg.String() {
-	case "up", "k":
+	switch {
+	case s.kbAny(msg, "nav_up", "nav_up_alt"):
 		s.modal.fieldIdx = (s.modal.fieldIdx - 1 + n) % n
-	case "down", "j", "tab":
+	case s.kbAny(msg, "nav_down", "nav_down_alt") || s.kb(msg, "field_next"):
 		s.modal.fieldIdx = (s.modal.fieldIdx + 1) % n
-	case "shift+tab":
+	case s.kb(msg, "field_prev"):
 		s.modal.fieldIdx = (s.modal.fieldIdx - 1 + n) % n
-	case "enter":
+	case msg.String() == "enter" || s.kb(msg, "select"):
+		// hardcoded "enter" fallback + keymap binding — stays usable even if
+		// select is unbound (mirrors the list modals' guaranteed-escape rule).
 		return s.activateField(s.modal.fieldIdx)
-	case "left", "h":
+	case s.kbAny(msg, "cycle_left", "cycle_left_alt"):
 		// cycle approval / reasoning left
 		s.cycleField(s.modal.fieldIdx, -1)
-	case "right", "l":
+	case s.kbAny(msg, "cycle_right", "cycle_right_alt"):
 		s.cycleField(s.modal.fieldIdx, +1)
 	}
 	return s, nil
@@ -1020,11 +1080,19 @@ func (s *session) startEditField(idx int) {
 }
 
 func (s *session) handleSettingsEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
+	switch {
+	case s.kb(msg, "close"):
+		if s.modal.kind == modalOauthCode {
+			// Esc cancels the OAuth code modal entirely (there's no list to
+			// return to, unlike the settings inline edit).
+			s.closeModal()
+			return s, nil
+		}
 		s.modal.editing = false
 		return s, nil
-	case "enter":
+	case msg.String() == "enter" || s.kb(msg, "select"):
+		// hardcoded "enter" fallback so committing a pasted key (login/settings)
+		// can't be trapped by an unbound select binding (mirrors list modals).
 		return s.commitEditField()
 	}
 	var cmd tea.Cmd
@@ -1033,6 +1101,21 @@ func (s *session) handleSettingsEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (s *session) commitEditField() (tea.Model, tea.Cmd) {
+	// /oauth-code modal: the user pasted the authorization code into the edit
+	// buffer (the long Google code is awkward to paste inline after the
+	// command). Send it to the core — which holds the stashed PKCE verifier and
+	// does the exchange — then close the modal.
+	if s.modal.kind == modalOauthCode {
+		code := strings.TrimSpace(s.modal.editBuf.Value())
+		s.modal.editing = false
+		s.closeModal()
+		if code == "" {
+			return s, nil
+		}
+		s.sendCore(map[string]any{"type": "oauth_code", "code": code})
+		s.logInfo("submitting OAuth code…")
+		return s, nil
+	}
 	// /login inline key entry: a preset was picked with no env key, so the
 	// modal captured a pasted key in the edit buffer. Commit sends `login`
 	// with that key and closes the modal.
@@ -1178,7 +1261,6 @@ func (s *session) cycleProvider(dir int) {
 	s.logInfo(fmt.Sprintf("switching provider: %s", name))
 }
 
-
 func (s *session) cycleApproval(dir int) {
 	modes := []string{"never", "destructive", "always"}
 	cur := 1
@@ -1266,60 +1348,34 @@ func (s *session) preferredLevel(levels []string) string {
 // ---------------------------------------------------------------------------
 
 func (s *session) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "up", "k":
+	switch {
+	case s.kbAny(msg, "nav_up", "nav_up_alt"):
 		if s.modal.scroll > 0 {
 			s.modal.scroll--
 		}
-	case "down", "j":
+	case s.kbAny(msg, "nav_down", "nav_down_alt"):
 		s.modal.scroll++
-	case "pgup":
+	case s.kb(msg, "scroll_page_up"):
 		s.modal.scroll = max(0, s.modal.scroll-10)
-	case "pgdown":
+	case s.kb(msg, "scroll_page_down"):
 		s.modal.scroll += 10
 	}
 	return s, nil
 }
 
-func helpText() string {
-	return strings.Join([]string{
-		"Keybindings",
-		"  ctrl+p / ctrl+k   open command palette",
-		"  /                 command palette (when input empty)",
-		"  @                 mention a file (CWD or @../ outside) — ↑↓ · tab",
-		"                    select, esc closes the flyout",
-		"  ctrl+t            toggle reasoning collapse",
-		"  ctrl+o            expand / collapse last tool output",
-		"  ctrl+r            set reasoning effort (per model)",
-		"  ctrl+c            quit",
-		"  esc               close modal / deny approval / drop queued · abort turn",
-		"",
-		"Scrolling the transcript",
-		"  pgup / pgdn       scroll a page",
-		"  ctrl+↑ / ctrl+↓   scroll a line",
-		"  ctrl+home/end     jump to top / bottom",
-		"  (scrolling up pauses auto-follow; sending a",
-		"   message or reaching the bottom re-pins)",
+func (s *session) helpText() string {
+	lines := s.helpKeybindLines()
+	lines = append(lines,
 		"",
 		"Mouse & copy",
 		"  click-drag selects/copies text (mouse off by default)",
 		"  /settings → Mouse Wheel enables wheel scrolling",
 		"  (hold Shift to select/copy while the mouse is on)",
 		"",
-		"While a turn is running (in-flight)",
-		"  enter             queue a follow-up message",
-		"  ctrl+enter        steer (interrupt + redirect the model)",
-		"  esc               drop the queued message, or abort if none queued",
-		"  /steer <msg>      steer (works on every terminal)",
-		"",
-		"Approval (when prompted)",
-		"  y                 approve once",
-		"  a                 approve & stop asking",
-		"  n                 deny",
-		"",
 		"Slash commands",
 		"  /login           log in / switch provider (OpenAI · Gemini · Anthropic)",
 		"  /logout          log out of a provider",
+		"  /oauth-code <c>  paste OAuth code (SSH/headless Google login)",
 		"  /model [N|substr] list or switch model",
 		"  /approval <mode>  never | destructive | always",
 		"  /reasoning        set reasoning effort (per model)",
@@ -1332,6 +1388,7 @@ func helpText() string {
 		"  /stats            token + turn totals",
 		"  /abort            stop running turn",
 		"  /settings         open settings modal",
+		"  /keybinds         view & customize keybindings",
 		"  /theme            switch colour theme",
 		"  /copy             copy last assistant reply",
 		"  /attach <path>   send an image (vision) with the current input",
@@ -1349,7 +1406,8 @@ func helpText() string {
 		"  Select one at startup with `--provider <name>` or UMANS_ACTIVE_PROVIDER.",
 		"  Switch at runtime: /settings -> Provider (cycles + re-discovers models).",
 		"  Each provider keeps its own key (/key stores per-provider).",
-	}, "\n")
+	)
+	return strings.Join(lines, "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1455,8 @@ func (s *session) renderModalBody() string {
 			return s.renderLoginKeyBox()
 		}
 		return s.renderListModal("Log in / switch provider", s.providerItems(), true)
+	case modalOauthCode:
+		return s.renderOauthCodeModal()
 	case modalLogout:
 		return s.renderListModal("Log out", s.logoutItems(), true)
 	case modalVision:
@@ -1405,6 +1465,8 @@ func (s *session) renderModalBody() string {
 		return s.renderSettingsModal()
 	case modalHelp:
 		return s.renderHelpModal()
+	case modalKeybinds:
+		return s.renderKeybindsModal()
 	}
 	return ""
 }
@@ -1571,7 +1633,7 @@ func (s *session) renderHelpModal() string {
 	if h < 6 {
 		h = 6
 	}
-	allLines := strings.Split(helpText(), "\n")
+	allLines := strings.Split(s.helpText(), "\n")
 	maxScroll := len(allLines) - h
 	if maxScroll < 0 {
 		maxScroll = 0

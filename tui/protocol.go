@@ -54,6 +54,7 @@ type providerPreset struct {
 	HasKey      bool     `json:"hasKey"`
 	Configured  bool     `json:"configured"`
 	LoggedIn    bool     `json:"loggedIn"`
+	SupportsOauth bool   `json:"supportsOauth"`
 }
 
 type approvalPrompt struct {

@@ -108,23 +108,23 @@ func (s *session) handleMentionNav(msg tea.KeyMsg) bool {
 		return false
 	}
 	n := len(s.mentionItems)
-	switch msg.String() {
-	case "up":
+	switch {
+	case s.kbAny(msg, "nav_up", "nav_up_alt"):
 		if n > 0 {
 			s.mentionCursor = (s.mentionCursor - 1 + n) % n
 		}
 		return true
-	case "down":
+	case s.kbAny(msg, "nav_down", "nav_down_alt"):
 		if n > 0 {
 			s.mentionCursor = (s.mentionCursor + 1) % n
 		}
 		return true
-	case "tab":
+	case s.kb(msg, "mention_accept"):
 		if n > 0 {
 			s.acceptMention()
 		}
 		return true
-	case "enter":
+	case s.kb(msg, "select"):
 		// With matches, Enter accepts; with no matches, fall through so the
 		// message can be sent as-is.
 		if n > 0 {
@@ -132,7 +132,7 @@ func (s *session) handleMentionNav(msg tea.KeyMsg) bool {
 			return true
 		}
 		return false
-	case "esc":
+	case s.kb(msg, "close"):
 		s.closeMention()
 		return true
 	}

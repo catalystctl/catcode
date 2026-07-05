@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +17,20 @@ import (
 // ---------------------------------------------------------------------------
 // Core event handling
 // ---------------------------------------------------------------------------
+
+// accumulateSaved adds a context-management event's reclaimed tokens
+// (before_tokens − after_tokens) to the session's cumulative counter. Shared by
+// the "digested" and "compacted" events; both carry the same before/after
+// fields, and because each event reports only its own delta they add up without
+// double-counting across the soft-digest and compaction tiers.
+func (s *session) accumulateSaved(ev *coreEvent) {
+	before, err1 := strconv.ParseUint(ev.get("before_tokens"), 10, 64)
+	after, err2 := strconv.ParseUint(ev.get("after_tokens"), 10, 64)
+	if err1 != nil || err2 != nil || before > after {
+		return
+	}
+	s.tokensSaved += before - after
+}
 
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	switch ev.Type {
@@ -251,6 +269,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.cur = nil
 		s.contextTokens = 0
 		s.lastCachePct = 0
+		s.tokensSaved = 0
+		s.summaryChars = 0
 		s.subProgress = nil
 		s.todos = nil
 		s.queued = nil
@@ -295,6 +315,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.contextTokens = at
 		}
 		s.logInfo(fmt.Sprintf("context digested: %s result(s), %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
+
+	case "reflecting":
+		// The auto-reflect seam fired: instead of completing on `finish`, the core
+		// injected a reflection continuation so durable facts (memory) and recurring
+		// patterns (skills) get persisted without relying on the model remembering
+		// to. Surfaced so the post-finish model activity isn't a mystery.
+		if n := ev.get("recurrence"); n != "" && n != "0" {
+			s.logInfo(fmt.Sprintf("auto-reflect: reflecting on this turn (%s recurring patterns)…", n))
+		} else {
+			s.logInfo("auto-reflect: reflecting on this turn…")
+		}
 
 	case "approval_changed":
 		s.approvalModeStr = ev.get("mode")
@@ -409,6 +440,47 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
 		if msg := ev.get("message"); msg != "" {
 			s.logInfo(msg)
+		}
+
+	case "oauth_prompt":
+		// The core needs the user to complete an interactive OAuth login (visit a
+		// URL and, for the device flow, enter a code). Surface it prominently in the
+		// transcript and try to open the URL via the OS.
+		url := ev.get("url")
+		code := ev.get("code")
+		message := ev.get("message")
+		if message == "" {
+			message = "complete the OAuth login in your browser"
+		}
+		// Copy the URL to the LOCAL clipboard via OSC 52 — works over SSH in
+		// most modern terminals (iTerm2/kitty/WezTerm/Windows Terminal/
+		// gnome-terminal/alacritty): the escape sequence passes through to the
+		// local terminal, which writes its clipboard, so the user can just paste.
+		// Best-effort: terminals that lack OSC 52 (e.g. macOS Terminal.app) ignore
+		// it and the user copies from the hard-wrapped URL shown below instead.
+		copyToClipboardOSC52(url)
+		var b strings.Builder
+		b.WriteString(message)
+		if url != "" {
+			b.WriteString("\n  url (copied to your clipboard — just paste into a browser; if paste is empty your terminal lacks OSC 52 — copy from below):")
+			ww := s.width - 6
+			if ww < 20 {
+				ww = 20
+			} else if ww > 200 {
+				ww = 200
+			}
+			for _, ln := range wrapRunes([]rune(url), ww) {
+				b.WriteString("\n    ")
+				b.WriteString(string(ln))
+			}
+		}
+		if code != "" {
+			b.WriteString("\n  code: ")
+			b.WriteString(code)
+		}
+		s.logInfo(b.String())
+		if url != "" {
+			openURL(url)
 		}
 
 	case "steer":
@@ -871,8 +943,9 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// global: Ctrl+C quits (unless a modal is open, where esc closes)
-	if msg.Type == tea.KeyCtrlC && s.modal.kind == modalNone {
+	// global: the quit key (default Ctrl+C) quits unless a modal is open
+	// (where esc / ctrl+c closes the modal instead).
+	if s.kb(msg, "quit") && s.modal.kind == modalNone {
 		if s.coreCmd != nil && s.coreCmd.Process != nil {
 			_ = s.coreCmd.Process.Kill()
 		}
@@ -887,8 +960,8 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.handleScrollKey(msg) {
 		return s, nil
 	}
-	// global: ctrl+t toggles reasoning-block collapse/expand
-	if msg.String() == "ctrl+t" {
+	// global: toggle reasoning-block collapse/expand
+	if s.kb(msg, "toggle_reasoning") {
 		s.thinkExpanded = !s.thinkExpanded
 		s.settings.ThinkExpanded = s.thinkExpanded
 		_ = s.settings.save()
@@ -901,10 +974,10 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.refresh()
 		return s, nil
 	}
-	// global: ctrl+o toggles full output for the most recent tool block.
+	// global: toggle full output for the most recent tool block.
 	// Tool output is truncated to the first 3 lines by default; this expands
 	// (or collapses) the last tool call so the user can inspect full output.
-	if msg.String() == "ctrl+o" {
+	if s.kb(msg, "toggle_tool_output") {
 		if b := s.lastToolOutputBlock(); b != nil {
 			b.expanded = !b.expanded
 			s.invalidateAll()
@@ -912,13 +985,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return s, nil
 	}
-	// global: ctrl+p / ctrl+k opens the command palette.
-	if msg.String() == "ctrl+p" || msg.String() == "ctrl+k" {
+	// global: open the command palette (default ctrl+p / ctrl+k).
+	if s.kbAny(msg, "command_palette", "command_palette_alt") {
 		s.openCommandPalette()
 		return s, nil
 	}
-	// global: ctrl+r opens the reasoning-effort picker for the active model.
-	if msg.String() == "ctrl+r" {
+	// global: open the reasoning-effort picker for the active model.
+	if s.kb(msg, "reasoning_picker") {
 		s.openReasoningPicker()
 		return s, nil
 	}
@@ -935,10 +1008,10 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if s.pendingIntercom != nil {
-		// A subagent asked the orchestrator a blocking question. Enter replies;
-		// Esc unblocks the child with a best-judgment nudge so it isn't stuck.
-		switch msg.String() {
-		case "esc":
+		// A subagent asked the orchestrator a blocking question. Enter (the send
+		// key) replies; Esc unblocks the child with a best-judgment nudge so it
+		// isn't stuck.
+		if s.kb(msg, "close") {
 			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": "[no reply — proceed with your best judgment]"})
 			s.pendingIntercom = nil
 			s.layout()
@@ -946,7 +1019,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.input.Focus()
 			return s, nil
 		}
-		if msg.Type == tea.KeyEnter {
+		if s.kb(msg, "send") {
 			reply := strings.TrimSpace(s.input.Value())
 			if reply == "" {
 				return s, nil
@@ -963,14 +1036,14 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return s, cmd
 	}
 	if s.pendingApproval != nil {
-		switch msg.String() {
-		case "y", "Y":
+		switch {
+		case s.kb(msg, "approve"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "yes"})
 			s.pendingApproval = nil
-		case "a", "A":
+		case s.kb(msg, "approve_always"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "always"})
 			s.pendingApproval = nil
-		case "n", "N", "esc":
+		case s.kbAny(msg, "deny", "close"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "no"})
 			s.logError("denied")
 			s.pendingApproval = nil
@@ -990,8 +1063,8 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// steer the model (Ctrl+Enter), run a slash command, or abort (Esc).
 		// Scrolling + ctrl+t/o/p above still work; a lone "/" with an empty
 		// input opens the command palette mid-turn too (like the @ flyout).
-		switch msg.String() {
-		case "esc":
+		switch {
+		case s.kb(msg, "close"):
 			// Esc peels off layers: if a follow-up/steer is queued, first Esc just
 			// drops the queued message (the in-flight turn keeps running); a
 			// second Esc then aborts the running turn. This matches the user's
@@ -1014,10 +1087,9 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.sendCore(map[string]any{"type": "abort"})
 			s.logWarn("aborting…")
 			return s, nil
-		case "ctrl+enter":
+		case s.kb(msg, "steer"):
 			return s, s.steerFromInput()
-		}
-		if msg.Type == tea.KeyEnter {
+		case s.kb(msg, "send"):
 			text := strings.TrimSpace(s.input.Value())
 			if text == "" {
 				return s, nil
@@ -1039,15 +1111,15 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// example cursor; enter drops the selected example into the (editable)
 	// input. Only arrow keys are used so typing letters/digits is unaffected.
 	if len(s.blocks) == 0 && s.pendingApproval == nil {
-		switch msg.String() {
-		case "up":
+		switch {
+		case s.kb(msg, "nav_up"):
 			s.welcomeIdx = (s.welcomeIdx - 1 + len(welcomeExamples)) % len(welcomeExamples)
 			return s, nil
-		case "down":
+		case s.kb(msg, "nav_down"):
 			s.welcomeIdx = (s.welcomeIdx + 1) % len(welcomeExamples)
 			return s, nil
 		}
-		if msg.Type == tea.KeyEnter && strings.TrimSpace(s.input.Value()) == "" {
+		if s.kb(msg, "select") && strings.TrimSpace(s.input.Value()) == "" {
 			s.input.SetValue(welcomeExamples[s.welcomeIdx])
 			s.evalMention()
 			s.input.Focus()
@@ -1056,20 +1128,20 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// history recall: up/down when the input is focused and not empty-positioned
-	if msg.String() == "up" && len(s.history) > 0 {
+	if s.kb(msg, "history_prev") && len(s.history) > 0 {
 		val := s.recallHistory(-1)
 		s.input.SetValue(val)
 		s.evalMention()
 		return s, nil
 	}
-	if msg.String() == "down" && len(s.history) > 0 {
+	if s.kb(msg, "history_next") && len(s.history) > 0 {
 		val := s.recallHistory(+1)
 		s.input.SetValue(val)
 		s.evalMention()
 		return s, nil
 	}
 
-	if msg.Type == tea.KeyEnter {
+	if s.kb(msg, "send") {
 		text := strings.TrimSpace(s.input.Value())
 		if text == "" {
 			return s, nil
@@ -1090,32 +1162,32 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // view isn't yanked to the bottom on the next token); scroll-down re-pins
 // follow once the bottom is reached.
 func (s *session) handleScrollKey(msg tea.KeyMsg) bool {
-	switch msg.String() {
-	case "pgup":
+	switch {
+	case s.kb(msg, "scroll_page_up"):
 		s.follow = false
 		s.viewport.PageUp()
 		return true
-	case "pgdown":
+	case s.kb(msg, "scroll_page_down"):
 		s.viewport.PageDown()
 		if s.viewport.AtBottom() {
 			s.follow = true
 		}
 		return true
-	case "ctrl+up":
+	case s.kb(msg, "scroll_line_up"):
 		s.follow = false
 		s.viewport.LineUp(1)
 		return true
-	case "ctrl+down":
+	case s.kb(msg, "scroll_line_down"):
 		s.viewport.LineDown(1)
 		if s.viewport.AtBottom() {
 			s.follow = true
 		}
 		return true
-	case "ctrl+home":
+	case s.kb(msg, "scroll_top"):
 		s.follow = false
 		s.viewport.GotoTop()
 		return true
-	case "ctrl+end":
+	case s.kb(msg, "scroll_bottom"):
 		s.follow = true
 		s.viewport.GotoBottom()
 		return true
@@ -1154,6 +1226,50 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				return nil
 			}
 			s.openLogoutPicker()
+			return nil
+		case "/key":
+			// /key <value> sets the API key for the active provider. Kept as a
+			// convenience because the app's "not authenticated" errors direct the
+			// user here ("run /key sk-... first"); the full multi-provider flow is
+			// /login. With no argument, /key opens the settings modal on the API
+			// Key field so the user can paste one inline.
+			if len(parts) < 2 {
+				s.openSettings()
+				s.modal.fieldIdx = s.settingsFieldIndex("API Key")
+				if s.modal.fieldIdx < 0 {
+					s.modal.fieldIdx = 0
+				}
+				s.logInfo("paste your key in the API Key field, then Enter")
+				return nil
+			}
+			key := parts[1]
+			// Scope the key to the active provider (per-provider keys). Also keep the
+			// legacy single APIKey field in sync for the default/active provider.
+			if s.activeProvider == "" {
+				s.activeProvider = "default"
+			}
+			if s.settings.ProviderKeys == nil {
+				s.settings.ProviderKeys = map[string]string{}
+			}
+			s.settings.ProviderKeys[s.activeProvider] = key
+			s.settings.APIKey = key
+			_ = s.settings.save()
+			s.sendCore(map[string]any{"type": "set_key", "provider": s.activeProvider, "api_key": key})
+			s.logInfo(fmt.Sprintf("sending key for provider '%s'…", s.activeProvider))
+			return nil
+		case "/oauth-code":
+			// /oauth-code [code] completes a pending no-browser OAuth login (the
+			// SSH/headless Google flow). With an inline code it sends immediately;
+			// with no argument it opens a modal to paste the code into — the long
+			// Google code is awkward to paste inline after the command (the command
+			// input mangles/truncates it).
+			if len(parts) >= 2 {
+				code := strings.Join(parts[1:], " ")
+				s.sendCore(map[string]any{"type": "oauth_code", "code": code})
+				s.logInfo("submitting OAuth code…")
+				return nil
+			}
+			s.openOauthCodeModal()
 			return nil
 		case "/model":
 			if len(parts) < 2 {
@@ -1220,6 +1336,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/settings":
 			s.openSettings()
+			return nil
+		case "/keybinds":
+			s.openKeybindsModal()
 			return nil
 		case "/theme":
 			s.openThemePicker()
@@ -1490,4 +1609,39 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 	s.sendCore(cmd)
 	s.busy = true
 	return nil
+}
+
+// openURL best-effort opens a URL in the OS default browser (used to surface an
+// OAuth login URL). Errors are ignored — the URL is also shown in the transcript.
+func openURL(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("cmd", "/C", "start", "", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	_ = cmd.Start()
+}
+
+// copyToClipboardOSC52 writes the OSC 52 escape sequence to set the LOCAL
+// terminal's clipboard to text. Over SSH the sequence passes through to the
+// user's local terminal, which writes its clipboard — so the user can paste
+// (Ctrl/Cmd+V) into their local browser without copying from the (wrapped,
+// hard-to-select) transcript. Best-effort: terminals that don't support OSC 52
+// ignore it. The sequence is invisible (no cursor move / no text), so it is
+// safe to emit from a Bubble Tea handler between render frames.
+func copyToClipboardOSC52(text string) {
+	if text == "" {
+		return
+	}
+	// OSC 52: ESC ] 52 ; <selection> ; <base64> BEL.  'c' = the CLIPBOARD
+	// selection (the Ctrl/Cmd+V paste buffer).
+	enc := base64.StdEncoding.EncodeToString([]byte(text))
+	os.Stdout.WriteString("\x1b]52;c;" + enc + "\x07")
 }
