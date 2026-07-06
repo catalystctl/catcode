@@ -28,3 +28,6 @@ next-env.d.ts
 
 # umans core debug log
 debug.jsonl
+
+# ad-hoc UI test scripts (local dev only, not wired into package.json)
+ui-test*.cjs

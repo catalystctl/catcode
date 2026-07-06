@@ -74,6 +74,13 @@ roo-code/
 context.md
 plan.md
 plan.html
+# One-off review artifact (subagent-generated, point-in-time)
+REVIEW.md
+# External skill-manager lockfile (references third-party GitHub repos)
+skills-lock.json
+# Local scratch / working directories (not part of the shipped project)
+scripts/
+tmp/
 # Stray build/test artifacts
 .intentionally-empty-file.o
 sdk/node_modules/
