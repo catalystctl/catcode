@@ -1,6 +1,7 @@
 // Structured debug logging + metrics. Writes one JSON line per record to a
 // debug log file (if configured) and exposes counters the core/TUI can show.
 // ponytail: no tracing crate; a locked append is enough for a local harness.
+use crate::message::{ContentPart, Message};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -70,7 +71,7 @@ pub fn estimate_tokens(text: &str) -> u64 {
 }
 
 /// Estimate tokens for a whole message list (serialize each message's text fields).
-pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
+pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     let mut total = 0u64;
     for m in messages {
         total += estimate_message_tokens(m);
@@ -85,27 +86,22 @@ pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
 /// would over-estimate by orders of magnitude and trip compaction every turn
 /// for vision users. Image parts are charged a fixed per-image token cost
 /// instead; text parts are estimated normally.
-pub fn estimate_message_tokens(m: &Value) -> u64 {
+pub fn estimate_message_tokens(m: &Message) -> u64 {
     const PER_IMAGE_TOKENS: u64 = 768;
-    if let Some(arr) = m.get("content").and_then(|v| v.as_array()) {
+    if let Some(parts) = m.content_parts() {
         let mut total = 0u64;
         let mut images = 0u64;
-        for part in arr {
-            match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "image_url" => images += 1,
-                "text" => {
-                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                        total += estimate_tokens(t);
-                    }
-                }
-                _ => total += estimate_tokens(&serde_json::to_string(part).unwrap_or_default()),
+        for part in parts {
+            match part {
+                ContentPart::Image { .. } => images += 1,
+                ContentPart::Text { text } => total += estimate_tokens(text),
             }
         }
         return total + images * PER_IMAGE_TOKENS + 4;
     }
     // Text-only message (content is a string): whole-message char/4 — the
     // common path, unchanged from before.
-    let s = serde_json::to_string(m).unwrap_or_default();
+    let s = serde_json::to_string(&serde_json::to_value(m).unwrap_or_default()).unwrap_or_default();
     estimate_tokens(&s)
 }
 
@@ -124,7 +120,7 @@ pub fn estimate_message_tokens(m: &Value) -> u64 {
 /// Falls back to a full `estimate_messages_tokens` when no real usage has been
 /// seen yet (first turn) or right after compaction rewrites history (the old
 /// baseline no longer describes the current messages).
-pub fn grounded_estimate(messages: &[Value], last_real: Option<u64>, len_at_real: usize) -> u64 {
+pub fn grounded_estimate(messages: &[Message], last_real: Option<u64>, len_at_real: usize) -> u64 {
     match last_real {
         Some(real) => {
             // Clamp: a rewrite (undo/digest/compaction) may have shrunk the
@@ -151,8 +147,8 @@ pub fn now_iso() -> String {
 /// Helper for TTFT: record the first-token time relative to a turn start.
 pub struct TurnTimer {
     pub start: Instant,
-    /// Turn-level first generated token (reasoning or content). Drives TTFT
-    /// (time to first token of the whole turn).
+    /// Turn-level first generated token (reasoning, content, or tool-call
+    /// chunk). Drives TTFT (time to first token of the whole turn).
     pub first_token: Option<Instant>,
     /// First generated token of the *current* stream call. `end_call` resets it
     /// so each request is timed independently of the wall time spent waiting for
@@ -162,10 +158,13 @@ pub struct TurnTimer {
     /// each call's first-token → end window, summed. Excludes prefill (TTFT)
     /// and tool-call wait, so TPS reflects pure model generation throughput.
     pub gen_ms: u64,
-    /// Accumulated real output tokens (completion_tokens) across all stream calls.
+    /// Accumulated real output tokens (completion_tokens/output_tokens) across
+    /// all stream calls. TPS is only reported from this real usage count; when
+    /// a provider omits usage we leave TPS blank instead of showing a char/4
+    /// guess as if it were measured model throughput.
     pub out_tokens: u64,
-    /// Accumulated char/4-estimated output tokens; fallback numerator when the
-    /// endpoint omits usage (out_tokens stays 0).
+    /// Accumulated char/4-estimated output tokens. Kept for token accounting and
+    /// diagnostics, but deliberately NOT used for the footer TPS widget.
     pub out_tokens_est: u64,
 }
 
@@ -181,8 +180,8 @@ impl TurnTimer {
         }
     }
     /// Record the first generated token of the turn (TTFT) and of the current
-    /// stream call (generation-time accounting). Called on the first reasoning
-    /// or content chunk of each call.
+    /// stream call (generation-time accounting). Called on the first reasoning,
+    /// content, or tool-call chunk of each call.
     pub fn mark_first_token(&mut self) {
         let now = Instant::now();
         if self.first_token.is_none() {
@@ -192,10 +191,37 @@ impl TurnTimer {
             self.call_first_token = Some(now);
         }
     }
+    /// Estimated in-flight throughput for the footer while a stream is still
+    /// running. This is intentionally separate from final `tps`: the current
+    /// stream's real usage is not available until the final usage chunk, so the
+    /// live numerator uses the current char/4 output estimate and the UI marks it
+    /// as approximate. Completed prior calls use real output tokens when any
+    /// have been reported, else their estimate.
+    pub fn live_tps_estimate(&self, current_est_out: u64) -> Option<f64> {
+        let ft = self.call_first_token?;
+        let current_ms = ft.elapsed().as_millis() as u64;
+        if current_ms < 200 {
+            return None;
+        }
+        let total_ms = self.gen_ms.saturating_add(current_ms);
+        if total_ms == 0 {
+            return None;
+        }
+        let completed_out = if self.out_tokens > 0 {
+            self.out_tokens
+        } else {
+            self.out_tokens_est
+        };
+        let total_out = completed_out.saturating_add(current_est_out);
+        if total_out == 0 {
+            return None;
+        }
+        Some(total_out as f64 / (total_ms as f64 / 1000.0))
+    }
     /// Close out one stream call: fold its generation time and output tokens
-    /// into the turn totals. `tokens_out` is the real completion_tokens from
-    /// usage (0 when the endpoint omits usage); `est_out` is the char/4 estimate
-    /// of content+reasoning, used as a fallback numerator.
+    /// into the turn totals. `tokens_out` is the real completion_tokens /
+    /// output_tokens from usage (0 when the endpoint omits usage); `est_out` is
+    /// the char/4 estimate retained for diagnostics/accounting only.
     pub fn end_call(&mut self, tokens_out: u64, est_out: u64) {
         if let Some(ft) = self.call_first_token {
             self.gen_ms = self.gen_ms.saturating_add(ft.elapsed().as_millis() as u64);
@@ -219,21 +245,11 @@ impl TurnTimer {
         // each stream call's first-token→end window, so it excludes both the
         // prefill latency (TTFT) and the wall time spent waiting for tool calls
         // to run between requests — i.e. pure model throughput, not end-to-end
-        // wall time. Use real usage when the endpoint reports it; fall back to
-        // the char/4 estimate otherwise. `tokens_out` (the last call's count,
-        // with the reported_tokens fallback) is kept for the metrics display;
-        // the TPS uses the accumulated turn-wide totals.
-        let tps = if self.gen_ms > 0 {
-            let n = if self.out_tokens > 0 {
-                self.out_tokens
-            } else {
-                self.out_tokens_est
-            };
-            if n > 0 {
-                Some(n as f64 / (self.gen_ms as f64 / 1000.0))
-            } else {
-                None
-            }
+        // wall time. Only real provider usage counts as TPS: showing a char/4
+        // fallback made the footer look precise while actually being a guess,
+        // and it drifted badly on tool-call JSON / reasoning-heavy turns.
+        let tps = if self.gen_ms > 0 && self.out_tokens > 0 {
+            Some(self.out_tokens as f64 / (self.gen_ms as f64 / 1000.0))
         } else {
             None
         };
@@ -255,7 +271,7 @@ mod tests {
     #[test]
     fn estimate_is_reasonable() {
         assert!(estimate_tokens("hello world foo bar") > 0);
-        let m = vec![json!({"role":"user","content":"hello world"})];
+        let m = vec![Message::user("hello world")];
         assert!(estimate_messages_tokens(&m) > 0);
     }
 
@@ -263,10 +279,10 @@ mod tests {
     fn grounded_estimate_uses_real_baseline_plus_delta() {
         // 4 messages; real prompt_tokens was recorded when the list had 2.
         let msgs = vec![
-            json!({"role":"system","content":"sys prompt here"}),
-            json!({"role":"user","content":"first user message"}),
-            json!({"role":"assistant","content":"assistant reply that grew the turn"}),
-            json!({"role":"tool","tool_call_id":"x","content":"tool output payload"}),
+            Message::system("sys prompt here"),
+            Message::user("first user message"),
+            Message::assistant("assistant reply that grew the turn"),
+            Message::tool("x", "tool output payload"),
         ];
         let real = 1_000u64;
         // Baseline covers msgs[0..2]; only msgs[2..4] should be char/4-estimated.
@@ -281,7 +297,7 @@ mod tests {
 
     #[test]
     fn grounded_estimate_falls_back_when_no_real_usage() {
-        let msgs = vec![json!({"role":"user","content":"hello world"})];
+        let msgs = vec![Message::user("hello world")];
         // No real baseline (first turn): behaves as a full char/4 estimate.
         assert_eq!(
             grounded_estimate(&msgs, None, 0),
@@ -293,10 +309,7 @@ mod tests {
     fn grounded_estimate_clamps_stale_length() {
         // Baseline recorded at length 10, but a rewrite shrank the list to 2.
         // Must clamp (never slice out of range) and yield just the baseline.
-        let msgs = vec![
-            json!({"role":"user","content":"a"}),
-            json!({"role":"assistant","content":"b"}),
-        ];
+        let msgs = vec![Message::user("a"), Message::assistant("b")];
         let real = 500u64;
         assert_eq!(grounded_estimate(&msgs, Some(real), 10), real);
     }
@@ -315,14 +328,25 @@ mod tests {
     }
 
     #[test]
-    fn tps_falls_back_to_estimate_when_no_usage() {
+    fn tps_is_blank_when_provider_omits_usage() {
         let mut t = TurnTimer::new();
-        // Endpoint reported no usage (out_tokens 0); fall back to the char/4 estimate.
+        // Endpoint reported no usage (out_tokens 0). Do not show the char/4
+        // estimate as final TPS; it is not real model throughput.
         t.gen_ms = 4000;
         t.out_tokens = 0;
         t.out_tokens_est = 400;
         let m = t.finalize(1000, 0, 0, "test".into());
-        assert!((m.tps.unwrap() - 100.0).abs() < 0.5, "tps was {:?}", m.tps);
+        assert!(m.tps.is_none());
+    }
+
+    #[test]
+    fn live_tps_estimate_uses_current_stream_estimate() {
+        let mut t = TurnTimer::new();
+        t.gen_ms = 1000;
+        t.out_tokens = 100;
+        t.call_first_token = Some(Instant::now() - std::time::Duration::from_millis(1000));
+        let live = t.live_tps_estimate(100).unwrap();
+        assert!((live - 100.0).abs() < 1.0, "live tps was {live}");
     }
 
     #[test]

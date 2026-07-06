@@ -21,20 +21,23 @@
 //!      out-of-band page that shows the code to copy) + PKCE; the user opens the
 //!      URL on ANY device and pastes the code back via `/oauth-code` (matches
 //!      gemini-cli's `authWithUserCode`). Works over SSH with no port forwarding.
-//!    Tokens are written to `~/.gemini/oauth_creds.json` in the
-//!    `google-auth-library` `Credentials` shape, so a token obtained here is
-//!    interchangeable with one obtained by `gemini`'s own `/login` (and vice
-//!    versa). This works for **regular Google accounts** (personal Gmail /
-//!    Google One AI) **and Google Cloud / Workspace identities** alike — the
-//!    Google consent screen lets the user pick the account.
+//!      Tokens are written to `~/.gemini/oauth_creds.json` in the
+//!      `google-auth-library` `Credentials` shape, so a token obtained here is
+//!      interchangeable with one obtained by `gemini`'s own `/login` (and vice
+//!      versa). This works for **regular Google accounts** (personal Gmail /
+//!      Google One AI) **and Google Cloud / Workspace identities** alike — the
+//!      Google consent screen lets the user pick the account.
 //!  - Google *Cloud* accounts that prefer ADC: `gcloud auth
 //!    application-default login` (`~/.config/gcloud/application_default_
 //!    credentials.json`) and a service-account key file pointed at by
 //!    `GOOGLE_APPLICATION_CREDENTIALS` are read and refreshed here too, so a
 //!    headless Cloud workload needs no `/login`.
-//!  - Claude: Anthropic **authorization-code + PKCE + loopback redirect** —
-//!    opens claude.ai; a local server captures the redirect. Uses Claude Code's
-//!    public client_id.
+//!  - Claude: Anthropic **authorization-code + PKCE** matching Claude Code's
+//!    subscription OAuth flow — local machines use `http://localhost:<port>/callback`
+//!    loopback; SSH/headless sessions use Anthropic's hosted manual callback
+//!    page and `/oauth-code`, so no port forwarding is required. Uses Claude
+//!    Code's public client_id, authorize/token endpoints, scopes, JSON token
+//!    exchange, and `oauth-2025-04-20` API beta header.
 //!
 //! Tokens from `/login` are stored at `~/.gemini/oauth_creds.json` (Google,
 //! 0600) or `~/.config/umans-harness/oauth/<id>.json` (OpenAI/Claude, 0600)
@@ -75,6 +78,12 @@ const GOOGLE_CLIENT_SECRET: &str = "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";
 // auth-code params and Google's consent rejects with "response_type missing").
 const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// The Code Assist API endpoint — the backend gemini-cli routes OAuth tokens
+/// through. `generativelanguage.googleapis.com` only accepts API keys; the
+/// gemini-cli OAuth token (client_id 681255809395-...) authenticates against
+/// `cloudcode-pa.googleapis.com/v1internal`, which proxies Gemini requests for
+/// personal Google accounts (the free tier).
+const CODE_ASSIST_BASE_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 // The exact three scopes gemini-cli requests (space-joined in the auth URL).
 // cloud-platform alone is NOT enough — userinfo.email + userinfo.profile are
 // what gemini-cli requests for account identity.
@@ -118,13 +127,24 @@ const OPENAI_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_REDIRECT_FALLBACK_PORT: u16 = 1457;
 
 // --- Anthropic (Claude) constants ---------------------------------------------
-// Claude Code's public OAuth client_id (reverse-engineered; the endpoints are
-// not in public docs). On any failure we fall back to the API-key path.
-const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944a1966a3c";
-const CLAUDE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
-const CLAUDE_SCOPE: &str = "user:inference";
-const CLAUDE_REDIRECT_PORT: u16 = 41007;
+// Claude Code's public OAuth identity and endpoints (verified against the
+// official `@anthropic-ai/claude-code` native package). On any failure we fall
+// back to the API-key path.
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_LEGACY_CLIENT_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+const CLAUDE_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
+const CLAUDE_SCOPES: &[&str] = &[
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+fn claude_scope_string() -> String {
+    CLAUDE_SCOPES.join(" ")
+}
 
 /// A prompt shown to the user during an interactive OAuth login. Emitted as an
 /// `oauth_prompt` event by the core handler.
@@ -157,6 +177,11 @@ pub struct OAuthToken {
     /// "google" | "claude" — which refresh path to use.
     #[serde(default)]
     pub kind: String,
+    /// OpenID Connect id_token (Google returns one because the userinfo scopes
+    /// imply OIDC). Persisted for interchangeability with gemini-cli, which
+    /// uses it for account identity. Not required for API calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 /// On-disk shape Google's `google-auth-library` (and the `gemini` CLI) writes
@@ -250,6 +275,49 @@ pub fn has_codex_creds() -> bool {
     codex_auth_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Delete the OAuth credential files that our `/login` flow created for a
+/// provider, so `/logout` fully clears the credentials (not just the provider
+/// config + runtime key). Without this, `has_*_creds()` still returns true
+/// after logout and the provider re-appears as "logged in" on the next
+/// session — the stale token would even be used for model discovery + turns.
+///
+/// Only deletes credentials OUR login created. System-managed credentials
+/// (gcloud ADC, `GOOGLE_APPLICATION_CREDENTIALS` service-account files) are
+/// left alone — the user set those up independently and may still need them.
+pub fn clear_oauth_creds(preset_id: &str) {
+    let try_remove = |p: Option<std::path::PathBuf>| {
+        if let Some(p) = p {
+            let _ = std::fs::remove_file(&p);
+        }
+    };
+    match preset_id {
+        "gemini" => {
+            // Our login writes ~/.gemini/oauth_creds.json (shared with gemini-cli
+            // — deleting it logs out of both, which is the point of /logout).
+            try_remove(gemini_creds_path());
+            try_remove(legacy_gemini_token_path());
+            // Clear the in-memory service-account cache so a stale SA token
+            // isn't used after the personal token is gone.
+            if let Ok(mut c) = sa_cache().lock() {
+                *c = None;
+            }
+            // Do NOT delete gcloud ADC or GOOGLE_APPLICATION_CREDENTIALS —
+            // those are system-managed credentials the user set up outside
+            // this app.
+        }
+        "anthropic" => {
+            // Our store only. Leave ~/.claude/.credentials.json (the Claude
+            // CLI's own login) — if the user has the CLI set up, they're still
+            // authenticated via it, which is correct.
+            try_remove(stored_token_path("anthropic"));
+        }
+        "openai" => {
+            try_remove(codex_auth_path());
+        }
+        _ => {}
+    }
+}
+
 // --- Google token storage (gemini-cli shape) ----------------------------------
 
 fn read_gemini_token() -> Option<OAuthToken> {
@@ -282,6 +350,7 @@ fn read_gemini_token() -> Option<OAuthToken> {
         client_id: Some(GOOGLE_CLIENT_ID.to_string()),
         client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
         kind: "google".to_string(),
+        id_token: creds.id_token,
     })
 }
 
@@ -290,15 +359,18 @@ fn write_gemini_token(tok: &OAuthToken) -> Option<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let creds = GeminiCreds {
-        access_token: Some(tok.access_token.clone()),
-        refresh_token: tok.refresh_token.clone(),
-        token_type: Some("Bearer".to_string()),
-        // seconds → milliseconds (match google-auth-library).
-        expiry_date: Some(tok.expires_at.saturating_mul(1000)),
-        scope: Some(google_scope_string()),
-        id_token: None,
-    };
+    // Preserve the existing refresh_token + id_token when the new token doesn't
+    // carry them. Google only returns a refresh_token on the FIRST authorization
+    // for a given client+user; re-logins (same user, same client) return NO
+    // refresh_token. Without this merge, a re-login would clobber the stored
+    // refresh_token with None, making future refreshes impossible — the access
+    // token expires in ~1h and the user is silently logged out. This mirrors
+    // google-auth-library's `OAuth2Client.setCredentials` merge (Object.assign
+    // over the existing credentials) that gemini-cli relies on.
+    let existing = gemini_creds_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|s| serde_json::from_str::<GeminiCreds>(&s).ok());
+    let creds = merged_gemini_creds(tok, existing.as_ref());
     let data = serde_json::to_string_pretty(&creds).ok()?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, data).ok()?;
@@ -315,6 +387,29 @@ fn write_gemini_token(tok: &OAuthToken) -> Option<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     Some(())
+}
+
+/// Build the on-disk `GeminiCreds` from a freshly obtained `OAuthToken`,
+/// merging with any existing credentials so fields Google omits on re-login
+/// (refresh_token, id_token) are preserved rather than clobbered with None.
+/// Google only returns a refresh_token on the FIRST authorization for a given
+/// client+user; subsequent logins return NO refresh_token, so without this
+/// merge a re-login would destroy the stored refresh_token and the access
+/// token would become unrefreshable after its ~1h expiry. This mirrors
+/// google-auth-library's `OAuth2Client.setCredentials` merge (Object.assign
+/// over the existing credentials) that gemini-cli relies on.
+fn merged_gemini_creds(tok: &OAuthToken, existing: Option<&GeminiCreds>) -> GeminiCreds {
+    let prev_refresh = existing.and_then(|c| c.refresh_token.clone());
+    let prev_id = existing.and_then(|c| c.id_token.clone());
+    GeminiCreds {
+        access_token: Some(tok.access_token.clone()),
+        refresh_token: tok.refresh_token.clone().or(prev_refresh),
+        token_type: Some("Bearer".to_string()),
+        // seconds → milliseconds (match google-auth-library).
+        expiry_date: Some(tok.expires_at.saturating_mul(1000)),
+        scope: Some(google_scope_string()),
+        id_token: tok.id_token.clone().or(prev_id),
+    }
 }
 
 // --- Claude token storage (our own shape) -------------------------------------
@@ -382,6 +477,7 @@ fn read_codex_token() -> Option<OAuthToken> {
         client_id: Some(OPENAI_CLIENT_ID.to_string()),
         client_secret: None,
         kind: "openai".to_string(),
+        id_token: None,
     })
 }
 
@@ -476,22 +572,41 @@ async fn refresh_google_token(client: &reqwest::Client, tok: &OAuthToken) -> Opt
     if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str()) {
         updated.refresh_token = Some(rt.to_string());
     }
+    // Update the id_token when Google returns a fresh one (it does on refresh
+    // when the openid scope was requested, as gemini-cli's scopes imply).
+    if let Some(id) = v.get("id_token").and_then(|t| t.as_str()) {
+        updated.id_token = Some(id.to_string());
+    }
     write_gemini_token(&updated);
     Some(access)
 }
 
-/// Refresh a Claude token via its refresh endpoint. None on any failure.
+/// Refresh a Claude token via Claude Code's exact refresh request: JSON body,
+/// `grant_type=refresh_token`, `refresh_token`, `client_id`, and the same
+/// subscription scopes. None on any failure.
 async fn refresh_claude_token(client: &reqwest::Client, tok: &OAuthToken) -> Option<String> {
     let refresh_token = tok.refresh_token.clone()?;
-    let client_id = tok.client_id.clone()?;
-    let form = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token.as_str()),
-        ("client_id", client_id.as_str()),
-    ];
+    let mut client_id = tok
+        .client_id
+        .clone()
+        .unwrap_or_else(|| CLAUDE_CLIENT_ID.to_string());
+    // Migrate pre-production harness tokens that used the old dynamic-client
+    // metadata URL. Fresh logins use Claude Code's first-party client UUID, and
+    // rotated refreshes should keep using it.
+    if client_id == CLAUDE_LEGACY_CLIENT_ID {
+        client_id = CLAUDE_CLIENT_ID.to_string();
+    }
+    // Exact refresh body from the Claude Code binary (offset ~63928087):
+    // grant_type=refresh_token, refresh_token, client_id. NO scope field.
+    let req = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    });
     let resp = client
         .post(CLAUDE_TOKEN_URL)
-        .form(&form)
+        .header("Content-Type", "application/json")
+        .json(&req)
         .send()
         .await
         .ok()?;
@@ -504,6 +619,8 @@ async fn refresh_claude_token(client: &reqwest::Client, tok: &OAuthToken) -> Opt
     let mut updated = tok.clone();
     updated.access_token = access.clone();
     updated.expires_at = now_secs() + expires_in;
+    updated.client_id = Some(client_id);
+    // Preserve the old refresh_token unless Anthropic returned a rotated one.
     if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str()) {
         updated.refresh_token = Some(rt.to_string());
     }
@@ -569,6 +686,74 @@ pub async fn google_token(client: &reqwest::Client) -> Option<String> {
         return Some(t);
     }
     google_token_from_adc(client).await
+}
+
+/// Cache for the Code Assist project ID (obtained via loadCodeAssist onboarding).
+/// The project ID is stable per-user, so we fetch it once and reuse it.
+static CODE_ASSIST_PROJECT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Onboard the user on the Code Assist platform and return their project ID.
+/// Every `generateContent` request to `cloudcode-pa.googleapis.com` requires
+/// a `project` field — this fetches it via `loadCodeAssist` (and falls back to
+/// `onboardUser` for new users who haven't been provisioned yet).
+/// The result is cached for the process lifetime (the project ID is stable).
+pub async fn code_assist_project(client: &reqwest::Client) -> Option<String> {
+    if let Some(cached) = CODE_ASSIST_PROJECT.get() {
+        return cached.clone();
+    }
+    let token = google_token(client).await?;
+    let result = fetch_code_assist_project(client, &token).await;
+    let _ = CODE_ASSIST_PROJECT.set(result.clone());
+    result
+}
+
+async fn fetch_code_assist_project(client: &reqwest::Client, token: &str) -> Option<String> {
+    let body = json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+    let resp = client
+        .post(format!("{CODE_ASSIST_BASE_URL}:loadCodeAssist"))
+        .bearer_auth(token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    let v: Value = resp.json().await.ok()?;
+    // cloudaicompanionProject is at the top level of the response.
+    if let Some(p) = v.get("cloudaicompanionProject").and_then(|p| p.as_str()) {
+        if !p.is_empty() {
+            return Some(p.to_string());
+        }
+    }
+    // New user not yet provisioned — onboard them.
+    onboard_code_assist_user(client, token).await
+}
+
+async fn onboard_code_assist_user(client: &reqwest::Client, token: &str) -> Option<String> {
+    let body = json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+    let resp = client
+        .post(format!("{CODE_ASSIST_BASE_URL}:onboardUser"))
+        .bearer_auth(token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    let v: Value = resp.json().await.ok()?;
+    v.get("projectId")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string())
 }
 
 #[derive(Deserialize)]
@@ -854,6 +1039,15 @@ pub async fn enrich_oauth(mut rp: ResolvedProvider, client: &reqwest::Client) ->
         _ if crate::provider::is_gemini_endpoint(&rp.base_url) => {
             if let Some(t) = google_token(client).await {
                 rp.api_key = Some(t);
+                rp.oauth = true;
+                // CRITICAL: the gemini-cli OAuth token (from client_id
+                // 681255809395-...) is NOT for generativelanguage.googleapis.com
+                // — that endpoint only accepts API keys (returns 401 "missing
+                // authentication credential" for OAuth Bearer tokens). The OAuth
+                // token is for the Code Assist API at cloudcode-pa.googleapis.com,
+                // which proxies Gemini requests for personal Google accounts.
+                // Route all turns through the Code Assist API when using OAuth.
+                rp.base_url = CODE_ASSIST_BASE_URL.to_string();
             }
         }
         _ => {}
@@ -1062,98 +1256,6 @@ async fn handle_redirect_stream(
     Ok(None)
 }
 
-/// A native-app authorization-code + PKCE + loopback-redirect OAuth login (the
-/// flow the `claude` CLI uses). Opens the authorize URL in a browser; a local
-/// TCP server on `port` captures the `?code=` redirect; exchanges it for tokens;
-/// stores them. Used for Claude (Gemini uses its own gemini-cli-matching flow).
-async fn native_app_login(
-    client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
-    authorize_url: &str,
-    token_url: &str,
-    client_id: &str,
-    client_secret: Option<&str>,
-    scope: &str,
-    port: u16,
-    store_as: &str,
-    kind: &str,
-    label: &str,
-) -> Result<OAuthToken, String> {
-    let verifier = random_b64url(48);
-    let challenge = pkce_challenge(&verifier);
-    let state = random_b64url(16);
-    let redirect = format!("http://127.0.0.1:{port}/callback");
-    let redirect_enc = pct_encode(&redirect);
-
-    let authorize = format!(
-        "{authorize_url}?client_id={client_id}&redirect_uri={redirect_enc}&response_type=code&code_challenge={challenge}&code_challenge_method=S256&scope={}&state={state}",
-        pct_encode(scope)
-    );
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("could not bind localhost:{port}: {e}"))?;
-
-    emit(OAuthPrompt {
-        url: authorize.clone(),
-        code: None,
-        message: format!(
-            "Open the URL in a browser to log in to {label}. After approving, this continues automatically."
-        ),
-    });
-    let _ = open_browser(&authorize);
-
-    let code = await_redirect(listener, &state, None).await?;
-
-    // Exchange the code for tokens.
-    let mut form: Vec<(String, String)> = vec![
-        ("grant_type".to_string(), "authorization_code".to_string()),
-        ("code".to_string(), code),
-        ("redirect_uri".to_string(), redirect),
-        ("client_id".to_string(), client_id.to_string()),
-        ("code_verifier".to_string(), verifier),
-    ];
-    if let Some(secret) = client_secret {
-        form.push(("client_secret".to_string(), secret.to_string()));
-    }
-    let form_refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let resp = client
-        .post(token_url)
-        .form(&form_refs)
-        .send()
-        .await
-        .map_err(|e| format!("token exchange failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("token endpoint returned {status}: {body}"));
-    }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("token parse failed: {e}"))?;
-    let access = v
-        .get("access_token")
-        .and_then(|t| t.as_str())
-        .ok_or("no access_token")?
-        .to_string();
-    let refresh = v
-        .get("refresh_token")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
-    let exp = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
-    let tok = OAuthToken {
-        access_token: access,
-        refresh_token: refresh,
-        expires_at: now_secs() + exp,
-        client_id: Some(client_id.to_string()),
-        client_secret: client_secret.map(|s| s.to_string()),
-        kind: kind.to_string(),
-    };
-    store_token(store_as, &tok);
-    Ok(tok)
-}
-
 /// Pending state for the no-browser (manual-code) OAuth flow — held in `State`
 /// until the user pastes the authorization code back via the `oauth_code`
 /// command, at which point `complete_oauth` finishes the exchange.
@@ -1310,6 +1412,10 @@ pub async fn complete_google_login(
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
     let exp = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
+    let id_token = v
+        .get("id_token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
     let tok = OAuthToken {
         access_token: access,
         refresh_token: refresh,
@@ -1317,6 +1423,7 @@ pub async fn complete_google_login(
         client_id: Some(GOOGLE_CLIENT_ID.to_string()),
         client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
         kind: "google".to_string(),
+        id_token,
     };
     write_gemini_token(&tok);
     if let Ok(mut c) = sa_cache().lock() {
@@ -1336,6 +1443,7 @@ pub async fn complete_oauth(
     match preset_id {
         "openai" => complete_codex_login(client, pending, code).await,
         "gemini" => complete_google_login(client, pending, code).await,
+        "anthropic" => complete_claude_login(client, pending, code).await,
         other => Err(format!("no manual OAuth completion for '{other}'")),
     }
 }
@@ -1454,6 +1562,10 @@ async fn google_login_web(
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
     let exp = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
+    let id_token = v
+        .get("id_token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
     let tok = OAuthToken {
         access_token: access,
         refresh_token: refresh,
@@ -1461,6 +1573,7 @@ async fn google_login_web(
         client_id: Some(GOOGLE_CLIENT_ID.to_string()),
         client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
         kind: "google".to_string(),
+        id_token,
     };
     write_gemini_token(&tok);
     // Best-effort: clear any stale service-account cache so the new personal
@@ -1471,25 +1584,194 @@ async fn google_login_web(
     Ok(tok)
 }
 
-/// Perform the Anthropic OAuth login (Claude) via auth-code + PKCE + loopback.
+/// Start Anthropic Claude subscription OAuth. Local machines use Claude Code's
+/// loopback flow (`http://localhost:<port>/callback`). SSH/headless sessions use
+/// Claude Code's manual flow (`https://platform.claude.com/oauth/code/callback`)
+/// and complete via `/oauth-code <code-or-callback-url>`, so no port forwarding
+/// is required.
 pub async fn claude_login(
     client: &reqwest::Client,
     emit: &dyn Fn(OAuthPrompt),
+) -> Result<LoginOutcome, String> {
+    if likely_headless() {
+        return claude_login_manual(emit);
+    }
+    claude_login_web(client, emit)
+        .await
+        .map(|_| LoginOutcome::Done)
+}
+
+fn claude_authorize_url(challenge: &str, state: &str, redirect_uri: &str) -> String {
+    // Exact query params from the Claude Code binary (offset ~63918986):
+    // client_id, response_type, redirect_uri, scope, code_challenge,
+    // code_challenge_method=S256, state.  (login_hint/login_method are optional
+    // and omitted; isManual/port/code=true are internal JS options, NOT URL params.)
+    let params = [
+        ("client_id", CLAUDE_CLIENT_ID),
+        ("response_type", "code"),
+        ("redirect_uri", redirect_uri),
+        ("scope", &claude_scope_string()),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+    ];
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{CLAUDE_AUTHORIZE_URL}?{query}")
+}
+
+fn claude_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, String> {
+    let verifier = random_b64url(48);
+    let challenge = pkce_challenge(&verifier);
+    let state = random_b64url(32);
+    let redirect = CLAUDE_MANUAL_REDIRECT_URL.to_string();
+    let authorize = claude_authorize_url(&challenge, &state, &redirect);
+    emit(OAuthPrompt {
+        url: authorize,
+        code: None,
+        message: "No browser detected (SSH/headless). Open this Claude URL on ANY device, sign in and approve, then paste the authorization code or the final callback URL back here with: /oauth-code <code-or-url>".to_string(),
+    });
+    Ok(LoginOutcome::AwaitingCode {
+        pending: PendingOauth {
+            kind: "anthropic".to_string(),
+            code_verifier: verifier,
+            state,
+            redirect_uri: redirect,
+        },
+    })
+}
+
+async fn claude_login_web(
+    client: &reqwest::Client,
+    emit: &dyn Fn(OAuthPrompt),
 ) -> Result<OAuthToken, String> {
-    native_app_login(
+    let verifier = random_b64url(48);
+    let challenge = pkce_challenge(&verifier);
+    let state = random_b64url(32);
+    let (listener, listener_v6, port) = bind_claude_callback().await?;
+    let redirect = format!("http://localhost:{port}/callback");
+    let authorize = claude_authorize_url(&challenge, &state, &redirect);
+
+    emit(OAuthPrompt {
+        url: authorize.clone(),
+        code: None,
+        message: "Open the URL in a browser to log in to Claude. After approving, this continues automatically.".to_string(),
+    });
+    let _ = open_browser(&authorize);
+
+    let code = await_redirect_dual(listener, listener_v6, &state, None).await?;
+    exchange_claude_code(client, &code, &redirect, &verifier).await
+}
+
+async fn bind_claude_callback() -> Result<
+    (
+        tokio::net::TcpListener,
+        Option<tokio::net::TcpListener>,
+        u16,
+    ),
+    String,
+> {
+    // Claude Code uses a loopback localhost redirect with an arbitrary available
+    // port. Bind IPv4 first and IPv6 best-effort because browsers often resolve
+    // localhost to ::1 before 127.0.0.1.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| format!("could not bind localhost OAuth callback: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let listener_v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
+    Ok((listener, listener_v6, port))
+}
+
+pub async fn complete_claude_login(
+    client: &reqwest::Client,
+    pending: &PendingOauth,
+    code: &str,
+) -> Result<OAuthToken, String> {
+    // The manual callback page may present the code as `authorizationCode#state`
+    // (Claude Code's own paste format). We already stashed the state at login
+    // start, so strip anything after `#`. Also handle full callback URLs.
+    let raw = code.trim();
+    let stripped = if let Some((auth, _)) = raw.split_once('#') {
+        auth
+    } else {
+        raw
+    };
+    let extracted = extract_auth_code(stripped);
+    if extracted.is_empty() {
+        return Err("No authorization code found in the input. Paste the code from the Claude callback page (format: code#state) or the full callback URL.".to_string());
+    }
+    exchange_claude_code(
         client,
-        emit,
-        CLAUDE_AUTHORIZE_URL,
-        CLAUDE_TOKEN_URL,
-        CLAUDE_CLIENT_ID,
-        None,
-        CLAUDE_SCOPE,
-        CLAUDE_REDIRECT_PORT,
-        "anthropic",
-        "claude",
-        "Anthropic Claude",
+        &extracted,
+        &pending.redirect_uri,
+        &pending.code_verifier,
     )
     .await
+    .map_err(|e| {
+        format!(
+            "{e}  (extracted code: {} chars, starts with {:?})",
+            extracted.len(),
+            extracted.chars().take(16).collect::<String>()
+        )
+    })
+}
+
+async fn exchange_claude_code(
+    client: &reqwest::Client,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<OAuthToken, String> {
+    // Exact token exchange body from the Claude Code binary (offset ~63928087):
+    // grant_type, code, redirect_uri, client_id, code_verifier.
+    // NO state field — Claude Code does not send it in the token exchange.
+    let req = json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": CLAUDE_CLIENT_ID,
+        "code_verifier": verifier,
+    });
+    let resp = client
+        .post(CLAUDE_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("token exchange failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("token endpoint returned {status}: {body}"));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("token parse failed: {e}"))?;
+    let access = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .ok_or("no access_token")?
+        .to_string();
+    let refresh = v
+        .get("refresh_token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+    let exp = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
+    let tok = OAuthToken {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at: now_secs() + exp,
+        client_id: Some(CLAUDE_CLIENT_ID.to_string()),
+        client_secret: None,
+        kind: "claude".to_string(),
+        id_token: None,
+    };
+    store_token("anthropic", &tok);
+    Ok(tok)
 }
 
 #[derive(Deserialize)]
@@ -1712,6 +1994,7 @@ async fn exchange_codex_code(
         client_id: Some(OPENAI_CLIENT_ID.to_string()),
         client_secret: None,
         kind: "openai".to_string(),
+        id_token: id_token.map(|s| s.to_string()),
     };
     write_codex_auth(&tok, id_token);
     Ok(tok)
@@ -1736,7 +2019,7 @@ pub async fn login(
     match preset_id {
         "openai" => codex_login(client, emit).await,
         "gemini" => google_login(client, emit).await,
-        "anthropic" => claude_login(client, emit).await.map(|_| LoginOutcome::Done),
+        "anthropic" => claude_login(client, emit).await,
         other => Err(format!("'{other}' has no OAuth login flow yet")),
     }
 }
@@ -1805,6 +2088,52 @@ mod tests {
     }
 
     #[test]
+    fn claude_constants_match_claude_code() {
+        assert_eq!(CLAUDE_CLIENT_ID, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        assert_eq!(
+            CLAUDE_AUTHORIZE_URL,
+            "https://claude.com/cai/oauth/authorize"
+        );
+        assert_eq!(
+            CLAUDE_TOKEN_URL,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(
+            CLAUDE_MANUAL_REDIRECT_URL,
+            "https://platform.claude.com/oauth/code/callback"
+        );
+        assert_eq!(
+            claude_scope_string(),
+            "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+        );
+    }
+
+    #[test]
+    fn claude_authorize_url_has_correct_params() {
+        // Local loopback mode
+        let local = claude_authorize_url("challenge", "state", "http://localhost:54321/callback");
+        assert!(local.starts_with("https://claude.com/cai/oauth/authorize?"));
+        // NO code=true, isManual, or port — those are internal JS options, not URL params
+        assert!(!local.contains("code=true"));
+        assert!(!local.contains("isManual"));
+        assert!(!local.contains("port="));
+        assert!(local.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
+        assert!(local.contains("response_type=code"));
+        assert!(local.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback"));
+        assert!(local.contains("scope=user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"));
+        assert!(local.contains("code_challenge=challenge"));
+        assert!(local.contains("code_challenge_method=S256"));
+        assert!(local.contains("state=state"));
+
+        // Manual/headless mode — same params, different redirect_uri
+        let manual = claude_authorize_url("challenge", "state", CLAUDE_MANUAL_REDIRECT_URL);
+        assert!(manual
+            .contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"));
+        assert!(!manual.contains("isManual"));
+        assert!(!manual.contains("port="));
+    }
+
+    #[test]
     fn pct_encode_encodes_reserved() {
         assert_eq!(pct_encode("hello world"), "hello%20world");
         assert_eq!(
@@ -1833,6 +2162,7 @@ mod tests {
             client_id: Some(GOOGLE_CLIENT_ID.into()),
             client_secret: Some(GOOGLE_CLIENT_SECRET.into()),
             kind: "google".into(),
+            id_token: None,
         };
         let creds = GeminiCreds {
             access_token: Some(tmp.access_token.clone()),
@@ -1847,6 +2177,67 @@ mod tests {
         assert_eq!(parsed.expiry_date, Some(1719000000000u64));
         // ms → s on read:
         assert_eq!(parsed.expiry_date.unwrap() / 1000, tmp.expires_at);
+    }
+
+    #[test]
+    fn merged_gemini_creds_preserves_refresh_token_on_relogin() {
+        // Google only returns a refresh_token on the FIRST authorization for a
+        // client+user. A re-login returns NO refresh_token. Without the merge,
+        // write_gemini_token would clobber the stored refresh_token with None,
+        // making future refreshes impossible (access token expires in ~1h →
+        // silently logged out). The merge must preserve the existing one.
+        let existing = GeminiCreds {
+            access_token: Some("ya29.old".into()),
+            refresh_token: Some("1//old-refresh".into()),
+            token_type: Some("Bearer".into()),
+            expiry_date: Some(1_719_000_000_000),
+            scope: None,
+            id_token: Some("old.jwt".into()),
+        };
+        // New login: fresh access token, but NO refresh_token / id_token (the
+        // re-authorization case Google hits us with).
+        let new_tok = OAuthToken {
+            access_token: "ya29.new".into(),
+            refresh_token: None,
+            expires_at: 1_719_003_600,
+            client_id: Some(GOOGLE_CLIENT_ID.into()),
+            client_secret: Some(GOOGLE_CLIENT_SECRET.into()),
+            kind: "google".into(),
+            id_token: None,
+        };
+        let merged = merged_gemini_creds(&new_tok, Some(&existing));
+        assert_eq!(merged.access_token, Some("ya29.new".into()));
+        // CRITICAL: the old refresh_token survives the re-login.
+        assert_eq!(merged.refresh_token, Some("1//old-refresh".into()));
+        // The old id_token is also preserved (interchangeability with gemini-cli).
+        assert_eq!(merged.id_token, Some("old.jwt".into()));
+        assert_eq!(merged.expiry_date, Some(1_719_003_600_000)); // ms
+    }
+
+    #[test]
+    fn merged_gemini_creds_uses_new_refresh_when_google_returns_one() {
+        // When Google DOES return a new refresh_token (first-ever login, or a
+        // forced re-consent), the new one wins.
+        let existing = GeminiCreds {
+            access_token: Some("ya29.old".into()),
+            refresh_token: Some("1//old-refresh".into()),
+            token_type: Some("Bearer".into()),
+            expiry_date: Some(1_719_000_000_000),
+            scope: None,
+            id_token: None,
+        };
+        let new_tok = OAuthToken {
+            access_token: "ya29.new".into(),
+            refresh_token: Some("1//new-refresh".into()),
+            expires_at: 1_719_003_600,
+            client_id: Some(GOOGLE_CLIENT_ID.into()),
+            client_secret: Some(GOOGLE_CLIENT_SECRET.into()),
+            kind: "google".into(),
+            id_token: Some("new.jwt".into()),
+        };
+        let merged = merged_gemini_creds(&new_tok, Some(&existing));
+        assert_eq!(merged.refresh_token, Some("1//new-refresh".into()));
+        assert_eq!(merged.id_token, Some("new.jwt".into()));
     }
 
     #[test]

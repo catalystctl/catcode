@@ -20,6 +20,7 @@
 use crate::config::{Config, ResolvedProvider, SubagentConfig};
 use crate::intercom::{execute_contact_supervisor, execute_intercom};
 use crate::logging::{estimate_messages_tokens, grounded_estimate, TurnTimer};
+use crate::message::{self, Message};
 use crate::protocol::{emit, Event, ModelInfo};
 use crate::tools::{self, Outcome};
 use crate::State;
@@ -984,7 +985,7 @@ async fn run_single(
         run_id,
         "single",
         Some(agent.name.as_str()),
-        &[agent.name.clone()],
+        std::slice::from_ref(&agent.name),
         task,
         depth,
         started,
@@ -1123,7 +1124,7 @@ async fn run_agent_inner(
         sys.push_str(&sinj);
     }
 
-    let mut sub: Vec<Value> = vec![json!({ "role": "system", "content": sys })];
+    let mut sub: Vec<Message> = vec![Message::system(sys)];
 
     // --- forked context: parent conversation as reference ---
     if context == ContextKind::Fork {
@@ -1134,17 +1135,16 @@ async fn run_agent_inner(
         // output with pasted credentials) and tool_call envelopes, then redact
         // common secret patterns from the kept user/assistant prose before
         // handing the transcript to a child whose own tools could exfiltrate it.
-        let filtered: Vec<Value> = parent
+        let filtered: Vec<Message> = parent
             .iter()
             .filter(|m| {
-                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                if role == "system" {
+                if m.is_system() {
                     return false;
                 }
-                if role == "tool" {
+                if m.is_tool() {
                     return false;
                 } // drop all tool results (secret/noise)
-                if role == "assistant" && m.get("tool_calls").is_some() {
+                if m.is_assistant() && m.tool_calls().is_some() {
                     return false;
                 }
                 true
@@ -1152,9 +1152,9 @@ async fn run_agent_inner(
             .map(redact_message_secrets)
             .collect();
         let start = filtered.len().saturating_sub(40);
-        let fork_msgs: Vec<Value> = filtered[start..].to_vec();
+        let fork_msgs: Vec<Message> = filtered[start..].to_vec();
         if !fork_msgs.is_empty() {
-            sub.push(json!({ "role": "system", "content": "You are running from a fork of the parent session. Treat the following inherited conversation as reference-only context, not a live thread to continue. Do not answer prior messages.\n\n--- inherited parent context ---" }));
+            sub.push(Message::system("You are running from a fork of the parent session. Treat the following inherited conversation as reference-only context, not a live thread to continue. Do not answer prior messages.\n\n--- inherited parent context ---"));
             sub.extend(fork_msgs);
         }
     }
@@ -1170,15 +1170,17 @@ async fn run_agent_inner(
             }
         }
         if !read_ctx.is_empty() {
-            sub.push(json!({ "role": "system", "content": format!("Reference files read before your task:\n\n{read_ctx}") }));
+            sub.push(Message::system(format!(
+                "Reference files read before your task:\n\n{read_ctx}"
+            )));
         }
     }
 
     // --- task message ---
     let task_msg = if context == ContextKind::Fork {
-        json!({ "role": "user", "content": format!("Task:\n{task}") })
+        Message::user(format!("Task:\n{task}"))
     } else {
-        json!({ "role": "user", "content": task })
+        Message::user(task)
     };
     sub.push(task_msg);
 
@@ -1255,6 +1257,7 @@ async fn run_agent_inner(
             );
         }
 
+        // Sanitize the conversation directly (it's already Vec<Message>).
         crate::provider::sanitize_orphaned_tool_calls(&mut sub);
         // Coerce any malformed tool-call `arguments` (e.g. a long, quote-heavy
         // command that broke the model's JSON encoding) to "{}" so the history
@@ -1262,7 +1265,7 @@ async fn run_agent_inner(
         // later subagent request fail with "function.arguments must be valid JSON".
         let _ = crate::provider::sanitize_tool_call_arguments(&mut sub);
 
-        // stream with model fallback
+        // stream with model fallback — pass Messages directly
         let (assistant, _finish_reason, ti, to, cached, served_model) = match stream_with_fallback(
             client,
             &cfg,
@@ -1315,26 +1318,14 @@ async fn run_agent_inner(
             run_start.elapsed().as_millis() as u64,
             true,
         );
-        let asst_text = assistant
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let asst_text = assistant.content_text().unwrap_or("").to_string();
         if !asst_text.is_empty() {
             emit_subagent_message(run_id, "assistant", &truncate(&asst_text, 16000));
         }
 
-        let Some(calls) = assistant
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .cloned()
-        else {
+        let Some(calls) = assistant.tool_calls().map(|tc| tc.to_vec()) else {
             // done — finalize output
-            let text = assistant
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let text = assistant.content_text().unwrap_or("").to_string();
             // optional output file
             if let Some(out_path) = &agent.output {
                 let p = workspace.join(out_path);
@@ -1347,32 +1338,15 @@ async fn run_agent_inner(
             return Outcome::ok(text);
         };
         if calls.is_empty() {
-            let text = assistant
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let text = assistant.content_text().unwrap_or("").to_string();
             emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
             return Outcome::ok(text);
         }
 
         for call in &calls {
-            let id = call
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let func = call.get("function");
-            let name = func
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let args_str = func
-                .and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}")
-                .to_string();
+            let id = call.id.clone();
+            let name = call.function.name.clone();
+            let args_str = call.function.arguments.clone();
             tool_count += 1;
             if tool_count > SUBAGENT_MAX_TOOL_CALLS {
                 emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
@@ -1414,7 +1388,7 @@ async fn run_agent_inner(
                     );
                     emit_subagent_tool_call(run_id, &id, &name, &json!({}), tool_count);
                     emit_subagent_tool_result(run_id, &id, &name, &truncate(&msg, 8000), false);
-                    sub.push(json!({ "role": "tool", "tool_call_id": id, "content": msg }));
+                    sub.push(Message::tool(&id, &msg));
                     continue;
                 }
             };
@@ -1457,15 +1431,11 @@ async fn run_agent_inner(
                 &truncate(&outcome.output, 8000),
                 outcome.ok,
             );
-            sub.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.output }));
+            sub.push(Message::tool(&id, &outcome.output));
 
             // finish sentinel
             if name == "finish" && outcome.ok && outcome.output == "__finish__" {
-                let text = assistant
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let text = assistant.content_text().unwrap_or("").to_string();
                 if let Some(out_path) = &agent.output {
                     let p = workspace.join(out_path);
                     if let Some(parent) = p.parent() {
@@ -1845,14 +1815,14 @@ async fn stream_with_fallback(
     cfg: &Config,
     provider: &ResolvedProvider,
     candidates: &[String],
-    messages: &[Value],
+    messages: &[Message],
     tools: &[Value],
     effort: &str,
     thinking_levels: &[String],
     models: &[ModelInfo],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
-) -> Result<(Value, String, u64, u64, u64, String), String> {
+) -> Result<(Message, String, u64, u64, u64, String), String> {
     let mut last_err = String::from("no model candidates");
     for (i, model) in candidates.iter().enumerate() {
         // Always re-resolve thinking_levels per candidate model (a fallback model
@@ -1889,7 +1859,14 @@ async fn stream_with_fallback(
         .await
         {
             Ok((assistant, fr, ti, to, cached)) => {
-                return Ok((assistant, fr, ti, to, cached, model.clone()))
+                let assistant_msg = Message::try_from(&assistant).unwrap_or_else(|e| {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("subagent assistant parse: {e}"))),
+                    );
+                    Message::assistant("")
+                });
+                return Ok((assistant_msg, fr, ti, to, cached, model.clone()));
             }
             Err(e) => {
                 if e == "aborted" || cancel.is_cancelled() {
@@ -2069,30 +2046,39 @@ fn redact_secrets(s: &str) -> String {
 }
 
 /// Redact secrets from a forked message's text content (string or multimodal).
-fn redact_message_secrets(m: &Value) -> Value {
+fn redact_message_secrets(m: &Message) -> Message {
     let mut clean = m.clone();
-    if let Some(obj) = clean.as_object_mut() {
-        if let Some(content) = obj.get_mut("content") {
-            match content {
-                Value::String(s) => *s = redact_secrets(s),
-                Value::Array(arr) => {
-                    for part in arr.iter_mut() {
-                        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            let redacted = part
-                                .get("text")
-                                .and_then(|v| v.as_str())
-                                .map(redact_secrets);
-                            if let (Some(r), Some(po)) = (redacted, part.as_object_mut()) {
-                                po.insert("text".into(), Value::String(r));
-                            }
-                        }
-                    }
+    match &mut clean {
+        Message::System { content, .. } | Message::User { content, .. } => {
+            redact_content(content);
+        }
+        Message::Assistant {
+            content: Some(ref mut s),
+            ..
+        } => {
+            *s = redact_secrets(s);
+        }
+        Message::Tool {
+            ref mut content, ..
+        } => {
+            *content = redact_secrets(content);
+        }
+        _ => {}
+    }
+    clean
+}
+
+fn redact_content(content: &mut message::Content) {
+    match content {
+        message::Content::Text(s) => *s = redact_secrets(s),
+        message::Content::Multimodal(parts) => {
+            for part in parts {
+                if let message::ContentPart::Text { ref mut text } = part {
+                    *text = redact_secrets(text);
                 }
-                _ => {}
             }
         }
     }
-    clean
 }
 
 fn now_ms() -> u64 {

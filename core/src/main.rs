@@ -13,6 +13,7 @@ mod git_ctx;
 mod intercom;
 mod logging;
 mod memory;
+mod message;
 mod oauth;
 mod pattern_log;
 mod plugins;
@@ -34,6 +35,8 @@ use logging::{
     TurnTimer,
 };
 use memory::memory_injection;
+#[allow(unused_imports)]
+use message::{ContentPart, FunctionCall, ImageUrl, Message, ToolCall};
 use plugins::{PluginManager, PLUGIN_DOCS};
 use protocol::{emit, Command, Event, ModelInfo};
 use serde_json::{json, Value};
@@ -265,7 +268,7 @@ pub struct State {
     /// Runtime override of the active provider name (set via `set_provider`).
     /// Wins over `cfg.active_provider`; None => use config's active provider.
     pub active_provider: RwLock<Option<String>>,
-    pub conversation: Mutex<Vec<Value>>,
+    pub conversation: Mutex<Vec<Message>>,
     pub models: RwLock<Vec<ModelInfo>>,
     pub current: Mutex<Option<CancellationToken>>,
     pub handle: Mutex<Option<JoinHandle<()>>>,
@@ -318,8 +321,7 @@ pub struct State {
     /// can aggregate per-turn signal out-of-the-box (without the debug log).
     /// `None` until the first turn completes.
     pub last_turn_metrics: Mutex<Option<TurnMetrics>>,
-    /// True after compaction until the next sanitization pass.
-    pub needs_sanitize: Mutex<bool>,
+
     /// Rolling, KV-cache-aware work-state summary (goal / done / in-progress /
     /// next / recent files). Maintained incrementally from conversation signals
     /// and injected as a TRANSIENT tail system message before every request —
@@ -871,7 +873,7 @@ async fn record_file_touch(st: &State, tool: &str, args: &Value) {
 /// persisted conversation or the session file — the conversation prefix stays
 /// byte-identical turn to turn and the provider's prefix cache is never
 /// invalidated by it.
-async fn work_state_message(st: &State) -> Option<Value> {
+async fn work_state_message(st: &State) -> Option<Message> {
     if !st.cfg.read().await.rolling_state {
         return None;
     }
@@ -879,7 +881,7 @@ async fn work_state_message(st: &State) -> Option<Value> {
     if ws.is_empty() {
         return None;
     }
-    Some(json!({ "role": "system", "content": ws.render() }))
+    Some(Message::system(ws.render()))
 }
 
 /// Reset the rolling work-state (new session / reset / clear / undo / load).
@@ -978,7 +980,7 @@ async fn main() {
     // Resume session if configured and present. A future-version session file
     // returns Err (surfaced to the user via an `error` event at Init) rather
     // than silently starting blank.
-    let (resumed, session_error): (Vec<Value>, Option<String>) = match cfg.session_file.as_ref() {
+    let (resumed, session_error): (Vec<Message>, Option<String>) = match cfg.session_file.as_ref() {
         Some(p) => match session::load(p.as_path()) {
             Ok(v) => (v, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -1022,10 +1024,6 @@ async fn main() {
 
     // Pre-compute token estimate for resumed conversation.
     let init_est = estimate_messages_tokens(&resumed);
-    // Sanitize a resumed conversation before its first request: a prior crash
-    // may have left a malformed tool-call `arguments` in the history, which the
-    // API would reject with "function.arguments must be valid JSON".
-    let sanitize_on_resume = !resumed.is_empty();
 
     let vision_cfg = VisionConfig::load(&cfg.workspace);
     let state = Arc::new(State {
@@ -1056,7 +1054,7 @@ async fn main() {
         conv_len_at_last_real: Mutex::new(0),
         last_model: Mutex::new(None),
         last_turn_metrics: Mutex::new(None),
-        needs_sanitize: Mutex::new(sanitize_on_resume),
+
         work_state: Mutex::new(WorkState::default()),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
@@ -1148,9 +1146,10 @@ async fn main() {
                 // on launch instead of starting from an empty transcript.
                 if conv_len > 0 {
                     let conv = state.conversation.lock().await;
-                    let visible: Vec<&Value> = conv
+                    let visible: Vec<Value> = conv
                         .iter()
-                        .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
+                        .filter(|m| !m.is_system())
+                        .map(Value::from)
                         .collect();
                     let est = estimate_messages_tokens(&conv);
                     emit(
@@ -1337,6 +1336,14 @@ async fn main() {
                     );
                     return;
                 }
+                // Delete the OAuth credential files our /login created, so the
+                // provider is FULLY logged out — not just its config/runtime key.
+                // Without this, has_*_creds() still returns true (token file
+                // remains on disk) and the provider re-appears as "logged in" on
+                // the next session, with the stale token silently used for turns.
+                for n in &to_remove {
+                    oauth::clear_oauth_creds(n);
+                }
                 // If the active provider was one of those logged out, clear the
                 // override so the fallback resolves to the first remaining / legacy.
                 {
@@ -1411,12 +1418,12 @@ async fn main() {
                         // emitted; stash the PKCE verifier + redirect_uri and
                         // wait for the user to paste the code/redirect URL via
                         // the `oauth_code` command.
-                        let is_openai = pending.kind == "openai";
+                        let kind = pending.kind.clone();
                         *state.pending_oauth.lock().await = Some(pending);
-                        let msg = if is_openai {
-                            "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>."
-                        } else {
-                            "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>."
+                        let msg = match kind.as_str() {
+                            "openai" => "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>.",
+                            "anthropic" => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code or final callback URL via /oauth-code <code-or-url>.",
+                            _ => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>.",
                         };
                         emit(&Event::new("info").with("message", json!(msg)));
                     }
@@ -1533,8 +1540,7 @@ async fn main() {
                 let mut conv = state.conversation.lock().await;
                 // Walk back past trailing tool/assistant messages to the last user message.
                 while let Some(last) = conv.last() {
-                    let role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    if role == "user" {
+                    if last.is_user() {
                         conv.pop();
                         break;
                     }
@@ -1572,7 +1578,6 @@ async fn main() {
                     *state.estimated_tokens.lock().await = after_est;
                     // Manual compaction rewrote history; drop the stale baseline.
                     state.invalidate_real_token_baseline().await;
-                    *state.needs_sanitize.lock().await = true;
                     if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                         session::rewrite(p, &messages);
                     }
@@ -1677,9 +1682,10 @@ async fn main() {
                 emit(&Event::new("reset"));
                 // Replay the loaded transcript so the TUI shows prior turns
                 // instead of an empty view after switching/resuming a session.
-                let visible: Vec<&Value> = loaded
+                let visible: Vec<Value> = loaded
                     .iter()
-                    .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
+                    .filter(|m| !m.is_system())
+                    .map(Value::from)
                     .collect();
                 let est = estimate_messages_tokens(&loaded);
                 *state.estimated_tokens.lock().await = est;
@@ -2545,8 +2551,7 @@ async fn run_turn(
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
             let workspace = st.cfg.read().await.workspace.clone();
-            let sys_msg =
-                json!({ "role": "system", "content": build_system_prompt(&workspace, true) });
+            let sys_msg = Message::system(build_system_prompt(&workspace, true));
             init_est_add += estimate_message_tokens(&sys_msg);
             conv.push(sys_msg);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -2558,14 +2563,18 @@ async fn run_turn(
         let allow_vision = st.cfg.read().await.allow_vision;
         let user_msg = match (&images, allow_vision) {
             (Some(imgs), true) if !imgs.is_empty() => {
-                let mut parts: Vec<Value> = vec![json!({ "type": "text", "text": prompt })];
+                let mut parts: Vec<ContentPart> = vec![ContentPart::Text {
+                    text: prompt.clone(),
+                }];
                 for img in imgs {
                     let url = image_to_data_url(img);
-                    parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                    parts.push(ContentPart::Image {
+                        image_url: ImageUrl { url, detail: None },
+                    });
                 }
-                json!({ "role": "user", "content": parts })
+                Message::user_multimodal(parts)
             }
-            _ => json!({ "role": "user", "content": prompt }),
+            _ => Message::user(prompt.clone()),
         };
         init_est_add += estimate_message_tokens(&user_msg);
         conv.push(user_msg);
@@ -2750,7 +2759,6 @@ async fn run_turn(
                 *st.estimated_tokens.lock().await = after_est;
                 // Idle compaction rewrote history; the old real baseline is stale.
                 st.invalidate_real_token_baseline().await;
-                *st.needs_sanitize.lock().await = true;
                 emit(
                     &Event::new("compacted")
                         .with("before_tokens", json!(est))
@@ -2896,7 +2904,6 @@ async fn run_turn(
             *st.estimated_tokens.lock().await = after_est;
             // Compaction rewrote history; the old real baseline is stale.
             st.invalidate_real_token_baseline().await;
-            *st.needs_sanitize.lock().await = true;
             emit(
                 &Event::new("compacted")
                     .with("before_tokens", json!(est))
@@ -2905,20 +2912,31 @@ async fn run_turn(
             );
         }
 
-        // Sanitize orphaned tool calls right before the request (mirrors Umans extension).
-        // Only needed after compaction; skip the O(n) scan on clean turns.
-        if *st.needs_sanitize.lock().await {
-            provider::sanitize_orphaned_tool_calls(&mut messages);
-            let fixed_args = provider::sanitize_tool_call_arguments(&mut messages);
-            *st.needs_sanitize.lock().await = false;
-            // Persist the sanitized history so a resumed session doesn't replay
-            // orphaned tool_calls (which the API would reject) or malformed args.
-            // Both sanitizers mutate `messages`; write the whole sanitized vec
-            // back to the conversation + session file so the on-disk history stays
-            // valid for the API and for any other client that loads it.
+        // Sanitize orphaned tool calls + malformed tool-call arguments right
+        // before the request. Orphans can arise not only from context compaction
+        // but from ANY turn that ended with an assistant `tool_calls` message
+        // whose matching results weren't all appended — notably an aborted
+        // approval, which `return`s after the assistant message (carrying ALL
+        // its tool_calls) was already persisted but before results for the
+        // aborted + remaining calls were appended. The next request would then
+        // ship an orphaned `tool_calls` and the API rejects it with HTTP 400
+        // "No tool output found for function call …", which bricks the session
+        // (it repeats every turn). The scan is O(n) with tiny constants and a
+        // strict no-op on clean turns; we persist back only when it actually
+        // changed something, so clean turns pay just the scan (no clone, no
+        // session rewrite). The subagent path already does this unconditionally
+        // (subagent.rs) — this makes the main loop consistent with it.
+        let orphan_fixes = provider::sanitize_orphaned_tool_calls(&mut messages);
+        let fixed_args = provider::sanitize_tool_call_arguments(&mut messages);
+        if orphan_fixes > 0 || fixed_args > 0 {
             *st.conversation.lock().await = messages.clone();
             if let Some(p) = cfg.session_file.as_ref() {
                 session::rewrite(p, &messages);
+            }
+            if orphan_fixes > 0 {
+                emit(&Event::new("info").with("message", json!(format!(
+                    "inserted {orphan_fixes} synthetic tool result(s) for tool call(s) whose result was missing (e.g. after an aborted turn) — the conversation is valid again for the API"
+                ))));
             }
             if fixed_args > 0 {
                 emit(&Event::new("info").with("message", json!(format!(
@@ -2944,6 +2962,7 @@ async fn run_turn(
         if let Some(msg) = &ws_msg {
             messages.push(msg.clone());
         }
+        // messages is already Vec<Message> — pass directly.
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
             match provider::stream_turn(
                 client,
@@ -2984,6 +3003,12 @@ async fn run_turn(
             messages.pop();
         }
 
+        // Convert the assistant from OpenAI-shaped Value to Message.
+        let assistant_msg = Message::try_from(&assistant).unwrap_or_else(|e| {
+            emit(&Event::new("error").with("message", json!(format!("assistant parse: {e}"))));
+            Message::assistant("")
+        });
+
         // Anchor all future estimates on the endpoint's REAL `prompt_tokens` —
         // the exact count of `messages` as the model tokenized it (system +
         // history + tool-call framing). `messages` is exactly what we sent, so its
@@ -3009,7 +3034,7 @@ async fn run_turn(
             // usage-less endpoints.
             (
                 estimate_messages_tokens(&messages),
-                estimate_message_tokens(&assistant),
+                estimate_message_tokens(&assistant_msg),
             )
         };
         *st.tokens_in.lock().await += acc_in;
@@ -3020,36 +3045,20 @@ async fn run_turn(
         // Append + persist the finalized assistant message.
         {
             let mut conv = st.conversation.lock().await;
-            conv.push(assistant.clone());
+            conv.push(assistant_msg.clone());
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                 session::append(p, conv.last().unwrap());
             }
         }
-        *st.estimated_tokens.lock().await += estimate_message_tokens(&assistant);
+        *st.estimated_tokens.lock().await += estimate_message_tokens(&assistant_msg);
 
-        let tool_calls = assistant
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .cloned();
+        let tool_calls = assistant_msg.tool_calls().map(|tc| tc.to_vec());
         match tool_calls {
             Some(calls) if !calls.is_empty() => {
                 for tc in &calls {
-                    let id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let func = tc.get("function");
-                    let name = func
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args_str = func
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("{}")
-                        .to_string();
+                    let id = tc.id.clone();
+                    let name = tc.function.name.clone();
+                    let args_str = tc.function.arguments.clone();
                     emit(
                         &Event::new("tool_call")
                             .with("id", json!(id))
@@ -3076,7 +3085,6 @@ async fn run_turn(
                             // assistant message doesn't make the next API request fail
                             // with "function.arguments must be valid JSON" — which would
                             // repeat on every turn and brick the session.
-                            *st.needs_sanitize.lock().await = true;
                             let msg = format!(
                                 "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
                                 name
@@ -3087,8 +3095,7 @@ async fn run_turn(
                                     .with("ok", json!(false))
                                     .with("output", json!(msg)),
                             );
-                            let tool_result =
-                                json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            let tool_result = Message::tool(id.clone(), msg);
                             let est = estimate_message_tokens(&tool_result);
                             let mut conv = st.conversation.lock().await;
                             conv.push(tool_result);
@@ -3137,8 +3144,7 @@ async fn run_turn(
                                 .with("ok", json!(false))
                                 .with("output", json!(msg)),
                         );
-                        let tool_result =
-                            json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        let tool_result = Message::tool(id.clone(), msg);
                         let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
@@ -3169,8 +3175,7 @@ async fn run_turn(
                                         .with("ok", json!(false))
                                         .with("output", json!(msg)),
                                 );
-                                let tool_result =
-                                    json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                                let tool_result = Message::tool(id.clone(), msg);
                                 let est = estimate_message_tokens(&tool_result);
                                 let mut conv = st.conversation.lock().await;
                                 conv.push(tool_result);
@@ -3202,8 +3207,7 @@ async fn run_turn(
                                 .with("ok", json!(false))
                                 .with("output", json!(msg)),
                         );
-                        let tool_result =
-                            json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                        let tool_result = Message::tool(id.clone(), msg);
                         let est = estimate_message_tokens(&tool_result);
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
@@ -3270,8 +3274,7 @@ async fn run_turn(
                                     .with("ok", json!(false))
                                     .with("output", json!(msg)),
                             );
-                            let tool_result =
-                                json!({ "role": "tool", "tool_call_id": id, "content": msg });
+                            let tool_result = Message::tool(id.clone(), msg);
                             let est = estimate_message_tokens(&tool_result);
                             let mut conv = st.conversation.lock().await;
                             conv.push(tool_result);
@@ -3600,8 +3603,7 @@ async fn run_turn(
                         ev = ev.with("diff", json!(d));
                     }
                     emit(&ev);
-                    let tool_result =
-                        json!({ "role": "tool", "tool_call_id": id, "content": outcome.output });
+                    let tool_result = Message::tool(id.clone(), &outcome.output);
                     let est = estimate_message_tokens(&tool_result);
                     let mut conv = st.conversation.lock().await;
                     conv.push(tool_result);
@@ -3637,7 +3639,7 @@ async fn run_turn(
                 }
                 if do_reflect {
                     // Push the reflect prompt as a user message and re-stream.
-                    let msg = json!({ "role": "user", "content": reflect_prompt });
+                    let msg = Message::user(reflect_prompt);
                     let est = estimate_message_tokens(&msg);
                     let mut conv = st.conversation.lock().await;
                     conv.push(msg);
@@ -3812,7 +3814,7 @@ const DIGEST_MIN_BYTES: usize = 256;
 /// tool_call_id and role are preserved so orphaned-call sanitization and the
 /// model's tool-call/result pairing stay intact. Returns the count digested.
 #[allow(clippy::ptr_arg)]
-pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usize {
+pub fn digest_stale_tool_results(messages: &mut Vec<Message>, keep: usize) -> usize {
     if messages.len() <= keep {
         return 0;
     }
@@ -3821,57 +3823,43 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usiz
     let mut call_map: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for m in messages.iter() {
-        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        if !m.is_assistant() {
             continue;
         }
-        if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(calls) = m.tool_calls() {
             for tc in calls {
-                let id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if id.is_empty() {
+                if tc.id.is_empty() {
                     continue;
                 }
-                let func = tc.get("function");
-                let name = func
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = func
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}")
-                    .to_string();
-                call_map.insert(id, (name, args));
+                call_map.insert(
+                    tc.id.clone(),
+                    (tc.function.name.clone(), tc.function.arguments.clone()),
+                );
             }
         }
     }
     let digest_to = messages.len().saturating_sub(keep);
     let mut changed = 0usize;
     for m in messages[..digest_to].iter_mut() {
-        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+        if !m.is_tool() {
             continue;
         }
-        let content = match m.get("content").and_then(|v| v.as_str()) {
+        let content = match m.content_text() {
             Some(c) => c,
             None => continue,
         };
         if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
             continue;
         }
-        let id = m
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let id = m.tool_call_id().unwrap_or("").to_string();
         let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
         let lines = content.lines().count();
         let digest = make_digest(&name, &args_json, content.len(), lines);
-        if let Some(obj) = m.as_object_mut() {
-            obj.insert("content".into(), Value::String(digest));
+        if let Message::Tool {
+            ref mut content, ..
+        } = m
+        {
+            *content = digest;
             changed += 1;
         }
     }
@@ -3892,7 +3880,7 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Value>, keep: usize) -> usiz
 /// collapsing those results to a one-liner (with a re-run hint) drops 100k+
 /// tokens at a time. `tool_call_id` + `role` are preserved, so tool-call/result
 /// pairing and orphan-sanitization stay intact. Returns the count digested.
-fn digest_to_budget(messages: &mut [Value], budget: u64) -> usize {
+fn digest_to_budget(messages: &mut [Message], budget: u64) -> usize {
     if estimate_messages_tokens(messages) <= budget {
         return 0;
     }
@@ -3901,31 +3889,18 @@ fn digest_to_budget(messages: &mut [Value], budget: u64) -> usize {
     let mut call_map: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for m in messages.iter() {
-        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        if !m.is_assistant() {
             continue;
         }
-        if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(calls) = m.tool_calls() {
             for tc in calls {
-                let id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if id.is_empty() {
+                if tc.id.is_empty() {
                     continue;
                 }
-                let func = tc.get("function");
-                let name = func
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = func
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}")
-                    .to_string();
-                call_map.insert(id, (name, args));
+                call_map.insert(
+                    tc.id.clone(),
+                    (tc.function.name.clone(), tc.function.arguments.clone()),
+                );
             }
         }
     }
@@ -3937,26 +3912,25 @@ fn digest_to_budget(messages: &mut [Value], budget: u64) -> usize {
         if estimate_messages_tokens(messages) <= budget {
             break;
         }
-        if messages[i].get("role").and_then(|v| v.as_str()) != Some("tool") {
+        if !messages[i].is_tool() {
             continue;
         }
-        let content = match messages[i].get("content").and_then(|v| v.as_str()) {
+        let content = match messages[i].content_text() {
             Some(c) => c,
             None => continue,
         };
         if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
             continue;
         }
-        let id = messages[i]
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let id = messages[i].tool_call_id().unwrap_or("").to_string();
         let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
         let lines = content.lines().count();
         let digest = make_digest(&name, &args_json, content.len(), lines);
-        if let Some(obj) = messages[i].as_object_mut() {
-            obj.insert("content".into(), Value::String(digest));
+        if let Message::Tool {
+            ref mut content, ..
+        } = messages[i]
+        {
+            *content = digest;
             changed += 1;
         }
     }
@@ -4033,16 +4007,15 @@ async fn refresh_memory_injection(state: &State) -> String {
     let new_system = build_system_prompt(&ws, true);
     let mut conv = state.conversation.lock().await;
     if let Some(first) = conv.first() {
-        let old_content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let old_content = first.content_text().unwrap_or("");
         if old_content == new_system {
             return "memory unchanged; system prompt kept intact (preserving prefix cache)"
                 .to_string();
         }
     }
     if let Some(first) = conv.first_mut() {
-        if first.get("role").and_then(|v| v.as_str()) == Some("system") {
-            *first = json!({ "role": "system", "content": new_system });
-            *state.needs_sanitize.lock().await = true;
+        if first.is_system() {
+            *first = Message::system(new_system);
             *state.estimated_tokens.lock().await = estimate_messages_tokens(&conv);
             // System prompt changed; the real baseline's system portion is stale.
             state.invalidate_real_token_baseline().await;
@@ -4066,7 +4039,7 @@ async fn refresh_memory_injection(state: &State) -> String {
 /// messages. A fixed count over-keeps a quiet stretch and under-keeps when a
 /// huge tool result eats the whole window; a budget keeps the live context
 /// that actually fits and lets the summary reclaim the rest.
-fn token_budget_tail_start(messages: &[Value], context_window: u64) -> usize {
+fn token_budget_tail_start(messages: &[Message], context_window: u64) -> usize {
     const MIN_TAIL: usize = 6;
     const TAIL_FRACTION: f32 = 0.25;
     let n = messages.len();
@@ -4116,15 +4089,15 @@ fn trim_heap() {
 #[cfg(not(all(unix, target_env = "gnu")))]
 fn trim_heap() {}
 
-pub fn compact_conversation(messages: &mut Vec<Value>, context_window: u64) {
+pub fn compact_conversation(messages: &mut Vec<Message>, context_window: u64) {
     if messages.len() <= 2 {
         return;
     }
     let system = messages[0].clone();
     let tail_start = token_budget_tail_start(messages, context_window).max(1);
-    let tail: Vec<Value> = messages[tail_start..].to_vec();
+    let tail: Vec<Message> = messages[tail_start..].to_vec();
     let mut compacted = vec![system];
-    compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped.]" }));
+    compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped.]"));
     compacted.extend(tail);
     // The kept tail can still hold the bulk of the tokens when a few tool
     // results are huge (large file reads, verbose command output). Dropping old
@@ -4147,7 +4120,7 @@ pub async fn compact_with_summary(
     cfg: &Config,
     provider: &ResolvedProvider,
     model: &str,
-    messages: &mut Vec<Value>,
+    messages: &mut Vec<Message>,
     cancel: &CancellationToken,
     force_summarize: bool,
     context_window: u64,
@@ -4168,17 +4141,17 @@ pub async fn compact_with_summary(
         compact_conversation(messages, context_window);
         return 0;
     }
-    let to_summarize: Vec<Value> = messages[1..tail_start].to_vec();
-    let kept: Vec<Value> = messages[tail_start..].to_vec();
+    let to_summarize: Vec<Message> = messages[1..tail_start].to_vec();
+    let kept: Vec<Message> = messages[tail_start..].to_vec();
     let summary = provider::summarize(client, provider, model, &to_summarize, cancel).await;
     let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
         let content = format!("[Summary of earlier turns]\n{s}");
         summary_chars = content.chars().count();
-        compacted.push(json!({ "role": "system", "content": content }));
+        compacted.push(Message::system(content));
     } else {
-        compacted.push(json!({ "role": "system", "content": "[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]" }));
+        compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]"));
     }
     // Session memory extraction: persist durable facts so future sessions inherit
     // project knowledge. Best-effort; never blocks compaction. Facts ACCUMULATE
@@ -4383,17 +4356,21 @@ mod skill_manifest_tests {
 mod digest_tests {
     use super::*;
 
-    fn asst_tool_call(id: &str, name: &str, args: &str) -> Value {
-        json!({ "role": "assistant", "tool_calls": [ {
-            "id": id, "type": "function",
-            "function": { "name": name, "arguments": args }
-        } ] })
+    fn asst_tool_call(id: &str, name: &str, args: &str) -> Message {
+        Message::assistant_tool_calls(vec![ToolCall {
+            id: id.into(),
+            typ: "function".into(),
+            function: message::FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }])
     }
-    fn tool_result(id: &str, content: &str) -> Value {
-        json!({ "role": "tool", "tool_call_id": id, "content": content })
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message::tool(id, content)
     }
-    fn asst_text(t: &str) -> Value {
-        json!({ "role": "assistant", "content": t })
+    fn asst_text(t: &str) -> Message {
+        Message::assistant(t)
     }
 
     fn big_content(n: usize) -> String {
@@ -4401,8 +4378,8 @@ mod digest_tests {
     }
 
     /// system + a stale large read result + padding + a recent large read result.
-    fn fixture() -> Vec<Value> {
-        let mut m = vec![json!({ "role": "system", "content": "sys" })];
+    fn fixture() -> Vec<Message> {
+        let mut m = vec![Message::system("sys")];
         m.push(asst_tool_call(
             "call_1",
             "read_file",
@@ -4430,28 +4407,19 @@ mod digest_tests {
         let n = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n, 1, "only the stale large result should be digested");
         // stale result (index 2) is now a digest
-        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        let d = m[2].content_text().unwrap();
         assert!(d.starts_with("[digested:"), "{}", d);
         assert!(d.contains("read_file"), "{}", d);
         assert!(d.contains("src/big.rs"), "{}", d);
         assert!(d.contains("lines"), "should report line count: {}", d);
         assert!(d.contains("re-run to recover full output"), "{}", d);
         // tool_call_id preserved so the assistant/tool pairing stays valid
-        assert_eq!(
-            m[2].get("tool_call_id").and_then(|v| v.as_str()),
-            Some("call_1")
-        );
+        assert_eq!(m[2].tool_call_id(), Some("call_1"));
         // recent large result (inside the keep tail) is untouched
-        let r = m[m.len() - 2]
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap();
+        let r = m[m.len() - 2].content_text().unwrap();
         assert_eq!(r.len(), 280, "recent result kept full: {}", r);
         assert!(!r.starts_with("[digested:"));
-        assert_eq!(
-            m[m.len() - 2].get("tool_call_id").and_then(|v| v.as_str()),
-            Some("call_2")
-        );
+        assert_eq!(m[m.len() - 2].tool_call_id(), Some("call_2"));
     }
 
     #[test]
@@ -4459,23 +4427,16 @@ mod digest_tests {
         let mut m = fixture();
         let n1 = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n1, 1);
-        let after = m[2]
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .to_string();
+        let after = m[2].content_text().unwrap().to_string();
         let n2 = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n2, 0, "second pass must find nothing to digest");
-        assert_eq!(
-            m[2].get("content").and_then(|v| v.as_str()),
-            Some(after.as_str())
-        );
+        assert_eq!(m[2].content_text(), Some(after.as_str()));
     }
 
     #[test]
     fn digest_skips_small_results() {
         let mut m = vec![
-            json!({ "role": "system", "content": "sys" }),
+            Message::system("sys"),
             asst_tool_call("c1", "edit", "{\"path\":\"a.rs\"}"),
             tool_result("c1", "applied 1 edit(s)"), // 17 bytes — under MIN_BYTES
         ];
@@ -4485,31 +4446,25 @@ mod digest_tests {
         }
         let n = digest_stale_tool_results(&mut m, 10);
         assert_eq!(n, 0, "small result must not be digested");
-        assert_eq!(
-            m[2].get("content").and_then(|v| v.as_str()),
-            Some("applied 1 edit(s)")
-        );
+        assert_eq!(m[2].content_text(), Some("applied 1 edit(s)"));
     }
 
     #[test]
     fn digest_noop_when_under_keep() {
         let mut m = vec![
-            json!({ "role": "system", "content": "sys" }),
+            Message::system("sys"),
             asst_tool_call("c1", "read_file", "{\"path\":\"a.rs\"}"),
             tool_result("c1", &big_content(200)),
         ];
         // only 3 messages, keep=10 → nothing eligible
         assert_eq!(digest_stale_tool_results(&mut m, 10), 0);
-        assert_eq!(
-            m[2].get("content").and_then(|v| v.as_str()).unwrap().len(),
-            400
-        );
+        assert_eq!(m[2].content_text().unwrap().len(), 400);
     }
 
     #[test]
     fn digest_bash_label_says_rerun_if_needed() {
         let mut m = vec![
-            json!({ "role": "system", "content": "sys" }),
+            Message::system("sys"),
             asst_tool_call("c1", "bash", "{\"command\":\"cargo build\"}"),
             tool_result("c1", &big_content(150)),
         ];
@@ -4517,7 +4472,7 @@ mod digest_tests {
             m.push(asst_text(&format!("p{i}")));
         }
         digest_stale_tool_results(&mut m, 10);
-        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        let d = m[2].content_text().unwrap();
         assert!(d.contains("bash"), "{}", d);
         assert!(d.contains("cargo build"), "{}", d);
         assert!(
@@ -4532,11 +4487,11 @@ mod digest_tests {
 mod compact_tests {
     use super::*;
 
-    fn sys() -> Value {
-        json!({ "role": "system", "content": "sys" })
+    fn sys() -> Message {
+        Message::system("sys")
     }
-    fn user(t: &str) -> Value {
-        json!({ "role": "user", "content": t })
+    fn user(t: &str) -> Message {
+        Message::user(t)
     }
 
     #[test]
@@ -4567,7 +4522,7 @@ mod compact_tests {
         for i in 0..40 {
             m.push(user(&format!("turn {i}")));
         }
-        m.push(json!({ "role": "tool", "content": "x".repeat(50_000) }));
+        m.push(Message::tool("x", "x".repeat(50_000)));
         let s = token_budget_tail_start(&m, 1000); // floor budget 6k
         assert!(
             s >= m.len() - 7 && s <= m.len() - 6,
@@ -4575,14 +4530,18 @@ mod compact_tests {
         );
     }
 
-    fn asst_tool_call(id: &str, name: &str, args: &str) -> Value {
-        json!({ "role": "assistant", "tool_calls": [ {
-            "id": id, "type": "function",
-            "function": { "name": name, "arguments": args }
-        } ] })
+    fn asst_tool_call(id: &str, name: &str, args: &str) -> Message {
+        Message::assistant_tool_calls(vec![ToolCall {
+            id: id.into(),
+            typ: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }])
     }
-    fn tool_result(id: &str, content: &str) -> Value {
-        json!({ "role": "tool", "tool_call_id": id, "content": content })
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message::tool(id, content)
     }
 
     #[test]
@@ -4604,19 +4563,12 @@ mod compact_tests {
         // last and stays verbatim once the older one already fit the budget.
         let n = digest_to_budget(&mut m, 100_000);
         assert_eq!(n, 1, "only the older result needs digesting: {n}");
-        let d = m[2].get("content").and_then(|v| v.as_str()).unwrap();
+        let d = m[2].content_text().unwrap();
         assert!(d.starts_with("[digested:"), "{d}");
         assert!(d.contains("old.rs"), "{d}");
-        assert_eq!(
-            m[2].get("tool_call_id").and_then(|v| v.as_str()),
-            Some("c1")
-        );
+        assert_eq!(m[2].tool_call_id(), Some("c1"));
         assert!(
-            !m[4]
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap()
-                .starts_with("[digested:"),
+            !m[4].content_text().unwrap().starts_with("[digested:"),
             "recent result kept verbatim"
         );
         let after = estimate_messages_tokens(&m);
@@ -4635,11 +4587,7 @@ mod compact_tests {
         ];
         // ~62k tokens, budget 100k → already fits, nothing digested.
         assert_eq!(digest_to_budget(&mut m, 100_000), 0);
-        assert!(!m[2]
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .starts_with("[digested:"));
+        assert!(!m[2].content_text().unwrap().starts_with("[digested:"));
     }
 
     #[test]
@@ -4668,12 +4616,7 @@ mod compact_tests {
             "should be well under half the window: {after}"
         );
         // Both tool messages survive (pairing intact); the older one is digested.
-        assert_eq!(
-            m.iter()
-                .filter(|x| x.get("role").and_then(|v| v.as_str()) == Some("tool"))
-                .count(),
-            2
-        );
+        assert_eq!(m.iter().filter(|x| x.is_tool()).count(), 2);
     }
 }
 

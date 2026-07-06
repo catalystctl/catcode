@@ -44,17 +44,17 @@ type intercomPrompt struct {
 // (and embedded in `ready`). The /login + /logout pickers use HasKey/Configured/
 // LoggedIn to show the right action and prompt for a key when none is set.
 type providerPreset struct {
-	ID          string   `json:"id"`
-	Label       string   `json:"label"`
-	Kind        string   `json:"kind"`
-	BaseURL     string   `json:"base_url"`
-	EnvVar      string   `json:"envVar"`
-	AltEnvs     []string `json:"altEnvs"`
-	Description string   `json:"description"`
-	HasKey      bool     `json:"hasKey"`
-	Configured  bool     `json:"configured"`
-	LoggedIn    bool     `json:"loggedIn"`
-	SupportsOauth bool   `json:"supportsOauth"`
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	Kind          string   `json:"kind"`
+	BaseURL       string   `json:"base_url"`
+	EnvVar        string   `json:"envVar"`
+	AltEnvs       []string `json:"altEnvs"`
+	Description   string   `json:"description"`
+	HasKey        bool     `json:"hasKey"`
+	Configured    bool     `json:"configured"`
+	LoggedIn      bool     `json:"loggedIn"`
+	SupportsOauth bool     `json:"supportsOauth"`
 }
 
 type approvalPrompt struct {
@@ -160,6 +160,9 @@ func metricStr(raw json.RawMessage) string {
 		return ""
 	}
 	tps := get(m, "tps")
+	if tps == "" || tps == "null" {
+		tps = get(m, "tps_est")
+	}
 	ttft := get(m, "ttft_ms")
 	out := get(m, "tokens_out")
 	parts := []string{}

@@ -207,7 +207,9 @@ func (s *session) renderFooter() string {
 
 // renderMetrics builds the throughput string for the footer's second line:
 // TPS (rounded to the nearest integer) and TTFT, plus the prefix-cache hit rate
-// (e.g. "42 tok/s · 180ms ttft · 87% cached").
+// (e.g. "42 tok/s · 180ms ttft · 87% cached"). During an in-flight stream the
+// core may emit tps_est, an approximate live throughput based on streamed text;
+// final metrics use tps, the provider-reported real token count.
 //
 // The cache rate has a wrinkle: the live mid-stream metrics event omits
 // cached_tokens — it only lands in the turn-end metrics. So while a turn is in
@@ -223,13 +225,24 @@ func (s *session) renderMetrics() string {
 	var out string
 	if haveLive {
 		tps := get(m, "tps")
+		approx := false
+		if tps == "" || tps == "null" {
+			tps = get(m, "tps_est")
+			approx = tps != "" && tps != "null"
+		}
 		if tps != "" && tps != "null" {
 			// Round to the nearest integer so the footer reads "71 tok/s"
-			// rather than "71.123132991239 tok/s".
+			// rather than "71.123132991239 tok/s". Prefix live estimates with
+			// "~" so they are useful in-flight without being confused for the
+			// final provider-usage-derived TPS.
+			prefix := ""
+			if approx {
+				prefix = "~"
+			}
 			if f, err := strconv.ParseFloat(tps, 64); err == nil {
-				out = fmt.Sprintf("%d tok/s", int(math.Round(f)))
+				out = fmt.Sprintf("%s%d tok/s", prefix, int(math.Round(f)))
 			} else {
-				out = fmt.Sprintf("%s tok/s", tps)
+				out = fmt.Sprintf("%s%s tok/s", prefix, tps)
 			}
 		}
 		// Time-to-first-token for this turn (latency, not throughput).

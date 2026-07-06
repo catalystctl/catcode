@@ -3,6 +3,7 @@
 // files instead of silently misreading them. On init, if the session file
 // exists it's loaded and replayed; each finalized message is appended (and
 // fsync'd) so a crash mid-task loses at most the in-flight turn.
+use crate::message::Message;
 use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -44,7 +45,7 @@ pub fn ensure(path: &Path) {
 
 /// Append one message to the session file (creating it with a header if needed).
 /// fsync'd so a crash never truncates a finalized message mid-write.
-pub fn append(path: &Path, msg: &Value) {
+pub fn append(path: &Path, msg: &Message) {
     ensure_header(path);
     let Ok(mut f) = OpenOptions::new().append(true).open(path) else {
         return;
@@ -62,7 +63,7 @@ pub fn append(path: &Path, msg: &Value) {
 /// header version is NEWER than `SESSION_VERSION` — refusing to silently
 /// misread/drop a session on upgrade (the caller surfaces the error to the
 /// user instead of quietly starting blank).
-pub fn load(path: &Path) -> Result<Vec<Value>, String> {
+pub fn load(path: &Path) -> Result<Vec<Message>, String> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Ok(Vec::new()); // missing file: nothing to resume (not an error)
     };
@@ -82,11 +83,11 @@ pub fn load(path: &Path) -> Result<Vec<Value>, String> {
         } else {
             // no header on an old file — treat the first line as a real message
             let mut out = Vec::new();
-            if let Ok(m) = serde_json::from_str::<Value>(first) {
+            if let Ok(m) = serde_json::from_str::<Message>(first) {
                 out.push(m);
             }
             for l in lines {
-                if let Ok(m) = serde_json::from_str::<Value>(l) {
+                if let Ok(m) = serde_json::from_str::<Message>(l) {
                     out.push(m);
                 }
             }
@@ -94,7 +95,7 @@ pub fn load(path: &Path) -> Result<Vec<Value>, String> {
         }
     }
     Ok(lines
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|l| serde_json::from_str::<Message>(l).ok())
         .collect())
 }
 
@@ -198,7 +199,7 @@ pub fn save_stats(session_path: &Path, stats: &SessionStats) {
 /// rewrite never truncates the existing conversation — the old file stays intact
 /// until the rename lands (P1-3: the old truncate-then-write lost everything on a
 /// crash between truncate and final sync).
-pub fn rewrite(path: &Path, messages: &[Value]) {
+pub fn rewrite(path: &Path, messages: &[Message]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -275,7 +276,7 @@ pub fn describe(path: &Path) -> SessionInfo {
             break;
         }
         if title.is_none() {
-            if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+            if let Ok(msg) = serde_json::from_str::<Message>(&line) {
                 if let Some(t) = first_user_text(&msg) {
                     let t: String = t.trim().chars().take(80).collect();
                     title = Some(t);
@@ -289,44 +290,38 @@ pub fn describe(path: &Path) -> SessionInfo {
 /// Extract the text of a user message: plain string content, or the joined
 /// text parts of a multimodal content array. Returns None for non-user or
 /// empty messages (so tool/assistant/system messages never become a title).
-fn first_user_text(msg: &Value) -> Option<String> {
-    if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+fn first_user_text(msg: &Message) -> Option<String> {
+    if !msg.is_user() {
         return None;
     }
-    match msg.get("content") {
-        Some(Value::String(s)) => {
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s.clone())
-            }
+    if let Some(s) = msg.content_text() {
+        if s.trim().is_empty() {
+            return None;
         }
-        Some(Value::Array(parts)) => {
-            let mut out = String::new();
-            for p in parts {
-                if p.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                        if !out.is_empty() {
-                            out.push(' ');
-                        }
-                        out.push_str(t);
-                    }
-                }
-            }
-            if out.trim().is_empty() {
-                None
-            } else {
-                Some(out)
-            }
-        }
-        _ => None,
+        return Some(s.to_string());
     }
+    if let Some(parts) = msg.content_parts() {
+        let mut out = String::new();
+        for p in parts {
+            if let crate::message::ContentPart::Text { text } = p {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(text);
+            }
+        }
+        if out.trim().is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::message::{ContentPart, ImageUrl};
 
     #[test]
     fn append_then_load_roundtrip() {
@@ -334,13 +329,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
-        append(&p, &json!({"role":"system","content":"x"}));
-        append(&p, &json!({"role":"user","content":"hi"}));
+        append(&p, &Message::system("x"));
+        append(&p, &Message::user("hi"));
         let v = load(&p).unwrap();
         assert_eq!(v.len(), 2);
-        assert_eq!(v[0]["role"], "system");
+        assert_eq!(v[0].role(), "system");
         // rewrite
-        rewrite(&p, &[json!({"role":"system","content":"y"})]);
+        rewrite(&p, &[Message::system("y")]);
         assert_eq!(load(&p).unwrap().len(), 1);
     }
 
@@ -350,7 +345,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
-        append(&p, &json!({"role":"user","content":"hi"}));
+        append(&p, &Message::user("hi"));
         // header line present and well-formed
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.starts_with("{\"_session_version\": 1}"));
@@ -381,13 +376,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
-        append(&p, &json!({"role":"system","content":"sys"}));
-        append(
-            &p,
-            &json!({"role":"user","content":"Add a login form to the app"}),
-        );
-        append(&p, &json!({"role":"assistant","content":"done"}));
-        append(&p, &json!({"role":"user","content":"now add tests"}));
+        append(&p, &Message::system("sys"));
+        append(&p, &Message::user("Add a login form to the app"));
+        append(&p, &Message::assistant("done"));
+        append(&p, &Message::user("now add tests"));
         let info = describe(&p);
         assert_eq!(info.messages, 4);
         // Title is the FIRST user message (the stable topic), not the latest.
@@ -407,10 +399,17 @@ mod tests {
         // a multimodal user message: title is the joined text parts
         append(
             &p,
-            &json!({"role":"user","content":[
-                {"type":"text","text":"describe this"},
-                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
-            ]}),
+            &Message::user_multimodal(vec![
+                ContentPart::Text {
+                    text: "describe this".into(),
+                },
+                ContentPart::Image {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAA".into(),
+                        detail: None,
+                    },
+                },
+            ]),
         );
         let info = describe(&p);
         assert_eq!(info.messages, 1);
@@ -424,7 +423,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
         let long = "x".repeat(200);
-        append(&p, &json!({"role":"user","content":long}));
+        append(&p, &Message::user(long));
         let info = describe(&p);
         assert_eq!(info.title.as_deref().map(|s| s.len()), Some(80));
     }

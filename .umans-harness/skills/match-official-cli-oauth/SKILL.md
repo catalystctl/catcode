@@ -122,6 +122,32 @@ client). A future Codex/Responses-API task is the same shape.
   binary fails to compile (`use serde_json::{json, Value};`; add `jsonwebtoken`
   to `Cargo.toml`). These look like pre-existing breakage but are just missing
   imports from the new code.
+- **Distinguish internal JS function options from URL query params when
+  extracting from a binary.** A compiled/minified CLI binary contains string
+  constants for BOTH the `startOAuthFlow(options)` argument names AND the URL
+  query parameter names — they appear in DIFFERENT clusters at different
+  offsets. `isManual`, `port`, `codeChallenge`, `loginWithClaudeAi`,
+  `inferenceOnly`, `loginHint`, `loginMethod`, `oauthClient`, `scopes` are
+  JavaScript OPTION names — they control which `redirect_uri` is used or
+  whether to open a browser, but they are NEVER sent as URL query params.
+  The actual URL params (e.g. `client_id`, `response_type`, `redirect_uri`,
+  `scope`, `code_challenge`, `code_challenge_method`, `state`) appear in a
+  separate cluster near the URL construction code. A single `strings | grep`
+  pass can conflate the two → you add `isManual=true&port=12345&code=true` to
+  the authorize URL when the CLI never sends them. Cross-reference at multiple
+  offsets before committing.
+- **`state` goes in the AUTHORIZE URL but NOT in the token exchange body.**
+  This is standard OAuth 2.0 (RFC 6749 §4.1.3) but easy to get wrong when
+  trying to "match exactly" — you see `state` in the authorize URL and
+  assume it should also be in the token exchange. It should NOT be. Sending
+  `state` in the token exchange can cause the endpoint to reject the request
+  (consuming the single-use authorization code), making ALL subsequent
+  retries fail with `invalid_grant` / "Invalid 'code' in request" because
+  the code was already burned on the first failed attempt. The token exchange
+  body should contain ONLY: `grant_type`, `code`, `redirect_uri`, `client_id`,
+  `code_verifier` (for PKCE flows). Same for refresh: `grant_type`,
+  `refresh_token`, `client_id` — do NOT add `scope` unless the CLI's binary
+  explicitly shows it in the refresh body.
 
 ## Reference (already-ported providers)
 

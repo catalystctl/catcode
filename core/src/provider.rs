@@ -7,6 +7,7 @@
 // exponential backoff (honors Retry-After).
 use crate::config::{ProviderKind, ResolvedProvider};
 use crate::logging::{estimate_tokens, TurnTimer};
+use crate::message::{self, Message};
 use crate::protocol::{emit, Event, ModelInfo};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -81,8 +82,9 @@ pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
 /// prompt. Re-serializing a multimodal message verbatim would POST megabytes
 /// of base64 image data to the model (costly, and it can blow the summary
 /// request's own context); image parts are replaced with a short placeholder.
-fn message_for_summary(m: &Value) -> String {
-    let mut clean = m.clone();
+fn message_for_summary(m: &Message) -> String {
+    let v: Value = m.into();
+    let mut clean = v;
     if let Some(arr) = clean.get_mut("content").and_then(|v| v.as_array_mut()) {
         for part in arr.iter_mut() {
             if part.get("type").and_then(|v| v.as_str()) == Some("image_url") {
@@ -102,7 +104,7 @@ pub async fn summarize(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     cancel: &CancellationToken,
 ) -> Option<String> {
     const SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
@@ -122,7 +124,7 @@ pub async fn extract_facts(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     cancel: &CancellationToken,
 ) -> Option<String> {
     const SYS: &str = "Extract durable facts about this project worth remembering across future sessions: conventions, structure, key decisions, gotchas, and how things work. Be concise and specific (paths, names). If there is nothing durable, reply with the single word: none\n\nOutput a short bulleted list, one fact per line, no preamble.";
@@ -209,11 +211,10 @@ async fn anthropic_complete(
     max_tokens: u32,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    let messages = vec![
-        json!({ "role": "system", "content": system }),
-        json!({ "role": "user", "content": user }),
-    ];
-    let body = build_anthropic_request(&messages, &[], model, "none", &[], max_tokens.max(256));
+    let messages: Vec<Message> = vec![Message::system(system), Message::user(user)];
+    let mut body =
+        message::build_anthropic_request(&messages, &[], "none", &[], max_tokens.max(256));
+    body["model"] = json!(model);
     let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
     let mut req = client
         .post(&url)
@@ -825,6 +826,21 @@ pub fn is_gemini_endpoint(base_url: &str) -> bool {
     host == "generativelanguage.googleapis.com"
 }
 
+/// True when the base URL points at the Code Assist API (cloudcode-pa.googleapis.com).
+/// This is where OAuth-authenticated Gemini requests are routed — the
+/// generativelanguage.googleapis.com endpoint only accepts API keys.
+pub fn is_code_assist_endpoint(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "cloudcode-pa.googleapis.com"
+}
+
 /// True when the base URL points at ChatGPT's Codex subscription backend.
 pub fn is_codex_endpoint(base_url: &str) -> bool {
     let host_path = base_url
@@ -1146,7 +1162,9 @@ fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
     if is_codex_endpoint(base_url) {
         return codex_fallback_models();
     }
-    if is_gemini_endpoint(base_url) {
+    // Code Assist endpoint (OAuth Gemini) and the standard Gemini endpoint both
+    // serve the same models — use the Gemini fallback list for both.
+    if is_gemini_endpoint(base_url) || is_code_assist_endpoint(base_url) {
         return gemini_fallback_models();
     }
     fallback_models()
@@ -1185,29 +1203,30 @@ fn gemini_fallback_models() -> Vec<ModelInfo> {
 /// Also verifies that the sanitizer doesn't leave behind a broken conversation
 /// (validate that every assistant with tool_calls has corresponding tool results).
 #[allow(clippy::ptr_arg)]
-pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
+pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Message>) -> usize {
+    // Number of fixes applied (orphaned results dropped + synthetic results
+    // inserted). Callers persist only when this is non-zero, so clean turns pay
+    // just the scan with no session rewrite.
     // All tool_call ids emitted by any assistant message in the kept history.
     let call_ids: std::collections::HashSet<String> = messages
         .iter()
         .filter_map(|m| {
-            if m.get("role").and_then(|v| v.as_str()) == Some("assistant") {
-                m.get("tool_calls").and_then(|v| v.as_array())
+            if m.is_assistant() {
+                m.tool_calls()
             } else {
                 None
             }
         })
         .flatten()
-        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
+        .map(|tc| tc.id.clone())
         .collect();
 
     // All tool_call ids that currently have a matching `role:"tool"` result.
     let result_ids: std::collections::HashSet<String> = messages
         .iter()
         .filter_map(|m| {
-            if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-                m.get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
+            if m.is_tool() {
+                m.tool_call_id().map(String::from)
             } else {
                 None
             }
@@ -1220,16 +1239,17 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
     // requested it — OpenAI APIs then reject the orphaned `tool` message with a
     // 400 that bricks the turn (and persists into the next). This is the
     // symmetric fix to the orphaned-CALL handling below.
+    let before = messages.len();
     messages.retain(|m| {
-        if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-            m.get("tool_call_id")
-                .and_then(|v| v.as_str())
+        if m.is_tool() {
+            m.tool_call_id()
                 .map(|id| call_ids.contains(id))
                 .unwrap_or(false)
         } else {
             true
         }
     });
+    let dropped_results = before - messages.len();
 
     // Insert synthetic results for orphaned CALLS (assistant tool_calls with no
     // matching tool message). Computed against the original result_ids — the
@@ -1241,43 +1261,40 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
         .cloned()
         .collect();
     if orphaned.is_empty() {
-        return;
+        return dropped_results;
     }
 
     // Insert synthetic tool results right after the assistant message that made each call.
+    let mut inserted = 0;
     let mut i = 0;
     while i < messages.len() {
-        let is_assistant_with_calls = messages[i].get("role").and_then(|v| v.as_str())
-            == Some("assistant")
-            && messages[i]
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .is_some();
+        let is_assistant_with_calls =
+            messages[i].is_assistant() && messages[i].tool_calls().is_some();
         if !is_assistant_with_calls {
             i += 1;
             continue;
         }
         let calls: Vec<String> = messages[i]
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
+            .tool_calls()
             .unwrap()
             .iter()
-            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
+            .map(|tc| tc.id.clone())
             .filter(|id| orphaned.contains(id))
             .collect();
         let insert_at = i + 1;
         for (k, id) in calls.iter().enumerate() {
             messages.insert(
                 insert_at + k,
-                json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": "[tool result was lost during context compaction]",
-                }),
+                Message::tool(
+                    id,
+                    "[tool result was lost — this call did not complete (the turn may have been aborted or its result dropped during context compaction). Re-issue the tool call if still needed.]",
+                ),
             );
+            inserted += 1;
         }
         i = insert_at + calls.len();
     }
+    dropped_results + inserted
 }
 
 /// Read a token count from a usage field, tolerating the integer, float, and
@@ -1296,26 +1313,24 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Value>) {
 /// tool dispatch already returned an actionable error to the model. Returns
 /// the number of tool calls fixed.
 #[allow(clippy::ptr_arg)]
-pub fn sanitize_tool_call_arguments(messages: &mut Vec<Value>) -> usize {
+pub fn sanitize_tool_call_arguments(messages: &mut Vec<Message>) -> usize {
     let mut fixed = 0;
     for m in messages.iter_mut() {
-        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        if !m.is_assistant() {
             continue;
         }
-        let Some(calls) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
-            continue;
+        // Get mutable access to tool_calls via the Message enum
+        let calls = match m {
+            Message::Assistant {
+                tool_calls: Some(ref mut tc),
+                ..
+            } => tc,
+            _ => continue,
         };
         for tc in calls.iter_mut() {
-            let Some(fobj) = tc.get_mut("function").and_then(|f| f.as_object_mut()) else {
-                continue;
-            };
-            let malformed = match fobj.get("arguments") {
-                None => true,
-                Some(Value::String(s)) => serde_json::from_str::<Value>(s).is_err(),
-                Some(_) => true, // non-string (e.g. object) — coerce to "{}"
-            };
+            let malformed = serde_json::from_str::<Value>(&tc.function.arguments).is_err();
             if malformed {
-                fobj.insert("arguments".to_string(), Value::String("{}".to_string()));
+                tc.function.arguments = "{}".to_string();
                 fixed += 1;
             }
         }
@@ -1344,7 +1359,7 @@ pub async fn stream_turn(
     provider: &ResolvedProvider,
     idle_timeout_secs: u64,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
     thinking_levels: &[String],
@@ -1356,7 +1371,24 @@ pub async fn stream_turn(
 ) -> Result<(Value, String, u64, u64, u64), String> {
     match provider.kind {
         ProviderKind::OpenAI => {
-            if is_codex_endpoint(&provider.base_url) {
+            if is_code_assist_endpoint(&provider.base_url) {
+                stream_turn_gemini(
+                    client,
+                    provider,
+                    idle_timeout_secs,
+                    model,
+                    messages,
+                    tools,
+                    reasoning_effort,
+                    thinking_levels,
+                    max_tokens,
+                    cancel,
+                    timer,
+                    prompt_est,
+                    quiet,
+                )
+                .await
+            } else if is_codex_endpoint(&provider.base_url) {
                 stream_turn_codex(
                     client,
                     provider,
@@ -1415,7 +1447,7 @@ async fn stream_turn_codex(
     provider: &ResolvedProvider,
     idle_timeout_secs: u64,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
     cancel: &CancellationToken,
@@ -1424,7 +1456,9 @@ async fn stream_turn_codex(
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     let api_key = provider.api_key.as_deref().unwrap_or("");
-    let (instructions, input) = codex_responses_input(messages);
+    // Convert Messages → Values for the Codex path (keep existing translator).
+    let values = Message::to_openai_messages(messages);
+    let (instructions, input) = codex_responses_input(&values);
     let body = json!({
         "model": model,
         "instructions": instructions,
@@ -1497,6 +1531,7 @@ async fn stream_turn_codex(
                 "response.output_item.done" => {
                     if let Some(item) = obj.get("item") {
                         if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                            timer.mark_first_token();
                             let call_id = item
                                 .get("call_id")
                                 .and_then(|v| v.as_str())
@@ -1565,17 +1600,30 @@ async fn stream_turn_codex(
                     .unwrap_or(true)
                 {
                     last_stats = Some(now);
-                    emit(
-                        &Event::new("metrics")
-                            .with("tokens_in", json!(tokens_in.max(prompt_est)))
-                            .with("tokens_out", json!(tokens_out))
-                            .with("cached_tokens", json!(cached_tokens)),
-                    );
+                    let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+                    let live_ctx = prompt_est.saturating_add(est_out);
+                    let mut ev = Event::new("metrics")
+                        .with("tokens_in", json!(live_ctx))
+                        .with("tokens_out", json!(est_out))
+                        .with("cached_tokens", json!(cached_tokens));
+                    if let Some(ttft) = timer
+                        .first_token
+                        .map(|t| t.duration_since(timer.start).as_millis() as u64)
+                    {
+                        ev = ev.with("ttft_ms", json!(ttft));
+                    }
+                    if let Some(tps) = timer.live_tps_estimate(est_out) {
+                        ev = ev.with("tps_est", json!(tps));
+                    }
+                    emit(&ev);
                 }
             }
         }
     }
-    timer.end_call(tokens_out, estimate_tokens(&content));
+    timer.end_call(
+        tokens_out,
+        estimate_tokens(&content) + estimate_tokens(&reasoning),
+    );
     let tool_calls: Vec<Value> = calls
         .iter()
         .map(|c| {
@@ -1675,7 +1723,7 @@ async fn stream_turn_openai(
     provider: &ResolvedProvider,
     idle_timeout_secs: u64,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
     thinking_levels: &[String],
@@ -1690,9 +1738,11 @@ async fn stream_turn_openai(
     let base_url = &provider.base_url;
     let umans = is_umans(base_url);
     let api_key = provider.api_key.as_deref().unwrap_or("");
+    // Convert Messages → OpenAI-shaped JSON for the wire.
+    let openai_messages = Message::to_openai_messages(messages);
     let mut body = json!({
         "model": model,
-        "messages": messages,
+        "messages": openai_messages,
         "tools": tools,
         "tool_choice": "auto",
         "stream": true,
@@ -1870,6 +1920,9 @@ async fn stream_turn_openai(
                     .and_then(|d| d.get("tool_calls"))
                     .and_then(|v| v.as_array())
                 {
+                    if !tcs.is_empty() {
+                        timer.mark_first_token();
+                    }
                     for tc in tcs {
                         let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         while tool_calls.len() <= idx {
@@ -1929,9 +1982,9 @@ async fn stream_turn_openai(
             }
 
             // Live footer stats: emit a metrics event at most every ~400ms so the
-            // TUI's context + TPS move during the turn, not just at the end.
-            // ponytail: char/4 estimate (same heuristic as the compaction threshold);
-            // the real usage chunk at stream end overwrites these with exact values.
+            // TUI's context + approximate in-flight TPS move during the turn.
+            // `tps_est` is explicitly marked approximate by the TUI; the final
+            // `tps` still uses provider-reported usage only.
             if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
                 let now = Instant::now();
                 let due = last_stats
@@ -1950,15 +2003,8 @@ async fn stream_turn_openai(
                     {
                         ev = ev.with("ttft_ms", json!(ttft));
                     }
-                    if let Some(tps) = timer.call_first_token.and_then(|ft| {
-                        let e = ft.elapsed().as_secs_f64();
-                        if e >= 0.2 {
-                            Some(est_out as f64 / e)
-                        } else {
-                            None
-                        }
-                    }) {
-                        ev = ev.with("tps", json!(tps));
+                    if let Some(tps) = timer.live_tps_estimate(est_out) {
+                        ev = ev.with("tps_est", json!(tps));
                     }
                     emit(&ev);
                 }
@@ -2034,6 +2080,453 @@ async fn stream_turn_openai(
     Ok((
         Value::Object(msg),
         finish_reason,
+        tokens_in,
+        tokens_out,
+        cached_tokens,
+    ))
+}
+
+// ===========================================================================
+// Gemini Code Assist API (cloudcode-pa.googleapis.com)
+// ===========================================================================
+//
+// When a user signs in via the gemini-cli OAuth flow, the OAuth token is for
+// the Code Assist API — NOT for generativelanguage.googleapis.com (which only
+// accepts API keys). The Code Assist API uses the native Google GenAI wire
+// format (not OpenAI-compatible), so we need our own message converter,
+// request builder, and SSE response parser.
+
+/// Convert `&[Message]` to the Code Assist (native GenAI) `contents` array.
+/// Returns (contents, systemInstruction). System messages are extracted into a
+/// separate `systemInstruction` field (the GenAI API doesn't put them in
+/// `contents`). Tool-result messages need the function NAME (not just
+/// tool_call_id), so we track the last assistant's tool_call id→name map.
+fn messages_to_genai_contents(messages: &[Message]) -> (Vec<Value>, Option<Value>) {
+    let mut contents = Vec::new();
+    let mut system_parts: Vec<Value> = Vec::new();
+    let mut last_tool_call_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for msg in messages {
+        match msg {
+            Message::System { content, .. } => {
+                let text = genai_content_to_text(content);
+                if !text.is_empty() {
+                    system_parts.push(json!({"text": text}));
+                }
+            }
+            Message::User { content, .. } => {
+                let text = genai_content_to_text(content);
+                contents.push(json!({"role": "user", "parts": [{"text": text}]}));
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                last_tool_call_names.clear();
+                let mut parts: Vec<Value> = Vec::new();
+                if let Some(text) = content {
+                    if !text.is_empty() {
+                        parts.push(json!({"text": text}));
+                    }
+                }
+                if let Some(tcs) = tool_calls {
+                    for tc in tcs {
+                        last_tool_call_names.insert(tc.id.clone(), tc.function.name.clone());
+                        let args: Value =
+                            serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
+                        parts.push(
+                            json!({"functionCall": {"name": &tc.function.name, "args": args}}),
+                        );
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "model", "parts": parts}));
+                }
+            }
+            Message::Tool {
+                tool_call_id,
+                name,
+                content,
+            } => {
+                let func_name = name
+                    .clone()
+                    .or_else(|| last_tool_call_names.get(tool_call_id).cloned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                contents.push(json!({
+                    "role": "function",
+                    "parts": [{"functionResponse": {"name": func_name, "response": {"result": content}}}]
+                }));
+            }
+        }
+    }
+
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(json!({"parts": system_parts}))
+    };
+    (contents, system_instruction)
+}
+
+/// Extract plain text from a `Content` (string or multimodal — joins text parts).
+fn genai_content_to_text(content: &crate::message::Content) -> String {
+    use crate::message::{Content, ContentPart};
+    match content {
+        Content::Text(s) => s.clone(),
+        Content::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.clone()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Convert OpenAI-shaped tool schemas to GenAI `tools` format.
+/// OpenAI: `[{"type":"function","function":{"name":..,"description":..,"parameters":..}}]`
+/// GenAI:  `[{"functionDeclarations":[{"name":..,"description":..,"parameters":..}]}]`
+fn tools_to_genai(tools: &[Value]) -> Vec<Value> {
+    let decls: Vec<Value> = tools
+        .iter()
+        .filter_map(|t| t.get("function"))
+        .map(|f| {
+            let mut d = json!({
+                "name": f.get("name").cloned().unwrap_or(json!("")),
+                "description": f.get("description").cloned().unwrap_or(json!("")),
+            });
+            if let Some(p) = f.get("parameters") {
+                d["parameters"] = p.clone();
+            }
+            d
+        })
+        .collect();
+    if decls.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"functionDeclarations": decls})]
+    }
+}
+
+/// Stream a turn through the Code Assist API (native GenAI wire format).
+/// This is the OAuth path for Gemini — `generativelanguage.googleapis.com`
+/// only accepts API keys; the OAuth token authenticates against
+/// `cloudcode-pa.googleapis.com` which proxies Gemini for personal accounts.
+async fn stream_turn_gemini(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Message],
+    tools: &[Value],
+    reasoning_effort: &str,
+    _thinking_levels: &[String],
+    max_tokens: u32,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    prompt_est: u64,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
+    let api_key = provider.api_key.as_deref().unwrap_or("");
+    let base_url = provider.base_url.trim_end_matches('/');
+    let max_attempts = 3u32;
+
+    // Onboarding: get the Code Assist project ID (cached for process lifetime).
+    let project = crate::oauth::code_assist_project(client)
+        .await
+        .ok_or_else(|| {
+            "Code Assist onboarding failed: could not obtain a project ID. \
+             Try /login again or check your Google account."
+                .to_string()
+        })?;
+
+    // Convert messages + tools to GenAI format.
+    let (contents, system_instruction) = messages_to_genai_contents(messages);
+    let genai_tools = tools_to_genai(tools);
+
+    // Strip "models/" prefix if present — the Code Assist API expects bare IDs.
+    let model_name = model.strip_prefix("models/").unwrap_or(model);
+
+    // Build the request body.
+    let mut request = json!({
+        "model": model_name,
+        "project": project,
+        "request": {
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+            },
+        },
+    });
+    if let Some(si) = system_instruction {
+        request["request"]["systemInstruction"] = si;
+    }
+    if !genai_tools.is_empty() {
+        request["request"]["tools"] = json!(genai_tools);
+    }
+    // Thinking config: disable for "none", enable with includeThoughts otherwise.
+    if reasoning_effort == "none" || reasoning_effort.is_empty() {
+        request["request"]["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": 0});
+    } else {
+        request["request"]["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
+    }
+
+    let url = format!("{base_url}:streamGenerateContent?alt=sse");
+    let idle = Duration::from_secs(idle_timeout_secs.max(5));
+    let est_prompt = prompt_est;
+    let mut last_stats: Option<Instant> = None;
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut genai_tool_calls: Vec<(String, Value)> = Vec::new(); // (name, args)
+    let mut finish_reason = String::new();
+    let mut tokens_in: u64 = 0;
+    let mut tokens_out: u64 = 0;
+    let mut cached_tokens: u64 = 0;
+    let mut emitted = false;
+
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let resp =
+            send_with_retry(client, &url, api_key, &provider.headers, &request, cancel).await?;
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut pending = String::new();
+        let mut err: Option<String> = None;
+
+        loop {
+            let chunk = tokio::select! {
+                c = tokio::time::timeout(idle, stream.next()) => match c {
+                    Ok(x) => x,
+                    Err(_) => { err = Some(format!("stream idle timeout ({}s with no data)", idle_timeout_secs)); break; }
+                },
+                _ = cancel.cancelled() => return Err("aborted".into()),
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    break;
+                }
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim().to_string();
+                buf.drain(..=nl);
+                if line.is_empty() || line.starts_with(':') {
+                    pending.clear();
+                    continue;
+                }
+                let data = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                    .unwrap_or("");
+                if data == "[DONE]" || data.is_empty() {
+                    pending.clear();
+                    continue;
+                }
+                pending.push_str(data);
+                let obj = match serde_json::from_str::<Value>(&pending) {
+                    Ok(o) => {
+                        pending.clear();
+                        o
+                    }
+                    Err(_) => continue,
+                };
+
+                // Code Assist wraps the GenAI response in a "response" field.
+                let resp_obj = obj.get("response").unwrap_or(&obj);
+
+                // Usage metadata (may arrive on any chunk, finalized on the last).
+                if let Some(u) = resp_obj.get("usageMetadata") {
+                    if let Some(p) = u.get("promptTokenCount").and_then(token_count) {
+                        tokens_in = p;
+                    }
+                    if let Some(c) = u.get("candidatesTokenCount").and_then(token_count) {
+                        tokens_out = c;
+                    }
+                    if let Some(t) = u.get("cachedContentTokenCount").and_then(token_count) {
+                        cached_tokens = t;
+                    }
+                }
+
+                let Some(candidate) = resp_obj.get("candidates").and_then(|c| c.get(0)) else {
+                    continue;
+                };
+
+                // Parse content parts (text / thought / functionCall).
+                if let Some(parts) = candidate
+                    .get("content")
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.as_array())
+                {
+                    for part in parts {
+                        // Regular text content.
+                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                            let is_thought = part
+                                .get("thought")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if !t.is_empty() {
+                                if is_thought {
+                                    if reasoning.is_empty() {
+                                        timer.mark_first_token();
+                                    }
+                                    reasoning.push_str(t);
+                                    if !quiet {
+                                        emitted = true;
+                                        emit(&Event::new("thinking").with("text", json!(t)));
+                                    }
+                                } else {
+                                    if content.is_empty() {
+                                        timer.mark_first_token();
+                                    }
+                                    content.push_str(t);
+                                    if !quiet {
+                                        emitted = true;
+                                        emit(&Event::new("delta").with("text", json!(t)));
+                                    }
+                                }
+                            }
+                        }
+                        // Function call (tool call).
+                        if let Some(fc) = part.get("functionCall") {
+                            let name = fc
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let args = fc.get("args").cloned().unwrap_or(json!({}));
+                            genai_tool_calls.push((name.clone(), args.clone()));
+                            if !quiet {
+                                emitted = true;
+                                emit(
+                                    &Event::new("tool_call_name")
+                                        .with("index", json!(genai_tool_calls.len() - 1))
+                                        .with("name", json!(name)),
+                                );
+                                emit(
+                                    &Event::new("tool_call_args")
+                                        .with("index", json!(genai_tool_calls.len() - 1))
+                                        .with("args", json!(args.to_string())),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+                    if !fr.is_empty() && fr != "FINISH_REASON_UNSPECIFIED" {
+                        finish_reason = fr.to_string();
+                    }
+                }
+
+                // Live footer stats.
+                if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
+                    let now = Instant::now();
+                    let due = last_stats
+                        .map(|t| now.duration_since(t) >= Duration::from_millis(400))
+                        .unwrap_or(true);
+                    if due {
+                        last_stats = Some(now);
+                        let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+                        let live_ctx = est_prompt.saturating_add(est_out);
+                        let mut ev = Event::new("metrics")
+                            .with("tokens_in", json!(live_ctx))
+                            .with("tokens_out", json!(est_out));
+                        if let Some(ttft) = timer
+                            .first_token
+                            .map(|t| t.duration_since(timer.start).as_millis() as u64)
+                        {
+                            ev = ev.with("ttft_ms", json!(ttft));
+                        }
+                        if let Some(tps) = timer.live_tps_estimate(est_out) {
+                            ev = ev.with("tps_est", json!(tps));
+                        }
+                        emit(&ev);
+                    }
+                }
+            }
+        }
+
+        if err.is_none() {
+            break;
+        }
+        let msg = err.unwrap();
+        if emitted || attempt >= max_attempts {
+            return Err(msg);
+        }
+        let backoff = backoff_ms(attempt, None);
+        emit(
+            &Event::new("http_retry")
+                .with("attempt", json!(attempt))
+                .with("reason", json!("stream error before first token"))
+                .with("backoff_ms", json!(backoff)),
+        );
+        content.clear();
+        reasoning.clear();
+        genai_tool_calls.clear();
+        finish_reason.clear();
+        tokens_in = 0;
+        tokens_out = 0;
+        cached_tokens = 0;
+        timer.call_first_token = None;
+        sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
+    }
+
+    let est_out = estimate_tokens(&content) + estimate_tokens(&reasoning);
+    timer.end_call(tokens_out, est_out);
+
+    // Build the assistant message in OpenAI shape (the rest of the harness
+    // expects OpenAI-format messages).
+    let mut msg = serde_json::Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    msg.insert(
+        "content".into(),
+        if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        },
+    );
+    if !reasoning.is_empty() {
+        msg.insert("reasoning_content".into(), json!(reasoning));
+    }
+    if !genai_tool_calls.is_empty() {
+        let arr: Vec<Value> = genai_tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| {
+                json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args.to_string(),
+                    }
+                })
+            })
+            .collect();
+        msg.insert("tool_calls".into(), json!(arr));
+    }
+
+    // Map GenAI finish reasons to OpenAI finish reasons.
+    let finish = match finish_reason.as_str() {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" => "content_filter",
+        _ => "stop",
+    };
+
+    Ok((
+        Value::Object(msg),
+        finish.to_string(),
         tokens_in,
         tokens_out,
         cached_tokens,
@@ -2242,6 +2735,7 @@ fn fmt_chain(e: &dyn std::error::Error) -> String {
 /// Returns None when thinking can't be enabled (effort "none"/unknown, or
 /// `max_tokens` too small to leave room for a >=1024 budget — Anthropic counts
 /// thinking within `max_tokens`, so the budget must be < max_tokens).
+#[allow(dead_code)]
 fn anthropic_thinking_budget(effort: &str, max_tokens: u32) -> Option<u32> {
     let base: u32 = match effort.to_ascii_lowercase().as_str() {
         "low" | "minimal" => 4096,
@@ -2258,6 +2752,7 @@ fn anthropic_thinking_budget(effort: &str, max_tokens: u32) -> Option<u32> {
 
 /// Push text from an OpenAI `content` (string or multimodal array) into a vec
 /// of system-parts. Image parts are ignored (system is text-only).
+#[allow(dead_code)]
 fn push_content_str(content: &Value, parts: &mut Vec<String>) {
     if let Some(s) = content.as_str() {
         if !s.is_empty() {
@@ -2281,6 +2776,7 @@ fn push_content_str(content: &Value, parts: &mut Vec<String>) {
 /// roles; consecutive same-role messages 400). Merging concatenates the block
 /// arrays — e.g. several OpenAI `role:tool` results fold into one user message
 /// with multiple `tool_result` blocks.
+#[allow(dead_code)]
 fn push_or_merge(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     if let Some(last) = out.last_mut() {
         if last.get("role").and_then(|r| r.as_str()) == Some(role) {
@@ -2296,6 +2792,7 @@ fn push_or_merge(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 /// Convert a single OpenAI message `content` (string or multimodal array) into
 /// Anthropic content blocks. Images become Anthropic `image` blocks (base64 or
 /// url source); text stays text. A plain string yields a single text block.
+#[allow(dead_code)]
 fn anthropic_content_blocks(content: &Value) -> Vec<Value> {
     if let Some(s) = content.as_str() {
         return vec![json!({ "type": "text", "text": s })];
@@ -2332,6 +2829,7 @@ fn anthropic_content_blocks(content: &Value) -> Vec<Value> {
 
 /// Build an Anthropic `image` block from an OpenAI `image_url.url`. Supports
 /// `data:<media>;base64,<data>` (-> base64 source) and plain URLs (-> url source).
+#[allow(dead_code)]
 fn anthropic_image_block(url: &str) -> Option<Value> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',')?;
@@ -2348,6 +2846,7 @@ fn anthropic_image_block(url: &str) -> Option<Value> {
 /// Convert OpenAI function tools to Anthropic tool definitions.
 /// OpenAI: `{"type":"function","function":{"name","description","parameters"}}`
 /// Anthropic: `{"name","description","input_schema"}`
+#[allow(dead_code)]
 fn anthropic_tools(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
@@ -2367,6 +2866,12 @@ fn anthropic_tools(tools: &[Value]) -> Vec<Value> {
 /// OpenAI function tools to `input_schema` tools. `thinking_levels` non-empty +
 /// a supported effort enables extended thinking. Pure (no I/O) so it can be
 /// unit-tested directly.
+///
+/// **DEPRECATED**: Use `message::build_anthropic_request(messages: &[Message], ...)`
+/// instead — it works on typed `Message` values rather than opaque `Value` JSON.
+/// This function is kept for backward-compat with existing tests and will be
+/// removed once callers are migrated.
+#[allow(dead_code)]
 pub fn build_anthropic_request(
     messages: &[Value],
     tools: &[Value],
@@ -2618,7 +3123,7 @@ async fn stream_turn_anthropic(
     provider: &ResolvedProvider,
     idle_timeout_secs: u64,
     model: &str,
-    messages: &[Value],
+    messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
     thinking_levels: &[String],
@@ -2629,15 +3134,11 @@ async fn stream_turn_anthropic(
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     let mt = if max_tokens == 0 { 8192 } else { max_tokens };
-    let mut body = build_anthropic_request(
-        messages,
-        tools,
-        model,
-        reasoning_effort,
-        thinking_levels,
-        mt,
-    );
+    // Use the native Message-based Anthropic request builder.
+    let mut body =
+        message::build_anthropic_request(messages, tools, reasoning_effort, thinking_levels, mt);
     body["stream"] = json!(true);
+    body["model"] = json!(model);
 
     let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
@@ -2752,6 +3253,7 @@ async fn stream_turn_anthropic(
                         if btype == "tool_use" {
                             // tool id + name only; the streamed `input` arrives
                             // via input_json_delta (see init_tool_use_block).
+                            timer.mark_first_token();
                             init_tool_use_block(b, &cb);
                             if !quiet {
                                 emitted = true;
@@ -2813,6 +3315,9 @@ async fn stream_turn_anthropic(
                             "input_json_delta" => {
                                 if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str())
                                 {
+                                    if !pj.is_empty() {
+                                        timer.mark_first_token();
+                                    }
                                     let b = &mut blocks[idx];
                                     if b.kind.is_empty() {
                                         b.kind = "tool_use".into();
@@ -2876,6 +3381,9 @@ async fn stream_turn_anthropic(
                             .map(|t| t.duration_since(timer.start).as_millis() as u64)
                         {
                             ev = ev.with("ttft_ms", json!(ttft));
+                        }
+                        if let Some(tps) = timer.live_tps_estimate(est_out) {
+                            ev = ev.with("tps_est", json!(tps));
                         }
                         emit(&ev);
                     }
@@ -3371,18 +3879,25 @@ mod tests {
 
     #[test]
     fn sanitize_inserts_synthetic_results() {
-        let mut msgs = vec![
-            json!({"role":"user","content":"hi"}),
-            json!({"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+        let mut msgs: Vec<Message> = vec![
+            Message::user("hi"),
+            Message::assistant_tool_calls(vec![crate::message::ToolCall {
+                id: "call_1".into(),
+                typ: "function".into(),
+                function: crate::message::FunctionCall {
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
         ];
-        sanitize_orphaned_tool_calls(&mut msgs);
+        let n = sanitize_orphaned_tool_calls(&mut msgs);
         // a tool result for call_1 should now follow the assistant message
-        let has_result = msgs.iter().any(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("tool")
-                && m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_1")
-        });
+        let has_result = msgs
+            .iter()
+            .any(|m| m.is_tool() && m.tool_call_id() == Some("call_1"));
         assert!(has_result);
         assert_eq!(msgs.len(), 3);
+        assert_eq!(n, 1, "should report 1 synthetic result inserted");
     }
 
     #[test]
@@ -3391,78 +3906,109 @@ mod tests {
         // was dropped. The orphaned `tool` message must be removed (not left to
         // 400 the request), and no synthetic call is inserted (there's no call
         // to synthesize a result for).
-        let mut msgs = vec![
-            json!({"role":"user","content":"hi"}),
-            json!({"role":"tool","tool_call_id":"ghost_call","content":"stale result"}),
-            json!({"role":"assistant","content":"ok"}),
+        let mut msgs: Vec<Message> = vec![
+            Message::user("hi"),
+            Message::tool("ghost_call", "stale result"),
+            Message::assistant("ok"),
         ];
-        sanitize_orphaned_tool_calls(&mut msgs);
+        let n = sanitize_orphaned_tool_calls(&mut msgs);
         assert!(
-            !msgs
-                .iter()
-                .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool")),
+            !msgs.iter().any(|m| m.is_tool()),
             "orphaned tool result should be dropped: {msgs:?}"
         );
         assert_eq!(msgs.len(), 2);
+        assert_eq!(n, 1, "should report 1 orphaned result dropped");
     }
 
     #[test]
     fn sanitize_noop_when_results_present() {
-        let mut msgs = vec![
-            json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"c1","content":"ok"}),
+        let mut msgs: Vec<Message> = vec![
+            Message::assistant_tool_calls(vec![crate::message::ToolCall {
+                id: "c1".into(),
+                typ: "function".into(),
+                function: crate::message::FunctionCall {
+                    name: "x".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            Message::tool("c1", "ok"),
         ];
-        sanitize_orphaned_tool_calls(&mut msgs);
+        let n = sanitize_orphaned_tool_calls(&mut msgs);
         assert_eq!(msgs.len(), 2);
+        assert_eq!(n, 0, "clean conversation: no fixes");
     }
 
     #[test]
     fn sanitize_args_fixes_malformed_arguments() {
-        let mut msgs = vec![
-            json!({"role":"assistant","tool_calls":[
-                {"id":"c1","type":"function","function":{"name":"bulk","arguments":"{broken json"}},
-                {"id":"c2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}},
-                {"id":"c3","type":"function","function":{"name":"bulk","arguments":"{\"calls\":[{\"name\":\"bash\",\"args\":{\"command\":\"echo '"}}
-            ]}),
-            json!({"role":"tool","tool_call_id":"c1","content":"err"}),
-            json!({"role":"tool","tool_call_id":"c2","content":"ok"}),
-            json!({"role":"tool","tool_call_id":"c3","content":"err"}),
+        let mut msgs: Vec<Message> = vec![
+            Message::assistant_tool_calls(vec![
+                crate::message::ToolCall {
+                    id: "c1".into(),
+                    typ: "function".into(),
+                    function: crate::message::FunctionCall {
+                        name: "bulk".into(),
+                        arguments: "{broken json".into(),
+                    },
+                },
+                crate::message::ToolCall {
+                    id: "c2".into(),
+                    typ: "function".into(),
+                    function: crate::message::FunctionCall {
+                        name: "bash".into(),
+                        arguments: "{\"command\":\"echo hi\"}".into(),
+                    },
+                },
+                crate::message::ToolCall {
+                    id: "c3".into(),
+                    typ: "function".into(),
+                    function: crate::message::FunctionCall {
+                        name: "bulk".into(),
+                        arguments: "{\"calls\":[{\"name\":\"bash\",\"args\":{\"command\":\"echo '"
+                            .into(),
+                    },
+                },
+            ]),
+            Message::tool("c1", "err"),
+            Message::tool("c2", "ok"),
+            Message::tool("c3", "err"),
         ];
         let n = sanitize_tool_call_arguments(&mut msgs);
         assert_eq!(n, 2, "only the two malformed calls should be fixed");
-        let calls = msgs[0]["tool_calls"].as_array().unwrap();
-        assert_eq!(calls[0]["function"]["arguments"].as_str().unwrap(), "{}");
-        assert_eq!(
-            calls[1]["function"]["arguments"].as_str().unwrap(),
-            "{\"command\":\"echo hi\"}"
-        );
-        assert_eq!(calls[2]["function"]["arguments"].as_str().unwrap(), "{}");
+        let calls = msgs[0].tool_calls().unwrap();
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[1].function.arguments, "{\"command\":\"echo hi\"}");
+        assert_eq!(calls[2].function.arguments, "{}");
         // every arguments field must now be valid JSON
         for tc in calls {
-            let args = tc["function"]["arguments"].as_str().unwrap();
-            serde_json::from_str::<Value>(args).unwrap();
+            serde_json::from_str::<Value>(&tc.function.arguments).unwrap();
         }
     }
 
     #[test]
-    fn sanitize_args_coerces_nonstring_arguments() {
-        // Some clients serialize `arguments` as a JSON object instead of a string.
-        let mut msgs = vec![json!({"role":"assistant","tool_calls":[
-            {"id":"c1","type":"function","function":{"name":"bash","arguments":{"command":"echo hi"}}}
-        ]})];
+    fn sanitize_args_coerces_non_json_arguments() {
+        // A tool call with garbage arguments (not valid JSON at all)
+        // gets fixed to "{}".
+        let mut msgs: Vec<Message> = vec![Message::assistant_tool_calls(vec![
+            crate::message::ToolCall {
+                id: "c1".into(),
+                typ: "function".into(),
+                function: crate::message::FunctionCall {
+                    name: "bash".into(),
+                    arguments: "not valid json".into(),
+                },
+            },
+        ])];
         let n = sanitize_tool_call_arguments(&mut msgs);
         assert_eq!(n, 1);
-        let args = msgs[0]["tool_calls"][0]["function"]["arguments"]
-            .as_str()
-            .unwrap();
+        let args = &msgs[0].tool_calls().unwrap()[0].function.arguments;
         assert_eq!(args, "{}");
     }
 
     #[test]
     fn sanitize_args_skips_non_assistant_messages() {
-        let mut msgs = vec![
-            json!({"role":"user","content":"hi"}),
-            json!({"role":"tool","tool_call_id":"x","content":"{not real json but role is tool}"}),
+        let mut msgs: Vec<Message> = vec![
+            Message::user("hi"),
+            Message::tool("x", "{not real json but role is tool}"),
         ];
         assert_eq!(sanitize_tool_call_arguments(&mut msgs), 0);
     }
@@ -4043,9 +4589,9 @@ mod tests {
         let client = reqwest::Client::new();
         let provider = mock_provider(base);
         let cancel = CancellationToken::new();
-        let msgs = vec![
-            json!({ "role": "user", "content": "please refactor the auth module" }),
-            json!({ "role": "assistant", "content": "on it" }),
+        let msgs: Vec<Message> = vec![
+            Message::user("please refactor the auth module"),
+            Message::assistant("on it"),
         ];
         let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
         assert_eq!(out.as_deref(), Some("<summary>mocked</summary>"));
@@ -4058,7 +4604,7 @@ mod tests {
         let client = reqwest::Client::new();
         let provider = mock_provider(base);
         let cancel = CancellationToken::new();
-        let msgs = vec![json!({ "role": "user", "content": "hello" })];
+        let msgs: Vec<Message> = vec![Message::user("hello")];
         let out = extract_facts(&client, &provider, "mock-model", &msgs, &cancel).await;
         assert!(
             out.is_none(),
@@ -4073,7 +4619,7 @@ mod tests {
         let client = reqwest::Client::new();
         let provider = mock_provider(base);
         let cancel = CancellationToken::new();
-        let msgs = vec![json!({ "role": "user", "content": "x" })];
+        let msgs: Vec<Message> = vec![Message::user("x")];
         let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
         assert!(out.is_none());
     }

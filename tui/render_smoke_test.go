@@ -229,6 +229,11 @@ func TestThemeAndMetrics(t *testing.T) {
 	if !strings.Contains(m, "42 tok/s") {
 		t.Errorf("metrics tps should be rounded to int, got %q", m)
 	}
+	s.lastMetrics = []byte(`{"tps_est":"51.7","ttft_ms":"180","tokens_in":"1000","tokens_out":"200"}`)
+	m = s.renderMetrics()
+	if !strings.Contains(m, "~52 tok/s") {
+		t.Errorf("live estimated tps should be rounded and marked approximate, got %q", m)
+	}
 	// context budget: live context / model window → "14% 1.2k/8.2k"
 	ctx := s.renderContext()
 	for _, w := range []string{"%", "1.2k", "8.2k"} {

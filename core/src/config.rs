@@ -170,8 +170,8 @@ pub struct Config {
     pub active_provider: Option<String>,
     /// Per-provider API keys persisted by the TUI (settings.json `provider_keys`
     /// + the legacy `api_key` under "default"). Seeded into `State::api_keys` at
-    /// startup so they override config/env keys (runtime keys win in provider
-    /// resolution) and survive restarts — this is what makes `/key` sticky.
+    ///   startup so they override config/env keys (runtime keys win in provider
+    ///   resolution) and survive restarts — this is what makes `/key` sticky.
     pub persisted_keys: std::collections::HashMap<String, String>,
 }
 
@@ -409,7 +409,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.anthropic.com/v1",
         api_key_env: "ANTHROPIC_API_KEY",
         alt_envs: &[],
-        description: "Anthropic API — Claude Opus/Sonnet/Haiku 4. Uses your ANTHROPIC_API_KEY.",
+        description: "Anthropic Claude via API key (ANTHROPIC_API_KEY) or Claude subscription OAuth with /login (works locally and over SSH/headless).",
     },
     ProviderPreset {
         id: "opencode-go",
@@ -1478,8 +1478,10 @@ mod tests {
 
     #[test]
     fn resolve_provider_legacy_default_when_none_configured() {
-        let mut c = Config::default();
-        c.base_url = "https://example.test/v1".into();
+        let c = Config {
+            base_url: "https://example.test/v1".into(),
+            ..Default::default()
+        };
         let keys = std::collections::HashMap::new();
         let r = c.resolve_provider(&keys);
         assert_eq!(r.name, "default");
