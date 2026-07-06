@@ -23,6 +23,34 @@ use std::sync::Mutex as StdMutex;
 /// correct for one core process — the only writer to a memory dir.
 static WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
+/// Memory scope: workspace-local (per-codebase) or global (cross-codebase).
+/// Global memories carry user-level facts — the user's name, preferred tech
+/// stacks, harness conventions — that apply regardless of which project is
+/// open. They are stored in a fixed `global/` directory and merged into every
+/// workspace's system-prompt injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Workspace,
+    Global,
+}
+
+impl Scope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Scope::Workspace => "workspace",
+            Scope::Global => "global",
+        }
+    }
+
+    /// Parse a scope string; unrecognized values default to Workspace.
+    pub fn parse(s: &str) -> Scope {
+        match s.trim().to_lowercase().as_str() {
+            "global" | "user" => Scope::Global,
+            _ => Scope::Workspace,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryEntry {
     pub name: String,
@@ -30,6 +58,7 @@ pub struct MemoryEntry {
     pub mem_type: String,
     pub content: String,
     pub path: PathBuf,
+    pub scope: Scope,
 }
 
 // ---- hash ----
@@ -78,8 +107,25 @@ impl Store {
         self.root.join(hash_workspace(workspace))
     }
 
+    /// Fixed directory for global (cross-workspace) memories.
+    fn global_dir(&self) -> PathBuf {
+        self.root.join("global")
+    }
+
+    /// Resolve the memory directory for a given scope.
+    fn dir_scoped(&self, workspace: &Path, scope: Scope) -> PathBuf {
+        match scope {
+            Scope::Global => self.global_dir(),
+            Scope::Workspace => self.dir(workspace),
+        }
+    }
+
     fn scan(&self, workspace: &Path) -> Vec<MemoryEntry> {
-        scan_dir(&self.dir(workspace))
+        scan_dir(&self.dir(workspace), Scope::Workspace)
+    }
+
+    fn scan_scoped(&self, workspace: &Path, scope: Scope) -> Vec<MemoryEntry> {
+        scan_dir(&self.dir_scoped(workspace, scope), scope)
     }
 
     fn save(
@@ -90,7 +136,19 @@ impl Store {
         mem_type: &str,
         description: &str,
     ) -> Result<PathBuf, String> {
-        let dir = self.dir(workspace);
+        self.save_scoped(workspace, Scope::Workspace, name, content, mem_type, description)
+    }
+
+    fn save_scoped(
+        &self,
+        workspace: &Path,
+        scope: Scope,
+        name: &str,
+        content: &str,
+        mem_type: &str,
+        description: &str,
+    ) -> Result<PathBuf, String> {
+        let dir = self.dir_scoped(workspace, scope);
         std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create memory dir: {e}"))?;
 
         let slug = slugify(name);
@@ -113,7 +171,7 @@ impl Store {
         std::fs::rename(&tmp, &path)
             .map_err(|e| format!("failed to commit memory file {filename:?}: {e}"))?;
 
-        rebuild_index(&dir)?;
+        rebuild_index(&dir, scope)?;
 
         Ok(path)
     }
@@ -124,7 +182,23 @@ impl Store {
 /// Scan all memory files for a workspace, returning parsed entries.
 /// Skips the index file (MEMORY.md) and any unparseable files.
 pub fn scan_memories(workspace: &Path) -> Vec<MemoryEntry> {
-    Store::new(Store::default_root()).scan(workspace)
+    scan_memories_scoped(workspace, Scope::Workspace)
+}
+
+/// Like `scan_memories` but for a specific scope.
+pub fn scan_memories_scoped(workspace: &Path, scope: Scope) -> Vec<MemoryEntry> {
+    Store::new(Store::default_root()).scan_scoped(workspace, scope)
+}
+
+/// Scan memories from BOTH scopes: global first (user-level, cross-codebase
+/// facts), then workspace (project-specific). Each entry's `scope` field
+/// identifies its origin. Used by `memory_injection` so the system prompt
+/// carries forward both universal and project-specific learnings.
+pub fn scan_all_memories(workspace: &Path) -> Vec<MemoryEntry> {
+    let store = Store::new(Store::default_root());
+    let mut entries = store.scan_scoped(workspace, Scope::Global);
+    entries.extend(store.scan_scoped(workspace, Scope::Workspace));
+    entries
 }
 
 /// Write a memory file (with frontmatter) and rebuild the MEMORY.md index.
@@ -137,8 +211,22 @@ pub fn save_memory(
     mem_type: &str,
     description: &str,
 ) -> Result<PathBuf, String> {
+    save_memory_scoped(workspace, Scope::Workspace, name, content, mem_type, description)
+}
+
+/// Like `save_memory` but for a specific scope. Use `Scope::Global` to store a
+/// cross-codebase memory (user identity, tech-stack preferences, harness facts)
+/// that is injected into every workspace's system prompt.
+pub fn save_memory_scoped(
+    workspace: &Path,
+    scope: Scope,
+    name: &str,
+    content: &str,
+    mem_type: &str,
+    description: &str,
+) -> Result<PathBuf, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    Store::new(Store::default_root()).save(workspace, name, content, mem_type, description)
+    Store::new(Store::default_root()).save_scoped(workspace, scope, name, content, mem_type, description)
 }
 
 /// Append `new_facts` to an existing memory (same name/slug), capped to
@@ -154,9 +242,32 @@ pub fn append_memory(
     description: &str,
     max_bytes: usize,
 ) -> Result<PathBuf, String> {
+    append_memory_scoped(
+        workspace,
+        Scope::Workspace,
+        name,
+        new_facts,
+        mem_type,
+        description,
+        max_bytes,
+    )
+}
+
+/// Like `append_memory` but for a specific scope. Use `Scope::Global` to
+/// accumulate cross-codebase facts.
+pub fn append_memory_scoped(
+    workspace: &Path,
+    scope: Scope,
+    name: &str,
+    new_facts: &str,
+    mem_type: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, String> {
     append_memory_locked(
         &Store::new(Store::default_root()),
         workspace,
+        scope,
         name,
         new_facts,
         mem_type,
@@ -172,6 +283,7 @@ pub fn append_memory(
 fn append_memory_locked(
     store: &Store,
     workspace: &Path,
+    scope: Scope,
     name: &str,
     new_facts: &str,
     mem_type: &str,
@@ -182,6 +294,7 @@ fn append_memory_locked(
     append_memory_into(
         store,
         workspace,
+        scope,
         name,
         new_facts,
         mem_type,
@@ -193,13 +306,14 @@ fn append_memory_locked(
 fn append_memory_into(
     store: &Store,
     workspace: &Path,
+    scope: Scope,
     name: &str,
     new_facts: &str,
     mem_type: &str,
     description: &str,
     max_bytes: usize,
 ) -> Result<PathBuf, String> {
-    let dir = store.dir(workspace);
+    let dir = store.dir_scoped(workspace, scope);
     let slug = slugify(name);
     let path = dir.join(format!("{slug}.md"));
     let existing = parse_memory_file(&path);
@@ -237,7 +351,7 @@ fn append_memory_into(
         Some(m) if !m.content.is_empty() => (m.mem_type.as_str(), m.description.as_str()),
         _ => (mem_type, description),
     };
-    store.save(workspace, name, &combined, final_type, final_desc)
+    store.save_scoped(workspace, scope, name, &combined, final_type, final_desc)
 }
 
 /// Delete a memory by its slug/id (the filename stem) and rebuild the index.
@@ -246,28 +360,48 @@ fn append_memory_into(
 /// slugify() strips '/', '\', and '.' to '-', so the joined path can never
 /// escape the memory dir (no path-traversal deletion via a crafted id).
 pub fn forget_memory(workspace: &Path, id: &str) -> Result<(), String> {
+    forget_memory_scoped(workspace, Scope::Workspace, id)
+}
+
+/// Like `forget_memory` but for a specific scope.
+pub fn forget_memory_scoped(
+    workspace: &Path,
+    scope: Scope,
+    id: &str,
+) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("memory id must not be empty".to_string());
     }
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let store = Store::new(Store::default_root());
-    let dir = store.dir(workspace);
+    let dir = store.dir_scoped(workspace, scope);
     let slug = slugify(id);
     let path = dir.join(format!("{}.md", slug));
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("failed to remove memory: {e}"))?;
-        rebuild_index(&dir)?;
+        rebuild_index(&dir, scope)?;
         Ok(())
     } else {
         Err(format!("no memory found with id/name '{id}'"))
     }
 }
 
+/// Forget a memory by searching both scopes (workspace first, then global).
+/// Used when the caller doesn't know which scope a memory lives in. Each
+/// scoped forget acquires WRITE_LOCK internally, so this is safe to call
+/// without an outer lock.
+pub fn forget_memory_any(workspace: &Path, id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("memory id must not be empty".to_string());
+    }
+    forget_memory_scoped(workspace, Scope::Workspace, id)
+        .or_else(|_| forget_memory_scoped(workspace, Scope::Global, id))
+}
+
 /// Build a string to inject into the system prompt with memories relevant to
 /// the user's current prompt. Returns an empty string if no memories match.
 pub fn memory_injection(workspace: &Path, prompt: &str) -> String {
-    let store = Store::new(Store::default_root());
-    let memories = store.scan(workspace);
+    let memories = scan_all_memories(workspace);
     build_injection(&memories, prompt)
 }
 
@@ -294,7 +428,13 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
         } else {
             format!(": {}", m.description)
         };
-        out.push_str(&format!("- **{}** ({}){}\n", m.name, m.mem_type, desc_part));
+        out.push_str(&format!(
+            "- **{}** ({}, {}){}\n",
+            m.name,
+            m.mem_type,
+            m.scope.as_str(),
+            desc_part
+        ));
         if !m.content.is_empty() {
             let preview: String = m.content.lines().take(5).collect::<Vec<_>>().join("\n");
             out.push_str(&format!("  {}\n", preview));
@@ -305,7 +445,7 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
 
 // ---- scan internals ----
 
-fn scan_dir(dir: &Path) -> Vec<MemoryEntry> {
+fn scan_dir(dir: &Path, scope: Scope) -> Vec<MemoryEntry> {
     let mut entries = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -319,7 +459,8 @@ fn scan_dir(dir: &Path) -> Vec<MemoryEntry> {
         if path.file_name().and_then(|x| x.to_str()) == Some("MEMORY.md") {
             continue;
         }
-        if let Some(entry) = parse_memory_file(&path) {
+        if let Some(mut entry) = parse_memory_file(&path) {
+            entry.scope = scope;
             entries.push(entry);
         }
     }
@@ -386,6 +527,10 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         mem_type,
         content,
         path: path.to_path_buf(),
+        // The scope is determined by the directory the file lives in, not the
+        // file content. scan_dir() overrides this with the correct value; the
+        // default here covers direct parse_memory_file callers (e.g. append).
+        scope: Scope::Workspace,
     })
 }
 
@@ -405,8 +550,8 @@ fn find_frontmatter_end(s: &str) -> Option<usize> {
 // ---- index ----
 
 /// Rebuild MEMORY.md from all .md files in the memory directory.
-fn rebuild_index(dir: &Path) -> Result<(), String> {
-    let entries = scan_dir(dir);
+fn rebuild_index(dir: &Path, scope: Scope) -> Result<(), String> {
+    let entries = scan_dir(dir, scope);
     let mut idx = String::from("# Memory Index\n\n");
     if entries.is_empty() {
         idx.push_str("_(no memories yet)_\n");
@@ -609,6 +754,7 @@ mod tests {
             mem_type: "user".into(),
             content: String::new(),
             path: PathBuf::from("/fake/ts.md"),
+            scope: Scope::Workspace,
         };
         assert!(is_relevant(&e, "write a strict TypeScript component"));
         assert!(is_relevant(&e, "use enums in this file"));
@@ -625,6 +771,7 @@ mod tests {
             mem_type: "project".into(),
             content: String::new(),
             path: PathBuf::from("/fake/fmt.md"),
+            scope: Scope::Workspace,
         };
         assert!(!is_relevant(&e, "the quick brown fox"));
         assert!(!is_relevant(&e, "this and that"));
@@ -734,6 +881,7 @@ mod tests {
                 append_memory_locked(
                     &s,
                     &ws2,
+                    Scope::Workspace,
                     "shared",
                     &format!("fact-{i}"),
                     "note",
@@ -782,7 +930,7 @@ mod tests {
         store
             .save(&ws, "skill", "body", "convention", "How we do X")
             .unwrap();
-        append_memory_locked(&store, &ws, "skill", "more facts", "", "", 1_000_000).unwrap();
+        append_memory_locked(&store, &ws, Scope::Workspace, "skill", "more facts", "", "", 1_000_000).unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].description, "How we do X");
@@ -867,7 +1015,7 @@ mod tests {
         let ws = fake_workspace("append");
         let store = test_store(&root);
         // first append: no existing file -> writes new facts
-        let _ = append_memory_into(&store, &ws, "facts", "fact A", "note", "d", 4096).unwrap();
+        let _ = append_memory_into(&store, &ws, Scope::Workspace, "facts", "fact A", "note", "d", 4096).unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         assert!(
@@ -877,7 +1025,7 @@ mod tests {
         );
 
         // second append: accumulates onto the first (does NOT overwrite)
-        let _ = append_memory_into(&store, &ws, "facts", "fact B", "note", "d", 4096).unwrap();
+        let _ = append_memory_into(&store, &ws, Scope::Workspace, "facts", "fact B", "note", "d", 4096).unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         let c = &entries[0].content;
@@ -888,6 +1036,7 @@ mod tests {
         let _ = append_memory_into(
             &store,
             &ws,
+            Scope::Workspace,
             "facts",
             &"new big fact ".repeat(400),
             "note",
@@ -904,5 +1053,172 @@ mod tests {
             "newest must survive trimming: {c}"
         );
         assert!(!c.contains("fact A"), "oldest should be trimmed away: {c}");
+    }
+
+    #[test]
+    fn global_memories_stored_separately_from_workspace() {
+        // Global memories live in a fixed `global/` dir, separate from the
+        // workspace-hashed dir. They must not leak into workspace scans and vice
+        // versa.
+        let root = tmp_root();
+        let ws = fake_workspace("global1");
+        let store = test_store(&root);
+
+        store
+            .save_scoped(&ws, Scope::Workspace, "project-rule", "use rust", "project", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Global, "user-name", "Alice", "user", "")
+            .unwrap();
+
+        // Workspace scan sees only the workspace memory
+        let ws_entries = store.scan(&ws);
+        assert_eq!(ws_entries.len(), 1);
+        assert_eq!(ws_entries[0].name, "project-rule");
+        assert_eq!(ws_entries[0].scope, Scope::Workspace);
+
+        // Global scan sees only the global memory
+        let global_entries = store.scan_scoped(&ws, Scope::Global);
+        assert_eq!(global_entries.len(), 1);
+        assert_eq!(global_entries[0].name, "user-name");
+        assert_eq!(global_entries[0].scope, Scope::Global);
+    }
+
+    #[test]
+    fn scan_all_merges_global_then_workspace() {
+        // scan_all_memories returns global entries first, then workspace entries,
+        // each sorted by name. This ordering puts universal user-level facts
+        // before project-specific ones in the system prompt.
+        let root = tmp_root();
+        let ws = fake_workspace("global2");
+        let store = test_store(&root);
+
+        store
+            .save_scoped(&ws, Scope::Workspace, "zzz-project", "p", "project", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Global, "aaa-global", "g", "user", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Workspace, "aaa-project", "p2", "project", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Global, "zzz-global", "g2", "user", "")
+            .unwrap();
+
+        let all = scan_all_memories_with_store(&store, &ws);
+        assert_eq!(all.len(), 4);
+        // Global first (sorted by name), then workspace (sorted by name)
+        assert_eq!(all[0].name, "aaa-global");
+        assert_eq!(all[0].scope, Scope::Global);
+        assert_eq!(all[1].name, "zzz-global");
+        assert_eq!(all[1].scope, Scope::Global);
+        assert_eq!(all[2].name, "aaa-project");
+        assert_eq!(all[2].scope, Scope::Workspace);
+        assert_eq!(all[3].name, "zzz-project");
+        assert_eq!(all[3].scope, Scope::Workspace);
+    }
+
+    #[test]
+    fn global_memories_persist_across_workspaces() {
+        // The key property: a global memory saved from one workspace is visible
+        // from a DIFFERENT workspace's scan_all_memories. This is what makes
+        // them "cross-codebase".
+        let root = tmp_root();
+        let ws1 = fake_workspace("global3a");
+        let ws2 = fake_workspace("global3b");
+        let store = test_store(&root);
+
+        // Save a global memory from ws1
+        store
+            .save_scoped(&ws1, Scope::Global, "user-prefs", "likes Rust + Go", "user", "")
+            .unwrap();
+
+        // It must be visible from ws2 (a completely different workspace)
+        let all = scan_all_memories_with_store(&store, &ws2);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "user-prefs");
+        assert_eq!(all[0].scope, Scope::Global);
+        assert_eq!(all[0].content, "likes Rust + Go");
+    }
+
+    #[test]
+    fn forget_memory_any_searches_both_scopes() {
+        // forget_memory_any finds a memory regardless of which scope it's in.
+        let root = tmp_root();
+        let ws = fake_workspace("global4");
+        let store = test_store(&root);
+
+        store
+            .save_scoped(&ws, Scope::Global, "global-fact", "g", "user", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Workspace, "ws-fact", "w", "project", "")
+            .unwrap();
+
+        // Forget the global one via forget_memory_any (no scope specified)
+        forget_memory_any_with_store(&store, &ws, "global-fact").unwrap();
+        let all = scan_all_memories_with_store(&store, &ws);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "ws-fact");
+
+        // Forget the workspace one too
+        forget_memory_any_with_store(&store, &ws, "ws-fact").unwrap();
+        assert!(scan_all_memories_with_store(&store, &ws).is_empty());
+    }
+
+    #[test]
+    fn memory_injection_includes_global_memories() {
+        // The system-prompt injection must include global memories so the model
+        // always carries forward cross-codebase user-level facts.
+        let root = tmp_root();
+        let ws = fake_workspace("global5");
+        let store = test_store(&root);
+
+        store
+            .save_scoped(&ws, Scope::Global, "user-identity", "User is Alice", "user", "")
+            .unwrap();
+        store
+            .save_scoped(&ws, Scope::Workspace, "project-rule", "use tabs", "project", "")
+            .unwrap();
+
+        let memories = scan_all_memories_with_store(&store, &ws);
+        let injection = build_injection(&memories, "");
+        assert!(injection.contains("[PERSISTENT MEMORIES]"));
+        assert!(injection.contains("user-identity"));
+        assert!(injection.contains("Alice"));
+        assert!(injection.contains("project-rule"));
+        // scope tags present
+        assert!(injection.contains("global"));
+        assert!(injection.contains("workspace"));
+    }
+
+    // Helper: scan_all_memories against a test store (not the default root).
+    fn scan_all_memories_with_store(store: &Store, workspace: &Path) -> Vec<MemoryEntry> {
+        let mut entries = store.scan_scoped(workspace, Scope::Global);
+        entries.extend(store.scan_scoped(workspace, Scope::Workspace));
+        entries
+    }
+
+    // Helper: forget_memory_any against a test store.
+    fn forget_memory_any_with_store(
+        store: &Store,
+        workspace: &Path,
+        id: &str,
+    ) -> Result<(), String> {
+        // Try workspace first, then global — mirrors the public forget_memory_any.
+        let try_scope = |scope: Scope| -> Result<(), String> {
+            let dir = store.dir_scoped(workspace, scope);
+            let slug = slugify(id);
+            let path = dir.join(format!("{slug}.md"));
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|e| format!("failed to remove memory: {e}"))?;
+                rebuild_index(&dir, scope)?;
+                Ok(())
+            } else {
+                Err(format!("no memory found with id/name '{id}'"))
+            }
+        };
+        try_scope(Scope::Workspace).or_else(|_| try_scope(Scope::Global))
     }
 }

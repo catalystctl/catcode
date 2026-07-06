@@ -76,7 +76,7 @@ Work step by step: read/search before changing, make the smallest correct change
 Be concise. Prefer standard tools. When done, summarize what you did in two lines.
 
 Self-learning — you compound knowledge across sessions, so future you starts smarter:
-- The `memory` tool (actions: save/append/list/forget) persists durable facts scoped to this workspace. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
+- The `memory` tool (actions: save/append/list/forget) persists durable facts. By default memories are scoped to this workspace (per-codebase); pass `scope: "global"` for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
 - Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation before `finish` exits and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `UMANS_HARNESS_AUTO_REFLECT=0`).
 - Reusable skills live as markdown + YAML frontmatter under `.umans-harness/skills/<name>/SKILL.md`. Discover them with `list_dir .umans-harness/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
 - `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
@@ -1941,7 +1941,7 @@ async fn main() {
                 let msg = refresh_memory_injection(&state).await;
                 emit(&Event::new("info").with("message", json!(msg)));
             }
-            Command::SaveMemory { text, tags } => {
+            Command::SaveMemory { text, tags, scope } => {
                 if text.trim().is_empty() {
                     emit(
                         &Event::new("error")
@@ -1967,7 +1967,8 @@ async fn main() {
                         .and_then(|t| t.first().cloned())
                         .unwrap_or_else(|| "note".to_string());
                     let ws = state.cfg.read().await.workspace.clone();
-                    match memory::save_memory(&ws, &name, &text, &mem_type, "") {
+                    let mem_scope = memory::Scope::parse(scope.as_deref().unwrap_or("workspace"));
+                    match memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "") {
                         Ok(p) => {
                             let id = p
                                 .file_stem()
@@ -1992,7 +1993,7 @@ async fn main() {
             }
             Command::ListMemory => {
                 let ws = state.cfg.read().await.workspace.clone();
-                let entries = memory::scan_memories(&ws);
+                let entries = memory::scan_all_memories(&ws);
                 let arr: Vec<Value> = entries
                     .iter()
                     .map(|m| {
@@ -2007,6 +2008,7 @@ async fn main() {
                             "type": m.mem_type,
                             "description": m.description,
                             "content": m.content,
+                            "scope": m.scope.as_str(),
                             // Display fields consumed by the TUI's /memory list:
                             // `text` is the scannable label (the memory name),
                             // `tags` surfaces the type as a single tag.
@@ -2021,9 +2023,15 @@ async fn main() {
                         .with("count", json!(arr.len())),
                 );
             }
-            Command::ForgetMemory { id } => {
+            Command::ForgetMemory { id, scope } => {
                 let ws = state.cfg.read().await.workspace.clone();
-                match memory::forget_memory(&ws, &id) {
+                let result = match scope.as_deref() {
+                    Some(s) if !s.is_empty() => {
+                        memory::forget_memory_scoped(&ws, memory::Scope::parse(s), &id)
+                    }
+                    _ => memory::forget_memory_any(&ws, &id),
+                };
+                match result {
                     Ok(()) => {
                         let _ = refresh_memory_injection(&state).await;
                         emit(
@@ -2420,7 +2428,9 @@ fn build_reflect_text(recurring: &[(usize, String)]) -> String {
         "[auto-reflect] Before completing, take one reflection step. \n\
          (1) If you learned a durable convention, architecture fact, decision, \n\
          or gotcha, persist it with the `memory` tool (action: append if a topic \n\
-         memory exists, else save) — skip transient task state. \n\
+         memory exists, else save; use scope: \"global\" for cross-codebase facts \n\
+         like the user's identity, tech-stack preferences, or harness conventions) \n\
+         — skip transient task state. \n\
          (2) If you just performed a reusable workflow, consider writing a skill \n\
          under `.umans-harness/skills/<name>/SKILL.md` (run \n\
          `list_dir .umans-harness/skills/` first to extend rather than duplicate). \n\

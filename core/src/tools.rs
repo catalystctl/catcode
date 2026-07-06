@@ -471,11 +471,12 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Persist, list, or forget durable memories scoped to this workspace. Memories survive across sessions and are injected into the system prompt so prior learnings carry forward. Use `save` to record conventions, structure, decisions, or gotchas worth remembering; use `append` to add facts to an existing memory (accumulates, oldest trimmed when it exceeds a rolling cap) instead of overwriting it. Read-only (no workspace side effects).",
+                "description": "Persist, list, or forget durable memories. Memories survive across sessions and are injected into the system prompt so prior learnings carry forward. By default memories are scoped to the current workspace (per-codebase). Use scope 'global' for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Use `save` to record conventions, structure, decisions, or gotchas worth remembering; use `append` to add facts to an existing memory (accumulates, oldest trimmed when it exceeds a rolling cap) instead of overwriting it. Read-only (no workspace side effects).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": ["save", "append", "list", "forget"], "description": "save a new memory, append facts to an existing one, list memories, or forget one by id" },
+                        "scope": { "type": "string", "enum": ["workspace", "global"], "description": "where the memory lives: 'workspace' (per-codebase, default) or 'global' (cross-codebase, applies to every project). For 'list' and 'forget', omit to search/list both scopes" },
                         "name": { "type": "string", "description": "(save/append) short memory name; becomes the file slug and the id. append looks up the same name to accumulate onto" },
                         "content": { "type": "string", "description": "(save/append) the memory body (save) or the facts to append (append)" },
                         "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision (default note)" },
@@ -2387,7 +2388,9 @@ fn git_commit(args: &Value, cfg: &Config) -> Outcome {
 // ---- memory tool (agent-callable wrapper over crate::memory) ----
 
 fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
+    use crate::memory::Scope;
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let scope = Scope::parse(args.get("scope").and_then(|v| v.as_str()).unwrap_or("workspace"));
     match action {
         "save" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2403,13 +2406,20 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
             if content.trim().is_empty() {
                 return Outcome::err("memory save requires 'content'");
             }
-            match crate::memory::save_memory(&cfg.workspace, name, content, mem_type, description) {
+            match crate::memory::save_memory_scoped(
+                &cfg.workspace,
+                scope,
+                name,
+                content,
+                mem_type,
+                description,
+            ) {
                 Ok(p) => {
                     let id = p
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    Outcome::ok(format!("saved memory '{name}' (id: {id})"))
+                    Outcome::ok(format!("saved {} memory '{name}' (id: {id})", scope.as_str()))
                 }
                 Err(e) => Outcome::err(e),
             }
@@ -2431,8 +2441,9 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
             if content.trim().is_empty() {
                 return Outcome::err("memory append requires 'content'");
             }
-            match crate::memory::append_memory(
+            match crate::memory::append_memory_scoped(
                 &cfg.workspace,
+                scope,
                 name,
                 content,
                 mem_type,
@@ -2444,13 +2455,21 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    Outcome::ok(format!("appended to memory '{name}' (id: {id})"))
+                    Outcome::ok(format!("appended to {} memory '{name}' (id: {id})", scope.as_str()))
                 }
                 Err(e) => Outcome::err(e),
             }
         }
         "list" => {
-            let entries = crate::memory::scan_memories(&cfg.workspace);
+            // When a scope is explicitly specified, list only that scope.
+            // When omitted (the common case), list BOTH scopes so the agent
+            // sees every memory it has — global + workspace.
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let entries = if scope_str.is_empty() {
+                crate::memory::scan_all_memories(&cfg.workspace)
+            } else {
+                crate::memory::scan_memories_scoped(&cfg.workspace, scope)
+            };
             if entries.is_empty() {
                 return Outcome::ok("(no memories)");
             }
@@ -2467,8 +2486,8 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     format!(": {}", m.description)
                 };
                 out.push_str(&format!(
-                    "- {} [id: {}] ({}){}\n",
-                    m.name, id, m.mem_type, desc
+                    "- {} [id: {}] ({}, {}){}\n",
+                    m.name, id, m.mem_type, m.scope.as_str(), desc
                 ));
                 if !m.content.is_empty() {
                     for l in m.content.lines().take(3) {
@@ -2483,7 +2502,15 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
             if id.trim().is_empty() {
                 return Outcome::err("memory forget requires 'id' (the memory slug/name)");
             }
-            match crate::memory::forget_memory(&cfg.workspace, id) {
+            // When a scope is specified, delete from that scope only.
+            // When omitted, search both scopes (workspace first, then global).
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let result = if scope_str.is_empty() {
+                crate::memory::forget_memory_any(&cfg.workspace, id)
+            } else {
+                crate::memory::forget_memory_scoped(&cfg.workspace, scope, id)
+            };
+            match result {
                 Ok(()) => Outcome::ok(format!("forgot memory '{id}'")),
                 Err(e) => Outcome::err(e),
             }
