@@ -289,7 +289,42 @@ func (s *session) renderMetrics() string {
 		}
 		out += fmt.Sprintf("summary %s chars", compactTokens(uint64(s.summaryChars)))
 	}
+	// Live Umans account-wide concurrency (used/limit) goes FIRST, ahead of
+	// tps/ttft/cached, so it reads "Conc 3/8 · 42 tok/s · …". It is shown even
+	// when idle (no turn metrics) because it is polled independently every few
+	// seconds — that is the "always live" part. Hidden when not Umans / fetch
+	// failed; limit renders ∞ when the plan is unlimited.
+	if conc := s.renderUmansConc(); conc != "" {
+		if out != "" {
+			out = conc + " · " + out
+		} else {
+			out = conc
+		}
+	}
 	return out
+}
+
+// renderUmansConc renders the live concurrency field for the footer, e.g.
+// "Conc 3/8". Returns "" (hide) when there is no usage reading (not Umans,
+// no key, or the /v1/usage fetch failed), OR when the selected model does NOT
+// route to the Umans provider the poll is tracking — a Gemini/OpenAI model
+// selected means no conc field, even if a Umans provider is logged in. A null
+// limit (unlimited plan) renders as ∞.
+func (s *session) renderUmansConc() string {
+	if s.umansConcUsed == nil || s.umansConcProvider == "" {
+		return ""
+	}
+	// Only show when the selected model routes to this Umans provider.
+	if s.modelIdx < 0 || s.modelIdx >= len(s.models) {
+		return ""
+	}
+	if s.models[s.modelIdx].Provider != s.umansConcProvider {
+		return ""
+	}
+	if s.umansConcLimit == nil {
+		return fmt.Sprintf("Conc %d/∞", *s.umansConcUsed)
+	}
+	return fmt.Sprintf("Conc %d/%d", *s.umansConcUsed, *s.umansConcLimit)
 }
 
 // fitRow places left flush and right flush, padding the gap.

@@ -40,6 +40,7 @@ export const initialState: AgentState = {
   retrying: false,
   pendingApproval: null,
   metrics: null,
+  umansConc: null,
   sessions: [],
   currentSessionFile: null,
   stats: null,
@@ -395,6 +396,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return onToolCall(state, ev);
     case "tool_result":
       return onToolResult(state, ev);
+    case "umans_conc": {
+      const { used, limit, provider } = ev;
+      // Live account-wide Umans concurrency from the /v1/usage poll. null used
+      // => not Umans / fetch failed (hide); null limit => unlimited (render ∞).
+      // `provider` is the Umans provider the poll tracks; the header only shows
+      // the field when the selected model routes to it.
+      return { ...state, umansConc: { used: used ?? null, limit: limit ?? null, provider: provider ?? "" } };
+    }
     case "metrics": {
       const { type: _t, ...rest } = ev;
       const metrics = { ...state.metrics, ...rest };

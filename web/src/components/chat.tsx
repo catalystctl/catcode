@@ -347,6 +347,7 @@ export function Chat() {
           thinkingLevel={state.thinkingLevel}
           approvalMode={state.approvalMode}
           metrics={state.metrics}
+          umansConc={state.umansConc}
           streaming={state.streaming}
           retrying={state.retrying}
           sessionFile={state.currentSessionFile}

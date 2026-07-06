@@ -404,6 +404,32 @@ impl State {
         Some(resolve_provider_from_config(&p, &keys))
     }
 
+    /// Find a configured Umans provider that has a usable API key, searching
+    /// ALL configured providers (not just the active one) so the concurrency
+    /// `/v1/usage` poll stays live even when a non-Umans provider is active but
+    /// a Umans model is selected. Prefers the active/legacy provider when it is
+    /// Umans (the common case); otherwise scans the configured providers.
+    pub async fn umans_provider_with_key(&self) -> Option<ResolvedProvider> {
+        // Prefer the active/legacy provider when it is Umans with a key.
+        let active = self.resolved_provider().await;
+        if provider::is_umans(&active.base_url) && active.api_key.is_some() {
+            return Some(active);
+        }
+        // Otherwise scan every configured provider for a Umans one with a key.
+        let names: Vec<String> = {
+            let cfg = self.cfg.read().await;
+            cfg.providers.iter().map(|p| p.name.clone()).collect()
+        };
+        for name in &names {
+            if let Some(rp) = self.resolve_provider_by_name(name).await {
+                if provider::is_umans(&rp.base_url) && rp.api_key.is_some() {
+                    return Some(rp);
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve the provider that should serve a turn for `model`: look up the
     /// model in the aggregated list, route to its owning provider; fall back to
     /// the active/legacy provider when the model has no provider tag (legacy
@@ -1083,6 +1109,54 @@ async fn main() {
                 .await
                 .insert(name.clone(), key.clone());
         }
+    }
+
+    // Background poll of the Umans gateway's `/v1/usage` endpoint so the footer
+    // can show a LIVE, account-wide concurrency usage (used/limit) ahead of tps.
+    // Updated every few seconds, independent of turns. Polls ANY configured Umans
+    // provider that has a key (not just the active one) so conc stays live even
+    // when a non-Umans provider is active but a Umans model is selected. Emits
+    // `umans_conc { used, limit, provider }` — `provider` is the Umans provider
+    // name it polled, so the UI only renders the field when the SELECTED model
+    // routes to that provider (a Gemini/OpenAI model selected → hidden). Both
+    // null + no provider when no Umans provider is available, to clear the UI.
+    {
+        let st = state.clone();
+        let cl = client.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(5);
+            let mut last_provider: Option<String> = None;
+            loop {
+                match st.umans_provider_with_key().await {
+                    Some(rp) => {
+                        let name = rp.name.clone();
+                        let (used, limit) =
+                            match rp.api_key.as_deref() {
+                                Some(k) => match provider::fetch_umans_usage(&cl, &rp.base_url, k).await {
+                                    Some(u) => (u.used, u.limit),
+                                    None => (None, None),
+                                },
+                                None => (None, None),
+                            };
+                        let used_v = used.map(Value::from).unwrap_or(Value::Null);
+                        let limit_v = limit.map(Value::from).unwrap_or(Value::Null);
+                        emit(
+                            &Event::new("umans_conc")
+                                .with("used", used_v)
+                                .with("limit", limit_v)
+                                .with("provider", json!(name)),
+                        );
+                        last_provider = Some(name);
+                    }
+                    None => {
+                        if last_provider.take().is_some() {
+                            emit(&Event::new("umans_conc").with("used", Value::Null).with("limit", Value::Null));
+                        }
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     let stdin = tokio::io::stdin();

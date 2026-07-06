@@ -5,7 +5,7 @@
 // the secondary controls on small screens.
 
 import { useState } from "react";
-import type { Metrics } from "@/lib/types";
+import type { Metrics, UmansConc } from "@/lib/types";
 import { formatTokens, formatTps, formatMs, basename } from "@/lib/format";
 import { useOutsideClose } from "@/lib/use-outside-close";
 import {
@@ -24,11 +24,13 @@ interface Props {
   connected: boolean;
   workspace: string;
   provider: string;
-  models: { id: string; name: string; reasoning: boolean; thinking_levels: string[] }[];
+  models: { id: string; name: string; reasoning: boolean; thinking_levels: string[]; provider?: string }[];
   selectedModel: string | null;
   thinkingLevel: string;
   approvalMode: string;
   metrics: Metrics | null;
+  /** Live Umans concurrency (used/limit); shown ahead of tps when present. */
+  umansConc?: UmansConc | null;
   streaming: boolean;
   retrying: boolean;
   sessionFile: string | null;
@@ -57,6 +59,7 @@ export function Header(props: Props) {
   const effLevels = current?.reasoning ? levels : ["off"];
 
   const m = props.metrics;
+  const conc = props.umansConc;
   const approvalModes: Array<"never" | "destructive" | "always"> = ["never", "destructive", "always"];
 
   return (
@@ -204,6 +207,13 @@ export function Header(props: Props) {
           <div className="hidden items-center gap-2.5 font-mono text-[10px] text-ink-400 lg:flex">
             {m.prompt_tokens != null && <span title="input tokens">↑{formatTokens(m.prompt_tokens)}</span>}
             {m.tokens_out != null && <span title="output tokens">↓{formatTokens(m.tokens_out)}</span>}
+            {conc && conc.used != null && current.provider === conc.provider && (
+              <span title="live account-wide concurrency in use / plan limit" className="text-accent-soft">
+                {conc.limit == null
+                  ? `Conc ${conc.used}/∞`
+                  : `Conc ${conc.used}/${conc.limit}`}
+              </span>
+            )}
             {m.tps != null && <span title="tokens/sec" className="text-accent-soft">{formatTps(m.tps)}</span>}
             {m.ttft_ms != null && <span title="time to first token">ttft {formatMs(m.ttft_ms)}</span>}
           </div>

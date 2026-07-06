@@ -94,6 +94,9 @@ type session struct {
 	lastCachePct  int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
 	tokensSaved   uint64              // cumulative tokens reclaimed by digest + compaction (shown next to "cached" in the footer)
 	summaryChars  int                 // character count of the current rolling compaction summary (0 until a summary is produced)
+	umansConcUsed  *int64            // live Umans account-wide concurrency in use; nil => not Umans / fetch failed (hide the field)
+	umansConcLimit *int64            // Umans plan concurrency ceiling; nil => unlimited (render ∞); only meaningful when used != nil
+	umansConcProvider string        // the Umans provider name the poll is tracking; conc shows only when the selected model routes here
 	subProgress   []*subProgressEntry // live subagent runs (drives the progress panel)
 	cwd           string              // working dir, shown in the header as ~/
 

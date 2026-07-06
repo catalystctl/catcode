@@ -364,6 +364,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 
+	case "umans_conc":
+		// Live account-wide concurrency from the Umans gateway's /v1/usage poll
+		// (core background task). used=nil => not Umans / fetch failed → hide;
+		// used set + limit=nil => unlimited → render ∞. `provider` is the Umans
+		// provider the poll tracks; renderUmansConc only shows the field when the
+		// selected model routes to it (a Gemini/OpenAI model selected → hidden).
+		s.umansConcUsed = nullableInt64(ev.get("used"))
+		s.umansConcLimit = nullableInt64(ev.get("limit"))
+		s.umansConcProvider = ev.get("provider")
+
 	case "approval_request":
 		s.pendingApproval = &approvalPrompt{
 			requestID: ev.get("request_id"),

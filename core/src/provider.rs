@@ -52,6 +52,67 @@ pub fn is_umans(base_url: &str) -> bool {
     host == "umans.ai" || host.ends_with(".umans.ai")
 }
 
+/// Live account-wide concurrency usage from the Umans gateway's `/v1/usage`
+/// endpoint. `used` = the number of concurrent sessions right now (across ALL
+/// clients on this key, not just this process — the gateway tracks it), `limit`
+/// = the plan's concurrency ceiling. `limit == None` means the plan has no
+/// concurrency cap (unlimited) OR the field was absent — the footer renders
+/// these as `∞`.
+///
+/// Returns `None` only when the HTTP request fails or the payload can't be
+/// parsed — a successful fetch always yields `Some` (the inner fields may be
+/// `None`). Polled every few seconds by the background task in `main.rs` so the
+/// footer can show a live "Conc used/limit" ahead of tps; mirrors the
+/// pi-provider-umans status widget.
+pub struct UmansUsage {
+    pub used: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// Parse the Umans `/v1/usage` JSON payload into `UmansUsage`. Pure (no I/O) so
+/// it can be unit-tested against the documented response shape:
+/// `{ limits: { concurrency: { limit }, requests: { limit } },
+///    usage: { requests_in_window, concurrent_sessions } }`.
+/// `used` = `usage.concurrent_sessions`; `limit` = `limits.concurrency.limit`
+/// (null/absent → `None`, rendered as ∞ by the UI).
+pub fn parse_umans_usage(v: &Value) -> UmansUsage {
+    let used = v
+        .get("usage")
+        .and_then(|u| u.get("concurrent_sessions"))
+        .and_then(|c| c.as_u64());
+    let limit = v
+        .get("limits")
+        .and_then(|l| l.get("concurrency"))
+        .and_then(|c| c.get("limit"))
+        .and_then(|l| l.as_u64());
+    UmansUsage { used, limit }
+}
+
+pub async fn fetch_umans_usage(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Option<UmansUsage> {
+    // base_url conventionally ends in `/v1` (e.g. https://api.code.umans.ai/v1),
+    // so the usage endpoint is `{base_url}/usage` — matching how the chat path
+    // is built as `{base_url}/chat/completions`. (The pi-provider-umans build
+    // is `{base-without-v1}/v1/usage`; both resolve to the same URL.)
+    let url = format!("{}/usage", base_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    Some(parse_umans_usage(&v))
+}
+
 /// The reasoning levels offered when a model advertises none of its own
 /// (and as the fallback set the TUI cycles through).
 pub const DEFAULT_THINKING_LEVELS: &[&str] = &["low", "medium", "high"];
@@ -3608,6 +3669,40 @@ mod tests {
         assert!(!is_opencode_go("https://opencode.ai.evil.com/zen/go/v1"));
         // not umans (must not trigger Umans-only wire fields)
         assert!(!is_umans("https://opencode.ai/zen/go/v1"));
+    }
+
+    #[test]
+    fn parse_umans_usage_fields() {
+        // Documented /v1/usage shape from the Umans gateway (matches
+        // pi-provider-umans): concurrent_sessions = current, limits.concurrency.limit
+        // = guaranteed plan ceiling.
+        let v = json!({
+            "limits": { "concurrency": { "limit": 8 }, "requests": { "limit": 500 } },
+            "usage": { "requests_in_window": 12, "concurrent_sessions": 3 }
+        });
+        let u = parse_umans_usage(&v);
+        assert_eq!(u.used, Some(3));
+        assert_eq!(u.limit, Some(8));
+    }
+
+    #[test]
+    fn parse_umans_usage_unlimited_limit() {
+        // A null concurrency limit = unlimited plan → None (UI renders ∞).
+        let v = json!({
+            "limits": { "concurrency": { "limit": null } },
+            "usage": { "concurrent_sessions": 1 }
+        });
+        let u = parse_umans_usage(&v);
+        assert_eq!(u.used, Some(1));
+        assert_eq!(u.limit, None);
+    }
+
+    #[test]
+    fn parse_umans_usage_missing_fields() {
+        // An empty / differently-shaped payload yields None for both (UI hides).
+        let u = parse_umans_usage(&json!({}));
+        assert_eq!(u.used, None);
+        assert_eq!(u.limit, None);
     }
 
     #[test]

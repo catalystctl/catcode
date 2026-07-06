@@ -70,6 +70,19 @@ export interface Metrics {
   model?: string;
 }
 
+/** Live, account-wide Umans concurrency usage from the gateway's `/v1/usage`
+ *  endpoint, polled every few seconds by the core (independent of turns) so the
+ *  footer can show a "Conc used/limit" field ahead of tps. `used == null` means
+ *  not Umans / fetch failed (hide); `limit == null` means the plan is unlimited
+ *  (render ∞). */
+export interface UmansConc {
+  used: number | null;
+  limit: number | null;
+  /** The Umans provider name the poll is tracking; the UI only renders the
+   *  field when the selected model routes to this provider. */
+  provider: string;
+}
+
 export interface SessionEntry {
   name: string;
   mtime: number;
@@ -235,6 +248,7 @@ export type CoreEvent =
   | { type: "tool_result"; id: string; ok: boolean; output: string; diff?: string; tool?: string }
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
   | { type: "metrics" } & Metrics
+  | { type: "umans_conc"; used: number | null; limit: number | null; provider: string }
   | { type: "compacted"; before_tokens: number; after_tokens: number }
   | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
@@ -455,6 +469,9 @@ export interface AgentState {
   retrying: boolean;
   pendingApproval: ApprovalRequest | null;
   metrics: Metrics | null;
+  /** Live Umans concurrency (used/limit) from the `/v1/usage` poll; null when
+   *  not Umans / fetch failed. Drives a footer field ahead of tps. */
+  umansConc: UmansConc | null;
   sessions: SessionEntry[];
   currentSessionFile: string | null;
   stats: Stats | null;

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -149,6 +150,20 @@ func get(m map[string]json.RawMessage, key string) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.TrimSpace(string(v))
+}
+
+// nullableInt64 parses a coreEvent.get() string into a *int64. Returns nil for
+// "" / "null" / unparseable — used for the Umans concurrency fields where nil
+// means "absent" (hide the field for used; render ∞ for limit).
+func nullableInt64(s string) *int64 {
+	if s == "" || s == "null" {
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &n
 }
 
 func metricStr(raw json.RawMessage) string {

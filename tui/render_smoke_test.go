@@ -243,6 +243,49 @@ func TestThemeAndMetrics(t *testing.T) {
 	}
 	t.Logf("METRICS: %s  CONTEXT: %s", m, ctx)
 
+	// Umans live concurrency is shown AHEAD of tps ("Conc 3/8 · 42 tok/s …")
+	// and is rendered even when idle (no turn metrics), because it is polled
+	// independently. A nil limit (unlimited plan) renders as ∞. It only shows
+	// when the selected model routes to the Umans provider the poll tracks.
+	var used int64 = 3
+	var limit int64 = 8
+	s.lastMetrics = nil // idle: no turn metrics yet
+	s.umansConcUsed = &used
+	s.umansConcLimit = &limit
+	s.umansConcProvider = "umans"
+	s.models = []modelInfo{{ID: "umans-glm-5.2", Provider: "umans"}}
+	s.modelIdx = 0
+	mc := s.renderMetrics()
+	if !strings.Contains(mc, "Conc 3/8") {
+		t.Errorf("conc should render when a umans model is selected, got %q", mc)
+	}
+	// conc must precede tps when both are present.
+	s.lastMetrics = []byte(`{"tps":"42.1","ttft_ms":"180"}`)
+	mc = s.renderMetrics()
+	if ci, ti := strings.Index(mc, "Conc 3/8"), strings.Index(mc, "42 tok/s"); ci < 0 || ti < 0 || ci > ti {
+		t.Errorf("conc should appear before tps, got %q", mc)
+	}
+	// unlimited plan → ∞.
+	s.umansConcLimit = nil
+	mc = s.renderMetrics()
+	if !strings.Contains(mc, "Conc 3/∞") {
+		t.Errorf("unlimited limit should render ∞, got %q", mc)
+	}
+	// a non-Umans model selected (e.g. Gemini) → hidden, even with a live value.
+	s.models = []modelInfo{{ID: "gemini-2.5-pro", Provider: "gemini"}}
+	s.umansConcLimit = &limit
+	mc = s.renderMetrics()
+	if strings.Contains(mc, "Conc") {
+		t.Errorf("conc should be hidden when a non-umans model is selected, got %q", mc)
+	}
+	// not Umans / fetch failed (used nil) → hidden entirely.
+	s.models = []modelInfo{{ID: "umans-glm-5.2", Provider: "umans"}}
+	s.umansConcUsed = nil
+	mc = s.renderMetrics()
+	if strings.Contains(mc, "Conc") {
+		t.Errorf("conc should be hidden when used is nil, got %q", mc)
+	}
+
 	// long model list scrolls + highlights
 	s.width = 60
 	s.height = 16
