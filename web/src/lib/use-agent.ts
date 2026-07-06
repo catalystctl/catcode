@@ -63,6 +63,9 @@ export interface AgentApi {
   dismissToast: (id: string) => void;
   // ── Subagent / intercom ──
   intercomReply: (reply: string) => Promise<void>;
+  // ── OAuth ──
+  submitOauthCode: (code: string) => Promise<void>;
+  dismissOauth: () => void;
   // ── Turn / history ──
   undo: () => Promise<void>;
   clear: () => Promise<void>;
@@ -409,6 +412,23 @@ export function useAgent(): AgentApi {
     [send],
   );
 
+  // ── OAuth ──
+  // Complete a no-browser (manual-code) OAuth login by pasting the code or
+  // final callback URL the provider returned. Mirrors the TUI's /oauth-code.
+  const submitOauthCode = useCallback(
+    async (code: string) => {
+      const v = code.trim();
+      if (!v) return;
+      await post({ type: "oauth_code", code: v });
+    },
+    [post],
+  );
+  const dismissOauth = useCallback(() => {
+    // Hide the banner only — the core keeps its pending login until oauth_code
+    // or a fresh /login, so dismissing does not cancel an in-flight login.
+    setState((s) => ({ ...s, pendingOauth: null }));
+  }, []);
+
   // ── Turn / history ──
   const undo = useCallback(() => send({ type: "undo" }), [send]);
   const clear = useCallback(() => send({ type: "clear" }), [send]);
@@ -596,6 +616,8 @@ export function useAgent(): AgentApi {
       stats,
       dismissToast,
       intercomReply,
+      submitOauthCode,
+      dismissOauth,
       undo,
       clear,
       saveMemory,

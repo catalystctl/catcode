@@ -15,6 +15,8 @@ import { Composer, type ComposerHandle } from "./composer";
 import { Toasts } from "./toasts";
 import { Approval } from "./approval";
 import { IntercomPrompt } from "./intercom";
+import { OauthPromptBanner } from "./oauth-prompt";
+import { WorkStatePanel } from "./work-state";
 import { SubagentsPanel } from "./subagents";
 import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
@@ -169,6 +171,13 @@ export function Chat() {
       case "key": {
         const key = window.prompt("Enter API key:");
         if (key?.trim()) void a.setKey(key.trim());
+        return;
+      }
+      case "oauth-code": {
+        // Complete a pending no-browser OAuth login (the /login flow printed a
+        // URL; paste its code or final localhost callback URL here).
+        const code = window.prompt("Paste the OAuth code or final callback URL:");
+        if (code?.trim()) void a.submitOauthCode(code.trim());
         return;
       }
       case "login": {
@@ -351,6 +360,8 @@ export function Chat() {
           onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         />
 
+        {state.workState && <WorkStatePanel ws={state.workState} />}
+
         {/* Messages */}
         <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto">
           {empty || switching ? (
@@ -385,6 +396,15 @@ export function Chat() {
                     prompt={state.pendingIntercom}
                     onReply={agent.intercomReply}
                     onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
+                  />
+                </div>
+              )}
+              {state.pendingOauth && (
+                <div className="mx-4 mb-2 sm:mx-6">
+                  <OauthPromptBanner
+                    prompt={state.pendingOauth}
+                    onSubmit={agent.submitOauthCode}
+                    onDismiss={agent.dismissOauth}
                   />
                 </div>
               )}

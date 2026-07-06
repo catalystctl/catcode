@@ -195,6 +195,29 @@ export interface VisionConfig {
   vision_model: string | null;
 }
 
+/** An OAuth authorization prompt from the core: the user must visit `url`
+ *  (and, for the device flow, enter `code`) to complete a provider login. For
+ *  the no-browser flow the user pastes the resulting code/callback URL back via
+ *  the `oauth_code` command. */
+export interface OauthPrompt {
+  url: string;
+  code?: string;
+  message?: string;
+}
+
+/** Rolling work-state summary the core maintains from conversation signals
+ *  (goal / done / in-progress / next / recent files / last activity). Emitted
+ *  via `work_state` so the UI can render a live status panel. */
+export interface WorkState {
+  version: number;
+  goal: string;
+  done: string[];
+  in_progress: string[];
+  next: string[];
+  recent_files: string[];
+  last_activity: string;
+}
+
 /** Core events (server → client). A typed subset of what the core emits. */
 export type CoreEvent =
   | ReadyPayload
@@ -248,8 +271,12 @@ export type CoreEvent =
   | { type: "workspace_changed"; workspace: string; projects: ProjectEntry[] }
   | { type: "session_renamed"; name: string; title: string }
   // ── Compaction / config ──
-  | { type: "digested"; count?: number; what?: string }
+  | { type: "digested"; results: number; before_tokens: number; after_tokens: number }
   | { type: "config_changed"; key: string; value: string | number }
+  // ── OAuth / lifecycle status ──
+  | { type: "oauth_prompt"; url: string; code?: string; message?: string }
+  | { type: "reflecting"; recurrence: number | string }
+  | { type: "work_state"; version: number; goal: string; done: string[]; in_progress: string[]; next: string[]; recent_files: string[]; last_activity: string }
   // ── Skills ──
   | { type: "skills"; skills: SkillInfo[] };
 
@@ -268,6 +295,7 @@ export type CoreCommand =
   | { type: "list_provider_presets" }
   | { type: "login"; preset: string; api_key?: string }
   | { type: "logout"; provider: string }
+  | { type: "oauth_code"; code: string }
   | { type: "list_sessions" }
   | { type: "load_session"; path: string }
   | { type: "new_session"; path?: string }
@@ -435,10 +463,14 @@ export interface AgentState {
   plugins: PluginEntry[];
   skills: SkillInfo[];
   pendingIntercom: IntercomPrompt | null;
+  pendingOauth: OauthPrompt | null;
   intercomLog: IntercomEntry[];
   /** Live subagent runs keyed by run_id — the SubagentsPanel list + drill-in chat. */
   subagentRuns: Record<string, SubagentRunView>;
   visionConfig: VisionConfig | null;
+  /** Rolling work-state summary (goal/done/doing/next/recent files) from
+   *  `work_state` events — drives the ambient status panel. */
+  workState: WorkState | null;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;
 }

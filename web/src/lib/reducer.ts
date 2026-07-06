@@ -48,9 +48,11 @@ export const initialState: AgentState = {
   plugins: [],
   skills: [],
   pendingIntercom: null,
+  pendingOauth: null,
   intercomLog: [],
   subagentRuns: {},
   visionConfig: null,
+  workState: null,
   switching: false,
 };
 
@@ -358,9 +360,9 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     case "provider_presets":
       return { ...state, providerPresets: ev.presets ?? [] };
     case "authed":
-      return { ...state, authed: ev.ok };
+      return { ...state, authed: ev.ok, pendingOauth: null };
     case "provider_changed":
-      return { ...state, provider: ev.provider, providerKind: ev.kind, authed: ev.has_key };
+      return { ...state, provider: ev.provider, providerKind: ev.kind, authed: ev.has_key, pendingOauth: null };
     case "approval_changed": {
       if (ev.mode.includes(":")) {
         const kind = ev.mode.split(":")[0];
@@ -468,6 +470,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentAssistantId: null,
         streaming: false,
         pendingApproval: null,
+        workState: null,
       };
     case "done":
       return finishTurn(state);
@@ -651,6 +654,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         sessions: [],
         currentSessionFile: null,
         stats: null,
+        workState: null,
       };
     case "session_renamed": {
       const sessions = state.sessions.map((s) =>
@@ -660,13 +664,60 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
 
     // ── Compaction / config ──
-    case "digested":
+    case "digested": {
+      const n = ev.results;
       return {
         ...state,
-        toasts: pushToast(state.toasts, "info", ev.count && ev.count > 1 ? `Compacted ${ev.count} large result(s)` : "Compacted a large result"),
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          n > 1
+            ? `Compacted ${n} large result(s) — ${ev.before_tokens.toLocaleString()} → ${ev.after_tokens.toLocaleString()} tokens`
+            : `Compacted a large result — ${ev.before_tokens.toLocaleString()} → ${ev.after_tokens.toLocaleString()} tokens`,
+        ),
       };
+    }
     case "config_changed":
       return { ...state, toasts: pushToast(state.toasts, "info", `${ev.key} → ${ev.value}`) };
+
+    // ── OAuth / lifecycle status ──
+    case "oauth_prompt":
+      // The core needs the user to visit an authorize URL (and, for the device
+      // flow, paste back a code). Surface it as a blocking banner + a toast.
+      return {
+        ...state,
+        pendingOauth: { url: ev.url, code: ev.code, message: ev.message },
+        toasts: pushToast(state.toasts, "info", ev.message || "Complete the OAuth login in your browser"),
+      };
+    case "reflecting": {
+      // Auto-reflect injected a reflection continuation turn. Mirror the TUI's
+      // logInfo so the post-finish model activity isn't a mystery.
+      const n = String(ev.recurrence ?? "");
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          n && n !== "0"
+            ? `auto-reflect: reflecting on this turn (${n} recurring patterns)…`
+            : "auto-reflect: reflecting on this turn…",
+        ),
+      };
+    }
+    case "work_state":
+      // Rolling KV-cache-aware work-state summary (goal/done/doing/next/files).
+      return {
+        ...state,
+        workState: {
+          version: ev.version,
+          goal: ev.goal,
+          done: ev.done,
+          in_progress: ev.in_progress,
+          next: ev.next,
+          recent_files: ev.recent_files,
+          last_activity: ev.last_activity,
+        },
+      };
 
     default:
       return state;
