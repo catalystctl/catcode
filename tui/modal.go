@@ -1472,9 +1472,13 @@ func (s *session) renderModalBody() string {
 }
 
 // fitListRow builds a single-line list row — marker + label + desc — that
-// fits width visible columns, truncating the label first (it is the least
-// essential) so the description (e.g. "12 msgs · 2h ago") is kept whole. The
-// marker is already styled; markerW is its visible width.
+// fits width visible columns. When both fit, the description is kept whole
+// and the label is truncated (it is the least essential for session-style
+// rows like "12 msgs · 2h ago"). When the description is too long to fit
+// beside any label, the label is kept (truncated) and the description is
+// truncated to the remaining space — the command name must stay visible so
+// name + description always share one line. The marker is already styled;
+// markerW is its visible width.
 func fitListRow(marker, label, desc string, markerW, width int) string {
 	budget := width - markerW
 	if budget < 0 {
@@ -1484,9 +1488,16 @@ func fitListRow(marker, label, desc string, markerW, width int) string {
 		if 2+d <= budget {
 			label = truncateFit(label, budget-2-d)
 		} else {
-			// desc alone fills the row: drop the label, truncate the desc
-			label = ""
-			desc = truncateFit(desc, budget)
+			// desc is too long to fit whole beside any label: keep a truncated
+			// label (the command name is what the user selects, so it must stay
+			// visible) and truncate the desc to the remaining space so name +
+			// description stay on a single line instead of the label vanishing.
+			maxLabel := budget / 3 // cap so a long label can't starve the desc
+			if maxLabel < 1 {
+				maxLabel = 1
+			}
+			label = truncateFit(label, maxLabel)
+			desc = truncateFit(desc, budget-2-len([]rune(label)))
 		}
 	} else {
 		label = truncateFit(label, budget)
