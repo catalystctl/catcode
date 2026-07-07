@@ -1,4 +1,7 @@
 import type { Metadata, Viewport } from "next";
+import "@fontsource-variable/dm-sans";
+import "@fontsource-variable/outfit";
+import "@fontsource-variable/jetbrains-mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -6,12 +9,12 @@ export const metadata: Metadata = {
   description: "A web interface for the Umans coding-agent harness.",
   icons: {
     icon:
-      "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%2309090b'/><text x='50' y='68' font-size='58' text-anchor='middle' font-family='monospace' fill='%238b7cff'>u</text></svg>",
+      "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0a'/><text x='50' y='68' font-size='58' text-anchor='middle' font-family='monospace' fill='%23cf8a59'>u</text></svg>",
   },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#08080a",
+  themeColor: "#0a0a0a",
   width: "device-width",
   initialScale: 1,
 };

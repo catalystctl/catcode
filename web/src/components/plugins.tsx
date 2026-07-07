@@ -89,7 +89,7 @@ export function PluginsPanel({ plugins, onInstall, onRemove, onEnable, onDisable
                     <span
                       className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
                         p.enabled
-                          ? "bg-emerald-500/10 text-emerald-300"
+                          ? "bg-success/10 text-success"
                           : "bg-ink-800 text-ink-500"
                       }`}
                     >
@@ -106,7 +106,7 @@ export function PluginsPanel({ plugins, onInstall, onRemove, onEnable, onDisable
                       ) : (
                         <button
                           onClick={() => onEnable(p.name)}
-                          className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-300 transition-colors hover:bg-emerald-500/20"
+                          className="rounded-md border border-success/30 bg-success/10 px-2 py-1 text-[11px] text-success transition-colors hover:bg-success/20"
                         >
                           Enable
                         </button>
@@ -115,7 +115,7 @@ export function PluginsPanel({ plugins, onInstall, onRemove, onEnable, onDisable
                         onClick={() => {
                           if (window.confirm(`Remove plugin "${p.name}"?`)) onRemove(p.name);
                         }}
-                        className="rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-rose-500/10 hover:text-rose-400 group-hover:opacity-100"
+                        className="rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100"
                         title="Remove"
                       >
                         <TrashIcon width={13} height={13} />
@@ -126,7 +126,7 @@ export function PluginsPanel({ plugins, onInstall, onRemove, onEnable, onDisable
                     <p className="mt-1 text-[11px] text-ink-500">{p.description}</p>
                   )}
                   {p.error && (
-                    <p className="mt-1 text-[11px] text-rose-300">{p.error}</p>
+                    <p className="mt-1 text-[11px] text-danger">{p.error}</p>
                   )}
                 </div>
               ))}

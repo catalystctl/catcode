@@ -9,6 +9,7 @@ const config: Config = {
       fontFamily: {
         sans: ["var(--font-sans)", "ui-sans-serif", "system-ui", "sans-serif"],
         mono: ["var(--font-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+        display: ["var(--font-display)", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       colors: {
         // Refined dark surface scale (zinc-tuned, slightly cooler).
@@ -35,6 +36,11 @@ const config: Config = {
           soft: "rgb(var(--accent-soft) / <alpha-value>)",
           deep: "rgb(var(--accent-deep) / <alpha-value>)",
         },
+        // Semantic tokens (catalyst Obsidian: success / warning / danger / info).
+        success: "rgb(var(--success) / <alpha-value>)",
+        warning: "rgb(var(--warning) / <alpha-value>)",
+        danger: "rgb(var(--danger) / <alpha-value>)",
+        info: "rgb(var(--info) / <alpha-value>)",
       },
       keyframes: {
         "fade-in": {
@@ -61,7 +67,7 @@ const config: Config = {
         "pulse-ring": "pulse-ring 1.4s ease-out infinite",
       },
       boxShadow: {
-        glow: "0 0 0 1px rgba(139,124,255,0.25), 0 0 24px -6px rgba(139,124,255,0.45)",
+        glow: "0 0 0 1px rgba(207,138,89,0.25), 0 0 24px -6px rgba(207,138,89,0.45)",
       },
     },
   },

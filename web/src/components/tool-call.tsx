@@ -42,7 +42,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
         <span className="shrink-0 text-sm">{toolIcon(tc.name)}</span>
         <span className="font-mono text-[13px] font-medium text-ink-100">{tc.name || "tool"}</span>
         {danger && (
-          <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+          <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
             destructive
           </span>
         )}
@@ -61,11 +61,11 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
               loaded
             </span>
           ) : ok ? (
-            <span className="flex items-center gap-1 text-[11px] text-emerald-400">
+            <span className="flex items-center gap-1 text-[11px] text-success">
               <CheckIcon width={12} height={12} /> ok
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-rose-400">
+            <span className="flex items-center gap-1 text-[11px] text-danger">
               <XIcon width={12} height={12} /> error
             </span>
           )}
@@ -97,7 +97,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
               {tc.result.diff && <Diff diff={tc.result.diff} />}
               <pre
                 className={`mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed ${
-                  ok || unknown ? "text-ink-200" : "text-rose-300"
+                  ok || unknown ? "text-ink-200" : "text-danger"
                 }`}
               >
                 {tc.result.output || "(no output)"}

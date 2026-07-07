@@ -30,6 +30,25 @@ type theme struct {
 }
 
 var themes = []theme{
+	// --- Catalyst (Obsidian design system) — default ---
+	// Matches the catalystctl frontend: pure neutral-black grayscale with a
+	// warm peach accent. Source: catalyst-website/src/styles/global.css.
+	// Kept first so it is the default for new users; existing users keep their
+	// saved theme (lookups are by name, not index).
+	{
+		name:    "catalyst",
+		bg:      "#0a0a0a", // 0 0% 4%
+		fg:      "#f0f0f0", // 0 0% 94%
+		dim:     "#4d4d4d", // 0 0% 30%
+		muted:   "#858585", // 0 0% 52%
+		accent:  "#cf8a59", // peach  25 55% 58%
+		user:    "#cf8a59", // peach (terminal prompt)
+		assist:  "#f0f0f0", // 0 0% 94%
+		tool:    "#f59f0a", // amber  38 92% 50%
+		success: "#3bde77", // green 142 71% 55%
+		warn:    "#f59f0a", // amber  38 92% 50%
+		err:     "#ef4343", // red    0 84% 60%
+	},
 	{
 		name:    "mocha",
 		bg:      "#1e1e2e",

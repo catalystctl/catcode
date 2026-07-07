@@ -144,10 +144,10 @@ export function SettingsModal(props: Props) {
                     className={`flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
                       active
                         ? mode === "always"
-                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                          ? "border-success/40 bg-success/10 text-success"
                           : mode === "never"
                             ? "border-ink-700 bg-ink-850 text-ink-100"
-                            : "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                            : "border-warning/40 bg-warning/10 text-warning"
                         : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
                     }`}
                   >

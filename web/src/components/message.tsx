@@ -122,7 +122,7 @@ function UserMessage({
               {m.text}
             </div>
             {m.steer && (
-              <span className="absolute -top-2 right-2 rounded-full border border-amber-500/40 bg-ink-950 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-300">
+              <span className="absolute -top-2 right-2 rounded-full border border-warning/40 bg-ink-950 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-warning">
                 ↳ steer
               </span>
             )}
@@ -228,7 +228,7 @@ function ToolMessage({ m }: { m: ToolMsg }) {
         </div>
         <pre
           className={`mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words text-[12px] ${
-            m.ok ? "text-ink-200" : "text-rose-300"
+            m.ok ? "text-ink-200" : "text-danger"
           }`}
         >
           {m.output}

@@ -9,72 +9,94 @@
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
-  --ink-950: 8 8 10;
-  --ink-925: 12 12 16;
-  --ink-900: 16 16 21;
-  --ink-850: 21 21 28;
-  --ink-800: 27 27 35;
-  --ink-750: 34 34 44;
-  --ink-700: 42 42 53;
-  --ink-600: 58 58 71;
-  --ink-500: 82 82 95;
-  --ink-400: 110 110 126;
-  --ink-300: 154 154 168;
-  --ink-200: 196 196 207;
-  --ink-100: 230 230 236;
-  --accent: 139 124 255;
-  --accent-soft: 169 156 255;
-  --accent-deep: 109 92 230;
 
-  /* Semantic extras used in prose / chrome. */
-  --bg-page: 8 8 10;
-  --bg-code: 10 10 12;
-  --bg-inline: 21 21 28;
-  --border-subtle: 34 34 44;
-  --scrollbar: 34 34 44;
-  --scrollbar-hover: 58 58 71;
-  --prose-heading: 242 242 246;
-  --prose-muted: 154 154 168;
-  --prose-link: 169 156 255;
+  /* Obsidian ink scale — pure neutral grayscale (0% saturation), matching
+     the catalystctl frontend. Surface steps 4/6/9/13% map onto the ink ramp. */
+  --ink-950: 10 10 10;    /* 4%  page bg */
+  --ink-925: 13 13 13;    /* 5% */
+  --ink-900: 15 15 15;    /* 6%  card */
+  --ink-850: 20 20 20;    /* 8% */
+  --ink-800: 26 26 26;    /* 10% */
+  --ink-750: 31 31 31;    /* 12% */
+  --ink-700: 33 33 33;    /* 13% border */
+  --ink-600: 56 56 56;    /* 22% */
+  --ink-500: 87 87 87;    /* 34% */
+  --ink-400: 117 117 117; /* 46% */
+  --ink-300: 163 163 163; /* 64% */
+  --ink-200: 212 212 212; /* 83% */
+  --ink-100: 240 240 240;/* 94% fg */
+
+  /* Accent — warm peach/salmon (catalyst primary, hsl 25 55% 58%). */
+  --accent: 207 138 89;
+  --accent-soft: 222 165 124;
+  --accent-deep: 180 120 70;
+
+  /* Semantic tokens (catalyst success / warning / danger / info). */
+  --success: 59 222 119;
+  --warning: 245 159 10;
+  --danger: 239 67 67;
+  --info: 24 211 192;
+
+  /* Prose / chrome extras. */
+  --bg-page: 10 10 10;
+  --bg-code: 8 8 8;            /* darker than page, like catalyst pre (3%) */
+  --bg-inline: 20 20 20;
+  --border-subtle: 33 33 33;
+  --scrollbar: 33 33 33;
+  --scrollbar-hover: 56 56 56;
+  --prose-heading: 240 240 240;
+  --prose-muted: 133 133 133;
+  --prose-link: 222 165 124;       /* accent-soft peach */
   --hljs-bg: transparent;
-  --inline-code-text: 230 179 255;
+  --inline-code-text: 219 178 148; /* hsl 25 50% 72% peach */
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
-    "Liberation Mono", monospace;
+  --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono",
+    SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-display: "Outfit Variable", ui-sans-serif, system-ui, sans-serif;
 }
 
 [data-theme="light"] {
   color-scheme: light;
-  --ink-950: 244 244 247;
-  --ink-925: 235 235 239;
-  --ink-900: 255 255 255;
-  --ink-850: 232 232 238;
-  --ink-800: 220 220 228;
-  --ink-750: 208 208 218;
-  --ink-700: 196 196 208;
-  --ink-600: 154 154 170;
-  --ink-500: 110 110 126;
-  --ink-400: 82 82 95;
-  --ink-300: 58 58 71;
-  --ink-200: 34 34 44;
-  --ink-100: 26 26 30;
-  --accent: 109 92 230;
-  --accent-soft: 139 124 255;
-  --accent-deep: 91 76 192;
 
-  --bg-page: 244 244 247;
-  --bg-code: 248 248 250;
-  --bg-inline: 232 232 238;
-  --border-subtle: 220 220 228;
-  --scrollbar: 196 196 208;
-  --scrollbar-hover: 154 154 170;
-  --prose-heading: 26 26 30;
-  --prose-muted: 82 82 95;
-  --prose-link: 109 92 230;
+  /* Neutral grayscale (light). */
+  --ink-950: 250 250 250; /* page bg */
+  --ink-925: 245 245 245;
+  --ink-900: 255 255 255; /* card */
+  --ink-850: 240 240 240;
+  --ink-800: 230 230 230;
+  --ink-750: 214 214 214;
+  --ink-700: 204 204 204; /* border */
+  --ink-600: 179 179 179;
+  --ink-500: 128 128 128;
+  --ink-400: 102 102 102;
+  --ink-300: 77 77 77;
+  --ink-200: 51 51 51;
+  --ink-100: 20 20 20;    /* fg */
+
+  /* Peach accent (deeper for contrast on light). */
+  --accent: 180 110 60;
+  --accent-soft: 200 130 80;
+  --accent-deep: 150 90 50;
+
+  /* Semantic tokens (light). */
+  --success: 26 122 58;
+  --warning: 180 83 9;
+  --danger: 196 18 47;
+  --info: 14 116 144;
+
+  --bg-page: 250 250 250;
+  --bg-code: 245 245 245;
+  --bg-inline: 240 240 240;
+  --border-subtle: 214 214 214;
+  --scrollbar: 204 204 204;
+  --scrollbar-hover: 154 154 154;
+  --prose-heading: 20 20 20;
+  --prose-muted: 82 82 82;
+  --prose-link: 180 110 60;
   --hljs-bg: transparent;
-  --inline-code-text: 150 60 180;
+  --inline-code-text: 160 90 40;
 }
 
 html,
@@ -387,12 +409,12 @@ body {
 
 /* ── Diff rendering ─────────────────────────────────────────────────────── */
 .diff-line-add {
-  color: #7ee2a8;
-  background: rgba(126, 226, 168, 0.08);
+  color: #3bde77;
+  background: rgba(59, 222, 119, 0.10);
 }
 .diff-line-del {
-  color: #ff8b8b;
-  background: rgba(255, 139, 139, 0.08);
+  color: #ef4343;
+  background: rgba(239, 67, 67, 0.10);
 }
 .diff-line-hunk {
   color: rgb(var(--ink-400));

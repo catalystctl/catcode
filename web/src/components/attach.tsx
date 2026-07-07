@@ -97,7 +97,7 @@ export const ImageAttach = forwardRef<ImageAttachHandle, Props>(function ImageAt
             type="button"
             onClick={() => onRemove(i)}
             aria-label={`Remove attachment ${i + 1}`}
-            className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-ink-700 bg-ink-950 text-ink-300 opacity-0 transition-opacity hover:bg-rose-500/80 hover:text-white group-hover/img:opacity-100"
+            className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-ink-700 bg-ink-950 text-ink-300 opacity-0 transition-opacity hover:bg-danger/80 hover:text-white group-hover/img:opacity-100"
           >
             <XIcon width={10} height={10} />
           </button>

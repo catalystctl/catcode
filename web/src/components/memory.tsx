@@ -103,7 +103,7 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
                       onClick={() => {
                         if (window.confirm("Forget this memory?")) onForget(m.id);
                       }}
-                      className="shrink-0 rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-rose-500/10 hover:text-rose-400 group-hover:opacity-100"
+                      className="shrink-0 rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100"
                       title="Forget"
                     >
                       <TrashIcon width={13} height={13} />

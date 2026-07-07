@@ -33,9 +33,9 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
 
   const cfg =
     toast.kind === "error"
-      ? { icon: <XIcon width={14} height={14} />, ring: "border-rose-500/30", tint: "bg-rose-500/10", text: "text-rose-300" }
+      ? { icon: <XIcon width={14} height={14} />, ring: "border-danger/30", tint: "bg-danger/10", text: "text-danger" }
       : toast.kind === "success"
-        ? { icon: <CheckIcon width={14} height={14} />, ring: "border-emerald-500/30", tint: "bg-emerald-500/10", text: "text-emerald-300" }
+        ? { icon: <CheckIcon width={14} height={14} />, ring: "border-success/30", tint: "bg-success/10", text: "text-success" }
         : { icon: <WarningIcon width={14} height={14} />, ring: "border-accent/20", tint: "bg-accent/[0.06]", text: "text-accent-soft" };
 
   return (

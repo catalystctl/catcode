@@ -30,8 +30,8 @@ export class ErrorBoundary extends Component<Props, State> {
     if (this.state.error) {
       return (
         <div className="mx-auto my-6 max-w-xl px-4">
-          <div className="rounded-xl border border-rose-500/30 bg-rose-500/[0.06] p-4">
-            <div className="flex items-center gap-2 text-[13px] font-semibold text-rose-300">
+          <div className="rounded-xl border border-danger/30 bg-danger/[0.06] p-4">
+            <div className="flex items-center gap-2 text-[13px] font-semibold text-danger">
               <span>⚠</span>
               <span>Something broke rendering{this.props.label ? ` the ${this.props.label}` : ""}.</span>
             </div>

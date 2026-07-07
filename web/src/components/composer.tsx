@@ -516,7 +516,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             {streaming ? (
               <button
                 onClick={onAbort}
-                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/10 px-3.5 text-[13px] font-medium text-rose-300 transition-colors hover:bg-rose-500/20"
+                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3.5 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
               >
                 <StopIcon width={14} height={14} /> Stop
               </button>

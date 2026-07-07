@@ -72,9 +72,9 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
   };
 
   return (
-    <div className="my-3 overflow-hidden rounded-xl border border-amber-500/30 bg-amber-500/[0.04]">
-      <div className="flex items-center gap-2 border-b border-amber-500/20 px-4 py-2.5">
-        <QuestionIcon width={15} height={15} className="text-amber-300" />
+    <div className="my-3 overflow-hidden rounded-xl border border-warning/30 bg-warning/[0.04]">
+      <div className="flex items-center gap-2 border-b border-warning/20 px-4 py-2.5">
+        <QuestionIcon width={15} height={15} className="text-warning" />
         <span className="text-sm font-semibold text-ink-100">Subagent needs a decision</span>
         <span className="ml-auto flex items-center gap-1.5 rounded-full bg-ink-850 px-2 py-0.5">
           <span className="text-xs">↳</span>
@@ -104,7 +104,7 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
           </button>
           <button
             onClick={onDismiss}
-            className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300"
+            className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
           >
             <XIcon width={14} height={14} /> Skip
           </button>
@@ -124,8 +124,8 @@ interface PanelProps {
 }
 
 const KIND_COLOR: Record<IntercomEntry["kind"], string> = {
-  ask: "text-amber-400",
-  reply: "text-emerald-400",
+  ask: "text-warning",
+  reply: "text-success",
   status: "text-ink-500",
 };
 

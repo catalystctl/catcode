@@ -655,7 +655,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
 
     // ── Memory ──
     case "memory_list":
-      return { ...state, memories: Array.isArray(ev.memories) ? ev.memories : [] };
+      return { ...state, memories: Array.isArray(ev.entries) ? ev.entries : [] };
     case "memory_saved": {
       const ok = !ev.deleted;
       return {

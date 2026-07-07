@@ -37,9 +37,9 @@ import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 
 const STATE_STYLE: Record<string, { dot: string; text: string; label: string }> = {
-  running: { dot: "bg-amber-400", text: "text-amber-300", label: "running" },
-  completed: { dot: "bg-emerald-400", text: "text-emerald-300", label: "done" },
-  failed: { dot: "bg-rose-400", text: "text-rose-300", label: "failed" },
+  running: { dot: "bg-warning", text: "text-warning", label: "running" },
+  completed: { dot: "bg-success", text: "text-success", label: "done" },
+  failed: { dot: "bg-danger", text: "text-danger", label: "failed" },
   paused: { dot: "bg-ink-500", text: "text-ink-400", label: "paused" },
 };
 
@@ -147,21 +147,21 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
         <span className="text-[13px]">{toolIcon(name)}</span>
         <span className="font-mono text-[12px] font-medium text-ink-200">{name || "tool"}</span>
         {dangerous && (
-          <span className="rounded bg-rose-500/10 px-1.5 py-0.5 text-[10px] font-medium text-rose-300">
+          <span className="rounded bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
             destructive
           </span>
         )}
         <span className="ml-auto flex items-center gap-2">
           {pending ? (
-            <span className="flex items-center gap-1 text-[11px] text-amber-300">
-              <DotIcon className="text-amber-400" /> running
+            <span className="flex items-center gap-1 text-[11px] text-warning">
+              <DotIcon className="text-warning" /> running
             </span>
           ) : item.ok ? (
-            <span className="flex items-center gap-1 text-[11px] text-emerald-300">
+            <span className="flex items-center gap-1 text-[11px] text-success">
               <CheckIcon width={12} height={12} /> ok
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-rose-300">
+            <span className="flex items-center gap-1 text-[11px] text-danger">
               <WarningIcon width={12} height={12} /> error
             </span>
           )}
@@ -243,8 +243,8 @@ function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }
               ),
             )}
             {run.state === "running" && (
-              <div className="mt-3 flex items-center gap-1.5 text-[11px] text-amber-300">
-                <DotIcon className="text-amber-400" /> working…
+              <div className="mt-3 flex items-center gap-1.5 text-[11px] text-warning">
+                <DotIcon className="text-warning" /> working…
               </div>
             )}
           </div>
@@ -286,8 +286,8 @@ export function SubagentsPanel({ runs, onClose }: PanelProps) {
           <div className="flex items-center gap-2">
             <span className="text-[15px] font-semibold text-ink-100">Subagents</span>
             {runningCount > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-                <DotIcon className="text-amber-400" /> {runningCount} running
+              <span className="flex items-center gap-1.5 rounded-full bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
+                <DotIcon className="text-warning" /> {runningCount} running
               </span>
             )}
           </div>

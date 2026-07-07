@@ -290,7 +290,7 @@ export type CoreEvent =
   | { type: "subagent_done"; run_id: string; state: string; summary?: string; ended_at: number }
   // ── Memory ──
   | { type: "memory_saved"; id?: string; text?: string; deleted?: boolean; message?: string }
-  | { type: "memory_list"; memories: MemoryEntry[] }
+  | { type: "memory_list"; entries: MemoryEntry[] }
   // ── Plugins ──
   | { type: "plugins_list"; plugins: PluginEntry[] }
   | { type: "plugin_installed"; name: string; ok: boolean; message?: string }

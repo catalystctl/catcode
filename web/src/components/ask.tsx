@@ -136,7 +136,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
               <div key={q.id} id={`ask-${q.id}`} className="space-y-1.5">
                 <label className="flex items-start gap-1 text-[13px] font-medium text-ink-100">
                   <span className="flex-1">{q.prompt}</span>
-                  {req && <span className="text-rose-400">*</span>}
+                  {req && <span className="text-danger">*</span>}
                   {!req && (
                     <span className="text-[10px] uppercase tracking-wide text-ink-600">
                       optional
@@ -215,7 +215,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
         </button>
         <button
           onClick={onSkip}
-          className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300"
+          className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
         >
           <XIcon width={14} height={14} /> Skip
         </button>

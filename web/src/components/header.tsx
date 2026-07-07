@@ -170,10 +170,10 @@ export function Header(props: Props) {
           aria-expanded={approvOpen}
           className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12px] font-medium transition-colors ${
             props.approvalMode === "always"
-              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+              ? "border-success/40 bg-success/10 text-success"
               : props.approvalMode === "never"
                 ? "border-ink-700/70 bg-ink-900/70 text-ink-300"
-                : "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                : "border-warning/40 bg-warning/10 text-warning"
           }`}
           title="Approval mode"
         >
@@ -239,11 +239,11 @@ export function Header(props: Props) {
           </button>
         )}
         <span
-          className={`flex items-center gap-1 text-[11px] ${props.connected ? "text-emerald-400" : "text-ink-500"}`}
+          className={`flex items-center gap-1 text-[11px] ${props.connected ? "text-success" : "text-ink-500"}`}
           title={props.connected ? "connected" : "disconnected"}
         >
           <DotIcon
-            className={`${props.connected ? "text-emerald-400" : "text-ink-600"} ${
+            className={`${props.connected ? "text-success" : "text-ink-600"} ${
               props.streaming || props.retrying || props.switching ? "animate-pulse" : ""
             }`}
           />

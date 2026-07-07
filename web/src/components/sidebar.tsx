@@ -139,7 +139,7 @@ export function Sidebar(props: Props) {
                         e.stopPropagation();
                         props.onRemoveProject(p.path);
                       }}
-                      className="shrink-0 rounded p-0.5 text-ink-600 opacity-0 transition-opacity hover:bg-rose-500/10 hover:text-rose-400 group/proj:opacity-100"
+                      className="shrink-0 rounded p-0.5 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group/proj:opacity-100"
                       title="Remove from list"
                     >
                       <XIcon width={12} height={12} />
@@ -300,7 +300,7 @@ export function Sidebar(props: Props) {
                             )
                               props.onDeleteSession(s.path ?? s.name);
                           }}
-                          className="rounded p-0.5 text-ink-600 hover:bg-rose-500/10 hover:text-rose-400"
+                          className="rounded p-0.5 text-ink-600 hover:bg-danger/10 hover:text-danger"
                           title="Delete session"
                         >
                           <TrashIcon width={11} height={11} />
