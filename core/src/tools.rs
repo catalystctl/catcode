@@ -27,6 +27,32 @@ pub fn classify(name: &str) -> ToolKind {
     }
 }
 
+/// Whether `name` is a built-in tool (one returned by [`definitions`]).
+///
+/// Used to ensure a plugin-declared tool that collides with a built-in name
+/// can never hijack the built-in's dispatch. The registry merge hides the
+/// colliding plugin tool from the model's tool list (the built-in wins), and
+/// the dispatch + classify sites guard on `is_builtin` so a call to a built-in
+/// name always routes to the built-in handler and classification — never a
+/// same-named plugin tool. Derived from `definitions()` (cached in a
+/// `OnceLock`) so it can never drift from the real built-in set.
+pub fn is_builtin(name: &str) -> bool {
+    use std::sync::OnceLock;
+    static SET: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    let set = SET.get_or_init(|| {
+        definitions()
+            .into_iter()
+            .filter_map(|d| {
+                d.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect()
+    });
+    set.contains(name)
+}
+
 pub fn definitions() -> Vec<Value> {
     vec![
         json!({

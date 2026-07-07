@@ -50,7 +50,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         if ft.is_dir() {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if ft.is_file() {
-            std::fs::copy(&entry.path(), &target)?;
+            std::fs::copy(entry.path(), &target)?;
         }
     }
     Ok(())

@@ -2943,9 +2943,16 @@ async fn run_turn(
         }
     }
 
-    // Main agent tool list: exclude the subagent-only intercom coordination tools
-    // (contact_supervisor/intercom) — those are registered only inside child runs.
-    let tool_defs: Vec<Value> = tools::definitions()
+    // Main agent tool list: built-in tools (minus the subagent-only intercom
+    // coordination tools contact_supervisor/intercom, registered only inside
+    // child runs) MERGED with tools declared by enabled plugins. Plugin tools
+    // that collide with a built-in (or an already-registered plugin tool) name
+    // are skipped — a plugin can never shadow a core tool, and the first plugin
+    // to claim a name wins (matching the project>global plugin override model).
+    let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    reserved.insert("contact_supervisor".into());
+    reserved.insert("intercom".into());
+    let mut tool_defs: Vec<Value> = tools::definitions()
         .into_iter()
         .filter(|d| {
             let n = d
@@ -2953,9 +2960,25 @@ async fn run_turn(
                 .and_then(|f| f.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            reserved.insert(n.to_string());
             n != "contact_supervisor" && n != "intercom"
         })
         .collect();
+    for d in st.plugin_manager.tool_definitions() {
+        let n = d
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !reserved.insert(n.to_string()) {
+            eprintln!(
+                "[plugins] tool '{}' collides with a built-in or already-registered tool; skipping",
+                n
+            );
+            continue;
+        }
+        tool_defs.push(d);
+    }
     let mut timer = TurnTimer::new();
 
     // Idle compaction: if 60+ minutes since the last turn completed, compact the
@@ -3350,9 +3373,20 @@ async fn run_turn(
                         }
                     };
 
-                    // Approval gate for destructive tools.
+                    // Approval gate for destructive tools. Plugin-declared tools
+                    // carry their own kind (default Destructive); built-ins use
+                    // the static classify() table. A plugin tool that collides
+                    // with a built-in name is hidden from the model's tool list
+                    // (the merge gives built-ins precedence), and `is_builtin`
+                    // here ensures its kind never overrides the built-in's either.
                     let cfg = st.cfg.read().await.clone();
-                    let kind = tools::classify(&name);
+                    let kind = if tools::is_builtin(&name) {
+                        tools::classify(&name)
+                    } else {
+                        st.plugin_manager
+                            .tool_kind(&name)
+                            .unwrap_or_else(|| tools::classify(&name))
+                    };
                     let kind_str: &'static str = match kind {
                         tools::ToolKind::ReadOnly => "readonly",
                         tools::ToolKind::Destructive => "destructive",
@@ -3683,6 +3717,28 @@ async fn run_turn(
                                 emit(&Event::new("done"));
                                 return;
                             }
+                        }
+                    } else if let Some(tc) = st
+                        .plugin_manager
+                        .tool_config(&name)
+                        .filter(|_| !tools::is_builtin(&name))
+                    {
+                        // Plugin-declared tool: dispatch to its handler script
+                        // (subprocess, stdin=args JSON, stdout={ok,output}). The
+                        // `is_builtin` guard means a plugin tool that collides
+                        // with a built-in name can never hijack it (the built-in
+                        // is always routed to its own handler below). Wrapped in
+                        // a select! on the turn cancel so /abort can interrupt it
+                        // mid-flight; kill_on_drop frees the child.
+                        let session_id = cfg
+                            .session_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let ws = cfg.workspace.display().to_string();
+                        tokio::select! {
+                            o = plugins::execute_plugin_tool(&name, &tc, &exec_args, &ws, &session_id) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err(format!("{name} aborted")),
                         }
                     } else {
                         tools::execute(&name, &exec_args, &cfg)

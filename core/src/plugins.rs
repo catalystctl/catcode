@@ -2,8 +2,9 @@
 // Each plugin is a subdirectory with a plugin.json manifest and hook scripts.
 // Hooks are spawned as subprocesses with stdin JSON context, stdout JSON response.
 // Broken hooks never crash the core; timeouts and parse failures are handled gracefully.
+use crate::tools::{Outcome, ToolKind};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -145,6 +146,92 @@ model. The core validates the id against discovered models and emits an `info`
 event on handoff. Use this to route image-bearing turns to a vision-capable
 model when the active one lacks vision (see the bundled `vision-handoff` plugin).
 
+### Declaring tools (custom capabilities, no MCP)
+
+A plugin can ALSO declare tools — first-class capabilities the model can call,
+defined without MCP and without recompiling. A tool is a JSON Schema (sent to
+the model like any built-in tool) plus a handler script the core spawns per
+call. This is the no-MCP way to give the agent a new capability (a domain tool,
+a CLI wrapper, an internal-API client, …) by dropping files in
+`.catalyst-code/plugins/`. (Plugin tools are available to the main agent;
+subagents use the built-in tool set.)
+
+Add a `tools` array to `plugin.json` (a plugin may declare only tools, only
+hooks, or both):
+
+```
+{
+  "name": "my-tools",
+  "version": "0.1.0",
+  "description": "Custom domain tools",
+  "tools": [
+    {
+      "name": "lookup_order",
+      "description": "Look up an order by id from the internal API.",
+      "parameters": {
+        "type": "object",
+        "properties": { "order_id": { "type": "string" } },
+        "required": ["order_id"]
+      },
+      "script": "tools/lookup_order.sh",
+      "kind": "readonly",
+      "timeout_ms": 15000
+    }
+  ]
+}
+```
+
+Fields:
+- `name` (required): tool name. Must not collide with a built-in tool
+  (bash, read_file, edit, subagent, …) — built-ins always win, so a colliding
+  plugin tool is skipped with a warning.
+- `description` (optional): shown to the model.
+- `parameters` (optional): a JSON Schema for the tool's arguments. Defaults
+  to an empty object.
+- `script` (required): path to the executable handler, relative to the plugin
+  directory (path-confined; `..` escapes are rejected).
+- `kind` (optional): `"readonly"` (skips the approval gate) or `"destructive"`
+  (prompts under Approval::Destructive — the default). Arbitrary external code
+  runs on every call, so default to `destructive`.
+- `timeout_ms` (optional): hard per-call timeout (default 30s).
+
+Tool handler contract (one JSON object on stdin, one on stdout):
+
+```
+# stdin (→ handler)
+{ "args": { "order_id": "12345" }, "workspace": "/abs/path", "session_id": "x.jsonl", "timestamp": 1719000000 }
+
+# stdout (→ core)
+{ "ok": true,  "output": "Order #12345: shipped" }
+{ "ok": false, "output": "order not found" }   # ok omitted defaults to true
+```
+
+- `output` is the text shown to the model as the tool result. `ok:false` (or
+  an `error` field) marks the call failed — the conversation continues; the
+  model sees the error and can react.
+- A bare non-JSON stdout is accepted as `output` with `ok=true`, so a trivial
+  `echo` handler works. Prefer the structured form.
+- Non-zero exit, timeout, or spawn failure produce an error result (the model
+  is told the tool failed); they never crash the core or the turn.
+
+Safety (identical to hooks): tool scripts are path-confined to the plugin
+directory, must be executable, and run with the same `trust_project_plugins`
+gate — a repo's project-scoped tools load only after you opt in with
+`--trust-project-plugins` (built-in + `~/.catalyst-code/plugins` tools load
+always). Tool calls honor the approval gate and your allow/deny permission
+rules like any tool.
+
+`.catalyst-code/plugins/my-tools/tools/lookup_order.sh`:
+```bash
+#!/bin/bash
+input=$(cat)
+id=$(echo "$input" | jq -r '.args.order_id')
+# …call your internal API…
+jq -n --arg o "Order #$id: shipped" '{ "ok": true, "output": $o }'
+```
+
+Remember: `chmod +x` the handler.
+
 ### Example: a pre_write linter plugin
 
 `.catalyst-code/plugins/lint-check/plugin.json`:
@@ -213,6 +300,9 @@ struct PluginManifest {
     description: String,
     #[serde(default)]
     hooks: HashMap<String, HookManifestEntry>,
+    /// Optional user-declared tools (custom capabilities, no MCP needed).
+    #[serde(default)]
+    tools: Vec<ToolManifestEntry>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -224,9 +314,27 @@ struct HookManifestEntry {
     pass_args: bool,
 }
 
+/// A tool declared in a plugin manifest (the `tools` array). Each entry becomes
+/// a tool the model can call; the `script` handler is spawned per call.
+#[derive(Deserialize, Debug, Clone)]
+struct ToolManifestEntry {
+    name: String,
+    #[serde(default)]
+    description: String,
+    /// JSON Schema for the tool's parameters (sent to the model as-is).
+    #[serde(default)]
+    parameters: Value,
+    script: String,
+    /// "readonly" (skip the approval gate) or "destructive" (prompt; default).
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
 // ---- public types ----
 
-/// A loaded plugin with its registered hooks.
+/// A loaded plugin with its registered hooks and declared tools.
 #[derive(Clone, Debug)]
 pub struct Plugin {
     pub name: String,
@@ -237,6 +345,8 @@ pub struct Plugin {
     pub source_path: PathBuf,
     /// Hook name → config map.
     pub hooks: HashMap<String, HookConfig>,
+    /// Tools this plugin declares (custom capabilities; no MCP needed).
+    pub tools: Vec<ToolConfig>,
 }
 
 /// Configuration for one hook within a plugin.
@@ -248,6 +358,21 @@ pub struct HookConfig {
     pub timeout_ms: u64,
     /// Whether to include tool args in the hook context JSON.
     pub pass_args: bool,
+}
+
+/// Configuration for one user-declared tool within a plugin.
+#[derive(Clone, Debug)]
+pub struct ToolConfig {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's parameters (sent to the model verbatim).
+    pub parameters: Value,
+    /// Absolute path to the executable handler script.
+    pub script: PathBuf,
+    /// Hard timeout in milliseconds for a single tool call.
+    pub timeout_ms: u64,
+    /// Approval classification: ReadOnly skips the gate, Destructive prompts.
+    pub kind: ToolKind,
 }
 
 /// Result returned from executing a hook.
@@ -550,6 +675,44 @@ impl PluginManager {
             );
         }
 
+        // --- plugin-declared tools (custom capabilities, no MCP needed) ---
+        // Each tool's handler script gets the same path-confinement +
+        // executable checks as a hook script, so a plugin can't reach outside
+        // its directory or run a non-executable file. Reserved-name filtering
+        // (collisions with built-in tools) is done by the caller at merge time,
+        // not here — keep loading decoupled from the built-in tool set.
+        let mut tools_vec: Vec<ToolConfig> = Vec::new();
+        for t in &manifest.tools {
+            if t.name.is_empty() {
+                return Err("plugin declares a tool with an empty name".into());
+            }
+            let canon_script = validate_plugin_script(&canon_dir, &t.script)?;
+            let timeout_ms = t.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS);
+            let kind = match t.kind.as_deref().unwrap_or("destructive") {
+                "readonly" => ToolKind::ReadOnly,
+                "destructive" => ToolKind::Destructive,
+                other => {
+                    return Err(format!(
+                        "tool '{}' has invalid kind '{}' (use 'readonly' or 'destructive')",
+                        t.name, other
+                    ))
+                }
+            };
+            let parameters = if t.parameters.is_object() {
+                t.parameters.clone()
+            } else {
+                json!({ "type": "object", "properties": {} })
+            };
+            tools_vec.push(ToolConfig {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters,
+                script: canon_script,
+                timeout_ms,
+                kind,
+            });
+        }
+
         Ok(Plugin {
             name: manifest.name,
             version: manifest.version,
@@ -557,6 +720,7 @@ impl PluginManager {
             enabled: true,
             source_path: canon_dir,
             hooks,
+            tools: tools_vec,
         })
     }
 
@@ -667,6 +831,43 @@ impl PluginManager {
     /// Look up a single plugin by name.
     pub fn get_plugin(&self, name: &str) -> Option<Plugin> {
         self.plugins.read().unwrap().get(name).cloned()
+    }
+
+    /// OpenAI function-calling tool definitions for every tool declared by
+    /// ENABLED plugins. Built-in tools are NOT included here; the caller merges
+    /// them and filters name collisions (a plugin tool may never shadow a
+    /// built-in). Empty when no plugin declares tools.
+    pub fn tool_definitions(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+            for t in &p.tools {
+                out.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                }));
+            }
+        }
+        out
+    }
+
+    /// Look up a plugin-declared tool's config by tool name (enabled plugins
+    /// only). Returns None for built-in tools.
+    pub fn tool_config(&self, name: &str) -> Option<ToolConfig> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .find_map(|p| p.tools.iter().find(|t| t.name == name).cloned())
+    }
+
+    /// Approval classification for a plugin-declared tool, if it exists.
+    pub fn tool_kind(&self, name: &str) -> Option<ToolKind> {
+        self.tool_config(name).map(|t| t.kind)
     }
 }
 
@@ -878,6 +1079,137 @@ pub fn apply_modify(args: &mut Value, modify: &Value) {
     }
 }
 
+/// Execute a plugin-declared tool by spawning its handler script.
+///
+/// The handler receives one JSON object on stdin:
+/// ```json
+/// { "args": {…}, "workspace": "/abs/path", "session_id": "x.jsonl", "timestamp": 1719000000 }
+/// ```
+/// It must write one JSON object to stdout:
+/// ```json
+/// { "ok": true,  "output": "result text shown to the model" }
+/// { "ok": false, "output": "error message" }      // `ok` omitted defaults to true
+/// ```
+/// A bare non-JSON stdout is accepted as the output text with `ok=true` (so a
+/// trivial `echo` handler works). Non-zero exit, timeout, or spawn failure
+/// produce an error `Outcome` — the conversation continues; the tool call
+/// failed from the model's point of view. Safety mirrors `execute_hook`:
+/// stdin-write is bounded by the tool's timeout, and the child is
+/// `kill_on_drop` so a dropped future frees it.
+pub async fn execute_plugin_tool(
+    tool_name: &str,
+    config: &ToolConfig,
+    args: &Value,
+    workspace: &str,
+    session_id: &str,
+) -> Outcome {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ctx = json!({
+        "args": args,
+        "workspace": workspace,
+        "session_id": session_id,
+        "timestamp": timestamp,
+    });
+    let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+
+    let mut child = match hook_command(&config.script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Outcome::err(format!(
+                "plugin tool '{}' failed to spawn handler: {e}",
+                tool_name
+            ))
+        }
+    };
+
+    // Write the args context to stdin, bounded by the tool's timeout so a
+    // handler that never drains its stdin can't hang the turn forever.
+    if let Some(mut stdin) = child.stdin.take() {
+        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
+        let write_fut = async {
+            let _ = stdin.write_all(&ctx_bytes).await;
+            let _ = stdin.shutdown().await;
+        };
+        if tokio::time::timeout(stdin_timeout, write_fut)
+            .await
+            .is_err()
+        {
+            let _ = child.start_kill();
+            return Outcome::err(format!(
+                "plugin tool '{}' handler did not consume stdin within {}ms",
+                tool_name,
+                stdin_timeout.as_millis()
+            ));
+        }
+    }
+
+    let timeout_dur = Duration::from_millis(config.timeout_ms);
+    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Outcome::err(format!(
+                    "plugin tool '{}' handler exited with {}: {}",
+                    tool_name,
+                    output.status,
+                    stderr.trim()
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                return Outcome::err(format!(
+                    "plugin tool '{}' handler returned empty stdout",
+                    tool_name
+                ));
+            }
+            // Structured {ok, output} | {error} | {result}; else accept raw text.
+            match serde_json::from_str::<Value>(&stdout) {
+                Ok(v) if v.is_object() => {
+                    if let Some(err) = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        Outcome::err(format!("plugin tool '{}': {}", tool_name, err))
+                    } else {
+                        let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+                        let output_text = v
+                            .get("output")
+                            .or_else(|| v.get("result"))
+                            .and_then(|o| o.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| stdout.clone());
+                        if ok {
+                            Outcome::ok(output_text)
+                        } else {
+                            Outcome::err(output_text)
+                        }
+                    }
+                }
+                Ok(_) => Outcome::ok(stdout),
+                Err(_) => Outcome::ok(stdout),
+            }
+        }
+        Ok(Err(e)) => Outcome::err(format!(
+            "plugin tool '{}' handler wait error: {e}",
+            tool_name
+        )),
+        Err(_) => Outcome::err(format!(
+            "plugin tool '{}' handler timed out after {}ms",
+            tool_name, config.timeout_ms
+        )),
+    }
+}
+
 // ---- helpers ----
 
 /// Return the default timeout for a hook point.
@@ -887,6 +1219,45 @@ fn default_hook_timeout(hook_name: &str) -> u64 {
     } else {
         DEFAULT_POST_TIMEOUT_MS
     }
+}
+
+/// Validate a script path declared by a plugin (hook or tool): reject `..`
+/// escapes, require the canonicalized path to stay within the plugin's
+/// canonical directory, and confirm it exists and is executable. Returns the
+/// canonical script path on success. Used for plugin-declared tools; the hook
+/// loader does the same checks inline (kept separate to avoid disturbing the
+/// proven hook path + its exact error messages).
+fn validate_plugin_script(canon_dir: &Path, script_rel: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(script_rel);
+    {
+        use std::path::Component;
+        for comp in rel.components() {
+            if let Component::ParentDir = comp {
+                return Err(format!(
+                    "script {:?} escapes the plugin directory",
+                    script_rel
+                ));
+            }
+        }
+    }
+    let abs = canon_dir.join(rel);
+    let canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+    if !canon.starts_with(canon_dir) {
+        return Err(format!(
+            "script {:?} escapes the plugin directory",
+            script_rel
+        ));
+    }
+    if !canon.exists() {
+        return Err(format!("script {:?} does not exist", script_rel));
+    }
+    if !is_executable(&canon) {
+        return Err(format!(
+            "script {:?} is not executable (try chmod +x)",
+            script_rel
+        ));
+    }
+    Ok(canon)
 }
 
 /// Cross-platform check for whether a hook script is executable.
@@ -1694,5 +2065,288 @@ mod tests {
         assert_eq!(default_hook_timeout("post_write"), 30_000);
         assert_eq!(default_hook_timeout("session_start"), 30_000);
         assert_eq!(default_hook_timeout("session_stop"), 30_000);
+    }
+
+    // ---- plugin-declared tools ----
+
+    /// Write a plugin that declares one tool whose handler is a minimal
+    /// executable script, into a `tools-plugin/` SUBDIRECTORY of `dir` (so a
+    /// `PluginManager::new(dir, …)` scan finds it — the scanner loads each
+    /// subdirectory, not `dir` itself). Returns the plugin directory path so
+    /// `load_plugin_from_dir` callers can target it directly. `extra` is
+    /// spliced into the tool object as extra fields (e.g.
+    /// `"kind":"readonly","timeout_ms":12345`).
+    fn write_plugin_with_tool(dir: &Path, tool_name: &str, extra: &str) -> PathBuf {
+        let plugin_dir = dir.join("tools-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let tools_dir = plugin_dir.join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+        let script = tools_dir.join("run.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&script);
+        let tool_extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", extra)
+        };
+        let manifest = format!(
+            r#"{{
+  "name": "tools-plugin",
+  "version": "1.0.0",
+  "tools": [
+    {{ "name": "{name}", "description": "a tool", "parameters": {{"type":"object","properties":{{}}}}, "script": "tools/run.sh"{extra} }}
+  ]
+}}"#,
+            name = tool_name,
+            extra = tool_extra,
+        );
+        fs::write(plugin_dir.join("plugin.json"), &manifest).unwrap();
+        plugin_dir
+    }
+
+    #[test]
+    fn load_plugin_with_tools() {
+        let tmp = TmpDir::new("load_tools");
+        let pdir = write_plugin_with_tool(&tmp.path, "my_tool", "");
+        let plugin = PluginManager::load_plugin_from_dir(&pdir).unwrap();
+        assert_eq!(plugin.tools.len(), 1);
+        let t = &plugin.tools[0];
+        assert_eq!(t.name, "my_tool");
+        assert_eq!(t.description, "a tool");
+        assert_eq!(t.timeout_ms, DEFAULT_POST_TIMEOUT_MS);
+        assert_eq!(t.kind, ToolKind::Destructive); // default
+        assert!(t.parameters.is_object());
+        assert!(t.script.exists());
+    }
+
+    #[test]
+    fn load_tool_readonly_kind() {
+        let tmp = TmpDir::new("tool_readonly");
+        let pdir = write_plugin_with_tool(&tmp.path, "ro_tool", r#""kind":"readonly""#);
+        let plugin = PluginManager::load_plugin_from_dir(&pdir).unwrap();
+        assert_eq!(plugin.tools[0].kind, ToolKind::ReadOnly);
+    }
+
+    #[test]
+    fn load_tool_explicit_destructive_kind() {
+        let tmp = TmpDir::new("tool_destructive");
+        let pdir = write_plugin_with_tool(&tmp.path, "d_tool", r#""kind":"destructive""#);
+        let plugin = PluginManager::load_plugin_from_dir(&pdir).unwrap();
+        assert_eq!(plugin.tools[0].kind, ToolKind::Destructive);
+    }
+
+    #[test]
+    fn load_tool_custom_timeout() {
+        let tmp = TmpDir::new("tool_timeout");
+        let pdir = write_plugin_with_tool(&tmp.path, "t_tool", r#""timeout_ms": 12345"#);
+        let plugin = PluginManager::load_plugin_from_dir(&pdir).unwrap();
+        assert_eq!(plugin.tools[0].timeout_ms, 12345);
+    }
+
+    #[test]
+    fn load_tool_rejects_missing_script() {
+        let tmp = TmpDir::new("tool_missing");
+        fs::write(
+            tmp.path.join("plugin.json"),
+            r#"{"name":"p","version":"1.0.0","tools":[{"name":"x","script":"tools/nope.sh"}]}"#,
+        )
+        .unwrap();
+        let r = PluginManager::load_plugin_from_dir(&tmp.path);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn load_tool_rejects_path_escape() {
+        let tmp = TmpDir::new("tool_escape");
+        fs::write(
+            tmp.path.join("plugin.json"),
+            r#"{"name":"p","version":"1.0.0","tools":[{"name":"x","script":"../escape.sh"}]}"#,
+        )
+        .unwrap();
+        let r = PluginManager::load_plugin_from_dir(&tmp.path);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("escapes"));
+    }
+
+    #[test]
+    fn load_tool_rejects_invalid_kind() {
+        let tmp = TmpDir::new("tool_bad_kind");
+        let pdir = write_plugin_with_tool(&tmp.path, "bad", r#""kind":"weird""#);
+        let r = PluginManager::load_plugin_from_dir(&pdir);
+        assert!(r.is_err());
+        let e = r.unwrap_err();
+        assert!(e.contains("invalid kind"));
+        assert!(e.contains("weird"));
+    }
+
+    #[test]
+    fn load_tool_rejects_empty_name() {
+        let tmp = TmpDir::new("tool_empty_name");
+        fs::write(
+            tmp.path.join("plugin.json"),
+            r#"{"name":"p","version":"1.0.0","tools":[{"name":"","script":"tools/run.sh"}]}"#,
+        )
+        .unwrap();
+        let r = PluginManager::load_plugin_from_dir(&tmp.path);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("empty name"));
+    }
+
+    #[test]
+    fn tool_definitions_schema() {
+        let tmp = TmpDir::new("tool_defs");
+        write_plugin_with_tool(&tmp.path, "echo_tool", r#""timeout_ms":5000"#);
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        let defs = mgr.tool_definitions();
+        assert_eq!(defs.len(), 1);
+        let f = defs[0].get("function").unwrap();
+        assert_eq!(f.get("name").and_then(|v| v.as_str()), Some("echo_tool"));
+        assert_eq!(
+            f.get("description").and_then(|v| v.as_str()),
+            Some("a tool")
+        );
+        assert!(f.get("parameters").unwrap().is_object());
+    }
+
+    #[test]
+    fn tool_definitions_excludes_disabled() {
+        let tmp = TmpDir::new("tool_disabled");
+        write_plugin_with_tool(&tmp.path, "t", "");
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert_eq!(mgr.tool_definitions().len(), 1);
+        mgr.disable("tools-plugin").unwrap();
+        assert_eq!(mgr.tool_definitions().len(), 0);
+        assert!(mgr.tool_config("t").is_none());
+        assert!(mgr.tool_kind("t").is_none());
+    }
+
+    #[test]
+    fn tool_config_and_kind_lookup() {
+        let tmp = TmpDir::new("tool_lookup");
+        write_plugin_with_tool(&tmp.path, "lookup", r#""kind":"readonly""#);
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        let tc = mgr.tool_config("lookup").unwrap();
+        assert_eq!(tc.name, "lookup");
+        assert_eq!(tc.kind, ToolKind::ReadOnly);
+        assert!(mgr.tool_config("nope").is_none());
+        assert_eq!(mgr.tool_kind("lookup"), Some(ToolKind::ReadOnly));
+        // A built-in tool name is not a plugin tool → None.
+        assert!(mgr.tool_kind("read_file").is_none());
+    }
+
+    #[test]
+    fn builtin_name_collision_never_hijacks() {
+        // A plugin MAY declare a tool whose name collides with a built-in. It
+        // still loads (tool_config finds it), but the registry merge hides it
+        // from the model's tool list (built-in wins) and the dispatch +
+        // classify guards drop it via `is_builtin` — so the built-in always
+        // runs, never the same-named plugin tool. This test pins that guard
+        // composition so a future change can't reintroduce the hijack.
+        let tmp = TmpDir::new("tool_collision");
+        write_plugin_with_tool(&tmp.path, "read_file", r#""kind":"readonly""#);
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        // Loadable + findable by the manager …
+        assert!(mgr.tool_config("read_file").is_some());
+        assert_eq!(mgr.tool_kind("read_file"), Some(ToolKind::ReadOnly));
+        // … but the dispatch guard filters it out (it's a built-in name), so a
+        // call to "read_file" routes to the built-in, not the plugin.
+        assert!(mgr
+            .tool_config("read_file")
+            .filter(|_| !crate::tools::is_builtin("read_file"))
+            .is_none());
+        // And a genuinely-custom name is NOT filtered — it dispatches normally.
+        let tmp2 = TmpDir::new("tool_no_collision");
+        write_plugin_with_tool(&tmp2.path, "my_domain_tool", r#""kind":"readonly""#);
+        let mgr2 = PluginManager::new(tmp2.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr2
+            .tool_config("my_domain_tool")
+            .filter(|_| !crate::tools::is_builtin("my_domain_tool"))
+            .is_some());
+        // is_builtin itself: known built-ins true, arbitrary/empty false.
+        assert!(crate::tools::is_builtin("read_file"));
+        assert!(crate::tools::is_builtin("bash"));
+        assert!(!crate::tools::is_builtin("my_domain_tool"));
+        assert!(!crate::tools::is_builtin(""));
+    }
+
+    // ---- execute_plugin_tool ----
+
+    fn tool_config_for(script: PathBuf, timeout_ms: u64, kind: ToolKind) -> ToolConfig {
+        ToolConfig {
+            name: "ut".into(),
+            description: "".into(),
+            parameters: json!({}),
+            script,
+            timeout_ms,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_json_output() {
+        let tmp = TmpDir::new("ept_json");
+        let script = write_hook_script(&tmp.path, "t.sh", r#"{"ok":true,"output":"hi there"}"#, 0);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({"x":1}), "/ws", "s.jsonl").await;
+        assert!(out.ok);
+        assert_eq!(out.output, "hi there");
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_raw_output() {
+        let tmp = TmpDir::new("ept_raw");
+        let script = write_hook_script(&tmp.path, "t.sh", "plain result", 0);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(out.ok);
+        assert_eq!(out.output, "plain result");
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_error_output() {
+        let tmp = TmpDir::new("ept_err");
+        let script = write_hook_script(&tmp.path, "t.sh", r#"{"ok":false,"output":"boom"}"#, 0);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(!out.ok);
+        assert_eq!(out.output, "boom");
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_error_field() {
+        let tmp = TmpDir::new("ept_errfield");
+        let script = write_hook_script(&tmp.path, "t.sh", r#"{"error":"something failed"}"#, 0);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(!out.ok);
+        assert!(out.output.contains("something failed"));
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_nonzero_exit() {
+        let tmp = TmpDir::new("ept_exit");
+        let script = write_hook_script(&tmp.path, "t.sh", r#"{"ok":true,"output":"x"}"#, 3);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(!out.ok);
+        assert!(out.output.contains("exited"));
+    }
+
+    #[tokio::test]
+    async fn execute_plugin_tool_timeout() {
+        let tmp = TmpDir::new("ept_timeout");
+        // Handler sleeps well past the tool's timeout.
+        let script = tmp.path.join("slow.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nsleep 2\necho '{\"ok\":true,\"output\":\"late\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let tc = tool_config_for(script, 300, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(!out.ok);
+        assert!(out.output.contains("timed out"));
     }
 }
