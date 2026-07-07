@@ -1259,6 +1259,18 @@ async fn main() {
                             .with("messages", json!(visible))
                             .with("tokens_in", json!(est)),
                     );
+                    // The conversation was left mid-`ask` by a prior core
+                    // restart (assistant `ask` tool_call with no tool result).
+                    // Tell the user a message will re-present the question so
+                    // they don't see a wedged transcript with no explanation.
+                    if find_trailing_unanswered_ask(&conv[..]).is_some() {
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(
+                                "A question from the previous session was interrupted by a restart. Send any message to answer it and continue."
+                            ),
+                        ));
+                    }
                 }
             }
             Command::SetKey { api_key, provider } => {
@@ -2745,6 +2757,15 @@ async fn run_turn(
     // and never blocks the turn.
     dispatch_lifecycle(st, "session_start").await;
 
+    // If the conversation was left mid-`ask` by a prior core restart (the
+    // assistant `ask` tool_call is persisted but no tool result exists),
+    // re-present the question before the turn proceeds. Without this the
+    // session is wedged (no modal) and the orphan-sanitizer would later
+    // insert a synthetic EMPTY result, losing the question. No-op on the
+    // common case of no trailing unanswered ask. Idempotent: once the ask
+    // has a result, `find_trailing_unanswered_ask` returns None.
+    resume_pending_ask(st, &cancel).await;
+
     // Clear the last-turn metrics at turn entry so a panic before finalization
     // can't leak the PRIOR turn's numbers to this turn's `session_stop` hook
     // (which fires unconditionally from the panic guard). A completed turn sets
@@ -4180,6 +4201,87 @@ pub(crate) async fn request_ask(
         // Some(Null) or Some(non-object) = user skipped the prompt.
         _ => AskResult::Skipped,
     }
+}
+
+/// If the conversation ends with an assistant message carrying an unanswered
+/// `ask` tool call (a prior core restart happened while blocked mid-`ask`),
+/// return that call's id and its arguments as a `Value` ready for `request_ask`.
+/// Only the LAST unanswered `ask` is returned (the one the prior core was blocked
+/// on). A call whose arguments fail validation is skipped — the
+/// orphan-sanitizer will later resolve it with a synthetic result. Returns None
+/// on the common case of no trailing unanswered ask.
+fn find_trailing_unanswered_ask(conv: &[Message]) -> Option<(String, Value)> {
+    let last = conv.last()?;
+    let calls = last.tool_calls()?;
+    if calls.is_empty() {
+        return None;
+    }
+    // Tool-call ids that already have a matching `role:"tool"` result.
+    let answered: HashSet<&str> = conv
+        .iter()
+        .filter_map(|m| if m.is_tool() { m.tool_call_id() } else { None })
+        .collect();
+    // Prefer the last unanswered `ask` (most likely the one that was blocking).
+    for tc in calls.iter().rev() {
+        if tc.function.name != "ask" || answered.contains(tc.id.as_str()) {
+            continue;
+        }
+        let args: Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+        if validate_ask_questions(&args).is_ok() {
+            return Some((tc.id.clone(), args));
+        }
+    }
+    None
+}
+
+/// Re-present an `ask` question that a prior core restart left unanswered, so
+/// the question is not lost and the session is not wedged. Called at the top of
+/// each turn; idempotent (a no-op once the ask has a result). The assistant
+/// `ask` tool_call is already persisted; this appends the matching tool result
+/// (the user's answers, or a "skipped" note) so the orphan-sanitizer never has
+/// to insert a synthetic EMPTY result that would silently drop the question.
+async fn resume_pending_ask(st: &Arc<State>, cancel: &CancellationToken) {
+    let (call_id, args) = {
+        let conv = st.conversation.lock().await;
+        match find_trailing_unanswered_ask(&conv[..]) {
+            Some(x) => x,
+            None => return,
+        }
+    };
+    // Re-present (fresh ask request_id) and block for the reply. An abort (the
+    // turn was cancelled while re-presenting) ends the turn like the in-turn
+    // ask abort; a skip resolves the orphan with a best-judgment note.
+    let content = match request_ask(st, &args, cancel).await {
+        AskResult::Answered { questions, answers } => {
+            format_ask_answers(&questions, &answers)
+        }
+        AskResult::Skipped => {
+            "The user skipped the questions. Proceed with your best judgment and note any assumptions."
+                .to_string()
+        }
+        AskResult::Aborted => {
+            emit(&Event::new("aborted"));
+            emit(&Event::new("done"));
+            return;
+        }
+    };
+    let tool_result = Message::tool(&call_id, &content);
+    let est = estimate_message_tokens(&tool_result);
+    {
+        let mut conv = st.conversation.lock().await;
+        conv.push(tool_result);
+        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+            session::append(p, conv.last().unwrap());
+        }
+    }
+    *st.estimated_tokens.lock().await += est;
+    emit(
+        &Event::new("tool_result")
+            .with("id", json!(call_id))
+            .with("ok", json!(true))
+            .with("output", json!(content)),
+    );
 }
 
 /// Number of trailing messages whose tool results are always kept verbatim.

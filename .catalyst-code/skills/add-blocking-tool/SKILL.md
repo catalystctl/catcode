@@ -88,3 +88,16 @@ Three canonical instances already exist — copy the closest one:
 - Keep blocking tools orchestrator-only by NOT adding them to
   `subagent::all_tool_names()`; subagents that need human input use
   `contact_supervisor` (which IS a blocking tool, subagent-scoped).
+- **Restart-resume (required correctness).** A blocking tool's pending state
+  lives ONLY in the in-memory `State::pending_*` map — it is never persisted.
+  But the assistant tool_call IS persisted *before* the block. So if the core
+  restarts mid-block (dev reload, crash, OOM, reboot), the reloaded conversation
+  ends in an orphaned tool_call with no result → the session wedges (no modal,
+  no progress) and the always-run orphan-sanitizer would later insert a
+  synthetic EMPTY result, silently losing the question. Handle this on load:
+  detect a trailing unanswered `<your>` tool_call and either re-present it
+  (re-emit the request event + re-block via `request_foo`) or synthesize a
+  result so the conversation isn't left hung. Reference impl: `resume_pending_ask`
+  + `find_trailing_unanswered_ask` in `main.rs`, called at the top of
+  `run_turn` (lazy re-present on the next turn — race-free, reuses the existing
+  request/command machinery). See the `ask-tool-restart-wedge` memory.
