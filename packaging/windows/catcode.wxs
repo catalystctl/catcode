@@ -40,8 +40,8 @@
         <Directory Id="PROGRAMS" Name="Programs">
           <Directory Id="INSTALLDIR" Name="catcode">
             <Component Id="Main" Guid="b6a1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d">
-              <File Id="ucli_exe"        Source="catcode.exe"      KeyPath="yes"/>
-              <File Id="umans_core_exe"  Source="catcode-core.exe"/>
+              <File Id="catcode_exe"      Source="catcode.exe"      KeyPath="yes"/>
+              <File Id="catcode_core_exe" Source="catcode-core.exe"/>
               <Environment Id="PATHENV" Name="PATH"
                            Value="[INSTALLDIR]" Action="set" Part="last" System="no"/>
             </Component>

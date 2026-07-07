@@ -55,6 +55,38 @@ jobs:
         working-directory: tui
         run: go build ./...
 
+  cross-compile:
+    name: tui cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: go build (plain)
+        working-directory: tui
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath .
+      - name: go build -tags embed_core (staged dummy core)
+        working-directory: tui
+        # The embed_core tag embeds tui/embed/catcode-core via go:embed; stage an
+        # empty file so the pattern matches (compile-check only — the real core
+        # is injected at release time by release-*.sh).
+        run: |
+          mkdir -p embed && touch embed/catcode-core
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -tags embed_core .
+
   docker:
     name: docker image
     runs-on: ubuntu-latest

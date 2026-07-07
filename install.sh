@@ -38,8 +38,22 @@ DEFAULT_PREFIX="/usr/local/bin"
 DEFAULT_PORT="49283"
 DEFAULT_HOST="0.0.0.0"
 STATE_FILE="/etc/catalyst-code/installer.state"
-UNIT_NAME="catalyst-code-web.service"
+UNIT_NAME="catalyst-code-web.service"   # systemd unit (Linux)
+LAUNCHD_LABEL="com.catalyst-code.web"   # launchd agent (macOS)
 GO_MIN="1.24.2"
+
+# ── platform ────────────────────────────────────────────────
+# install.sh builds from source (cargo + go) and works on both Linux and
+# macOS. The web frontend is installed as a system service via systemd on
+# Linux, or as a user LaunchAgent via launchd on macOS. Windows users should
+# use packaging/windows/install-web.ps1 instead (install.sh is not supported
+# there — it relies on a POSIX shell).
+PLATFORM="$(uname -s)"   # Linux | Darwin
+case "$PLATFORM" in
+  Linux)  SVC_MGR="systemd" ;;
+  Darwin) SVC_MGR="launchd" ;;
+  *)      SVC_MGR="unsupported" ;;
+esac
 
 # ── option defaults ──────────────────────────────────────────
 ACTION="install"
@@ -189,7 +203,7 @@ print_banner() {
   print_box "Catalyst Code  —  installer v${VERSION_DETECTED}" \
     "TUI (catcode) + core (catcode-core) -> PATH" \
     "optional 24/7 web service (Next.js)" \
-    "scope: system-wide   |   platform: linux (systemd)"
+    "scope: system-wide   |   platform: ${PLATFORM} (${SVC_MGR})"
   printf "  ${C_DIM}mode: %s   |   dry-run: %s${C_RST}\n\n" "$ACTION" "$DRY_RUN"
 }
 
@@ -275,6 +289,8 @@ check_deps() {
     for m in "${missing[@]}"; do printf "    ${C_RED}• %s${C_RST}\n" "$m" >&2; done
     die "install the dependencies above, then re-run."
   fi
+  [[ "$SVC_MGR" != "unsupported" ]] \
+    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
   log_ok "Dependencies present (cargo, go${WITH_WEB:+, node/bun})"
 }
 
@@ -344,7 +360,7 @@ resolve_repo() {
 
 detect_version() {
   VERSION_DETECTED="$(grep -m1 '^version' "$REPO_DIR/core/Cargo.toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-  [[ -z "$VERSION_DETECTED" ]] && VERSION_DETECTED="$VERSION"
+  if [[ -z "$VERSION_DETECTED" ]]; then VERSION_DETECTED="$VERSION"; fi
 }
 
 # ── build steps ──────────────────────────────────────────────
@@ -387,6 +403,15 @@ build_web() {
 
 install_web_service() {
   detect_runtime
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    install_web_launchd
+  else
+    install_web_systemd
+  fi
+}
+
+# systemd unit (Linux) — system service, starts at boot, auto-restarts on crash.
+install_web_systemd() {
   local unit_dir="/etc/systemd/system"
   local unit="$unit_dir/$UNIT_NAME"
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
@@ -425,9 +450,75 @@ EOF
   run_root "Starting $UNIT_NAME" systemctl start "$UNIT_NAME" || die "start failed — check: journalctl -u $UNIT_NAME -e"
 }
 
+# launchd agent (macOS) — user LaunchAgent in ~/Library/LaunchAgents, starts at
+# login, KeepAlive restarts it on crash. No sudo: it runs as the invoking user.
+install_web_launchd() {
+  local agents_dir="$HOME/Library/LaunchAgents"
+  local plist="$agents_dir/${LAUNCHD_LABEL}.plist"
+  local log_dir="$HOME/Library/Logs"
+  local log_file="$log_dir/catalyst-code-web.log"
+  local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
+  cat >"$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RT_BIN}</string>
+    <string>run</string>
+    <string>start</string>
+    <string>--</string>
+    <string>--hostname</string>
+    <string>${HOST}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${REPO_DIR}/web</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PORT</key>
+    <string>${PORT}</string>
+    <key>CATCODE_CORE</key>
+    <string>${PREFIX}/catcode-core</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>${log_file}</string>
+</dict>
+</plist>
+EOF
+  if $DRY_RUN; then
+    log_info "[dry-run] would write plist: $plist"
+    sed 's/^/      /' "$tmp"
+    return 0
+  fi
+  run_step "Creating $agents_dir" mkdir -p "$agents_dir"
+  run_step "Creating $log_dir" mkdir -p "$log_dir"
+  run_step "Installing plist" install -m 0644 "$tmp" "$plist" || die "could not install plist"
+  # Unload any prior version first; launchctl load errors if already loaded.
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  run_step "Loading $LAUNCHD_LABEL" launchctl load "$plist" || die "load failed — check: cat $log_file"
+  log_ok "Web agent loaded (starts at login, auto-restarts on crash)"
+}
+
 restart_web_service() {
-  run_root "Reloading systemd" systemctl daemon-reload
-  run_root "Restarting $UNIT_NAME" systemctl restart "$UNIT_NAME" || die "restart failed — check: journalctl -u $UNIT_NAME -e"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    run_step "Reloading $LAUNCHD_LABEL" launchctl load "$plist" || die "load failed — check: cat $HOME/Library/Logs/catalyst-code-web.log"
+  else
+    run_root "Reloading systemd" systemctl daemon-reload
+    run_root "Restarting $UNIT_NAME" systemctl restart "$UNIT_NAME" || die "restart failed — check: journalctl -u $UNIT_NAME -e"
+  fi
 }
 
 # ── state file ───────────────────────────────────────────────
@@ -555,10 +646,23 @@ do_uninstall() {
   ensure_sudo
 
   phase "Stopping & removing web service"
-  root_do "Stop $UNIT_NAME"   systemctl stop "$UNIT_NAME"
-  root_do "Disable $UNIT_NAME" systemctl disable "$UNIT_NAME"
-  root_do "Remove unit file"  rm -f "/etc/systemd/system/$UNIT_NAME"
-  root_do "Reload systemd"   systemctl daemon-reload
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    if $DRY_RUN; then
+      log_info "[dry-run] would unload + remove $plist"
+    elif [[ -f "$plist" ]]; then
+      launchctl unload "$plist" 2>/dev/null || true
+      rm -f "$plist"
+      log_ok "Removed launchd agent $LAUNCHD_LABEL"
+    else
+      log_info "No launchd agent at $plist (already removed?)"
+    fi
+  else
+    root_do "Stop $UNIT_NAME"   systemctl stop "$UNIT_NAME"
+    root_do "Disable $UNIT_NAME" systemctl disable "$UNIT_NAME"
+    root_do "Remove unit file"  rm -f "/etc/systemd/system/$UNIT_NAME"
+    root_do "Reload systemd"   systemctl daemon-reload
+  fi
 
   phase "Removing binaries"
   root_do "Remove $PREFIX/catcode-core" rm -f "$PREFIX/catcode-core"
@@ -575,8 +679,10 @@ summary_install() {
   local web_line="(not installed — run with --with-web)"
   local svc_line=""
   if $WITH_WEB; then
-    web_line="http://${HOST}:${PORT}  (running as $UNIT_NAME)"
-    svc_line="service:   $UNIT_NAME  (enabled, auto-restart)"
+    local svc_id="$UNIT_NAME"
+    [[ "$PLATFORM" == "Darwin" ]] && svc_id="$LAUNCHD_LABEL (launchd)"
+    web_line="http://${HOST}:${PORT}  (running as $svc_id)"
+    svc_line="service:   $svc_id  (enabled, auto-restart)"
   fi
   print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" \
     "tui:       $PREFIX/catcode" \
@@ -587,9 +693,19 @@ summary_install() {
     "uninstall: bash install.sh --uninstall" \
     "log:       ${LOG_FILE:-<disabled>}"
   log_info "Run the TUI with:  catcode"
-  $WITH_WEB && log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
-  $WITH_WEB && log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
-  $WITH_WEB && [[ "$HOST" != "127.0.0.1" ]] && log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
+  if $WITH_WEB; then
+    if [[ "$PLATFORM" == "Darwin" ]]; then
+      log_info "Web service logs:  tail -f $HOME/Library/Logs/catalyst-code-web.log"
+    else
+      log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
+    fi
+  fi
+  if $WITH_WEB; then
+    log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
+    if [[ "$HOST" != "127.0.0.1" ]]; then
+      log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
+    fi
+  fi
 }
 
 summary_update() {

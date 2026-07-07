@@ -327,6 +327,66 @@ Runtime caveats on Linux:
   the TUI settings modal or pass `--sandbox firejail --no-network` to the core.
 - The agent's `bash` tool needs `bash` on PATH (present by default).
 
+## Web frontend (as a service)
+
+The Next.js web frontend (`web/`) is the browser equivalent of the TUI — it
+spawns one `catcode-core` and streams events to the browser over SSE. It can be
+installed to run continuously as a background service on **all three platforms**.
+Because it is a Next.js app it is **built from source** (run from a checkout of
+this repo), and a `catcode-core` must already be installed for it to spawn.
+
+### Linux (systemd) & macOS (launchd)
+
+`install.sh` builds the TUI + core from source and, with `--with-web`, also
+builds and installs the web frontend as a system service. It works on both
+Linux and macOS (it detects the platform and uses the right service manager):
+
+```bash
+bash install.sh --with-web                 # builds catcode + catcode-core + web
+# optional: --port 49283 --host 0.0.0.0 --prefix /usr/local/bin
+bash install.sh --dry-run --with-web        # preview the plan without executing
+bash install.sh --update                    # git pull + rebuild + restart the service
+bash install.sh --uninstall                 # stop + remove everything
+```
+
+- **Linux** installs a `systemd` unit (`catalyst-code-web.service`) that starts
+  at boot and auto-restarts on crash. Logs: `journalctl -u catalyst-code-web.service -f`.
+- **macOS** installs a user `launchd` agent
+  (`~/Library/LaunchAgents/com.catalyst-code.web.plist`) that starts at login and
+  auto-restarts (`KeepAlive`). Logs: `~/Library/Logs/catalyst-code-web.log`.
+
+On macOS you can install the TUI via the `.dmg` first and still run
+`install.sh --with-web` afterwards (it detects the core on PATH), or let
+`install.sh` build the TUI from source too — both work.
+
+### Windows (NSSM service or scheduled task)
+
+`packaging/windows/install-web.ps1` builds the web and installs it as a Windows
+Service via [NSSM](https://nssm.cc) (preferred — starts at boot, auto-restarts,
+runs with no user logged in) or, if NSSM isn't installed, as a Scheduled Task at
+logon with a restart-loop wrapper (zero extra dependencies). Requires
+`catcode-core.exe` already installed (MSI or `packaging/windows/install.ps1`):
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1
+# optional: -Port 49283 -BindHost 0.0.0.0
+pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1 -Uninstall
+```
+
+Logs: `%LOCALAPPDATA%\catalyst-code\catalyst-code-web.log`. For public exposure
+bind `-BindHost 127.0.0.1` and put a TLS reverse proxy (Caddy/nginx/IIS) in front.
+
+### Manual (any platform, no service wrapper)
+
+```bash
+cd sdk && bun install && bun run build      # build the SDK first (sdk/dist/)
+cd ../web && bun install && bun run build   # build the Next.js app
+PORT=49283 bun run start                    # -> http://localhost:49283
+```
+
+Set `CATCODE_CORE=<path to catcode-core>` if the core isn't found automatically
+(it searches `CATCODE_CORE`, then a dev build, then `catcode-core` on `PATH`).
+
 ## Protocol
 
 Core reads commands from stdin, writes events to stdout, one JSON object per line.
