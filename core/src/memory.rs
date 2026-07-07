@@ -136,7 +136,14 @@ impl Store {
         mem_type: &str,
         description: &str,
     ) -> Result<PathBuf, String> {
-        self.save_scoped(workspace, Scope::Workspace, name, content, mem_type, description)
+        self.save_scoped(
+            workspace,
+            Scope::Workspace,
+            name,
+            content,
+            mem_type,
+            description,
+        )
     }
 
     fn save_scoped(
@@ -211,7 +218,14 @@ pub fn save_memory(
     mem_type: &str,
     description: &str,
 ) -> Result<PathBuf, String> {
-    save_memory_scoped(workspace, Scope::Workspace, name, content, mem_type, description)
+    save_memory_scoped(
+        workspace,
+        Scope::Workspace,
+        name,
+        content,
+        mem_type,
+        description,
+    )
 }
 
 /// Like `save_memory` but for a specific scope. Use `Scope::Global` to store a
@@ -226,7 +240,14 @@ pub fn save_memory_scoped(
     description: &str,
 ) -> Result<PathBuf, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    Store::new(Store::default_root()).save_scoped(workspace, scope, name, content, mem_type, description)
+    Store::new(Store::default_root()).save_scoped(
+        workspace,
+        scope,
+        name,
+        content,
+        mem_type,
+        description,
+    )
 }
 
 /// Append `new_facts` to an existing memory (same name/slug), capped to
@@ -364,11 +385,7 @@ pub fn forget_memory(workspace: &Path, id: &str) -> Result<(), String> {
 }
 
 /// Like `forget_memory` but for a specific scope.
-pub fn forget_memory_scoped(
-    workspace: &Path,
-    scope: Scope,
-    id: &str,
-) -> Result<(), String> {
+pub fn forget_memory_scoped(workspace: &Path, scope: Scope, id: &str) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("memory id must not be empty".to_string());
     }
@@ -930,7 +947,17 @@ mod tests {
         store
             .save(&ws, "skill", "body", "convention", "How we do X")
             .unwrap();
-        append_memory_locked(&store, &ws, Scope::Workspace, "skill", "more facts", "", "", 1_000_000).unwrap();
+        append_memory_locked(
+            &store,
+            &ws,
+            Scope::Workspace,
+            "skill",
+            "more facts",
+            "",
+            "",
+            1_000_000,
+        )
+        .unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].description, "How we do X");
@@ -1015,7 +1042,17 @@ mod tests {
         let ws = fake_workspace("append");
         let store = test_store(&root);
         // first append: no existing file -> writes new facts
-        let _ = append_memory_into(&store, &ws, Scope::Workspace, "facts", "fact A", "note", "d", 4096).unwrap();
+        let _ = append_memory_into(
+            &store,
+            &ws,
+            Scope::Workspace,
+            "facts",
+            "fact A",
+            "note",
+            "d",
+            4096,
+        )
+        .unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         assert!(
@@ -1025,7 +1062,17 @@ mod tests {
         );
 
         // second append: accumulates onto the first (does NOT overwrite)
-        let _ = append_memory_into(&store, &ws, Scope::Workspace, "facts", "fact B", "note", "d", 4096).unwrap();
+        let _ = append_memory_into(
+            &store,
+            &ws,
+            Scope::Workspace,
+            "facts",
+            "fact B",
+            "note",
+            "d",
+            4096,
+        )
+        .unwrap();
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         let c = &entries[0].content;
@@ -1065,7 +1112,14 @@ mod tests {
         let store = test_store(&root);
 
         store
-            .save_scoped(&ws, Scope::Workspace, "project-rule", "use rust", "project", "")
+            .save_scoped(
+                &ws,
+                Scope::Workspace,
+                "project-rule",
+                "use rust",
+                "project",
+                "",
+            )
             .unwrap();
         store
             .save_scoped(&ws, Scope::Global, "user-name", "Alice", "user", "")
@@ -1131,7 +1185,14 @@ mod tests {
 
         // Save a global memory from ws1
         store
-            .save_scoped(&ws1, Scope::Global, "user-prefs", "likes Rust + Go", "user", "")
+            .save_scoped(
+                &ws1,
+                Scope::Global,
+                "user-prefs",
+                "likes Rust + Go",
+                "user",
+                "",
+            )
             .unwrap();
 
         // It must be visible from ws2 (a completely different workspace)
@@ -1176,10 +1237,24 @@ mod tests {
         let store = test_store(&root);
 
         store
-            .save_scoped(&ws, Scope::Global, "user-identity", "User is Alice", "user", "")
+            .save_scoped(
+                &ws,
+                Scope::Global,
+                "user-identity",
+                "User is Alice",
+                "user",
+                "",
+            )
             .unwrap();
         store
-            .save_scoped(&ws, Scope::Workspace, "project-rule", "use tabs", "project", "")
+            .save_scoped(
+                &ws,
+                Scope::Workspace,
+                "project-rule",
+                "use tabs",
+                "project",
+                "",
+            )
             .unwrap();
 
         let memories = scan_all_memories_with_store(&store, &ws);

@@ -39,6 +39,7 @@ export const initialState: AgentState = {
   streaming: false,
   retrying: false,
   pendingApproval: null,
+  pendingAsk: null,
   metrics: null,
   umansConc: null,
   sessions: [],
@@ -431,6 +432,16 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           diff: ev.diff,
         },
       };
+    case "ask_request":
+      return {
+        ...state,
+        pendingAsk: { request_id: ev.request_id, questions: ev.questions },
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Agent asks: ${ev.questions.length} question${ev.questions.length === 1 ? "" : "s"}`,
+        ),
+      };
     case "compacted":
       return {
         ...state,
@@ -471,6 +482,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentAssistantId: null,
         streaming: false,
         pendingApproval: null,
+        pendingAsk: null,
       };
     case "reset":
       return {
@@ -479,6 +491,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentAssistantId: null,
         streaming: false,
         pendingApproval: null,
+        pendingAsk: null,
         workState: null,
       };
     case "done":
@@ -660,6 +673,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentAssistantId: null,
         streaming: false,
         pendingApproval: null,
+        pendingAsk: null,
         sessions: [],
         currentSessionFile: null,
         stats: null,

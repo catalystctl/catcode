@@ -15,6 +15,7 @@ import { Composer, type ComposerHandle } from "./composer";
 import { Toasts } from "./toasts";
 import { Approval } from "./approval";
 import { IntercomPrompt } from "./intercom";
+import { AskFlyout } from "./ask";
 import { OauthPromptBanner } from "./oauth-prompt";
 import { WorkStatePanel } from "./work-state";
 import { SubagentsPanel } from "./subagents";
@@ -397,6 +398,15 @@ export function Chat() {
                     prompt={state.pendingIntercom}
                     onReply={agent.intercomReply}
                     onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
+                  />
+                </div>
+              )}
+              {state.pendingAsk && (
+                <div className="mx-4 mb-2 sm:mx-6">
+                  <AskFlyout
+                    prompt={state.pendingAsk}
+                    onSubmit={(answers) => agent.askReply(answers)}
+                    onSkip={() => agent.askReply(null)}
                   />
                 </div>
               )}

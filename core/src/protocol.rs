@@ -205,6 +205,12 @@ pub enum Command {
     /// wakes and continues.
     #[serde(rename = "intercom_reply")]
     IntercomReply { request_id: String, reply: String },
+    /// Reply to a pending `ask_request` (the `ask` tool). `answers` is either a
+    /// JSON object mapping each question id → its answer string, or JSON null
+    /// to indicate the user skipped the questions. The awaiting tool call
+    /// resumes and the formatted answers are returned to the model.
+    #[serde(rename = "ask_reply")]
+    AskReply { request_id: String, answers: Value },
     /// Get the current vision-handoff configuration (curated vision-capable
     /// models + preferred target). Emits a `vision_config` event.
     #[serde(rename = "get_vision_config")]

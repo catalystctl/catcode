@@ -45,12 +45,14 @@ type session struct {
 	models              []modelInfo
 	modelIdx            int
 	busy                bool
-	queuedNext          bool // a follow-up/steer turn is chained after the current one
-	queued              *queuedMsg // the currently-queued follow-up/steer (drives the pinned banner + Esc-dequeue)
+	queuedNext          bool                         // a follow-up/steer turn is chained after the current one
+	queued              *queuedMsg                   // the currently-queued follow-up/steer (drives the pinned banner + Esc-dequeue)
 	todos               []map[string]json.RawMessage // latest todo_write state (pinned panel)
 	turnCount           int
 	pendingApproval     *approvalPrompt
 	pendingIntercom     *intercomPrompt
+	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
+	pendingAsk          *askPrompt
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
 	sessionList         []sessionEntry
@@ -70,7 +72,7 @@ type session struct {
 	providers       []string
 	providerHasKey  bool
 	providerPresets []providerPreset
-	pendingLogin   string // preset id awaiting a pasted API key in the /login modal
+	pendingLogin    string // preset id awaiting a pasted API key in the /login modal
 
 	settings *settingsStore
 	keybinds map[string]string // effective keymap (defaults + user overrides); see keybinds.go
@@ -88,17 +90,17 @@ type session struct {
 	// scroll: follow=true keeps the viewport pinned to the newest line (the
 	// default). Scrolling up pauses follow so history can be read without the
 	// view yanking back down on each new token; a banner offers to re-pin.
-	follow        bool
-	welcomeIdx    int                 // welcome-screen example cursor (empty conversation)
-	contextTokens uint64              // live context size from the last metrics event (drives the footer budget)
-	lastCachePct  int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
-	tokensSaved   uint64              // cumulative tokens reclaimed by digest + compaction (shown next to "cached" in the footer)
-	summaryChars  int                 // character count of the current rolling compaction summary (0 until a summary is produced)
-	umansConcUsed  *int64            // live Umans account-wide concurrency in use; nil => not Umans / fetch failed (hide the field)
-	umansConcLimit *int64            // Umans plan concurrency ceiling; nil => unlimited (render ∞); only meaningful when used != nil
-	umansConcProvider string        // the Umans provider name the poll is tracking; conc shows only when the selected model routes here
-	subProgress   []*subProgressEntry // live subagent runs (drives the progress panel)
-	cwd           string              // working dir, shown in the header as ~/
+	follow            bool
+	welcomeIdx        int                 // welcome-screen example cursor (empty conversation)
+	contextTokens     uint64              // live context size from the last metrics event (drives the footer budget)
+	lastCachePct      int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
+	tokensSaved       uint64              // cumulative tokens reclaimed by digest + compaction (shown next to "cached" in the footer)
+	summaryChars      int                 // character count of the current rolling compaction summary (0 until a summary is produced)
+	umansConcUsed     *int64              // live Umans account-wide concurrency in use; nil => not Umans / fetch failed (hide the field)
+	umansConcLimit    *int64              // Umans plan concurrency ceiling; nil => unlimited (render ∞); only meaningful when used != nil
+	umansConcProvider string              // the Umans provider name the poll is tracking; conc shows only when the selected model routes here
+	subProgress       []*subProgressEntry // live subagent runs (drives the progress panel)
+	cwd               string              // working dir, shown in the header as ~/
 
 	// @-mention file flyout state (see mention.go): active when an
 	// unbroken @-token sits at the cursor; mentionAt is its rune index.

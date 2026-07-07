@@ -192,6 +192,20 @@ impl IntercomBus {
         msg
     }
 
+    /// Remove and return the oldest message from `target`'s mailbox that was
+    /// sent by `from`. Messages from other senders are left in place so they
+    /// can be picked up by the `intercom` tool's `receive` action. Used by the
+    /// subagent loop's steer-message polling to avoid consuming peer messages.
+    pub fn receive_from(&self, target: &str, from: &str) -> Option<IntercomMessage> {
+        let mb = {
+            let guard = self.mailboxes.lock().unwrap();
+            guard.get(target).cloned()
+        }?;
+        let mut queue = mb.messages.lock().unwrap();
+        let pos = queue.iter().position(|m| m.from == from)?;
+        queue.remove(pos)
+    }
+
     /// Register a blocking ask and return its handle. The caller awaits the
     /// handle's notify; the recipient resolves it via `resolve_ask`.
     pub fn create_ask(&self, ask: PendingAsk) -> Result<Arc<PendingAsk>, String> {

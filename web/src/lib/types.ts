@@ -152,6 +152,25 @@ export interface IntercomPrompt {
   reason?: string;
 }
 
+/** One question in an `ask` tool call: a multiple-choice selection or a
+ *  free-text box. `options` is required for type "select". */
+export interface AskQuestion {
+  id: string;
+  prompt: string;
+  type: "select" | "text";
+  options?: string[];
+  allowCustom?: boolean;
+  required?: boolean;
+  placeholder?: string;
+}
+
+/** A pending `ask` tool call — the model asked the user one or more questions
+ *  and is blocking until they answer or skip. */
+export interface AskPrompt {
+  request_id: string;
+  questions: AskQuestion[];
+}
+
 /** A log entry for intercom/subagent activity (kept recent, capped). */
 export interface IntercomEntry {
   id: string;
@@ -247,6 +266,7 @@ export type CoreEvent =
   | { type: "tool_call"; id: string; name: string; args: string }
   | { type: "tool_result"; id: string; ok: boolean; output: string; diff?: string; tool?: string }
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
+  | { type: "ask_request"; request_id: string; questions: AskQuestion[] }
   | { type: "metrics" } & Metrics
   | { type: "umans_conc"; used: number | null; limit: number | null; provider: string }
   | { type: "compacted"; before_tokens: number; after_tokens: number }
@@ -319,6 +339,8 @@ export type CoreCommand =
   | { type: "undo" }
   // ── Subagent / intercom ──
   | { type: "intercom_reply"; request_id: string; reply: string }
+  // ── Ask tool ──
+  | { type: "ask_reply"; request_id: string; answers: Record<string, string> | null }
   // ── Memory ──
   | { type: "save_memory"; text: string; tags?: string[] }
   | { type: "list_memory" }
@@ -468,6 +490,7 @@ export interface AgentState {
   streaming: boolean;
   retrying: boolean;
   pendingApproval: ApprovalRequest | null;
+  pendingAsk: AskPrompt | null;
   metrics: Metrics | null;
   /** Live Umans concurrency (used/limit) from the `/v1/usage` poll; null when
    *  not Umans / fetch failed. Drives a footer field ahead of tps. */

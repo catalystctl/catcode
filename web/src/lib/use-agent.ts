@@ -63,6 +63,8 @@ export interface AgentApi {
   dismissToast: (id: string) => void;
   // ── Subagent / intercom ──
   intercomReply: (reply: string) => Promise<void>;
+  // ── Ask tool ──
+  askReply: (answers: Record<string, string> | null) => Promise<void>;
   // ── OAuth ──
   submitOauthCode: (code: string) => Promise<void>;
   dismissOauth: () => void;
@@ -237,7 +239,7 @@ export function useAgent(): AgentApi {
         retrying: false,
         pendingApproval: null,
         pendingIntercom: null,
-        sessions: [],
+        pendingAsk: null,
         currentSessionFile: sessionFile,
         switching: true,
         workspace: workspace ?? s.workspace,
@@ -408,6 +410,20 @@ export function useAgent(): AgentApi {
       if (!req) return Promise.resolve();
       setState((st) => ({ ...st, pendingIntercom: null }));
       return send({ type: "intercom_reply", request_id: req.request_id, reply });
+    },
+    [send],
+  );
+
+  // ── Ask tool ──
+  // Submit the user's answers to a pending `ask` tool call (object keyed by
+  // question id), or pass null to skip the prompt.
+  const askReply = useCallback(
+    (answers: Record<string, string> | null) => {
+      const s = stateRef.current;
+      const req = s.pendingAsk;
+      if (!req) return Promise.resolve();
+      setState((st) => ({ ...st, pendingAsk: null }));
+      return send({ type: "ask_reply", request_id: req.request_id, answers });
     },
     [send],
   );
@@ -616,6 +632,7 @@ export function useAgent(): AgentApi {
       stats,
       dismissToast,
       intercomReply,
+      askReply,
       submitOauthCode,
       dismissOauth,
       undo,

@@ -66,7 +66,43 @@ If a subagent asks you a question, answer it directly — it is waiting. Do not 
 { action: "status" } / { action: "status", id: "run-1" }
 { action: "interrupt", id: "run-1" }
 { action: "resume", id: "run-1", message: "follow-up" }
+{ action: "peek", id: "run-1" }          // watch: inspect conversation state
+{ action: "steer", id: "run-1", message: "..." }  // bump direction mid-run
 { action: "doctor" }                      // setup diagnostics
+```
+
+## Watching & steering running subagents
+
+You can inspect and intervene in a running subagent without interrupting it:
+
+- **`peek`** — returns the subagent's current conversation state: message
+  count, estimated tokens, the last 3 assistant turns, the last 3 tool
+  results, and any pending intercom asks. Use this to watch what a subagent
+  is doing, diagnose when it seems stuck, or decide whether to intervene.
+  Works on both running and completed runs (completed runs retain their
+  final conversation snapshot).
+
+- **`steer`** — injects a directional message into the subagent's
+  conversation. The message is appended as a user message
+  ("Orchestrator: …") and the subagent picks it up on its next turn —
+  between model calls, not mid-stream. Use this to:
+  - **Bump direction** when the subagent is going down the wrong path
+  - **Fix** a misunderstanding ("actually, use the Postgres driver, not MySQL")
+  - **Unstick** by adding a hint or constraint the subagent is missing
+  - **Refine scope** mid-flight ("also handle the error case in that function")
+
+  Steer is non-destructive: it does not cancel the current turn. If the
+  subagent is mid-model-call, the steer message waits in its mailbox and is
+  picked up when the call completes. To stop a subagent entirely, use
+  `interrupt`.
+
+**Pattern — monitor and course-correct:**
+```
+1. Dispatch: { agent: "worker", task: "refactor the auth module", async: true }
+2. Check in:  { action: "peek", id: "run-1" }
+3. If off-track: { action: "steer", id: "run-1", message: "Focus on the JWT validation first, leave the session store for later." }
+4. Check again: { action: "peek", id: "run-1" }
+5. If recovered: let it continue. If still wrong: { action: "interrupt", id: "run-1" }
 ```
 
 ## Patterns

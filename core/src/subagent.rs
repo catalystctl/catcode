@@ -27,7 +27,7 @@ use crate::State;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -750,6 +750,8 @@ pub struct SubagentRun {
     pub cancel: Option<Arc<CancellationToken>>,
     pub children: Vec<SubagentRun>,
     pub summary: Option<String>,
+    /// Shared conversation snapshot for peek/steer. Updated after each turn.
+    pub messages: Arc<Mutex<Vec<Message>>>,
 }
 
 /// Maximum number of *terminal* (completed/failed/paused) run records kept for
@@ -962,6 +964,7 @@ async fn run_single(
     // interrupt was a no-op.
     let run_cancel = cancel.child_token();
     let started = now_ms();
+    let messages = Arc::new(Mutex::new(Vec::new()));
     let run = SubagentRun {
         id: run_id.to_string(),
         mode: "single".into(),
@@ -975,6 +978,7 @@ async fn run_single(
         cancel: Some(Arc::new(run_cancel.clone())),
         children: vec![],
         summary: None,
+        messages: messages.clone(),
     };
     st.subagent_runs
         .lock()
@@ -1008,6 +1012,7 @@ async fn run_single(
         max_depth,
         bridge,
         &run_cancel,
+        messages,
     )
     .await;
 
@@ -1051,6 +1056,7 @@ pub async fn run_agent(
     max_depth: u32,
     bridge: bool,
     cancel: &CancellationToken,
+    messages: Arc<Mutex<Vec<Message>>>,
 ) -> Outcome {
     emit_subagent_progress(run_id, agent, "start", "", 0, 0, 0, 0, true);
     let result = run_agent_inner(
@@ -1069,6 +1075,7 @@ pub async fn run_agent(
         max_depth,
         bridge,
         cancel,
+        messages,
     )
     .await;
     emit_subagent_progress(run_id, agent, "done", "", 0, 0, 0, 0, result.ok);
@@ -1092,6 +1099,7 @@ async fn run_agent_inner(
     max_depth: u32,
     bridge: bool,
     cancel: &CancellationToken,
+    messages: Arc<Mutex<Vec<Message>>>,
 ) -> Outcome {
     let workspace = st.cfg.read().await.workspace.clone();
     let cfg = st.cfg.read().await.clone();
@@ -1224,6 +1232,33 @@ async fn run_agent_inner(
         if cancel.is_cancelled() {
             return Outcome::ok("[subagent aborted]");
         }
+        // Poll intercom mailbox for orchestrator steer messages (peek + steer actions)
+        // Drain orchestrator steer messages from the mailbox without
+        // consuming peer-to-peer messages (those stay for the intercom tool's
+        // `receive` action). Using receive_from ensures we never eat a peer's
+        // fire-and-forget message meant for the subagent.
+        let mut got_steer = false;
+        while let Some(msg) = st.intercom.receive_from(my_target, orchestrator) {
+            let steer_text = format!("Orchestrator: {}", &msg.message);
+            sub.push(Message::user(&steer_text));
+            emit_subagent_message(run_id, "system", &steer_text);
+            got_steer = true;
+        }
+        if got_steer {
+            emit_subagent_progress(
+                run_id,
+                agent,
+                "steered",
+                "",
+                tool_count,
+                sub_in,
+                sub_out,
+                run_start.elapsed().as_millis() as u64,
+                true,
+            );
+            *messages.lock().unwrap() = sub.clone();
+            continue; // re-enter loop with new context
+        }
         // compaction gate — anchor on the endpoint's real prompt_tokens when
         // available so compaction fires at the right context level, not a
         // whole-history char/4 guess that drifts late.
@@ -1307,6 +1342,8 @@ async fn run_agent_inner(
         *st.tokens_out.lock().await += to;
         *st.cached_tokens.lock().await += cached;
         sub.push(assistant.clone());
+        // Snapshot for peek: after assistant response
+        *messages.lock().unwrap() = sub.clone();
         emit_subagent_progress(
             run_id,
             agent,
@@ -1432,6 +1469,8 @@ async fn run_agent_inner(
                 outcome.ok,
             );
             sub.push(Message::tool(&id, &outcome.output));
+            // Snapshot after tool result (for peek)
+            *messages.lock().unwrap() = sub.clone();
 
             // finish sentinel
             if name == "finish" && outcome.ok && outcome.output == "__finish__" {
@@ -1484,16 +1523,16 @@ async fn dispatch_subagent_tool(
         ));
     }
 
-    // Guard write/edit/patch the same way the main loop does: block paths that
-    // escape the workspace or hit sensitive system locations. The deny reason
-    // becomes the tool result so the subagent model knows why its write was
-    // refused.
-    if name == "write_file" || name == "edit" || name == "patch" {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(msg) = crate::workspace::check_dangerous_path(path) {
-            return Outcome::err(msg);
-        }
-    }
+    // Restricted ("dangerous") paths (.env, .git/**, .ssh/**, id_rsa, …).
+    // Under `Never` ALL file restrictions are disabled — no prompt, no block.
+    // Under `Destructive`/`Always` a restricted path forces an approval prompt
+    // (for reads AND writes) instead of an unconditional hard block; an approved
+    // call proceeds. Mirrors the main loop.
+    let restricted = if matches!(cfg.approval, crate::config::Approval::Never) {
+        None
+    } else {
+        crate::restricted_path_for_tool(name, args)
+    };
 
     // Approval gate + permission rules. A subagent is model-driven (the parent
     // model decides to spawn; the child decides what to run), so delegated work
@@ -1530,7 +1569,9 @@ async fn dispatch_subagent_tool(
     } else {
         match cfg.approval {
             crate::config::Approval::Never => false,
-            crate::config::Approval::Destructive => kind == tools::ToolKind::Destructive,
+            crate::config::Approval::Destructive => {
+                kind == tools::ToolKind::Destructive || restricted.is_some()
+            }
             crate::config::Approval::Always => true,
         }
     };
@@ -1619,13 +1660,6 @@ async fn dispatch_subagent_tool(
                         }
                     }
                 }
-                if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
-                    if let Some(m) = crate::workspace::check_dangerous_path(
-                        iargs.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                    ) {
-                        dmsg = Some(m);
-                    }
-                }
                 if dmsg.is_none() {
                     let ihook = match iname.as_str() {
                         "bash" => "pre_bash",
@@ -1659,13 +1693,6 @@ async fn dispatch_subagent_tool(
                             }
                             if let Some(m) = &r.modify {
                                 crate::plugins::apply_modify(&mut modified, m);
-                            }
-                        }
-                        if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
-                            if let Some(m) = crate::workspace::check_dangerous_path(
-                                modified.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                            ) {
-                                dmsg = Some(m);
                             }
                         }
                     }
@@ -2164,6 +2191,7 @@ async fn run_parallel(
         cancel: Some(Arc::new(run_cancel.clone())),
         children: vec![],
         summary: None,
+        messages: Arc::new(Mutex::new(Vec::new())),
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
     emit_subagent_start(
@@ -2303,6 +2331,7 @@ async fn run_chain(
         cancel: Some(Arc::new(run_cancel.clone())),
         children: vec![],
         summary: None,
+        messages: Arc::new(Mutex::new(Vec::new())),
     };
     st.subagent_runs.lock().await.insert(run_id.clone(), run);
     emit_subagent_start(
@@ -2486,8 +2515,10 @@ async fn handle_action(
         "status" => status_action(args, st).await,
         "interrupt" => interrupt_action(args, st).await,
         "resume" => resume_action(args, st, cancel).await,
+        "peek" => peek_action(args, st).await,
+        "steer" => steer_action(args, st, cancel).await,
         "doctor" => doctor_action(workspace, cfg, st).await,
-        other => Outcome::err(format!("unknown action '{other}'; use list|get|create|update|delete|status|interrupt|resume|doctor")),
+        other => Outcome::err(format!("unknown action '{other}'; use list|get|create|update|delete|status|interrupt|resume|peek|steer|doctor")),
     }
 }
 
@@ -2497,6 +2528,89 @@ fn source_label(s: &AgentSource) -> &'static str {
         AgentSource::User => "user",
         AgentSource::Project => "project",
     }
+}
+
+/// Peek at a running subagent's conversation state.
+pub async fn peek_action(args: &Value, st: &Arc<State>) -> Outcome {
+    let runs = st.subagent_runs.lock().await;
+    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let r = match find_run_prefix(&runs, id) {
+        Some(r) => r.clone(),
+        None => return Outcome::err(format!("no run matching '{id}'")),
+    };
+    drop(runs);
+    let msgs = r.messages.lock().unwrap();
+    let msg_count = msgs.len();
+    let est_tokens = estimate_messages_tokens(&msgs);
+    let last_turns: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.is_assistant())
+        .filter_map(|m| m.content_text())
+        .map(|s| s.to_string())
+        .rev()
+        .take(3)
+        .collect();
+    let last_tools: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.is_tool())
+        .filter_map(|m| m.content_text())
+        .map(|s| s.to_string())
+        .rev()
+        .take(3)
+        .collect();
+    drop(msgs);
+    let body = json!({
+        "id": r.id,
+        "state": r.state,
+        "mode": r.mode,
+        "agents": r.agents,
+        "started_at": r.started_at,
+        "ended_at": r.ended_at,
+        "messages_count": msg_count,
+        "estimated_tokens": est_tokens,
+        "last_turns": last_turns,
+        "last_tools": last_tools,
+        "intercom_pending": st.intercom.pending_count(),
+    });
+    Outcome::ok(body.to_string())
+}
+
+/// Steer a running subagent by injecting a message into its conversation.
+pub async fn steer_action(args: &Value, st: &Arc<State>, _cancel: &CancellationToken) -> Outcome {
+    let runs = st.subagent_runs.lock().await;
+    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let r = match find_run_prefix(&runs, id) {
+        Some(r) => r.clone(),
+        None => return Outcome::err(format!("no run matching '{id}'")),
+    };
+    drop(runs);
+    if msg.is_empty() {
+        return Outcome::err("steer requires 'message'");
+    }
+    if let Some(target) = &r.intercom_target {
+        if st.intercom.targets().iter().any(|t| t == target) {
+            let imsg = crate::intercom::IntercomMessage {
+                id: format!("steer-{}", now_ms()),
+                from: st.intercom.orchestrator_target(),
+                to: target.clone(),
+                message: msg.to_string(),
+                reason: "steer".into(),
+                ts: now_ms(),
+                ask_id: String::new(),
+            };
+            match st.intercom.post(imsg) {
+                Ok(()) => {
+                    return Outcome::ok(format!(
+                        "steer message delivered to {} ({})",
+                        r.id, target
+                    ));
+                }
+                Err(e) => return Outcome::err(format!("steer delivery failed: {e}")),
+            }
+        }
+    }
+    Outcome::err(format!("run {} is no longer live", r.id))
 }
 
 fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {

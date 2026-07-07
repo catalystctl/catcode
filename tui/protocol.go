@@ -127,6 +127,17 @@ func (e *coreEvent) get(key string) string {
 	return strings.TrimSpace(string(v))
 }
 
+// rawKey returns the raw JSON value for a key (e.g. an array/object), so
+// callers can unmarshal structured fields themselves without re-parsing Raw.
+func (e *coreEvent) rawKey(key string) (json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(e.Raw, &m); err != nil {
+		return nil, false
+	}
+	v, ok := m[key]
+	return v, ok
+}
+
 // ---------------------------------------------------------------------------
 // Tea messages
 // ---------------------------------------------------------------------------

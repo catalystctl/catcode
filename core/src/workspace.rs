@@ -1,12 +1,20 @@
 // Workspace path confinement. Every file tool resolves paths against a root
 // and rejects escapes (absolute paths, `..` traversal, symlinks pointing out).
 // bash runs with cwd locked to the root.
-// Also includes a dangerous-path blocklist for write/edit operations.
+// Also includes a restricted-path list (.env, .git/**, .ssh/**, id_rsa, …)
+// that the approval gate uses to PROMPT (under Destructive/Always) rather than
+// hard-block. Under Approval::Never the list is not enforced at all.
 use std::path::{Path, PathBuf};
 
-/// Dangerous paths that should never be written to or edited by the agent.
-/// These are shell/ssh config files and VCS internals that could cause
-/// permanent damage or security issues if modified by an AI.
+/// Restricted paths the agent should not read or write without explicit
+/// approval. These are shell/ssh config files, VCS internals, and
+/// secret-bearing files (.env, private keys) that could cause permanent
+/// damage or leak secrets if touched by an AI.
+///
+/// Enforcement is approval-gated (see main::restricted_path_for_tool): under
+/// `Approval::Never` these are NOT enforced at all (ALL file restrictions
+/// disabled); under `Destructive`/`Always` a match forces an approval prompt
+/// (for reads AND writes) instead of an unconditional hard block.
 const DANGEROUS_PATHS: &[&str] = &[
     ".git/**",
     "**/.bashrc",
@@ -22,13 +30,14 @@ const DANGEROUS_PATHS: &[&str] = &[
     "**/.env.production",
 ];
 
-/// Check if a resolved path matches any dangerous pattern.
-/// Returns Some(error_message) if blocked, None if allowed.
+/// Check if a resolved path matches any restricted pattern.
+/// Returns Some(reason) if restricted, None if allowed. The approval gate
+/// turns a match into a prompt (Destructive/Always) — Never skips it entirely.
 pub fn check_dangerous_path(input: &str) -> Option<String> {
     for pattern in DANGEROUS_PATHS {
         if glob_match_path(pattern, input) {
             return Some(format!(
-                "path {input:?} matches dangerous pattern '{pattern}'; write/edit blocked"
+                "path {input:?} matches restricted pattern '{pattern}'"
             ));
         }
     }

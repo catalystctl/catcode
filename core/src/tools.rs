@@ -22,6 +22,7 @@ pub fn classify(name: &str) -> ToolKind {
         | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
         | "memory" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
+        "ask" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -36,7 +37,7 @@ pub fn definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["list","get","models","create","update","delete","status","interrupt","resume","doctor"], "description": "management/control action" },
+                        "action": { "type": "string", "enum": ["list","get","models","create","update","delete","status","interrupt","resume","peek","steer","doctor"], "description": "management/control action. peek: inspect a running subagent's conversation state (messages, tokens, last turns). steer: inject a directional message into a running subagent's conversation to bump its course or unstick it." },
                         "agent": { "type": "string", "description": "agent name for single mode or target for management" },
                         "task": { "type": "string", "description": "task string for single mode" },
                         "model": { "type": "string", "description": "override model for this run" },
@@ -46,8 +47,8 @@ pub fn definitions() -> Vec<Value> {
                         "worktree": { "type": "boolean" },
                         "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent conversation" },
                         "async": { "type": "boolean", "description": "background execution" },
-                        "id": { "type": "string", "description": "run id for status/interrupt/resume" },
-                        "message": { "type": "string", "description": "follow-up message for resume" },
+                        "id": { "type": "string", "description": "run id for status/interrupt/resume/peek/steer" },
+                        "message": { "type": "string", "description": "follow-up message for resume, or steering text for steer" },
                         "config": { "type": "object", "description": "agent/chain config for create/update" },
                         "agentScope": { "type": "string", "enum": ["user","project","both"] }
                     }
@@ -502,6 +503,41 @@ pub fn definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ask",
+                "description": "Ask the user one or more questions and block until they answer. Use this at the start of a task to gather requirements, clarify scope, or let the user choose between options (framework, approach, trade-offs) before you commit to a plan. Each question is either a multiple-choice selection or a free-text box. The user's answers are returned as the tool result. The user may skip optional questions or dismiss the whole prompt — handle a skip gracefully (fall back to your best judgment and say so).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "One or more questions to ask the user, in order. Each appears as its own field in the flyout.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Stable identifier for this question. The answers come back keyed by this id." },
+                                    "prompt": { "type": "string", "description": "The question text shown to the user." },
+                                    "type": { "type": "string", "enum": ["select", "text"], "description": "'select' = choose from options; 'text' = free-text input box." },
+                                    "options": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Required for type 'select': the choices the user picks from."
+                                    },
+                                    "allowCustom": { "type": "boolean", "description": "(select only) when true, the user may type a custom answer instead of picking from options." },
+                                    "placeholder": { "type": "string", "description": "(text only) placeholder shown in the input box." },
+                                    "required": { "type": "boolean", "description": "If false, the user may skip this question. Default true." }
+                                },
+                                "required": ["id", "prompt", "type"]
+                            }
+                        }
+                    },
+                    "required": ["questions"]
+                }
+            }
+        }),
     ]
 }
 
@@ -532,6 +568,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "web_search" => Outcome::err("web_search must be dispatched through execute_web_search (async)"),
         "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
         "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
+        "ask" => Outcome::err("ask must be dispatched through request_ask (async, orchestrator loop only)"),
         "edit" => {
             let path = s("path");
             match args.get("edits").and_then(|v| v.as_array()) {
@@ -640,13 +677,11 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
 }
 
 fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
-    // P0-3: enforce the dangerous-path blocklist inside the primitive so every
-    // caller (main loop, subagent dispatch, AND bulk_write/bulk) is covered —
-    // previously only the top-level write_file/edit/patch dispatch checked, so
-    // bulk_write could write .git/config, .env, id_rsa, etc.
-    if let Some(msg) = workspace::check_dangerous_path(input) {
-        return Outcome::err(msg);
-    }
+    // Restricted paths (.env, .git/**, .ssh/**, id_rsa, …) are NO LONGER
+    // hard-blocked here — enforcement moved to the approval gate
+    // (main::restricted_path_for_tool) so that under Approval::Never ALL
+    // restrictions are disabled, and under Destructive/Always a restricted
+    // path prompts (instead of an unconditional kill) for reads AND writes.
     let path = match workspace::resolve(&cfg.workspace, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
@@ -1456,9 +1491,6 @@ fn plan_edit(
     edits: &[Value],
     cfg: &Config,
 ) -> Result<(std::path::PathBuf, String, String), String> {
-    if let Some(msg) = workspace::check_dangerous_path(input) {
-        return Err(msg);
-    }
     let path = workspace::resolve(&cfg.workspace, input)?;
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
@@ -1543,9 +1575,6 @@ pub fn preview_diff_edit(input: &str, edits: &[Value], cfg: &Config) -> Result<S
 
 /// Compute the unified diff a `patch` call *would* produce, without writing.
 pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<String, String> {
-    if let Some(msg) = workspace::check_dangerous_path(path) {
-        return Err(msg);
-    }
     let resolved = workspace::resolve(&cfg.workspace, path)?;
     let original = std::fs::read_to_string(&resolved).unwrap_or_default();
     let new = apply_unified_diff(&original, patch)?;
@@ -1555,9 +1584,6 @@ pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<Strin
 /// Compute the unified diff a `write_file` call *would* produce, without
 /// writing. For a new file the diff is the whole content as additions.
 pub fn preview_diff_write(input: &str, content: &str, cfg: &Config) -> Result<String, String> {
-    if let Some(msg) = workspace::check_dangerous_path(input) {
-        return Err(msg);
-    }
     let path = workspace::resolve(&cfg.workspace, input)?;
     let old_content = std::fs::read_to_string(&path).unwrap_or_default();
     Ok(make_unified_diff(&old_content, content, input, 3))
@@ -1800,10 +1826,6 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
     let patch = args.get("patch").and_then(|v| v.as_str()).unwrap_or("");
     if path.is_empty() || patch.is_empty() {
         return Outcome::err("patch requires 'path' and 'patch'");
-    }
-    // P0-3: blocklist enforced inside the primitive (covers bulk patch too).
-    if let Some(msg) = workspace::check_dangerous_path(path) {
-        return Outcome::err(msg);
     }
     let resolved = match workspace::resolve(&cfg.workspace, path) {
         Ok(p) => p,
@@ -2390,7 +2412,11 @@ fn git_commit(args: &Value, cfg: &Config) -> Outcome {
 fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
     use crate::memory::Scope;
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-    let scope = Scope::parse(args.get("scope").and_then(|v| v.as_str()).unwrap_or("workspace"));
+    let scope = Scope::parse(
+        args.get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("workspace"),
+    );
     match action {
         "save" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2419,7 +2445,10 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    Outcome::ok(format!("saved {} memory '{name}' (id: {id})", scope.as_str()))
+                    Outcome::ok(format!(
+                        "saved {} memory '{name}' (id: {id})",
+                        scope.as_str()
+                    ))
                 }
                 Err(e) => Outcome::err(e),
             }
@@ -2455,7 +2484,10 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    Outcome::ok(format!("appended to {} memory '{name}' (id: {id})", scope.as_str()))
+                    Outcome::ok(format!(
+                        "appended to {} memory '{name}' (id: {id})",
+                        scope.as_str()
+                    ))
                 }
                 Err(e) => Outcome::err(e),
             }
@@ -2487,7 +2519,11 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                 };
                 out.push_str(&format!(
                     "- {} [id: {}] ({}, {}){}\n",
-                    m.name, id, m.mem_type, m.scope.as_str(), desc
+                    m.name,
+                    id,
+                    m.mem_type,
+                    m.scope.as_str(),
+                    desc
                 ));
                 if !m.content.is_empty() {
                     for l in m.content.lines().take(3) {
@@ -3097,37 +3133,38 @@ mod tests {
     }
 
     #[test]
-    fn write_file_blocks_dangerous_paths() {
+    fn write_file_primitive_no_longer_blocks_restricted_paths() {
+        // The dangerous-path blocklist moved OUT of the primitive to the approval
+        // gate (main::restricted_path_for_tool). So the primitive itself never
+        // hard-blocks: under Approval::Never (or after an explicit approval) a
+        // restricted file like .git/config CAN be written. This test pins that
+        // contract so the enforcement doesn't silently migrate back here.
         let (_root, cfg) = tmp_ws();
-        // P0-3: the blocklist is enforced inside write_file itself.
         let o = execute(
             "write_file",
             &json!({"path":".git/config","content":"x"}),
             &cfg,
         );
-        assert!(!o.ok, "{}", o.output);
-        assert!(o.output.contains("dangerous pattern"), "{}", o.output);
-        assert!(!cfg.workspace.join(".git/config").exists());
+        assert!(o.ok, "{}", o.output);
+        assert!(cfg.workspace.join(".git/config").exists());
     }
 
     #[test]
-    fn bulk_write_blocks_dangerous_paths() {
+    fn bulk_write_primitive_no_longer_blocks_restricted_paths() {
+        // Mirrors write_file: bulk_write calls write_file, which no longer
+        // blocks. A restricted path (.env) is written at the primitive level;
+        // the approval gate decides whether to prompt.
         let (_root, cfg) = tmp_ws();
-        // P0-3: bulk_write must NOT bypass the blocklist (it calls write_file).
         let o = bulk_write(
             &json!({"files":[{"path":".env","content":"LEAK=1"},{"path":"ok.txt","content":"hi"}]}),
             &cfg,
         );
-        assert!(!o.ok, "{}", o.output);
-        assert!(o.output.contains("dangerous pattern"), "{}", o.output);
+        assert!(o.ok, "{}", o.output);
         assert!(
-            !cfg.workspace.join(".env").exists(),
-            ".env must not be written"
+            cfg.workspace.join(".env").exists(),
+            ".env should be written (gate enforces, not the primitive)"
         );
-        assert!(
-            cfg.workspace.join("ok.txt").exists(),
-            "non-dangerous file should still be written"
-        );
+        assert!(cfg.workspace.join("ok.txt").exists());
     }
 
     #[test]

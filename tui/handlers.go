@@ -1032,6 +1032,12 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if s.kb(msg, "send") {
 			reply := strings.TrimSpace(s.input.Value())
 			if reply == "" {
+				// Empty intercom replies are never sent (Esc sends the
+				// "[no reply]" nudge). Pulse the banner hint instead of a
+				// silent no-op so the user knows to type — fixes
+				// "Enter does not reply to the subagent".
+				s.intercomNudge = time.Now()
+				s.input.Focus()
 				return s, nil
 			}
 			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": reply})

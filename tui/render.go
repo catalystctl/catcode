@@ -63,7 +63,12 @@ func (s *session) layout() {
 
 func (s *session) renderIntercomBanner() string {
 	i := s.pendingIntercom
-	msg := fmt.Sprintf("❓ subagent %s asks: %s   ↵ reply   esc skip", i.from, truncate(i.message, max(1, s.width-60)))
+	var msg string
+	if !s.intercomNudge.IsZero() && time.Since(s.intercomNudge) < 1500*time.Millisecond {
+		msg = "⚠ type a reply below, then ↵   ·   esc to skip"
+	} else {
+		msg = fmt.Sprintf("❓ subagent %s asks: %s   type reply + ↵   ·   esc skip", i.from, truncate(i.message, max(1, s.width-60)))
+	}
 	return lipgloss.NewStyle().
 		Width(s.width).
 		Background(lipgloss.Color(c.accent)).
@@ -472,6 +477,12 @@ func (s *session) inputContent(w int) string {
 	value := s.input.Value()
 	if value == "" {
 		ph := s.input.Placeholder
+		// When a subagent is waiting on an intercom reply, make it obvious the
+		// chat box below is where you type it (the banner alone reads as
+		// "press ↵ to reply", which leads users to hit Enter on an empty box).
+		if s.pendingIntercom != nil {
+			ph = "Reply to " + s.pendingIntercom.from + "…"
+		}
 		if ph == "" {
 			return ""
 		}

@@ -254,6 +254,20 @@ pub struct PendingApproval {
     escalated: Mutex<bool>,       // "always" was chosen → upgrade session mode
 }
 
+/// A pending `ask` tool call the user must answer before the model continues.
+/// Mirrors PendingApproval but carries arbitrary structured answers back.
+#[allow(dead_code)]
+pub struct PendingAsk {
+    request_id: String,
+    /// The validated questions array sent to the TUI in the `ask_request`
+    /// event (and used to format the model-facing result).
+    questions: Value,
+    notify: Arc<Notify>,
+    /// None = awaiting. Some(obj) = answered (obj maps question id → answer).
+    /// Some(Value::Null) = the user skipped the whole prompt.
+    answers: Mutex<Option<Value>>,
+}
+
 pub struct State {
     pub cfg: RwLock<Config>,
     /// The shared HTTP client. Held on State so per-turn resolution can do
@@ -275,6 +289,8 @@ pub struct State {
     /// Pending approval requests keyed by their unique approval id (see
     /// APPROVAL_SEQ) so parallel subagents can't clobber each other's request.
     pub pending: Mutex<std::collections::HashMap<String, Arc<PendingApproval>>>,
+    /// Pending `ask` tool calls keyed by their unique ask id (see ASK_SEQ).
+    pub pending_asks: Mutex<std::collections::HashMap<String, Arc<PendingAsk>>>,
     pub logger: Logger,
     /// Token counts accumulated across the session (for the status bar).
     pub tokens_in: Mutex<u64>,
@@ -1062,6 +1078,7 @@ async fn main() {
         current: Mutex::new(None),
         handle: Mutex::new(None),
         pending: Mutex::new(std::collections::HashMap::new()),
+        pending_asks: Mutex::new(std::collections::HashMap::new()),
         logger,
         tokens_in: Mutex::new(init_stats.tokens_in),
         tokens_out: Mutex::new(init_stats.tokens_out),
@@ -1130,14 +1147,15 @@ async fn main() {
                 match st.umans_provider_with_key().await {
                     Some(rp) => {
                         let name = rp.name.clone();
-                        let (used, limit) =
-                            match rp.api_key.as_deref() {
-                                Some(k) => match provider::fetch_umans_usage(&cl, &rp.base_url, k).await {
+                        let (used, limit) = match rp.api_key.as_deref() {
+                            Some(k) => {
+                                match provider::fetch_umans_usage(&cl, &rp.base_url, k).await {
                                     Some(u) => (u.used, u.limit),
                                     None => (None, None),
-                                },
-                                None => (None, None),
-                            };
+                                }
+                            }
+                            None => (None, None),
+                        };
                         let used_v = used.map(Value::from).unwrap_or(Value::Null);
                         let limit_v = limit.map(Value::from).unwrap_or(Value::Null);
                         emit(
@@ -1150,7 +1168,11 @@ async fn main() {
                     }
                     None => {
                         if last_provider.take().is_some() {
-                            emit(&Event::new("umans_conc").with("used", Value::Null).with("limit", Value::Null));
+                            emit(
+                                &Event::new("umans_conc")
+                                    .with("used", Value::Null)
+                                    .with("limit", Value::Null),
+                            );
                         }
                     }
                 }
@@ -2156,6 +2178,23 @@ async fn main() {
                     ));
                 }
             }
+            Command::AskReply {
+                request_id,
+                answers,
+            } => {
+                // The user answered (or skipped) a pending `ask` tool call.
+                // Resolves the awaiting request_ask() so the model continues.
+                let p = state.pending_asks.lock().await.get(&request_id).cloned();
+                if let Some(p) = p {
+                    *p.answers.lock().await = Some(answers);
+                    p.notify.notify_one();
+                } else {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!("no pending ask for id {request_id}")),
+                    ));
+                }
+            }
             Command::Abort => {
                 // Cancel the running turn AND drop any queued follow-up/steer so a
                 // single abort fully stops the loop (not just the current turn).
@@ -2307,6 +2346,67 @@ fn star_match_rule(pattern: &str, text: &str) -> bool {
         }
     }
     dp[p.len()][t.len()]
+}
+
+/// If this tool call targets a restricted ("dangerous") path, return the
+/// blocklist reason. The approval gate uses this so that — under
+/// `Destructive`/`Always` — a restricted path (`.env`, `.git/**`, `.ssh/**`,
+/// `id_rsa`, …) forces an approval prompt for BOTH reads and writes, instead
+/// of the old unconditional hard block. Under `Never` the gate skips this
+/// entirely, so ALL file restrictions are disabled.
+///
+/// Covers the content-touching tools: `read_file` (read), `write_file`/
+/// `edit`/`patch` (write), and the bulk variants (each inner path is checked).
+/// Search/list tools (`grep`/`glob`/`list_dir`) and `bash` are intentionally
+/// excluded — they don't read a single restricted file's content by path.
+pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<String> {
+    fn path_of(a: &Value) -> Option<&str> {
+        a.get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+    match name {
+        "read_file" | "write_file" | "edit" | "patch" => {
+            path_of(args).and_then(workspace::check_dangerous_path)
+        }
+        "bulk_read" => args
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.as_str())
+                    .find_map(workspace::check_dangerous_path)
+            }),
+        "bulk_write" => args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
+                    .find_map(workspace::check_dangerous_path)
+            }),
+        "bulk_edit" => args
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
+                    .find_map(workspace::check_dangerous_path)
+            }),
+        // `bulk`: recurse into inner calls — if ANY inner call targets a
+        // restricted path, the whole bulk prompts (then approved calls proceed).
+        "bulk" => args
+            .get("calls")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|c| {
+                    let n = c.get("name").and_then(|v| v.as_str())?;
+                    let a = c.get("args")?;
+                    restricted_path_for_tool(n, a)
+                })
+            }),
+        _ => None,
+    }
 }
 
 /// Build the user-message prompt for an `apply_skill` invocation: instructs
@@ -3239,12 +3339,25 @@ async fn run_turn(
                         continue;
                     }
 
+                    // Restricted ("dangerous") paths (.env, .git/**, .ssh/**, id_rsa, …).
+                    // Under `Never` ALL file restrictions are disabled — no
+                    // prompt, no block. Under `Destructive`/`Always` a
+                    // restricted path forces an approval prompt (for reads AND
+                    // writes) instead of the old unconditional hard block; an
+                    // approved call proceeds.
+                    let restricted = if matches!(cfg.approval, Approval::Never) {
+                        None
+                    } else {
+                        restricted_path_for_tool(&name, &args)
+                    };
                     let needs_approval = if force_allow || escalated {
                         false
                     } else {
                         match cfg.approval {
                             Approval::Never => false,
-                            Approval::Destructive => kind == tools::ToolKind::Destructive,
+                            Approval::Destructive => {
+                                kind == tools::ToolKind::Destructive || restricted.is_some()
+                            }
                             Approval::Always => true,
                         }
                     };
@@ -3275,31 +3388,6 @@ async fn run_turn(
                                 return;
                             }
                         }
-                    }
-
-                    // Check dangerous paths for write/edit tools.
-                    let dangerous = if name == "write_file" || name == "edit" || name == "patch" {
-                        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        workspace::check_dangerous_path(path)
-                    } else {
-                        None
-                    };
-                    if let Some(msg) = dangerous {
-                        emit(
-                            &Event::new("tool_result")
-                                .with("id", json!(id))
-                                .with("ok", json!(false))
-                                .with("output", json!(msg)),
-                        );
-                        let tool_result = Message::tool(id.clone(), msg);
-                        let est = estimate_message_tokens(&tool_result);
-                        let mut conv = st.conversation.lock().await;
-                        conv.push(tool_result);
-                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                            session::append(p, conv.last().unwrap());
-                        }
-                        *st.estimated_tokens.lock().await += est;
-                        continue;
                     }
 
                     // Dispatch pre-execution hooks for this tool. Each enabled
@@ -3425,14 +3513,6 @@ async fn run_turn(
                                         }
                                     }
                                 }
-                                // dangerous-path for write/edit (pre-hook)
-                                if dmsg.is_none() && (iname == "write_file" || iname == "edit") {
-                                    if let Some(m) = workspace::check_dangerous_path(
-                                        iargs.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                                    ) {
-                                        dmsg = Some(m);
-                                    }
-                                }
                                 // plugin pre-hooks (the security-relevant ones)
                                 if dmsg.is_none() {
                                     let hook_name = match iname.as_str() {
@@ -3469,19 +3549,6 @@ async fn run_turn(
                                             }
                                             if let Some(m) = &r.modify {
                                                 plugins::apply_modify(&mut modified, m);
-                                            }
-                                        }
-                                        // re-check dangerous path after a hook may have rewritten it
-                                        if dmsg.is_none()
-                                            && (iname == "write_file" || iname == "edit")
-                                        {
-                                            if let Some(m) = workspace::check_dangerous_path(
-                                                modified
-                                                    .get("path")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or(""),
-                                            ) {
-                                                dmsg = Some(m);
                                             }
                                         }
                                     }
@@ -3540,6 +3607,24 @@ async fn run_turn(
                             0,
                         )
                         .await
+                    } else if name == "ask" {
+                        // Blocking user-interaction tool: surface a flyout and
+                        // wait for the answer (or skip/abort). Validation errors
+                        // and skips return a normal Outcome; an abort ends the
+                        // turn like the approval gate does.
+                        match request_ask(st, &exec_args, &cancel).await {
+                            AskResult::Answered { questions, answers } => {
+                                tools::Outcome::ok(format_ask_answers(&questions, &answers))
+                            }
+                            AskResult::Skipped => tools::Outcome::ok(
+                                "The user skipped the questions. Proceed with your best judgment and note any assumptions.",
+                            ),
+                            AskResult::Aborted => {
+                                emit(&Event::new("aborted"));
+                                emit(&Event::new("done"));
+                                return;
+                            }
+                        }
                     } else {
                         tools::execute(&name, &exec_args, &cfg)
                     };
@@ -3878,6 +3963,184 @@ pub(crate) async fn request_approval(
         ApprovalResult::Granted
     } else {
         ApprovalResult::Denied
+    }
+}
+
+/// Outcome of a pending `ask` tool call.
+pub(crate) enum AskResult {
+    /// The user answered. Carries the validated questions array (for
+    /// formatting) and the answers object (question id → answer).
+    Answered { questions: Value, answers: Value },
+    /// The user skipped the whole prompt (closed the flyout without answering).
+    Skipped,
+    /// The turn was aborted (/abort) while the ask was pending.
+    Aborted,
+}
+
+/// Monotonic generator for globally-unique ask ids so concurrent asks (e.g.
+/// from a parallel subagent that somehow gained the tool) never collide.
+static ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Validate the `ask` tool args and return the normalized questions array.
+/// Returns Err(message) on invalid input (sent back to the model as a tool
+/// error WITHOUT blocking — the model can retry with a well-formed call).
+pub(crate) fn validate_ask_questions(args: &Value) -> Result<Value, String> {
+    let questions = args
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "ask requires a non-empty 'questions' array".to_string())?;
+    if questions.is_empty() {
+        return Err("ask 'questions' must not be empty".to_string());
+    }
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(questions.len());
+    for (i, q) in questions.iter().enumerate() {
+        let id = q
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("question {i}: missing 'id'"))?
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            return Err(format!("question {i}: 'id' must not be empty"));
+        }
+        if !seen_ids.insert(id.clone()) {
+            return Err(format!("question {i}: duplicate id '{id}'"));
+        }
+        let prompt = q
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("question {i}: missing 'prompt'"))?
+            .to_string();
+        let typ = q
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("question {i}: missing 'type'"))?;
+        let typ = match typ {
+            "select" | "text" => typ,
+            other => {
+                return Err(format!(
+                    "question {i}: invalid type '{other}' (select|text)"
+                ))
+            }
+        };
+        let options = if typ == "select" {
+            let opts = q
+                .get("options")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("question {i}: type 'select' requires 'options'"))?;
+            if opts.is_empty() {
+                return Err(format!("question {i}: 'options' must not be empty"));
+            }
+            let strs: Vec<String> = opts
+                .iter()
+                .map(|o| o.as_str().unwrap_or("").to_string())
+                .collect();
+            Value::from(strs)
+        } else {
+            Value::Null
+        };
+        let required = q.get("required").and_then(|v| v.as_bool()).unwrap_or(true);
+        let allow_custom = q
+            .get("allowCustom")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let placeholder = q
+            .get("placeholder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(json!({
+            "id": id,
+            "prompt": prompt,
+            "type": typ,
+            "options": options,
+            "allowCustom": allow_custom,
+            "required": required,
+            "placeholder": placeholder,
+        }));
+    }
+    Ok(Value::from(out))
+}
+
+/// Format the user's answers into the model-facing tool-result string.
+/// Skipped (unanswered optional) questions are listed as "(skipped)".
+pub(crate) fn format_ask_answers(questions: &Value, answers: &Value) -> String {
+    let qs = questions.as_array();
+    let ans = answers.as_object();
+    let mut lines = vec!["User answered:".to_string()];
+    if let Some(qs) = qs {
+        for q in qs {
+            let id = q.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let prompt = q.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let val = ans.and_then(|m| m.get(id)).and_then(|v| v.as_str());
+            let display = match val {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => "(skipped)".to_string(),
+            };
+            lines.push(format!("- {id} ({prompt}): {display}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Ask the user one or more questions via the TUI/web flyout; block until
+/// answered, skipped, or aborted. Mirrors `request_approval` but carries
+/// structured answers back instead of a granted/denied bool.
+pub(crate) async fn request_ask(
+    st: &Arc<State>,
+    args: &Value,
+    cancel: &CancellationToken,
+) -> AskResult {
+    let questions = match validate_ask_questions(args) {
+        Ok(q) => q,
+        Err(e) => {
+            // Validation failed BEFORE we block — surface as an info event and
+            // return Skipped so the model gets a tool result it can act on.
+            // (The dispatch wraps this: it formats the result.)
+            emit(
+                &Event::new("error").with("message", json!(format!("ask validation failed: {e}"))),
+            );
+            return AskResult::Skipped;
+        }
+    };
+    let request_id = format!(
+        "ask-{}",
+        ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let notify = Arc::new(Notify::new());
+    let pending = Arc::new(PendingAsk {
+        request_id: request_id.clone(),
+        questions: questions.clone(),
+        notify: notify.clone(),
+        answers: Mutex::new(None),
+    });
+    st.pending_asks
+        .lock()
+        .await
+        .insert(request_id.clone(), pending.clone());
+    emit(
+        &Event::new("ask_request")
+            .with("request_id", json!(request_id))
+            .with("questions", json!(questions)),
+    );
+
+    // Wait for the ask_reply command or abort.
+    let answers = tokio::select! {
+        _ = notify.notified() => pending.answers.lock().await.take(),
+        _ = cancel.cancelled() => {
+            st.pending_asks.lock().await.remove(&request_id);
+            return AskResult::Aborted;
+        }
+    };
+    st.pending_asks.lock().await.remove(&request_id);
+    match answers {
+        Some(v) if v.is_object() => AskResult::Answered {
+            questions: pending.questions.clone(),
+            answers: v,
+        },
+        // Some(Null) or Some(non-object) = user skipped the prompt.
+        _ => AskResult::Skipped,
     }
 }
 
@@ -4881,5 +5144,144 @@ mod auto_reflect_tests {
         assert!(extract_file_categories("grep", r#"{"pattern":"x"}"#).is_empty());
         // Malformed JSON is tolerated (no panic, no categories).
         assert!(extract_file_categories("edit", "not json").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod restricted_path_tests {
+    use super::*;
+
+    #[test]
+    fn read_file_restricted_path_detected() {
+        // A direct read of a restricted file is flagged so the gate can prompt.
+        let args = json!({"path": ".env"});
+        assert!(restricted_path_for_tool("read_file", &args).is_some());
+        // Safe path: no flag.
+        let args = json!({"path": "src/main.rs"});
+        assert!(restricted_path_for_tool("read_file", &args).is_none());
+    }
+
+    #[test]
+    fn write_edit_patch_restricted_paths_detected() {
+        for tool in ["write_file", "edit", "patch"] {
+            let args = json!({"path": ".git/config"});
+            assert!(
+                restricted_path_for_tool(tool, &args).is_some(),
+                "{tool} should flag .git/config"
+            );
+        }
+        let args = json!({"path": "README.md"});
+        assert!(restricted_path_for_tool("write_file", &args).is_none());
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        // .ENV / .GIT/config must still match on case-insensitive filesystems.
+        assert!(restricted_path_for_tool("read_file", &json!({"path": ".ENV"})).is_some());
+        assert!(restricted_path_for_tool("write_file", &json!({"path": ".GIT/config"})).is_some());
+    }
+
+    #[test]
+    fn bulk_read_flags_any_restricted() {
+        let args = json!({"paths": ["ok.txt", ".env", "other.rs"]});
+        assert!(restricted_path_for_tool("bulk_read", &args).is_some());
+        let args = json!({"paths": ["a.rs", "b.go"]});
+        assert!(restricted_path_for_tool("bulk_read", &args).is_none());
+    }
+
+    #[test]
+    fn bulk_write_and_bulk_edit_flag_restricted() {
+        let args = json!({"files": [{"path": ".env", "content": "x"}]});
+        assert!(restricted_path_for_tool("bulk_write", &args).is_some());
+        let args = json!({"edits": [{"path": ".ssh/config", "edits": []}]});
+        assert!(restricted_path_for_tool("bulk_edit", &args).is_some());
+        let args = json!({"files": [{"path": "ok.txt", "content": "x"}]});
+        assert!(restricted_path_for_tool("bulk_write", &args).is_none());
+    }
+
+    #[test]
+    fn bulk_recurses_into_inner_calls() {
+        // A bulk containing an inner write to a restricted path is flagged so
+        // the whole bulk prompts (then approved inner calls proceed).
+        let args = json!({"calls": [
+            {"name": "read_file", "args": {"path": "ok.txt"}},
+            {"name": "write_file", "args": {"path": ".env", "content": "LEAK=1"}}
+        ]});
+        assert!(restricted_path_for_tool("bulk", &args).is_some());
+        // All-safe bulk: no flag.
+        let args = json!({"calls": [
+            {"name": "read_file", "args": {"path": "a.rs"}},
+            {"name": "write_file", "args": {"path": "b.go", "content": "x"}}
+        ]});
+        assert!(restricted_path_for_tool("bulk", &args).is_none());
+    }
+
+    #[test]
+    fn excluded_tools_never_flag() {
+        // bash/grep/glob/list_dir are intentionally excluded — they don't read a
+        // single restricted file's content by path.
+        assert!(restricted_path_for_tool("bash", &json!({"command": "cat .env"})).is_none());
+        assert!(
+            restricted_path_for_tool("grep", &json!({"pattern": "x", "path": "src"})).is_none()
+        );
+        assert!(restricted_path_for_tool("glob", &json!({"pattern": "**/*"})).is_none());
+        assert!(restricted_path_for_tool("list_dir", &json!({"path": "."})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_empty_and_missing() {
+        assert!(validate_ask_questions(&json!({})).is_err());
+        assert!(validate_ask_questions(&json!({"questions": []})).is_err());
+        // missing id
+        assert!(validate_ask_questions(&json!({"questions": [{"prompt":"p","type":"text"}]})).is_err());
+        // missing prompt
+        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","type":"text"}]})).is_err());
+        // invalid type
+        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"radio"}]})).is_err());
+    }
+
+    #[test]
+    fn validate_select_requires_options() {
+        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select"}]})).is_err());
+        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select","options":[]}]})).is_err());
+        // valid select
+        let q = validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select","options":["x","y"]}]})).unwrap();
+        assert_eq!(q.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids() {
+        let r = validate_ask_questions(&json!({"questions": [
+            {"id":"a","prompt":"p","type":"text"},
+            {"id":"a","prompt":"q","type":"text"}
+        ]}));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn format_answers_marks_skipped() {
+        let qs = validate_ask_questions(&json!({"questions": [
+            {"id":"fw","prompt":"Which framework?","type":"select","options":["React","Vue"]},
+            {"id":"notes","prompt":"Any notes?","type":"text","required":false}
+        ]})).unwrap();
+        // answered fw, skipped notes
+        let out = format_ask_answers(&qs, &json!({"fw": "React"}));
+        assert!(out.contains("fw (Which framework?): React"));
+        assert!(out.contains("notes (Any notes?): (skipped)"));
+    }
+
+    #[test]
+    fn format_answers_all_answered() {
+        let qs = validate_ask_questions(&json!({"questions": [
+            {"id":"a","prompt":"Q1","type":"text"}
+        ]})).unwrap();
+        let out = format_ask_answers(&qs, &json!({"a": "hello"}));
+        assert!(out.contains("a (Q1): hello"));
+        assert!(!out.contains("(skipped)"));
     }
 }
