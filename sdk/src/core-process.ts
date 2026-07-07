@@ -1,4 +1,4 @@
-// CoreProcess — spawns the umans-harness core binary and speaks its JSONL
+// CoreProcess — spawns the catalyst-code core binary and speaks its JSONL
 // stdio protocol (commands → stdin, events ← stdout). Mirrors the Go TUI's
 // `startCore` plumbing (`tui/main.go`): binary resolution, pipe wiring, the
 // `init` handshake, and back-pressured line-delimited JSON I/O.
@@ -100,12 +100,12 @@ export class CoreProcess {
           stdio: ["pipe", "pipe", this.debugFd ?? "pipe"],
         });
       } catch (err: any) {
-        reject(new Error(`Failed to spawn umans-core (${binary}): ${err?.message ?? err}`));
+        reject(new Error(`Failed to spawn catcode-core (${binary}): ${err?.message ?? err}`));
         return;
       }
 
       if (!this.proc.stdin || !this.proc.stdout) {
-        reject(new Error("umans-core stdio is not piped"));
+        reject(new Error("catcode-core stdio is not piped"));
         return;
       }
       this.stdin = this.proc.stdin;
@@ -122,12 +122,12 @@ export class CoreProcess {
       rl.on("line", (line) => this.handleLine(line, resolve, reject));
 
       this.proc.on("error", (err) => {
-        if (!this.disposed) reject(new Error(`umans-core error: ${err.message}`));
+        if (!this.disposed) reject(new Error(`catcode-core error: ${err.message}`));
       });
       this.proc.on("exit", (code, signal) => {
         this.cleanup();
         // Reject any still-pending requests.
-        const err = new Error(`umans-core exited (code=${code} signal=${signal})`);
+        const err = new Error(`catcode-core exited (code=${code} signal=${signal})`);
         for (const p of this.pending) {
           if (p.timer) clearTimeout(p.timer);
           p.reject(err);
@@ -197,7 +197,7 @@ export class CoreProcess {
   /** Write a command (newline-delimited JSON) to the core's stdin. */
   send(command: CoreCommand): void {
     if (!this.stdin || this.disposed) {
-      throw new Error("umans-core is not running (no stdin)");
+      throw new Error("catcode-core is not running (no stdin)");
     }
     this.stdin.write(JSON.stringify(command) + "\n");
   }

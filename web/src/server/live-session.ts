@@ -1,4 +1,4 @@
-// LiveSession — one live conversation backed by its OWN umans-core process.
+// LiveSession — one live conversation backed by its OWN catcode-core process.
 //
 // The web frontend used to keep a SINGLE core for the whole server: switching
 // sessions or workspaces disposed it (killing any in-flight turn) and only one
@@ -17,7 +17,7 @@
 // list, project list, custom titles) are shared across siblings and surfaced
 // back to the owning HarnessBridge via callbacks.
 
-import { CoreProcess } from "@umans-harness/coding-agent";
+import { CoreProcess } from "@catalyst-code/coding-agent";
 import { reduce, initialState } from "@/lib/reducer";
 import type { AgentEvent, AgentState, CoreCommand, CoreEvent, ReadyPayload } from "@/lib/types";
 import { loadTitles } from "@/lib/session-titles";

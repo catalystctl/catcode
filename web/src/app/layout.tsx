@@ -5,7 +5,7 @@ import "@fontsource-variable/jetbrains-mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Umans Harness",
+  title: "Catalyst Code",
   description: "A web interface for the Umans coding-agent harness.",
   icons: {
     icon:

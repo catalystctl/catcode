@@ -7,7 +7,7 @@
 //! same shape ≥ 2×" rule (which the model cannot otherwise track across
 //! sessions) into an evaluable signal.
 //!
-//! Storage: `~/.config/umans-harness/patterns/<workspace-hash>.jsonl`, capped
+//! Storage: `~/.config/catalyst-code/patterns/<workspace-hash>.jsonl`, capped
 //! at [`MAX_ENTRIES`] lines (oldest trimmed) so it stays bounded over time.
 //! Single-writer by construction: only the main orchestrator turn appends, and
 //! `start_turn` enforces one turn at a time — so no cross-turn write races and
@@ -42,7 +42,7 @@ struct PatternEntry {
 }
 
 /// A patterns store rooted at `root`. The default root is the user's
-/// `~/.config/umans-harness/patterns`; tests inject a temp root.
+/// `~/.config/catalyst-code/patterns`; tests inject a temp root.
 struct Store {
     root: PathBuf,
 }
@@ -51,7 +51,7 @@ impl Store {
     fn default_root() -> PathBuf {
         crate::config::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".config/umans-harness/patterns")
+            .join(".config/catalyst-code/patterns")
     }
 
     fn new(root: PathBuf) -> Self {

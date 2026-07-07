@@ -1,4 +1,4 @@
-// Config / paths — mirrors the umans-harness conventions used by the Go TUI
+// Config / paths — mirrors the catalyst-code conventions used by the Go TUI
 // (`tui/settings.go` `configDir()` / `sessionsDir()`) and the Rust core's
 // `--workspace` / `--session` / `UMANS_*` env flags (`core/src/config.rs`).
 
@@ -6,20 +6,20 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 
-/** The per-user config directory (`~/.config/umans-harness`). */
+/** The per-user config directory (`~/.config/catalyst-code`). */
 export function configDir(): string {
-  // On Linux/macOS: ~/.config/umans-harness (matches the TUI).
-  // On Windows: %USERPROFILE%\.config\umans-harness (kept consistent with the TUI
+  // On Linux/macOS: ~/.config/catalyst-code (matches the TUI).
+  // On Windows: %USERPROFILE%\.config\catalyst-code (kept consistent with the TUI
   // rather than %APPDATA% so sessions/settings resolve identically across the
   // TUI and this SDK).
-  return join(homedir() || ".", ".config", "umans-harness");
+  return join(homedir() || ".", ".config", "catalyst-code");
 }
 
 /** The agent directory — pi-coding-agent's `getAgentDir()` equivalent.
  *
- * For umans-harness this is the same config dir (`~/.config/umans-harness`):
+ * For catalyst-code this is the same config dir (`~/.config/catalyst-code`):
  * sessions, settings.json, debug.jsonl and (future) skills/extensions live
- * there. The project-scoped plugin directory is `<cwd>/.umans-harness/plugins`
+ * there. The project-scoped plugin directory is `<cwd>/.catalyst-code/plugins`
  * (handled by the core), not here. */
 export function getAgentDir(): string {
   return configDir();
@@ -31,7 +31,7 @@ export function ensureDir(dir: string): string {
   return dir;
 }
 
-/** Per-workspace session directory: `~/.config/umans-harness/sessions/<hex(cwd)>`. */
+/** Per-workspace session directory: `~/.config/catalyst-code/sessions/<hex(cwd)>`. */
 export function sessionsDirFor(cwd: string): string {
   return join(configDir(), "sessions", fnv64aHex(cwd));
 }
@@ -57,32 +57,32 @@ export function fnv64aHex(s: string): string {
 /** The default core approval mode. */
 export const DEFAULT_APPROVAL = "destructive" as const;
 
-/** Resolve the umans-core binary path.
+/** Resolve the catcode-core binary path.
  *
  * Search order (mirrors `tui/main.go:coreBinaryPath`):
- *  1. `UMANS_CORE` env var (used as-is).
+ *  1. `CATCODE_CORE` env var (used as-is).
  *  2. A few dev build locations relative to this package / cwd.
- *  3. `umans-core` / `core` on PATH (installed layout).
+ *  3. `catcode-core` / `core` on PATH (installed layout).
  */
 export function resolveCoreBinary(overrides: { cwd?: string } = {}): string {
-  const env = process.env.UMANS_CORE;
+  const env = process.env.CATCODE_CORE;
   if (env && env.trim()) return env;
 
   const sfx = platform() === "win32" ? ".exe" : "";
   const candidates: string[] = [
     // dev builds relative to the SDK package (sdk/../core/target/release)
-    join(__dirname, "..", "..", "core", "target", "release", `umans-core${sfx}`),
+    join(__dirname, "..", "..", "core", "target", "release", `catcode-core${sfx}`),
     join(__dirname, "..", "..", "core", "target", "release", `core${sfx}`),
     // relative to cwd (common when running from the harness repo root)
-    join(overrides.cwd ?? process.cwd(), "core", "target", "release", `umans-core${sfx}`),
+    join(overrides.cwd ?? process.cwd(), "core", "target", "release", `catcode-core${sfx}`),
     join(overrides.cwd ?? process.cwd(), "core", "target", "release", `core${sfx}`),
     // installed beside a TUI exe in cwd
-    join(overrides.cwd ?? process.cwd(), `umans-core${sfx}`),
+    join(overrides.cwd ?? process.cwd(), `catcode-core${sfx}`),
     join(overrides.cwd ?? process.cwd(), `core${sfx}`),
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }
   // Fall back to PATH lookup names.
-  return `umans-core${sfx}`;
+  return `catcode-core${sfx}`;
 }

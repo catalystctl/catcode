@@ -1,6 +1,6 @@
 // ModelRegistry — mirrors `pi-coding-agent`'s `core/model-registry.ts`.
 //
-// Unlike PI (built-in model table + models.json), umans-harness discovers
+// Unlike PI (built-in model table + models.json), catalyst-code discovers
 // models dynamically from the active provider inside the core binary, which
 // reports them via the `ready`/`models` events. This registry is a passive
 // container: a `CoreProcess` populates it when models arrive, and

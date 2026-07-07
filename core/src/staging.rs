@@ -4,12 +4,12 @@
 //! definitions (`agents/*.md`), the orchestrator delegation skill
 //! (`skills/pi-subagents/SKILL.md`), and the vision-handoff plugin. These are
 //! the things every project needs for the agent system to work, and they
-//! should NOT be copied into each project's `.umans-harness/`. Instead they are
+//! should NOT be copied into each project's `.catalyst-code/`. Instead they are
 //! materialized once, at a single **global, user-owned** location —
-//! `~/.umans-harness/` — so they are shared across every project and editable in
+//! `~/.catalyst-code/` — so they are shared across every project and editable in
 //! one place.
 //!
-//! A project's own `.umans-harness/` remains a deliberate **override**: any file
+//! A project's own `.catalyst-code/` remains a deliberate **override**: any file
 //! placed there shadows the global default for that project only. Nothing is
 //! staged per-project by default.
 //!
@@ -30,12 +30,101 @@ use std::path::PathBuf;
 /// user files are still never overwritten) and then re-stamp the marker.
 pub const STAGING_VERSION: u32 = 2;
 
-/// `~/.umans-harness` — the global, user-owned home for harness defaults.
+/// `~/.catalyst-code` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
 pub fn global_home() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".umans-harness")
+        .join(".catalyst-code")
+}
+
+/// Recursively copy a directory tree (files + subdirs). Symlinks and other
+/// special types are skipped for safety (a migration never follows links).
+/// A per-entry error aborts the copy; the caller cleans up the partial dest.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if ft.is_file() {
+            std::fs::copy(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move `src` -> `dst`. Tries an atomic rename first; on failure (typically a
+/// cross-device EXDEV, e.g. `~/.config` on a separate mount from `$HOME`) falls
+/// back to a recursive copy + removal of the source. If the copy fails, the
+/// partial destination is removed so the next run retries cleanly — the source
+/// is only deleted after a complete, successful copy.
+fn move_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_rename_err) => {
+            if let Err(copy_err) = copy_dir_recursive(src, dst) {
+                let _ = std::fs::remove_dir_all(dst);
+                return Err(copy_err);
+            }
+            std::fs::remove_dir_all(src)?;
+            Ok(())
+        }
+    }
+}
+
+/// One-time migration from the pre-rename on-disk layout to the current names.
+///
+/// Moves (preserving all contents):
+/// - `~/.config/umans-harness/` -> `~/.config/catalyst-code/` — sessions,
+///   memory, OAuth tokens, settings, telemetry, patterns, escalation sidecars.
+/// - `~/.umans-harness/` -> `~/.catalyst-code/` — staged default agents/skills/
+///   plugins + user customizations + the `.staged` version marker.
+///
+/// Idempotent and non-clobbering: if the destination already exists (newer
+/// install, prior migration, or the user running both versions), the legacy dir
+/// is left untouched rather than risk overwriting newer data. Safe to call on
+/// every startup — a no-op once the new layout is present.
+pub fn migrate_legacy_dirs() {
+    if let Some(home) = home_dir() {
+        migrate_legacy_dirs_in(&home);
+    }
+}
+
+/// Testable core: migrate the legacy layout rooted at `home` (no `$HOME` env
+/// dependency, so tests don't race with other env-mutating tests).
+pub(super) fn migrate_legacy_dirs_in(home: &std::path::Path) {
+    let pairs: [(std::path::PathBuf, std::path::PathBuf); 2] = [
+        (
+            home.join(".config").join("umans-harness"),
+            home.join(".config").join("catalyst-code"),
+        ),
+        (home.join(".umans-harness"), home.join(".catalyst-code")),
+    ];
+    for (src, dst) in pairs {
+        if dst.exists() || !src.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match move_dir(&src, &dst) {
+            Ok(()) => eprintln!(
+                "[catalyst-code] migrated {} -> {} (preserved your existing data)",
+                src.display(),
+                dst.display()
+            ),
+            Err(e) => eprintln!(
+                "[catalyst-code] could not migrate {} -> {}: {}. Your existing data is \
+                 untouched; move it manually if you want it at the new path.",
+                src.display(),
+                dst.display(),
+                e
+            ),
+        }
+    }
 }
 
 /// What `stage_if_needed` did, for logging / surfacing to the user.
@@ -56,7 +145,7 @@ pub struct StageResult {
 /// binary is self-sufficient — staging needs no external files on disk.
 ///
 /// `include_str!` paths are relative to *this* source file (`core/src/`), so
-/// `../../.umans-harness/...` resolves to the repo-root `.umans-harness/`,
+/// `../../.catalyst-code/...` resolves to the repo-root `.catalyst-code/`,
 /// which is the canonical source for these defaults.
 fn bundled_files() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -65,69 +154,69 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
         // agents work even if these are deleted). ---
         (
             "agents/scout.md",
-            include_str!("../../.umans-harness/agents/scout.md"),
+            include_str!("../../.catalyst-code/agents/scout.md"),
         ),
         (
             "agents/researcher.md",
-            include_str!("../../.umans-harness/agents/researcher.md"),
+            include_str!("../../.catalyst-code/agents/researcher.md"),
         ),
         (
             "agents/planner.md",
-            include_str!("../../.umans-harness/agents/planner.md"),
+            include_str!("../../.catalyst-code/agents/planner.md"),
         ),
         (
             "agents/worker.md",
-            include_str!("../../.umans-harness/agents/worker.md"),
+            include_str!("../../.catalyst-code/agents/worker.md"),
         ),
         (
             "agents/reviewer.md",
-            include_str!("../../.umans-harness/agents/reviewer.md"),
+            include_str!("../../.catalyst-code/agents/reviewer.md"),
         ),
         (
             "agents/context-builder.md",
-            include_str!("../../.umans-harness/agents/context-builder.md"),
+            include_str!("../../.catalyst-code/agents/context-builder.md"),
         ),
         (
             "agents/oracle.md",
-            include_str!("../../.umans-harness/agents/oracle.md"),
+            include_str!("../../.catalyst-code/agents/oracle.md"),
         ),
         (
             "agents/delegate.md",
-            include_str!("../../.umans-harness/agents/delegate.md"),
+            include_str!("../../.catalyst-code/agents/delegate.md"),
         ),
         // --- Orchestrator delegation skill (required for the parent agent to
         // know how to use the `subagent` tool + intercom). ---
         (
             "skills/pi-subagents/SKILL.md",
-            include_str!("../../.umans-harness/skills/pi-subagents/SKILL.md"),
+            include_str!("../../.catalyst-code/skills/pi-subagents/SKILL.md"),
         ),
         // --- vision-handoff plugin (required for image-bearing turns to route
         // to a vision-capable model). ---
         (
             "plugins/vision-handoff/plugin.json",
-            include_str!("../../.umans-harness/plugins/vision-handoff/plugin.json"),
+            include_str!("../../.catalyst-code/plugins/vision-handoff/plugin.json"),
         ),
         (
             "plugins/vision-handoff/hooks/pre_turn.py",
-            include_str!("../../.umans-harness/plugins/vision-handoff/hooks/pre_turn.py"),
+            include_str!("../../.catalyst-code/plugins/vision-handoff/hooks/pre_turn.py"),
         ),
         (
             "plugins/vision-handoff/README.md",
-            include_str!("../../.umans-harness/plugins/vision-handoff/README.md"),
+            include_str!("../../.catalyst-code/plugins/vision-handoff/README.md"),
         ),
         // --- telemetry plugin (aggregates per-turn metrics into a per-workspace
         // telemetry summary; fires on the session_stop lifecycle hook). ---
         (
             "plugins/telemetry/plugin.json",
-            include_str!("../../.umans-harness/plugins/telemetry/plugin.json"),
+            include_str!("../../.catalyst-code/plugins/telemetry/plugin.json"),
         ),
         (
             "plugins/telemetry/hooks/session_stop.py",
-            include_str!("../../.umans-harness/plugins/telemetry/hooks/session_stop.py"),
+            include_str!("../../.catalyst-code/plugins/telemetry/hooks/session_stop.py"),
         ),
         (
             "plugins/telemetry/README.md",
-            include_str!("../../.umans-harness/plugins/telemetry/README.md"),
+            include_str!("../../.catalyst-code/plugins/telemetry/README.md"),
         ),
         // --- A short guide to the global layout + override model. ---
         ("README.md", GLOBAL_README),
@@ -160,7 +249,7 @@ fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     })
 }
 
-/// Ensure the global default files exist under `~/.umans-harness/`. Writes only
+/// Ensure the global default files exist under `~/.catalyst-code/`. Writes only
 /// files that are missing; never overwrites. Returns what it did.
 ///
 /// Safe to call on every startup: the per-file `exists()` check makes it a cheap
@@ -212,17 +301,17 @@ pub fn stage_if_needed() -> StageResult {
     }
 }
 
-/// Staged into `~/.umans-harness/README.md` on first run.
-const GLOBAL_README: &str = r#"# umans-harness — global home
+/// Staged into `~/.catalyst-code/README.md` on first run.
+const GLOBAL_README: &str = r#"# catalyst-code — global home
 
-This directory (`~/.umans-harness/`) is the **global, user-owned** home for the
+This directory (`~/.catalyst-code/`) is the **global, user-owned** home for the
 harness's default agent files. It is shared across every project you run the
 harness in, so defaults are configured once here — not copied into each
 project.
 
 ## Layout
 
-    ~/.umans-harness/
+    ~/.catalyst-code/
     ├── agents/            # built-in subagent definitions (*.md)
     ├── skills/
     │   └── pi-subagents/  # orchestrator delegation skill (parent-only)
@@ -234,10 +323,10 @@ project.
 ## Overrides
 
 Defaults live here, globally. To override for a **single project**, place the
-file under that project's own `.umans-harness/` — it shadows the global one for
+file under that project's own `.catalyst-code/` — it shadows the global one for
 that project only. For example, to customize the `scout` agent in one project:
 
-    <project>/.umans-harness/agents/scout.md
+    <project>/.catalyst-code/agents/scout.md
 
 Project files never modify the global defaults, and nothing is staged into a
 project automatically.
@@ -262,7 +351,7 @@ mod tests {
     #[test]
     fn staging_is_idempotent_and_nonclobbering() {
         let tmp = tempfile_dir();
-        let home = tmp.join(".umans-harness");
+        let home = tmp.join(".catalyst-code");
         std::env::set_var("HOME", &tmp);
 
         // First run: everything missing → all staged, first_run true.
@@ -337,11 +426,49 @@ mod tests {
         std::env::remove_var("HOME");
     }
 
+    #[test]
+    fn migrate_legacy_dirs_moves_old_layout() {
+        let tmp = tempfile_dir();
+        // Legacy layout with sentinel files under both old roots.
+        let old_cfg = tmp.join(".config").join("umans-harness");
+        std::fs::create_dir_all(old_cfg.join("sessions")).unwrap();
+        std::fs::write(old_cfg.join("settings.json"), "{\"v\":1}").unwrap();
+        let old_stage = tmp.join(".umans-harness");
+        std::fs::create_dir_all(old_stage.join("agents")).unwrap();
+        std::fs::write(old_stage.join(".staged"), "2").unwrap();
+        std::fs::write(old_stage.join("agents/scout.md"), "USER CUSTOMIZED").unwrap();
+
+        migrate_legacy_dirs_in(&tmp);
+
+        // New layout holds the sentinel files; old roots are gone.
+        assert!(tmp
+            .join(".config")
+            .join("catalyst-code")
+            .join("settings.json")
+            .exists());
+        assert!(tmp.join(".catalyst-code").join(".staged").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".catalyst-code").join("agents/scout.md")).unwrap(),
+            "USER CUSTOMIZED",
+            "user customizations must be preserved across the migration"
+        );
+        assert!(!old_cfg.exists(), "old config root should be removed after migration");
+        assert!(!old_stage.exists(), "old staging root should be removed after migration");
+
+        // Idempotent: a second call is a no-op (new layout present -> skip).
+        migrate_legacy_dirs_in(&tmp);
+        assert!(tmp
+            .join(".config")
+            .join("catalyst-code")
+            .join("settings.json")
+            .exists());
+    }
+
     /// A fresh temp dir to use as a fake $HOME for the staging test. Uses
     /// `std::env::temp_dir` + a unique subdir so tests don't collide.
     fn tempfile_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "umans-staging-test-{}-{}",
+            "catalyst-code-staging-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,4 +1,4 @@
-// Shared wire + UI types for the umans-harness web frontend.
+// Shared wire + UI types for the catalyst-code web frontend.
 //
 // The core speaks newline-delimited JSON over stdio. The server bridge forwards
 // raw core events to the browser over SSE, and accepts raw core commands via
@@ -134,7 +134,7 @@ export interface PluginEntry {
 
 /** A discoverable skill (project then user scope). `content` is the parsed
  *  SKILL.md body — sent by the core so `/skill:<name>` can apply a skill even
- *  when it lives under ~/.umans-harness/skills (outside the workspace, which
+ *  when it lives under ~/.catalyst-code/skills (outside the workspace, which
  *  the read_file tool cannot reach). */
 export interface SkillInfo {
   name: string;

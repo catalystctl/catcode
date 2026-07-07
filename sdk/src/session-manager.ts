@@ -1,6 +1,6 @@
 // SessionManager — mirrors `pi-coding-agent`'s `core/session-manager.ts`.
 //
-// The umans-harness core owns session persistence (a flat JSONL file of
+// The catalyst-code core owns session persistence (a flat JSONL file of
 // OpenAI-style messages). This manager is a thin handle over the session file
 // PATH: it resolves/creates the path and forwards structural operations
 // (`load_session`/`new_session`) to the core via the bound AgentSession.

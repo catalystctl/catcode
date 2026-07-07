@@ -1,7 +1,7 @@
 # Self-Learning AI Software Development System — Design & Implementation
 
 This document is the design for the self-learning layer built into the
-umans-harness. It is **opinionated and minimal**: the harness already had most of
+catalyst-code. It is **opinionated and minimal**: the harness already had most of
 the bones (memory store, skills, subagents, plugin hooks, telemetry). This layer
 welds them into a learning loop and documents the seams.
 
@@ -24,9 +24,9 @@ Before designing, audit what exists. The harness shipped with:
 - **`core/src/tools.rs`** — a `memory` AI tool (actions `save`/`append`/`list`/
   `forget`) reusing `memory.rs`. Classified `ReadOnly` (no approval gate).
   Reaches the main orchestrator.
-- **`.umans-harness/skills/`** — skills as markdown + YAML frontmatter. The
+- **`.catalyst-code/skills/`** — skills as markdown + YAML frontmatter. The
   `pi-subagents` skill is injected into the orchestrator's system prompt.
-- **`.umans-harness/agents/`** — 8 built-in subagents (scout, researcher,
+- **`.catalyst-code/agents/`** — 8 built-in subagents (scout, researcher,
   planner, worker, reviewer, context-builder, oracle, delegate) + an in-process
   intercom bus for orchestrator↔child and child↔child coordination.
 - **`core/src/plugins.rs`** — a plugin/hook system: `session_start`,
@@ -68,7 +68,7 @@ what is deliberately deferred.
 │                                                                      │
 │   ┌─────────┐   ┌────────────┐   ┌───────────┐   ┌───────────────┐  │
 │   │  turn   │──▶│ tool loop   │──▶│  memory   │──▶│  ~/.config/   │  │
-│   │  loop   │   │ (memory,   │   │  store ◀──│───│  umans-harness│  │
+│   │  loop   │   │ (memory,   │   │  store ◀──│───│  catalyst-code│  │
 │   │         │   │  read/edit/│   │ (markdown │   │  /memory/     │  │
 │   │ pre_turn │   │  bash/sub- │   │  + front- │   │  <hash>/      │  │
 │   │  hook    │   │  agent…)   │   │  matter)  │   │  *.md         │  │
@@ -97,7 +97,7 @@ Key invariants:
   explicitly tracks `cached_tokens`); per-turn prompt churn would torch the
   cache. Memories live *inside* the stable prompt, not in a per-turn message.
 - **Memory is the AI's notebook, not the user's codebase.** Saving a memory
-  touches `~/.config/umans-harness/memory/<hash>/`, never the workspace, so it
+  touches `~/.config/catalyst-code/memory/<hash>/`, never the workspace, so it
   is `ReadOnly` and needs no approval gate.
 - **Learning is prompt-driven + tool-backed, not a hidden daemon.** The model
   reflects and persists; a `session_stop` plugin hook is the deterministic seam
@@ -122,7 +122,7 @@ NEW TASK
   │        should future sessions NOT rediscover?
   ▼
 [persist]  memory tool: append (topic exists) or save (new)
-  │        optional: write_file a skill under .umans-harness/skills/
+  │        optional: write_file a skill under .catalyst-code/skills/
   ▼
 [NEXT SESSION]  memories re-injected into the standing prompt → compounding
 ```
@@ -139,7 +139,7 @@ properties the brief demands.
 ### What is a skill?
 
 A skill is **a markdown file with YAML frontmatter** at
-`.umans-harness/skills/<name>/SKILL.md`. Concretely it is **a prompt fragment**
+`.catalyst-code/skills/<name>/SKILL.md`. Concretely it is **a prompt fragment**
 (the body) with **metadata** (the frontmatter). It is *not* executable code, a
 workflow graph, or a tool composition — those are heavier representations that
 this harness does not need because the model itself is the executor.
@@ -185,7 +185,7 @@ You are adding a new HTTP route/handler.
 | Testing        | Skills are prompts; "testing" = applying them to a benchmark task and   |
 |                | checking the result. No unit-test harness for prompts in v1.            |
 | Documentation  | The skill file IS the documentation (frontmatter + body).                |
-| Discovery      | `list_dir .umans-harness/skills/` + read `SKILL.md`. The orchestrator   |
+| Discovery      | `list_dir .catalyst-code/skills/` + read `SKILL.md`. The orchestrator   |
 |                | skill (`pi-subagents`) is auto-injected; others are opt-in.              |
 |                | **Deferred:** a one-line skill manifest in the system prompt (note §15).|
 
@@ -210,7 +210,7 @@ manifest + fuzzy name match at write time. Speculative now → YAGNI.
 ### Storage: markdown files, not a vector/graph DB
 
 ```
-~/.config/umans-harness/memory/<workspace-hash>/
+~/.config/catalyst-code/memory/<workspace-hash>/
 ├── MEMORY.md            # auto-generated index (name → file → description)
 ├── architecture.md      # frontmatter + body
 ├── conventions.md
@@ -312,9 +312,9 @@ Reflection (system-prompt protocol)
   ↓
 "Have I solved this shape ≥2×?" ── no ──▶ stop (ad-hoc is fine)
   ↓ yes
-list_dir .umans-harness/skills/   (check for an existing skill to extend)
+list_dir .catalyst-code/skills/   (check for an existing skill to extend)
   ↓
-write_file .umans-harness/skills/<name>/SKILL.md
+write_file .catalyst-code/skills/<name>/SKILL.md
   ↓
 (next session) skill is discoverable via list_dir; model reads it when relevant
 ```
@@ -378,7 +378,7 @@ The harness uses **two** storage roots, by design:
 ### Per-workspace learning (the AI's notebook — NOT in the repo)
 
 ```
-~/.config/umans-harness/memory/<workspace-hash>/
+~/.config/catalyst-code/memory/<workspace-hash>/
 ├── MEMORY.md            # auto-index
 └── *.md                 # memories (frontmatter + body)
 ```
@@ -390,7 +390,7 @@ projects don't cross-contaminate.
 ### In-repo, shareable artifacts (versioned with the code)
 
 ```
-.umans-harness/
+.catalyst-code/
 ├── agents/              # subagent definitions (markdown + frontmatter)
 │   ├── scout.md
 │   ├── reviewer.md
@@ -484,7 +484,7 @@ Why in-band and not a separate reflection daemon?
   re-entry (the reflect's own `finish` exits for real). `/reflect` and `/index`
   turns are exempt (they ARE reflections); trivial turns (no real work) are
   exempt by the tool-call gate. Disable with the `auto_reflect` config (env
-  `UMANS_HARNESS_AUTO_REFLECT=0`). This closes the asymmetry noted in §5:
+  `CATALYST_CODE_AUTO_REFLECT=0`). This closes the asymmetry noted in §5:
   memories already had a deterministic compaction hook (`extract_facts`);
   skills now have a deterministic reflection hook.
 
@@ -493,7 +493,7 @@ Why in-band and not a separate reflection daemon?
 The "write a skill when you solve the same shape ≥2×" rule was previously
 un-trackable — the model has no cross-session recurrence counter. The
 auto-reflect seam records one entry per non-trivial turn to a per-workspace log
-`~/.config/umans-harness/patterns/<hash>.jsonl` (capped at 200 entries). The
+`~/.config/catalyst-code/patterns/<hash>.jsonl` (capped at 200 entries). The
 "shape" is a signature of the action tools used (bash/edit/write/patch/bulk_*/
 todo_write/spawn/subagent — recon tools excluded) plus the file areas touched
 (`core/src/*.rs`, `tui/*.go`, …). On each reflect, recurring shapes (count ≥ 2)
@@ -562,7 +562,7 @@ The harness already has subagents + intercom. Multi-agent learning:
 
 | Concern                    | Decision                                                        |
 |----------------------------|-----------------------------------------------------------------|
-| Share skills               | Skills are files in `.umans-harness/skills/` — shared by       |
+| Share skills               | Skills are files in `.catalyst-code/skills/` — shared by       |
 |                            | construction (all subagents in the same workspace read them).   |
 | Synchronize knowledge      | Memories are per-workspace files; subagents writing to the     |
 |                            | same workspace share them. (Subagents don't currently carry the  |
@@ -591,7 +591,7 @@ embeddings, no graph DB.**
 ### What it produces
 
 - Knowledge memories (types: architecture / convention / api / gotcha / build).
-- Candidate skills under `.umans-harness/skills/` for workflows seen 2+ times.
+- Candidate skills under `.catalyst-code/skills/` for workflows seen 2+ times.
 - A closing summary: memories created + the area the model is least confident
   about (the "human review" hint).
 
@@ -624,7 +624,7 @@ memories from it.
 ### Memory (file on disk)
 
 ```yaml
-# ~/.config/umans-harness/memory/<hash>/conventions.md
+# ~/.config/catalyst-code/memory/<hash>/conventions.md
 ---
 name: conventions           # required; slugified into filename
 description: <one line>     # shown in the injection + index
@@ -639,7 +639,7 @@ Rust: `MemoryEntry { name, description, mem_type, content, path }` (`memory.rs`)
 ### Skill (file in repo)
 
 ```yaml
-# .umans-harness/skills/<name>/SKILL.md
+# .catalyst-code/skills/<name>/SKILL.md
 ---
 name: <slug>                # required
 description: <one line>     # used for discovery
@@ -654,7 +654,7 @@ triggers: [add endpoint, new route]   # optional, advisory
 ### Subagent (file in repo — already exists)
 
 ```yaml
-# .umans-harness/agents/<name>.md
+# .catalyst-code/agents/<name>.md
 ---
 name: context-builder
 description: <…>
@@ -761,7 +761,7 @@ All core tests (206) and TUI tests pass; both build clean.
 
 - **Skill manifest in the system prompt** (`main.rs::skill_manifest_injection`):
   a one-line-per-skill list (name + description) discovered under
-  `.umans-harness/skills/*/SKILL.md` (project then user scope) is spliced into
+  `.catalyst-code/skills/*/SKILL.md` (project then user scope) is spliced into
   the orchestrator's standing prompt, so available opt-in skills are visible
   without a `list_dir` round-trip. It excludes `pi-subagents` (already injected
   in full) and dedups by name (project wins). It returns `""` when no opt-in
@@ -771,9 +771,9 @@ All core tests (206) and TUI tests pass; both build clean.
 
 ### ✅ Milestone 3 — Measurement (done)
 
-- **Telemetry plugin** (`.umans-harness/plugins/telemetry/`): a `session_stop`
+- **Telemetry plugin** (`.catalyst-code/plugins/telemetry/`): a `session_stop`
   lifecycle hook that aggregates per-turn metrics into a per-workspace summary
-  under `~/.config/umans-harness/telemetry/<workspace-hash>/`:
+  under `~/.config/catalyst-code/telemetry/<workspace-hash>/`:
   `turns.jsonl` (one record per turn), `summary.json` (incremental aggregates —
   totals, cache-hit rate, avg/min/max TTFT, avg TPS, per-model breakdown), and
   `summary.md` (human-readable). It is robust (always exits 0, emits one JSON
@@ -792,13 +792,13 @@ All core tests (206) and TUI tests pass; both build clean.
   `session_stop` context (consumed when a plugin sets `pass_args: true`). No
   new infrastructure — just routing existing numbers to the existing hook.
 - **Global staging** (`staging.rs`): the plugin is staged into
-  `~/.umans-harness/plugins/telemetry/` on first run (added to `bundled_files()`
+  `~/.catalyst-code/plugins/telemetry/` on first run (added to `bundled_files()`
   + `executable_rel_paths()`; `STAGING_VERSION` bumped 1 → 2 so existing users
   backfill it). Staging is non-clobbering, so users who already have a staged
   `agents/scout.md` (etc.) keep their copy; to pick up the memory-enabled agent
   defaults globally, delete the file and it is restored on next run:
-  `rm ~/.umans-harness/agents/{scout,researcher,context-builder}.md`. Project
-  copies (`.umans-harness/agents/*.md`) always win, so this repo gets them
+  `rm ~/.catalyst-code/agents/{scout,researcher,context-builder}.md`. Project
+  copies (`.catalyst-code/agents/*.md`) always win, so this repo gets them
   immediately.
 
 All core tests (221) and TUI tests pass; core is `cargo fmt`/`clippy` clean
@@ -824,7 +824,7 @@ All core tests (221) and TUI tests pass; core is `cargo fmt`/`clippy` clean
   model now actually remembers across sessions. `/index` lets it bootstrap on an
   unfamiliar repo in one command. A developer notices the agent "already knows"
   their conventions by day 3.
-- **1 month**: A small skill library accrues under `.umans-harness/skills/`,
+- **1 month**: A small skill library accrues under `.catalyst-code/skills/`,
   reviewed via `git`. The agent reuses them instead of re-deriving. Memories
   stabilize around architecture/conventions/gotchas.
 - **6 months**: Telemetry (Milestone 3) shows measurable trends — fewer

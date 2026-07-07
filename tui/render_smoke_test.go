@@ -63,7 +63,7 @@ func TestRenderSmoke(t *testing.T) {
 	tb := s.push(blkTool)
 	tb.name = "bash"
 	tb.args = "go test ./..."
-	tb.output = "ok  umans-harness-tui  0.012s\nPASS"
+	tb.output = "ok  catalyst-code-tui  0.012s\nPASS"
 	tb.dur = 1400000000
 	s.invalidateAll()
 

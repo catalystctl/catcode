@@ -190,7 +190,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("umans_harness_ws_test_{}", n));
+        let d = std::env::temp_dir().join(format!("catalyst_code_ws_test_{}", n));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         fs::write(d.join("a.txt"), "hi").unwrap();
@@ -253,7 +253,7 @@ mod tests {
         let r = tmp_root();
         // `linkdir` is a symlink to a directory OUTSIDE the workspace.
         let outside =
-            std::env::temp_dir().join(format!("umans_harness_escape_{}", std::process::id()));
+            std::env::temp_dir().join(format!("catalyst_code_escape_{}", std::process::id()));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, r.join("linkdir")).unwrap();

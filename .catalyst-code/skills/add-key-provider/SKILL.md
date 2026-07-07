@@ -81,7 +81,7 @@ Look at the **sample model-discovery JSON** from step 0.4:
 
 ## Step 2 — Config-only path (Shapes A/B/C)
 
-Add a `providers` entry to `~/.config/umans-harness/settings.json` (user-owned,
+Add a `providers` entry to `~/.config/catalyst-code/settings.json` (user-owned,
 0600). Minimal shape (mirrors `parse_provider` in `config.rs`):
 
 ```jsonc
@@ -187,7 +187,7 @@ If it serves two protocols, also add the expansion in `preset_provider_configs`
 - **Cache is keyed `base_url|kind`** (`provider_cache_key`) and has an 8h TTL +
   schema version (`MODELS_CACHE_VERSION`, currently 5). If you change the parser,
   bump the version so stale caches refresh instead of masking the fix. Delete
-  `~/.config/umans-harness/models-cache.json` to force-refresh during testing.
+  `~/.config/catalyst-code/models-cache.json` to force-refresh during testing.
 - **`api_key` vs `api_key_env`**: storing the env-var *name* (not the secret) is
   the convention for presets; a literal key is fine in the 0600 user file but
   NEVER in a project-local `settings.json` (untrusted repo footgun).

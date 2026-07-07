@@ -525,7 +525,7 @@ function EmptyState({
       <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-accent to-accent-deep text-3xl font-bold text-white shadow-glow">
         u
       </div>
-      <h1 className="text-2xl font-semibold tracking-tight text-ink-100">Umans Harness</h1>
+      <h1 className="text-2xl font-semibold tracking-tight text-ink-100">Catalyst Code</h1>
       <p className="mt-2 max-w-md text-[14px] text-ink-400">
         {switching ? (
           "Loading session…"

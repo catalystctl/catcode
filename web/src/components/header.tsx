@@ -80,7 +80,7 @@ export function Header(props: Props) {
         </span>
         <div className="hidden min-w-0 sm:block">
           <div className="flex items-center gap-1 text-[13px] font-semibold text-ink-100">
-            Umans Harness
+            Catalyst Code
           </div>
           <div className="flex items-center gap-1 truncate text-[10px] text-ink-500">
             <FolderIcon width={10} height={10} />
@@ -264,7 +264,7 @@ export function Header(props: Props) {
           <button
             onClick={props.onReconnect}
             className="flex items-center gap-1 rounded-md border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
-            title="Reconnect to umans-core"
+            title="Reconnect to catcode-core"
           >
             <RefreshIcon width={12} height={12} /> Reconnect
           </button>

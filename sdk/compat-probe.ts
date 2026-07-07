@@ -1,7 +1,7 @@
 // Compatibility probe — imports the EXACT symbol set pi-web uses from
 // @earendil-works/pi-coding-agent + @earendil-works/pi-ai, but from this
 // package, and exercises the call patterns from pi-web's `pi-agent.ts`.
-// If this type-checks, pi-web can swap its imports to @umans-harness/coding-agent.
+// If this type-checks, pi-web can swap its imports to @catalyst-code/coding-agent.
 
 import {
   AuthStorage,

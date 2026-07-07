@@ -16,7 +16,7 @@
 //!    - **web flow** (local machine) — loopback
 //!      `http://127.0.0.1:<random>/oauth2callback` redirect, no PKCE (matches
 //!      gemini-cli's `authWithWeb`); completes synchronously.
-//!    - **no-browser flow** (SSH / headless, or `UMANS_HARNESS_NO_BROWSER=1`)
+//!    - **no-browser flow** (SSH / headless, or `CATALYST_CODE_NO_BROWSER=1`)
 //!      — redirect to `https://codeassist.google.com/authcode` (Google's
 //!      out-of-band page that shows the code to copy) + PKCE; the user opens the
 //!      URL on ANY device and pastes the code back via `/oauth-code` (matches
@@ -40,7 +40,7 @@
 //!    exchange, and `oauth-2025-04-20` API beta header.
 //!
 //! Tokens from `/login` are stored at `~/.gemini/oauth_creds.json` (Google,
-//! 0600) or `~/.config/umans-harness/oauth/<id>.json` (OpenAI/Claude, 0600)
+//! 0600) or `~/.config/catalyst-code/oauth/<id>.json` (OpenAI/Claude, 0600)
 //! and refreshed in place. OpenAI/Codex deliberately does NOT reuse the
 //! official Codex CLI's `~/.codex/auth.json`; use this app's OAuth flow so the
 //! selected account/subscription is explicit.
@@ -225,7 +225,7 @@ fn codex_auth_path() -> Option<PathBuf> {
     // Use our own OAuth store. Do NOT auto-detect/reuse the official Codex
     // CLI's ~/.codex/auth.json; users should sign in here via this app's OAuth
     // flow so account selection and refresh state are under our control.
-    Some(home_dir()?.join(".config/umans-harness/oauth/openai.json"))
+    Some(home_dir()?.join(".config/catalyst-code/oauth/openai.json"))
 }
 
 /// Where the `gemini` CLI (and now we) store Google OAuth tokens.
@@ -236,16 +236,16 @@ fn gemini_creds_path() -> Option<PathBuf> {
 /// Our legacy pre-match token path (kept as a read-only fallback so an existing
 /// login is not silently lost). New logins always write `~/.gemini/oauth_creds.json`.
 fn legacy_gemini_token_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".config/umans-harness/oauth/gemini.json"))
+    Some(home_dir()?.join(".config/catalyst-code/oauth/gemini.json"))
 }
 
 /// Where WE store Anthropic OAuth tokens obtained via `/login`.
 fn stored_token_path(provider: &str) -> Option<PathBuf> {
-    Some(home_dir()?.join(format!(".config/umans-harness/oauth/{provider}.json")))
+    Some(home_dir()?.join(format!(".config/catalyst-code/oauth/{provider}.json")))
 }
 
 fn stored_token_dir() -> Option<PathBuf> {
-    Some(home_dir()?.join(".config/umans-harness/oauth"))
+    Some(home_dir()?.join(".config/catalyst-code/oauth"))
 }
 
 /// True when Gemini auth is available: our/gemini-cli token OR gcloud ADC OR a
@@ -1293,7 +1293,7 @@ pub enum LoginOutcome {
 /// Whether we appear to be in a headless / remote (SSH) session where launching
 /// a local browser and capturing a loopback redirect will NOT work. When true,
 /// `google_login` uses the no-browser (manual-code) flow. Override explicitly
-/// with `UMANS_HARNESS_NO_BROWSER=1` (force manual) or `=0` (force web, e.g.
+/// with `CATALYST_CODE_NO_BROWSER=1` (force manual) or `=0` (force web, e.g.
 /// when you've set up SSH port forwarding to the loopback port).
 pub fn likely_headless() -> bool {
     fn env_truthy(name: &str) -> Option<bool> {
@@ -1302,7 +1302,7 @@ pub fn likely_headless() -> bool {
             !(v.is_empty() || v == "0" || v == "false" || v == "no" || v == "off")
         })
     }
-    match env_truthy("UMANS_HARNESS_NO_BROWSER").or_else(|| env_truthy("NO_BROWSER")) {
+    match env_truthy("CATALYST_CODE_NO_BROWSER").or_else(|| env_truthy("NO_BROWSER")) {
         Some(true) => return true,
         Some(false) => return false,
         None => {}
@@ -1327,7 +1327,7 @@ pub fn likely_headless() -> bool {
 /// Start the Google OAuth login. Picks the flow by environment:
 ///  - web flow (default, local machine): loopback redirect, no PKCE — completes
 ///    synchronously.
-///  - no-browser flow (SSH / headless, or `UMANS_HARNESS_NO_BROWSER=1`):
+///  - no-browser flow (SSH / headless, or `CATALYST_CODE_NO_BROWSER=1`):
 ///    redirect to `https://codeassist.google.com/authcode` + PKCE; returns
 ///    `AwaitingCode` and the user pastes the code back via `oauth_code`. This
 ///    is gemini-cli's `authWithUserCode` path, so it works over SSH with no

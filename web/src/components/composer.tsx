@@ -509,7 +509,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                   ? streaming
                     ? "Redirect the agent… (Enter to steer)"
                     : "Message the agent…  (/ for commands, @ for files)"
-                  : "Connecting to umans-core…"
+                  : "Connecting to catcode-core…"
               }
               className="max-h-60 flex-1 resize-none bg-transparent px-2 py-1.5 text-[14px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50"
             />

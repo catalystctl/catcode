@@ -157,7 +157,7 @@ func initialSession() *session {
 // ---------------------------------------------------------------------------
 
 // coreExeSuffix returns the platform executable suffix (".exe" on Windows,
-// "" elsewhere) so the installed Windows layout (ucli.exe + umans-core.exe)
+// "" elsewhere) so the installed Windows layout (catcode.exe + catcode-core.exe)
 // is discovered correctly.
 func coreExeSuffix() string {
 	if runtime.GOOS == "windows" {
@@ -167,17 +167,17 @@ func coreExeSuffix() string {
 }
 
 // coreBinaryPath resolves the core subprocess binary. Search order:
-//  1. $UMANS_CORE — explicit override (used as-is if it exists)
-//  2. <dir of this exe>/umans-core[.exe] — installed layout (beside the TUI)
+//  1. $CATCODE_CORE — explicit override (used as-is if it exists)
+//  2. <dir of this exe>/catcode-core[.exe] — installed layout (beside the TUI)
 //  3. <dir of this exe>/core[.exe] — dev/legacy core placed beside the TUI
 //  4. core/target/release/core[.exe] — dev build run from the repo root
 //  5. ../core/target/release/core[.exe] — dev build run from a sibling dir
 //  6. <dir of this exe>/../core/target/release/core[.exe]
 //
 // On Windows ".exe" is appended to every candidate so the install layout
-// (ucli.exe next to umans-core.exe) is found from any CWD.
+// (catcode.exe next to catcode-core.exe) is found from any CWD.
 func coreBinaryPath() string {
-	if env := os.Getenv("UMANS_CORE"); env != "" {
+	if env := os.Getenv("CATCODE_CORE"); env != "" {
 		if _, err := os.Stat(env); err == nil {
 			if abs, err := filepath.Abs(env); err == nil {
 				return abs
@@ -189,7 +189,7 @@ func coreBinaryPath() string {
 		return p
 	}
 	sfx := coreExeSuffix()
-	coreName := "umans-core" + sfx // installed beside the TUI
+	coreName := "catcode-core" + sfx // installed beside the TUI
 	devName := "core" + sfx        // cargo's bin name in the dev build
 	candidates := []string{
 		"core/target/release/" + devName,
@@ -216,7 +216,7 @@ func coreBinaryPath() string {
 
 // coreProcess holds the running core's *os.Process so a signal handler can
 // kill+wait it on SIGHUP/SIGTERM — otherwise closing the terminal (SIGHUP) or
-// `kill` (SIGTERM) kills the TUI but orphans umans-core, which keeps running.
+// `kill` (SIGTERM) kills the TUI but orphans catcode-core, which keeps running.
 // Set in startCore after cmd.Start(); best-effort only (read under a nil check
 // from the signal goroutine, so the benign pointer race is harmless).
 var coreProcess *os.Process

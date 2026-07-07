@@ -36,7 +36,7 @@ export async function GET(req: Request) {
     live = await bridge.ensure(workspace, session);
   } catch (err: any) {
     return new Response(
-      JSON.stringify({ error: err?.message ?? "failed to start umans-core" }),
+      JSON.stringify({ error: err?.message ?? "failed to start catcode-core" }),
       { status: 502, headers: { "Content-Type": "application/json" } },
     );
   }

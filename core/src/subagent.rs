@@ -138,7 +138,7 @@ impl AgentConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in agents (embedded fallback; .umans-harness/agents/*.md overrides)
+// Built-in agents (embedded fallback; .catalyst-code/agents/*.md overrides)
 // ---------------------------------------------------------------------------
 
 fn builtin_agents() -> Vec<AgentConfig> {
@@ -325,13 +325,13 @@ pub fn discover_agents(workspace: &Path, cfg: &SubagentConfig) -> Vec<AgentConfi
         }
     }
 
-    // user scope: ~/.umans-harness/agents/**/*.md
+    // user scope: ~/.catalyst-code/agents/**/*.md
     if let Some(home) = crate::config::home_dir() {
-        let dir = home.join(".umans-harness/agents");
+        let dir = home.join(".catalyst-code/agents");
         load_agent_dir(&dir, AgentSource::User, &mut by_name);
     }
-    // project scope: <workspace>/.umans-harness/agents/**/*.md
-    let dir = workspace.join(".umans-harness/agents");
+    // project scope: <workspace>/.catalyst-code/agents/**/*.md
+    let dir = workspace.join(".catalyst-code/agents");
     load_agent_dir(&dir, AgentSource::Project, &mut by_name);
 
     let mut v: Vec<AgentConfig> = by_name.into_values().collect();
@@ -452,10 +452,10 @@ pub(crate) fn discover_skills(workspace: &Path) -> Vec<(String, String, String)>
     // (name, description, location) — project first, then user.
     let mut out: Vec<(String, String, String)> = Vec::new();
     let dirs = [
-        (workspace.join(".umans-harness/skills"), true),
+        (workspace.join(".catalyst-code/skills"), true),
         (
             crate::config::home_dir()
-                .map(|h| h.join(".umans-harness/skills"))
+                .map(|h| h.join(".catalyst-code/skills"))
                 .unwrap_or_default(),
             false,
         ),
@@ -493,7 +493,7 @@ pub(crate) fn discover_skills(workspace: &Path) -> Vec<(String, String, String)>
 
 /// A discoverable skill with its parsed body content — used by the `skills`
 /// event and `apply_skill` command so the core (which has unrestricted FS
-/// access) can read global skills under ~/.umans-harness/skills that the
+/// access) can read global skills under ~/.catalyst-code/skills that the
 /// read_file tool cannot reach (it rejects absolute / `..` paths).
 #[derive(Clone)]
 pub(crate) struct SkillEntry {
@@ -510,10 +510,10 @@ pub(crate) fn discover_skills_full(workspace: &Path) -> Vec<SkillEntry> {
     let mut out: Vec<SkillEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let dirs = [
-        (workspace.join(".umans-harness/skills"), true),
+        (workspace.join(".catalyst-code/skills"), true),
         (
             crate::config::home_dir()
-                .map(|h| h.join(".umans-harness/skills"))
+                .map(|h| h.join(".catalyst-code/skills"))
                 .unwrap_or_default(),
             false,
         ),
@@ -2680,9 +2680,9 @@ fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
         .unwrap_or("project");
     let dir = match scope {
         "user" => crate::config::home_dir()
-            .map(|h| h.join(".umans-harness/agents"))
-            .unwrap_or_else(|| workspace.join(".umans-harness/agents")),
-        _ => workspace.join(".umans-harness/agents"),
+            .map(|h| h.join(".catalyst-code/agents"))
+            .unwrap_or_else(|| workspace.join(".catalyst-code/agents")),
+        _ => workspace.join(".catalyst-code/agents"),
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Outcome::err(format!("create mkdir failed: {e}"));
@@ -2726,10 +2726,10 @@ fn update_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     // find the file
     let candidates = [
         workspace
-            .join(".umans-harness/agents")
+            .join(".catalyst-code/agents")
             .join(format!("{name}.md")),
         crate::config::home_dir()
-            .map(|h| h.join(format!(".umans-harness/agents/{name}.md")))
+            .map(|h| h.join(format!(".catalyst-code/agents/{name}.md")))
             .unwrap_or_default(),
     ];
     let path = candidates.iter().find(|p| p.exists()).cloned();
@@ -2789,10 +2789,10 @@ fn delete_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     }
     let candidates = [
         workspace
-            .join(".umans-harness/agents")
+            .join(".catalyst-code/agents")
             .join(format!("{name}.md")),
         crate::config::home_dir()
-            .map(|h| h.join(format!(".umans-harness/agents/{name}.md")))
+            .map(|h| h.join(format!(".catalyst-code/agents/{name}.md")))
             .unwrap_or_default(),
     ];
     for p in &candidates {

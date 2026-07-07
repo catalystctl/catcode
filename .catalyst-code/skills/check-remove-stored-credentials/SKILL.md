@@ -17,17 +17,17 @@ the relevant ones — a provider can have BOTH an OAuth token AND a literal/env 
 
 | Provider | OAuth token file | Notes |
 |---|---|---|
-| Codex (ChatGPT sub) | `~/.config/umans-harness/oauth/openai.json` | harness's OWN store. Shape: `{auth_mode, tokens{id_token, access_token, refresh_token, account_id}}` |
+| Codex (ChatGPT sub) | `~/.config/catalyst-code/oauth/openai.json` | harness's OWN store. Shape: `{auth_mode, tokens{id_token, access_token, refresh_token, account_id}}` |
 | Gemini | `~/.gemini/oauth_creds.json` | SHARED with gemini-cli (both write the same file) |
 | Claude/Anthropic | `~/.claude/.credentials.json` | official Claude CLI's store — harness READS it, does not own it |
 | Codex CLI (official) | `~/.codex/auth.json` | NOT read by the harness (intentional) — only matters if the user installed the CLI separately |
 
 **API keys / provider config** (literal pasted keys + `api_key_env` names + which
-providers exist + activeProvider): `~/.config/umans-harness/config.json` (the
+providers exist + activeProvider): `~/.config/catalyst-code/config.json` (the
 managed config). Written by `save_providers_config` (atomic temp+rename). Runtime
 keys from `/key` also land here.
 
-**Models cache**: `~/.config/umans-harness/models-cache.json` (keyed
+**Models cache**: `~/.config/catalyst-code/models-cache.json` (keyed
 `base_url|kind`, 8-hour TTL, schema v4). A STALE cache can mask a freshly-changed
 key/provider for up to 8h. When you change credentials, clear it too so
 discovery re-runs.
@@ -41,12 +41,12 @@ sidecar next to the session JSONL — not a credential, but relevant to a full r
    the harness's own OAuth file) the masked token fields + account_id, and the
    `providers`/`activeProvider` block of config.json. Use `bash`:
    ```bash
-   ls -la ~/.config/umans-harness/oauth/ 2>/dev/null
+   ls -la ~/.config/catalyst-code/oauth/ 2>/dev/null
    test -f ~/.gemini/oauth_creds.json && echo "gemini: present"
    test -f ~/.claude/.credentials.json && echo "claude: present"
    test -f ~/.codex/auth.json && echo "codex-cli: present (not read by harness)"
    # masked peek at config.json providers (no raw secrets printed):
-   jq '{activeProvider, providers: [.providers[]? | {name, kind, base_url, has_api_key:(.api_key!=null), api_key_env}]}' ~/.config/umans-harness/config.json 2>/dev/null
+   jq '{activeProvider, providers: [.providers[]? | {name, kind, base_url, has_api_key:(.api_key!=null), api_key_env}]}' ~/.config/catalyst-code/config.json 2>/dev/null
    ```
    Do NOT print raw secret values — mask them. The user asked to check, not leak.
 
@@ -55,15 +55,15 @@ sidecar next to the session JSONL — not a credential, but relevant to a full r
    entry from config.json's `providers[]` + clear the models cache:
    ```bash
    # Codex
-   rm -f ~/.config/umans-harness/oauth/openai.json
+   rm -f ~/.config/catalyst-code/oauth/openai.json
    # Gemini
    rm -f ~/.gemini/oauth_creds.json
    # Claude (official CLI store — only remove if user wants to re-login there)
    rm -f ~/.claude/.credentials.json
    # Models cache (clear after ANY credential change so stale models don't mask it)
-   rm -f ~/.config/umans-harness/models-cache.json
+   rm -f ~/.config/catalyst-code/models-cache.json
    ```
-   To remove a literal/env API key from config.json, edit `~/.config/umans-harness/config.json`
+   To remove a literal/env API key from config.json, edit `~/.config/catalyst-code/config.json`
    and delete the `api_key` (or the whole `providers[]` entry). Env-var keys
    (`api_key_env`) only NAME the env var; the secret lives in the shell env.
 
@@ -75,7 +75,7 @@ sidecar next to the session JSONL — not a credential, but relevant to a full r
 
 - `~/.codex/auth.json` (official CLI) is INTENTIONALLY not read by the harness —
   removing it does NOT log the harness out. The harness's Codex store is
-  `~/.config/umans-harness/oauth/openai.json`.
+  `~/.config/catalyst-code/oauth/openai.json`.
 - `~/.gemini/oauth_creds.json` is SHARED with gemini-cli; removing it logs BOTH out.
 - Claude creds live in the official CLI's store; the harness borrows them, so
   there is no harness-owned Anthropic OAuth file to clear.

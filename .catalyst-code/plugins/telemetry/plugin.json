@@ -1,0 +1,12 @@
+{
+  "name": "telemetry",
+  "version": "0.1.0",
+  "description": "Aggregate per-turn metrics (tokens, TTFT, TPS, prefix-cache hits) into a per-workspace telemetry summary under ~/.config/catalyst-code/telemetry/. Fires on the session_stop lifecycle hook; works out-of-the-box (no debug log needed).",
+  "hooks": {
+    "session_stop": {
+      "script": "hooks/session_stop.py",
+      "timeout_ms": 10000,
+      "pass_args": true
+    }
+  }
+}

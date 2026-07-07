@@ -22,7 +22,7 @@ import { DotIcon, CopyIcon, CheckIcon, PencilIcon, RefreshIcon } from "./icons";
 // used once the message is done streaming.
 function StreamingMarkdown({ children }: { children: string }) {
   return (
-    <div className="prose-umans stream-caret">
+    <div className="prose-catalyst stream-caret">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={streamComponents}>
         {children}
       </ReactMarkdown>

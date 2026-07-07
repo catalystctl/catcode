@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build EVERY release artifact for umans-harness across all platforms:
+# Build EVERY release artifact for catalyst-code across all platforms:
 #
-#   Windows  -> MSI installer  + standalone ucli.exe        (release-windows.sh)
+#   Windows  -> MSI installer  + standalone catcode.exe        (release-windows.sh)
 #   macOS    -> .dmg installer  + standalone executable     (release-macos.sh)
 #   Linux    -> AppImage        + standalone executable     (release-linux.sh)
 #
@@ -15,7 +15,7 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit
 
 VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
-echo "############ umans-harness ${VERSION} — full release (all platforms) ############"
+echo "############ catalyst-code ${VERSION} — full release (all platforms) ############"
 
 pass=0; fail=0; failed=""
 
@@ -42,7 +42,7 @@ echo "############ release summary ############"
 echo "  passed : $pass"
 echo "  failed : $fail${failed:+  (${failed# })}"
 echo "  dist/  :"
-( cd dist 2>/dev/null && for f in ucli-* umans-harness-*; do [ -e "$f" ] && printf '    %s\n' "$f"; done | sort -u ) || echo "    (none)"
+( cd dist 2>/dev/null && for f in catcode-* catalyst-code-*; do [ -e "$f" ] && printf '    %s\n' "$f"; done | sort -u ) || echo "    (none)"
 
 if [ "$fail" -ne 0 ]; then
 	echo

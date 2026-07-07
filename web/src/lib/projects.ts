@@ -1,6 +1,6 @@
 // Projects store — persists the user's known workspace directories so the
 // multi-project picker can list and switch between them. Stored in the shared
-// umans-harness config dir alongside settings.json so the TUI and web agree.
+// catalyst-code config dir alongside settings.json so the TUI and web agree.
 //
 // This is a server-side store (reads/writes the filesystem). The browser talks
 // to it via the /api/workspace route.
@@ -20,13 +20,13 @@ export interface ProjectEntry {
 
 function projectsFile(): string {
   const home = homedir() || ".";
-  const cfg = join(home, ".config", "umans-harness");
+  const cfg = join(home, ".config", "catalyst-code");
   return join(cfg, "projects.json");
 }
 
 function ensureDir(): void {
   const home = homedir() || ".";
-  const cfg = join(home, ".config", "umans-harness");
+  const cfg = join(home, ".config", "catalyst-code");
   if (!existsSync(cfg)) mkdirSync(cfg, { recursive: true });
 }
 

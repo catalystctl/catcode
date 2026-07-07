@@ -2,7 +2,7 @@
 // `core/agent-session-runtime.ts`. Wraps a session + services + a recreate
 // factory so session replacement (`newSession`/`switchSession`/`fork`) can rebind.
 //
-// NOTE: the umans-harness core reuses ONE process across session switches (it
+// NOTE: the catalyst-code core reuses ONE process across session switches (it
 // repoints to a different session file via `load_session`/`new_session`),
 // whereas PI creates a new AgentSession per replacement. The runtime still
 // calls `rebindSession`/`beforeSessionInvalidate`/`withSession` so pi-web's pool

@@ -1,5 +1,5 @@
 {
-  "name": "umans-harness-web",
+  "name": "catalyst-code-web",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -15,7 +15,7 @@
     "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/outfit": "^5.2.8",
-    "@umans-harness/coding-agent": "file:../sdk",
+    "@catalyst-code/coding-agent": "file:../sdk",
     "highlight.js": "^11.10.0",
     "next": "^15.1.0",
     "react": "^19.0.0",

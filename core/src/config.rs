@@ -155,7 +155,7 @@ pub struct Config {
     // --- plugin system (centerpiece) ---
     pub plugin_dir: PathBuf,           // directory scanned for plugins
     pub plugins_disabled: Vec<String>, // plugin names that are explicitly disabled
-    pub trust_project_plugins: bool, // allow loading project-scoped plugins (.umans-harness/plugins). Default false for safety; set via env/CLI only — never a project config file, which an untrusted repo could use to self-enable its own hooks.
+    pub trust_project_plugins: bool, // allow loading project-scoped plugins (.catalyst-code/plugins). Default false for safety; set via env/CLI only — never a project config file, which an untrusted repo could use to self-enable its own hooks.
     // --- regex denylist upgrade (quick win) ---
     pub bash_deny_regex: Vec<String>, // regex patterns that block bash commands
     pub bash_deny_regex_compiled: Vec<regex::Regex>, // pre-compiled at startup
@@ -541,11 +541,11 @@ pub fn provider_to_json(p: &ProviderConfig) -> Value {
     Value::Object(o)
 }
 
-/// Path of the core-owned config file (`~/.config/umans-harness/config.json`),
+/// Path of the core-owned config file (`~/.config/catalyst-code/config.json`),
 /// where first-party providers added at runtime are persisted. The TUI does
 /// NOT write this file (it owns `settings.json`), so there is no clobber.
 pub fn user_config_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".config/umans-harness/config.json"))
+    Some(home_dir()?.join(".config/catalyst-code/config.json"))
 }
 
 /// Persist `providers` (+ optional active provider) into the core-owned config
@@ -742,7 +742,7 @@ impl Default for Config {
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
             ask_rules: Vec::new(),
-            plugin_dir: PathBuf::from(".umans-harness/plugins"),
+            plugin_dir: PathBuf::from(".catalyst-code/plugins"),
             plugins_disabled: Vec::new(),
             trust_project_plugins: false, // secure default: don't auto-run repo-shipped plugins
             bash_deny_regex: Vec::new(),
@@ -757,29 +757,29 @@ impl Default for Config {
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const HELP: &str = "\
-umans-harness-core — OpenAI-compatible coding agent core (native Umans)
+catalyst-code-core — OpenAI-compatible coding agent core (native Umans)
 
 USAGE:
   core [OPTIONS]
 
 OPTIONS:
-      --workspace <DIR>         Workspace root (constrains all file/bash ops) [env: UMANS_HARNESS_WORKSPACE]
+      --workspace <DIR>         Workspace root (constrains all file/bash ops) [env: CATALYST_CODE_WORKSPACE]
       --base-url <URL>          OpenAI-compatible base URL [env: UMANS_BASE_URL]
-      --approval <MODE>         never | destructive | always  [env: UMANS_HARNESS_APPROVAL]
-      --bash-timeout <SECS>     Per-command bash timeout in seconds [env: UMANS_HARNESS_BASH_TIMEOUT]
-      --max-bash-timeout <SECS>  Ceiling for the bash tool's per-call `timeout` override [env: UMANS_HARNESS_MAX_BASH_TIMEOUT]
-      --fetch-timeout <SECS>    Wall-clock timeout for the `fetch` tool [env: UMANS_HARNESS_FETCH_TIMEOUT]
-      --diag-timeout <SECS>     Diagnostics tool (cargo check/tsc/go build) timeout in seconds [env: UMANS_HARNESS_DIAG_TIMEOUT]
-      --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: UMANS_HARNESS_SANDBOX]
-      --no-network             Block bash network egress (unshare -n) [env: UMANS_HARNESS_NO_NETWORK=1]
-      --trust-project-plugins  Load project-scoped plugins (.umans-harness/plugins). Off by default for safety [env: UMANS_HARNESS_TRUST_PROJECT_PLUGINS=1]
-      --idle-timeout <SECS>    SSE idle timeout in seconds [env: UMANS_HARNESS_IDLE_TIMEOUT]
-      --max-session-tokens <N> Hard session token budget (0=unlimited) [env: UMANS_HARNESS_MAX_SESSION_TOKENS]
-      --debug-log <FILE>        Structured JSONL debug log [env: UMANS_HARNESS_DEBUG_LOG]
-      --session <FILE>          Append-only JSONL session file (resume on restart) [env: UMANS_HARNESS_SESSION]
+      --approval <MODE>         never | destructive | always  [env: CATALYST_CODE_APPROVAL]
+      --bash-timeout <SECS>     Per-command bash timeout in seconds [env: CATALYST_CODE_BASH_TIMEOUT]
+      --max-bash-timeout <SECS>  Ceiling for the bash tool's per-call `timeout` override [env: CATALYST_CODE_MAX_BASH_TIMEOUT]
+      --fetch-timeout <SECS>    Wall-clock timeout for the `fetch` tool [env: CATALYST_CODE_FETCH_TIMEOUT]
+      --diag-timeout <SECS>     Diagnostics tool (cargo check/tsc/go build) timeout in seconds [env: CATALYST_CODE_DIAG_TIMEOUT]
+      --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: CATALYST_CODE_SANDBOX]
+      --no-network             Block bash network egress (unshare -n) [env: CATALYST_CODE_NO_NETWORK=1]
+      --trust-project-plugins  Load project-scoped plugins (.catalyst-code/plugins). Off by default for safety [env: CATALYST_CODE_TRUST_PROJECT_PLUGINS=1]
+      --idle-timeout <SECS>    SSE idle timeout in seconds [env: CATALYST_CODE_IDLE_TIMEOUT]
+      --max-session-tokens <N> Hard session token budget (0=unlimited) [env: CATALYST_CODE_MAX_SESSION_TOKENS]
+      --debug-log <FILE>        Structured JSONL debug log [env: CATALYST_CODE_DEBUG_LOG]
+      --session <FILE>          Append-only JSONL session file (resume on restart) [env: CATALYST_CODE_SESSION]
       --model <ID>              Default model id
       --provider <NAME>        Active model provider (openai/anthropic endpoint; see `providers` in config) [env: UMANS_ACTIVE_PROVIDER]
-      --config <FILE>           JSON config file (defaults: ./umans-harness.json, ~/.config/umans-harness/config.json)
+      --config <FILE>           JSON config file (defaults: ./catalyst-code.json, ~/.config/catalyst-code/config.json)
   -h, --help                    Print this help
   -V, --version                 Print version
 
@@ -887,21 +887,21 @@ pub fn load() -> Config {
         std::process::exit(0);
     }
     if version {
-        println!("umans-harness-core {VERSION}");
+        println!("catalyst-code-core {VERSION}");
         std::process::exit(0);
     }
 
     // Layer 1: config file (lowest precedence among the three, applied first so
-    // env/CLI can override). Pick explicit --config, else ./umans-harness.json,
-    // else ~/.config/umans-harness/config.json.
+    // env/CLI can override). Pick explicit --config, else ./catalyst-code.json,
+    // else ~/.config/catalyst-code/config.json.
     // Multi-layer: also load managed-settings and settings.local.json.
     let candidates: Vec<PathBuf> = match config_file {
         Some(p) => vec![p],
         None => {
             let managed = dirs_config_path();
-            let managed_dir = managed.with_file_name("umans-harness.d");
+            let managed_dir = managed.with_file_name("catalyst-code.d");
             let home = home_dir().unwrap_or_default();
-            let settings_path = home.join(".config/umans-harness/settings.json");
+            let settings_path = home.join(".config/catalyst-code/settings.json");
             let local = PathBuf::from("settings.local.json");
             let proj = PathBuf::from("settings.json");
             let mut v = vec![managed];
@@ -933,39 +933,39 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("UMANS_BASE_URL") {
         c.base_url = v;
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_WORKSPACE") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_WORKSPACE") {
         c.workspace = PathBuf::from(v);
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_APPROVAL") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_APPROVAL") {
         c.approval = Approval::parse(&v);
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_BASH_TIMEOUT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_BASH_TIMEOUT") {
         c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs);
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_MAX_BASH_TIMEOUT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_MAX_BASH_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
             c.max_bash_timeout_secs = n;
         }
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_TIMEOUT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_FETCH_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
             c.fetch_timeout_secs = n;
         }
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_MAX_BYTES") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_FETCH_MAX_BYTES") {
         if let Ok(n) = v.parse::<usize>() {
             c.fetch_max_bytes = n;
         }
     }
     // Comma-separated host glob allowlist for the fetch tool. Empty/unset = any host.
-    if let Ok(v) = std::env::var("UMANS_HARNESS_FETCH_ALLOWLIST") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_FETCH_ALLOWLIST") {
         c.fetch_allowlist = v
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_DIAG_TIMEOUT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_DIAG_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
             c.diag_timeout_secs = n;
         }
@@ -973,37 +973,37 @@ pub fn load() -> Config {
     // trust_project_plugins is intentionally NOT read from any JSON config file
     // (those are merged from project-local settings.json, which an untrusted
     // repo could ship to self-enable its own plugins). Env/CLI are user-owned.
-    if let Ok(v) = std::env::var("UMANS_HARNESS_TRUST_PROJECT_PLUGINS") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_TRUST_PROJECT_PLUGINS") {
         c.trust_project_plugins = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_DEBUG_LOG") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_DEBUG_LOG") {
         c.debug_log = Some(PathBuf::from(v));
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_SESSION") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_SESSION") {
         c.session_file = Some(PathBuf::from(v));
     }
     // Sandbox / network / token-budget knobs advertised in --help (P1-19: these
     // were documented as env vars but never read, so the Dockerfile's
-    // `ENV UMANS_HARNESS_SANDBOX=firejail` etc. were dead). Wire them up here.
-    if let Ok(v) = std::env::var("UMANS_HARNESS_SANDBOX") {
+    // `ENV CATALYST_CODE_SANDBOX=firejail` etc. were dead). Wire them up here.
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX") {
         c.sandbox = Sandbox::parse(&v);
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_NO_NETWORK") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_NO_NETWORK") {
         // Present without a value, or "1"/"true", means block network; "0"/"false" off.
         let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
         c.no_network = on;
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_IDLE_TIMEOUT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_IDLE_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
             c.idle_timeout_secs = n;
         }
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_MAX_SESSION_TOKENS") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_MAX_SESSION_TOKENS") {
         if let Ok(n) = v.parse::<u64>() {
             c.max_session_tokens = n;
         }
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_AUTO_REFLECT") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_AUTO_REFLECT") {
         let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
         let off = v == "0" || v.eq_ignore_ascii_case("false");
         if off {
@@ -1012,7 +1012,7 @@ pub fn load() -> Config {
             c.auto_reflect = true;
         }
     }
-    if let Ok(v) = std::env::var("UMANS_HARNESS_AUTO_REFLECT_MIN_TOOL_CALLS") {
+    if let Ok(v) = std::env::var("CATALYST_CODE_AUTO_REFLECT_MIN_TOOL_CALLS") {
         if let Ok(n) = v.parse::<u32>() {
             c.auto_reflect_min_tool_calls = n.max(1);
         }
@@ -1066,12 +1066,12 @@ pub fn home_dir() -> Option<PathBuf> {
     None
 }
 
-/// Cross-platform config base: `~/.config/umans-harness` on Unix, and
-/// `%USERPROFILE%\.config\umans-harness` on Windows (kept under the same
+/// Cross-platform config base: `~/.config/catalyst-code` on Unix, and
+/// `%USERPROFILE%\.config\catalyst-code` on Windows (kept under the same
 /// relative path so settings are shared across shells / WSL).
 fn dirs_config_path() -> PathBuf {
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config/umans-harness/config.json")
+    home.join(".config/catalyst-code/config.json")
 }
 
 fn apply_json(c: &mut Config, v: &Value) {
@@ -1379,10 +1379,10 @@ mod tests {
         // Save, set, restore the advertised env knobs (P1-19). Only this test
         // calls load(), so there's no parallel-reader race on these vars.
         let vars = [
-            ("UMANS_HARNESS_SANDBOX", "firejail"),
-            ("UMANS_HARNESS_NO_NETWORK", "1"),
-            ("UMANS_HARNESS_IDLE_TIMEOUT", "42"),
-            ("UMANS_HARNESS_MAX_SESSION_TOKENS", "123456"),
+            ("CATALYST_CODE_SANDBOX", "firejail"),
+            ("CATALYST_CODE_NO_NETWORK", "1"),
+            ("CATALYST_CODE_IDLE_TIMEOUT", "42"),
+            ("CATALYST_CODE_MAX_SESSION_TOKENS", "123456"),
         ];
         let saved: Vec<(String, Option<String>)> = vars
             .iter()

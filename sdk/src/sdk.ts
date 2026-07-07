@@ -1,5 +1,5 @@
 // Top-level `createAgentSession` + tool factory stubs — mirrors
-// `pi-coding-agent`'s `core/sdk.ts`. The tool factories are no-ops: the umans-harness
+// `pi-coding-agent`'s `core/sdk.ts`. The tool factories are no-ops: the catalyst-code
 // core owns the built-in toolset (read_file/edit/write_file/grep/glob/bash/...).
 
 import { getAgentDir } from "./config.js";

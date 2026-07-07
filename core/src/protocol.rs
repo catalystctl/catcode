@@ -216,7 +216,7 @@ pub enum Command {
     #[serde(rename = "get_vision_config")]
     GetVisionConfig,
     /// Set the vision-handoff configuration and persist it to
-    /// .umans-harness/vision.json. `vision_model` is the preferred handoff
+    /// .catalyst-code/vision.json. `vision_model` is the preferred handoff
     /// target; an empty string / null means "pick dynamically". Emits a
     /// `vision_config` event with the new state.
     #[serde(rename = "set_vision_config")]
@@ -233,7 +233,7 @@ pub enum Command {
     ListSkills,
     /// Invoke a skill by name: the core reads the matching SKILL.md (resolving
     /// project > user scope, bypassing the read_file path restriction so global
-    /// skills under ~/.umans-harness/skills work too), builds a prompt that
+    /// skills under ~/.catalyst-code/skills work too), builds a prompt that
     /// instructs the model to apply it, and runs a normal assistant turn.
     /// `task` is an optional follow-up appended to the skill instructions.
     #[serde(rename = "apply_skill")]

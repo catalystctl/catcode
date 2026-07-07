@@ -582,7 +582,7 @@ export function useAgent(): AgentApi {
 
   const exportTranscript = useCallback((): string => {
     const msgs = stateRef.current.messages;
-    const lines: string[] = [`# Umans Harness Transcript`, ``];
+    const lines: string[] = [`# Catalyst Code Transcript`, ``];
     for (const m of msgs) {
       if (m.role === "user") {
         lines.push(`## You`, ``, m.text, ``);

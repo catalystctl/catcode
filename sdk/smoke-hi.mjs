@@ -9,7 +9,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-process.env.UMANS_CORE = process.env.UMANS_CORE || join(process.cwd(), "core", "target", "release", "core");
+process.env.CATCODE_CORE = process.env.CATCODE_CORE || join(process.cwd(), "core", "target", "release", "core");
 const cwd = mkdtempSync(join(tmpdir(), "umans-sdk-hi-"));
 
 const authStorage = AuthStorage.create();

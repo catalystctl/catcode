@@ -23,7 +23,7 @@ function fnv64aHex(s: string): string {
 
 function titlesFile(workspace: string): string {
   const home = homedir() || ".";
-  const cfg = join(home, ".config", "umans-harness", "session-titles");
+  const cfg = join(home, ".config", "catalyst-code", "session-titles");
   if (!existsSync(cfg)) mkdirSync(cfg, { recursive: true });
   return join(cfg, `${fnv64aHex(workspace)}.json`);
 }

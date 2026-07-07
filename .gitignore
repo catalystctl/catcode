@@ -9,8 +9,9 @@ core/target/
 # Go (tui/) compiled binaries
 tui/tui
 tui/umans-harness-tui
-tui/ucli
-tui/ucli.exe
+tui/catalyst-code-tui
+tui/catcode
+tui/catcode.exe
 tui/bin/
 
 # Release / distribution output (built by release.sh)
@@ -21,8 +22,17 @@ dist/
 # =============================================================================
 
 # Umans harness runtime state (mutable) -- ignored. The shipped agent
-# definitions, plugins, and skills under .umans-harness/{agents,plugins,skills}
+# definitions, plugins, and skills under .catalyst-code/{agents,plugins,skills}
 # are NOT ignored and ARE tracked (they ship the subagent + plugin systems).
+.catalyst-code/sessions/
+.catalyst-code/todo.json
+.catalyst-code/vision.json
+**/.catalyst-code/sessions/
+**/.catalyst-code/todo.json
+**/.catalyst-code/vision.json
+
+# Legacy pre-rename paths (umans-harness -> catalyst-code): ignore stale leftovers
+# so a `git add -A` can't re-introduce old-name runtime state or binaries.
 .umans-harness/sessions/
 .umans-harness/todo.json
 .umans-harness/vision.json
@@ -62,7 +72,7 @@ desktop.ini
 *.key
 
 # macOS standalone build: core binary injected into the TUI at build time
-tui/embed/umans-core
+tui/embed/catcode-core
 
 # =============================================================================
 # External reference clones & scratch artifacts (not part of this project)
@@ -84,11 +94,11 @@ tmp/
 # Stray build/test artifacts
 .intentionally-empty-file.o
 sdk/node_modules/
-.umans-harness/*
+.catalyst-code/*
 # ...but the shipped subagent / plugin / skill trees DO ship (see the comment
 # above): un-ignore those three directories so new files track normally
 # instead of being silently swallowed (which requires `git add -f`).
-!.umans-harness/agents
-!.umans-harness/plugins
-!.umans-harness/skills
+!.catalyst-code/agents
+!.catalyst-code/plugins
+!.catalyst-code/skills
 core/.config

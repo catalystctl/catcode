@@ -34,7 +34,7 @@ func TestSessionPath_PerProjectResumeAndMigration(t *testing.T) {
 	chdir(t, proj)
 
 	hash := fmt.Sprintf("%x", fnv64a(proj))
-	sessionsRoot := filepath.Join(tmp, ".config", "umans-harness", "sessions")
+	sessionsRoot := filepath.Join(tmp, ".config", "catalyst-code", "sessions")
 	projDir := filepath.Join(sessionsRoot, hash)
 
 	// Legacy flat-layout file: sessions/<hash>.jsonl (the old single-file scheme).

@@ -25,7 +25,7 @@ You are a Rust reviewer. Review three files:
 4. **Correctness**: Potential bugs — concurrent access, file corruption, injection ordering
 
 **`core/src/staging.rs` (~335 lines)**:
-1. **Staging**: How bundled files (agents, skills, plugins) are staged to ~/.umans-harness/ on first run
+1. **Staging**: How bundled files (agents, skills, plugins) are staged to ~/.catalyst-code/ on first run
 2. **Idempotency**: Never overwrites user edits, backfills deleted files
 3. **Correctness**: Potential bugs — race conditions on first run, version marker management
 

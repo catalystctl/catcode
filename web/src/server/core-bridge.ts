@@ -1,4 +1,4 @@
-// HarnessBridge — a POOL of live sessions, one umans-core process per session.
+// HarnessBridge — a POOL of live sessions, one catcode-core process per session.
 //
 // Previously the bridge owned a SINGLE CoreProcess for the whole server, so
 // switching sessions or workspaces disposed it (killing any in-flight turn) and
@@ -34,11 +34,11 @@ interface HarnessSettings {
   provider?: string;
 }
 
-/** Read the TUI's settings.json (~/.config/umans-harness/settings.json) so the web
+/** Read the TUI's settings.json (~/.config/catalyst-code/settings.json) so the web
  *  app auto-authenticates with the same key the TUI uses — no re-entry needed.
  *  The core itself does not read settings.json (the TUI forwards the key via env). */
 function loadSettings(): HarnessSettings {
-  const path = join(homedir() || ".", ".config", "umans-harness", "settings.json");
+  const path = join(homedir() || ".", ".config", "catalyst-code", "settings.json");
   try {
     if (!existsSync(path)) return {};
     const raw = readFileSync(path, "utf8");
@@ -77,7 +77,7 @@ function fnv64aHex(s: string): string {
 /** The per-workspace session directory (mirrors the TUI's sessionsDir()). */
 export function sessionsDir(workspace: string): string {
   const home = homedir() || ".";
-  const cfg = join(home, ".config", "umans-harness", "sessions");
+  const cfg = join(home, ".config", "catalyst-code", "sessions");
   return join(cfg, fnv64aHex(workspace));
 }
 
@@ -122,10 +122,10 @@ export function resolveSessionFile(workspace: string): string {
 
 /** Walk up from cwd to find the built core binary; return its repo root too. */
 function resolveCore(): CoreRoot {
-  const env = process.env.UMANS_CORE;
+  const env = process.env.CATCODE_CORE;
   if (env && env.trim()) return { binary: env.trim(), root: process.cwd() };
   const exe = process.platform === "win32" ? ".exe" : "";
-  const names = [`core${exe}`, `umans-core${exe}`];
+  const names = [`core${exe}`, `catcode-core${exe}`];
   let dir = process.cwd();
   for (let i = 0; i < 8; i++) {
     for (const name of names) {
@@ -150,7 +150,7 @@ class HarnessBridge {
 
   constructor() {
     const { root } = resolveCore();
-    this.defaultWorkspace = process.env.UMANS_HARNESS_WORKSPACE ?? root;
+    this.defaultWorkspace = process.env.CATALYST_CODE_WORKSPACE ?? root;
     // Reap idle sessions every minute so the live-core count stays bounded.
     // Mid-turn sessions and sessions with active viewers are never reaped.
     this.gcTimer = setInterval(() => this.gcIdle(), 60_000);
@@ -361,8 +361,8 @@ class HarnessBridge {
 export type { ReadyPayload, AgentState, CoreCommand };
 
 // Singleton preserved across Next.js dev HMR.
-const g = globalThis as unknown as { __UMANS_BRIDGE?: HarnessBridge };
+const g = globalThis as unknown as { __CATALYST_BRIDGE?: HarnessBridge };
 export function getBridge(): HarnessBridge {
-  if (!g.__UMANS_BRIDGE) g.__UMANS_BRIDGE = new HarnessBridge();
-  return g.__UMANS_BRIDGE;
+  if (!g.__CATALYST_BRIDGE) g.__CATALYST_BRIDGE = new HarnessBridge();
+  return g.__CATALYST_BRIDGE;
 }

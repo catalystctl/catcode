@@ -4,31 +4,31 @@
 
 ### Added — cross-platform installers & standalone executables
 - All three desktop platforms now ship BOTH a native installer AND a
-  self-contained standalone executable, so `ucli` runs from the terminal with
+  self-contained standalone executable, so `catcode` runs from the terminal with
   no install on any OS:
-  - **Windows** — `ucli-<ver>-windows.msi` (per-user MSI, adds `ucli` to PATH,
-    no admin) **and** `ucli-<ver>-windows-x86_64.exe` (single file, Rust core
+  - **Windows** — `catcode-<ver>-windows.msi` (per-user MSI, adds `catcode` to PATH,
+    no admin) **and** `catcode-<ver>-windows-x86_64.exe` (single file, Rust core
     embedded via `go:embed` `-tags embed_core`; extracts its core to
-    `%LOCALAPPDATA%\umans-harness` on first run). `release-windows.sh` now
+    `%LOCALAPPDATA%\catalyst-code` on first run). `release-windows.sh` now
     emits both (previously MSI + zip only).
-  - **macOS** — `ucli-<ver>-macos-{arm64,x86_64}.dmg` (disk-image installer:
-    mount + double-click `Install ucli.command` to put `ucli` on `/usr/local/bin`)
-    **and** the existing `umans-harness-<ver>-macos-{arm64,x86_64}` standalone.
+  - **macOS** — `catcode-<ver>-macos-{arm64,x86_64}.dmg` (disk-image installer:
+    mount + double-click `Install catcode.command` to put `catcode` on `/usr/local/bin`)
+    **and** the existing `catcode-<ver>-macos-{arm64,x86_64}` standalone.
     `release-macos.sh` now builds the `.dmg` too (`hdiutil` real UDIF on macOS,
     `xorriso` HFS+ hybrid when cross-built on Linux).
-  - **Linux** — `ucli-<ver>-<arch>.AppImage` (self-contained AppImage wrapping
-    the embedded-core standalone) **and** `umans-harness-<ver>-linux-<arch>`
+  - **Linux** — `catcode-<ver>-<arch>.AppImage` (self-contained AppImage wrapping
+    the embedded-core standalone) **and** `catcode-<ver>-linux-<arch>`
     standalone. New `release-linux.sh` builds the core natively, embeds it into
     the TUI, generates a terminal-prompt icon, and packages the AppImage with
     `appimagetool` (fetched on demand; runs without FUSE via
     `APPIMAGE_EXTRACT_AND_RUN=1`).
   - New `release-all.sh` runs all three platform scripts and reports
     per-platform pass/fail, so a partial toolchain still ships what it can.
-  - Packaging assets: `packaging/linux/{AppRun,ucli.desktop,make-icon.py}` and
+  - Packaging assets: `packaging/linux/{AppRun,catcode.desktop,make-icon.py}` and
     `packaging/macos/{install.command,README.txt}`.
 - `tui/embed_core.go`: the extracted embedded core now gets the platform exe
   suffix (`coreExeSuffix()`), so on Windows it caches as
-  `umans-core-<ver>-windows-amd64.exe` (a proper PE name CreateProcess exec's
+  `catcode-core-<ver>-windows-amd64.exe` (a proper PE name CreateProcess exec's
   and AV tools recognize); unchanged on macOS/Linux.
 - Fixed a latent `go build -ldflags` bug: `release-windows.sh` and `release.sh`
   used `-X main/coreVersion` with a slash (`main/coreVersion`), which the Go
@@ -46,8 +46,8 @@
   egress; empty = any host when network is enabled. Closes the gap where the
   `researcher` agent couldn't look anything up under the hard-security config.
   New config: `fetch_allowlist`, `fetch_timeout_secs` (20), `fetch_max_bytes`
-  (262144); CLI `--fetch-timeout`; env `UMANS_HARNESS_FETCH_ALLOWLIST`,
-  `UMANS_HARNESS_FETCH_TIMEOUT`, `UMANS_HARNESS_FETCH_MAX_BYTES`. Also usable
+  (262144); CLI `--fetch-timeout`; env `CATALYST_CODE_FETCH_ALLOWLIST`,
+  `CATALYST_CODE_FETCH_TIMEOUT`, `CATALYST_CODE_FETCH_MAX_BYTES`. Also usable
   via `bulk`.
 - **`edit`: `replace_all` and `normalize_whitespace`** per edit. `replace_all`
   replaces every occurrence instead of erroring on a non-unique match.
@@ -62,7 +62,7 @@
   default ceiling 600s) so a slow `cargo build --release`/`npm install`/test
   suite can get more time for one command without raising the global default.
   New config: `max_bash_timeout_secs`; CLI `--max-bash-timeout`; env
-  `UMANS_HARNESS_MAX_BASH_TIMEOUT`.
+  `CATALYST_CODE_MAX_BASH_TIMEOUT`.
 - **`bash`: smarter output truncation.** When over the 32 KiB cap, the tail is
   kept AND error/warning lines are salvaged from the dropped head — a compile
   error in the middle of a huge build log no longer vanishes under a pure tail
@@ -142,10 +142,10 @@
   `cargo zigbuild` (zig as the macOS linker; pure-Rust `rustls-tls` so no
   macOS SDK is needed), then embedded into the Go TUI via `go:embed`
   (`-tags embed_core`). Each output file runs from any CWD — it extracts its
-  bundled core to `~/Library/Caches/umans-harness` on first run and launches
-  the harness in that directory, with no separate `umans-core` and no install.
+  bundled core to `~/Library/Caches/catalyst-code` on first run and launches
+  the harness in that directory, with no separate `catcode-core` and no install.
 - TUI: new `embeddedCorePath()` (build-tagged `embed_core`) is wired into
-  `coreBinaryPath()` ahead of the usual `$UMANS_CORE`/dev/installed search;
+  `coreBinaryPath()` ahead of the usual `$CATCODE_CORE`/dev/installed search;
   it's a no-op stub in normal builds, so dev, Linux, and the Windows MSI
   layout are unchanged.
 
@@ -154,7 +154,7 @@
   and the `spawn` sub-agent turn cap (`spawn_max_turns`, default 10). Turns are
   now bounded only by the session token budget (`--max-session-tokens`, 0 =
   unlimited), the `finish` tool, abort, or the model stopping. Removed: the
-  `--max-turns` flag, `UMANS_HARNESS_MAX_TURNS` env var, `max_turns` config
+  `--max-turns` flag, `CATALYST_CODE_MAX_TURNS` env var, `max_turns` config
   key, `ready` event's `max_turns` field, the `set_config max_turns` knob, and
   the TUI "Max Turns" setting. Stale `max_turns` config values are ignored.
 
@@ -213,7 +213,7 @@
   `ready` now emits `bash_timeout_secs` / `max_turns`.
 - TUI never passed `--session`, so persistent chats were unreachable.
   The TUI now writes one JSONL per workspace under
-  `~/.config/umans-harness/sessions/`.
+  `~/.config/catalyst-code/sessions/`.
 - Flaky `workspace::tests::relative_inside_ok` under parallel `cargo test`
   (shared fixed temp dir). Now uses a unique dir per call.
 

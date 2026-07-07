@@ -1,4 +1,4 @@
-// umans-harness-core: stdio JSON-RPC server. The TUI spawns this binary,
+// catalyst-code-core: stdio JSON-RPC server. The TUI spawns this binary,
 // writes commands to stdin, and reads newline-delimited events from stdout.
 //
 // Several core functions (stream_turn, run_turn, dispatch_*) intentionally
@@ -77,8 +77,8 @@ Be concise. Prefer standard tools. When done, summarize what you did in two line
 
 Self-learning — you compound knowledge across sessions, so future you starts smarter:
 - The `memory` tool (actions: save/append/list/forget) persists durable facts. By default memories are scoped to this workspace (per-codebase); pass `scope: "global"` for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
-- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation before `finish` exits and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `UMANS_HARNESS_AUTO_REFLECT=0`).
-- Reusable skills live as markdown + YAML frontmatter under `.umans-harness/skills/<name>/SKILL.md`. Discover them with `list_dir .umans-harness/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
+- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation before `finish` exits and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `CATALYST_CODE_AUTO_REFLECT=0`).
+- Reusable skills live as markdown + YAML frontmatter under `.catalyst-code/skills/<name>/SKILL.md`. Discover them with `list_dir .catalyst-code/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
 - `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
 
 /// Build the full system prompt by appending git context, memory context,
@@ -122,8 +122,8 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
 /// orchestrator's system prompt. Returns None if no skill file is found.
 fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
     let candidates: [Option<std::path::PathBuf>; 2] = [
-        Some(workspace.join(".umans-harness/skills/pi-subagents/SKILL.md")),
-        config::home_dir().map(|h| h.join(".umans-harness/skills/pi-subagents/SKILL.md")),
+        Some(workspace.join(".catalyst-code/skills/pi-subagents/SKILL.md")),
+        config::home_dir().map(|h| h.join(".catalyst-code/skills/pi-subagents/SKILL.md")),
     ];
     for p in candidates.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&p) {
@@ -135,7 +135,7 @@ fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
 }
 
 /// One-line manifest of opt-in skills (name + description) discovered under
-/// `.umans-harness/skills/` (project then user scope). Spliced into the
+/// `.catalyst-code/skills/` (project then user scope). Spliced into the
 /// orchestrator's stable system prompt so available skills are visible without a
 /// `list_dir` round-trip. Excludes `pi-subagents` (already injected in full) and
 /// deduplicates by name (project wins). Returns an empty string when no opt-in
@@ -149,7 +149,7 @@ fn skill_manifest_injection(workspace: &std::path::Path) -> String {
         .filter(|(name, _, _)| name.as_str() != "pi-subagents")
         .filter_map(|(name, desc, loc)| {
             // Use the skill DIRECTORY name (parsed from the SKILL.md path) as the
-            // identifier, so the header's `read .umans-harness/skills/<name>/SKILL.md`
+            // identifier, so the header's `read .catalyst-code/skills/<name>/SKILL.md`
             // always resolves — frontmatter `name` can drift from the dirname.
             let n = std::path::Path::new(loc)
                 .parent()
@@ -173,7 +173,7 @@ fn skill_manifest_injection(workspace: &std::path::Path) -> String {
         return String::new();
     }
     format!(
-        "Available opt-in skills — read the matching .umans-harness/skills/<name>/SKILL.md with read_file when a task fits one:\n{}",
+        "Available opt-in skills — read the matching .catalyst-code/skills/<name>/SKILL.md with read_file when a task fits one:\n{}",
         lines.join("\n")
     )
 }
@@ -307,7 +307,7 @@ pub struct State {
     /// Plugin manager — scans, loads, and executes hooks.
     pub plugin_manager: PluginManager,
     /// Vision-handoff config (curated vision models + preferred target), persisted
-    /// to .umans-harness/vision.json; merged into the pre_turn hook context.
+    /// to .catalyst-code/vision.json; merged into the pre_turn hook context.
     pub vision: RwLock<VisionConfig>,
     /// Last time a turn completed (for idle compaction).
     pub last_turn_time: Mutex<std::time::Instant>,
@@ -983,8 +983,14 @@ fn new_session_filename() -> String {
 
 #[tokio::main]
 async fn main() {
+    // One-time rename migration: move the pre-rename on-disk layout
+    // (~/.config/umans-harness/, ~/.umans-harness/) to the current names
+    // (~/.config/catalyst-code/, ~/.catalyst-code/), preserving sessions,
+    // memory, OAuth tokens, settings, and staged agent/skill/plugin files.
+    // Runs before staging + config load so this run sees the migrated data.
+    staging::migrate_legacy_dirs();
     // Stage the harness's global defaults (agents, orchestrator skill,
-    // vision-handoff plugin) into ~/.umans-harness/ on first run — shared
+    // vision-handoff plugin) into ~/.catalyst-code/ on first run — shared
     // across every project, editable once, never per-project by default. Done
     // before config/plugin loading so staged files are picked up this run.
     let stage = staging::stage_if_needed();
@@ -1217,14 +1223,14 @@ async fn main() {
                         .with("resumed_messages", json!(conv_len)),
                 );
                 // Tell the user when the harness staged its global defaults
-                // (first run) so the global ~/.umans-harness/ layout is
+                // (first run) so the global ~/.catalyst-code/ layout is
                 // discoverable.
                 if stage.first_run {
                     emit(
                         &Event::new("info").with(
                             "message",
                             json!(format!(
-                                "First run: staged {} default file(s) into {} — agents, the pi-subagents skill, and the vision-handoff plugin now live globally and are shared across all projects. Edit them there to customize; drop a file in a project's own .umans-harness/ to override for that project only.",
+                                "First run: staged {} default file(s) into {} — agents, the pi-subagents skill, and the vision-handoff plugin now live globally and are shared across all projects. Edit them there to customize; drop a file in a project's own .catalyst-code/ to override for that project only.",
                                 stage.written.len(),
                                 stage.home.display()
                             )),
@@ -2443,7 +2449,7 @@ pub(crate) fn restricted_path_for_tool(
 
 /// Build the user-message prompt for an `apply_skill` invocation: instructs
 /// the model to read and follow the named skill, inlining the skill body (the
-/// core reads it from disk so global skills under ~/.umans-harness/skills
+/// core reads it from disk so global skills under ~/.catalyst-code/skills
 /// work despite read_file's path restriction), and appending an optional task.
 fn build_skill_prompt(skill: &subagent::SkillEntry, task: Option<&str>) -> String {
     let mut p = format!(
@@ -2638,8 +2644,8 @@ fn build_reflect_text(recurring: &[(usize, String)]) -> String {
          like the user's identity, tech-stack preferences, or harness conventions) \n\
          — skip transient task state. \n\
          (2) If you just performed a reusable workflow, consider writing a skill \n\
-         under `.umans-harness/skills/<name>/SKILL.md` (run \n\
-         `list_dir .umans-harness/skills/` first to extend rather than duplicate). \n\
+         under `.catalyst-code/skills/<name>/SKILL.md` (run \n\
+         `list_dir .catalyst-code/skills/` first to extend rather than duplicate). \n\
          Then call `finish` to complete.",
     );
     if !recurring.is_empty() {
@@ -4656,7 +4662,7 @@ mod skill_manifest_tests {
     /// Write a SKILL.md with arbitrary extra frontmatter lines (for deprecated, etc.).
     fn write_skill_raw(dir: &std::path::Path, name: &str, frontmatter_body: &str) {
         let p = dir
-            .join(".umans-harness/skills")
+            .join(".catalyst-code/skills")
             .join(name)
             .join("SKILL.md");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

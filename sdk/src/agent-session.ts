@@ -1,4 +1,4 @@
-// AgentSession — the PI-compatible session wrapper. Spawns a umans-harness core
+// AgentSession — the PI-compatible session wrapper. Spawns a catalyst-code core
 // process and translates its JSONL events into `AgentSessionEvent`s, mapping the
 // harness protocol (`send`/`delta`/`tool_call`/`tool_result`/`done`/`aborted`/
 // `compacted`) onto PI's `agent_start`/`turn_start`/`message_start`/

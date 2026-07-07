@@ -1,5 +1,5 @@
-// @umans-harness/coding-agent — a pi-coding-agent-compatible TypeScript SDK
-// that wraps the umans-harness core binary. Drop-in replacement for
+// @catalyst-code/coding-agent — a pi-coding-agent-compatible TypeScript SDK
+// that wraps the catalyst-code core binary. Drop-in replacement for
 // `@earendil-works/pi-coding-agent` (plus the `pi-ai` subset pi-web uses).
 //
 // This is a thin adapter: the agent loop, model inference, tool execution and

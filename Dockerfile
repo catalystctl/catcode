@@ -1,4 +1,4 @@
-# Multi-stage build for umans-harness.
+# Multi-stage build for catalyst-code.
 # Stage 1 builds the Rust core + Go TUI in a full toolchain image.
 # Stage 2 copies only the binaries + firejail into a slim runtime image.
 # ponytail: no distroless, no scratch — a slim Debian keeps firejail + glibc
@@ -27,13 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/* && \
     useradd -m harness
 WORKDIR /workspace
-COPY --from=core-builder /build/core/target/release/core /usr/local/bin/umans-core
+COPY --from=core-builder /build/core/target/release/core /usr/local/bin/catcode-core
 COPY --from=tui-builder /tui /usr/local/bin/umans-tui
 
 # The core writes session/debug files here; the TUI reads settings here.
-RUN mkdir -p /home/harness/.config/umans-harness/sessions && chown -R harness:harness /home/harness
+RUN mkdir -p /home/harness/.config/catalyst-code/sessions && chown -R harness:harness /home/harness
 USER harness
-ENV UMANS_HARNESS_WORKSPACE=/workspace
+ENV CATALYST_CODE_WORKSPACE=/workspace
 # Production defaults wired through env (core/config.rs reads these).
 #   SANDBOX=firejail  -> bash runs under a firejail profile (see --sandbox).
 #   NO_NETWORK=0      -> network stays ON: the core must reach the model API.
@@ -48,9 +48,9 @@ ENV UMANS_HARNESS_WORKSPACE=/workspace
 #   docker run --cap-add SYS_ADMIN --security-opt apparmor=unconfined ...
 # (or use gVisor / a VM). Without those flags, treat the container itself as the
 # boundary and don't rely on --sandbox firejail inside it.
-ENV UMANS_HARNESS_SANDBOX=firejail
-ENV UMANS_HARNESS_NO_NETWORK=0
-ENV UMANS_HARNESS_IDLE_TIMEOUT=120
+ENV CATALYST_CODE_SANDBOX=firejail
+ENV CATALYST_CODE_NO_NETWORK=0
+ENV CATALYST_CODE_IDLE_TIMEOUT=120
 
 # The TUI is the entry point; it spawns the core.
 ENTRYPOINT ["/usr/local/bin/umans-tui"]

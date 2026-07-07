@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn append_then_load_roundtrip() {
-        let dir = std::env::temp_dir().join("umans_harness_session_test");
+        let dir = std::env::temp_dir().join("catalyst_code_session_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn header_version_is_present_and_validated() {
-        let dir = std::env::temp_dir().join("umans_harness_session_hdr_test");
+        let dir = std::env::temp_dir().join("catalyst_code_session_hdr_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn future_version_refused() {
-        let dir = std::env::temp_dir().join("umans_harness_session_future");
+        let dir = std::env::temp_dir().join("catalyst_code_session_future");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn describe_extracts_first_user_title_and_count() {
-        let dir = std::env::temp_dir().join("umans_harness_session_describe_test");
+        let dir = std::env::temp_dir().join("catalyst_code_session_describe_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn describe_header_only_and_multimodal() {
-        let dir = std::env::temp_dir().join("umans_harness_session_describe_mm");
+        let dir = std::env::temp_dir().join("catalyst_code_session_describe_mm");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn describe_truncates_long_titles() {
-        let dir = std::env::temp_dir().join("umans_harness_session_describe_long");
+        let dir = std::env::temp_dir().join("catalyst_code_session_describe_long");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn stats_roundtrip_survives_restart() {
-        let dir = std::env::temp_dir().join("umans_harness_session_stats_test");
+        let dir = std::env::temp_dir().join("catalyst_code_session_stats_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.jsonl");

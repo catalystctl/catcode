@@ -1,4 +1,4 @@
-// Plugin system: self-bootstrapping hooks loaded from .umans-harness/plugins/.
+// Plugin system: self-bootstrapping hooks loaded from .catalyst-code/plugins/.
 // Each plugin is a subdirectory with a plugin.json manifest and hook scripts.
 // Hooks are spawned as subprocesses with stdin JSON context, stdout JSON response.
 // Broken hooks never crash the core; timeouts and parse failures are handled gracefully.
@@ -19,12 +19,12 @@ use tokio::process::Command;
 pub const PLUGIN_DOCS: &str = r#"## Plugin System
 
 You can extend the harness with plugins. Plugins are self-contained directories
-under `.umans-harness/plugins/`. Each plugin hooks into tool execution and
+under `.catalyst-code/plugins/`. Each plugin hooks into tool execution and
 session lifecycle events to inspect, approve, modify, or log operations.
 
 ### Creating a plugin
 
-1. Create a directory: `.umans-harness/plugins/<plugin-name>/`
+1. Create a directory: `.catalyst-code/plugins/<plugin-name>/`
 2. Write a `plugin.json` manifest (see format below)
 3. Write executable hook scripts (bash, python, or any language)
 4. Make hook scripts executable (`chmod +x hooks/*.sh`)
@@ -147,7 +147,7 @@ model when the active one lacks vision (see the bundled `vision-handoff` plugin)
 
 ### Example: a pre_write linter plugin
 
-`.umans-harness/plugins/lint-check/plugin.json`:
+`.catalyst-code/plugins/lint-check/plugin.json`:
 ```
 {
   "name": "lint-check",
@@ -163,7 +163,7 @@ model when the active one lacks vision (see the bundled `vision-handoff` plugin)
 }
 ```
 
-`.umans-harness/plugins/lint-check/hooks/pre_write.sh`:
+`.catalyst-code/plugins/lint-check/hooks/pre_write.sh`:
 ```bash
 #!/bin/bash
 input=$(cat)
@@ -180,7 +180,7 @@ fi
 echo '{"allow": true}'
 ```
 
-Remember: `chmod +x .umans-harness/plugins/lint-check/hooks/pre_write.sh`
+Remember: `chmod +x .catalyst-code/plugins/lint-check/hooks/pre_write.sh`
 "#;
 
 /// Valid hook point names. Plugins can register for any of these.
@@ -267,7 +267,7 @@ pub struct HookResult {
 /// Holds an in-memory registry behind a `RwLock`.
 pub struct PluginManager {
     plugins_dir: PathBuf,
-    /// Optional **global, user-owned** plugins dir (`~/.umans-harness/plugins`)
+    /// Optional **global, user-owned** plugins dir (`~/.catalyst-code/plugins`)
     /// scanned before the project dir so globally-staged plugins load across
     /// every project. `None` for the isolated `new()` constructor (used by
     /// tests); `Some` for `new_with_global_plugins()` (used by the core at
@@ -277,7 +277,7 @@ pub struct PluginManager {
     /// (inside the workspace) vs user-installed (outside it).
     workspace: PathBuf,
     /// When false (the secure default), project-scoped plugins under the
-    /// workspace's `.umans-harness/plugins` are NOT auto-loaded — a repo you
+    /// workspace's `.catalyst-code/plugins` are NOT auto-loaded — a repo you
     /// `cd` into must not run hook scripts with your privileges without opt-in.
     trust_project: bool,
     plugins: RwLock<HashMap<String, Plugin>>,
@@ -288,7 +288,7 @@ pub struct PluginManager {
 impl PluginManager {
     /// Create a new manager and scan/load all plugins from `plugins_dir` only
     /// (the project plugins dir). This is the **isolated** constructor used by
-    /// tests; it does NOT scan the global `~/.umans-harness/plugins` dir, so
+    /// tests; it does NOT scan the global `~/.catalyst-code/plugins` dir, so
     /// tests are unaffected by the developer's real global plugins.
     ///
     /// Production code should use [`PluginManager::new_with_global_plugins`]
@@ -307,7 +307,7 @@ impl PluginManager {
     }
 
     /// Production constructor: like [`PluginManager::new`] but ALSO scans the
-    /// global, user-owned plugins dir (`~/.umans-harness/plugins`, staged on
+    /// global, user-owned plugins dir (`~/.catalyst-code/plugins`, staged on
     /// first run) before the project dir. Globally-staged plugins (e.g. the
     /// vision-handoff plugin) therefore load in every project without any
     /// per-project setup; a same-named project plugin overrides the global one.
@@ -316,7 +316,7 @@ impl PluginManager {
         workspace: PathBuf,
         trust_project: bool,
     ) -> Self {
-        let user_plugins_dir = crate::config::home_dir().map(|h| h.join(".umans-harness/plugins"));
+        let user_plugins_dir = crate::config::home_dir().map(|h| h.join(".catalyst-code/plugins"));
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir,
@@ -331,7 +331,7 @@ impl PluginManager {
 
     /// Test-only constructor that scans an explicit user (global) plugins dir
     /// in addition to the project dir, so global-scan behavior can be exercised
-    /// deterministically without touching the real `~/.umans-harness/plugins`.
+    /// deterministically without touching the real `~/.catalyst-code/plugins`.
     #[cfg(test)]
     fn new_with_user_plugins_dir(
         plugins_dir: PathBuf,
@@ -360,15 +360,15 @@ impl PluginManager {
     /// Re-scan the plugin directories and load/reload all valid plugins.
     ///
     /// Two directories are scanned:
-    /// 1. the **global, user-owned** plugins dir `~/.umans-harness/plugins`
+    /// 1. the **global, user-owned** plugins dir `~/.catalyst-code/plugins`
     ///    (staged on first run; shared across every project; loads always —
     ///    these are plugins *you* installed, outside the workspace), then
     /// 2. the **project** plugins dir (`plugins_dir`, default
-    ///    `.umans-harness/plugins` inside the workspace; gated by
+    ///    `.catalyst-code/plugins` inside the workspace; gated by
     ///    `trust_project`).
     ///
     /// On a name collision the project plugin wins, so a project's own
-    /// `.umans-harness/plugins/<name>` overrides the global one for that
+    /// `.catalyst-code/plugins/<name>` overrides the global one for that
     /// project only — matching the agent/skill override model.
     ///
     /// Invalid plugins are skipped with a log message to stderr but never
@@ -382,7 +382,7 @@ impl PluginManager {
         plugins.clear();
         let mut skipped_local: Vec<String> = Vec::new();
 
-        // 1) Global, user-owned plugins (~/.umans-harness/plugins) when this
+        // 1) Global, user-owned plugins (~/.catalyst-code/plugins) when this
         //    manager was constructed to scan them (production). Outside the
         //    workspace, so `is_project` is false and they load unconditionally.
         //    Skipped entirely for the isolated `new()` constructor (tests).
@@ -429,7 +429,7 @@ impl PluginManager {
                 continue;
             }
             // Project-scoped gating: a plugin dir inside the workspace (e.g.
-            // `.umans-harness/plugins/*` shipped by the repo) is treated as
+            // `.catalyst-code/plugins/*` shipped by the repo) is treated as
             // untrusted unless the user opted in via `trust_project`. This stops
             // a repo from auto-running hook scripts (which see every tool's
             // args, including bash commands + file contents) with your
@@ -450,7 +450,7 @@ impl PluginManager {
                             .unwrap_or_default()
                     });
                 eprintln!(
-                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / UMANS_HARNESS_TRUST_PROJECT_PLUGINS=1 to enable"
+                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / CATALYST_CODE_TRUST_PROJECT_PLUGINS=1 to enable"
                 );
                 skipped.push(name);
                 continue;
@@ -932,7 +932,7 @@ fn python_interpreter() -> String {
 /// extension so plugins work cross-platform. On Unix a shebang handles `*.sh`;
 /// on Windows `.bat`/`.cmd`/`.exe` launch directly, `.ps1` uses powershell,
 /// `.py` uses python, and `.sh`/`.bash` use `bash` (Git Bash/WSL) when present.
-/// `UMANS_HARNESS_SHELL` overrides the interpreter for `.sh`/`.bash`.
+/// `CATALYST_CODE_SHELL` overrides the interpreter for `.sh`/`.bash`.
 fn hook_command(script: &Path) -> Command {
     let ext = script
         .extension()
@@ -963,7 +963,7 @@ fn hook_command(script: &Path) -> Command {
         "sh" | "bash" => {
             // Prefer an explicit override, then bash (Git Bash/WSL on Windows).
             // On bare Windows without bash the spawn fails → graceful pre-hook deny.
-            if let Ok(shell) = std::env::var("UMANS_HARNESS_SHELL") {
+            if let Ok(shell) = std::env::var("CATALYST_CODE_SHELL") {
                 let mut c = Command::new(shell);
                 c.arg(script);
                 c
@@ -1031,7 +1031,7 @@ mod tests {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::SeqCst);
             let path =
-                std::env::temp_dir().join(format!("umans_harness_plugin_test_{}_{}", prefix, n));
+                std::env::temp_dir().join(format!("catalyst_code_plugin_test_{}_{}", prefix, n));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             TmpDir { path }
@@ -1218,8 +1218,8 @@ mod tests {
         // A plugin shipped inside the workspace (project-scoped) must be skipped
         // when trust_project is false — a repo must not auto-run its own hooks.
         let tmp = TmpDir::new("proj_skip");
-        // workspace == the tmp dir; plugin under <tmp>/.umans-harness/plugins/x
-        let plugins_dir = tmp.path.join(".umans-harness/plugins");
+        // workspace == the tmp dir; plugin under <tmp>/.catalyst-code/plugins/x
+        let plugins_dir = tmp.path.join(".catalyst-code/plugins");
         let plugin_dir = plugins_dir.join("shady");
         fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
         write_hook_script(&plugin_dir.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
@@ -1250,7 +1250,7 @@ mod tests {
         // project plugin overrides it.
         let ws = TmpDir::new("glob_ws");
         let global = TmpDir::new("glob_user_plugins");
-        let proj_plugins = ws.path.join(".umans-harness/plugins");
+        let proj_plugins = ws.path.join(".catalyst-code/plugins");
 
         // Global plugin "vision-fake" (outside the workspace).
         let gdir = global.path.join("vision-fake");

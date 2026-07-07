@@ -580,8 +580,8 @@ func (s *session) renderWelcome() string {
 	w := s.viewport.Width
 	h := s.viewport.Height
 
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Umans") + dimStyle.Render(" harness")
-	sub := mutedStyle.Render("an OpenAI-compatible coding agent")
+	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
+	sub := mutedStyle.Render("a multi-provider coding agent")
 
 	// build the example panel
 	panelW := 50

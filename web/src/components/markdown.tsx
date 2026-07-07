@@ -69,7 +69,7 @@ const components: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] =
 
 export const Markdown = memo(function Markdown({ children }: { children: string }) {
   return (
-    <div className="prose-umans">
+    <div className="prose-catalyst">
       <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={components}>
         {children}
       </ReactMarkdown>

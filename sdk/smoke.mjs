@@ -1,11 +1,11 @@
-// Runtime smoke test against the REAL umans-core binary.
+// Runtime smoke test against the REAL catcode-core binary.
 // Validates CoreProcess spawn + JSONL I/O + `ready` handshake + dispose.
 import { CoreProcess } from "./dist/index.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-process.env.UMANS_CORE = process.env.UMANS_CORE || join(process.cwd(), "core", "target", "release", "core");
+process.env.CATCODE_CORE = process.env.CATCODE_CORE || join(process.cwd(), "core", "target", "release", "core");
 const cwd = mkdtempSync(join(tmpdir(), "umans-sdk-smoke-"));
 
 const proc = new CoreProcess({ cwd, approval: "never", idleTimeout: 60 });

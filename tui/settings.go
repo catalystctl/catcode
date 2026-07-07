@@ -12,7 +12,7 @@ import (
 // ---------------------------------------------------------------------------
 // Settings persistence (TUI-owned prefs)
 //
-// Stored as JSON at ~/.config/umans-harness/settings.json with 0600 perms.
+// Stored as JSON at ~/.config/catalyst-code/settings.json with 0600 perms.
 // Atomic write via temp-file + rename so a crash never corrupts the file.
 // The API key is stored locally (same trust model as ~/.pi/agent/auth.json);
 // the file is mode 0600 and the key is masked in the UI.
@@ -50,12 +50,12 @@ type settingsStore struct {
 
 func configDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "umans-harness")
+	return filepath.Join(home, ".config", "catalyst-code")
 }
 
 // sessionPath returns the JSONL conversation file the core resumes from.
 // Sessions are scoped per workspace: each project gets its own directory
-// (~/.config/umans-harness/sessions/<hex(cwd)>) holding an unlimited number of
+// (~/.config/catalyst-code/sessions/<hex(cwd)>) holding an unlimited number of
 // session files. On launch we resume the most recently modified one (crash
 // recovery / continuity); if none exists we start a fresh timestamped file.
 // A legacy flat-layout file (sessions/<hex>.jsonl) is migrated into the dir

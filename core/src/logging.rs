@@ -28,7 +28,7 @@ impl Logger {
     pub fn new(path: Option<&std::path::Path>) -> Self {
         let file = path.and_then(|p| {
             // Rotate once if the debug log has grown past a generous cap, so a
-            // long-running session with UMANS_HARNESS_DEBUG_LOG set can't fill
+            // long-running session with CATALYST_CODE_DEBUG_LOG set can't fill
             // the disk. Single rotation: the current file is renamed to <path>.1
             // (overwriting any prior .1), then a fresh file is opened below.
             // Best-effort — rename errors are ignored (we just keep appending to

@@ -276,7 +276,7 @@ func (s *session) visionItems() []listItem {
 }
 
 // saveVisionConfig persists the current vision config (curated set + preferred
-// target) to the core, which writes .umans-harness/vision.json and echoes a
+// target) to the core, which writes .catalyst-code/vision.json and echoes a
 // vision_config event that re-syncs the TUI state. Empty vision_model => the
 // core treats it as None (pick dynamically).
 func (s *session) saveVisionConfig() {
@@ -1394,8 +1394,8 @@ func (s *session) helpText() string {
 		"  /attach <path>   send an image (vision) with the current input",
 		"  /vision          configure vision models & handoff target",
 		"",
-		"Settings persist to ~/.config/umans-harness/settings.json",
-		"Config (core) persists to ~/.config/umans-harness/config.json",
+		"Settings persist to ~/.config/catalyst-code/settings.json",
+		"Config (core) persists to ~/.config/catalyst-code/config.json",
 		"",
 		"Custom providers (OpenAI- & Anthropic-compatible endpoints)",
 		"  Define named providers in the core config file's `providers` array:",

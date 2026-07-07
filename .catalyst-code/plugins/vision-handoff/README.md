@@ -50,6 +50,6 @@ Attach an image and the handoff triggers automatically:
 
 ## Loading
 
-The core scans `.umans-harness/plugins` at startup, so **restart the TUI**
+The core scans `.catalyst-code/plugins` at startup, so **restart the TUI**
 after adding this plugin. Verify with `/plugin-config` (it should list
 `vision-handoff`), then press enter on a plugin to toggle it on or off.

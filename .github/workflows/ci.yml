@@ -67,4 +67,4 @@ jobs:
           context: .
           push: false
           load: true
-          tags: umans-harness:ci
+          tags: catalyst-code:ci

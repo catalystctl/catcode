@@ -1,5 +1,5 @@
 // persistent memory system. Stores named memories as markdown files with
-// YAML-like frontmatter under ~/.config/umans-harness/memory/<project-hash>/.
+// YAML-like frontmatter under ~/.config/catalyst-code/memory/<project-hash>/.
 // Memories are scoped per workspace (hashed canonical path) and injected into
 // the standing system prompt so learnings persist across sessions.
 // ponytail: no DB, no extra crate — just markdown files on disk.
@@ -97,7 +97,7 @@ struct Store {
 impl Store {
     fn default_root() -> PathBuf {
         let home = crate::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/umans-harness/memory")
+        home.join(".config/catalyst-code/memory")
     }
 
     fn new(root: PathBuf) -> Self {
@@ -669,13 +669,13 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("umans_harness_memory_test_{n}"));
+        let d = std::env::temp_dir().join(format!("catalyst_code_memory_test_{n}"));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
 
     fn fake_workspace(name: &str) -> PathBuf {
-        let ws = std::env::temp_dir().join(format!("umans_harness_memory_ws_{name}"));
+        let ws = std::env::temp_dir().join(format!("catalyst_code_memory_ws_{name}"));
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join(".gitkeep"), "").ok();
         ws

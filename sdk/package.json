@@ -1,7 +1,7 @@
 {
-  "name": "@umans-harness/coding-agent",
+  "name": "@catalyst-code/coding-agent",
   "version": "0.2.0",
-  "description": "pi-coding-agent-compatible TypeScript SDK that wraps the umans-harness core binary. A drop-in adapter — no agent-loop reimplementation.",
+  "description": "pi-coding-agent-compatible TypeScript SDK that wraps the catalyst-code core binary. A drop-in adapter — no agent-loop reimplementation.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

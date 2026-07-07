@@ -7,7 +7,7 @@ and model responsiveness.
 
 Works **out of the box**: it reads the metrics the core surfaces in the
 `session_stop` hook context, so it does **not** require enabling the JSONL
-debug log (`UMANS_HARNESS_DEBUG_LOG`).
+debug log (`CATALYST_CODE_DEBUG_LOG`).
 
 ## How it works
 
@@ -23,7 +23,7 @@ metrics. This plugin:
 
 ## Output location
 
-`~/.config/umans-harness/telemetry/<workspace-hash>/`
+`~/.config/catalyst-code/telemetry/<workspace-hash>/`
 
 The `<workspace-hash>` is the FNV-1a 64-bit hash of the canonical workspace path
 (16-char hex), matching the core's memory-store hashing so the two trees
@@ -61,4 +61,4 @@ conversation session file incrementally, without touching core.
 
 None. The hook runs whenever the plugin is enabled (it is staged globally by
 default). To disable it, use the plugin management command or delete the
-directory under `~/.umans-harness/plugins/telemetry/`.
+directory under `~/.catalyst-code/plugins/telemetry/`.

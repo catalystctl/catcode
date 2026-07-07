@@ -82,8 +82,8 @@ func (s *session) renderIntercomBanner() string {
 // working directory + a tip on row 2 (right-aligned). The model/auth state
 // moved to the footer so the header stays clean like the reference design.
 func (s *session) renderHeader() string {
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Umans") + dimStyle.Render(" harness")
-	tagline := mutedStyle.Render("an OpenAI-compatible coding agent")
+	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
+	tagline := mutedStyle.Render("a multi-provider coding agent")
 	row1 := fitRow(s.width, brand, tagline)
 
 	cwd := dimStyle.Render(truncatePath(s.cwd, max(20, s.width-40)))

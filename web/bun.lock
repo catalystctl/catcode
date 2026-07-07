@@ -3,12 +3,12 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "umans-harness-web",
+      "name": "catalyst-code-web",
       "dependencies": {
         "@fontsource-variable/dm-sans": "^5.2.8",
         "@fontsource-variable/jetbrains-mono": "^5.2.8",
         "@fontsource-variable/outfit": "^5.2.8",
-        "@umans-harness/coding-agent": "file:../sdk",
+        "@catalyst-code/coding-agent": "file:../sdk",
         "highlight.js": "^11.10.0",
         "next": "^15.1.0",
         "react": "^19.0.0",
@@ -149,7 +149,7 @@
 
     "@types/unist": ["@types/unist@3.0.3", "", {}, "sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q=="],
 
-    "@umans-harness/coding-agent": ["@umans-harness/coding-agent@file:../sdk", { "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.7.0" } }],
+    "@catalyst-code/coding-agent": ["@catalyst-code/coding-agent@file:../sdk", { "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.7.0" } }],
 
     "@ungap/structured-clone": ["@ungap/structured-clone@1.3.2", "", {}, "sha512-5jsZFwgR5rTdKwidH9Qmat75RKwqfpKlWWB1frDkljN127mwqBu8K0PYo7/hFpF03IEJpfVPpCQDY/eDx3iHvA=="],
 

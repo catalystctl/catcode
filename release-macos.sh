@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Build self-contained macOS artifacts for the Umans AI harness, per arch
+# Build self-contained macOS artifacts for the Catalyst Code, per arch
 # (arm64 + x86_64):
 #
 #   1. A standalone executable — the TUI with the Rust core embedded via go:embed
 #      (-tags embed_core). One file per arch; run it from any CWD and it extracts
-#      its bundled core to ~/Library/Caches/umans-harness on first run — no
-#      separate umans-core, no install.
+#      its bundled core to ~/Library/Caches/catalyst-code on first run — no
+#      separate catcode-core, no install.
 #
-#   2. A ucli .dmg installer wrapping that standalone executable. The .dmg
-#      contains `ucli` (the standalone) + a double-clickable "Install
-#      ucli.command" that copies it onto your PATH, + a README. Mounts on macOS
+#   2. A catcode .dmg installer wrapping that standalone executable. The .dmg
+#      contains `catcode` (the standalone) + a double-clickable "Install
+#      catcode.command" that copies it onto your PATH, + a README. Mounts on macOS
 #      and installs with one click.
 #
 # Run on Linux. Needs: cargo + the aarch64-apple-darwin / x86_64-apple-darwin
@@ -24,7 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
-EMBED_FILE="tui/embed/umans-core"
+EMBED_FILE="tui/embed/catcode-core"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
 require cargo         "install rustup/rust"
@@ -43,20 +43,20 @@ mkdir -p dist tui/embed
 # Always remove a stale injected core on exit so it never leaks into the tree.
 trap 'rm -f "$EMBED_FILE"' EXIT
 
-echo "==> building umans-harness ${VERSION} for macOS (standalone + .dmg, core embedded)"
+echo "==> building catalyst-code ${VERSION} for macOS (standalone + .dmg, core embedded)"
 
-# make_dmg <standalone_path> <tag>  -> dist/ucli-<ver>-macos-<tag>.dmg
+# make_dmg <standalone_path> <tag>  -> dist/catcode-<ver>-macos-<tag>.dmg
 make_dmg() {
 	local standalone="$1" tag="$2"
-	local volname="ucli-${VERSION}-macos-${tag}"
-	local out="dist/ucli-${VERSION}-macos-${tag}.dmg"
+	local volname="catcode-${VERSION}-macos-${tag}"
+	local out="dist/catcode-${VERSION}-macos-${tag}.dmg"
 	local stage; stage="$(mktemp -d)"
-	# Layout: ucli (the standalone, renamed) + one-click installer + README.
-	cp "$standalone" "$stage/ucli"
-	cp packaging/macos/install.command "$stage/Install ucli.command"
+	# Layout: catcode (the standalone, renamed) + one-click installer + README.
+	cp "$standalone" "$stage/catcode"
+	cp packaging/macos/install.command "$stage/Install catcode.command"
 	sed "s/<VERSION>/${VERSION}/g; s/<ARCH>/${tag}/g" \
 		packaging/macos/README.txt > "$stage/README.txt"
-	chmod +x "$stage/ucli" "$stage/Install ucli.command"
+	chmod +x "$stage/catcode" "$stage/Install catcode.command"
 	if command -v hdiutil >/dev/null 2>&1; then
 		# Real UDIF compressed DMG (build host is macOS).
 		hdiutil create -srcfolder "$stage" -volname "$volname" \
@@ -89,7 +89,7 @@ build_arch() {
 	cp "$corebin" "$EMBED_FILE"
 
 	echo "[2/3] tui -> darwin/${goarch} (go build -tags embed_core, core embedded)..."
-	local out="dist/umans-harness-${VERSION}-macos-${tag}"
+	local out="dist/catcode-${VERSION}-macos-${tag}"
 	( cd tui && CGO_ENABLED=0 GOOS=darwin GOARCH="$goarch" \
 		go build -trimpath -tags embed_core \
 			-ldflags "-s -w -X main.coreVersion=${VERSION}" \
@@ -98,7 +98,7 @@ build_arch() {
 	rm -f "$EMBED_FILE"
 	echo "    -> ${out}  ($(du -h "${out}" | cut -f1))"
 
-	echo "[3/3] dmg -> dist/ucli-${VERSION}-macos-${tag}.dmg..."
+	echo "[3/3] dmg -> dist/catcode-${VERSION}-macos-${tag}.dmg..."
 	make_dmg "${out}" "${tag}" || echo "    (warning: .dmg for ${tag} skipped — see message above)"
 }
 
@@ -107,8 +107,8 @@ build_arch x86_64-apple-darwin  amd64 x86_64
 
 echo "[done] checksums..."
 ( cd dist
-  for f in umans-harness-${VERSION}-macos-arm64 umans-harness-${VERSION}-macos-x86_64 \
-           ucli-${VERSION}-macos-arm64.dmg    ucli-${VERSION}-macos-x86_64.dmg; do
+  for f in catcode-${VERSION}-macos-arm64 catcode-${VERSION}-macos-x86_64 \
+           catcode-${VERSION}-macos-arm64.dmg    catcode-${VERSION}-macos-x86_64.dmg; do
 	[[ -f "$f" ]] && sha256sum "$f" > "$f.sha256"
   done )
 
@@ -120,14 +120,14 @@ echo "[done] checksums..."
 #   xcrun stapler staple "$f"
 # Without this, Gatekeeper blocks the unsigned artifacts for most users.
 
-echo "==> dist/umans-harness-${VERSION}-macos-arm64   (standalone, Apple Silicon)"
-echo "==> dist/umans-harness-${VERSION}-macos-x86_64  (standalone, Intel)"
-echo "==> dist/ucli-${VERSION}-macos-arm64.dmg         (installer, Apple Silicon)"
-echo "==> dist/ucli-${VERSION}-macos-x86_64.dmg        (installer, Intel)"
+echo "==> dist/catcode-${VERSION}-macos-arm64   (standalone, Apple Silicon)"
+echo "==> dist/catcode-${VERSION}-macos-x86_64  (standalone, Intel)"
+echo "==> dist/catcode-${VERSION}-macos-arm64.dmg         (installer, Apple Silicon)"
+echo "==> dist/catcode-${VERSION}-macos-x86_64.dmg        (installer, Intel)"
 echo
 echo "Download + run the standalone from any directory:"
-echo "  chmod +x umans-harness-${VERSION}-macos-arm64"
-echo "  ./umans-harness-${VERSION}-macos-arm64      # launches in the current directory"
-echo "Or install via the .dmg:  open ucli-${VERSION}-macos-arm64.dmg  -> double-click 'Install ucli.command'"
-echo "Then run from any terminal:  ucli"
+echo "  chmod +x catcode-${VERSION}-macos-arm64"
+echo "  ./catcode-${VERSION}-macos-arm64      # launches in the current directory"
+echo "Or install via the .dmg:  open catcode-${VERSION}-macos-arm64.dmg  -> double-click 'Install catcode.command'"
+echo "Then run from any terminal:  catcode"
 echo "First run: /key sk-...  then /model, then type a prompt."

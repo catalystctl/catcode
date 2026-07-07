@@ -13,11 +13,11 @@ import (
 	"runtime"
 )
 
-// embeddedCore is the umans-core binary compiled into this executable by the
+// embeddedCore is the catcode-core binary compiled into this executable by the
 // macOS standalone build (release-macos.sh, -tags embed_core). It lets the
-// single downloaded file run from any CWD with no separate umans-core.
+// single downloaded file run from any CWD with no separate catcode-core.
 //
-//go:embed embed/umans-core
+//go:embed embed/catcode-core
 var embeddedCore []byte
 
 // embeddedCoreHash caches the SHA-256 of the embedded core (computed once).
@@ -59,11 +59,11 @@ func embeddedCorePath() string {
 		}
 		dir = filepath.Join(home, ".cache")
 	}
-	cacheDir := filepath.Join(dir, "umans-harness")
+	cacheDir := filepath.Join(dir, "catalyst-code")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return ""
 	}
-	name := fmt.Sprintf("umans-core-%s-%s-%s%s", coreVersion, runtime.GOOS, runtime.GOARCH, coreExeSuffix())
+	name := fmt.Sprintf("catcode-core-%s-%s-%s%s", coreVersion, runtime.GOOS, runtime.GOARCH, coreExeSuffix())
 	dst := filepath.Join(cacheDir, name)
 	// On Windows the extracted core needs the .exe suffix (coreExeSuffix) so
 	// CreateProcess exec's it by name and AV tools recognize it; on macOS/Linux

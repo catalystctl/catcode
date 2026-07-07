@@ -1,5 +1,5 @@
 // Vision handoff configuration: user-curated vision-capable models + a preferred
-// handoff target, persisted to .umans-harness/vision.json. The core merges the
+// handoff target, persisted to .catalyst-code/vision.json. The core merges the
 // curated set with the endpoint's `capabilities.vision` flag when building the
 // pre_turn hook context, and passes `vision_model` as the preferred target the
 // vision-handoff plugin should route image-bearing turns to.
@@ -18,11 +18,11 @@ pub struct VisionConfig {
 const FILENAME: &str = "vision.json";
 
 fn path(workspace: &Path) -> std::path::PathBuf {
-    workspace.join(".umans-harness").join(FILENAME)
+    workspace.join(".catalyst-code").join(FILENAME)
 }
 
 impl VisionConfig {
-    /// Load from <workspace>/.umans-harness/vision.json; default if absent/unreadable.
+    /// Load from <workspace>/.catalyst-code/vision.json; default if absent/unreadable.
     pub fn load(workspace: &Path) -> Self {
         let p = path(workspace);
         let Ok(content) = std::fs::read_to_string(&p) else {
@@ -52,7 +52,7 @@ impl VisionConfig {
         }
     }
 
-    /// Persist to <workspace>/.umans-harness/vision.json (best-effort).
+    /// Persist to <workspace>/.catalyst-code/vision.json (best-effort).
     pub fn save(&self, workspace: &Path) {
         let p = path(workspace);
         if let Some(parent) = p.parent() {
@@ -110,9 +110,9 @@ mod tests {
     #[test]
     fn empty_vision_model_becomes_none() {
         let dir = tmp("empty_vm");
-        std::fs::create_dir_all(dir.join(".umans-harness")).unwrap();
+        std::fs::create_dir_all(dir.join(".catalyst-code")).unwrap();
         std::fs::write(
-            dir.join(".umans-harness").join("vision.json"),
+            dir.join(".catalyst-code").join("vision.json"),
             r#"{"vision_models":["x"],"vision_model":""}"#,
         )
         .unwrap();
@@ -125,9 +125,9 @@ mod tests {
     #[test]
     fn malformed_file_is_default() {
         let dir = tmp("malformed");
-        std::fs::create_dir_all(dir.join(".umans-harness")).unwrap();
+        std::fs::create_dir_all(dir.join(".catalyst-code")).unwrap();
         std::fs::write(
-            dir.join(".umans-harness").join("vision.json"),
+            dir.join(".catalyst-code").join("vision.json"),
             "not json {{{",
         )
         .unwrap();

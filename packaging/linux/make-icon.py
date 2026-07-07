@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the ucli AppImage/desktop icon as a 256x256 RGBA PNG.
+"""Generate the catcode AppImage/desktop icon as a 256x256 RGBA PNG.
 
 Pure stdlib (zlib + struct) so there is no imagemagick/rsvg dependency. Draws a
 tokyo-night-ish dark rounded panel with a terminal ">" prompt and an underscore
@@ -15,7 +15,7 @@ def lerp(a, b, t):
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "ucli.png"
+    out = sys.argv[1] if len(sys.argv) > 1 else "catcode.png"
     size = int(sys.argv[2]) if len(sys.argv) > 2 else 256
     W = H = size
 

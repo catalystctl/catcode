@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=ucli
-GenericName=Umans AI Harness
+Name=catcode
+GenericName=Catalyst Code
 Comment=Terminal coding-agent harness with native Umans provider
-Exec=ucli
-Icon=ucli
+Exec=catcode
+Icon=catcode
 Terminal=true
 Type=Application
 Categories=Development;ConsoleOnly;Utility;

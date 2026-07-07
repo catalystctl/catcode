@@ -1,6 +1,6 @@
 // AuthStorage — the symbols pi-web imports from `pi-coding-agent`'s auth layer.
 //
-// The umans-harness core resolves API keys from (1) `--provider`/config
+// The catalyst-code core resolves API keys from (1) `--provider`/config
 // provider `api_key_env`/`api_key`, (2) `UMANS_API_KEY` env, (3) a runtime key
 // pushed via the `set_key` command. This class is the bridge: keys set here are
 // forwarded to a spawned core via `set_key` (handled by `AgentSession`).
@@ -127,7 +127,7 @@ export class AuthStorage {
     return [];
   }
   async login(_providerId: string, _callbacks: any): Promise<void> {
-    throw new Error("OAuth login is not supported by the umans-harness SDK");
+    throw new Error("OAuth login is not supported by the catalyst-code SDK");
   }
   logout(_provider: string): void {}
 }

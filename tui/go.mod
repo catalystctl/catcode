@@ -1,4 +1,4 @@
-module umans-harness-tui
+module catalyst-code-tui
 
 go 1.24.2
 

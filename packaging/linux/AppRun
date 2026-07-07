@@ -1,15 +1,15 @@
 #!/usr/bin/env sh
-# AppRun — entry point for the ucli AppImage.
+# AppRun — entry point for the catcode AppImage.
 #
 # The AppImage runtime mounts this squashfs read-only and execs AppRun. We hand
 # off to the bundled TUI, which embeds the Rust core (release-linux.sh builds it
 # with -tags embed_core) so the whole harness is one self-contained file.
 #
-# Run ./ucli-<ver>-x86_64.AppImage from a terminal to launch the TUI in that
+# Run ./catcode-<ver>-x86_64.AppImage from a terminal to launch the TUI in that
 # terminal, in the current directory (the workspace is your CWD). First run:
 # /key sk-... then /model, then type a prompt.
 set -e
 # APPDIR is set by the AppImage runtime to the mount point; fall back to this
 # script's dir for extracted/unpacked runs.
 here="${APPDIR:-$(cd "$(dirname -- "$0")" && pwd)}"
-exec "$here/ucli" "$@"
+exec "$here/catcode" "$@"

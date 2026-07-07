@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Build self-contained Linux artifacts for the Umans AI harness:
+# Build self-contained Linux artifacts for the Catalyst Code:
 #
 #   1. A standalone executable (TUI with the Rust core embedded via go:embed,
 #      -tags embed_core) — one file, run from any CWD; it extracts its bundled
-#      core to ~/.cache/umans-harness on first run. No install.
-#   2. A ucli AppImage wrapping that standalone executable — double-clickable
-#      on desktop Linux and runnable as ./ucli-<ver>-x86_64.AppImage from any
+#      core to ~/.cache/catalyst-code on first run. No install.
+#   2. A catcode AppImage wrapping that standalone executable — double-clickable
+#      on desktop Linux and runnable as ./catcode-<ver>-x86_64.AppImage from any
 #      terminal; self-contained (squashfs payload, no deps).
 #
 # Output (dist/):
-#   umans-harness-<ver>-linux-<arch>          standalone executable
-#   umans-harness-<ver>-linux-<arch>.sha256
-#   ucli-<ver>-<arch>.AppImage               AppImage installer
-#   ucli-<ver>-<arch>.AppImage.sha256
+#   catcode-<ver>-linux-<arch>          standalone executable
+#   catcode-<ver>-linux-<arch>.sha256
+#   catcode-<ver>-<arch>.AppImage               AppImage installer
+#   catcode-<ver>-<arch>.AppImage.sha256
 #
 # Run on Linux. Needs: cargo (stable), Go 1.21+. appimagetool is fetched on
 # demand to ~/.cache/appimagetool/ if not on PATH (needs network once).
@@ -21,7 +21,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
-EMBED_FILE="tui/embed/umans-core"
+EMBED_FILE="tui/embed/catcode-core"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
 require cargo "install rustup/rust"
@@ -40,7 +40,7 @@ mkdir -p dist tui/embed
 # Never leak an injected core into the tree on exit.
 trap 'rm -f "$EMBED_FILE"' EXIT
 
-echo "==> building umans-harness ${VERSION} for Linux (${HOST_ARCH})"
+echo "==> building catalyst-code ${VERSION} for Linux (${HOST_ARCH})"
 
 echo "[1/6] core -> native release (cargo, --locked)..."
 cargo build --release --locked --manifest-path core/Cargo.toml
@@ -49,7 +49,7 @@ CORE_BIN="core/target/release/core"
 
 echo "[2/6] tui -> standalone (go build -tags embed_core, core embedded)..."
 cp "$CORE_BIN" "$EMBED_FILE"
-STANDALONE="dist/umans-harness-${VERSION}-linux-${STANDALONE_ARCH}"
+STANDALONE="dist/catcode-${VERSION}-linux-${STANDALONE_ARCH}"
 ( cd tui && CGO_ENABLED=0 go build -trimpath -tags embed_core \
 		-ldflags "-s -w -X main.coreVersion=${VERSION}" -o "../${STANDALONE}" . )
 chmod +x "${STANDALONE}"
@@ -57,24 +57,24 @@ rm -f "$EMBED_FILE"
 echo "    -> ${STANDALONE}  ($(du -h "${STANDALONE}" | cut -f1))"
 
 echo "[3/6] generating AppImage icon..."
-ICON="dist/.appimg-${VERSION}/ucli.png"
+ICON="dist/.appimg-${VERSION}/catcode.png"
 mkdir -p "$(dirname "$ICON")"
 python3 packaging/linux/make-icon.py "$ICON" 256
 
 echo "[4/6] assembling AppDir..."
-APPDIR="dist/.appimg-${VERSION}/ucli.AppDir"
+APPDIR="dist/.appimg-${VERSION}/catcode.AppDir"
 rm -rf "$APPDIR"; mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
                          "$APPDIR/usr/share/applications"
-cp "$STANDALONE" "$APPDIR/ucli"; chmod +x "$APPDIR/ucli"
+cp "$STANDALONE" "$APPDIR/catcode"; chmod +x "$APPDIR/catcode"
 cp packaging/linux/AppRun "$APPDIR/AppRun"; chmod +x "$APPDIR/AppRun"
-cp packaging/linux/ucli.desktop "$APPDIR/ucli.desktop"
+cp packaging/linux/catcode.desktop "$APPDIR/catcode.desktop"
 cp "$ICON" "$APPDIR/.DirIcon"
-cp "$ICON" "$APPDIR/ucli.png"
-cp "$ICON" "$APPDIR/usr/share/icons/hicolor/256x256/apps/ucli.png"
-cp packaging/linux/ucli.desktop "$APPDIR/usr/share/applications/ucli.desktop"
+cp "$ICON" "$APPDIR/catcode.png"
+cp "$ICON" "$APPDIR/usr/share/icons/hicolor/256x256/apps/catcode.png"
+cp packaging/linux/catcode.desktop "$APPDIR/usr/share/applications/catcode.desktop"
 
 echo "[5/6] building AppImage (appimagetool)..."
-APPIMG="dist/ucli-${VERSION}-${APPIMG_ARCH}.AppImage"
+APPIMG="dist/catcode-${VERSION}-${APPIMG_ARCH}.AppImage"
 resolve_appimagetool() {
 	# 1) explicit override
 	if [[ -n "${APPIMAGETOOL:-}" && -x "$APPIMAGETOOL" ]]; then echo "$APPIMAGETOOL"; return; fi

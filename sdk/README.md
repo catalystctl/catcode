@@ -1,7 +1,7 @@
-# @umans-harness/coding-agent
+# @catalyst-code/coding-agent
 
 A **pi-coding-agent-compatible** TypeScript SDK for the
-[umans-harness](..) core. It is a thin adapter — it spawns the Rust `core`
+[catalyst-code](..) core. It is a thin adapter — it spawns the Rust `core`
 binary, speaks its JSONL stdio protocol, and exposes the
 [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
 API surface (plus the `@earendil-works/pi-ai` subset that pi-web uses) so a
@@ -34,7 +34,7 @@ import { … } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 
 // after — one package
-import { …, getSupportedThinkingLevels, type Model } from "@umans-harness/coding-agent";
+import { …, getSupportedThinkingLevels, type Model } from "@catalyst-code/coding-agent";
 ```
 
 No other pi-web changes are required: `AuthStorage`, `ModelRegistry`,
@@ -53,7 +53,7 @@ No other pi-web changes are required: `AuthStorage`, `ModelRegistry`,
 import {
   AuthStorage, ModelRegistry, SessionManager, Theme, initTheme, getAgentDir,
   createAgentSessionServices, createAgentSessionFromServices, createAgentSessionRuntime,
-} from "@umans-harness/coding-agent";
+} from "@catalyst-code/coding-agent";
 
 const cwd = process.cwd();
 const authStorage = AuthStorage.create();
@@ -83,11 +83,11 @@ await runtime.dispose();
 
 ### Core binary resolution
 
-`AgentSession` spawns `umans-core` (the Rust binary). It is resolved, in order:
+`AgentSession` spawns `catcode-core` (the Rust binary). It is resolved, in order:
 
-1. `UMANS_CORE` env var (absolute path — use this in production).
-2. Dev build at `core/target/release/umans-core` / `…/core` (repo-relative).
-3. `umans-core` on `PATH` (installed layout).
+1. `CATCODE_CORE` env var (absolute path — use this in production).
+2. Dev build at `core/target/release/catcode-core` / `…/core` (repo-relative).
+3. `catcode-core` on `PATH` (installed layout).
 
 API keys are read by the core from `UMANS_API_KEY` / provider config by default;
 push a runtime key via `authStorage.setRuntimeApiKey(provider, key)` (forwarded
@@ -133,7 +133,7 @@ src/
   settings-manager.ts       # SettingsManager (skill/extension/prompt paths)
   resource-loader.ts        # DefaultResourceLoader, loadSkills, Skill
   extension-runner.ts       # ExtensionRunner (mutable emit), ExtensionUIContext
-  core-process.ts           # CoreProcess — spawns umans-core, JSONL I/O
+  core-process.ts           # CoreProcess — spawns catcode-core, JSONL I/O
   agent-session.ts          # AgentSession — harness→PI event translation
   agent-session-services.ts # createAgentSessionServices / FromServices
   agent-session-runtime.ts  # AgentSessionRuntime, createAgentSessionRuntime

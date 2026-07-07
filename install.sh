@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# Umans AI Harness — Installer  v1.0.0
+# Catalyst Code — Installer  v1.0.0
 # Platform: Linux (systemd)
 #
-# Installs the umans-harness TUI (`ucli`) + core (`umans-core`) to your PATH,
+# Installs the catalyst-code TUI (`catcode`) + core (`catcode-core`) to your PATH,
 # and can optionally install the Next.js web frontend as a systemd service
 # that stays online 24/7 (default port 49283).
 #
@@ -23,7 +23,7 @@
 #   --prefix <path>       binary install dir   (default: /usr/local/bin)
 #   --port <n>            web service port      (default: 49283)
 #   --host <h>            web bind host         (default: 0.0.0.0)
-#   --log-file <path>     write a log here      (default: ~/umans-harness-install.log)
+#   --log-file <path>     write a log here      (default: ~/catalyst-code-install.log)
 #   --no-log             disable logging
 #   --no-color           disable ANSI colors
 #   --dry-run            print the plan, execute nothing
@@ -32,13 +32,13 @@
 set -euo pipefail
 
 # ── constants ────────────────────────────────────────────────
-APP_NAME="Umans AI Harness"
+APP_NAME="Catalyst Code"
 VERSION="1.0.0"
 DEFAULT_PREFIX="/usr/local/bin"
 DEFAULT_PORT="49283"
 DEFAULT_HOST="0.0.0.0"
-STATE_FILE="/etc/umans-harness/installer.state"
-UNIT_NAME="umans-harness-web.service"
+STATE_FILE="/etc/catalyst-code/installer.state"
+UNIT_NAME="catalyst-code-web.service"
 GO_MIN="1.24.2"
 
 # ── option defaults ──────────────────────────────────────────
@@ -49,7 +49,7 @@ REPO_OVERRIDE=""
 PREFIX="$DEFAULT_PREFIX"
 PORT="$DEFAULT_PORT"
 HOST="$DEFAULT_HOST"
-LOG_FILE="${HOME}/umans-harness-install.log"
+LOG_FILE="${HOME}/catalyst-code-install.log"
 NO_COLOR_FLAG=false
 LOG_ENABLED=false
 
@@ -186,8 +186,8 @@ ver_ge() {
 
 # ── banner ───────────────────────────────────────────────────
 print_banner() {
-  print_box "Umans AI Harness  —  installer v${VERSION_DETECTED}" \
-    "TUI (ucli) + core (umans-core) -> PATH" \
+  print_box "Catalyst Code  —  installer v${VERSION_DETECTED}" \
+    "TUI (catcode) + core (catcode-core) -> PATH" \
     "optional 24/7 web service (Next.js)" \
     "scope: system-wide   |   platform: linux (systemd)"
   printf "  ${C_DIM}mode: %s   |   dry-run: %s${C_RST}\n\n" "$ACTION" "$DRY_RUN"
@@ -251,7 +251,7 @@ setup_log() {
     LOG_FILE=""; LOG_ENABLED=false; return
   fi
   LOG_ENABLED=true
-  _log "===== umans-harness install.sh — $(date -u +%FT%TZ) ====="
+  _log "===== catalyst-code install.sh — $(date -u +%FT%TZ) ====="
   _log "action=$ACTION dry_run=$DRY_RUN with_web=$WITH_WEB prefix=$PREFIX port=$PORT host=$HOST"
 }
 
@@ -320,7 +320,7 @@ find_repo_root() {
 
 resolve_repo() {
   if [[ -n "$REPO_OVERRIDE" ]]; then
-    REPO_DIR="${UMANS_INSTALL_DIR:-$HOME/umans-harness}"
+    REPO_DIR="${CATALYST_CODE_INSTALL_DIR:-$HOME/catalyst-code}"
     if $DRY_RUN; then
       run_step "Clone $REPO_OVERRIDE -> $REPO_DIR" git clone "$REPO_OVERRIDE" "$REPO_DIR"
       cd "$REPO_DIR" 2>/dev/null || true
@@ -338,7 +338,7 @@ resolve_repo() {
   REPO_DIR="$(cd "$REPO_DIR" && pwd)"
   ORIGIN_URL="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
   if [[ ! -f "$REPO_DIR/core/Cargo.toml" ]]; then
-    $DRY_RUN || die "repo at $REPO_DIR has no core/Cargo.toml — not the umans-harness repo?"
+    $DRY_RUN || die "repo at $REPO_DIR has no core/Cargo.toml — not the catalyst-code repo?"
   fi
 }
 
@@ -355,7 +355,7 @@ build_core() {
 }
 
 build_tui() {
-  run_step "Building Go TUI (ucli)" \
+  run_step "Building Go TUI (catcode)" \
     go -C "$REPO_DIR/tui" build -o "$REPO_DIR/tui/tui" \
     || die "TUI build failed (need go >= ${GO_MIN}?)"
 }
@@ -368,8 +368,8 @@ install_bins() {
     [[ -f "$tui_bin" ]]  || die "TUI binary not found at $tui_bin"
   fi
   run_root "Creating $PREFIX" mkdir -p "$PREFIX"
-  run_root "Installing umans-core -> $PREFIX/umans-core" install -m 0755 "$core_bin" "$PREFIX/umans-core"
-  run_root "Installing ucli       -> $PREFIX/ucli"       install -m 0755 "$tui_bin"  "$PREFIX/ucli"
+  run_root "Installing catcode-core -> $PREFIX/catcode-core" install -m 0755 "$core_bin" "$PREFIX/catcode-core"
+  run_root "Installing catcode       -> $PREFIX/catcode"       install -m 0755 "$tui_bin"  "$PREFIX/catcode"
 }
 
 build_web() {
@@ -393,7 +393,7 @@ install_web_service() {
   local exec_start="$RT_BIN run start -- --hostname $HOST"
   cat >"$tmp" <<EOF
 [Unit]
-Description=Umans AI Harness Web Frontend (port $PORT)
+Description=Catalyst Code Web Frontend (port $PORT)
 After=network-online.target
 Wants=network-online.target
 
@@ -403,7 +403,7 @@ User=$INSTALL_USER
 WorkingDirectory=$REPO_DIR/web
 Environment=NODE_ENV=production
 Environment=PORT=$PORT
-Environment=UMANS_CORE=$PREFIX/umans-core
+Environment=CATCODE_CORE=$PREFIX/catcode-core
 ExecStart=$exec_start
 Restart=on-failure
 RestartSec=3
@@ -436,7 +436,7 @@ save_state() {
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
   local web_flag="no"; $WITH_WEB && web_flag="yes"
   cat >"$tmp" <<EOF
-# Umans AI Harness installer state — written by install.sh
+# Catalyst Code installer state — written by install.sh
 # (shell-sourcable; safe to read with 'source')
 REPO_DIR="$REPO_DIR"
 ORIGIN_URL="${ORIGIN_URL:-}"
@@ -479,10 +479,10 @@ do_install() {
   log_info "Prefix:   $PREFIX"
   $WITH_WEB && log_info "Web:      $UNIT_NAME on :$PORT ($HOST)"
 
-  phase "Building Rust core (umans-core)"
+  phase "Building Rust core (catcode-core)"
   build_core
 
-  phase "Building Go TUI (ucli)"
+  phase "Building Go TUI (catcode)"
   build_tui
 
   phase "Installing binaries"
@@ -561,8 +561,8 @@ do_uninstall() {
   root_do "Reload systemd"   systemctl daemon-reload
 
   phase "Removing binaries"
-  root_do "Remove $PREFIX/umans-core" rm -f "$PREFIX/umans-core"
-  root_do "Remove $PREFIX/ucli"       rm -f "$PREFIX/ucli"
+  root_do "Remove $PREFIX/catcode-core" rm -f "$PREFIX/catcode-core"
+  root_do "Remove $PREFIX/catcode"       rm -f "$PREFIX/catcode"
 
   phase "Cleaning up"
   root_do "Remove state file" rm -f "$STATE_FILE"
@@ -579,16 +579,16 @@ summary_install() {
     svc_line="service:   $UNIT_NAME  (enabled, auto-restart)"
   fi
   print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" \
-    "tui:       $PREFIX/ucli" \
-    "core:      $PREFIX/umans-core" \
+    "tui:       $PREFIX/catcode" \
+    "core:      $PREFIX/catcode-core" \
     "web:       $web_line" \
     "$svc_line" \
     "update:    bash install.sh --update" \
     "uninstall: bash install.sh --uninstall" \
     "log:       ${LOG_FILE:-<disabled>}"
-  log_info "Run the TUI with:  ucli"
+  log_info "Run the TUI with:  catcode"
   $WITH_WEB && log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
-  $WITH_WEB && log_warn "Auth: ensure a key/login exists (~/.config/umans-harness/settings.json) or set UMANS_API_KEY."
+  $WITH_WEB && log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
   $WITH_WEB && [[ "$HOST" != "127.0.0.1" ]] && log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
 }
 
@@ -596,17 +596,17 @@ summary_update() {
   local web_line="(web service not installed)"
   [[ "${WEB_INSTALLED:-no}" == yes ]] && web_line="http://${HOST}:${PORT}  (restarted)"
   print_box "✓  Updated  ${APP_NAME}  v${VERSION_DETECTED}" \
-    "tui:    $PREFIX/ucli" \
-    "core:   $PREFIX/umans-core" \
+    "tui:    $PREFIX/catcode" \
+    "core:   $PREFIX/catcode-core" \
     "web:    $web_line" \
     "source: git pull @ $REPO_DIR"
-  log_info "Run the TUI with:  ucli"
+  log_info "Run the TUI with:  catcode"
 }
 
 summary_uninstall() {
   print_box "✓  Uninstalled  ${APP_NAME}" \
-    "removed: $PREFIX/ucli" \
-    "removed: $PREFIX/umans-core" \
+    "removed: $PREFIX/catcode" \
+    "removed: $PREFIX/catcode-core" \
     "removed: $UNIT_NAME (stopped + disabled)" \
     "removed: $STATE_FILE"
   log_info "The cloned repo at ${REPO_DIR:-<unknown>} was left untouched."

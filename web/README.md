@@ -1,14 +1,14 @@
-# Umans Harness — Web
+# Catalyst Code — Web
 
-A browser frontend for the [umans-harness](..) coding agent, built with Next.js.
+A browser frontend for the [catalyst-code](..) coding agent, built with Next.js.
 It is the web equivalent of the Go Bubble Tea TUI: instead of spawning the core
-in a terminal, the Next server spawns it once (via the `@umans-harness/coding-agent`
+in a terminal, the Next server spawns it once (via the `@catalyst-code/coding-agent`
 SDK's low-level `CoreProcess`) and streams its events to the browser over
 Server-Sent Events. The browser renders a full agentic UI — streaming markdown,
 reasoning, tool calls, approvals, metrics, sessions — and sends commands back.
 
 ```
-Browser ──SSE──▶ /api/stream ──▶ HarnessBridge ──stdio JSONL──▶ umans-core ──▶ Umans API
+Browser ──SSE──▶ /api/stream ──▶ HarnessBridge ──stdio JSONL──▶ catcode-core ──▶ Umans API
 Browser ──POST─▶ /api/command ─▶ HarnessBridge ─▶ (stdin)
 ```
 
@@ -32,25 +32,25 @@ It also works under Node — just replace `bun` with `node`/`npm run`.
 
 ## The core binary
 
-The server spawns `umans-core` (the Rust binary). It is resolved, in order:
+The server spawns `catcode-core` (the Rust binary). It is resolved, in order:
 
-1. `UMANS_CORE` env var (absolute path — use this in production).
+1. `CATCODE_CORE` env var (absolute path — use this in production).
 2. A dev build found by walking up from the server cwd: `<…>/core/target/release/core`.
-3. `core` / `umans-core` on `PATH`.
+3. `core` / `catcode-core` on `PATH`.
 
 The harness repo ships a built core at `../core/target/release/core`, so it is
 found automatically when running from `web/`. To point at a different build, set
-`UMANS_CORE=/path/to/core`.
+`CATCODE_CORE=/path/to/core`.
 
 ## API key & workspace
 
-- **API key**: read from the TUI's `~/.config/umans-harness/settings.json` (`api_key`)
+- **API key**: read from the TUI's `~/.config/catalyst-code/settings.json` (`api_key`)
   on startup and forwarded to the core via `UMANS_API_KEY`, so the web app
   authenticates with the same key the TUI uses — no re-entry. If none is found, a
   key-entry overlay is shown; submit it there (sends the `set_key` command).
   You can also set `UMANS_API_KEY` in the environment.
 - **Workspace**: defaults to the repo root (the directory containing the located
-  `core/` binary). Override with `UMANS_HARNESS_WORKSPACE=/path/to/project`. The
+  `core/` binary). Override with `CATALYST_CODE_WORKSPACE=/path/to/project`. The
   workspace constrains all file/bash operations the agent performs.
 
 ## Architecture

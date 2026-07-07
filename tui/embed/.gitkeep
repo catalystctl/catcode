@@ -1,4 +1,4 @@
-# This directory holds the umans-core binary injected at build time by the macOS
+# This directory holds the catcode-core binary injected at build time by the macOS
 # standalone build (release-macos.sh -tags embed_core). It is normally empty; the
-# build writes tui/embed/umans-core just before compiling the TUI and removes it
+# build writes tui/embed/catcode-core just before compiling the TUI and removes it
 # afterwards. go:embed only needs the file when the embed_core tag is set.

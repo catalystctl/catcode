@@ -1,4 +1,4 @@
-# Umans AI Harness
+# Catalyst Code
 
 A production-grade, OpenAI-compatible coding-agent harness with **native Umans** provider support.
 - **Core** (`core/`): Rust async engine. Streams from any OpenAI-compatible `/chat/completions`, discovers models live, runs an agentic tool loop with a human-in-the-loop approval gate, and speaks a newline-delimited JSON protocol over stdio.
@@ -29,10 +29,10 @@ A production-grade, OpenAI-compatible coding-agent harness with **native Umans**
 **Observability & persistence**
 - **Structured debug log** — JSONL records (`init`, `tool`, `turn_done`, `http_retry`, `turn_error`) to `--debug-log <file>` for post-mortem.
 - **Metrics** — TTFT, elapsed, tokens in/out, TPS emitted per turn (`metrics` event) and shown in the TUI status bar.
-- **Session persistence** — sessions are stored **per workspace** under `~/.config/umans-harness/sessions/<hex(cwd)>/` as append-only JSONL files; one project can hold an unlimited number of them. On restart the most-recently-modified session is replayed (crash-safe: a mid-turn crash loses at most the in-flight turn). `/new` starts a fresh session file (the previous one is kept on disk); `/sessions` opens a searchable picker to switch between this project's sessions. A legacy single-file layout is migrated into the per-project dir automatically.
+- **Session persistence** — sessions are stored **per workspace** under `~/.config/catalyst-code/sessions/<hex(cwd)>/` as append-only JSONL files; one project can hold an unlimited number of them. On restart the most-recently-modified session is replayed (crash-safe: a mid-turn crash loses at most the in-flight turn). `/new` starts a fresh session file (the previous one is kept on disk); `/sessions` opens a searchable picker to switch between this project's sessions. A legacy single-file layout is migrated into the per-project dir automatically.
 
 **Config & packaging**
-- **CLI flags + env vars + JSON config file** — `--workspace`, `--base-url`, `--approval`, `--bash-timeout`, `--debug-log`, `--session`, `--model`, `--config`. Env: `UMANS_BASE_URL`, `UMANS_HARNESS_*`. Config files: `./umans-harness.json` or `~/.config/umans-harness/config.json`.
+- **CLI flags + env vars + JSON config file** — `--workspace`, `--base-url`, `--approval`, `--bash-timeout`, `--debug-log`, `--session`, `--model`, `--config`. Env: `UMANS_BASE_URL`, `CATALYST_CODE_*`. Config files: `./catalyst-code.json` or `~/.config/catalyst-code/config.json`.
 - **`--help` / `--version`** — CLI is self-documenting.
 - **OpenAI-compatible** — change `--base-url` and model IDs to point at any OpenAI-shaped endpoint. Umans is the default; the GLM `reasoning_effort=high` clamp and `reasoning_content` replay are Umans/Zhipu-specific.
 
@@ -44,7 +44,7 @@ A production-grade, OpenAI-compatible coding-agent harness with **native Umans**
 
 A port of [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is built into the core. The orchestrator (parent agent) can delegate to focused child agents via the `subagent` tool; children can prompt the orchestrator for decisions and talk to each other over an in-process intercom bus.
 
-**Built-in agents** (`.umans-harness/agents/*.md`, overridable): `scout`, `researcher`, `planner`, `worker`, `reviewer`, `context-builder`, `oracle`, `delegate`. Each is a markdown file with YAML frontmatter (`tools`, `model`, `thinking`, `systemPromptMode`, `defaultContext`, …). Discover with `subagent({ action: "list" })` or `/subagents`.
+**Built-in agents** (`.catalyst-code/agents/*.md`, overridable): `scout`, `researcher`, `planner`, `worker`, `reviewer`, `context-builder`, `oracle`, `delegate`. Each is a markdown file with YAML frontmatter (`tools`, `model`, `thinking`, `systemPromptMode`, `defaultContext`, …). Discover with `subagent({ action: "list" })` or `/subagents`.
 
 **Execution modes**: single `{ agent, task }`, parallel `{ tasks, concurrency }`, chain `{ chain: [...] }` (with `{previous}`/`{outputs.name}` templating and inline parallel groups), plus management actions `list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`/`resume`/`doctor`/`models`. Recursion is capped by `maxSubagentDepth` (default 2; env `UMANS_SUBAGENT_MAX_DEPTH`).
 
@@ -60,7 +60,7 @@ A port of [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is built 
 { "subagents": { "maxSubagentDepth": 2, "intercomBridge": { "mode": "always" }, "parallel": { "maxTasks": 8, "concurrency": 4 }, "asyncByDefault": false, "disableBuiltins": false, "agentOverrides": { "reviewer": { "model": "umans-glm-5.2", "thinking": "high" } } } }
 ```
 
-Forked context (`context: "fork"`) starts a child from a filtered snapshot of the parent conversation; model fallback tries `model` then `fallbackModels` on provider failures; the orchestrator skill (`.umans-harness/skills/pi-subagents/SKILL.md`) is injected into the parent only — children never receive it.
+Forked context (`context: "fork"`) starts a child from a filtered snapshot of the parent conversation; model fallback tries `model` then `fallbackModels` on provider failures; the orchestrator skill (`.catalyst-code/skills/pi-subagents/SKILL.md`) is injected into the parent only — children never receive it.
 core/                 Rust core (stdio JSON-RPC server)
   src/main.rs         stdin dispatch, approval gate, turn loop, compaction, metrics
   src/provider.rs     OpenAI streaming client: retry/backoff, idle timeout, orphaned-call sanitize
@@ -165,7 +165,7 @@ the official CLI: `/login` performs the OAuth flow itself.
   `chatgpt.com` Responses API (a different request shape than chat-completions).
   Codex stays on `OPENAI_API_KEY` until a Responses-API integration is added.
 
-Tokens from `/login` are stored at `~/.config/umans-harness/oauth/<id>.json`
+Tokens from `/login` are stored at `~/.config/catalyst-code/oauth/<id>.json`
 (0600) and refreshed automatically. The OAuth client credentials used are the
 vendors' public installed-app client IDs (gcloud's for Google, Claude Code's
 for Anthropic).
@@ -175,53 +175,53 @@ uses the API-key path, and an explicit API key (env var or pasted via `/login`)
 always takes precedence over OAuth — so `/login` → pick the provider → paste a
 key overrides a bad OAuth credential.
 
-## Windows install (`ucli`)
+## Windows install (`catcode`)
 
 `release-windows.sh` cross-compiles for Windows x86_64 and produces two
 self-contained artifacts:
 
-- **`ucli-<ver>-windows.msi`** — a per-user MSI installer that installs
-  `ucli` + `umans-core` to `%LOCALAPPDATA%\Programs\ucli` and adds that
-  directory to the user PATH (so `ucli` works from any CWD, no admin needed).
-- **`ucli-<ver>-windows-x86_64.exe`** — a single standalone executable with the
+- **`catcode-<ver>-windows.msi`** — a per-user MSI installer that installs
+  `catcode` + `catcode-core` to `%LOCALAPPDATA%\Programs\catcode` and adds that
+  directory to the user PATH (so `catcode` works from any CWD, no admin needed).
+- **`catcode-<ver>-windows-x86_64.exe`** — a single standalone executable with the
   Rust core embedded (`-tags embed_core`); no install, no separate
-  `umans-core`. Run it from any CWD — it extracts its bundled core to
-  `%LOCALAPPDATA%\umans-harness` on first run.
+  `catcode-core`. Run it from any CWD — it extracts its bundled core to
+  `%LOCALAPPDATA%\catalyst-code` on first run.
 
 ```bash
-./release-windows.sh        # -> dist/ucli-<ver>-windows.msi + .sha256
-                           #    dist/ucli-<ver>-windows-x86_64.exe + .sha256
-                           #    dist/ucli-<ver>-windows.zip (no-build fallback)
+./release-windows.sh        # -> dist/catcode-<ver>-windows.msi + .sha256
+                           #    dist/catcode-<ver>-windows-x86_64.exe + .sha256
+                           #    dist/catcode-<ver>-windows.zip (no-build fallback)
 ```
 
 `release-windows.sh` cross-compiles with cargo (`x86_64-pc-windows-gnu`) and Go
 (`GOOS=windows`), then builds the MSI with msitools `wixl` from
-`packaging/windows/ucli.wxs` (the same `.wxs` also compiles with the WiX
+`packaging/windows/catcode.wxs` (the same `.wxs` also compiles with the WiX
 Toolset `candle`+`light` on a Windows build host).
 
 On Windows, install by double-clicking the `.msi`, or silently:
 
 ```powershell
-msiexec /i ucli-<ver>-windows.msi            # interactive (no UAC prompt)
-msiexec /i ucli-<ver>-windows.msi /quiet     # silent
+msiexec /i catcode-<ver>-windows.msi            # interactive (no UAC prompt)
+msiexec /i catcode-<ver>-windows.msi /quiet     # silent
 ```
 
 The MSI is per-user (no admin), writes a clean Add/Remove Programs entry,
 and supports in-place upgrades (fixed `UpgradeCode`). Open a new PowerShell
-window after install and run `ucli` from any directory. First run: `/login`
+window after install and run `catcode` from any directory. First run: `/login`
 then `/model`.
 
 Prefer no install? Run the standalone `.exe` from anywhere — double-click
-`ucli-<ver>-windows-x86_64.exe` (or `.\ucli-<ver>-windows-x86_64.exe` in
+`catcode-<ver>-windows-x86_64.exe` (or `.\catcode-<ver>-windows-x86_64.exe` in
 PowerShell) and it launches in the current directory with the core embedded.
 
 No `wixl`/WiX available? `packaging/windows/install.ps1` is a no-build fallback:
 unzip the two `.exe` files beside it and run `.\install.ps1` to copy them into
-`%LOCALAPPDATA%\Programs\ucli` and update the user PATH.
+`%LOCALAPPDATA%\Programs\catcode` and update the user PATH.
 
-The TUI finds the core by searching, in order: `$UMANS_CORE`, `umans-core(.exe)`
+The TUI finds the core by searching, in order: `$CATCODE_CORE`, `catcode-core(.exe)`
 next to the TUI, then the dev paths `core/target/release/core(.exe)`. Set
-`UMANS_CORE=<path>` to point at a custom core build.
+`CATCODE_CORE=<path>` to point at a custom core build.
 
 Runtime caveats on Windows:
 - The agent's `bash` tool needs bash on PATH (Git Bash or WSL); chat and the
@@ -229,29 +229,29 @@ Runtime caveats on Windows:
 - Sandboxing (`--sandbox firejail` / `--no-network`) is Linux-only; leave
   `/sandbox` set to `none`.
 
-## macOS install (`ucli`)
+## macOS install (`catcode`)
 
 `release-macos.sh` cross-compiles per arch (arm64 + x86_64) and produces two
 self-contained artifacts:
 
-- **`umans-harness-<ver>-macos-{arm64,x86_64}`** — a single standalone
+- **`catcode-<ver>-macos-{arm64,x86_64}`** — a single standalone
   executable with the Rust core embedded (`-tags embed_core`); runs from any
-  CWD, no install, no separate `umans-core`. It extracts its bundled core to
-  `~/Library/Caches/umans-harness` on first run.
-- **`ucli-<ver>-macos-{arm64,x86_64}.dmg`** — a disk-image installer wrapping
-  that standalone executable. Mount it and double-click `Install ucli.command`
-  to copy `ucli` onto your PATH (`/usr/local/bin`), then run `ucli` from any
+  CWD, no install, no separate `catcode-core`. It extracts its bundled core to
+  `~/Library/Caches/catalyst-code` on first run.
+- **`catcode-<ver>-macos-{arm64,x86_64}.dmg`** — a disk-image installer wrapping
+  that standalone executable. Mount it and double-click `Install catcode.command`
+  to copy `catcode` onto your PATH (`/usr/local/bin`), then run `catcode` from any
   terminal.
 
 Grab the matching arch from `dist/` (built by `./release-macos.sh`):
 
-- `umans-harness-<ver>-macos-arm64` / `ucli-<ver>-macos-arm64.dmg`  — Apple Silicon (M-series)
-- `umans-harness-<ver>-macos-x86_64` / `ucli-<ver>-macos-x86_64.dmg` — Intel
+- `catcode-<ver>-macos-arm64` / `catcode-<ver>-macos-arm64.dmg`  — Apple Silicon (M-series)
+- `catcode-<ver>-macos-x86_64` / `catcode-<ver>-macos-x86_64.dmg` — Intel
 
 ```bash
-chmod +x umans-harness-0.2.0-macos-arm64
-./umans-harness-0.2.0-macos-arm64      # launches in the current directory
-# or: open ucli-0.2.0-macos-arm64.dmg, then double-click "Install ucli.command"
+chmod +x catcode-0.2.0-macos-arm64
+./catcode-0.2.0-macos-arm64      # launches in the current directory
+# or: open catcode-0.2.0-macos-arm64.dmg, then double-click "Install catcode.command"
 ```
 
 Then `/login`, `/model`, and type a prompt. The workspace is the directory
@@ -262,8 +262,8 @@ Build it yourself on Linux (zig is the macOS linker; no Xcode/SDK needed):
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo install cargo-zigbuild          # and put zig 0.13+ on PATH
-./release-macos.sh                    # -> dist/umans-harness-<ver>-macos-{arm64,x86_64} + .sha256
-                                       #    dist/ucli-<ver>-macos-{arm64,x86_64}.dmg + .sha256
+./release-macos.sh                    # -> dist/catcode-<ver>-macos-{arm64,x86_64} + .sha256
+                                       #    dist/catcode-<ver>-macos-{arm64,x86_64}.dmg + .sha256
 ```
 
 `release-macos.sh` cross-compiles the core with `cargo zigbuild` (pure-Rust
@@ -271,7 +271,7 @@ cargo install cargo-zigbuild          # and put zig 0.13+ on PATH
 core via `go:embed` (`-tags embed_core`) so each standalone output is one file.
 The `.dmg` is built with `hdiutil` (real UDIF) on macOS, or `xorriso` (an HFS+
 hybrid image that mounts on macOS) when cross-built on Linux. The TUI resolves
-the core as: `$UMANS_CORE` → embedded extraction → the usual dev/installed
+the core as: `$CATCODE_CORE` → embedded extraction → the usual dev/installed
 search, so dev builds and the Windows MSI layout are unchanged.
 
 Runtime caveats on macOS:
@@ -279,37 +279,37 @@ Runtime caveats on macOS:
   `/sandbox` set to `none`.
 - The agent's `bash` tool needs `bash` on PATH (present by default on macOS).
 
-## Linux install (`ucli`)
+## Linux install (`catcode`)
 
 `release-linux.sh` builds for the host arch (x86_64 or aarch64) and produces two
 self-contained artifacts:
 
-- **`umans-harness-<ver>-linux-<arch>`** — a single standalone executable with
+- **`catcode-<ver>-linux-<arch>`** — a single standalone executable with
   the Rust core embedded (`-tags embed_core`); runs from any CWD, no install,
-  no separate `umans-core`. It extracts its bundled core to
-  `~/.cache/umans-harness` on first run.
-- **`ucli-<ver>-<arch>.AppImage`** — a self-contained AppImage (squashfs
+  no separate `catcode-core`. It extracts its bundled core to
+  `~/.cache/catalyst-code` on first run.
+- **`catcode-<ver>-<arch>.AppImage`** — a self-contained AppImage (squashfs
   payload) wrapping that standalone executable. Run it from any terminal with
-  `./ucli-<ver>-<arch>.AppImage`; it launches the TUI in the current directory.
+  `./catcode-<ver>-<arch>.AppImage`; it launches the TUI in the current directory.
   `<arch>` is `x86_64` or `aarch64`.
 
 ```bash
-./release-linux.sh          # -> dist/umans-harness-<ver>-linux-<arch> + .sha256
-                            #    dist/ucli-<ver>-<arch>.AppImage + .sha256
+./release-linux.sh          # -> dist/catcode-<ver>-linux-<arch> + .sha256
+                            #    dist/catcode-<ver>-<arch>.AppImage + .sha256
 ```
 
 Run either from any directory:
 
 ```bash
-chmod +x umans-harness-0.2.0-linux-x86_64 && ./umans-harness-0.2.0-linux-x86_64
-chmod +x ucli-0.2.0-x86_64.AppImage       && ./ucli-0.2.0-x86_64.AppImage
+chmod +x catcode-0.2.0-linux-x86_64 && ./catcode-0.2.0-linux-x86_64
+chmod +x catcode-0.2.0-x86_64.AppImage       && ./catcode-0.2.0-x86_64.AppImage
 ```
 
-Or install either as a `ucli` command on your PATH (the AppImage is a single
+Or install either as a `catcode` command on your PATH (the AppImage is a single
 ELF you can rename and place on PATH, just like the standalone):
 
 ```bash
-sudo install -m 0755 ucli-0.2.0-x86_64.AppImage /usr/local/bin/ucli   # then run: ucli
+sudo install -m 0755 catcode-0.2.0-x86_64.AppImage /usr/local/bin/catcode   # then run: catcode
 ```
 
 Then `/login`, `/model`, and type a prompt. The workspace is the directory

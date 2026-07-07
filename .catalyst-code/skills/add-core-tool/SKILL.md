@@ -6,7 +6,7 @@ version: 1
 
 ## When to use
 
-You are extending `umans-harness`'s Rust core with a new tool the agent can call
+You are extending `catalyst-code`'s Rust core with a new tool the agent can call
 (via OpenAI function-calling). Every existing tool — `read_file`, `edit`, `bash`,
 `grep`, `fetch`, `subagent`, `memory`, `git_*`, … — was added by following this
 exact shape, so this is the canonical workflow when the repo needs a new

@@ -218,7 +218,7 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
         ))
         .connect_timeout(std::time::Duration::from_secs(10))
         .redirect(allowlist_redirect_policy(cfg.fetch_allowlist.clone()))
-        .user_agent("umans-harness-fetch/0.1")
+        .user_agent("catalyst-code-fetch/0.1")
         .build()
     {
         Ok(c) => c,

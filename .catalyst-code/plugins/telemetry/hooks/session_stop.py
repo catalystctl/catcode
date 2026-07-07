@@ -29,7 +29,7 @@ Output (stdout, exactly one JSON line):
 response is required and a non-zero exit means the hook is silently skipped —
 so this script always exits 0 and emits a clear `reason`.
 
-Writes, under ~/.config/umans-harness/telemetry/<workspace-hash>/:
+Writes, under ~/.config/catalyst-code/telemetry/<workspace-hash>/:
   turns.jsonl   — one record per turn (append-only)
   summary.json  — incremental aggregates (read -> update -> atomic write)
   summary.md    — human-readable rendering, regenerated each call
@@ -224,7 +224,7 @@ def main():
     try:
         ws_hash = _workspace_hash(workspace)
         home = os.path.expanduser("~")
-        base = os.path.join(home, ".config", "umans-harness", "telemetry", ws_hash)
+        base = os.path.join(home, ".config", "catalyst-code", "telemetry", ws_hash)
         os.makedirs(base, exist_ok=True)
 
         turns_path = os.path.join(base, "turns.jsonl")

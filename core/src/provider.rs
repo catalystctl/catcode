@@ -528,7 +528,7 @@ fn cache_version_ok(cache: &Value) -> bool {
 
 fn models_cache_path() -> Option<std::path::PathBuf> {
     let home = crate::config::home_dir()?;
-    Some(home.join(".config/umans-harness/models-cache.json"))
+    Some(home.join(".config/catalyst-code/models-cache.json"))
 }
 
 fn read_models_cache(cache_key: &str) -> Option<Vec<ModelInfo>> {

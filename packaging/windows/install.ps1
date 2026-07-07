@@ -1,7 +1,7 @@
-# ucli installer for Windows.
+# catcode installer for Windows.
 #
-# Copies ucli.exe + umans-core.exe into %LOCALAPPDATA%\Programs\ucli and adds
-# that directory to the user PATH so `ucli` works from any CWD in PowerShell.
+# Copies catcode.exe + catcode-core.exe into %LOCALAPPDATA%\Programs\catcode and adds
+# that directory to the user PATH so `catcode` works from any CWD in PowerShell.
 #
 # Run from inside the unzipped bundle (the two .exe files sit next to this
 # script):
@@ -14,22 +14,22 @@
 
 [CmdletBinding()]
 param(
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ucli')
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\catcode')
 )
 
 $ErrorActionPreference = 'Stop'
 $BundleDir = $PSScriptRoot
 
 # --- locate the bundled binaries (this script ships beside them) ----------
-$tui  = Join-Path $BundleDir 'ucli.exe'
-$core = Join-Path $BundleDir 'umans-core.exe'
+$tui  = Join-Path $BundleDir 'catcode.exe'
+$core = Join-Path $BundleDir 'catcode-core.exe'
 foreach ($f in @($tui, $core)) {
     if (-not (Test-Path -LiteralPath $f)) {
-        throw "Missing bundled binary: $f`nRun install.ps1 from inside the unzipped ucli folder."
+        throw "Missing bundled binary: $f`nRun install.ps1 from inside the unzipped catcode folder."
     }
 }
 
-Write-Host "Installing ucli to $InstallDir" -ForegroundColor Cyan
+Write-Host "Installing catcode to $InstallDir" -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
@@ -52,12 +52,12 @@ if ($parts -notcontains $InstallDir) {
     Write-Host "$InstallDir is already on your user PATH." -ForegroundColor DarkGray
 }
 
-# refresh the current session so `ucli` works here immediately too
+# refresh the current session so `catcode` works here immediately too
 $env:Path = "$env:Path;$InstallDir"
 
 Write-Host ""
 Write-Host "Done. Open a NEW PowerShell window (so PATH reloads) and run:" -ForegroundColor Green
-Write-Host "    ucli" -ForegroundColor Yellow
+Write-Host "    catcode" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "First run inside ucli:  /key sk-...   then pick a model with /model"
+Write-Host "First run inside catcode:  /key sk-...   then pick a model with /model"
 Write-Host "Tip: the agent's bash tool needs bash on PATH (Git Bash or WSL)."

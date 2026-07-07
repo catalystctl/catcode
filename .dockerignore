@@ -5,7 +5,7 @@
 .gitignore
 .github/
 .pi/
-.umans-harness/
+.catalyst-code/
 continue/
 roo-code/
 dist/
@@ -18,11 +18,11 @@ plan.html
 # Stray binaries + build dirs (keep the image reproducible & lean)
 core/target/
 tui/tui
-tui/umans-harness-tui
-tui/ucli
-tui/ucli.exe
+tui/catalyst-code-tui
+tui/catcode
+tui/catcode.exe
 tui/bin/
-tui/embed/umans-core
+tui/embed/catcode-core
 **/*.rs.bk
 
 # OS / editor junk
