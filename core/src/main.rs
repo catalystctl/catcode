@@ -2355,19 +2355,51 @@ fn star_match_rule(pattern: &str, text: &str) -> bool {
 /// of the old unconditional hard block. Under `Never` the gate skips this
 /// entirely, so ALL file restrictions are disabled.
 ///
+/// `root` is the workspace root used to resolve symlinks: each path is first
+/// checked against the blocklist in its RAW model-supplied form (catches a
+/// literal `.env`/`.git` early), then — after `workspace::resolve` follows
+/// symlinks to a canonical absolute path — checked AGAIN against the
+/// canonical path's components. A symlink alias such as `linkdir -> .git`
+/// makes `linkdir/config` pass the raw check (no `.git` in the literal
+/// string) yet resolve to `<root>/.git/config`; the canonical re-check closes
+/// that bypass, since the canonical path is what actually gets read/written.
+/// If `resolve` fails (e.g. the path escapes the workspace) the raw-check
+/// result stands unchanged.
+///
 /// Covers the content-touching tools: `read_file` (read), `write_file`/
 /// `edit`/`patch` (write), and the bulk variants (each inner path is checked).
 /// Search/list tools (`grep`/`glob`/`list_dir`) and `bash` are intentionally
 /// excluded — they don't read a single restricted file's content by path.
-pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<String> {
+pub(crate) fn restricted_path_for_tool(
+    name: &str,
+    args: &Value,
+    root: &std::path::Path,
+) -> Option<String> {
     fn path_of(a: &Value) -> Option<&str> {
         a.get("path")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     }
+    // Check one path string: raw form first, then the symlink-resolved
+    // canonical path. Both use the same blocklist; the canonical pass is what
+    // defeats a symlink alias (linkdir -> .git) the raw pass can't see.
+    fn check(raw: &str, root: &std::path::Path) -> Option<String> {
+        if let Some(reason) = workspace::check_dangerous_path(raw) {
+            return Some(reason);
+        }
+        let canon = workspace::resolve(root, raw).ok()?;
+        // Reduce to a root-relative, forward-slash form so the same
+        // component-glob logic (`.git/**`, `**/.ssh/**`, …) that checks the
+        // raw string applies to the canonical path, cross-platform.
+        let canon_root =
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let rel = canon.strip_prefix(&canon_root).unwrap_or(&canon);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        workspace::check_dangerous_path(&rel_str)
+    }
     match name {
         "read_file" | "write_file" | "edit" | "patch" => {
-            path_of(args).and_then(workspace::check_dangerous_path)
+            path_of(args).and_then(|raw| check(raw, root))
         }
         "bulk_read" => args
             .get("paths")
@@ -2375,7 +2407,7 @@ pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<Strin
             .and_then(|arr| {
                 arr.iter()
                     .filter_map(|p| p.as_str())
-                    .find_map(workspace::check_dangerous_path)
+                    .find_map(|raw| check(raw, root))
             }),
         "bulk_write" => args
             .get("files")
@@ -2383,7 +2415,7 @@ pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<Strin
             .and_then(|arr| {
                 arr.iter()
                     .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
-                    .find_map(workspace::check_dangerous_path)
+                    .find_map(|raw| check(raw, root))
             }),
         "bulk_edit" => args
             .get("edits")
@@ -2391,7 +2423,7 @@ pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<Strin
             .and_then(|arr| {
                 arr.iter()
                     .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
-                    .find_map(workspace::check_dangerous_path)
+                    .find_map(|raw| check(raw, root))
             }),
         // `bulk`: recurse into inner calls — if ANY inner call targets a
         // restricted path, the whole bulk prompts (then approved calls proceed).
@@ -2402,7 +2434,7 @@ pub(crate) fn restricted_path_for_tool(name: &str, args: &Value) -> Option<Strin
                 arr.iter().find_map(|c| {
                     let n = c.get("name").and_then(|v| v.as_str())?;
                     let a = c.get("args")?;
-                    restricted_path_for_tool(n, a)
+                    restricted_path_for_tool(n, a, root)
                 })
             }),
         _ => None,
@@ -3348,7 +3380,7 @@ async fn run_turn(
                     let restricted = if matches!(cfg.approval, Approval::Never) {
                         None
                     } else {
-                        restricted_path_for_tool(&name, &args)
+                        restricted_path_for_tool(&name, &args, &cfg.workspace)
                     };
                     let needs_approval = if force_allow || escalated {
                         false
@@ -5151,81 +5183,125 @@ mod auto_reflect_tests {
 mod restricted_path_tests {
     use super::*;
 
+    // A throwaway workspace root for the canonical-path re-check. Unique per
+    // call so parallel `cargo test` never collides (mirrors workspace::tmp_root).
+    fn root() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("umans_rpt_test_{}", n));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
     #[test]
     fn read_file_restricted_path_detected() {
+        let r = root();
         // A direct read of a restricted file is flagged so the gate can prompt.
         let args = json!({"path": ".env"});
-        assert!(restricted_path_for_tool("read_file", &args).is_some());
+        assert!(restricted_path_for_tool("read_file", &args, &r).is_some());
         // Safe path: no flag.
         let args = json!({"path": "src/main.rs"});
-        assert!(restricted_path_for_tool("read_file", &args).is_none());
+        assert!(restricted_path_for_tool("read_file", &args, &r).is_none());
     }
 
     #[test]
     fn write_edit_patch_restricted_paths_detected() {
+        let r = root();
         for tool in ["write_file", "edit", "patch"] {
             let args = json!({"path": ".git/config"});
             assert!(
-                restricted_path_for_tool(tool, &args).is_some(),
+                restricted_path_for_tool(tool, &args, &r).is_some(),
                 "{tool} should flag .git/config"
             );
         }
         let args = json!({"path": "README.md"});
-        assert!(restricted_path_for_tool("write_file", &args).is_none());
+        assert!(restricted_path_for_tool("write_file", &args, &r).is_none());
     }
 
     #[test]
     fn case_insensitive_match() {
+        let r = root();
         // .ENV / .GIT/config must still match on case-insensitive filesystems.
-        assert!(restricted_path_for_tool("read_file", &json!({"path": ".ENV"})).is_some());
-        assert!(restricted_path_for_tool("write_file", &json!({"path": ".GIT/config"})).is_some());
+        assert!(restricted_path_for_tool("read_file", &json!({"path": ".ENV"}), &r).is_some());
+        assert!(restricted_path_for_tool("write_file", &json!({"path": ".GIT/config"}), &r).is_some());
     }
 
     #[test]
     fn bulk_read_flags_any_restricted() {
+        let r = root();
         let args = json!({"paths": ["ok.txt", ".env", "other.rs"]});
-        assert!(restricted_path_for_tool("bulk_read", &args).is_some());
+        assert!(restricted_path_for_tool("bulk_read", &args, &r).is_some());
         let args = json!({"paths": ["a.rs", "b.go"]});
-        assert!(restricted_path_for_tool("bulk_read", &args).is_none());
+        assert!(restricted_path_for_tool("bulk_read", &args, &r).is_none());
     }
 
     #[test]
     fn bulk_write_and_bulk_edit_flag_restricted() {
+        let r = root();
         let args = json!({"files": [{"path": ".env", "content": "x"}]});
-        assert!(restricted_path_for_tool("bulk_write", &args).is_some());
+        assert!(restricted_path_for_tool("bulk_write", &args, &r).is_some());
         let args = json!({"edits": [{"path": ".ssh/config", "edits": []}]});
-        assert!(restricted_path_for_tool("bulk_edit", &args).is_some());
+        assert!(restricted_path_for_tool("bulk_edit", &args, &r).is_some());
         let args = json!({"files": [{"path": "ok.txt", "content": "x"}]});
-        assert!(restricted_path_for_tool("bulk_write", &args).is_none());
+        assert!(restricted_path_for_tool("bulk_write", &args, &r).is_none());
     }
 
     #[test]
     fn bulk_recurses_into_inner_calls() {
+        let r = root();
         // A bulk containing an inner write to a restricted path is flagged so
         // the whole bulk prompts (then approved inner calls proceed).
         let args = json!({"calls": [
             {"name": "read_file", "args": {"path": "ok.txt"}},
             {"name": "write_file", "args": {"path": ".env", "content": "LEAK=1"}}
         ]});
-        assert!(restricted_path_for_tool("bulk", &args).is_some());
+        assert!(restricted_path_for_tool("bulk", &args, &r).is_some());
         // All-safe bulk: no flag.
         let args = json!({"calls": [
             {"name": "read_file", "args": {"path": "a.rs"}},
             {"name": "write_file", "args": {"path": "b.go", "content": "x"}}
         ]});
-        assert!(restricted_path_for_tool("bulk", &args).is_none());
+        assert!(restricted_path_for_tool("bulk", &args, &r).is_none());
     }
 
     #[test]
     fn excluded_tools_never_flag() {
+        let r = root();
         // bash/grep/glob/list_dir are intentionally excluded — they don't read a
         // single restricted file's content by path.
-        assert!(restricted_path_for_tool("bash", &json!({"command": "cat .env"})).is_none());
+        assert!(restricted_path_for_tool("bash", &json!({"command": "cat .env"}), &r).is_none());
         assert!(
-            restricted_path_for_tool("grep", &json!({"pattern": "x", "path": "src"})).is_none()
+            restricted_path_for_tool("grep", &json!({"pattern": "x", "path": "src"}), &r).is_none()
         );
-        assert!(restricted_path_for_tool("glob", &json!({"pattern": "**/*"})).is_none());
-        assert!(restricted_path_for_tool("list_dir", &json!({"path": "."})).is_none());
+        assert!(restricted_path_for_tool("glob", &json!({"pattern": "**/*"}), &r).is_none());
+        assert!(restricted_path_for_tool("list_dir", &json!({"path": "."}), &r).is_none());
+    }
+
+    // Regression (M1): a symlink alias to a restricted dir (linkdir -> .git)
+    // must be flagged. The raw path "linkdir/config" contains no `.git`
+    // component, so only the canonical (symlink-resolved) re-check catches it.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_to_restricted_is_flagged() {
+        use std::os::unix::fs::symlink;
+        let r = root();
+        // `linkdir` is a relative symlink to the in-workspace `.git` dir.
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        symlink(".git", r.join("linkdir")).unwrap();
+        // Reading through the alias must prompt (canonical path = <root>/.git/config).
+        let args = json!({"path": "linkdir/config"});
+        assert!(
+            restricted_path_for_tool("read_file", &args, &r).is_some(),
+            "symlink alias to .git must be flagged by the canonical re-check"
+        );
+        // The literal restricted path is also flagged.
+        let args = json!({"path": ".git/config"});
+        assert!(restricted_path_for_tool("read_file", &args, &r).is_some());
+        // A genuinely safe path is not flagged.
+        let args = json!({"path": "src/main.rs"});
+        assert!(restricted_path_for_tool("read_file", &args, &r).is_none());
     }
 }
 

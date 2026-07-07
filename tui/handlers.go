@@ -81,7 +81,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if s.settings.ActiveProvider != "" && s.settings.ActiveProvider != s.activeProvider &&
 			s.containsProvider(s.settings.ActiveProvider) {
 			s.sendCore(map[string]any{"type": "set_provider", "name": s.settings.ActiveProvider})
-			return nil
+			// Re-arm the core-event pump: returning nil here schedules no further
+			// waitForEvent, so no core event would ever be processed again — the
+			// spinner keeps ticking but nothing streams (TUI deadlock). The
+			// set_provider round-trip is async; provider_changed will arrive and
+			// be handled normally on the next pump tick.
+			return waitForEvent(s.coreEvents)
 		}
 		s.reauthActiveProvider()
 
@@ -958,6 +963,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
 		if s.coreCmd != nil && s.coreCmd.Process != nil {
 			_ = s.coreCmd.Process.Kill()
+			_, _ = s.coreCmd.Process.Wait() // reap the core child so it isn't a zombie
 		}
 		return s, tea.Quit
 	}

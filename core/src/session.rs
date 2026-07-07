@@ -120,6 +120,17 @@ pub fn load_escalations(session_path: &Path) -> std::collections::HashSet<String
         .unwrap_or_default()
 }
 
+/// Best-effort directory fsync after an atomic rename. POSIX does not guarantee
+/// a rename survives a power-loss crash unless the parent directory is also
+/// fsync'd, so after each temp→target rename we fsync the parent dir. Ignored on
+/// platforms where a directory cannot be opened as a file (Windows) — `File::open`
+/// on a directory simply fails there and the `if let Ok` skips it.
+fn fsync_dir(path: &Path) {
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.sync_all();
+    }
+}
+
 /// Persist the current set of escalated approval kinds atomically (temp +
 /// fsync + rename) so a crash never truncates it.
 pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<String>) {
@@ -127,7 +138,7 @@ pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<S
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = p.with_extension("tmp");
+    let tmp = p.with_extension("esc.tmp");
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -142,6 +153,9 @@ pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<S
     let _ = f.sync_all();
     drop(f); // release before rename (Windows)
     let _ = std::fs::rename(&tmp, &p);
+    if let Some(parent) = p.parent() {
+        fsync_dir(parent);
+    }
 }
 
 /// Cumulative session stats persisted beside the session file (sidecar
@@ -177,7 +191,7 @@ pub fn save_stats(session_path: &Path, stats: &SessionStats) {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = p.with_extension("tmp");
+    let tmp = p.with_extension("stats.tmp");
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -191,6 +205,9 @@ pub fn save_stats(session_path: &Path, stats: &SessionStats) {
     let _ = f.sync_all();
     drop(f); // release before rename (Windows)
     let _ = std::fs::rename(&tmp, &p);
+    if let Some(parent) = p.parent() {
+        fsync_dir(parent);
+    }
 }
 
 /// Truncate/replace the whole session file with `messages` (used on reset /
@@ -223,6 +240,9 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
     drop(f); // release the handle before rename (Windows requires it)
              // Atomic on POSIX (same dir/same volume); best-effort on Windows.
     let _ = std::fs::rename(&tmp, path);
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
 }
 
 /// A lightweight description of a session file used by the session picker.

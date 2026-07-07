@@ -703,7 +703,12 @@ pub async fn code_assist_project(client: &reqwest::Client) -> Option<String> {
     }
     let token = google_token(client).await?;
     let result = fetch_code_assist_project(client, &token).await;
-    let _ = CODE_ASSIST_PROJECT.set(result.clone());
+    // Only cache a successful onboarding. A transient failure on the FIRST call
+    // (network blip / 10s timeout) returning None would otherwise be cached for
+    // the process lifetime, permanently breaking Gemini-OAuth until restart.
+    if result.is_some() {
+        let _ = CODE_ASSIST_PROJECT.set(result.clone());
+    }
     result
 }
 

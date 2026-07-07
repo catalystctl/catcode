@@ -12,6 +12,7 @@
 // kept for potential external use, hence the module-level dead-code allow.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
@@ -170,13 +171,11 @@ impl Store {
             name, description, mem_type, content
         );
 
-        // Atomic write (temp + rename) so a crash mid-write can't leave a
-        // truncated/empty memory file — memories are durable learnings.
-        let tmp = path.with_file_name(format!("{filename}.tmp"));
-        std::fs::write(&tmp, &body)
+        // Atomic + fsync'd write (temp + fsync + rename) so a crash mid-write
+        // can't leave a truncated/empty memory file — memories are durable
+        // learnings, so they get the same crash-safety as session persistence.
+        atomic_write(&path, &body)
             .map_err(|e| format!("failed to write memory file {filename:?}: {e}"))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("failed to commit memory file {filename:?}: {e}"))?;
 
         rebuild_index(&dir, scope)?;
 
@@ -635,6 +634,29 @@ fn slugify(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// Atomic + fsync'd file write: write a sibling temp file, fsync it, then rename
+/// over the target (mirroring the session layer's durability). On any error the
+/// temp file is removed so a crash mid-write can never leave a truncated memory
+/// file. Memories are durable learnings, so they get the same crash-safety as
+/// session persistence.
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_e| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 // ---- tests ----

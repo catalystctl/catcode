@@ -676,6 +676,32 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
     Outcome::ok(content)
 }
 
+/// Atomically write `content` to `path`: write to a sibling temp file,
+/// fsync, then rename over the target. A crash/SIGKILL/OOM mid-write can never
+/// leave the target truncated or partially written — it is either the old or
+/// the new content. Mirrors the atomicity the session layer uses; user-facing
+/// file writes (write_file/edit/patch/todo_write) route through this.
+fn atomic_write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp: std::path::PathBuf = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".umans-tmp");
+        std::path::PathBuf::from(p)
+    };
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
 fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
     // Restricted paths (.env, .git/**, .ssh/**, id_rsa, …) are NO LONGER
     // hard-blocked here — enforcement moved to the approval gate
@@ -694,7 +720,7 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
         }
     }
     let old_content = std::fs::read_to_string(&path).unwrap_or_default();
-    match std::fs::write(&path, content) {
+    match atomic_write_file(&path, content) {
         Ok(_) => {
             let mut out = Outcome::ok(format!("wrote {} bytes to {input}", content.len()));
             out.diff = Some(make_unified_diff(&old_content, content, input, 3));
@@ -1415,25 +1441,36 @@ fn find_matches(content: &str, search: &str, normalize: bool) -> Vec<(usize, usi
         return Vec::new();
     }
     let (ncontent, map) = normalize_ws_with_map(content);
+    // `map` has ONE entry per kept CHAR of the normalized string (`map[k]` =
+    // the byte offset of the k-th char). But `str::find` returns a BYTE offset.
+    // For ASCII these coincide; for any multi-byte content (CJK, emoji, smart
+    // quotes, `→`/`…`/`—`) indexing `map` with a byte offset either panics (OOB)
+    // or returns the wrong span — silently corrupting the file via
+    // replace_range. Track the byte offset (`from`/`p`, for str slicing) AND
+    // the char index (`from_char`/`p_char`, for map indexing) in parallel.
     let nlen = nsearch.len();
+    let nlen_chars = nsearch.chars().count();
     let mut out = Vec::new();
-    let mut from = 0usize;
+    let mut from = 0usize; // byte offset in ncontent
+    let mut from_char = 0usize; // char index in ncontent
     while let Some(pos) = ncontent[from..].find(&nsearch) {
-        let p = from + pos;
-        let start_orig = map[p];
-        let end_norm = p + nlen;
-        let end_orig = if end_norm < map.len() {
+        let p = from + pos; // byte offset of the match start
+        // char index of the match start = from_char + chars in the gap
+        let p_char = from_char + ncontent[from..p].chars().count();
+        let start_orig = map[p_char];
+        let end_norm_char = p_char + nlen_chars;
+        let end_orig = if end_norm_char < map.len() {
             // Start of the next kept char sits right after any whitespace that
             // was collapsed between the last matched char and it — so this
             // includes the matched region's internal whitespace (correct) and
             // excludes trailing gap whitespace (also correct).
-            map[end_norm]
+            map[end_norm_char]
         } else {
             // Match runs to the end of the normalized content: end right after
             // the last matched SOURCE char, not content.len(), so trailing
             // whitespace the normalizer trimmed (e.g. a final newline) isn't
             // consumed by the replacement.
-            let last_start = map[p + nlen - 1];
+            let last_start = map[p_char + nlen_chars - 1];
             last_start
                 + content[last_start..]
                     .chars()
@@ -1443,6 +1480,7 @@ fn find_matches(content: &str, search: &str, normalize: bool) -> Vec<(usize, usi
         };
         out.push((start_orig, end_orig));
         from = p + nlen;
+        from_char = p_char + nlen_chars;
     }
     out
 }
@@ -1556,7 +1594,7 @@ fn execute_edit(input: &str, edits: &[Value], cfg: &Config) -> Outcome {
         Ok(v) => v,
         Err(e) => return Outcome::err(e),
     };
-    if let Err(e) = std::fs::write(&path, &new_content) {
+    if let Err(e) = atomic_write_file(&path, &new_content) {
         return Outcome::err(format!("edit: write {input:?} failed: {e}"));
     }
     let mut out = Outcome::ok(format!("applied {} edit(s)", edits.len()));
@@ -1810,7 +1848,7 @@ fn todo_write(args: &Value, cfg: &Config) -> Outcome {
     }
     let body = json!({ "todos": todos });
     let pretty = serde_json::to_string_pretty(&body).unwrap_or_default();
-    match std::fs::write(&p, pretty) {
+    match atomic_write_file(&p, &pretty) {
         Ok(_) => Outcome::ok(format!("wrote {} todo(s)", todos.len())),
         Err(e) => Outcome::err(format!("todo_write failed: {e}")),
     }
@@ -1834,7 +1872,7 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
     let original = std::fs::read_to_string(&resolved).unwrap_or_default();
     match apply_unified_diff(&original, patch) {
         Ok(new) => {
-            if let Err(e) = std::fs::write(&resolved, &new) {
+            if let Err(e) = atomic_write_file(&resolved, &new) {
                 return Outcome::err(format!("patch write failed: {e}"));
             }
             let mut out = Outcome::ok(format!(
@@ -2729,6 +2767,52 @@ mod tests {
         assert_eq!(
             fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
             "X\nX\nX\n"
+        );
+    }
+
+    #[test]
+    fn edit_normalize_whitespace_multibyte_no_corruption() {
+        // C1 regression: normalize_whitespace matching indexed a per-char map
+        // with a BYTE offset from str::find. For multi-byte content (CJK,
+        // emoji, smart quotes) this either panicked (OOB) or returned the wrong
+        // span and silently corrupted the file via replace_range. The fix
+        // tracks byte offset + char index in parallel.
+        let (_root, cfg) = tmp_ws();
+        fs::write(
+            cfg.workspace.join("f.txt"),
+            "漢字\n\tif (x)  return;\n}\n",
+        )
+        .unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "if (x) return;", "replace": "if (x) { return; }", "normalize_whitespace": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "漢字\n\tif (x) { return; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn edit_normalize_whitespace_multibyte_replace_all() {
+        // Same class of bug, replace_all path: each match's span must map back
+        // to the correct source bytes even when the collapsed string contains
+        // multi-byte chars between matches.
+        let (_root, cfg) = tmp_ws();
+        fs::write(
+            cfg.workspace.join("f.txt"),
+            "→ a   b\n★ a\tb\n☆ a b\n",
+        )
+        .unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "a b", "replace": "X", "normalize_whitespace": true, "replace_all": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "→ X\n★ X\n☆ X\n"
         );
     }
 

@@ -7,9 +7,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -212,6 +214,13 @@ func coreBinaryPath() string {
 	return "core/target/release/" + devName
 }
 
+// coreProcess holds the running core's *os.Process so a signal handler can
+// kill+wait it on SIGHUP/SIGTERM — otherwise closing the terminal (SIGHUP) or
+// `kill` (SIGTERM) kills the TUI but orphans umans-core, which keeps running.
+// Set in startCore after cmd.Start(); best-effort only (read under a nil check
+// from the signal goroutine, so the benign pointer race is harmless).
+var coreProcess *os.Process
+
 func (s *session) startCore() tea.Cmd {
 	bin := coreBinaryPath()
 	approval := s.settings.Approval
@@ -261,16 +270,21 @@ func (s *session) startCore() tea.Cmd {
 		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to start core (%s): %s", bin, err)} }
 	}
 	s.coreCmd = cmd
+	coreProcess = cmd.Process // expose to the signal handler (M8): kill+wait on SIGHUP/SIGTERM
 	s.coreIn = in
 	s.coreEvents = make(chan *coreEvent, 256)
 	s.stdinCh = make(chan []byte, 256)
 
 	// P1-15: a dedicated stdin-writer goroutine funnels commands to the core. A
 	// blocking pipe write (core not draining) happens here, off the UI thread,
-	// so a wedged core can never freeze the Bubble Tea Update loop.
+	// so a wedged core can never freeze the Bubble Tea Update loop. The locals
+	// (in/ch) are captured once so the writer never reads the shared s.coreIn /
+	// s.stdinCh fields, which the restart path nils concurrently — avoids a data
+	// race / nil-deref when the core is restarted mid-write.
+	ch := s.stdinCh
 	go func() {
-		for b := range s.stdinCh {
-			if _, err := s.coreIn.Write(b); err != nil {
+		for b := range ch {
+			if _, err := in.Write(b); err != nil {
 				return // core died; the stdout EOF will trigger restart
 			}
 		}
@@ -295,7 +309,21 @@ func (s *session) startCore() tea.Cmd {
 						ev.Type = t
 					}
 				}
-				s.coreEvents <- &ev // blocking: backpressure, no drops
+				// Blocking send preserves backpressure (a `done` or
+				// approval_request is never silently dropped). But when the read
+				// also returned an error (io.EOF at core exit), the UI may have
+				// stopped draining — a blocking send here would wedge the reader
+				// forever, skipping cmd.Wait()/close() and leaking the core as a
+				// zombie. Drop the final line non-blockingly on error so we reach
+				// the break and reap the child.
+				if err != nil {
+					select {
+					case s.coreEvents <- &ev:
+					default:
+					}
+				} else {
+					s.coreEvents <- &ev
+				}
 			}
 			if err != nil {
 				if err != io.EOF {
@@ -423,6 +451,22 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.pendingApproval = nil
 		s.pendingIntercom = nil
 		s.subProgress = nil
+		// clear stale per-core state so a crash-restart starts clean: a leftover
+		// queued follow-up, pinned todos, a pending ask, footer metrics, or an
+		// open settings/login modal would otherwise survive the restart and
+		// reference the dead core's request ids / counts.
+		s.queued = nil
+		s.todos = nil
+		s.pendingAsk = nil
+		s.contextTokens = 0
+		s.lastMetrics = nil
+		s.lastCachePct = 0
+		s.tokensSaved = 0
+		s.umansConcUsed = nil
+		s.umansConcLimit = nil
+		if s.modal.kind != modalNone {
+			s.closeModal()
+		}
 		// Stop the old stdin writer (its range loop exits on close) and drop the
 		// dead pipes before respawning.
 		if s.stdinCh != nil {
@@ -483,6 +527,20 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Kill+wait the core child on SIGHUP (terminal closed) / SIGTERM (kill) so it
+	// isn't orphaned and left running after the TUI exits. Best-effort: a missing
+	// handle (core not yet started) just exits.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		<-sigCh
+		if p := coreProcess; p != nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+		os.Exit(0)
+	}()
+
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
 	if loadSettings().MouseWheel {
 		opts = append(opts, tea.WithMouseCellMotion())

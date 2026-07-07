@@ -513,11 +513,12 @@ async fn discover_models_openai(
 /// Model cache TTL in seconds (8 hours).
 const MODELS_CACHE_TTL: u64 = 28800;
 
-/// Cache schema version. Bumped when the parsed model shape changes so a stale
-/// cache written by an older parser (e.g. one that stored empty thinking_levels
-/// or wrong vision flags because it read the wrong field) is treated as a miss
-/// and refreshed, instead of masking the fix for up to the TTL window.
-const MODELS_CACHE_VERSION: u64 = 5;
+/// Cache schema version. Bumped when the parsed model shape OR the cache file
+/// shape changes so a stale cache written by an older parser (e.g. one that
+/// stored empty thinking_levels or wrong vision flags, or the old single-`key`
+/// file shape) is treated as a miss and refreshed, instead of masking the fix
+/// for up to the TTL window.
+const MODELS_CACHE_VERSION: u64 = 6;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -534,14 +535,14 @@ fn read_models_cache(cache_key: &str) -> Option<Vec<ModelInfo>> {
     let path = models_cache_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     let cache: Value = serde_json::from_str(&content).ok()?;
-    let cached_key = cache.get("key")?.as_str()?;
-    if cached_key != cache_key {
-        return None;
-    }
     if !cache_version_ok(&cache) {
         return None;
     }
-    let updated = cache.get("updated_at")?.as_u64()?;
+    // The cache holds a `key -> entry` map so multiple providers' caches coexist
+    // (previously a single `key` field meant each provider's write clobbered the
+    // file, so only the last writer ever hit on the next startup).
+    let entry = cache.get("entries")?.get(cache_key)?;
+    let updated = entry.get("updated_at")?.as_u64()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -549,21 +550,18 @@ fn read_models_cache(cache_key: &str) -> Option<Vec<ModelInfo>> {
     if now.saturating_sub(updated) > MODELS_CACHE_TTL {
         return None;
     }
-    parse_cache_models(&cache)
+    parse_cache_models(entry)
 }
 
 fn read_models_cache_stale(cache_key: &str) -> Option<Vec<ModelInfo>> {
     let path = models_cache_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     let cache: Value = serde_json::from_str(&content).ok()?;
-    let cached_key = cache.get("key")?.as_str()?;
-    if cached_key != cache_key {
-        return None;
-    }
     if !cache_version_ok(&cache) {
         return None;
     }
-    parse_cache_models(&cache)
+    let entry = cache.get("entries")?.get(cache_key)?;
+    parse_cache_models(entry)
 }
 
 fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
@@ -592,13 +590,53 @@ fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
             })
         })
         .collect();
+    // Load the existing entries map (if present and same schema) so this
+    // provider's entry is MERGED in rather than clobbering the whole file —
+    // multi-provider caches then all hit on the next startup instead of only
+    // the last writer's. Written atomically (temp + fsync + rename) so a crash
+    // mid-write can't truncate/corrupt the cache file.
+    let mut entries: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .filter(cache_version_ok)
+        .and_then(|c| c.get("entries").cloned())
+        .and_then(|e| e.as_object().cloned())
+        .unwrap_or_default();
+    entries.insert(
+        cache_key.to_string(),
+        json!({ "updated_at": now, "models": models_json }),
+    );
     let cache = json!({
-        "key": cache_key,
         "version": MODELS_CACHE_VERSION,
-        "updated_at": now,
-        "models": models_json,
+        "entries": entries,
     });
-    let _ = std::fs::write(&path, serde_json::to_string(&cache).unwrap_or_default());
+    atomic_write_cache_file(
+        &path,
+        &serde_json::to_string(&cache).unwrap_or_else(|_| "{}".into()),
+    );
+}
+
+/// Atomically write `content` to the models-cache `path`: temp file + fsync +
+/// rename, so a crash/SIGKILL/OOM mid-write can never leave the cache truncated
+/// or partially written (bare `std::fs::write` is truncate-then-write).
+fn atomic_write_cache_file(path: &std::path::Path, content: &str) {
+    use std::io::Write;
+    let tmp: std::path::PathBuf = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".tmp");
+        std::path::PathBuf::from(p)
+    };
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {

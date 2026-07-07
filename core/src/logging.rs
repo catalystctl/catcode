@@ -26,7 +26,23 @@ pub struct TurnMetrics {
 
 impl Logger {
     pub fn new(path: Option<&std::path::Path>) -> Self {
-        let file = path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
+        let file = path.and_then(|p| {
+            // Rotate once if the debug log has grown past a generous cap, so a
+            // long-running session with UMANS_HARNESS_DEBUG_LOG set can't fill
+            // the disk. Single rotation: the current file is renamed to <path>.1
+            // (overwriting any prior .1), then a fresh file is opened below.
+            // Best-effort — rename errors are ignored (we just keep appending to
+            // the oversized file). Only checked on open, not on every write.
+            const ROTATE_CAP: u64 = 64 * 1024 * 1024; // 64 MiB
+            if let Ok(meta) = std::fs::metadata(p) {
+                if meta.len() > ROTATE_CAP {
+                    let mut rotated = p.as_os_str().to_os_string();
+                    rotated.push(".1");
+                    let _ = std::fs::rename(p, &rotated);
+                }
+            }
+            OpenOptions::new().create(true).append(true).open(p).ok()
+        });
         Self {
             file: Mutex::new(file),
             turns: std::sync::atomic::AtomicU64::new(0),

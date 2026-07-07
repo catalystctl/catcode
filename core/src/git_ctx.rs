@@ -1,7 +1,7 @@
 // Filesystem-based git state reader. Reads .git directory directly
 // (HEAD, refs, config, packed-refs) to extract branch, SHA, remote,
 // and default branch. No external git dependency — pure std.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct GitContext {
     pub branch: String,
@@ -13,15 +13,22 @@ pub struct GitContext {
 /// Read git context from a workspace directory. Returns None if the
 /// workspace is not a git repository (no .git directory).
 pub fn read_git_context(workspace: &Path) -> Option<GitContext> {
-    let git_dir = workspace.join(".git");
-    if !git_dir.is_dir() {
+    let dot_git = workspace.join(".git");
+    // `.git` is usually a directory, but for a linked worktree or submodule it
+    // is a FILE — a `gitdir: <path>` pointer. Treat either as a valid repo.
+    if !dot_git.exists() {
         return None;
     }
+    // Follow the gitdir pointer (if any) to the real git dir, then resolve the
+    // common dir: linked worktrees keep HEAD in their own git dir but share
+    // refs/config/packed-refs with the main repo via a `commondir` file.
+    let git_dir = resolve_gitdir(&dot_git, workspace);
+    let common_dir = resolve_common_dir(&git_dir);
 
     let branch = read_branch(&git_dir);
-    let head_sha = read_head_sha(&git_dir, &branch);
-    let remote_url = read_remote_url(&git_dir);
-    let default_branch = read_default_branch(&git_dir);
+    let head_sha = read_head_sha(&common_dir, &branch);
+    let remote_url = read_remote_url(&common_dir);
+    let default_branch = read_default_branch(&common_dir);
 
     Some(GitContext {
         branch,
@@ -46,6 +53,46 @@ pub fn git_context_injection(ctx: &GitContext) -> String {
 }
 
 // --- internal helpers ---
+
+/// If `.git` is a `gitdir: <path>` pointer file, follow it to the real git dir
+/// (a relative path is resolved against the worktree root — the directory that
+/// contains the `.git` file). Otherwise return the path unchanged (a normal
+/// `.git` directory). Mirrors `git rev-parse --git-dir` for worktrees/submodules
+/// without shelling out to `git`.
+fn resolve_gitdir(dot_git: &Path, workspace: &Path) -> PathBuf {
+    if dot_git.is_file() {
+        if let Ok(content) = std::fs::read_to_string(dot_git) {
+            let line = content.lines().next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("gitdir: ") {
+                let p = PathBuf::from(rest);
+                if p.is_absolute() {
+                    return p;
+                }
+                return workspace.join(p);
+            }
+        }
+    }
+    dot_git.to_path_buf()
+}
+
+/// Resolve the common git dir (shared refs/config/packed-refs) for a linked
+/// worktree. A worktree's git dir contains a `commondir` file pointing at the
+/// main `.git`; for a normal repo or submodule there is none, so the git dir
+/// itself is the common dir. Mirrors `git rev-parse --git-common-dir`.
+fn resolve_common_dir(git_dir: &Path) -> PathBuf {
+    let commondir_file = git_dir.join("commondir");
+    if let Ok(content) = std::fs::read_to_string(&commondir_file) {
+        let line = content.lines().next().unwrap_or("").trim();
+        if !line.is_empty() {
+            let p = PathBuf::from(line);
+            if p.is_absolute() {
+                return p;
+            }
+            return git_dir.join(p);
+        }
+    }
+    git_dir.to_path_buf()
+}
 
 fn read_branch(git_dir: &Path) -> String {
     let head_path = git_dir.join("HEAD");
@@ -294,6 +341,72 @@ mod tests {
         fs::remove_file(origin.join("main")).unwrap();
         // No main, no master → falls back to "main".
         let ctx = read_git_context(&d).expect("should find .git");
+        assert_eq!(ctx.default_branch, "main");
+    }
+
+    fn unique_dir(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static M: AtomicU64 = AtomicU64::new(0);
+        let n = M.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("{prefix}_{n}"));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn gitdir_file_pointer_is_followed() {
+        // A submodule's `.git` is a FILE: a `gitdir: <path>` pointer to a
+        // complete git dir. The reader must follow it instead of returning None
+        // (the old `is_dir()` gate dropped all worktree/submodule context).
+        let main = tmp_git(
+            "feature/sub",
+            "0123456789abcdef",
+            Some("git@github.com:u/sub.git"),
+            "main",
+        );
+        let main_git = main.join(".git");
+        // Workspace whose `.git` is a pointer file (not a directory).
+        let ws = unique_dir("umans_git_ctx_sub");
+        fs::write(ws.join(".git"), format!("gitdir: {}\n", main_git.display())).unwrap();
+        let ctx = read_git_context(&ws).expect("gitdir pointer should resolve");
+        assert_eq!(ctx.branch, "feature/sub");
+        assert_eq!(ctx.head_sha, short("0123456789abcdef"));
+        assert_eq!(ctx.remote_url.as_deref(), Some("git@github.com:u/sub.git"));
+        assert_eq!(ctx.default_branch, "main");
+    }
+
+    #[test]
+    fn linked_worktree_uses_commondir() {
+        // A linked worktree's `.git` points to a per-worktree git dir that holds
+        // only HEAD; refs/config/packed-refs live in the COMMON dir (main .git),
+        // referenced by a `commondir` file. HEAD must come from the worktree dir
+        // and everything else from the common dir.
+        let main = tmp_git(
+            "main",
+            "abcdef0123456789",
+            Some("git@github.com:u/wt.git"),
+            "main",
+        );
+        let main_git = main.join(".git");
+        // The worktree's branch is a normal ref stored in the common (main) repo.
+        fs::write(main_git.join("refs/heads/wt-branch"), "abcdef0123456789\n").unwrap();
+
+        // Per-worktree git dir: HEAD + a commondir pointer to the main repo.
+        let wt_git = unique_dir("umans_git_ctx_wtgit");
+        fs::write(wt_git.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        fs::write(wt_git.join("commondir"), format!("{}\n", main_git.display())).unwrap();
+
+        // Workspace whose `.git` is a pointer to the per-worktree git dir.
+        let ws = unique_dir("umans_git_ctx_wtws");
+        fs::write(ws.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        let ctx = read_git_context(&ws).expect("worktree should resolve");
+        // Branch from the worktree's own HEAD.
+        assert_eq!(ctx.branch, "wt-branch");
+        // SHA/remote/default pulled from the common (main) dir.
+        assert_eq!(ctx.head_sha, short("abcdef0123456789"));
+        assert_eq!(ctx.remote_url.as_deref(), Some("git@github.com:u/wt.git"));
         assert_eq!(ctx.default_branch, "main");
     }
 }

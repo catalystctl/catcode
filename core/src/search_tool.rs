@@ -17,7 +17,21 @@ use crate::config::Config;
 use crate::fetch_tool::{egress_check, html_to_text};
 use crate::tools::{smart_truncate, Outcome};
 use regex::Regex;
+use std::sync::LazyLock;
 use serde_json::{json, Value};
+
+/// Hoisted (compiled once at first use) instead of recompiled on every
+/// web_search call. DDG Lite markup is stable enough that these don't change
+/// at runtime, and web_search may run several times in a session.
+static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+class="result-link"\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
+});
+static SNIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"class="result-snippet"[^>]*>([\s\S]*?)</td>"#).unwrap()
+});
+static ANY_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
+});
 
 /// Percent-decode a query-string value (no `percent-encoding` crate dep).
 /// Handles `%XX` hex escapes and `+`→space. Malformed `%` sequences are passed
@@ -92,11 +106,7 @@ struct Hit {
 /// nothing (markup drift / captcha), falls back to scraping any `<a href>`
 /// whose href looks like a real external result.
 fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
-    let link_re =
-        Regex::new(r#"<a\s+class="result-link"\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap();
-    let snip_re = Regex::new(r#"class="result-snippet"[^>]*>([\s\S]*?)</td>"#).unwrap();
-
-    let titles_urls: Vec<(String, String)> = link_re
+    let titles_urls: Vec<(String, String)> = LINK_RE
         .captures_iter(html)
         .map(|c| {
             let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -105,7 +115,7 @@ fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
         })
         .filter(|(t, u)| !t.is_empty() && !u.is_empty())
         .collect();
-    let snippets: Vec<String> = snip_re
+    let snippets: Vec<String> = SNIP_RE
         .captures_iter(html)
         .map(|c| cell_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
         .collect();
@@ -126,9 +136,8 @@ fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
     // Fallback: scrape external-looking <a href> links. Filters out anchors,
     // javascript:, and DDG-internal nav links. This is looser but still useful
     // when the structured classes drift.
-    let any_link = Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap();
     let mut hits: Vec<Hit> = Vec::new();
-    for c in any_link.captures_iter(html) {
+    for c in ANY_LINK_RE.captures_iter(html) {
         let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
         let title = cell_text(c.get(2).map(|m| m.as_str()).unwrap_or(""));
         if (href.starts_with("http://")
@@ -179,7 +188,9 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
             cfg.fetch_timeout_secs.max(1),
         ))
         .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(crate::fetch_tool::allowlist_redirect_policy(
+            cfg.fetch_allowlist.clone(),
+        ))
         // DDG blocks obvious bot user-agents; use a plain browser UA.
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
         .build()

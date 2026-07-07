@@ -44,6 +44,28 @@ fn host_allowed(host: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|p| host_matches(host, p))
 }
 
+/// A redirect policy that re-checks the fetch_allowlist on EVERY redirect hop,
+/// not just the original URL. `Policy::limited(5)` would follow a
+/// docs.rs → 169.254.169.254 (cloud-metadata) or → localhost redirect straight
+/// to an internal host, defeating the `--no-network` + `fetch_allowlist` opt-in
+/// security model (the whole point: bash stays offline, fetch reaches only
+/// listed hosts). A redirect whose target host isn't allowed is stopped — the
+/// 3xx response is returned without following, and the disallowed host is
+/// never contacted. Shared by `fetch` and `web_search` so both honor the same
+/// redirect policy.
+pub(crate) fn allowlist_redirect_policy(
+    allowlist: Vec<String>,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let host = attempt.url().host_str().unwrap_or("").to_ascii_lowercase();
+        if host_allowed(&host, &allowlist) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// Remove every case-insensitive `<open ...>...</open>` block from `s`
 /// (used to drop `<script>`/`<style>` so their text doesn't leak into the
 /// readable output). Bounded bodies keep this affordable despite the
@@ -195,7 +217,7 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
             cfg.fetch_timeout_secs.max(1),
         ))
         .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(allowlist_redirect_policy(cfg.fetch_allowlist.clone()))
         .user_agent("umans-harness-fetch/0.1")
         .build()
     {

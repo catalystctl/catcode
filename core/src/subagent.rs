@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
 
 // ---------------------------------------------------------------------------
 // Frontmatter parsing (port of frontmatter.ts)
@@ -773,7 +775,10 @@ fn prune_terminal_runs(runs: &mut HashMap<String, SubagentRun>) {
     }
     let mut terminal: Vec<(u64, String)> = runs
         .iter()
-        .filter(|(_, r)| r.state != "running")
+        // A `paused` (interrupted) run is NOT droppable — the user may still
+        // `resume`/`steer` it. Only genuinely terminal runs (completed/failed)
+        // are eligible for eviction.
+        .filter(|(_, r)| r.state != "running" && r.state != "paused")
         .map(|(id, r)| (r.ended_at.unwrap_or(r.started_at), id.clone()))
         .collect();
     if terminal.len() <= MAX_TERMINAL_RUNS {
@@ -996,7 +1001,13 @@ async fn run_single(
     );
     emit_subagent_message(run_id, "user", task);
 
-    let result = run_agent(
+    // Wrap the run in catch_unwind so a panic inside run_agent_inner (e.g. the
+    // old char-boundary `truncate` bug, a future unwrap, or a serde panic) is
+    // CAUGHT here and the run still gets finalized + its mailbox unregistered.
+    // Without this, a panic unwound past run_single's finalize, leaving the run
+    // stuck "running" forever (pinning its whole conversation + cancel token)
+    // and the dead mailbox advertised to peers (5-min intercom wedges).
+    let result = match AssertUnwindSafe(run_agent(
         st,
         client,
         provider,
@@ -1013,8 +1024,31 @@ async fn run_single(
         bridge,
         &run_cancel,
         messages,
-    )
-    .await;
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(o) => o,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("(non-string panic payload)");
+            emit(
+                &Event::new("error").with(
+                    "message",
+                    json!(format!(
+                        "subagent {} panicked (finalizing run): {msg}",
+                        run_id
+                    )),
+                ),
+            );
+            Outcome::err(format!(
+                "subagent {run_id} terminated unexpectedly (panic): {msg}"
+            ))
+        }
+    };
 
     // Finalize run state.
     let final_state = if result.ok { "completed" } else { "failed" };
@@ -1531,7 +1565,7 @@ async fn dispatch_subagent_tool(
     let restricted = if matches!(cfg.approval, crate::config::Approval::Never) {
         None
     } else {
-        crate::restricted_path_for_tool(name, args)
+        crate::restricted_path_for_tool(name, args, &cfg.workspace)
     };
 
     // Approval gate + permission rules. A subagent is model-driven (the parent
@@ -2030,10 +2064,17 @@ fn emit_subagent_summary(sub_in: u64, sub_out: u64, sub_cached: u64, last_model:
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    // Walk back from `max` to the nearest UTF-8 char boundary so we never panic
+    // slicing into the middle of a multi-byte character (model prose, code with
+    // CJK/emoji/smart quotes routinely contains them). The main loop uses the
+    // char-safe `smart_truncate`; this is the subagent equivalent.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Per-run backstop to catch a runaway/looping subagent (no per-subagent
@@ -2304,14 +2345,9 @@ async fn run_chain(
     let chain_dir = std::env::temp_dir().join(format!("umans-subagent-chain-{}", run_id));
     let _ = std::fs::create_dir_all(&chain_dir);
 
-    let mut outputs: HashMap<String, String> = HashMap::new();
-    let mut previous = String::new();
-
     // Child token so interrupt_action cancels JUST this chain (and a parent
     // /abort still propagates through it), not the parent orchestrator/turn
-    // and its siblings — matching run_single/run_parallel. Previously this
-    // stored `cancel.clone()` (the parent token), so interrupting a chain run
-    // cancelled the whole parent turn and every concurrent sibling.
+    // and its siblings — matching run_single/run_parallel.
     let run_cancel = cancel.child_token();
     let chain_agents: Vec<String> = chain
         .iter()
@@ -2344,89 +2380,104 @@ async fn run_chain(
         started,
     );
 
-    for (step_i, step) in chain.iter().enumerate() {
-        if run_cancel.is_cancelled() {
-            return Outcome::ok("[chain aborted]");
-        }
-        // parallel group?
-        if let Some(group) = step.get("parallel").and_then(|v| v.as_array()) {
-            let group_args = json!({ "tasks": group, "context": args.get("context").and_then(|v| v.as_str()).unwrap_or("fresh"), "concurrency": step.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(cfg.subagents.parallel_concurrency as u64) });
-            let o = Box::pin(run_parallel(
+    // The step loop runs in an inner async block so EVERY exit path (abort,
+    // unknown agent, a failed step, or clean completion) falls through to the
+    // finalize + chain_dir cleanup below. Previously an early `return` skipped
+    // the parent run's finalize (leaving it "running" forever, pinning its
+    // messages + cancel token) AND leaked the chain_dir temp directory.
+    let outcome = async {
+        let mut outputs: HashMap<String, String> = HashMap::new();
+        let mut previous = String::new();
+
+        for (step_i, step) in chain.iter().enumerate() {
+            if run_cancel.is_cancelled() {
+                return Outcome::ok("[chain aborted]");
+            }
+            // parallel group?
+            if let Some(group) = step.get("parallel").and_then(|v| v.as_array()) {
+                let group_args = json!({ "tasks": group, "context": args.get("context").and_then(|v| v.as_str()).unwrap_or("fresh"), "concurrency": step.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(cfg.subagents.parallel_concurrency as u64) });
+                let o = Box::pin(run_parallel(
+                    st,
+                    client,
+                    provider,
+                    parent_model,
+                    group,
+                    &group_args,
+                    depth,
+                    &run_cancel,
+                ))
+                .await;
+                if !o.ok {
+                    return Outcome::err(format!(
+                        "chain step {step_i} (parallel group) failed: {}",
+                        o.output
+                    ));
+                }
+                previous = o.output.clone();
+                if let Some(as_name) = step.get("as").and_then(|v| v.as_str()) {
+                    outputs.insert(as_name.to_string(), o.output.clone());
+                }
+                continue;
+            }
+
+            let an = step.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+            let agent = match find_agent(&agents, an) {
+                Some(a) => a.clone(),
+                None => return Outcome::err(format!("chain step {step_i}: unknown agent '{an}'")),
+            };
+            let task_tmpl = step
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{previous}");
+            let task = render_task(task_tmpl, &previous, &outputs, &chain_dir);
+            let model_override = step.get("model").and_then(|v| v.as_str()).map(String::from);
+            let context = match args.get("context").and_then(|v| v.as_str()) {
+                Some("fork") => ContextKind::Fork,
+                Some("fresh") => ContextKind::Fresh,
+                _ => agent.default_context.clone().unwrap_or(ContextKind::Fresh),
+            };
+            let step_id = format!("{run_id}-{step_i}");
+            emit(&Event::new("info").with(
+                "message",
+                json!(format!(
+                    "chain step {step_i}+1: {} — {}",
+                    agent.name,
+                    truncate(&task, 80)
+                )),
+            ));
+            let o = run_single(
                 st,
                 client,
                 provider,
                 parent_model,
-                group,
-                &group_args,
+                &agent,
+                &task,
+                &step_id,
+                model_override,
+                context,
                 depth,
                 &run_cancel,
-            ))
+            )
             .await;
             if !o.ok {
                 return Outcome::err(format!(
-                    "chain step {step_i} (parallel group) failed: {}",
-                    o.output
+                    "chain step {step_i} ({}) failed: {}",
+                    agent.name, o.output
                 ));
             }
             previous = o.output.clone();
             if let Some(as_name) = step.get("as").and_then(|v| v.as_str()) {
                 outputs.insert(as_name.to_string(), o.output.clone());
             }
-            continue;
         }
-
-        let an = step.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-        let agent = match find_agent(&agents, an) {
-            Some(a) => a.clone(),
-            None => return Outcome::err(format!("chain step {step_i}: unknown agent '{an}'")),
-        };
-        let task_tmpl = step
-            .get("task")
-            .and_then(|v| v.as_str())
-            .unwrap_or("{previous}");
-        let task = render_task(task_tmpl, &previous, &outputs, &chain_dir);
-        let model_override = step.get("model").and_then(|v| v.as_str()).map(String::from);
-        let context = match args.get("context").and_then(|v| v.as_str()) {
-            Some("fork") => ContextKind::Fork,
-            Some("fresh") => ContextKind::Fresh,
-            _ => agent.default_context.clone().unwrap_or(ContextKind::Fresh),
-        };
-        let step_id = format!("{run_id}-{step_i}");
-        emit(&Event::new("info").with(
-            "message",
-            json!(format!(
-                "chain step {step_i}+1: {} — {}",
-                agent.name,
-                truncate(&task, 80)
-            )),
-        ));
-        let o = run_single(
-            st,
-            client,
-            provider,
-            parent_model,
-            &agent,
-            &task,
-            &step_id,
-            model_override,
-            context,
-            depth,
-            &run_cancel,
-        )
-        .await;
-        if !o.ok {
-            return Outcome::err(format!(
-                "chain step {step_i} ({}) failed: {}",
-                agent.name, o.output
-            ));
-        }
-        previous = o.output.clone();
-        if let Some(as_name) = step.get("as").and_then(|v| v.as_str()) {
-            outputs.insert(as_name.to_string(), o.output.clone());
-        }
+        Outcome::ok(previous)
     }
+    .await;
 
-    let final_state = "completed";
+    // Finalize the parent run record on every exit path, and remove the
+    // chain_dir temp directory (previously leaked — one per chain run,
+    // including failed/aborted ones — filling /tmp over a long session).
+    let final_state = if outcome.ok { "completed" } else { "failed" };
     let mut runs = st.subagent_runs.lock().await;
     let mut done_ended: u64 = started;
     if let Some(r) = runs.get_mut(&run_id) {
@@ -2437,7 +2488,8 @@ async fn run_chain(
     prune_terminal_runs(&mut runs);
     drop(runs);
     emit_subagent_done(&run_id, final_state, None, done_ended);
-    Outcome::ok(previous)
+    let _ = std::fs::remove_dir_all(&chain_dir);
+    outcome
 }
 
 /// Render a chain task template, substituting {previous}, {outputs.name},

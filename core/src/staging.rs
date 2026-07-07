@@ -22,6 +22,7 @@
 //!   untouched.
 
 use crate::config::home_dir;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Bump when the bundled default set changes meaningfully. The marker file
@@ -141,6 +142,24 @@ fn executable_rel_paths() -> &'static [&'static str] {
     ]
 }
 
+/// Write `content` to `path` atomically: a sibling temp file is written, fsync'd,
+/// then renamed over the target. On error the temp is removed, so a crash
+/// mid-write can never leave a truncated file that the per-file `exists()`
+/// short-circuit would then treat as complete (and never re-stage). Keeps the
+/// idempotent/non-clobbering semantics — only the write durability changes.
+fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_e| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// Ensure the global default files exist under `~/.umans-harness/`. Writes only
 /// files that are missing; never overwrites. Returns what it did.
 ///
@@ -171,7 +190,7 @@ pub fn stage_if_needed() -> StageResult {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&path, content).is_ok() {
+        if atomic_write(&path, content).is_ok() {
             written.push(rel.to_string());
             #[cfg(unix)]
             if executable_rel_paths().contains(&rel) {
@@ -184,7 +203,7 @@ pub fn stage_if_needed() -> StageResult {
     // Stamp the marker at the current version so subsequent runs short-circuit
     // `first_run` (we still re-scan for missing files above, but this keeps the
     // "is this the very first run" signal stable for user-facing messaging).
-    let _ = std::fs::write(&marker, &version);
+    let _ = atomic_write(&marker, &version);
 
     StageResult {
         first_run,

@@ -113,7 +113,7 @@ pub struct IntercomBus {
 impl IntercomBus {
     pub fn new() -> Self {
         let s = Self::default();
-        *s.orchestrator_target.lock().unwrap() = "orchestrator".to_string();
+        *s.orchestrator_target.lock().unwrap_or_else(|e| e.into_inner()) = "orchestrator".to_string();
         s.known_targets
             .lock()
             .unwrap()
@@ -123,7 +123,7 @@ impl IntercomBus {
 
     /// The orchestrator target the parent session answers as.
     pub fn orchestrator_target(&self) -> String {
-        self.orchestrator_target.lock().unwrap().clone()
+        self.orchestrator_target.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Create (idempotently) a mailbox for a target and register it as known.
@@ -131,12 +131,12 @@ impl IntercomBus {
         if target.is_empty() {
             return;
         }
-        let mut mb = self.mailboxes.lock().unwrap();
+        let mut mb = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
         if !mb.contains_key(target) {
             mb.insert(target.to_string(), Arc::new(Mailbox::new(target)));
         }
         drop(mb);
-        let mut kt = self.known_targets.lock().unwrap();
+        let mut kt = self.known_targets.lock().unwrap_or_else(|e| e.into_inner());
         if !kt.iter().any(|t| t == target) {
             kt.push(target.to_string());
         }
@@ -144,17 +144,17 @@ impl IntercomBus {
 
     /// Drop a mailbox when its subagent finishes.
     pub fn unregister(&self, target: &str) {
-        self.mailboxes.lock().unwrap().remove(target);
+        self.mailboxes.lock().unwrap_or_else(|e| e.into_inner()).remove(target);
         // Also drop it from the known-targets list so `targets()` no longer
         // advertises a peer whose mailbox (and run) is gone — otherwise a
         // subagent could `ask` a stale target and wedge until the 5-min timeout.
-        self.known_targets.lock().unwrap().retain(|t| t != target);
+        self.known_targets.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t != target);
     }
 
     /// Known peer targets (for the `intercom({action:"targets"})` introspection
     /// action and doctor diagnostics).
     pub fn targets(&self) -> Vec<String> {
-        self.known_targets.lock().unwrap().clone()
+        self.known_targets.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Post a fire-and-forget message into a target's mailbox. Returns Err if
@@ -164,7 +164,7 @@ impl IntercomBus {
         // The orchestrator always exists as a conceptual target even if no
         // mailbox was explicitly created for it (it answers via the TUI).
         if target != self.orchestrator_target() {
-            let mb = self.mailboxes.lock().unwrap();
+            let mb = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
             if !mb.contains_key(&target) {
                 return Err(format!(
                     "unknown intercom target '{target}'; use action:\"targets\" to list known peers"
@@ -174,9 +174,9 @@ impl IntercomBus {
         // If the recipient has a mailbox, push there. The orchestrator has no
         // mailbox (it answers via events), so its messages are surfaced by the
         // caller through `emit_intercom_message` instead.
-        let mailbox = self.mailboxes.lock().unwrap().get(&target).cloned();
+        let mailbox = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner()).get(&target).cloned();
         if let Some(mb) = mailbox {
-            mb.messages.lock().unwrap().push_back(msg.clone());
+            mb.messages.lock().unwrap_or_else(|e| e.into_inner()).push_back(msg.clone());
             mb.notify.notify_one();
         }
         Ok(())
@@ -185,10 +185,10 @@ impl IntercomBus {
     /// Read (and remove) the oldest message from a target's mailbox.
     pub fn receive(&self, target: &str) -> Option<IntercomMessage> {
         let mb = {
-            let guard = self.mailboxes.lock().unwrap();
+            let guard = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(target).cloned()
         }?;
-        let msg = mb.messages.lock().unwrap().pop_front();
+        let msg = mb.messages.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         msg
     }
 
@@ -198,10 +198,10 @@ impl IntercomBus {
     /// subagent loop's steer-message polling to avoid consuming peer messages.
     pub fn receive_from(&self, target: &str, from: &str) -> Option<IntercomMessage> {
         let mb = {
-            let guard = self.mailboxes.lock().unwrap();
+            let guard = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(target).cloned()
         }?;
-        let mut queue = mb.messages.lock().unwrap();
+        let mut queue = mb.messages.lock().unwrap_or_else(|e| e.into_inner());
         let pos = queue.iter().position(|m| m.from == from)?;
         queue.remove(pos)
     }
@@ -211,7 +211,7 @@ impl IntercomBus {
     pub fn create_ask(&self, ask: PendingAsk) -> Result<Arc<PendingAsk>, String> {
         let arc = Arc::new(ask);
         {
-            let mut pa = self.pending_asks.lock().unwrap();
+            let mut pa = self.pending_asks.lock().unwrap_or_else(|e| e.into_inner());
             pa.insert(arc.id.clone(), arc.clone());
         }
         // Surface it: if addressed to the orchestrator, emit an event so the
@@ -232,7 +232,7 @@ impl IntercomBus {
                 ask_id: arc.id.clone(),
             };
             if let Err(e) = self.post(msg) {
-                self.pending_asks.lock().unwrap().remove(&arc.id);
+                self.pending_asks.lock().unwrap_or_else(|e| e.into_inner()).remove(&arc.id);
                 return Err(e);
             }
         }
@@ -241,9 +241,9 @@ impl IntercomBus {
 
     /// Resolve a pending ask with a reply. Returns true if the ask existed.
     pub fn resolve_ask(&self, id: &str, reply: &str) -> bool {
-        let ask = self.pending_asks.lock().unwrap().remove(id);
+        let ask = self.pending_asks.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         if let Some(ask) = ask {
-            *ask.reply.lock().unwrap() = Some(reply.to_string());
+            *ask.reply.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply.to_string());
             ask.notify.notify_one();
             true
         } else {
@@ -254,16 +254,16 @@ impl IntercomBus {
     /// Take a pending ask (remove it) without resolving — used on cancel/abort
     /// so the awaiting task can wake and return.
     pub fn cancel_ask(&self, id: &str) {
-        let ask = self.pending_asks.lock().unwrap().remove(id);
+        let ask = self.pending_asks.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         if let Some(ask) = ask {
-            *ask.reply.lock().unwrap() = Some("[interrupted]".to_string());
+            *ask.reply.lock().unwrap_or_else(|e| e.into_inner()) = Some("[interrupted]".to_string());
             ask.notify.notify_one();
         }
     }
 
     /// Snapshot of pending ask ids (doctor diagnostics).
     pub fn pending_count(&self) -> usize {
-        self.pending_asks.lock().unwrap().len()
+        self.pending_asks.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -336,7 +336,7 @@ pub async fn execute_contact_supervisor(
     // orchestrator inattention; return an error so the model re-asks/escalates.
     let result = tokio::select! {
         _ = handle.notify.notified() => {
-            let reply = handle.reply.lock().unwrap().clone();
+            let reply = handle.reply.lock().unwrap_or_else(|e| e.into_inner()).clone();
             reply.unwrap_or_else(|| "[no reply]".to_string())
         }
         _ = cancel.cancelled() => {
@@ -436,7 +436,7 @@ pub async fn execute_intercom(
             };
             let result = tokio::select! {
                 _ = handle.notify.notified() => {
-                    handle.reply.lock().unwrap().clone().unwrap_or_else(|| "[no reply]".to_string())
+                    handle.reply.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "[no reply]".to_string())
                 }
                 _ = cancel.cancelled() => {
                     bus.cancel_ask(&handle.id);
@@ -546,7 +546,7 @@ mod tests {
         let r = bus.create_ask(ask);
         assert!(r.is_err(), "create_ask to unknown peer should error fast");
         // The ask must be removed from pending_asks on failure.
-        assert!(bus.pending_asks.lock().unwrap().is_empty());
+        assert!(bus.pending_asks.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 
     #[test]
@@ -571,7 +571,7 @@ mod tests {
         };
         let handle = bus.create_ask(ask).unwrap();
         assert!(bus.resolve_ask("a1", "do it"));
-        assert_eq!(handle.reply.lock().unwrap().clone().unwrap(), "do it");
+        assert_eq!(handle.reply.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap(), "do it");
         // second resolve fails (already removed)
         assert!(!bus.resolve_ask("a1", "again"));
     }
