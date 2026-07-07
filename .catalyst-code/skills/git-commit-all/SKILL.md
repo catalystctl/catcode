@@ -64,3 +64,4 @@ refactor(core): replace opaque Value conversation with typed Message enum
 - **Nothing to commit**: exit early with "nothing to commit, working tree clean"
 - **Unmerged paths** (conflicts): abort — `git add --all` would stage conflict markers; tell the user to resolve conflicts first
 - **Large binary files**: check `git diff --cached --stat` for suspicious files >1MB and warn before committing
+- **Multiple unrelated changes**: if the working tree contains two or more logically distinct changes (e.g. a feature plus an untracked skill, or a refactor plus an unrelated fix), commit them SEPARATELY — one commit per logical change — rather than muddling them into one. Stage each group with explicit `git add <paths>` (NOT `git add --all`), commit, then stage+commit the next. The single `git add --all` + one commit is only for changes that belong together.
