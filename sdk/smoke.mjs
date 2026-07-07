@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.CATCODE_CORE = process.env.CATCODE_CORE || join(process.cwd(), "core", "target", "release", "core");
-const cwd = mkdtempSync(join(tmpdir(), "umans-sdk-smoke-"));
+const cwd = mkdtempSync(join(tmpdir(), "catalyst-code-sdk-smoke-"));
 
 const proc = new CoreProcess({ cwd, approval: "never", idleTimeout: 60 });
 const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("ready timeout")), 15000));

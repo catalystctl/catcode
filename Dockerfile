@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     useradd -m harness
 WORKDIR /workspace
 COPY --from=core-builder /build/core/target/release/core /usr/local/bin/catcode-core
-COPY --from=tui-builder /tui /usr/local/bin/umans-tui
+COPY --from=tui-builder /tui /usr/local/bin/catcode
 
 # The core writes session/debug files here; the TUI reads settings here.
 RUN mkdir -p /home/harness/.config/catalyst-code/sessions && chown -R harness:harness /home/harness
@@ -53,4 +53,4 @@ ENV CATALYST_CODE_NO_NETWORK=0
 ENV CATALYST_CODE_IDLE_TIMEOUT=120
 
 # The TUI is the entry point; it spawns the core.
-ENTRYPOINT ["/usr/local/bin/umans-tui"]
+ENTRYPOINT ["/usr/local/bin/catcode"]

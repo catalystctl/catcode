@@ -5,7 +5,7 @@ A **pi-coding-agent-compatible** TypeScript SDK for the
 binary, speaks its JSONL stdio protocol, and exposes the
 [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
 API surface (plus the `@earendil-works/pi-ai` subset that pi-web uses) so a
-consumer written against the PI SDK runs unchanged against the umans harness.
+consumer written against the PI SDK runs unchanged against the Catalyst Code harness.
 
 > **No agent-loop reimplementation.** Model inference, tool execution, session
 > persistence and auto-compaction all run in the Rust `core`. This package only
@@ -143,7 +143,7 @@ src/
 
 ## Known adaptation points
 
-These are inherent differences between the umans harness and the PI session
+These are inherent differences between the Catalyst Code harness and the PI session
 model. They compile and run, but behave slightly differently — documented so
 pi-web can adapt if exact parity is needed:
 

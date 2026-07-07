@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.CATCODE_CORE = process.env.CATCODE_CORE || join(process.cwd(), "core", "target", "release", "core");
-const cwd = mkdtempSync(join(tmpdir(), "umans-sdk-hi-"));
+const cwd = mkdtempSync(join(tmpdir(), "catalyst-code-sdk-hi-"));
 
 const authStorage = AuthStorage.create();
 const modelRegistry = ModelRegistry.create(authStorage);

@@ -23,16 +23,16 @@ STAGE="catalyst-code-${VERSION}"
 rm -rf "dist/${STAGE}"
 mkdir -p "dist/${STAGE}/bin"
 cp core/target/release/core          "dist/${STAGE}/bin/catcode-core"
-cp tui/catalyst-code-tui             "dist/${STAGE}/bin/umans-tui"
+cp tui/catalyst-code-tui             "dist/${STAGE}/bin/catcode"
 cp README.md Dockerfile              "dist/${STAGE}/"
 cat > "dist/${STAGE}/INSTALL.md" <<EOF
 catalyst-code ${VERSION}
 
 Install:
-  sudo cp bin/catcode-core bin/umans-tui /usr/local/bin/
+  sudo cp bin/catcode-core bin/catcode /usr/local/bin/
 
 Run:
-  umans-tui            # spawns catcode-core from PATH or ../core/target/release
+  catcode            # spawns catcode-core from PATH or ../core/target/release
   catcode-core --help    # the core speaks stdio JSON; the TUI drives it
 
 First run: /key sk-...  then /model, then type a prompt.

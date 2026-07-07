@@ -45,7 +45,7 @@ func TestRenderSmoke(t *testing.T) {
 
 	// welcome screen: brand + a selectable example panel
 	welcome := stripANSI(s.renderBlocks())
-	for _, want := range []string{"Umans", "Examples", "Explain"} {
+	for _, want := range []string{"Catalyst Code", "Examples", "Explain"} {
 		if !strings.Contains(welcome, want) {
 			t.Errorf("welcome missing %q:\n%s", want, welcome)
 		}
@@ -81,7 +81,7 @@ func TestRenderSmoke(t *testing.T) {
 
 	// header: brand + tagline / cwd + tip (model & approval moved to footer)
 	hdr := stripANSI(s.renderHeader())
-	for _, want := range []string{"Umans", "Tip"} {
+	for _, want := range []string{"Catalyst Code", "Tip"} {
 		if !strings.Contains(hdr, want) {
 			t.Errorf("header missing %q:\n%s", want, hdr)
 		}
@@ -209,7 +209,7 @@ func TestThemeAndMetrics(t *testing.T) {
 		s.invalidateAll()
 		s.refresh()
 		out := stripANSI(s.renderHeader())
-		if !strings.Contains(out, "Umans") {
+		if !strings.Contains(out, "Catalyst Code") {
 			t.Errorf("theme %q header broke: %s", name, out)
 		}
 	}
@@ -333,7 +333,7 @@ func TestFullView(t *testing.T) {
 	s.refresh()
 
 	view := stripANSI(s.View())
-	for _, want := range []string{"Umans", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "tok/s", "Chat with the agent"} {
+	for _, want := range []string{"Catalyst Code", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "tok/s", "Chat with the agent"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("full view missing %q:\n%s", want, view)
 		}

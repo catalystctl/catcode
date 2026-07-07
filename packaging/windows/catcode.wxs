@@ -21,7 +21,7 @@
            Name="catcode"
            Language="1033"
            Version="$(var.Version)"
-           Manufacturer="Umans"
+           Manufacturer="Catalyst Code"
            UpgradeCode="8c4e2f7a-3b1d-4a6e-9c2b-1e5f8a7d0b3c">
 
     <Package InstallerVersion="200" Compressed="yes" InstallScope="perUser"/>

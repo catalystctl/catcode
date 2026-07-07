@@ -1,6 +1,6 @@
 // Config / paths — mirrors the catalyst-code conventions used by the Go TUI
 // (`tui/settings.go` `configDir()` / `sessionsDir()`) and the Rust core's
-// `--workspace` / `--session` / `UMANS_*` env flags (`core/src/config.rs`).
+// `--workspace` / `--session` / `CATALYST_CODE_*` env flags (`core/src/config.rs`).
 
 import { homedir, platform } from "node:os";
 import { join } from "node:path";

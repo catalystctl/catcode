@@ -46,7 +46,7 @@ A port of [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is built 
 
 **Built-in agents** (`.catalyst-code/agents/*.md`, overridable): `scout`, `researcher`, `planner`, `worker`, `reviewer`, `context-builder`, `oracle`, `delegate`. Each is a markdown file with YAML frontmatter (`tools`, `model`, `thinking`, `systemPromptMode`, `defaultContext`, …). Discover with `subagent({ action: "list" })` or `/subagents`.
 
-**Execution modes**: single `{ agent, task }`, parallel `{ tasks, concurrency }`, chain `{ chain: [...] }` (with `{previous}`/`{outputs.name}` templating and inline parallel groups), plus management actions `list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`/`resume`/`doctor`/`models`. Recursion is capped by `maxSubagentDepth` (default 2; env `UMANS_SUBAGENT_MAX_DEPTH`).
+**Execution modes**: single `{ agent, task }`, parallel `{ tasks, concurrency }`, chain `{ chain: [...] }` (with `{previous}`/`{outputs.name}` templating and inline parallel groups), plus management actions `list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`/`resume`/`doctor`/`models`. Recursion is capped by `maxSubagentDepth` (default 2; env `CATALYST_CODE_SUBAGENT_MAX_DEPTH`).
 
 **Intercom (the centerpiece):**
 - `contact_supervisor({ reason: "need_decision", message })` — a subagent asks the orchestrator a blocking question. It surfaces in the TUI as a prompt (`❓ subagent … asks: …`); type a reply + Enter (or Esc to unblock with best-judgment). This is how subagents prompt the orchestrator for issues.

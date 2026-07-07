@@ -105,7 +105,7 @@ export function Chat() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `umans-transcript-${new Date().toISOString().slice(0, 10)}.md`;
+    a.download = `catalyst-code-transcript-${new Date().toISOString().slice(0, 10)}.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

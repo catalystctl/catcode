@@ -8,7 +8,6 @@ core/target/
 
 # Go (tui/) compiled binaries
 tui/tui
-tui/umans-harness-tui
 tui/catalyst-code-tui
 tui/catcode
 tui/catcode.exe
@@ -21,7 +20,7 @@ dist/
 # Local tooling & editor state
 # =============================================================================
 
-# Umans harness runtime state (mutable) -- ignored. The shipped agent
+# Catalyst Code harness runtime state (mutable) -- ignored. The shipped agent
 # definitions, plugins, and skills under .catalyst-code/{agents,plugins,skills}
 # are NOT ignored and ARE tracked (they ship the subagent + plugin systems).
 .catalyst-code/sessions/

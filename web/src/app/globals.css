@@ -10,17 +10,18 @@
 [data-theme="dark"] {
   color-scheme: dark;
 
-  /* Obsidian ink scale — pure neutral grayscale (0% saturation), matching
-     the catalystctl frontend. Surface steps 4/6/9/13% map onto the ink ramp. */
-  --ink-950: 10 10 10;    /* 4%  page bg */
-  --ink-925: 13 13 13;    /* 5% */
-  --ink-900: 15 15 15;    /* 6%  card */
-  --ink-850: 20 20 20;    /* 8% */
-  --ink-800: 26 26 26;    /* 10% */
-  --ink-750: 31 31 31;    /* 12% */
-  --ink-700: 33 33 33;    /* 13% border */
-  --ink-600: 56 56 56;    /* 22% */
-  --ink-500: 87 87 87;    /* 34% */
+  /* Obsidian ink scale — pure neutral grayscale, lifted to a gray (not
+     near-black) page so the dark theme reads as gray. Monotonic: cards lift
+     above the page, code recesses slightly below it. */
+  --ink-950: 26 26 26;    /* 10% page bg (#1a1a1a) */
+  --ink-925: 31 31 31;    /* 12% */
+  --ink-900: 36 36 36;    /* 14% card (#242424) */
+  --ink-850: 41 41 41;    /* 16% */
+  --ink-800: 46 46 46;    /* 18% */
+  --ink-750: 51 51 51;    /* 20% */
+  --ink-700: 56 56 56;    /* 22% border (#383838) */
+  --ink-600: 66 66 66;    /* 26% */
+  --ink-500: 95 95 95;    /* 37% */
   --ink-400: 117 117 117; /* 46% */
   --ink-300: 163 163 163; /* 64% */
   --ink-200: 212 212 212; /* 83% */
@@ -38,12 +39,12 @@
   --info: 24 211 192;
 
   /* Prose / chrome extras. */
-  --bg-page: 10 10 10;
-  --bg-code: 8 8 8;            /* darker than page, like catalyst pre (3%) */
-  --bg-inline: 20 20 20;
-  --border-subtle: 33 33 33;
-  --scrollbar: 33 33 33;
-  --scrollbar-hover: 56 56 56;
+  --bg-page: 26 26 26;        /* matches ink-950 */
+  --bg-code: 20 20 20;        /* slightly recessed below page */
+  --bg-inline: 36 36 36;      /* matches ink-900 (card) */
+  --border-subtle: 56 56 56;  /* matches ink-700 */
+  --scrollbar: 56 56 56;
+  --scrollbar-hover: 82 82 82;
   --prose-heading: 240 240 240;
   --prose-muted: 133 133 133;
   --prose-link: 222 165 124;       /* accent-soft peach */

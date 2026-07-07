@@ -1,7 +1,7 @@
 catcode <VERSION> for macOS (<ARCH>)
 ================================
 
-catcode is the terminal interface for the Umans AI coding-agent harness. This .dmg
+catcode is the terminal interface for the Catalyst Code harness. This .dmg
 ships a single self-contained `catcode` executable — the Rust core is embedded,
 so there's no separate catcode-core to install.
 

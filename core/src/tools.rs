@@ -685,7 +685,7 @@ fn atomic_write_file(path: &std::path::Path, content: &str) -> std::io::Result<(
     use std::io::Write;
     let tmp: std::path::PathBuf = {
         let mut p = path.as_os_str().to_owned();
-        p.push(".umans-tmp");
+        p.push(".catalyst-code-tmp");
         std::path::PathBuf::from(p)
     };
     let res = (|| -> std::io::Result<()> {

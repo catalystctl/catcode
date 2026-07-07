@@ -31,13 +31,13 @@ type theme struct {
 
 var themes = []theme{
 	// --- Catalyst (Obsidian design system) — default ---
-	// Matches the catalystctl frontend: pure neutral-black grayscale with a
+	// Matches the catalystctl frontend: pure neutral-gray with a
 	// warm peach accent. Source: catalyst-website/src/styles/global.css.
 	// Kept first so it is the default for new users; existing users keep their
 	// saved theme (lookups are by name, not index).
 	{
 		name:    "catalyst",
-		bg:      "#0a0a0a", // 0 0% 4%
+		bg:      "#1a1a1a", // 0 0% 10% (gray, not near-black)
 		fg:      "#f0f0f0", // 0 0% 94%
 		dim:     "#4d4d4d", // 0 0% 30%
 		muted:   "#858585", // 0 0% 52%

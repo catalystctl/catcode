@@ -4671,7 +4671,7 @@ mod skill_manifest_tests {
 
     fn fresh_workspace() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "umans-skill-test-{}-{}",
+            "catalyst-code-skill-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

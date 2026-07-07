@@ -69,7 +69,7 @@ cleanup() {
   [[ -n "${TMPDIR_SELF:-}" && -d "${TMPDIR_SELF:-}" ]] && rm -rf "$TMPDIR_SELF"
 }
 trap cleanup EXIT
-TMPDIR_SELF="$(mktemp -d -t umans-inst.XXXXXX 2>/dev/null || mktemp -d)"
+TMPDIR_SELF="$(mktemp -d -t catalyst-inst.XXXXXX 2>/dev/null || mktemp -d)"
 
 # ── colors (degrade gracefully) ──────────────────────────────
 USE_COLOR=true

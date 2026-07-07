@@ -603,7 +603,7 @@ pub fn bridge_active(mode: &crate::config::IntercomBridgeMode, ctx: Option<&Cont
 // ---------------------------------------------------------------------------
 
 pub fn resolve_max_depth(cfg: &SubagentConfig) -> u32 {
-    std::env::var("UMANS_SUBAGENT_MAX_DEPTH")
+    std::env::var("CATALYST_CODE_SUBAGENT_MAX_DEPTH")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n: &u32| *n == 0 || *n >= 1)
@@ -2342,7 +2342,7 @@ async fn run_chain(
     let cfg = st.cfg.read().await.clone();
     let agents = discover_agents(&workspace, &cfg.subagents);
     let run_id = next_run_id();
-    let chain_dir = std::env::temp_dir().join(format!("umans-subagent-chain-{}", run_id));
+    let chain_dir = std::env::temp_dir().join(format!("catalyst-code-subagent-chain-{}", run_id));
     let _ = std::fs::create_dir_all(&chain_dir);
 
     // Child token so interrupt_action cancels JUST this chain (and a parent
