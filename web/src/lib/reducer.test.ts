@@ -1,7 +1,7 @@
 // Reducer unit tests — exercises the pure reduce() function for the key
 // message-assembly rules and state transitions. Run with `bun test`.
 import { test, expect, describe } from "bun:test";
-import { reduce, initialState } from "./reducer";
+import { reduce, initialState, MAX_TERMINAL_RUNS } from "./reducer";
 import type { AgentEvent, UIMessage } from "./types";
 
 const ev = (e: AgentEvent) => reduce(initialState, e);
@@ -266,5 +266,74 @@ describe("history replay", () => {
     expect(a.toolCalls).toHaveLength(1);
     expect(a.toolCalls[0].result?.output).toBe("a\nb\nc");
     expect(a.toolCalls[0].result?.unknown).toBe(true);
+  });
+});
+
+describe("reset clears stale prompts", () => {
+  test("reset drops a pending intercom ask", () => {
+    let s = ev({
+      type: "intercom_message",
+      id: "ic1",
+      from: "worker",
+      message: "decide?",
+      reason: "need_decision",
+    });
+    expect(s.pendingIntercom).not.toBeNull();
+    s = reduce(s, { type: "reset" });
+    expect(s.pendingIntercom).toBeNull();
+  });
+});
+
+describe("subagent run pruning", () => {
+  test("terminal runs are pruned past the cap (no unbounded growth)", () => {
+    let s = initialState;
+    const N = MAX_TERMINAL_RUNS + 40;
+    for (let i = 0; i < N; i++) {
+      const id = `run-${i}`;
+      s = reduce(s, {
+        type: "subagent_start",
+        run_id: id,
+        mode: "single",
+        agent: "worker",
+        agents: ["worker"],
+        task: "t",
+        depth: 0,
+        started_at: 1000 + i,
+      });
+      s = reduce(s, {
+        type: "subagent_done",
+        run_id: id,
+        state: "completed",
+        ended_at: 2000 + i,
+      });
+    }
+    expect(Object.keys(s.subagentRuns).length).toBeLessThanOrEqual(MAX_TERMINAL_RUNS);
+    // Most-recent terminal run is retained; oldest was pruned.
+    expect(s.subagentRuns[`run-${N - 1}`]).toBeDefined();
+    expect(s.subagentRuns["run-0"]).toBeUndefined();
+  });
+
+  test("running runs are never pruned even past the cap", () => {
+    let s = initialState;
+    const N = MAX_TERMINAL_RUNS + 12;
+    for (let i = 0; i < N; i++) {
+      const id = `run-${i}`;
+      s = reduce(s, {
+        type: "subagent_start",
+        run_id: id,
+        mode: "single",
+        agents: [],
+        task: "t",
+        depth: 0,
+        started_at: i,
+      });
+      // leave odd-indexed runs running; complete even ones.
+      if (i % 2 === 0)
+        s = reduce(s, { type: "subagent_done", run_id: id, state: "completed", ended_at: i });
+    }
+    for (let i = 1; i < N; i += 2) {
+      expect(s.subagentRuns[`run-${i}`]).toBeDefined();
+      expect(s.subagentRuns[`run-${i}`].state).toBe("running");
+    }
   });
 });

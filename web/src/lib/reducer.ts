@@ -99,6 +99,30 @@ function upsertRun(
   };
 }
 
+/** Cap on retained COMPLETED/FAILED subagent runs. The core prunes its own
+ *  terminal runs (core/src/subagent.rs::prune_terminal_runs, MAX=64); the web
+ *  reducer mirrors this so a long session with many delegations doesn't grow
+ *  `subagentRuns` (and each run's full transcript) without bound. Running runs
+ *  are always kept; only the oldest terminal runs beyond this cap are dropped. */
+export const MAX_TERMINAL_RUNS = 64;
+
+/** Drop the oldest terminal runs so `subagentRuns` can't grow unbounded over a
+ *  long session. Running runs are always retained. No-op when under the cap. */
+function pruneTerminalRuns(state: AgentState): AgentState {
+  const runs = Object.values(state.subagentRuns);
+  const terminal = runs.filter((r) => r.state !== "running");
+  if (terminal.length <= MAX_TERMINAL_RUNS) return state;
+  // Keep every running run + the most-recently-ended MAX_TERMINAL_RUNS.
+  const keep = new Set<string>(runs.filter((r) => r.state === "running").map((r) => r.id));
+  terminal
+    .sort((a, b) => (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0))
+    .slice(0, MAX_TERMINAL_RUNS)
+    .forEach((r) => keep.add(r.id));
+  const next: Record<string, SubagentRunView> = {};
+  for (const id of keep) next[id] = state.subagentRuns[id];
+  return { ...state, subagentRuns: next };
+}
+
 /** Begin a new assistant message if none is in flight. */
 function beginAssistant(state: AgentState, model?: string): AgentState {
   if (state.currentAssistantId) return state;
@@ -492,6 +516,9 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         streaming: false,
         pendingApproval: null,
         pendingAsk: null,
+        // A reset aborts the current turn (and any in-flight subagent), so a
+        // pending intercom ask is now stale — drop the banner so it can't hang.
+        pendingIntercom: null,
         workState: null,
       };
     case "done":
@@ -617,12 +644,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         return { ...r, items };
       });
     case "subagent_done":
-      return upsertRun(state, ev.run_id, (r) => ({
-        ...r,
-        state: ev.state ?? r.state,
-        summary: ev.summary ?? r.summary,
-        endedAt: ev.ended_at ?? r.endedAt,
-      }));
+      return pruneTerminalRuns(
+        upsertRun(state, ev.run_id, (r) => ({
+          ...r,
+          state: ev.state ?? r.state,
+          summary: ev.summary ?? r.summary,
+          endedAt: ev.ended_at ?? r.endedAt,
+        })),
+      );
 
     // ── Memory ──
     case "memory_list":

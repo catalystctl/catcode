@@ -218,7 +218,11 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       setCmdOpen(false);
       return;
     }
-    const q = text.toLowerCase();
+    // Strip the leading "/" so a partial like "/frontend" matches
+    // "/skill:frontend-design" (the label Contains "frontend"), mirroring
+    // filterCommands' own slash-stripping for built-in commands. Without this
+    // the skill filter required typing the full "/skill:<name>" prefix.
+    const q = text.toLowerCase().replace(/^\//, "");
     const cmdFiltered = filterCommands(text).map((c) => ({
       id: c.label,
       label: c.label,
@@ -386,7 +390,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     const items = e.clipboardData?.items;
     if (!items) return;
     let added = false;
-    for (const it of items) {
+    for (const it of Array.from(items)) {
       if (it.type.startsWith("image/")) {
         const file = it.getAsFile();
         if (file) {
@@ -478,7 +482,14 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             />
           )}
 
-          <div className="flex items-end gap-2 rounded-2xl border border-ink-700/70 bg-ink-900/80 p-2 shadow-lg shadow-black/20 transition-colors focus-within:border-accent/50 focus-within:shadow-glow">
+          <div
+            className={
+              "flex items-end gap-2 rounded-2xl p-2 shadow-lg shadow-black/20 transition-all duration-200 " +
+              (streaming
+                ? "composer-inflight"
+                : "border border-ink-700/70 bg-ink-900/80 focus-within:border-accent/50 focus-within:shadow-glow")
+            }
+          >
             <ImageAttach ref={attachRef} images={images} onAdd={onAddImage} onRemove={onRemoveImage} />
             <textarea
               ref={taRef}

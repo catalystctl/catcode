@@ -3,7 +3,7 @@
 // Markdown — react-markdown + GFM + syntax highlighting (rehype-highlight).
 // Code blocks get a header bar with the language + a copy button.
 
-import { memo, useState, type ComponentPropsWithoutRef } from "react";
+import { memo, useRef, useState, type ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -12,8 +12,13 @@ import { CopyIcon, CheckIcon } from "./icons";
 function CodeBlock({ className, children }: { className?: string; children?: React.ReactNode }) {
   const lang = /language-(\w+)/.exec(className || "")?.[1] ?? "text";
   const [copied, setCopied] = useState(false);
-  const code = String(children ?? "").replace(/\n$/, "");
+  const codeRef = useRef<HTMLElement>(null);
   const copy = () => {
+    // Read the rendered text from the DOM so the copied text is exactly what's
+    // shown — including highlighted code, where `children` is an array of
+    // rehype-highlight <span> tokens (so String(children) would be "[object
+    // Object],…"). Reading textContent at click time is robust to any tree.
+    const code = (codeRef.current?.textContent ?? "").replace(/\n$/, "");
     navigator.clipboard?.writeText(code).then(
       () => {
         setCopied(true);
@@ -35,7 +40,9 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
         </button>
       </div>
       <pre className="!my-0 !border-0 !rounded-none">
-        <code className={className}>{children}</code>
+        <code ref={codeRef} className={className}>
+          {children}
+        </code>
       </pre>
     </div>
   );

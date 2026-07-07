@@ -128,6 +128,45 @@ body {
   background-size: 22px 22px;
 }
 
+/* ── Composer inflight ring ─────────────────────────────────────────────────
+   A soft, flowing violet ring drawn around the prompt input while the model is
+   working (streaming). Uses the double-background trick: an opaque solid fill
+   clipped to the padding-box (so the interior keeps its normal bg and the
+   gradient never tints the text area) layered above the animated gradient, which
+   is clipped to the border-box so it only shows through the 1px transparent
+   border — tracing the rounded box exactly. A box-shadow halo adds the glow.
+   Applied as a sibling class set (swapped in for the idle border/bg classes), so
+   there is no specificity clash with focus-within styles. */
+.composer-inflight {
+  border: 1px solid transparent;
+  background-image:
+    linear-gradient(rgb(var(--ink-900) / 0.82), rgb(var(--ink-900) / 0.82)),
+    linear-gradient(
+      90deg,
+      rgb(var(--accent) / 0.18),
+      rgb(var(--accent-soft) / 0.95) 32%,
+      rgb(var(--accent-deep) / 0.95) 50%,
+      rgb(var(--accent-soft) / 0.95) 68%,
+      rgb(var(--accent) / 0.18)
+    );
+  background-origin: padding-box, border-box;
+  background-clip: padding-box, border-box;
+  -webkit-background-clip: padding-box, border-box;
+  background-size: 100% 100%, 200% 100%;
+  background-position: 0% 50%, 0% 50%;
+  animation: inflight-flow 3s linear infinite;
+  box-shadow:
+    0 0 0 1px rgb(var(--accent) / 0.12),
+    0 0 24px -6px rgb(var(--accent) / 0.5);
+}
+@keyframes inflight-flow {
+  0%   { background-position: 0% 50%, 0% 50%; }
+  100% { background-position: 0% 50%, 200% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .composer-inflight { animation: none; }
+}
+
 /* ── Markdown prose ──────────────────────────────────────────────────────── */
 .prose-umans {
   line-height: 1.65;

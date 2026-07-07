@@ -53,6 +53,10 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
 
   const send = () => {
     const t = text.trim();
+    // An empty "Send reply" used to dispatch an empty reply to the subagent
+    // (mirroring the TUI's fixed "Enter does not reply" bug). No-op instead —
+    // the user can type a reply or press Skip to defer to the subagent.
+    if (!t) return;
     onReply(t);
     setText("");
   };
@@ -93,7 +97,8 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={send}
-            className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft"
+            disabled={!text.trim()}
+            className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
           >
             <SendIcon width={14} height={14} /> Send reply
           </button>

@@ -207,7 +207,7 @@ export function Header(props: Props) {
           <div className="hidden items-center gap-2.5 font-mono text-[10px] text-ink-400 lg:flex">
             {m.prompt_tokens != null && <span title="input tokens">↑{formatTokens(m.prompt_tokens)}</span>}
             {m.tokens_out != null && <span title="output tokens">↓{formatTokens(m.tokens_out)}</span>}
-            {conc && conc.used != null && current.provider === conc.provider && (
+            {conc && conc.used != null && current?.provider === conc.provider && (
               <span title="live account-wide concurrency in use / plan limit" className="text-accent-soft">
                 {conc.limit == null
                   ? `Conc ${conc.used}/∞`
