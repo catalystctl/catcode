@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Catalyst Code — Installer  v1.0.0
-# Platform: Linux (systemd)
+# Platform: Linux (systemd) & macOS (launchd)
 #
 # Installs the catalyst-code TUI (`catcode`) + core (`catcode-core`) to your PATH,
 # and can optionally install the Next.js web frontend as a systemd service
