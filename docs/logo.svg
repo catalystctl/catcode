@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1254" height="1254" viewBox="0 0 1254 1254"
+     role="img" aria-labelledby="title desc"
+     shape-rendering="geometricPrecision">
+  <title id="title">Catalyst Code app icon</title>
+  <desc id="desc">A glossy black rounded-square app badge with a glowing amber segmented frame, central spark, and forward chevron.</desc>
+
+  <defs>
+    <!-- Badge surface -->
+    <radialGradient id="badgeSurface" cx="35%" cy="14%" r="95%">
+      <stop offset="0" stop-color="#2c2928"/>
+      <stop offset="0.22" stop-color="#191716"/>
+      <stop offset="0.62" stop-color="#090908"/>
+      <stop offset="1" stop-color="#020202"/>
+    </radialGradient>
+
+    <linearGradient id="badgeEdge" x1="0" y1="0" x2="0.92" y2="1">
+      <stop offset="0" stop-color="#fff4e4" stop-opacity="0.92"/>
+      <stop offset="0.11" stop-color="#b8997a" stop-opacity="0.62"/>
+      <stop offset="0.42" stop-color="#ff9e28" stop-opacity="0.58"/>
+      <stop offset="0.77" stop-color="#6f3615" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#f38a1f" stop-opacity="0.54"/>
+    </linearGradient>
+
+    <linearGradient id="badgeGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.15"/>
+      <stop offset="0.38" stop-color="#ffffff" stop-opacity="0.035"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Emblem metals -->
+    <linearGradient id="goldMain" gradientUnits="userSpaceOnUse" x1="455" y1="350" x2="730" y2="850">
+      <stop offset="0" stop-color="#fff3a7"/>
+      <stop offset="0.18" stop-color="#ffd067"/>
+      <stop offset="0.47" stop-color="#ffb02b"/>
+      <stop offset="0.72" stop-color="#ff8b00"/>
+      <stop offset="1" stop-color="#d46a08"/>
+    </linearGradient>
+
+    <linearGradient id="goldArrow" gradientUnits="userSpaceOnUse" x1="760" y1="495" x2="880" y2="710">
+      <stop offset="0" stop-color="#ffe58e"/>
+      <stop offset="0.35" stop-color="#ffc24e"/>
+      <stop offset="0.72" stop-color="#ffa018"/>
+      <stop offset="1" stop-color="#e57508"/>
+    </linearGradient>
+
+    <linearGradient id="goldDark" gradientUnits="userSpaceOnUse" x1="690" y1="355" x2="790" y2="845">
+      <stop offset="0" stop-color="#ffca65"/>
+      <stop offset="0.23" stop-color="#c87925"/>
+      <stop offset="0.48" stop-color="#7b3e17"/>
+      <stop offset="0.74" stop-color="#b9631f"/>
+      <stop offset="1" stop-color="#ffd16c"/>
+    </linearGradient>
+
+    <radialGradient id="sparkFill" cx="43%" cy="31%" r="82%">
+      <stop offset="0" stop-color="#ffe991"/>
+      <stop offset="0.35" stop-color="#ffc04c"/>
+      <stop offset="0.72" stop-color="#ff9a16"/>
+      <stop offset="1" stop-color="#df7109"/>
+    </radialGradient>
+
+    <!-- Shadows and glows -->
+    <filter id="ambientGlow" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="28"/>
+    </filter>
+
+    <filter id="badgeShadow" x="-30%" y="-30%" width="160%" height="175%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="29" result="shadowBlur"/>
+      <feOffset in="shadowBlur" dx="0" dy="28" result="shadowOffset"/>
+      <feFlood flood-color="#000000" flood-opacity="0.68" result="shadowColor"/>
+      <feComposite in="shadowColor" in2="shadowOffset" operator="in" result="shadow"/>
+
+      <feGaussianBlur in="SourceAlpha" stdDeviation="13" result="amberBlur"/>
+      <feFlood flood-color="#ff8c18" flood-opacity="0.38" result="amberColor"/>
+      <feComposite in="amberColor" in2="amberBlur" operator="in" result="amberGlow"/>
+
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="amberGlow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="symbolGlow" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="13" result="wideBlur"/>
+      <feFlood flood-color="#ff8a00" flood-opacity="0.42" result="wideColor"/>
+      <feComposite in="wideColor" in2="wideBlur" operator="in" result="wideGlow"/>
+
+      <feGaussianBlur in="SourceAlpha" stdDeviation="5" result="tightBlur"/>
+      <feFlood flood-color="#ffd369" flood-opacity="0.64" result="tightColor"/>
+      <feComposite in="tightColor" in2="tightBlur" operator="in" result="tightGlow"/>
+
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="lowerBlur"/>
+      <feOffset in="lowerBlur" dx="0" dy="8" result="lowerOffset"/>
+      <feFlood flood-color="#8b3300" flood-opacity="0.52" result="lowerColor"/>
+      <feComposite in="lowerColor" in2="lowerOffset" operator="in" result="lowerGlow"/>
+
+      <feMerge>
+        <feMergeNode in="wideGlow"/>
+        <feMergeNode in="lowerGlow"/>
+        <feMergeNode in="tightGlow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="innerWarmth" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+
+    <clipPath id="badgeClip">
+      <rect x="252" y="239" width="750" height="738" rx="166" ry="166"/>
+    </clipPath>
+  </defs>
+
+  <!-- Transparent canvas; no background rectangle -->
+
+  <!-- Warm aura and contact shadow -->
+  <rect x="250" y="237" width="754" height="742" rx="170" ry="170"
+        fill="none" stroke="#ff941c" stroke-width="14" opacity="0.30"
+        filter="url(#ambientGlow)"/>
+  <ellipse cx="627" cy="974" rx="302" ry="38"
+           fill="#6e2600" opacity="0.28" filter="url(#ambientGlow)"/>
+
+  <!-- App badge -->
+  <g filter="url(#badgeShadow)">
+    <rect x="252" y="239" width="750" height="738" rx="166" ry="166"
+          fill="url(#badgeSurface)" stroke="url(#badgeEdge)" stroke-width="3.5"/>
+  </g>
+
+  <!-- Surface gloss and subtle internal warmth -->
+  <g clip-path="url(#badgeClip)">
+    <rect x="266" y="250" width="722" height="282" rx="150" ry="150"
+          fill="url(#badgeGloss)"/>
+    <ellipse cx="600" cy="585" rx="330" ry="280"
+             fill="#ff8a00" opacity="0.025" filter="url(#innerWarmth)"/>
+    <path d="M 300 324 C 430 253, 810 243, 956 328"
+          fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="4"
+          stroke-linecap="round" filter="url(#ambientGlow)"/>
+  </g>
+
+  <!-- Emblem -->
+  <g filter="url(#symbolGlow)">
+    <!-- Top-left segmented frame -->
+    <path d="M402 560
+             V458
+             C402 404 444 363 498 363
+             H627
+             C632 363 635 366 635 371
+             V419
+             C635 424 632 427 627 427
+             H500
+             C480 427 466 442 466 462
+             V560
+             C466 565 462 568 457 568
+             H410
+             C405 568 402 565 402 560Z"
+          fill="url(#goldMain)"/>
+
+    <!-- Bottom-left segmented frame -->
+    <path d="M410 639
+             H457
+             C462 639 466 643 466 648
+             V730
+             C466 758 485 775 513 775
+             H632
+             C637 775 640 779 640 784
+             V832
+             C640 837 637 840 632 840
+             H504
+             C445 840 402 797 402 738
+             V647
+             C402 642 405 639 410 639Z"
+          fill="url(#goldMain)"/>
+
+    <!-- Top-right small segment -->
+    <path d="M697 363
+             H742
+             C771 363 788 380 788 409
+             V445
+             C777 434 762 427 746 427
+             H697
+             C692 427 689 424 689 419
+             V371
+             C689 366 692 363 697 363Z"
+          fill="url(#goldDark)"/>
+
+    <!-- Bottom-right small segment -->
+    <path d="M697 775
+             H746
+             C762 775 777 768 788 757
+             V794
+             C788 823 771 840 742 840
+             H697
+             C692 840 689 837 689 832
+             V783
+             C689 778 692 775 697 775Z"
+          fill="url(#goldDark)"/>
+
+    <!-- Forward chevron -->
+    <path d="M773 526 L866 602 L773 686"
+          fill="none" stroke="url(#goldArrow)" stroke-width="57"
+          stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Catalyst spark -->
+    <path d="M621 493
+             C637 555 665 585 727 602
+             C665 620 637 649 621 711
+             C605 649 577 620 515 602
+             C577 585 605 555 621 493Z"
+          fill="url(#sparkFill)"/>
+  </g>
+
+  <!-- Fine specular accents -->
+  <g fill="none" stroke="#fff6d8" stroke-linecap="round" opacity="0.42">
+    <path d="M436 446 C449 405 469 391 506 391 H608" stroke-width="3"/>
+    <path d="M438 666 V721 C438 777 472 806 522 806 H603" stroke-width="2.5" opacity="0.22"/>
+    <path d="M781 532 L855 594" stroke-width="3" opacity="0.32"/>
+    <path d="M601 558 C610 542 615 525 621 507" stroke-width="2.6" opacity="0.28"/>
+  </g>
+</svg>
