@@ -17,7 +17,7 @@ RUN cd core && cargo build --release
 # pulled 1.24 via GOTOOLCHAIN (P0-6). Dockerfile FROM lines cannot carry an
 # inline `#` comment — BuildKit treats it as extra FROM args and errors with
 # "FROM requires either one or three arguments". Keep comments on their own line.
-FROM golang:1.24-slim AS tui-builder
+FROM golang:1.24-bookworm AS tui-builder
 WORKDIR /build
 COPY tui/ ./tui/
 RUN cd tui && CGO_ENABLED=0 go build -o /tui .
