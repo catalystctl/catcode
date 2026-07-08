@@ -21,6 +21,7 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 jsonwebtoken = "9"
+libc = "0.2"
 
 [dev-dependencies]
 filetime = "0.2"

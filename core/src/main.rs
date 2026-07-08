@@ -9,6 +9,7 @@
 
 mod config;
 mod fetch_tool;
+mod fsutil;
 mod git_ctx;
 mod intercom;
 mod logging;

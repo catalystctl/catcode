@@ -214,9 +214,37 @@ func (s *settingsStore) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	// Unique temp file (random suffix via os.CreateTemp) in the SAME directory
+	// as the target, so two processes saving settings concurrently never
+	// share a temp file — a shared temp would interleave writes and rename a
+	// corrupted file over settings.json. Atomic rename within one filesystem
+	// is preserved (same dir).
+	base := filepath.Base(s.path)
+	f, err := os.CreateTemp(dir, "."+base+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Close()
+	// 0600: settings.json may hold API keys. CreateTemp already uses 0600 on
+	// Unix, but set it explicitly for parity with the original WriteFile path.
+	if err := os.Chmod(tmp, 0600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

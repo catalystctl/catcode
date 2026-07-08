@@ -571,6 +571,10 @@ pub fn save_providers_config(
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
+    // Cross-process lock: this is a read-modify-write (merge providers into
+    // existing config.json). Two processes logging in different providers
+    // concurrently would otherwise race and one provider's entry would be lost.
+    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))?;
     // Read existing config.json (if any) and merge so other keys survive.
     let mut root: Value = std::fs::read_to_string(&path)
         .ok()
@@ -585,19 +589,8 @@ pub fn save_providers_config(
         root["activeProvider"] = json!(a);
     }
     let data = serde_json::to_string_pretty(&root).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    // Unique-temp atomic write + 0600 (fsutil): no shared-temp collision.
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes())?;
     Ok(())
 }
 
