@@ -48,7 +48,7 @@ newline-delimited JSON protocol over stdio:
   - [Windows — MSI + `install-web.ps1`](#windows--msi--install-webps1)
   - [First run](#first-run)
   - [Web frontend (as a service)](#web-frontend-as-a-service)
-  - [Prebuilt binaries (optional)](#prebuilt-binaries-optional)
+  - [Prebuilt binaries (standalone)](#prebuilt-binaries-standalone)
 - [Features](#features)
 - [Providers and login](#providers-and-login)
 - [Build from source](#build-from-source)
@@ -64,25 +64,35 @@ newline-delimited JSON protocol over stdio:
 
 ## Installation
 
-The **recommended** path is the bundled install script — it builds from source
-and installs `catcode` + `catcode-core` to your PATH, and can also install the
-web frontend as a background service. Prebuilt binaries (AppImage / `.dmg` /
-MSI) are available as a no-toolchain [alternative](#prebuilt-binaries-optional).
+The **recommended** path is the bundled install script — it **downloads
+prebuilt binaries** (no compiler needed) and installs `catcode` +
+`catcode-core` to your PATH, and can also install the web frontend as a
+background service. Pass `--build-from-source` to compile locally instead.
+Standalone no-install binaries (AppImage / `.dmg` / MSI) are also
+[available](#prebuilt-binaries-standalone).
+
+> **Repo visibility:** the installer downloads from this repo's GitHub
+> Releases. Anonymous download works once the repo is **public**. If it is
+> private, point the installer at a public mirror with `--base-url <url>`
+> (Linux/macOS) / `-BaseUrl <url>` (Windows), or build from source.
 
 ### Linux & macOS — `install.sh` (recommended)
 
-`install.sh` builds the Rust core + Go TUI and installs them to your PATH. With
-`--with-web` it also builds the Next.js web frontend and installs it as a system
-service (**systemd** on Linux, **launchd** on macOS — auto-detected).
+`install.sh` **downloads prebuilt** `catcode` + `catcode-core` and installs
+them to your PATH — no Rust/Go/`next build` on the host. With `--with-web` it
+also downloads a prebuilt Next.js web bundle and installs it as a system
+service (**systemd** on Linux, **launchd** on macOS — auto-detected). The web
+service only needs a [Node](https://nodejs.org) or [Bun](https://bun.sh)
+runtime to *run* (not to build).
 
-**Prerequisites:** Rust (stable), Go **1.24.2+**, and (for the web) [Bun](https://bun.sh)
-or Node.js + npm. On macOS the Xcode Command Line Tools provide the C linker.
+**Prerequisites:** `curl` + `coreutils` (always); Node or Bun (only for
+`--with-web`). No compiler. Add `--build-from-source` to compile locally
+(then also needs Rust + Go 1.24.2+).
 
 ```bash
-git clone https://github.com/catalystctl/catcode.git
-cd catcode
-bash install.sh                 # build + install catcode and catcode-core
-bash install.sh --with-web      # …also build + install the web service
+bash install.sh                 # download + install catcode and catcode-core
+bash install.sh --with-web      # …also download + install the web service
+bash install.sh --version 0.2.0 # pin a specific release
 bash install.sh --dry-run        # preview the full plan, execute nothing
 ```
 
@@ -94,12 +104,16 @@ launch it from another folder to work on a different project.
 
 | Option | Default | Description |
 |:---|:---|:---|
-| `--with-web` | off | Also build + install the web frontend service |
-| `--repo <url>` | — | Clone `<url>` first, then install from it |
+| `--with-web` | off | Also download + install the web frontend service |
+| `--version <v>` | latest | Pin a release (e.g. `0.2.0` or `v0.2.0`) |
+| `--base-url <url>` | GitHub Releases | Download from a mirror instead of GitHub |
+| `--build-from-source` | off | Compile locally (cargo + go + next build) instead of downloading |
+| `--web-dir <path>` | `/opt/catalyst-code/web` (Linux), `~/Library/Application Support/catalyst-code/web` (macOS) | Web bundle install dir |
 | `--prefix <dir>` | `/usr/local/bin` | Binary install directory |
 | `--port <n>` | `49283` | Web service port |
 | `--host <h>` | `0.0.0.0` | Web bind host |
-| `--update` | — | `git pull` + rebuild + reinstall (+ restart the service) |
+| `--repo <url>` | — | (source path) Clone `<url>` first, then install from it |
+| `--update` | — | Re-download latest + reinstall (+ restart the service) |
 | `--uninstall` | — | Stop + remove binaries, service, and state |
 | `--dry-run` | off | Print the plan, execute nothing |
 | `-h`, `--help` | — | Show help |
@@ -113,7 +127,7 @@ launch it from another folder to work on a different project.
 | **Web logs** | `journalctl -u catalyst-code-web.service -f` | `~/Library/Logs/catalyst-code-web.log` |
 
 ```bash
-bash install.sh --update        # pull latest + rebuild + restart the service
+bash install.sh --update        # re-download latest + reinstall (+ restart service)
 bash install.sh --uninstall     # stop + remove binaries, service, and state
 ```
 
@@ -137,11 +151,12 @@ msiexec /i catcode-<ver>-windows.msi            # interactive (no UAC)
 msiexec /i catcode-<ver>-windows.msi /quiet     # silent
 ```
 
-**Web service** — `packaging/windows/install-web.ps1` builds the web from source
-and installs it as a **Windows Service via [NSSM](https://nssm.cc)** (starts at
-boot, auto-restarts, runs with no user logged in) or, if NSSM isn't installed, a
-**Scheduled Task at logon** with a restart-loop wrapper (zero extra deps).
-Requires `catcode-core.exe` already installed (MSI or `install.ps1`).
+**Web service** — `packaging/windows/install-web.ps1` **downloads a prebuilt
+web bundle** (and `catcode-core.exe` if not already present) and installs it as
+a **Windows Service via [NSSM](https://nssm.cc)** (starts at boot, auto-restarts,
+runs with no user logged in) or, if NSSM isn't installed, a **Scheduled Task at
+logon** with a restart-loop wrapper (zero extra deps). No `next build`; needs
+Node or Bun to run. Add `-BuildFromSource` to compile from a checkout instead.
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1
@@ -169,9 +184,10 @@ In the TUI:
 ### Web frontend (as a service)
 
 The Next.js web frontend is the browser equivalent of the TUI — it spawns one
-`catcode-core` and streams events to the browser over SSE. Because it is a
-Next.js app it is **built from source** (run from a checkout of this repo), and a
-`catcode-core` must already be installed for it to spawn.
+`catcode-core` and streams events to the browser over SSE. The installer
+downloads a **prebuilt** standalone bundle (no `next build` on the host); it
+only needs a Node or Bun runtime to run. `catcode-core` is installed
+alongside it (or auto-downloaded on Windows).
 
 | Platform | Install command | Service manager |
 |:---|:---|:---|
@@ -193,10 +209,10 @@ Set `CATCODE_CORE=<path>` if the core isn't found automatically (it searches
 > For public exposure, bind to `127.0.0.1` and put a TLS reverse proxy
 > (Caddy / nginx / IIS) in front.
 
-### Prebuilt binaries (optional)
+### Prebuilt binaries (standalone)
 
-No toolchain? Grab a prebuilt artifact (built by the `release-*.sh` scripts; see
-[Releases](#releases)):
+Prefer a single file with no installer? Grab a prebuilt artifact (built by the
+`release-*.sh` scripts; see [Releases](#releases)):
 
 | Platform | Artifact | Run |
 |:---|:---|:---|
@@ -372,16 +388,20 @@ management actions (`list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`
 Windows MSI + standalone `.exe`, macOS standalone + `.dmg` (arm64 + x86_64),
 Linux standalone + AppImage — running each platform script independently and
 reporting per-platform pass/fail (a host with a partial toolchain still ships
-what it can).
+what it can). `release-web.sh` builds the cross-platform prebuilt web bundle.
+All artifacts are published to a GitHub Release by `.github/workflows/release.yml`
+(on a `v*` tag push); the installers download them so users never compile.
 
 | Script | Outputs |
 |:---|:---|
-| `release-linux.sh` | standalone `catcode-<ver>-linux-<arch>` + `.AppImage` |
-| `release-macos.sh` | standalone `catcode-<ver>-macos-{arm64,x86_64}` + `.dmg` (cross-compiles via `cargo zigbuild`) |
-| `release-windows.sh` | `catcode-<ver>-windows.msi` + standalone `.exe` (cross-compiles `x86_64-pc-windows-gnu`) |
+| `release-linux.sh` | standalone `catcode-<ver>-linux-<arch>` + `.AppImage` + `catcode-core-<ver>-linux-<arch>` |
+| `release-macos.sh` | standalone `catcode-<ver>-macos-{arm64,x86_64}` + `.dmg` + `catcode-core-<ver>-macos-{arm64,x86_64}` (cross-compiles via `cargo zigbuild`) |
+| `release-windows.sh` | `catcode-<ver>-windows.msi` + standalone `.exe` + `.zip` + `catcode-core-<ver>-windows-x86_64.exe` (cross-compiles `x86_64-pc-windows-gnu`) |
+| `release-web.sh` | `catcode-web-<ver>.tar.gz` — prebuilt Next.js standalone bundle (one cross-platform tarball) |
 
 Each standalone embeds the Rust core via `go:embed` (`-tags embed_core`) so it's
-one self-contained file. Artifacts land in `dist/` with `.sha256` checksums.
+one self-contained file. The separate `catcode-core-*` binaries are for the web
+service's `CATCODE_CORE`. Artifacts land in `dist/` with `.sha256` checksums.
 
 ---
 

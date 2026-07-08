@@ -1,0 +1,100 @@
+name: Release
+
+# Build prebuilt artifacts for ALL platforms (Linux/macOS/Windows) on a single
+# ubuntu runner via cross-compilation, plus the cross-platform web bundle, and
+# publish them to a GitHub Release. The installers (install.sh /
+# install-web.ps1) download these — users never compile anything.
+#
+# Triggered by every push to master (and v* tags / manual dispatch). The
+# version IS the git commit (short SHA) — no manual version bumping; each push
+# produces a release keyed by its commit. The installers download `latest`
+# (the most recent commit's release) or a pinned SHA via --version.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (defaults to the git commit short SHA)'
+        required: false
+
+permissions:
+  contents: write   # needed by gh release create / softprops/action-gh-release
+
+jobs:
+  release:
+    name: Build + publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version (git commit short SHA)
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Using version: $v (commit)"
+
+      # --- Rust + cross-compile targets -----------------------------------
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu, aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      # --- Go (TUI builds) ------------------------------------------------
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # --- zig + cargo-zigbuild (macOS cross-compile from Linux) ----------
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.13.0'
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      # --- system deps: mingw (windows gnu), xorriso (dmg), jq, zip, appimagetool deps ---
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 xorriso jq zip curl python3 file libfuse2
+      - name: Install Bun (web build)
+        uses: oven-sh/setup-bun@v2
+
+      # --- build everything -----------------------------------------------
+      - name: Build all platform artifacts (TUI + core, all platforms)
+        run: bash release-all.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Build web bundle (prebuilt Next.js standalone)
+        run: bash release-web.sh "${{ steps.ver.outputs.version }}"
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      # --- publish ---------------------------------------------------------
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Release tag = the version (the commit short SHA), unless a v* tag push.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="${{ steps.ver.outputs.version }}"
+          fi
+          echo "Publishing release '$tag'..."
+          # --target master creates the SHA tag at HEAD (no pre-existing tag needed).
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" --target master --title "$tag" --generate-notes dist/*
+          fi

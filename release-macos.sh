@@ -19,11 +19,11 @@
 #   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 #   cargo install cargo-zigbuild      # and put zig on PATH
 #
-#   ./release-macos.sh [version]     # version defaults to core/Cargo.toml
+#   ./release-macos.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
+VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
 EMBED_FILE="tui/embed/catcode-core"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
@@ -98,6 +98,12 @@ build_arch() {
 	rm -f "$EMBED_FILE"
 	echo "    -> ${out}  ($(du -h "${out}" | cut -f1))"
 
+	# Separate core binary (no embed) for the web service's CATCODE_CORE.
+	# Built from the SAME cargo-zigbuild artifact as the embedded core.
+	local core_art="dist/catcode-core-${VERSION}-macos-${tag}"
+	cp "$corebin" "$core_art"; chmod +x "$core_art"
+	echo "    -> ${core_art}  ($(du -h "$core_art" | cut -f1))"
+
 	echo "[3/3] dmg -> dist/catcode-${VERSION}-macos-${tag}.dmg..."
 	make_dmg "${out}" "${tag}" || echo "    (warning: .dmg for ${tag} skipped — see message above)"
 }
@@ -108,6 +114,7 @@ build_arch x86_64-apple-darwin  amd64 x86_64
 echo "[done] checksums..."
 ( cd dist
   for f in catcode-${VERSION}-macos-arm64 catcode-${VERSION}-macos-x86_64 \
+           catcode-core-${VERSION}-macos-arm64 catcode-core-${VERSION}-macos-x86_64 \
            catcode-${VERSION}-macos-arm64.dmg    catcode-${VERSION}-macos-x86_64.dmg; do
 	[[ -f "$f" ]] && sha256sum "$f" > "$f.sha256"
   done )
@@ -122,6 +129,8 @@ echo "[done] checksums..."
 
 echo "==> dist/catcode-${VERSION}-macos-arm64   (standalone, Apple Silicon)"
 echo "==> dist/catcode-${VERSION}-macos-x86_64  (standalone, Intel)"
+echo "==> dist/catcode-core-${VERSION}-macos-arm64  (core binary; web service CATCODE_CORE)"
+echo "==> dist/catcode-core-${VERSION}-macos-x86_64 (core binary; web service CATCODE_CORE)"
 echo "==> dist/catcode-${VERSION}-macos-arm64.dmg         (installer, Apple Silicon)"
 echo "==> dist/catcode-${VERSION}-macos-x86_64.dmg        (installer, Intel)"
 echo

@@ -16,11 +16,11 @@
 #
 # Run on Linux. Needs: cargo (stable), Go 1.21+. appimagetool is fetched on
 # demand to ~/.cache/appimagetool/ if not on PATH (needs network once).
-#   ./release-linux.sh [version]     # version defaults to core/Cargo.toml
+#   ./release-linux.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
+VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
 EMBED_FILE="tui/embed/catcode-core"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
@@ -55,6 +55,16 @@ STANDALONE="dist/catcode-${VERSION}-linux-${STANDALONE_ARCH}"
 chmod +x "${STANDALONE}"
 rm -f "$EMBED_FILE"
 echo "    -> ${STANDALONE}  ($(du -h "${STANDALONE}" | cut -f1))"
+
+# Separate core binary (no embed) for the web service's CATCODE_CORE. The
+# installer downloads this alongside the standalone when --with-web is used, so
+# the web service spawns a real core without depending on the TUI's first-run
+# extraction. Built from the SAME cargo artifact as the embedded core — no
+# second compile.
+CORE_BIN="core/target/release/core"
+CORE_ART="dist/catcode-core-${VERSION}-linux-${STANDALONE_ARCH}"
+cp "$CORE_BIN" "$CORE_ART"; chmod +x "$CORE_ART"
+echo "    -> ${CORE_ART}  ($(du -h "$CORE_ART" | cut -f1))"
 
 echo "[3/6] generating AppImage icon..."
 ICON="dist/.appimg-${VERSION}/catcode.png"
@@ -111,10 +121,13 @@ echo "    -> ${APPIMG}  ($(du -h "$APPIMG" | cut -f1))"
 echo "[6/6] checksums..."
 ( cd dist
   sha256sum "$(basename "$STANDALONE")" > "$(basename "$STANDALONE")".sha256
+  sha256sum "$(basename "$CORE_ART")"    > "$(basename "$CORE_ART")".sha256
   sha256sum "$(basename "$APPIMG")"     > "$(basename "$APPIMG")".sha256 )
 
 echo "==> ${STANDALONE}        (standalone; run from any dir)"
 echo "==> ${STANDALONE}.sha256"
+echo "==> ${CORE_ART}   (core binary; for the web service CATCODE_CORE)"
+echo "==> ${CORE_ART}.sha256"
 echo "==> ${APPIMG}            (AppImage; run from a terminal)"
 echo "==> ${APPIMG}.sha256"
 echo

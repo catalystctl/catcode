@@ -10,11 +10,11 @@
 # still builds whatever it can instead of aborting on the first missing tool.
 # Exit status is non-zero if any platform failed.
 #
-#   ./release-all.sh [version]     # version defaults to core/Cargo.toml
+#   ./release-all.sh [version]     # version defaults to the git commit (short SHA)
 set -uo pipefail
 cd "$(dirname "$0")" || exit
 
-VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
+VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
 echo "############ catalyst-code ${VERSION} — full release (all platforms) ############"
 
 pass=0; fail=0; failed=""

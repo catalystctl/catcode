@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
 # ============================================================
-# Catalyst Code — Installer  v1.0.0
+# Catalyst Code — Installer  v1.1.0
 # Platform: Linux (systemd) & macOS (launchd)
 #
-# Installs the catalyst-code TUI (`catcode`) + core (`catcode-core`) to your PATH,
-# and can optionally install the Next.js web frontend as a systemd service
-# that stays online 24/7 (default port 49283).
+# DEFAULT: download prebuilt binaries (catcode + catcode-core) and, with
+# --with-web, a prebuilt Next.js web bundle — NO compiler (cargo/go/next
+# build) is needed on the host. The TUI needs zero host deps; the web
+# service only needs a Node OR Bun runtime to run (not to build).
 #
-# Update mode records how you obtained the source (a git clone, or a remote
-# URL) so `--update` can `git pull` + rebuild + reinstall.
-#
-# Usage:
-#   bash install.sh                       # install TUI + core
-#   bash install.sh --with-web            # also install the web service
-#   bash install.sh --repo <url>          # clone first, then install
-#   bash install.sh --update              # git pull + rebuild + reinstall
-#   bash install.sh --uninstall           # remove everything
+#   bash install.sh                       # download + install catcode
+#   bash install.sh --with-web             # …also install the web service
+#   bash install.sh --version 0.2.0        # pin a version
+#   bash install.sh --base-url <url>       # download from a mirror (not GitHub)
+#   bash install.sh --build-from-source    # fall back to cargo+go+next build
+#   bash install.sh --update               # re-download latest + reinstall
+#   bash install.sh --uninstall            # remove everything
 #
 # Options:
 #   --with-web            install the web frontend service
-#   --repo <url>          clone <url> first (then install from it)
+#   --version <v>         pin a release version (e.g. 0.2.0 or v0.2.0)
+#   --base-url <url>      download base URL (default: GitHub Releases)
+#   --build-from-source   build locally instead of downloading prebuilt
+#   --repo <url>          (source path) clone <url> first
 #   --prefix <path>       binary install dir   (default: /usr/local/bin)
+#   --web-dir <path>      web bundle install dir (default: /opt/catalyst-code/web
+#                         on Linux, ~/Library/Application Support/catalyst-code/web
+#                         on macOS)
 #   --port <n>            web service port      (default: 49283)
 #   --host <h>            web bind host         (default: 0.0.0.0)
 #   --log-file <path>     write a log here      (default: ~/catalyst-code-install.log)
-#   --no-log             disable logging
+#   --no-log              disable logging
 #   --no-color           disable ANSI colors
 #   --dry-run            print the plan, execute nothing
 #   -h, --help           show this help
@@ -33,7 +38,8 @@ set -euo pipefail
 
 # ── constants ────────────────────────────────────────────────
 APP_NAME="Catalyst Code"
-VERSION="1.0.0"
+VERSION="1.1.0"
+GITHUB_REPO="catalystctl/catcode"
 DEFAULT_PREFIX="/usr/local/bin"
 DEFAULT_PORT="49283"
 DEFAULT_HOST="0.0.0.0"
@@ -43,11 +49,6 @@ LAUNCHD_LABEL="com.catalyst-code.web"   # launchd agent (macOS)
 GO_MIN="1.24.2"
 
 # ── platform ────────────────────────────────────────────────
-# install.sh builds from source (cargo + go) and works on both Linux and
-# macOS. The web frontend is installed as a system service via systemd on
-# Linux, or as a user LaunchAgent via launchd on macOS. Windows users should
-# use packaging/windows/install-web.ps1 instead (install.sh is not supported
-# there — it relies on a POSIX shell).
 PLATFORM="$(uname -s)"   # Linux | Darwin
 case "$PLATFORM" in
   Linux)  SVC_MGR="systemd" ;;
@@ -59,6 +60,10 @@ esac
 ACTION="install"
 DRY_RUN=false
 WITH_WEB=false
+BUILD_FROM_SOURCE=false
+VERSION_OVERRIDE=""
+BASE_URL_OVERRIDE=""
+WEB_DIR_OVERRIDE=""
 REPO_OVERRIDE=""
 PREFIX="$DEFAULT_PREFIX"
 PORT="$DEFAULT_PORT"
@@ -69,13 +74,21 @@ LOG_ENABLED=false
 
 # ── runtime state ────────────────────────────────────────────
 SUDO=""
-RUNTIME=""        # bun | npm
-RT_BIN=""         # absolute path to bun/npm
+RUNTIME=""        # bun | npm | node
+RT_BIN=""         # absolute path to bun/node
 RT=""             # runtime word for "run"/"install" invocations
 REPO_DIR=""
 ORIGIN_URL=""
 INSTALL_USER=""
 VERSION_DETECTED="$VERSION"
+# download-path state
+OS_TAG=""
+ARCH=""
+TAG=""            # e.g. v0.2.0
+VER=""            # e.g. 0.2.0
+BASE_URL=""
+WEB_DIR=""
+METHOD="download" # download | source
 
 # ── temp dir + cleanup ───────────────────────────────────────
 TMPDIR_SELF=""
@@ -172,7 +185,6 @@ run_root() {
   else run_step "$msg" "$@"; fi
 }
 
-# root_do "message" command [args...] — tolerant (no spinner, ignores failure).
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 root_do() {
   local msg="$1"; shift
@@ -198,17 +210,7 @@ ver_ge() {
   }'
 }
 
-# ── banner ───────────────────────────────────────────────────
-print_banner() {
-  print_box "Catalyst Code  —  installer v${VERSION_DETECTED}" \
-    "TUI (catcode) + core (catcode-core) -> PATH" \
-    "optional 24/7 web service (Next.js)" \
-    "scope: system-wide   |   platform: ${PLATFORM} (${SVC_MGR})"
-  printf "  ${C_DIM}mode: %s   |   dry-run: %s${C_RST}\n\n" "$ACTION" "$DRY_RUN"
-}
-
-# ── box printer ──────────────────────────────────────────────
-# print_box TITLE  line1 line2 ...
+# ── banner / box ─────────────────────────────────────────────
 print_box() {
   local title="$1"; shift
   local lines=("$@")
@@ -229,6 +231,16 @@ print_box() {
   printf "  ${F}└${bar}┘${R}\n\n"
 }
 
+print_banner() {
+  local mode="download (prebuilt)"
+  $BUILD_FROM_SOURCE && mode="build-from-source"
+  print_box "Catalyst Code  —  installer v${VERSION_DETECTED}" \
+    "TUI (catcode) + core (catcode-core) -> PATH" \
+    "optional 24/7 web service (Next.js, prebuilt)" \
+    "scope: system-wide   |   platform: ${PLATFORM} (${SVC_MGR})"
+  printf "  ${C_DIM}mode: %s   |   dry-run: %s${C_RST}\n\n" "$mode" "$DRY_RUN"
+}
+
 # ── arg parsing ──────────────────────────────────────────────
 usage() {
   awk 'NR==1{next} /^#/{print; next} {exit}' "$0" | sed 's/^# \{0,1\}//'
@@ -238,20 +250,24 @@ usage() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --install)   ACTION="install" ;;
-      --update|--upgrade) ACTION="update" ;;
-      --uninstall) ACTION="uninstall" ;;
-      --dry-run)   DRY_RUN=true ;;
-      --with-web)  WITH_WEB=true ;;
-      --repo)      [[ $# -ge 2 ]] || die "--repo requires a URL"; REPO_OVERRIDE="$2"; shift ;;
-      --prefix)    [[ $# -ge 2 ]] || die "--prefix requires a path"; PREFIX="$2"; shift ;;
-      --port)      [[ $# -ge 2 ]] || die "--port requires a number"; PORT="$2"; shift ;;
-      --host)      [[ $# -ge 2 ]] || die "--host requires a value"; HOST="$2"; shift ;;
-      --log-file)  [[ $# -ge 2 ]] || die "--log-file requires a path"; LOG_FILE="$2"; shift ;;
-      --no-log)    LOG_FILE="" ;;
-      --no-color)  NO_COLOR_FLAG=true ;;
-      -h|--help)   usage ;;
-      *)           die "unknown option: $1 (try --help)" ;;
+      --install)            ACTION="install" ;;
+      --update|--upgrade)   ACTION="update" ;;
+      --uninstall)          ACTION="uninstall" ;;
+      --dry-run)            DRY_RUN=true ;;
+      --with-web)           WITH_WEB=true ;;
+      --build-from-source)  BUILD_FROM_SOURCE=true; METHOD="source" ;;
+      --version)            [[ $# -ge 2 ]] || die "--version requires a value"; VERSION_OVERRIDE="$2"; shift ;;
+      --base-url)           [[ $# -ge 2 ]] || die "--base-url requires a URL"; BASE_URL_OVERRIDE="$2"; shift ;;
+      --web-dir)            [[ $# -ge 2 ]] || die "--web-dir requires a path"; WEB_DIR_OVERRIDE="$2"; shift ;;
+      --repo)               [[ $# -ge 2 ]] || die "--repo requires a URL"; REPO_OVERRIDE="$2"; shift ;;
+      --prefix)             [[ $# -ge 2 ]] || die "--prefix requires a path"; PREFIX="$2"; shift ;;
+      --port)               [[ $# -ge 2 ]] || die "--port requires a number"; PORT="$2"; shift ;;
+      --host)               [[ $# -ge 2 ]] || die "--host requires a value"; HOST="$2"; shift ;;
+      --log-file)           [[ $# -ge 2 ]] || die "--log-file requires a path"; LOG_FILE="$2"; shift ;;
+      --no-log)             LOG_FILE="" ;;
+      --no-color)           NO_COLOR_FLAG=true ;;
+      -h|--help)            usage ;;
+      *)                    die "unknown option: $1 (try --help)" ;;
     esac
     shift
   done
@@ -266,32 +282,7 @@ setup_log() {
   fi
   LOG_ENABLED=true
   _log "===== catalyst-code install.sh — $(date -u +%FT%TZ) ====="
-  _log "action=$ACTION dry_run=$DRY_RUN with_web=$WITH_WEB prefix=$PREFIX port=$PORT host=$HOST"
-}
-
-# ── dependency checks ────────────────────────────────────────
-check_deps() {
-  local missing=()
-  have cargo || missing+=("cargo (Rust toolchain — https://rustup.rs)")
-  have go    || missing+=("go (>= ${GO_MIN} — https://go.dev/dl/)")
-  if have go; then
-    local gv
-    gv="$(go version 2>/dev/null | sed -E 's/.*go([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/' || echo 0)"
-    ver_ge "$GO_MIN" "$gv" || missing+=("go >= ${GO_MIN} (have ${gv})")
-  fi
-  if $WITH_WEB || [[ "$ACTION" == "uninstall" ]]; then :; fi
-  if $WITH_WEB; then
-    have bun || have npm || missing+=("bun or npm (for the web build — https://bun.sh)")
-  fi
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    printf "\n  ${C_BOLD}${C_RED}Missing dependencies:${C_RST}\n" >&2
-    local m
-    for m in "${missing[@]}"; do printf "    ${C_RED}• %s${C_RST}\n" "$m" >&2; done
-    die "install the dependencies above, then re-run."
-  fi
-  [[ "$SVC_MGR" != "unsupported" ]] \
-    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
-  log_ok "Dependencies present (cargo, go${WITH_WEB:+, node/bun})"
+  _log "action=$ACTION dry_run=$DRY_RUN build_from_source=$BUILD_FROM_SOURCE with_web=$WITH_WEB prefix=$PREFIX port=$PORT host=$HOST"
 }
 
 # ── sudo ─────────────────────────────────────────────────────
@@ -305,25 +296,369 @@ ensure_sudo() {
   SUDO="sudo"
   INSTALL_USER="${SUDO_USER:-$USER}"
   if ! $DRY_RUN; then
-    log_info "System-wide install — authenticating with sudo..."
-    sudo -v || die "sudo authentication failed"
+    if sudo -n true 2>/dev/null; then
+      : # passwordless sudo — no prompt needed
+    else
+      log_info "System-wide install — authenticating with sudo..."
+      sudo -v || die "sudo authentication failed"
+    fi
   fi
 }
 
-# ── runtime detection (bun vs npm) ───────────────────────────
+# ── runtime detection (bun vs node, for RUNNING the web) ─────
 detect_runtime() {
   if have bun; then
     RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
+  elif have node; then
+    RUNTIME="node"; RT_BIN="$(command -v node)"; RT="node"
   elif have npm; then
     RUNTIME="npm"; RT_BIN="$(command -v npm)"; RT="npm"
     have node || die "node not found (npm requires it)"
   else
-    die "neither bun nor npm found — install one to build the web frontend (https://bun.sh)"
+    die "neither bun nor node found — install one to run the web frontend (https://bun.sh or https://nodejs.org)"
   fi
   log_ok "Web runtime: $RUNTIME ($RT_BIN)"
 }
 
-# ── repo resolution ──────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# DOWNLOAD PATH (default — no compile)
+# ════════════════════════════════════════════════════════════
+
+detect_os_tag() {
+  case "$PLATFORM" in
+    Linux)  OS_TAG="linux" ;;
+    Darwin) OS_TAG="macos" ;;
+    *)      die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1" ;;
+  esac
+}
+
+detect_arch() {
+  local m; m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64)  ARCH="x86_64" ;;
+    aarch64|arm64) ARCH="arm64"  ;;
+    *)             die "unsupported arch: $m (expected x86_64 or arm64)" ;;
+  esac
+}
+
+# Resolve the release TAG/VER and the download BASE_URL.
+#   --version <v>  pins a version (accepts "0.2.0" or "v0.2.0")
+#   otherwise      query the GitHub API for the latest release tag
+#   --base-url <u> overrides the download root (skips the GitHub default)
+resolve_release() {
+  if [[ -n "$VERSION_OVERRIDE" ]]; then
+    # Accept "0.2.0" (-> v0.2.0 semver tag), "v0.2.0" (as-is), or a commit
+    # SHA like "9fecd6b" (as-is — SHA tags have no leading v). Only prepend v
+    # for bare semver (digits.digits), never for hex SHAs.
+    TAG="$VERSION_OVERRIDE"
+    if [[ "$TAG" =~ ^[0-9]+\.[0-9]+ ]] && [[ "$TAG" != v* ]]; then
+      TAG="v${TAG}"
+    fi
+    VER="${TAG#v}"
+  else
+    local api="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    if ! TAG="$(curl -fsSL --retry 2 "$api" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)" || [[ -z "${TAG:-}" ]]; then
+      die "could not resolve the latest release from $api.
+  The repo may be private, or the API is rate-limited. Pass --version <v>
+  (e.g. --version 0.2.0 or --version 9fecd6b) or --base-url <url> to a public mirror."
+    fi
+    VER="${TAG#v}"
+  fi
+  VERSION_DETECTED="$VER"
+  if [[ -n "$BASE_URL_OVERRIDE" ]]; then
+    BASE_URL="${BASE_URL_OVERRIDE%/}"
+  else
+    BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${TAG}"
+  fi
+}
+
+# verify_sha256 <file> <shafile>  — compares the recorded hash to the file.
+verify_sha256() {
+  local f="$1" sf="$2" expected actual
+  [[ -f "$sf" ]] || die "missing checksum file: $sf"
+  expected="$(awk '{print $1; exit}' "$sf")"
+  actual="$(sha256sum "$f" | awk '{print $1}')"
+  if [[ "$expected" != "$actual" ]]; then
+    die "checksum mismatch for $(basename "$f")
+  expected $expected
+  got      $actual"
+  fi
+}
+
+# fetch_asset <name>  — download <BASE_URL>/<name> + <name>.sha256 into the
+# temp dir and verify the checksum. Leaves the file at $TMPDIR_SELF/<name>.
+fetch_asset() {
+  local name="$1"
+  local url="${BASE_URL}/${name}"
+  local dest="$TMPDIR_SELF/$name"
+  run_step "Downloading $name" curl -fL --retry 3 -o "$dest" "$url" \
+    || die "download failed: $url"
+  run_step "Downloading $name.sha256" curl -fL --retry 3 -o "$dest.sha256" "${url}.sha256" \
+    || die "checksum download failed: ${url}.sha256"
+  if $DRY_RUN; then return 0; fi
+  verify_sha256 "$dest" "$dest.sha256"
+  log_ok "Verified $name"
+}
+
+resolve_web_dir() {
+  if [[ -n "$WEB_DIR_OVERRIDE" ]]; then
+    WEB_DIR="$WEB_DIR_OVERRIDE"; return
+  fi
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    WEB_DIR="$HOME/Library/Application Support/catalyst-code/web"
+  else
+    WEB_DIR="/opt/catalyst-code/web"
+  fi
+}
+
+# Download + install the TUI standalone (and, with --with-web, the core binary).
+install_bins_download() {
+  local tui_asset="catcode-${VER}-${OS_TAG}-${ARCH}"
+  fetch_asset "$tui_asset"
+  run_root "Creating $PREFIX" mkdir -p "$PREFIX"
+  if ! $DRY_RUN; then
+    [[ -f "$TMPDIR_SELF/$tui_asset" ]] || die "downloaded TUI binary missing"
+  fi
+  run_root "Installing catcode -> $PREFIX/catcode" install -m 0755 "$TMPDIR_SELF/$tui_asset" "$PREFIX/catcode"
+
+  if $WITH_WEB; then
+    local core_asset="catcode-core-${VER}-${OS_TAG}-${ARCH}"
+    fetch_asset "$core_asset"
+    run_root "Installing catcode-core -> $PREFIX/catcode-core" install -m 0755 "$TMPDIR_SELF/$core_asset" "$PREFIX/catcode-core"
+  fi
+}
+
+# Download + extract the prebuilt web bundle and wire the service.
+install_web_download() {
+  detect_runtime
+  local web_asset="catcode-web-${VER}.tar.gz"
+  fetch_asset "$web_asset"
+  resolve_web_dir
+  run_root "Creating $WEB_DIR" mkdir -p "$WEB_DIR"
+  # Clean stale contents so an update doesn't leave old chunks.
+  if ! $DRY_RUN; then
+    find "$WEB_DIR" -mindepth 1 -delete 2>/dev/null || true
+  fi
+  run_root "Extracting web bundle -> $WEB_DIR" tar xzf "$TMPDIR_SELF/$web_asset" -C "$WEB_DIR"
+  if ! $DRY_RUN; then
+    [[ -f "$WEB_DIR/start.js" ]] || die "web bundle missing start.js (extraction failed?)"
+  fi
+  install_web_service_download
+}
+
+# systemd unit (Linux) — runs the prebuilt standalone server (node start.js).
+install_web_systemd_download() {
+  local unit_dir="/etc/systemd/system"
+  local unit="$unit_dir/$UNIT_NAME"
+  local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=Catalyst Code Web Frontend (port $PORT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$INSTALL_USER
+WorkingDirectory=$WEB_DIR
+Environment=NODE_ENV=production
+Environment=PORT=$PORT
+Environment=HOSTNAME=$HOST
+Environment=CATCODE_CORE=$PREFIX/catcode-core
+ExecStart=$RT_BIN $WEB_DIR/start.js
+Restart=on-failure
+RestartSec=3
+# NOTE: runs the prebuilt Next.js standalone server. For public exposure, put
+# a reverse proxy (caddy/nginx) with TLS in front and bind --host 127.0.0.1.
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if $DRY_RUN; then
+    log_info "[dry-run] would write unit: $unit"
+    sed 's/^/      /' "$tmp"
+    return 0
+  fi
+  run_root "Creating $unit_dir" mkdir -p "$unit_dir"
+  run_root "Installing unit file" install -m 0644 "$tmp" "$unit" || die "could not install unit"
+  run_root "Reloading systemd" systemctl daemon-reload || die "daemon-reload failed"
+  run_root "Enabling $UNIT_NAME" systemctl enable "$UNIT_NAME" || die "enable failed"
+  run_root "Starting $UNIT_NAME" systemctl start "$UNIT_NAME" || die "start failed — check: journalctl -u $UNIT_NAME -e"
+}
+
+# launchd agent (macOS) — runs the prebuilt standalone server (node start.js).
+install_web_launchd_download() {
+  local agents_dir="$HOME/Library/LaunchAgents"
+  local plist="$agents_dir/${LAUNCHD_LABEL}.plist"
+  local log_dir="$HOME/Library/Logs"
+  local log_file="$log_dir/catalyst-code-web.log"
+  local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
+  cat >"$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RT_BIN}</string>
+    <string>${WEB_DIR}/start.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${WEB_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PORT</key>
+    <string>${PORT}</string>
+    <key>HOSTNAME</key>
+    <string>${HOST}</string>
+    <key>CATCODE_CORE</key>
+    <string>${PREFIX}/catcode-core</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>${log_file}</string>
+</dict>
+</plist>
+EOF
+  if $DRY_RUN; then
+    log_info "[dry-run] would write plist: $plist"
+    sed 's/^/      /' "$tmp"
+    return 0
+  fi
+  run_step "Creating $agents_dir" mkdir -p "$agents_dir"
+  run_step "Creating $log_dir" mkdir -p "$log_dir"
+  run_step "Installing plist" install -m 0644 "$tmp" "$plist" || die "could not install plist"
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  run_step "Loading $LAUNCHD_LABEL" launchctl load "$plist" || die "load failed — check: cat $log_file"
+  log_ok "Web agent loaded (starts at login, auto-restarts on crash)"
+}
+
+install_web_service_download() {
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    install_web_launchd_download
+  else
+    install_web_systemd_download
+  fi
+}
+
+restart_web_service_download() {
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    run_step "Reloading $LAUNCHD_LABEL" launchctl load "$plist" || die "load failed — check: cat $HOME/Library/Logs/catalyst-code-web.log"
+  else
+    run_root "Reloading systemd" systemctl daemon-reload
+    run_root "Restarting $UNIT_NAME" systemctl restart "$UNIT_NAME" || die "restart failed — check: journalctl -u $UNIT_NAME -e"
+  fi
+}
+
+check_deps_download() {
+  local missing=()
+  have curl     || missing+=("curl")
+  have sha256sum || missing+=("sha256sum (coreutils)")
+  if $WITH_WEB; then
+    have bun || have node || have npm || missing+=("bun or node (to RUN the web frontend — https://bun.sh or https://nodejs.org)")
+  fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    printf "\n  ${C_BOLD}${C_RED}Missing dependencies:${C_RST}\n" >&2
+    local m
+    for m in "${missing[@]}"; do printf "    ${C_RED}• %s${C_RST}\n" "$m" >&2; done
+    die "install the dependencies above, then re-run."
+  fi
+  [[ "$SVC_MGR" != "unsupported" ]] \
+    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
+  log_ok "Dependencies present (curl, sha256sum${WITH_WEB:+, node/bun})"
+}
+
+do_install_download() {
+  phase "Checking dependencies"
+  check_deps_download
+  ensure_sudo
+  phase "Resolving release"
+  detect_os_tag
+  detect_arch
+  resolve_release
+
+  log_info "Version:  $VER (tag $TAG)"
+  log_info "Source:   $BASE_URL"
+  log_info "Platform: $OS_TAG/$ARCH"
+  log_info "Prefix:   $PREFIX"
+  $WITH_WEB && log_info "Web:      $UNIT_NAME on :$PORT ($HOST)"
+
+  phase "Installing catcode (prebuilt — no compile)"
+  install_bins_download
+
+  if $WITH_WEB; then
+    phase "Installing web service (prebuilt — no compile)"
+    install_web_download
+  else
+    log_info "Skipping web service (pass --with-web to install it)"
+  fi
+
+  save_state
+  summary_install
+}
+
+do_update_download() {
+  phase "Resolving latest release"
+  detect_os_tag
+  detect_arch
+  resolve_release
+  log_info "Version:  $VER (tag $TAG)"
+  log_info "Source:   $BASE_URL"
+  ensure_sudo
+
+  phase "Reinstalling catcode (prebuilt)"
+  install_bins_download
+
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    WITH_WEB=true
+    phase "Reinstalling web service (prebuilt)"
+    install_web_download
+    phase "Restarting web service"
+    restart_web_service_download
+  fi
+
+  save_state
+  summary_update
+}
+
+# ════════════════════════════════════════════════════════════
+# SOURCE PATH (--build-from-source fallback)
+# ════════════════════════════════════════════════════════════
+
+check_deps_source() {
+  local missing=()
+  have cargo || missing+=("cargo (Rust toolchain — https://rustup.rs)")
+  have go    || missing+=("go (>= ${GO_MIN} — https://go.dev/dl/)")
+  if have go; then
+    local gv
+    gv="$(go version 2>/dev/null | sed -E 's/.*go([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/' || echo 0)"
+    ver_ge "$GO_MIN" "$gv" || missing+=("go >= ${GO_MIN} (have ${gv})")
+  fi
+  if $WITH_WEB; then
+    have bun || have npm || missing+=("bun or npm (for the web build — https://bun.sh)")
+  fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    printf "\n  ${C_BOLD}${C_RED}Missing dependencies:${C_RST}\n" >&2
+    local m
+    for m in "${missing[@]}"; do printf "    ${C_RED}• %s${C_RST}\n" "$m" >&2; done
+    die "install the dependencies above, then re-run (or drop --build-from-source to download prebuilt binaries)."
+  fi
+  [[ "$SVC_MGR" != "unsupported" ]] \
+    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
+  log_ok "Dependencies present (cargo, go${WITH_WEB:+, node/bun})"
+}
+
 find_repo_root() {
   local d
   d="$(cd "$(dirname "$0")" && pwd)"
@@ -348,7 +683,7 @@ resolve_repo() {
       cd "$REPO_DIR"
     fi
   else
-    REPO_DIR="$(find_repo_root)" || die "could not locate the repo (no core/Cargo.toml found upward from this script). Run from inside the repo, or use --repo <url>."
+    REPO_DIR="$(find_repo_root)" || die "could not locate the repo (no core/Cargo.toml found upward from this script). Run from inside the repo, or use --repo <url>, or drop --build-from-source to download prebuilt binaries."
     cd "$REPO_DIR"
   fi
   REPO_DIR="$(cd "$REPO_DIR" && pwd)"
@@ -363,7 +698,6 @@ detect_version() {
   if [[ -z "$VERSION_DETECTED" ]]; then VERSION_DETECTED="$VERSION"; fi
 }
 
-# ── build steps ──────────────────────────────────────────────
 build_core() {
   run_step "Building Rust core (cargo --release)" \
     cargo build --release --manifest-path "$REPO_DIR/core/Cargo.toml" \
@@ -376,7 +710,7 @@ build_tui() {
     || die "TUI build failed (need go >= ${GO_MIN}?)"
 }
 
-install_bins() {
+install_bins_source() {
   local core_bin="$REPO_DIR/core/target/release/core"
   local tui_bin="$REPO_DIR/tui/tui"
   if ! $DRY_RUN; then
@@ -388,7 +722,7 @@ install_bins() {
   run_root "Installing catcode       -> $PREFIX/catcode"       install -m 0755 "$tui_bin"  "$PREFIX/catcode"
 }
 
-build_web() {
+build_web_source() {
   detect_runtime
   run_step --cwd "$REPO_DIR/sdk" "Installing SDK deps ($RT)" $RT install \
     || die "SDK dependency install failed"
@@ -401,17 +735,7 @@ build_web() {
     || die "web build failed (next build)"
 }
 
-install_web_service() {
-  detect_runtime
-  if [[ "$PLATFORM" == "Darwin" ]]; then
-    install_web_launchd
-  else
-    install_web_systemd
-  fi
-}
-
-# systemd unit (Linux) — system service, starts at boot, auto-restarts on crash.
-install_web_systemd() {
+install_web_systemd_source() {
   local unit_dir="/etc/systemd/system"
   local unit="$unit_dir/$UNIT_NAME"
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
@@ -432,8 +756,6 @@ Environment=CATCODE_CORE=$PREFIX/catcode-core
 ExecStart=$exec_start
 Restart=on-failure
 RestartSec=3
-# NOTE: runs next start in production mode. For public exposure, put a
-# reverse proxy (caddy/nginx) with TLS in front and bind --host 127.0.0.1.
 
 [Install]
 WantedBy=multi-user.target
@@ -450,9 +772,7 @@ EOF
   run_root "Starting $UNIT_NAME" systemctl start "$UNIT_NAME" || die "start failed — check: journalctl -u $UNIT_NAME -e"
 }
 
-# launchd agent (macOS) — user LaunchAgent in ~/Library/LaunchAgents, starts at
-# login, KeepAlive restarts it on crash. No sudo: it runs as the invoking user.
-install_web_launchd() {
+install_web_launchd_source() {
   local agents_dir="$HOME/Library/LaunchAgents"
   local plist="$agents_dir/${LAUNCHD_LABEL}.plist"
   local log_dir="$HOME/Library/Logs"
@@ -504,13 +824,20 @@ EOF
   run_step "Creating $agents_dir" mkdir -p "$agents_dir"
   run_step "Creating $log_dir" mkdir -p "$log_dir"
   run_step "Installing plist" install -m 0644 "$tmp" "$plist" || die "could not install plist"
-  # Unload any prior version first; launchctl load errors if already loaded.
   launchctl unload "$plist" >/dev/null 2>&1 || true
   run_step "Loading $LAUNCHD_LABEL" launchctl load "$plist" || die "load failed — check: cat $log_file"
   log_ok "Web agent loaded (starts at login, auto-restarts on crash)"
 }
 
-restart_web_service() {
+install_web_service_source() {
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    install_web_launchd_source
+  else
+    install_web_systemd_source
+  fi
+}
+
+restart_web_service_source() {
   if [[ "$PLATFORM" == "Darwin" ]]; then
     local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
     launchctl unload "$plist" >/dev/null 2>&1 || true
@@ -521,6 +848,78 @@ restart_web_service() {
   fi
 }
 
+do_install_source() {
+  phase "Checking dependencies (source build)"
+  check_deps_source
+  ensure_sudo
+  resolve_repo
+  detect_version
+
+  log_info "Repo:     $REPO_DIR"
+  log_info "Origin:   ${ORIGIN_URL:-(none — local copy)}"
+  log_info "Prefix:   $PREFIX"
+  $WITH_WEB && log_info "Web:      $UNIT_NAME on :$PORT ($HOST)"
+
+  phase "Building Rust core (catcode-core)"
+  build_core
+  phase "Building Go TUI (catcode)"
+  build_tui
+  phase "Installing binaries"
+  install_bins_source
+
+  if $WITH_WEB; then
+    phase "Building web frontend (SDK + Next.js)"
+    build_web_source
+    phase "Installing web service"
+    install_web_service_source
+  else
+    log_info "Skipping web service (pass --with-web to install it)"
+  fi
+
+  save_state
+  summary_install
+}
+
+do_update_source() {
+  phase "Reading previous install state"
+  log_info "Repo:     $REPO_DIR"
+  log_info "Origin:   ${ORIGIN_URL:-(none)}"
+  log_info "Prefix:   $PREFIX"
+  [[ "${WEB_INSTALLED:-no}" == yes ]] && log_info "Web:      $UNIT_NAME on :$PORT"
+
+  phase "Updating source (git)"
+  if [[ ! -d "$REPO_DIR/.git" ]]; then
+    if [[ -n "${ORIGIN_URL:-}" ]]; then
+      die "repo at $REPO_DIR is not a git checkout. Re-clone with: bash install.sh --build-from-source --repo $ORIGIN_URL"
+    fi
+    die "repo at $REPO_DIR is not a git checkout and no origin URL recorded — cannot update."
+  fi
+  run_step "Pulling latest (git pull --ff-only)" git -C "$REPO_DIR" pull --ff-only \
+    || die "git pull failed — resolve conflicts: cd $REPO_DIR && git status"
+
+  cd "$REPO_DIR"
+  detect_version
+  log_info "Version:  $VERSION_DETECTED"
+  ensure_sudo
+
+  phase "Rebuilding Rust core"
+  build_core
+  phase "Rebuilding Go TUI"
+  build_tui
+  phase "Reinstalling binaries"
+  install_bins_source
+
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    phase "Rebuilding web frontend"
+    build_web_source
+    phase "Restarting web service"
+    restart_web_service_source
+  fi
+
+  save_state
+  summary_update
+}
+
 # ── state file ───────────────────────────────────────────────
 save_state() {
   local f="$STATE_FILE"
@@ -529,12 +928,14 @@ save_state() {
   cat >"$tmp" <<EOF
 # Catalyst Code installer state — written by install.sh
 # (shell-sourcable; safe to read with 'source')
+METHOD="$METHOD"
 REPO_DIR="$REPO_DIR"
 ORIGIN_URL="${ORIGIN_URL:-}"
 PREFIX="$PREFIX"
 PORT="$PORT"
 HOST="$HOST"
 RUNTIME="${RUNTIME:-}"
+WEB_DIR="${WEB_DIR:-}"
 WEB_INSTALLED="$web_flag"
 UNIT_NAME="$UNIT_NAME"
 INSTALL_USER="$INSTALL_USER"
@@ -559,37 +960,11 @@ load_state() {
 
 # ── actions ──────────────────────────────────────────────────
 do_install() {
-  phase "Checking dependencies"
-  check_deps
-  ensure_sudo
-  resolve_repo
-  detect_version
-
-  log_info "Repo:     $REPO_DIR"
-  log_info "Origin:   ${ORIGIN_URL:-(none — local copy)}"
-  log_info "Prefix:   $PREFIX"
-  $WITH_WEB && log_info "Web:      $UNIT_NAME on :$PORT ($HOST)"
-
-  phase "Building Rust core (catcode-core)"
-  build_core
-
-  phase "Building Go TUI (catcode)"
-  build_tui
-
-  phase "Installing binaries"
-  install_bins
-
-  if $WITH_WEB; then
-    phase "Building web frontend (SDK + Next.js)"
-    build_web
-    phase "Installing web service"
-    install_web_service
+  if $BUILD_FROM_SOURCE; then
+    do_install_source
   else
-    log_info "Skipping web service (pass --with-web to install it)"
+    do_install_download
   fi
-
-  save_state
-  summary_install
 }
 
 do_update() {
@@ -597,48 +972,17 @@ do_update() {
   if ! load_state; then
     die "no previous install found at $STATE_FILE — run 'bash install.sh' first."
   fi
-  log_info "Repo:     $REPO_DIR"
-  log_info "Origin:   ${ORIGIN_URL:-(none)}"
-  log_info "Prefix:   $PREFIX"
-  [[ "${WEB_INSTALLED:-no}" == yes ]] && log_info "Web:      $UNIT_NAME on :$PORT"
-
-  phase "Updating source (git)"
-  if [[ ! -d "$REPO_DIR/.git" ]]; then
-    if [[ -n "${ORIGIN_URL:-}" ]]; then
-      die "repo at $REPO_DIR is not a git checkout. Re-clone with: bash install.sh --repo $ORIGIN_URL"
-    fi
-    die "repo at $REPO_DIR is not a git checkout and no origin URL recorded — cannot update."
+  if [[ "${METHOD:-download}" == "source" ]]; then
+    do_update_source
+  else
+    do_update_download
   fi
-  run_step "Pulling latest (git pull --ff-only)" git -C "$REPO_DIR" pull --ff-only \
-    || die "git pull failed — resolve conflicts: cd $REPO_DIR && git status"
-
-  cd "$REPO_DIR"
-  detect_version
-  log_info "Version:  $VERSION_DETECTED"
-  ensure_sudo
-
-  phase "Rebuilding Rust core"
-  build_core
-  phase "Rebuilding Go TUI"
-  build_tui
-  phase "Reinstalling binaries"
-  install_bins
-
-  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
-    phase "Rebuilding web frontend"
-    build_web
-    phase "Restarting web service"
-    restart_web_service
-  fi
-
-  save_state
-  summary_update
 }
 
 do_uninstall() {
   phase "Reading install state"
   if load_state; then
-    log_info "Found previous install (repo: $REPO_DIR)"
+    log_info "Found previous install (method: ${METHOD:-download}, repo/web-dir: ${WEB_DIR:-${REPO_DIR:-<none>}})"
   else
     log_warn "no state file at $STATE_FILE — attempting default paths"
   fi
@@ -665,10 +1009,13 @@ do_uninstall() {
   fi
 
   phase "Removing binaries"
-  root_do "Remove $PREFIX/catcode-core" rm -f "$PREFIX/catcode-core"
   root_do "Remove $PREFIX/catcode"       rm -f "$PREFIX/catcode"
+  root_do "Remove $PREFIX/catcode-core"  rm -f "$PREFIX/catcode-core"
 
   phase "Cleaning up"
+  if [[ -n "${WEB_DIR:-}" && -d "${WEB_DIR:-}" ]]; then
+    root_do "Remove web bundle $WEB_DIR" rm -rf "$WEB_DIR"
+  fi
   root_do "Remove state file" rm -f "$STATE_FILE"
 
   summary_uninstall
@@ -699,8 +1046,6 @@ summary_install() {
     else
       log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
     fi
-  fi
-  if $WITH_WEB; then
     log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
     if [[ "$HOST" != "127.0.0.1" ]]; then
       log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
@@ -715,7 +1060,7 @@ summary_update() {
     "tui:    $PREFIX/catcode" \
     "core:   $PREFIX/catcode-core" \
     "web:    $web_line" \
-    "source: git pull @ $REPO_DIR"
+    "source: ${METHOD:-download} @ ${BASE_URL:-${REPO_DIR:-<unknown>}}"
   log_info "Run the TUI with:  catcode"
 }
 
@@ -724,15 +1069,16 @@ summary_uninstall() {
     "removed: $PREFIX/catcode" \
     "removed: $PREFIX/catcode-core" \
     "removed: $UNIT_NAME (stopped + disabled)" \
+    "removed: ${WEB_DIR:-<web bundle>}" \
     "removed: $STATE_FILE"
-  log_info "The cloned repo at ${REPO_DIR:-<unknown>} was left untouched."
+  if [[ "${METHOD:-}" == "source" && -n "${REPO_DIR:-}" ]]; then
+    log_info "The cloned repo at $REPO_DIR was left untouched."
+  fi
 }
 
 # ── main ────────────────────────────────────────────────────
 main() {
   parse_args "$@"
-  setup_colors 2>/dev/null || true
-  # re-evaluate colors after flag parse (NO_COLOR_FLAG may have changed)
   if ! $USE_COLOR; then
     C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_DIM=""; C_BOLD=""; C_RST=""
   fi

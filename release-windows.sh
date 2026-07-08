@@ -16,11 +16,11 @@
 # (wixl). The same packaging/windows/catcode.wxs also compiles with the WiX
 # Toolset (candle+light) on a Windows build host.
 #
-#   ./release-windows.sh [version]      # version defaults to core/Cargo.toml
+#   ./release-windows.sh [version]      # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-$(grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
+VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
 TARGET="x86_64-pc-windows-gnu"
 STAGE="dist/.msi-stage"
 MSI="dist/catcode-${VERSION}-windows.msi"
@@ -48,6 +48,12 @@ cp "$CORE_EXE" "$EMBED_FILE"
 rm -f "$EMBED_FILE"
 echo "    -> ${STANDALONE}  ($(du -h "${STANDALONE}" | cut -f1))"
 
+# Separate core binary (no embed) for the web service's CATCODE_CORE —
+# downloadable directly, mirroring the Linux/macOS release assets.
+CORE_ART="dist/catcode-core-${VERSION}-windows-x86_64.exe"
+cp "$CORE_EXE" "$CORE_ART"
+echo "    -> ${CORE_ART}  ($(du -h "$CORE_ART" | cut -f1))"
+
 echo "[4/5] staging + building MSI (wixl)..."
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp "$CORE_EXE"            "$STAGE/catcode-core.exe"
@@ -68,12 +74,15 @@ rm -rf "$STAGE"
 ( cd dist
   sha256sum "$(basename "$MSI")"        > "$(basename "$MSI")".sha256
   sha256sum "$(basename "$STANDALONE")" > "$(basename "$STANDALONE")".sha256
+  sha256sum "$(basename "$CORE_ART")"    > "$(basename "$CORE_ART")".sha256
   sha256sum "$(basename "$ZIP")"        > "$(basename "$ZIP")".sha256 2>/dev/null || true )
 
 echo "==> ${MSI}            (installer; ($(du -h "$MSI" | cut -f1)))"
 echo "==> ${MSI}.sha256"
 echo "==> ${STANDALONE}      (standalone; ($(du -h "$STANDALONE" | cut -f1)))"
 echo "==> ${STANDALONE}.sha256"
+echo "==> ${CORE_ART}  (core binary; web service CATCODE_CORE)"
+echo "==> ${CORE_ART}.sha256"
 echo "==> ${ZIP}             (no-build fallback)"
 # P1-23: Authenticode-sign the MSI/exe in CI (osslsigncode/signtool + a
 # code-signing cert) to avoid SmartScreen warnings. Not done here (no cert).
