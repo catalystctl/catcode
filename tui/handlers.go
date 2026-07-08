@@ -388,6 +388,24 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.logApproveDiff(ev.get("tool"), ev.get("args"), ev.get("diff"))
 		s.input.Focus()
+	case "ask_request":
+		// The model called the `ask` tool and is blocking on the user's
+		// answers. Parse the questions into a flyout and render it; the core
+		// waits for `ask_reply` (sent by sendAskReply on submit/skip). rawKey
+		// is required: ev.get unmarshals into a string, which fails for an
+		// array and returns "" — the flyout would never open (the original
+		// bug: ask.go existed but no event case ever called parseAskRequest).
+		qraw, ok := ev.rawKey("questions")
+		if !ok {
+			qraw = json.RawMessage("[]")
+		}
+		if a := parseAskRequest(ev.get("request_id"), qraw); a != nil {
+			s.pendingAsk = a
+			s.input.Blur()
+			s.logInfo(fmt.Sprintf("❓ agent asks: %d question%s — answer the prompt",
+				len(a.questions), pluralS(len(a.questions))))
+			s.layout()
+		}
 	case "intercom_message":
 		// A subagent is prompting the orchestrator for a decision (or a progress
 		// update). need_decision blocks until we reply; progress_update is a log line.
@@ -970,6 +988,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// modal intercept: when a modal is active it owns all keys.
 	if s.modal.kind != modalNone {
 		return s.handleModalKey(msg)
+	}
+	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
+	// all keys (option cycling, text entry, submit, skip). Dispatched before
+	// scrolling/global keys just like the modal above — without it the flyout
+	// never receives keystrokes even after ask_request set s.pendingAsk.
+	if s.pendingAsk != nil {
+		return s.handleAskKey(msg)
 	}
 	// transcript scrolling works in every state (idle/busy/approval) so the
 	// user can read history while a turn runs or a decision is pending.

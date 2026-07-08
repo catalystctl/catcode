@@ -853,7 +853,10 @@ func (s *session) View() string {
 	parts = append(parts, s.renderInputBox(), s.renderFooter())
 	view := strings.Join(parts, "\n")
 	if s.modal.kind != modalNone {
-		return s.renderModalOverlay(view)
+		view = s.renderModalOverlay(view)
 	}
-	return view
+	// ask flyout: a blocking `ask` prompt renders as a centered overlay on top
+	// of the full view (like the modal above). renderAskOverlay is a no-op
+	// (returns base unchanged) when s.pendingAsk is nil.
+	return s.renderAskOverlay(view)
 }
