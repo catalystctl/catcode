@@ -125,9 +125,15 @@ pub enum Command {
     /// Drop the last turn (user prompt + its assistant reply + tool calls/results).
     #[serde(rename = "undo")]
     Undo,
-    /// Force a context compaction now (regardless of the 70% threshold).
+    /// Force a context compaction now (regardless of the threshold). Optional
+    /// `instructions` override `compact_instructions` for this call only (e.g.
+    /// `/compact Focus on code samples and API usage`); empty/absent falls back
+    /// to the configured default. Always works regardless of `auto_compact`.
     #[serde(rename = "compact")]
-    Compact,
+    Compact {
+        #[serde(default)]
+        instructions: Option<String>,
+    },
     /// List available session files (returns a `sessions` event).
     #[serde(rename = "list_sessions")]
     ListSessions,
@@ -145,6 +151,11 @@ pub enum Command {
     /// Request a stats summary (returns a `stats` event).
     #[serde(rename = "stats")]
     Stats,
+    /// Request a token-usage breakdown of the current context (returns a
+    /// `context_breakdown` event): total/context-window/pct, per-role buckets,
+    /// and the top token consumers (biggest messages). Read-only.
+    #[serde(rename = "context")]
+    Context,
     /// Approve a pending tool call. decision: "yes" | "no" | "always".
     /// "always" upgrades the session approval mode so subsequent same-tool calls skip the gate.
     #[serde(rename = "approve")]

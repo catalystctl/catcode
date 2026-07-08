@@ -127,16 +127,22 @@ pub struct Config {
     pub max_read_lines: usize,
     pub context_compact_at: f32, // fraction of context_window that triggers compaction
     pub context_digest_at: f32, // fraction of context_window that triggers stale-tool-result digesting (sub-threshold reclaim; 0 disables)
+    pub auto_compact: bool, // automatically compact when context approaches the limit (threshold + idle); manual /compact always works regardless
+    /// Opt-in JSONL debug log path. Records every tool call with its full
+    /// arguments (file contents, bash commands) — which may include secrets the
+    /// model writes (e.g. into a `.env`). User-owned, off by default, rotates at
+    /// 64 MiB. Enable only when debugging.
     pub debug_log: Option<PathBuf>,
     pub session_file: Option<PathBuf>,
     pub default_model: Option<String>,
     // --- production knobs (items 3,4,7) ---
-    pub sandbox: Sandbox,           // --sandbox firejail wraps bash
-    pub no_network: bool,           // --no-network: unshare -n on bash
-    pub idle_timeout_secs: u64,     // per-chunk SSE idle timeout
-    pub max_session_tokens: u64,    // hard session token budget (0 = unlimited)
-    pub summarize_on_compact: bool, // use a model call to summarize dropped turns
-    pub rolling_state: bool,        // inject a transient tail work-state summary (KV-cache-aware)
+    pub sandbox: Sandbox,                     // --sandbox firejail wraps bash
+    pub no_network: bool,                     // --no-network: unshare -n on bash
+    pub idle_timeout_secs: u64,               // per-chunk SSE idle timeout
+    pub max_session_tokens: u64,              // hard session token budget (0 = unlimited)
+    pub summarize_on_compact: bool,           // use a model call to summarize dropped turns
+    pub compact_instructions: Option<String>, // optional guidance woven into the summarize prompt (e.g. "Focus on code samples and API usage"); /compact <instructions> overrides per-call
+    pub rolling_state: bool, // inject a transient tail work-state summary (KV-cache-aware)
     /// Auto-reflect: on a non-trivial turn (≥ `auto_reflect_min_tool_calls` tool
     /// calls), inject a reflection continuation before `finish` exits so durable
     /// facts get persisted (memory) and recurring patterns get written as skills
@@ -559,7 +565,16 @@ pub fn save_providers_config(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
+    // Cross-process lock: this is a read-modify-write (merge providers into
+    // existing config.json). Two processes logging in different providers
+    // concurrently would otherwise race and one provider's entry would be lost.
+    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))?;
     // Read existing config.json (if any) and merge so other keys survive.
     let mut root: Value = std::fs::read_to_string(&path)
         .ok()
@@ -574,9 +589,8 @@ pub fn save_providers_config(
         root["activeProvider"] = json!(a);
     }
     let data = serde_json::to_string_pretty(&root).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, &path)?;
+    // Unique-temp atomic write + 0600 (fsutil): no shared-temp collision.
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes())?;
     Ok(())
 }
 
@@ -725,7 +739,7 @@ impl Default for Config {
             ],
             max_read_bytes: 5_242_880, // 5 MiB (was 1 MiB; real files exceed 1MB)
             max_read_lines: 10_000,    // was 2000; pagination covers the rest
-            context_compact_at: 0.70,
+            context_compact_at: 0.90,
             context_digest_at: 0.40,
             debug_log: None,
             session_file: None,
@@ -735,6 +749,8 @@ impl Default for Config {
             idle_timeout_secs: 120, // some reasoning models think >60s before first token
             max_session_tokens: 0,
             summarize_on_compact: true,
+            compact_instructions: None,
+            auto_compact: true,
             rolling_state: true,
             auto_reflect: true,
             auto_reflect_min_tool_calls: 1,
@@ -1017,6 +1033,28 @@ pub fn load() -> Config {
             c.auto_reflect_min_tool_calls = n.max(1);
         }
     }
+    // auto_compact: toggle automatic context compaction (threshold-triggered +
+    // idle). Default true. Manual /compact always works regardless of this
+    // setting. Mirrors Claude Code's autoCompactEnabled / DISABLE_AUTO_COMPACT.
+    if let Ok(v) = std::env::var("CATALYST_CODE_AUTO_COMPACT") {
+        let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
+        let off = v == "0" || v.eq_ignore_ascii_case("false");
+        if off {
+            c.auto_compact = false;
+        } else if on {
+            c.auto_compact = true;
+        }
+    }
+    // compact_instructions: optional guidance woven into the compaction summarize
+    // prompt ("Focus on code samples and API usage"). /compact <instructions>
+    // overrides per-call; this sets the default used by auto-compaction.
+    if let Ok(v) = std::env::var("CATALYST_CODE_COMPACT_INSTRUCTIONS") {
+        if v.trim().is_empty() {
+            c.compact_instructions = None;
+        } else {
+            c.compact_instructions = Some(v);
+        }
+    }
 
     // Custom providers. `UMANS_PROVIDERS` is a JSON array of provider objects
     // (same shape as the config-file `providers` field); merged after the file
@@ -1123,6 +1161,19 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(b) = v.get("summarize_on_compact").and_then(|x| x.as_bool()) {
         c.summarize_on_compact = b;
+    }
+    if let Some(b) = v.get("auto_compact").and_then(|x| x.as_bool()) {
+        c.auto_compact = b;
+    }
+    if let Some(s) = v.get("compact_instructions").and_then(|x| x.as_str()) {
+        c.compact_instructions = if s.trim().is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+    if let Some(f) = v.get("context_compact_at").and_then(|x| x.as_f64()) {
+        c.context_compact_at = f as f32;
     }
     if let Some(b) = v.get("rolling_state").and_then(|x| x.as_bool()) {
         c.rolling_state = b;

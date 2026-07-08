@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // askPrompt is the TUI state for a pending `ask` tool call. The core emits an
@@ -18,6 +18,11 @@ type askPrompt struct {
 	requestID string
 	questions []askQuestion
 	focusIdx  int
+	// errMsg is a transient inline error (e.g. "Required: …") shown in the
+	// flyout when submit fails validation. Cleared on the next non-submit
+	// keypress so it never accumulates in the transcript (the old behavior
+	// logged a fresh "✗ required" line per Enter, spamming the log).
+	errMsg string
 }
 
 // askQuestion is one field in the flyout.
@@ -180,6 +185,11 @@ func (s *session) handleAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a == nil {
 		return s, nil
 	}
+	// Any key other than submit clears a stale inline error so it doesn't
+	// linger after the user starts fixing the field.
+	if !s.kb(msg, "send") {
+		a.errMsg = ""
+	}
 	// Esc / close: skip the whole prompt (send null).
 	if s.kb(msg, "close") {
 		s.sendAskReply(a, nil)
@@ -189,23 +199,28 @@ func (s *session) handleAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.kb(msg, "send") {
 		obj, missing := a.answers()
 		if len(missing) > 0 {
-			s.logError(fmt.Sprintf("required: %s", strings.Join(missing, "; ")))
+			// Show the error INLINE in the flyout (transient) instead of
+			// logging to the transcript — repeated Enter on an empty
+			// required field used to spam "✗ required" lines.
+			a.errMsg = fmt.Sprintf("Required: %s", strings.Join(missing, "; "))
 			return s, nil
 		}
 		s.sendAskReply(a, obj)
 		s.logSuccess("↦ answers sent")
 		return s, nil
 	}
-	// Tab / down: next question (clamp at last).
-	if s.kb(msg, "next_field") || s.kb(msg, "down") {
+	// Tab / ↓ / j: next question (clamp at last). The bare "down" fallback
+	// mirrors the scroll handler so arrows always navigate even if a user
+	// disabled/rebound nav_down in /keybinds.
+	if s.kb(msg, "field_next") || msg.String() == "down" || s.kbAny(msg, "nav_down", "nav_down_alt") {
 		if a.focusIdx < len(a.questions)-1 {
 			a.focusIdx++
 			a.focusInput()
 		}
 		return s, nil
 	}
-	// Shift+Tab / up: previous question (clamp at first).
-	if s.kb(msg, "prev_field") || s.kb(msg, "up") {
+	// Shift+Tab / ↑ / k: previous question (clamp at first).
+	if s.kb(msg, "field_prev") || msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt") {
 		if a.focusIdx > 0 {
 			a.focusIdx--
 			a.focusInput()
@@ -338,6 +353,9 @@ func (s *session) renderAskBox() string {
 		}
 	}
 	b.WriteString(footer)
+	if a.errMsg != "" {
+		b.WriteString("\n" + errStyle.Render("✗ "+a.errMsg))
+	}
 
 	body := b.String()
 	return lipgloss.NewStyle().

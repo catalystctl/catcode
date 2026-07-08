@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ---------------------------------------------------------------------------
@@ -126,9 +126,9 @@ func effectiveKeybinds(user map[string]string) map[string]string {
 // NOT case-folded so an uppercase letter typed into a search filter still
 // goes to the filter instead of navigating.
 var caseInsensitiveActions = map[string]bool{
-	"approve":       true,
+	"approve":        true,
 	"approve_always": true,
-	"deny":         true,
+	"deny":           true,
 }
 
 // kb reports whether msg matches the key bound to action. Single-character keys

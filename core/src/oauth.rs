@@ -372,20 +372,9 @@ fn write_gemini_token(tok: &OAuthToken) -> Option<()> {
         .and_then(|s| serde_json::from_str::<GeminiCreds>(&s).ok());
     let creds = merged_gemini_creds(tok, existing.as_ref());
     let data = serde_json::to_string_pretty(&creds).ok()?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path).ok()?;
-    // chmod the final file too (rename preserves the tmp perms, but be safe).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    // Unique-temp atomic write + 0600 (fsutil): two processes refreshing the
+    // same token concurrently never collide on a shared temp file.
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes()).ok()?;
     Some(())
 }
 
@@ -425,14 +414,7 @@ fn store_token(provider: &str, tok: &OAuthToken) -> Option<()> {
     std::fs::create_dir_all(&dir).ok()?;
     let path = stored_token_path(provider)?;
     let data = serde_json::to_string_pretty(tok).ok()?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path).ok()?;
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes()).ok()?;
     Some(())
 }
 
@@ -509,14 +491,8 @@ fn write_codex_auth(tok: &OAuthToken, id_token: Option<&str>) -> Option<()> {
             "account_id": account_id,
         },
     });
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&data).ok()?).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path).ok()?;
+    let serialized = serde_json::to_string_pretty(&data).ok()?;
+    crate::fsutil::atomic_write_secure(&path, serialized.as_bytes()).ok()?;
     Some(())
 }
 

@@ -1,9 +1,16 @@
-// Workspace path confinement. Every file tool resolves paths against a root
-// and rejects escapes (absolute paths, `..` traversal, symlinks pointing out).
-// bash runs with cwd locked to the root.
+// Workspace path confinement. Every file tool resolves paths against a
+// root and rejects escapes (absolute paths, `..` traversal, symlinks pointing
+// out). bash runs with cwd locked to the root.
 // Also includes a restricted-path list (.env, .git/**, .ssh/**, id_rsa, …)
 // that the approval gate uses to PROMPT (under Destructive/Always) rather than
 // hard-block. Under Approval::Never the list is not enforced at all.
+//
+// The path CONFINEMENT itself (reject absolute / `..` / symlink-escape) is
+// ALSO approval-gated: under `Approval::Never` the file tools call
+// `resolve_unconfined` (see tools::resolve_ws) which skips every confinement
+// check, so the model may read/write ANY path — absolute, parent-traversing,
+// or symlinked-out — matching the "trust the model fully" intent of Never.
+// The dangerous-path list is a separate, independent guard (also Never-off).
 use std::path::{Path, PathBuf};
 
 /// Restricted paths the agent should not read or write without explicit
@@ -170,6 +177,24 @@ pub fn resolve(root: &Path, input: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+/// Resolve `input` against `root` WITHOUT path confinement — the untrusted-
+/// model guards (absolute-path rejection, `..` traversal rejection, symlink-
+/// escape rejection) are all SKIPPED. Used under `Approval::Never`, where the
+/// model is fully trusted and ALL file restrictions are disabled.
+///
+/// Absolute paths are returned as-is; relative paths are joined to `root`
+/// (so `src/foo.rs` still resolves to `<root>/src/foo.rs`, and `../escape`
+/// becomes `<root>/../escape`, which the OS resolves naturally when the path is
+/// opened). No canonicalization is performed — it was only needed to detect
+/// symlink escapes, which are no longer rejected here.
+pub fn resolve_unconfined(root: &Path, input: &str) -> Result<PathBuf, String> {
+    let p = Path::new(input);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    Ok(root.join(p))
+}
+
 /// True if `path` (already resolved) is confined within `root`.
 #[allow(dead_code)]
 pub fn is_confined(root: &Path, path: &Path) -> bool {
@@ -244,6 +269,23 @@ mod tests {
         // A nested `.git` directory IS blocked (component match anywhere).
         assert!(check_dangerous_path("vendor/lib/.git/config").is_some());
         assert!(check_dangerous_path("sub/.git/HEAD").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfined_allows_absolute_and_parent_traversal() {
+        // Under Approval::Never the file tools use resolve_unconfined: absolute
+        // paths and `..` traversal are NOT rejected (the model is fully trusted).
+        let r = tmp_root();
+        // Absolute path is returned verbatim (NOT rejected).
+        let p = resolve_unconfined(&r, "/etc/passwd").unwrap();
+        assert_eq!(p, PathBuf::from("/etc/passwd"));
+        // `..` traversal is allowed — joined to root, OS resolves the `..`.
+        let p = resolve_unconfined(&r, "../escape").unwrap();
+        assert!(p.ends_with("../escape"));
+        // A normal relative path still resolves under the root.
+        let p = resolve_unconfined(&r, "sub/b.txt").unwrap();
+        assert!(p.starts_with(std::fs::canonicalize(&r).unwrap()));
     }
 
     #[cfg(unix)]

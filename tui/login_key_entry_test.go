@@ -19,12 +19,12 @@ func TestLoginKeyEntryEnterCommits(t *testing.T) {
 
 	// A first-party preset with no key and no OAuth → prompts for inline key.
 	s.providerPresets = []providerPreset{{
-		ID:      "umans",
-		Label:   "Umans",
-		Kind:    "openai",
-		BaseURL: "https://example.com/v1",
-		EnvVar:  "UMANS_API_KEY",
-		HasKey:  false,
+		ID:       "umans",
+		Label:    "Umans",
+		Kind:     "openai",
+		BaseURL:  "https://example.com/v1",
+		EnvVar:   "UMANS_API_KEY",
+		HasKey:   false,
 		LoggedIn: false,
 	}}
 

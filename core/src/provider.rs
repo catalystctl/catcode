@@ -167,14 +167,21 @@ pub async fn summarize(
     model: &str,
     messages: &[Message],
     cancel: &CancellationToken,
+    instructions: Option<&str>,
 ) -> Option<String> {
-    const SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
+    const BASE_SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
+    let sys = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!(
+            "{BASE_SYS}\n\nThe user provided the following guidance for what to preserve in this summary — honor it above the default priorities:\n{extra}"
+        ),
+        None => BASE_SYS.to_string(),
+    };
     let user = messages
         .iter()
         .map(message_for_summary)
         .collect::<Vec<_>>()
         .join("\n");
-    complete_text(client, provider, model, SYS, &user, 1024, cancel).await
+    complete_text(client, provider, model, &sys, &user, 1024, cancel).await
 }
 
 /// Extract durable facts worth remembering across future sessions from a slice of
@@ -595,6 +602,15 @@ fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
     // multi-provider caches then all hit on the next startup instead of only
     // the last writer's. Written atomically (temp + fsync + rename) so a crash
     // mid-write can't truncate/corrupt the cache file.
+    // Cross-process lock: the cache is a shared read-modify-write (we merge
+    // this provider's entry into the existing entries map). Without a lock two
+    // processes refreshing different providers concurrently would both read the
+    // same base and the second rename would clobber the first's entry. Advisory
+    // (flock); auto-releases on exit/crash so there are no stale locks.
+    let _lock = match crate::fsutil::FileLock::acquire(&path.with_extension("lock")) {
+        Ok(g) => g,
+        Err(_) => return, // best-effort: never block the turn on a wedged lock
+    };
     let mut entries: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
@@ -610,33 +626,12 @@ fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
         "version": MODELS_CACHE_VERSION,
         "entries": entries,
     });
-    atomic_write_cache_file(
+    // Unique-temp atomic write (fsutil): two processes never share a temp file,
+    // so a concurrent writer can't corrupt this one's write.
+    let _ = crate::fsutil::atomic_write_str(
         &path,
         &serde_json::to_string(&cache).unwrap_or_else(|_| "{}".into()),
     );
-}
-
-/// Atomically write `content` to the models-cache `path`: temp file + fsync +
-/// rename, so a crash/SIGKILL/OOM mid-write can never leave the cache truncated
-/// or partially written (bare `std::fs::write` is truncate-then-write).
-fn atomic_write_cache_file(path: &std::path::Path, content: &str) {
-    use std::io::Write;
-    let tmp: std::path::PathBuf = {
-        let mut p = path.as_os_str().to_owned();
-        p.push(".tmp");
-        std::path::PathBuf::from(p)
-    };
-    let res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
 }
 
 fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
@@ -4726,7 +4721,7 @@ mod tests {
             Message::user("please refactor the auth module"),
             Message::assistant("on it"),
         ];
-        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
         assert_eq!(out.as_deref(), Some("<summary>mocked</summary>"));
     }
 
@@ -4753,7 +4748,7 @@ mod tests {
         let provider = mock_provider(base);
         let cancel = CancellationToken::new();
         let msgs: Vec<Message> = vec![Message::user("x")];
-        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
         assert!(out.is_none());
     }
 }

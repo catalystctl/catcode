@@ -22,7 +22,6 @@
 //!   untouched.
 
 use crate::config::home_dir;
-use std::io::Write;
 use std::path::PathBuf;
 
 /// Bump when the bundled default set changes meaningfully. The marker file
@@ -237,16 +236,11 @@ fn executable_rel_paths() -> &'static [&'static str] {
 /// short-circuit would then treat as complete (and never re-stage). Keeps the
 /// idempotent/non-clobbering semantics — only the write durability changes.
 fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path).inspect_err(|_e| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    // Unique-temp (fsutil): two processes staging on first run simultaneously
+    // never collide on a shared temp file. Staging is idempotent +
+    // non-clobbering (the exists() check skips present files), so no
+    // cross-process lock is needed here — just a non-corrupting write.
+    crate::fsutil::atomic_write_str(path, content)
 }
 
 /// Ensure the global default files exist under `~/.catalyst-code/`. Writes only

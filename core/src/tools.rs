@@ -1,7 +1,7 @@
 // Built-in tools the agent can call. OpenAI function-calling schema.
 // All file ops are confined to the workspace root; bash runs with cwd=workspace
 // and a real timeout+kill. read_file returns plain content; edit uses search/replace.
-use crate::config::Config;
+use crate::config::{Approval, Config};
 use crate::workspace;
 use serde_json::{json, Value};
 
@@ -23,6 +23,7 @@ pub fn classify(name: &str) -> ToolKind {
         | "memory" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
+        "workspace_activity" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -468,6 +469,17 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "workspace_activity",
+                "description": "List OTHER active catalyst-code agent sessions running in THIS workspace (separate processes), with each one's goal, what it's working on, and the files it recently touched. Use this when something seems off (a build failing for reasons you didn't cause, a file that changed unexpectedly, a test suddenly breaking) to check whether another session is the cause before assuming you introduced the error. Read-only — awareness only, no coordination. Returns the live peers (stale/crashed sessions are auto-pruned).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git_add",
                 "description": "Stage files for commit (`git add -- <paths>`). Paths must be workspace-relative; absolute paths and `..` escapes are rejected. Destructive (modifies the index).",
                 "parameters": {
@@ -615,6 +627,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_status" => git_status(args, cfg),
         "git_diff" => git_diff(args, cfg),
         "git_log" => git_log(args, cfg),
+        "workspace_activity" => workspace_activity(args, cfg),
         "git_add" => git_add(args, cfg),
         "git_commit" => git_commit(args, cfg),
         "memory" => memory_tool(args, cfg),
@@ -643,8 +656,24 @@ impl Outcome {
 
 // ---- file tools ----
 
+/// Resolve a tool's path argument against the workspace root, honoring the
+/// approval mode. Under `Approval::Never` ALL path confinement is disabled —
+/// absolute paths, `..` traversal, and symlink escapes are allowed (the model
+/// is fully trusted, so it may read/write anywhere on the host). Under
+/// `Destructive`/`Always` the full confinement applies (reject absolute,
+/// reject `..`, reject symlink-outside-workspace). The dangerous-path list
+/// (.env/.git/.ssh) is gated separately in the approval gate
+/// (main::restricted_path_for_tool), which is also Never-off.
+fn resolve_ws(cfg: &Config, input: &str) -> Result<std::path::PathBuf, String> {
+    if matches!(cfg.approval, Approval::Never) {
+        workspace::resolve_unconfined(&cfg.workspace, input)
+    } else {
+        workspace::resolve(&cfg.workspace, input)
+    }
+}
+
 fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -734,7 +763,7 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
     // (main::restricted_path_for_tool) so that under Approval::Never ALL
     // restrictions are disabled, and under Destructive/Always a restricted
     // path prompts (instead of an unconditional kill) for reads AND writes.
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -757,7 +786,7 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
 }
 
 fn list_dir(input: &str, cfg: &Config) -> Outcome {
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -790,7 +819,7 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     let root = if input.is_empty() {
         cfg.workspace.clone()
     } else {
-        match workspace::resolve(&cfg.workspace, input) {
+        match resolve_ws(cfg, input) {
             Ok(p) => p,
             Err(e) => return Outcome::err(e),
         }
@@ -1555,7 +1584,7 @@ fn plan_edit(
     edits: &[Value],
     cfg: &Config,
 ) -> Result<(std::path::PathBuf, String, String), String> {
-    let path = workspace::resolve(&cfg.workspace, input)?;
+    let path = resolve_ws(cfg, input)?;
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
     let mut new_content = content.clone();
@@ -1639,7 +1668,7 @@ pub fn preview_diff_edit(input: &str, edits: &[Value], cfg: &Config) -> Result<S
 
 /// Compute the unified diff a `patch` call *would* produce, without writing.
 pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<String, String> {
-    let resolved = workspace::resolve(&cfg.workspace, path)?;
+    let resolved = resolve_ws(cfg, path)?;
     let original = std::fs::read_to_string(&resolved).unwrap_or_default();
     let new = apply_unified_diff(&original, patch)?;
     Ok(make_unified_diff(&original, &new, path, 3))
@@ -1648,7 +1677,7 @@ pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<Strin
 /// Compute the unified diff a `write_file` call *would* produce, without
 /// writing. For a new file the diff is the whole content as additions.
 pub fn preview_diff_write(input: &str, content: &str, cfg: &Config) -> Result<String, String> {
-    let path = workspace::resolve(&cfg.workspace, input)?;
+    let path = resolve_ws(cfg, input)?;
     let old_content = std::fs::read_to_string(&path).unwrap_or_default();
     Ok(make_unified_diff(&old_content, content, input, 3))
 }
@@ -1891,7 +1920,7 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
     if path.is_empty() || patch.is_empty() {
         return Outcome::err("patch requires 'path' and 'patch'");
     }
-    let resolved = match workspace::resolve(&cfg.workspace, path) {
+    let resolved = match resolve_ws(cfg, path) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -2028,7 +2057,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     let target = if path.is_empty() {
         cfg.workspace.clone()
     } else {
-        match workspace::resolve(&cfg.workspace, path) {
+        match resolve_ws(cfg, path) {
             Ok(p) => p,
             Err(e) => return Outcome::err(e),
         }
@@ -2433,6 +2462,92 @@ fn git_log(args: &Value, cfg: &Config) -> Outcome {
             let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             git_exec(cfg, &refs)
         }
+    }
+}
+
+/// List OTHER active catalyst-code sessions in this workspace (separate
+/// processes), each with its goal, in-progress work, and recently touched
+/// files. Awareness only — read-only broadcast of "who is here". Use when
+/// something seems off to decide whether a neighbor caused it before assuming
+/// you introduced the error. Stale/crashed sessions are auto-pruned by mtime.
+fn workspace_activity(_args: &Value, cfg: &Config) -> Outcome {
+    let my_pid = std::process::id();
+    let peers = crate::presence::read_peers(&cfg.workspace, my_pid);
+    if peers.is_empty() {
+        return Outcome::ok(
+            "No other active catalyst-code sessions in this workspace. Any error \
+             you are seeing is from your own work or the environment.",
+        );
+    }
+    let now = crate::presence::unix_now();
+    let mut out = format!(
+        "{} other active session(s) in this workspace:\n",
+        peers.len()
+    );
+    for p in &peers {
+        out.push_str(&format!(
+            "\n- pid {} (started {}, last active {})",
+            p.pid,
+            age(now, p.started_at),
+            age(now, p.last_heartbeat)
+        ));
+        if let Some(sid) = &p.session_id {
+            out.push_str(&format!(", session {sid}"));
+        }
+        if let Some(m) = &p.model {
+            out.push_str(&format!(", model {m}"));
+        }
+        if !p.goal.is_empty() {
+            out.push_str(&format!("\n  goal: {}", truncate(p.goal.as_str(), 140)));
+        }
+        if !p.in_progress.is_empty() {
+            out.push_str(&format!("\n  in progress: {}", p.in_progress.join("; ")));
+        }
+        if !p.next.is_empty() {
+            out.push_str(&format!("\n  next: {}", p.next.join("; ")));
+        }
+        if !p.recent_files.is_empty() {
+            out.push_str(&format!(
+                "\n  recently touched: {}",
+                p.recent_files.join(", ")
+            ));
+        }
+        if !p.last_activity.is_empty() {
+            out.push_str(&format!(
+                "\n  last: {}",
+                truncate(p.last_activity.as_str(), 140)
+            ));
+        }
+    }
+    Outcome::ok(out)
+}
+
+/// Render a unix-seconds delta as a compact human age ("3m", "2h", "just now").
+fn age(now: u64, then: u64) -> String {
+    let s = now.saturating_sub(then);
+    if s < 5 {
+        "just now".to_string()
+    } else if s < 60 {
+        format!("{}s ago", s)
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
+}
+
+/// Truncate `s` to at most `n` chars, appending an ellipsis if cut. A small
+/// local copy of main.rs's `truncate_str` (kept private there) so this module
+/// stays self-contained.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
+        t.push('…');
+        t
     }
 }
 
@@ -2935,6 +3050,43 @@ mod tests {
         fs::write(cfg.workspace.join("inside.txt"), "ok").unwrap();
         let o = execute("read_file", &json!({"path":"inside.txt"}), &cfg);
         assert!(o.ok, "{}", o.output);
+    }
+
+    #[test]
+    fn never_mode_disables_path_confinement() {
+        // Under Approval::Never ALL file restrictions are disabled: absolute
+        // paths and `..` traversal are allowed (the model is fully trusted), so
+        // path confinement is OFF — not just the dangerous-path list. This is
+        // the counterpart to `workspace_confines_paths` (which asserts the
+        // Destructive rejection of the same paths).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let (_root, mut cfg) = tmp_ws();
+        cfg.approval = crate::config::Approval::Never;
+        // A small file in the PARENT of the workspace, reached both by absolute
+        // path and by `..` traversal from inside the workspace.
+        let parent = cfg.workspace.parent().unwrap().to_path_buf();
+        let name = format!("catalyst_code_never_out_{n}.txt");
+        let outside = parent.join(&name);
+        fs::write(&outside, "leaked").unwrap();
+        // Absolute path: allowed under Never (rejected under Destructive).
+        let o = execute(
+            "read_file",
+            &json!({ "path": outside.to_str().unwrap() }),
+            &cfg,
+        );
+        assert!(
+            o.ok,
+            "absolute read must be allowed under Never: {}",
+            o.output
+        );
+        assert!(o.output.contains("leaked"), "{}", o.output);
+        // `..` traversal: allowed under Never.
+        let o = execute("read_file", &json!({ "path": format!("../{name}") }), &cfg);
+        assert!(o.ok, "`..` read must be allowed under Never: {}", o.output);
+        assert!(o.output.contains("leaked"), "{}", o.output);
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]
@@ -3472,5 +3624,71 @@ mod tests {
             .ok
         );
         assert!(!execute("memory", &json!({ "action": "append", "name": "x" }), &cfg).ok);
+    }
+
+    #[test]
+    fn workspace_activity_lists_peers() {
+        let (_root, cfg) = tmp_ws();
+        let my_pid = std::process::id();
+
+        // No peers → reassuring "you're alone" message.
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("No other active"), "{}", o.output);
+
+        // Seed a fake peer (a different pid) in this workspace's presence dir.
+        let peer_pid = my_pid.wrapping_add(1);
+        let peer = crate::presence::PresenceRecord::from_work_state(
+            &crate::WorkState {
+                goal: "fix CI".into(),
+                recent_files: vec!["core/src/main.rs".into()],
+                in_progress: vec!["green build".into()],
+                ..Default::default()
+            },
+            peer_pid,
+            Some("peer.json".into()),
+            None,
+            crate::presence::unix_now(),
+        );
+        crate::presence::write_presence(&cfg.workspace, peer_pid, &peer);
+
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("1 other active session"), "{}", o.output);
+        assert!(o.output.contains("fix CI"), "goal missing: {}", o.output);
+        assert!(
+            o.output.contains("core/src/main.rs"),
+            "recent file missing: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("green build"),
+            "in-progress missing: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains(&format!("pid {peer_pid}")),
+            "pid missing: {}",
+            o.output
+        );
+
+        // Self (my_pid) must never appear even if our own presence file exists.
+        let me = crate::presence::PresenceRecord::from_work_state(
+            &crate::WorkState::default(),
+            my_pid,
+            None,
+            None,
+            crate::presence::unix_now(),
+        );
+        crate::presence::write_presence(&cfg.workspace, my_pid, &me);
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(
+            !o.output.contains(&format!("pid {my_pid}\n")),
+            "self leaked: {}",
+            o.output
+        );
+
+        crate::presence::clear_presence(&cfg.workspace, peer_pid);
+        crate::presence::clear_presence(&cfg.workspace, my_pid);
     }
 }

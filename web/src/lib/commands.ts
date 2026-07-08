@@ -24,8 +24,9 @@ export const COMMANDS: CommandDef[] = [
   { label: "/reset", desc: "wipe conversation + session file", category: "session", action: "reset" },
   { label: "/clear", desc: "clear view (keep session file)", category: "session", action: "clear" },
   { label: "/undo", desc: "drop last turn", category: "session", action: "undo" },
-  { label: "/compact", desc: "force context compaction", category: "session", action: "compact" },
+  { label: "/compact", desc: "force compaction (opt: instructions)", category: "session", action: "compact" },
   { label: "/stats", desc: "token + turn totals", category: "session", action: "stats" },
+  { label: "/context", desc: "token-usage breakdown (top consumers)", category: "session", action: "context" },
   { label: "/abort", desc: "stop running turn", category: "session", action: "abort", streaming: true },
 
   // ── Config ──

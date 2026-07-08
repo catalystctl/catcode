@@ -121,8 +121,14 @@ export function Chat() {
         if (window.confirm("Reset the conversation and session file? This cannot be undone."))
           return a.reset();
         return;
-      case "compact":
-        return a.compact();
+      case "compact": {
+        const instr = window.prompt(
+          "Optional: what should compaction preserve?\n(e.g. “Focus on code samples and API usage”)\nLeave blank for the default summary.",
+        );
+        return a.compact(instr?.trim() || undefined);
+      }
+      case "context":
+        return a.context();
       case "new":
         return a.newSession();
       case "abort":

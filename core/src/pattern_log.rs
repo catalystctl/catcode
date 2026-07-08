@@ -72,6 +72,11 @@ impl Store {
         }
         let _ = std::fs::create_dir_all(&self.root);
         let path = self.path(workspace);
+        // Cross-process lock: append is a read-modify-write (read all lines,
+        // push, trim, write back). Two processes in the same workspace both
+        // completing a turn would otherwise race and silently drop entries.
+        // Advisory flock (auto-released on exit/crash).
+        let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"));
         let mut lines = read_lines(&path);
         let entry = PatternEntry {
             sig: sig.to_string(),
@@ -143,10 +148,9 @@ fn read_entries(path: &Path) -> Vec<PatternEntry> {
 }
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // Unique-temp atomic write (fsutil): two processes in the same workspace
+    // never share a temp file, so a concurrent append can't corrupt this one.
+    crate::fsutil::atomic_write_str(path, content)
 }
 
 /// Build a shape signature from the tool names used (in order) and the file

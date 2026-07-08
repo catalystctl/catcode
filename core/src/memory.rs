@@ -12,7 +12,6 @@
 // kept for potential external use, hence the module-level dead-code allow.
 #![allow(dead_code)]
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
@@ -336,6 +335,14 @@ fn append_memory_into(
     let dir = store.dir_scoped(workspace, scope);
     let slug = slugify(name);
     let path = dir.join(format!("{slug}.md"));
+    // Cross-process lock: append is a read-modify-write (read existing content,
+    // merge new facts, write back). The in-process WRITE_LOCK serializes
+    // threads/subagents but NOT separate processes — two processes appending
+    // to the same memory name concurrently would both read the same base and
+    // the second rename would silently drop the first's facts. This advisory
+    // flock (auto-released on exit/crash) closes that gap.
+    let _lock = crate::fsutil::FileLock::acquire(&dir.join(".lock"))
+        .map_err(|e| format!("failed to acquire memory lock: {e}"))?;
     let existing = parse_memory_file(&path);
     let mut combined = match &existing {
         Some(m) if !m.content.is_empty() => {
@@ -636,27 +643,13 @@ fn slugify(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Atomic + fsync'd file write: write a sibling temp file, fsync it, then rename
-/// over the target (mirroring the session layer's durability). On any error the
-/// temp file is removed so a crash mid-write can never leave a truncated memory
-/// file. Memories are durable learnings, so they get the same crash-safety as
-/// session persistence.
+/// Atomic + fsync'd file write via a UNIQUE temp file (fsutil), so two
+/// processes writing the same memory concurrently never collide on a shared
+/// temp name and corrupt each other's write. Memories are durable learnings,
+/// so they get the same crash-safety as session persistence (temp + fsync +
+/// rename; an orphaned temp on crash is benign).
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path).inspect_err(|_e| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fsutil::atomic_write_str(path, content)
 }
 
 // ---- tests ----

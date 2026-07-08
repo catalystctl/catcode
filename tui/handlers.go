@@ -35,6 +35,7 @@ func (s *session) accumulateSaved(ev *coreEvent) {
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	switch ev.Type {
 	case "ready":
+		s.coreReady = true // disarm the startup watchdog
 		var models []modelInfo
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
@@ -57,6 +58,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				if n > 0 {
 					s.coreBashTimeout = n
 				}
+			}
+			if raw, ok := m["auto_compact"]; ok {
+				var b bool
+				_ = json.Unmarshal(raw, &b)
+				s.coreAutoCompact = b
 			}
 			// Provider fields (openai/anthropic endpoints).
 			if raw, ok := m["provider"]; ok {
@@ -200,7 +206,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 		if match != nil {
-			match.output = out
+			match.output = capOutput(out)
 			match.diff = ev.get("diff")
 			match.ok = ev.get("ok") == "true"
 			match.hasOk = true
@@ -270,6 +276,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "reset":
+		s.busy = false // a reset is a conversation boundary — no turn is in flight
 		s.blocks = nil
 		s.cur = nil
 		s.contextTokens = 0
@@ -286,6 +293,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logInfo("conversation reset")
 
 	case "history":
+		// Loading a session is a conversation boundary — clear any in-flight
+		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with
+		// busy=true and a wiped transcript.
+		s.busy = false
+		s.cur = nil
+		s.queuedNext = false
+		s.queued = nil
 		var m map[string]json.RawMessage
 		if json.Unmarshal(ev.Raw, &m) == nil {
 			if raw, ok := m["messages"]; ok {
@@ -303,6 +317,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
+	case "compacting":
+		// Pre-compaction warning: the core is about to summarize/drop history.
+		// Shown as a toast so the pause isn't a mystery (esp. on slow providers
+		// where the summarize call can take several seconds).
+		trigger := ev.get("trigger")
+		if trigger == "" {
+			trigger = "auto"
+		}
+		s.logInfo(fmt.Sprintf("compacting context (%s)…", trigger))
+
 	case "compacted":
 		if ev.get("scope") == "subagent" {
 			break // subagent-internal compaction; don't clutter the main transcript
@@ -388,6 +412,24 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.logApproveDiff(ev.get("tool"), ev.get("args"), ev.get("diff"))
 		s.input.Focus()
+	case "ask_request":
+		// The model called the `ask` tool and is blocking on the user's
+		// answers. Parse the questions into a flyout and render it; the core
+		// waits for `ask_reply` (sent by sendAskReply on submit/skip). rawKey
+		// is required: ev.get unmarshals into a string, which fails for an
+		// array and returns "" — the flyout would never open (the original
+		// bug: ask.go existed but no event case ever called parseAskRequest).
+		qraw, ok := ev.rawKey("questions")
+		if !ok {
+			qraw = json.RawMessage("[]")
+		}
+		if a := parseAskRequest(ev.get("request_id"), qraw); a != nil {
+			s.pendingAsk = a
+			s.input.Blur()
+			s.logInfo(fmt.Sprintf("❓ agent asks: %d question%s — answer the prompt",
+				len(a.questions), pluralS(len(a.questions))))
+			s.layout()
+		}
 	case "intercom_message":
 		// A subagent is prompting the orchestrator for a decision (or a progress
 		// update). need_decision blocks until we reply; progress_update is a log line.
@@ -473,7 +515,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// local terminal, which writes its clipboard, so the user can just paste.
 		// Best-effort: terminals that lack OSC 52 (e.g. macOS Terminal.app) ignore
 		// it and the user copies from the hard-wrapped URL shown below instead.
-		copyToClipboardOSC52(url)
+		clipCmd := writeOSC52Cmd(url)
 		var b strings.Builder
 		b.WriteString(message)
 		if url != "" {
@@ -497,6 +539,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if url != "" {
 			openURL(url)
 		}
+		return clipCmd // OSC 52 write is a tea.Cmd so it's serialized with the renderer
 
 	case "steer":
 		// Core acknowledged a steer: the running turn was interrupted and the
@@ -549,6 +592,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
 			}
 		}
+
+	case "context_breakdown":
+		// /context reply: parse the token-usage breakdown and open a modal so
+		// the user can see where the context budget is being spent.
+		var cb contextBreakdown
+		if err := json.Unmarshal(ev.Raw, &cb); err != nil {
+			s.logError("failed to parse context breakdown")
+			break
+		}
+		s.ctxBreakdown = &cb
+		s.modal.kind = modalContext
+		s.modal.editing = false
+		s.modal.fieldIdx = 0
 
 	case "memory_saved":
 		if msg := ev.get("message"); msg != "" {
@@ -660,7 +716,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 func (s *session) applyModels(models []modelInfo) {
 	s.models = models
 	s.modelIdx = 0
-	if sel := s.settings.SelectedModel; sel != "" {
+	if len(models) == 0 {
+		s.modelIdx = -1 // no model: -1 is an explicit "invalid" sentinel (downstream guards accept it)
+	} else if sel := s.settings.SelectedModel; sel != "" {
 		for i, mm := range models {
 			if mm.ID == sel || strings.Contains(mm.ID, sel) {
 				s.modelIdx = i
@@ -961,15 +1019,26 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// global: the quit key (default Ctrl+C) quits unless a modal is open
 	// (where esc / ctrl+c closes the modal instead).
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
+		// Mark teardown so the core's stdout EOF doesn't trigger an auto-restart,
+		// then kill the core. The stdout-reader goroutine reaps it via cmd.Wait()
+		// on EOF — do NOT Wait() here, that would race the reader's Wait on the
+		// same Cmd (double-reap).
+		quitting.Store(true)
 		if s.coreCmd != nil && s.coreCmd.Process != nil {
 			_ = s.coreCmd.Process.Kill()
-			_, _ = s.coreCmd.Process.Wait() // reap the core child so it isn't a zombie
 		}
 		return s, tea.Quit
 	}
 	// modal intercept: when a modal is active it owns all keys.
 	if s.modal.kind != modalNone {
 		return s.handleModalKey(msg)
+	}
+	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
+	// all keys (option cycling, text entry, submit, skip). Dispatched before
+	// scrolling/global keys just like the modal above — without it the flyout
+	// never receives keystrokes even after ask_request set s.pendingAsk.
+	if s.pendingAsk != nil {
+		return s.handleAskKey(msg)
 	}
 	// transcript scrolling works in every state (idle/busy/approval) so the
 	// user can read history while a turn runs or a decision is pending.
@@ -1433,8 +1502,16 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logInfo("dropped last turn")
 			return nil
 		case "/compact":
-			s.sendCore(map[string]any{"type": "compact"})
+			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
+			if rest == "" {
+				s.sendCore(map[string]any{"type": "compact"})
+			} else {
+				s.sendCore(map[string]any{"type": "compact", "instructions": rest})
+			}
 			s.logInfo("forcing context compaction…")
+			return nil
+		case "/context":
+			s.sendCore(map[string]any{"type": "context"})
 			return nil
 		case "/remember":
 			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
@@ -1648,22 +1725,30 @@ func openURL(url string) {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	_ = cmd.Start()
+	// Run (Start+Wait) in a goroutine so the opener is reaped instead of
+	// leaving a zombie; fire-and-forget Start() never collects the child.
+	go func() { _ = cmd.Run() }()
 }
 
-// copyToClipboardOSC52 writes the OSC 52 escape sequence to set the LOCAL
-// terminal's clipboard to text. Over SSH the sequence passes through to the
-// user's local terminal, which writes its clipboard — so the user can paste
-// (Ctrl/Cmd+V) into their local browser without copying from the (wrapped,
-// hard-to-select) transcript. Best-effort: terminals that don't support OSC 52
-// ignore it. The sequence is invisible (no cursor move / no text), so it is
-// safe to emit from a Bubble Tea handler between render frames.
-func copyToClipboardOSC52(text string) {
+// writeOSC52Cmd returns a tea.Cmd that writes the OSC 52 escape sequence to set
+// the LOCAL terminal's clipboard to text. Over SSH the sequence passes through
+// to the user's local terminal, which writes its clipboard — so the user can
+// paste (Ctrl/Cmd+V) into their local browser without copying from the
+// (wrapped, hard-to-select) transcript. Best-effort: terminals that don't
+// support OSC 52 ignore it. The sequence is invisible (no cursor move / no
+// text). Routing the stdout write through a returned tea.Cmd serializes it with
+// Bubble Tea's renderer goroutine (which also writes stdout) — a direct
+// os.Stdout write from Update races the renderer and can garble the screen.
+func writeOSC52Cmd(text string) tea.Cmd {
 	if text == "" {
-		return
+		return nil
 	}
 	// OSC 52: ESC ] 52 ; <selection> ; <base64> BEL.  'c' = the CLIPBOARD
 	// selection (the Ctrl/Cmd+V paste buffer).
 	enc := base64.StdEncoding.EncodeToString([]byte(text))
-	os.Stdout.WriteString("\x1b]52;c;" + enc + "\x07")
+	seq := "\x1b]52;c;" + enc + "\x07"
+	return func() tea.Msg {
+		os.Stdout.WriteString(seq)
+		return nil
+	}
 }

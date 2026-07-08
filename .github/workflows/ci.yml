@@ -11,7 +11,7 @@ permissions:
 jobs:
   core:
     name: core (rust)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,7 +32,7 @@ jobs:
 
   tui:
     name: tui (go)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -45,6 +45,9 @@ jobs:
             ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('tui/go.sum') }}
           restore-keys: ${{ runner.os }}-go-
+      - name: gofmt check
+        working-directory: tui
+        run: test -z "$(gofmt -l .)"
       - name: go vet
         working-directory: tui
         run: go vet ./...
@@ -57,7 +60,7 @@ jobs:
 
   cross-compile:
     name: tui cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -89,14 +92,10 @@ jobs:
 
   docker:
     name: docker image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: build (no push)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          load: true
-          tags: catalyst-code:ci
+      - name: build image (no push; buildah chroot — runs under rootless podman)
+        # Nested OCI build: chroot isolation + vfs storage work inside a
+        # rootless container without extra privileges (build-check only).
+        run: buildah build --isolation chroot --storage-driver vfs -t catalyst-code:ci .

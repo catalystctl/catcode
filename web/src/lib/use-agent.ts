@@ -57,9 +57,10 @@ export interface AgentApi {
   newSession: () => Promise<void>;
   loadSession: (path: string) => Promise<void>;
   listSessions: () => Promise<void>;
-  compact: () => Promise<void>;
+  compact: (instructions?: string) => Promise<void>;
   reset: () => Promise<void>;
   stats: () => Promise<void>;
+  context: () => Promise<void>;
   dismissToast: (id: string) => void;
   // ── Subagent / intercom ──
   intercomReply: (reply: string) => Promise<void>;
@@ -394,9 +395,14 @@ export function useAgent(): AgentApi {
     [switchToSession],
   );
   const listSessions = useCallback(() => send({ type: "list_sessions" }), [send]);
-  const compact = useCallback(() => send({ type: "compact" }), [send]);
+  const compact = useCallback(
+    (instructions?: string) =>
+      send({ type: "compact", ...(instructions ? { instructions } : {}) }),
+    [send],
+  );
   const reset = useCallback(() => send({ type: "reset" }), [send]);
   const stats = useCallback(() => send({ type: "stats" }), [send]);
+  const context = useCallback(() => send({ type: "context" }), [send]);
 
   const dismissToast = useCallback((id: string) => {
     setState((s) => reduce(s, { type: "_dismiss_toast", id }));
@@ -630,6 +636,7 @@ export function useAgent(): AgentApi {
       compact,
       reset,
       stats,
+      context,
       dismissToast,
       intercomReply,
       askReply,
