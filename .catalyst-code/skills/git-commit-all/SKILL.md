@@ -22,6 +22,11 @@ Do NOT use for:
 
 1. **Show what will be committed**: `git status --short` and `git diff --stat` so the user can confirm.
 2. **Verify it compiles** (don't land broken code): run the project's type checker / build for each *changed* component before committing — e.g. `cd core && cargo check` (main binary; avoid `cargo check --tests` if a pre-existing test-binary breakage unrelated to your change is known), `cd tui && go build ./... && go vet ./...`, `cd web && npx tsc --noEmit`. Run the changed ones in parallel; only block the commit on errors in files YOU touched (isolate concurrent-user edits — see the concurrent-user-edits-isolate-errors gotcha). Skip components you didn't touch.
+
+   **Prefer the EXACT CI gates, not just "it compiles"** — especially when the diff touches formatting or adds/changes a CI gate. A plain `cargo check` / `go build` won't catch fmt drift that CI fails on. The authoritative gates (mirror `.github/workflows/ci.yml`):
+   - core: `cargo fmt --all -- --check` · `cargo clippy --all-targets` (treat warnings as errors under `-D warnings` if CI sets it) · `cargo test --locked`
+   - tui: `gofmt -l .` (must be EMPTY) · `go vet ./...` · `go build ./...` · `go test -race ./...` (the `-race` matters — catches data-race fixes a plain `go test` won't)
+   - When a commit ADDS a new CI gate (e.g. a gofmt step), run that gate yourself before committing — the gate's first run should already pass on your commit.
 3. **Stage everything**: `git add --all` (stages modified, new, and deleted files).
 4. **Build a commit message** from the diff:
    - For a SMALL change, `git diff --cached --stat` (file list + churn) is enough.
