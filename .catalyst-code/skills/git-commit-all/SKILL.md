@@ -43,6 +43,12 @@ Do NOT use for:
    - If it has NO upstream: `git push -u origin <branch>` (sets upstream on first push).
    - On non-fast-forward rejection: `git pull --rebase origin <branch>` then `git push`.
    - Report the range pushed (`<old>..<new>  <branch> -> <branch>`) and, if the repo has workflows triggered on push, list them (`gh run list -L 3 -R <owner/repo>`) so the user sees what the push kicked off.
+8. **Watch CI to green (when the user said "get it live" / was fixing CI)**: a push that says "get those changes live" or that fixes a red CI isn't done at `git push` — the point is a GREEN run. After pushing, capture the newest run id from the `gh run list` output above, then watch it to completion:
+   - `gh run watch <run-id> --repo <owner/repo> --exit-status` (blocks until the run finishes; exits non-zero if any job failed).
+   - On success: confirm green with a one-line summary (`gh run view <run-id> --repo <owner/repo>`, list the ✓ jobs).
+   - On failure: `gh run view --job <failed-job-id> --repo <owner/repo> --log-failed` to read the failing step's log, diagnose, fix, commit, push again, and re-watch. Loop until green (cap a few rounds — if a job is structurally broken, surface it to the user instead of flailing).
+   - Benign annotations (cache-restore misses like "Dependencies file is not found … go.sum", Node.js deprecation notices, runner-warnings) are NOT failures — don't chase them; only act on a job marked `X`.
+   - Skip this step if the push was to a branch with no CI, or the user only said "commit and push" without a live/CI connotation.
 
 ## Message convention
 
