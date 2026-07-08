@@ -395,7 +395,11 @@ mod tests {
         // Per-worktree git dir: HEAD + a commondir pointer to the main repo.
         let wt_git = unique_dir("umans_git_ctx_wtgit");
         fs::write(wt_git.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
-        fs::write(wt_git.join("commondir"), format!("{}\n", main_git.display())).unwrap();
+        fs::write(
+            wt_git.join("commondir"),
+            format!("{}\n", main_git.display()),
+        )
+        .unwrap();
 
         // Workspace whose `.git` is a pointer to the per-worktree git dir.
         let ws = unique_dir("umans_git_ctx_wtws");

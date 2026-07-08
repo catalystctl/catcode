@@ -2409,8 +2409,7 @@ pub(crate) fn restricted_path_for_tool(
         // Reduce to a root-relative, forward-slash form so the same
         // component-glob logic (`.git/**`, `**/.ssh/**`, …) that checks the
         // raw string applies to the canonical path, cross-platform.
-        let canon_root =
-            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let rel = canon.strip_prefix(&canon_root).unwrap_or(&canon);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         workspace::check_dangerous_path(&rel_str)
@@ -5389,7 +5388,9 @@ mod restricted_path_tests {
         let r = root();
         // .ENV / .GIT/config must still match on case-insensitive filesystems.
         assert!(restricted_path_for_tool("read_file", &json!({"path": ".ENV"}), &r).is_some());
-        assert!(restricted_path_for_tool("write_file", &json!({"path": ".GIT/config"}), &r).is_some());
+        assert!(
+            restricted_path_for_tool("write_file", &json!({"path": ".GIT/config"}), &r).is_some()
+        );
     }
 
     #[test]
@@ -5478,19 +5479,33 @@ mod ask_tests {
         assert!(validate_ask_questions(&json!({})).is_err());
         assert!(validate_ask_questions(&json!({"questions": []})).is_err());
         // missing id
-        assert!(validate_ask_questions(&json!({"questions": [{"prompt":"p","type":"text"}]})).is_err());
+        assert!(
+            validate_ask_questions(&json!({"questions": [{"prompt":"p","type":"text"}]})).is_err()
+        );
         // missing prompt
         assert!(validate_ask_questions(&json!({"questions": [{"id":"a","type":"text"}]})).is_err());
         // invalid type
-        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"radio"}]})).is_err());
+        assert!(validate_ask_questions(
+            &json!({"questions": [{"id":"a","prompt":"p","type":"radio"}]})
+        )
+        .is_err());
     }
 
     #[test]
     fn validate_select_requires_options() {
-        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select"}]})).is_err());
-        assert!(validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select","options":[]}]})).is_err());
+        assert!(validate_ask_questions(
+            &json!({"questions": [{"id":"a","prompt":"p","type":"select"}]})
+        )
+        .is_err());
+        assert!(validate_ask_questions(
+            &json!({"questions": [{"id":"a","prompt":"p","type":"select","options":[]}]})
+        )
+        .is_err());
         // valid select
-        let q = validate_ask_questions(&json!({"questions": [{"id":"a","prompt":"p","type":"select","options":["x","y"]}]})).unwrap();
+        let q = validate_ask_questions(
+            &json!({"questions": [{"id":"a","prompt":"p","type":"select","options":["x","y"]}]}),
+        )
+        .unwrap();
         assert_eq!(q.as_array().unwrap().len(), 1);
     }
 
@@ -5508,7 +5523,8 @@ mod ask_tests {
         let qs = validate_ask_questions(&json!({"questions": [
             {"id":"fw","prompt":"Which framework?","type":"select","options":["React","Vue"]},
             {"id":"notes","prompt":"Any notes?","type":"text","required":false}
-        ]})).unwrap();
+        ]}))
+        .unwrap();
         // answered fw, skipped notes
         let out = format_ask_answers(&qs, &json!({"fw": "React"}));
         assert!(out.contains("fw (Which framework?): React"));
@@ -5519,7 +5535,8 @@ mod ask_tests {
     fn format_answers_all_answered() {
         let qs = validate_ask_questions(&json!({"questions": [
             {"id":"a","prompt":"Q1","type":"text"}
-        ]})).unwrap();
+        ]}))
+        .unwrap();
         let out = format_ask_answers(&qs, &json!({"a": "hello"}));
         assert!(out.contains("a (Q1): hello"));
         assert!(!out.contains("(skipped)"));

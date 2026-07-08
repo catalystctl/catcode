@@ -1481,7 +1481,7 @@ fn find_matches(content: &str, search: &str, normalize: bool) -> Vec<(usize, usi
     let mut from_char = 0usize; // char index in ncontent
     while let Some(pos) = ncontent[from..].find(&nsearch) {
         let p = from + pos; // byte offset of the match start
-        // char index of the match start = from_char + chars in the gap
+                            // char index of the match start = from_char + chars in the gap
         let p_char = from_char + ncontent[from..p].chars().count();
         let start_orig = map[p_char];
         let end_norm_char = p_char + nlen_chars;
@@ -2804,11 +2804,7 @@ mod tests {
         // span and silently corrupted the file via replace_range. The fix
         // tracks byte offset + char index in parallel.
         let (_root, cfg) = tmp_ws();
-        fs::write(
-            cfg.workspace.join("f.txt"),
-            "漢字\n\tif (x)  return;\n}\n",
-        )
-        .unwrap();
+        fs::write(cfg.workspace.join("f.txt"), "漢字\n\tif (x)  return;\n}\n").unwrap();
         let args = json!({ "path": "f.txt", "edits": [
             { "search": "if (x) return;", "replace": "if (x) { return; }", "normalize_whitespace": true }
         ] });
@@ -2826,11 +2822,7 @@ mod tests {
         // to the correct source bytes even when the collapsed string contains
         // multi-byte chars between matches.
         let (_root, cfg) = tmp_ws();
-        fs::write(
-            cfg.workspace.join("f.txt"),
-            "→ a   b\n★ a\tb\n☆ a b\n",
-        )
-        .unwrap();
+        fs::write(cfg.workspace.join("f.txt"), "→ a   b\n★ a\tb\n☆ a b\n").unwrap();
         let args = json!({ "path": "f.txt", "edits": [
             { "search": "a b", "replace": "X", "normalize_whitespace": true, "replace_all": true }
         ] });

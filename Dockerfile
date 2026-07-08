@@ -13,7 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 COPY core/ ./core/
 RUN cd core && cargo build --release
 
-FROM golang:1.24-slim AS tui-builder  # 1.24: tui/go.mod requires go 1.24.2 (hard min since Go 1.21); 1.23 silently pulled 1.24 via GOTOOLCHAIN (P0-6)
+# 1.24: tui/go.mod requires go 1.24.2 (hard min since Go 1.21); 1.23 silently
+# pulled 1.24 via GOTOOLCHAIN (P0-6). Dockerfile FROM lines cannot carry an
+# inline `#` comment — BuildKit treats it as extra FROM args and errors with
+# "FROM requires either one or three arguments". Keep comments on their own line.
+FROM golang:1.24-slim AS tui-builder
 WORKDIR /build
 COPY tui/ ./tui/
 RUN cd tui && CGO_ENABLED=0 go build -o /tui .

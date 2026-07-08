@@ -17,8 +17,8 @@ use crate::config::Config;
 use crate::fetch_tool::{egress_check, html_to_text};
 use crate::tools::{smart_truncate, Outcome};
 use regex::Regex;
-use std::sync::LazyLock;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 
 /// Hoisted (compiled once at first use) instead of recompiled on every
 /// web_search call. DDG Lite markup is stable enough that these don't change
@@ -26,12 +26,10 @@ use serde_json::{json, Value};
 static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<a\s+class="result-link"\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
 });
-static SNIP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"class="result-snippet"[^>]*>([\s\S]*?)</td>"#).unwrap()
-});
-static ANY_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
-});
+static SNIP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"class="result-snippet"[^>]*>([\s\S]*?)</td>"#).unwrap());
+static ANY_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap());
 
 /// Percent-decode a query-string value (no `percent-encoding` crate dep).
 /// Handles `%XX` hex escapes and `+`→space. Malformed `%` sequences are passed

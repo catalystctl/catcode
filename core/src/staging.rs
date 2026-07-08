@@ -452,8 +452,14 @@ mod tests {
             "USER CUSTOMIZED",
             "user customizations must be preserved across the migration"
         );
-        assert!(!old_cfg.exists(), "old config root should be removed after migration");
-        assert!(!old_stage.exists(), "old staging root should be removed after migration");
+        assert!(
+            !old_cfg.exists(),
+            "old config root should be removed after migration"
+        );
+        assert!(
+            !old_stage.exists(),
+            "old staging root should be removed after migration"
+        );
 
         // Idempotent: a second call is a no-op (new layout present -> skip).
         migrate_legacy_dirs_in(&tmp);

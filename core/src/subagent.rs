@@ -24,13 +24,13 @@ use crate::message::{self, Message};
 use crate::protocol::{emit, Event, ModelInfo};
 use crate::tools::{self, Outcome};
 use crate::State;
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-use futures_util::FutureExt;
-use std::panic::AssertUnwindSafe;
 
 // ---------------------------------------------------------------------------
 // Frontmatter parsing (port of frontmatter.ts)
@@ -1035,15 +1035,13 @@ async fn run_single(
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
                 .unwrap_or("(non-string panic payload)");
-            emit(
-                &Event::new("error").with(
-                    "message",
-                    json!(format!(
-                        "subagent {} panicked (finalizing run): {msg}",
-                        run_id
-                    )),
-                ),
-            );
+            emit(&Event::new("error").with(
+                "message",
+                json!(format!(
+                    "subagent {} panicked (finalizing run): {msg}",
+                    run_id
+                )),
+            ));
             Outcome::err(format!(
                 "subagent {run_id} terminated unexpectedly (panic): {msg}"
             ))

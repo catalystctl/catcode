@@ -53,9 +53,7 @@ fn host_allowed(host: &str, allowlist: &[String]) -> bool {
 /// 3xx response is returned without following, and the disallowed host is
 /// never contacted. Shared by `fetch` and `web_search` so both honor the same
 /// redirect policy.
-pub(crate) fn allowlist_redirect_policy(
-    allowlist: Vec<String>,
-) -> reqwest::redirect::Policy {
+pub(crate) fn allowlist_redirect_policy(allowlist: Vec<String>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         let host = attempt.url().host_str().unwrap_or("").to_ascii_lowercase();
         if host_allowed(&host, &allowlist) {
