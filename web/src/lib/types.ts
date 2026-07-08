@@ -269,7 +269,9 @@ export type CoreEvent =
   | { type: "ask_request"; request_id: string; questions: AskQuestion[] }
   | { type: "metrics" } & Metrics
   | { type: "umans_conc"; used: number | null; limit: number | null; provider: string }
-  | { type: "compacted"; before_tokens: number; after_tokens: number }
+  | { type: "compacted"; before_tokens: number; after_tokens: number; summary_chars?: number }
+  | { type: "compacting"; before_tokens: number; trigger: string }
+  | { type: "context_breakdown"; total_tokens: number; context_window: number; pct: number; messages: number; system_tokens: number; by_role: Record<string, number>; top_consumers: { index: number; role: string; tokens: number; preview: string }[] }
   | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
   | Stats
@@ -321,7 +323,8 @@ export type CoreCommand =
   | { type: "abort" }
   | { type: "reset" }
   | { type: "clear" }
-  | { type: "compact" }
+  | { type: "compact"; instructions?: string }
+  | { type: "context" }
   | { type: "approve"; request_id: string; decision: "yes" | "no" | "always" }
   | { type: "set_approval"; mode: "never" | "destructive" | "always" }
   | { type: "set_key"; api_key: string; provider?: string }

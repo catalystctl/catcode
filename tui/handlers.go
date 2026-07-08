@@ -58,6 +58,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 					s.coreBashTimeout = n
 				}
 			}
+			if raw, ok := m["auto_compact"]; ok {
+				var b bool
+				_ = json.Unmarshal(raw, &b)
+				s.coreAutoCompact = b
+			}
 			// Provider fields (openai/anthropic endpoints).
 			if raw, ok := m["provider"]; ok {
 				_ = json.Unmarshal(raw, &s.activeProvider)
@@ -303,6 +308,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
+	case "compacting":
+		// Pre-compaction warning: the core is about to summarize/drop history.
+		// Shown as a toast so the pause isn't a mystery (esp. on slow providers
+		// where the summarize call can take several seconds).
+		trigger := ev.get("trigger")
+		if trigger == "" {
+			trigger = "auto"
+		}
+		s.logInfo(fmt.Sprintf("compacting context (%s)…", trigger))
+
 	case "compacted":
 		if ev.get("scope") == "subagent" {
 			break // subagent-internal compaction; don't clutter the main transcript
@@ -567,6 +582,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
 			}
 		}
+
+	case "context_breakdown":
+		// /context reply: parse the token-usage breakdown and open a modal so
+		// the user can see where the context budget is being spent.
+		var cb contextBreakdown
+		if err := json.Unmarshal(ev.Raw, &cb); err != nil {
+			s.logError("failed to parse context breakdown")
+			break
+		}
+		s.ctxBreakdown = &cb
+		s.modal.kind = modalContext
+		s.modal.editing = false
+		s.modal.fieldIdx = 0
 
 	case "memory_saved":
 		if msg := ev.get("message"); msg != "" {
@@ -1458,8 +1486,16 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logInfo("dropped last turn")
 			return nil
 		case "/compact":
-			s.sendCore(map[string]any{"type": "compact"})
+			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
+			if rest == "" {
+				s.sendCore(map[string]any{"type": "compact"})
+			} else {
+				s.sendCore(map[string]any{"type": "compact", "instructions": rest})
+			}
 			s.logInfo("forcing context compaction…")
+			return nil
+		case "/context":
+			s.sendCore(map[string]any{"type": "context"})
 			return nil
 		case "/remember":
 			rest := strings.TrimSpace(strings.Join(parts[1:], " "))

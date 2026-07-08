@@ -5,99 +5,88 @@
 <h1 align="center">Catalyst Code</h1>
 
 <p align="center">
-  A production-grade, <strong>OpenAI-compatible</strong> coding-agent harness.<br>
-  Native multi-provider — Umans · OpenAI · Gemini · Anthropic — with a human-in-the-loop approval gate.
+  A self-hosted, <strong>OpenAI-compatible</strong> coding-agent harness.<br>
+  One binary, any provider — Umans · OpenAI · Gemini · Anthropic — with a human-in-the-loop approval gate.
 </p>
 
 <p align="center">
   <a href="https://github.com/catalystctl/catcode/releases"><img alt="version" src="https://img.shields.io/badge/version-0.2.0-ff9e28?style=flat-square"></a>
   <img alt="platforms" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-1a1716?style=flat-square">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-ce422b?style=flat-square">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.24.2%2B-00add8?style=flat-square">
-  <img alt="license" src="https://img.shields.io/badge/license-MIT-ff9e28?style=flat-square">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.24%2B-00add8?style=flat-square">
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-ff9e28?style=flat-square"></a>
 </p>
 
 ---
 
-## Overview
+## About
 
-Catalyst Code is a self-hosted coding agent that runs against any OpenAI- or
-Anthropic-compatible endpoint. Four cooperating components share one
-newline-delimited JSON protocol over stdio:
+Catalyst Code is a coding agent you run on your own machine against **any
+OpenAI- or Anthropic-compatible endpoint** — a cloud API, a local model, or a
+self-hosted gateway. It is not a hosted service and does not phone home: your
+code, prompts, and API key stay on your box.
 
-| Component | Language | Role |
-|:---|:---|:---|
-| **`core/`** | Rust (async, tokio) | The engine — conversation, model streaming, an agentic tool loop with a human-in-the-loop approval gate, sessions, memory, plugins, and subagents. |
-| **`tui/`** | Go · [Bubble Tea](https://github.com/charmbracelet/bubbletea) | The terminal interface (`catcode`). Spawns the core, streams events, renders approvals and metrics. |
-| **`sdk/`** | TypeScript | A thin pi-compatible wrapper (`@catalyst-code/coding-agent`) so the web frontend can drive the core. |
-| **`web/`** | Next.js 15 · React 19 | The browser equivalent of the TUI — an SSE bridge to one core process. |
+It exists because most agent tooling is locked to one provider, runs as a hosted
+SaaS, or ships as an opaque binary. Catalyst Code is the opposite — a small set
+of readable components sharing one newline-delimited JSON protocol, with a real
+safety model (workspace confinement + an approval gate) and first-class
+subagents. You can drive it from the terminal, the browser, or your own code.
 
-> **v0.2.0** ships the production hardening layer: subagents + intercom,
-> summarizing context compaction, session token budgets, `--sandbox firejail`
-> + `--no-network`, persistent per-workspace sessions, vision input, core-crash
-> auto-recovery, multi-provider `/login` (API key **and** OAuth), a Dockerfile,
-> and cross-platform install scripts. Full history in
-> [`CHANGELOG.md`](CHANGELOG.md).
+## Features
 
----
+**Multi-provider, no lock-in** — one `/login` picker for Umans, OpenAI, Gemini,
+and Anthropic. Be logged into several at once; any model you pick routes that
+turn to its endpoint. API key *and* subscription OAuth (no key) supported.
 
-## Table of contents
+**Human-in-the-loop safety** — destructive tools (`bash`, `write_file`,
+`edit`, …) require consent under the default `destructive` mode. Restricted
+paths (`.env`, `.git`, `.ssh`) are gated for reads *and* writes. Optional Linux
+hard sandbox: `--sandbox firejail --no-network`.
 
-- [Installation](#installation)
-  - [Linux & macOS — `install.sh` (recommended)](#linux--macos--installsh-recommended)
-  - [Windows — MSI + `install-web.ps1`](#windows--msi--install-webps1)
-  - [First run](#first-run)
-  - [Web frontend (as a service)](#web-frontend-as-a-service)
-  - [Prebuilt binaries (standalone)](#prebuilt-binaries-standalone)
-- [Features](#features)
-- [Providers and login](#providers-and-login)
-- [Build from source](#build-from-source)
-- [Architecture](#architecture)
-- [Subagents and intercom](#subagents-and-intercom)
-- [Releases](#releases)
-- [Protocol](#protocol)
-- [Testing](#testing)
-- [Security and notes](#security-and-notes)
-- [License](#license)
+**Workspace confinement** — every file op resolves against a workspace root;
+absolute paths, `..`, and symlink escapes are rejected. `bash` runs with
+`cwd = workspace`.
 
----
+**Built-in subagents** — delegate to focused child agents (`scout`,
+`planner`, `worker`, `reviewer`, …) over single / parallel / chain execution,
+with a peer intercom bus for coordination.
+
+**Robust by default** — HTTP retry/backoff, idle-stream timeout, summarizing
+context compaction with orphaned-tool-call sanitization, fsync'd append-only
+sessions, and core-crash auto-recovery.
+
+**Pluggable** — bundled agents, skills, and hook-based plugins (pre/post +
+lifecycle + `pre_turn` model handoff) live in [`.catalyst-code/`](.catalyst-code).
+Plugins can even declare custom tools without MCP or a recompile.
+
+**Full toolset** — `edit`/`patch`/`grep`/`glob`, async `bash`, `diagnostics`
+(cargo / tsc / go / py), `fetch`, `todo`, `memory`, git tools, `spawn`, and
+`subagent` delegation.
 
 ## Installation
 
-The **recommended** path is the bundled install script — it **downloads
-prebuilt binaries** (no compiler needed) and installs `catcode` +
-`catcode-core` to your PATH, and can also install the web frontend as a
-background service. Pass `--build-from-source` to compile locally instead.
-Standalone no-install binaries (AppImage / `.dmg` / MSI) are also
-[available](#prebuilt-binaries-standalone).
-
-> **Repo visibility:** the installer downloads from this repo's GitHub
-> Releases. Anonymous download works once the repo is **public**. If it is
-> private, point the installer at a public mirror with `--base-url <url>`
-> (Linux/macOS) / `-BaseUrl <url>` (Windows), or build from source.
-
-### Linux & macOS — `install.sh` (recommended)
-
-`install.sh` **downloads prebuilt** `catcode` + `catcode-core` and installs
-them to your PATH — no Rust/Go/`next build` on the host. With `--with-web` it
-also downloads a prebuilt Next.js web bundle and installs it as a system
-service (**systemd** on Linux, **launchd** on macOS — auto-detected). The web
-service only needs a [Node](https://nodejs.org) or [Bun](https://bun.sh)
-runtime to *run* (not to build).
-
-**Prerequisites:** `curl` + `coreutils` (always); Node or Bun (only for
-`--with-web`). No compiler. Add `--build-from-source` to compile locally
-(then also needs Rust + Go 1.24.2+).
+### Quick start (Linux & macOS)
 
 ```bash
-bash install.sh                 # download + install catcode and catcode-core
-bash install.sh --with-web      # …also download + install the web service
-bash install.sh --version 0.2.0 # pin a specific release
-bash install.sh --dry-run        # preview the full plan, execute nothing
+bash install.sh            # downloads prebuilt catcode + catcode-core to PATH
+catcode                    # launches in your current directory
 ```
 
-Then run `catcode` from any directory. The workspace is your current directory —
-launch it from another folder to work on a different project.
+No compiler needed — the installer pulls prebuilt binaries from GitHub
+Releases. Run `catcode` from any folder to work on that project.
+
+```bash
+bash install.sh --with-web      # also install the web frontend as a service
+bash install.sh --version 0.2.0 # pin a release
+bash install.sh --dry-run       # preview the plan, execute nothing
+```
+
+### Requirements
+
+- **Linux / macOS / Windows** (sandbox is Linux-only; on macOS/Windows leave it `none`).
+- `curl` + coreutils (always). No compiler unless you build from source.
+- For `--with-web`: a [Node](https://nodejs.org) or [Bun](https://bun.sh) runtime to *run* the service (not to build it).
+- To build from source: Rust (stable) + **Go 1.24+**.
 
 <details>
 <summary><strong>install.sh options</strong></summary>
@@ -112,51 +101,35 @@ launch it from another folder to work on a different project.
 | `--prefix <dir>` | `/usr/local/bin` | Binary install directory |
 | `--port <n>` | `49283` | Web service port |
 | `--host <h>` | `0.0.0.0` | Web bind host |
-| `--repo <url>` | — | (source path) Clone `<url>` first, then install from it |
+| `--repo <url>` | — | Clone `<url>` first, then install from it |
 | `--update` | — | Re-download latest + reinstall (+ restart the service) |
 | `--uninstall` | — | Stop + remove binaries, service, and state |
 | `--dry-run` | off | Print the plan, execute nothing |
-| `-h`, `--help` | — | Show help |
 
 </details>
 
-| | Linux | macOS |
-|:---|:---|:---|
-| **TUI / core** | `catcode`, `catcode-core` → `$PREFIX` (sudo) | same |
-| **Web service** | systemd unit `catalyst-code-web.service` — starts at boot, auto-restarts | launchd agent `~/Library/LaunchAgents/com.catalyst-code.web.plist` — starts at login, `KeepAlive` |
-| **Web logs** | `journalctl -u catalyst-code-web.service -f` | `~/Library/Logs/catalyst-code-web.log` |
+### Windows
 
-```bash
-bash install.sh --update        # re-download latest + reinstall (+ restart service)
-bash install.sh --uninstall     # stop + remove binaries, service, and state
-```
+No POSIX `install.sh` on Windows — use the PowerShell / MSI paths.
 
-### Windows — MSI + `install-web.ps1`
+**TUI** — install `catcode` + `catcode-core` via any of:
 
-Windows has no POSIX `install.sh`; use the PowerShell scripts instead.
+- **Per-user MSI** (`catcode-<ver>-windows.msi`) — no admin, clean
+  Add/Remove Programs entry, in-place upgrades:
+  ```powershell
+  msiexec /i catcode-<ver>-windows.msi            # interactive (no UAC)
+  msiexec /i catcode-<ver>-windows.msi /quiet     # silent
+  ```
+- **Standalone `.exe`** (`catcode-<ver>-windows-x86_64.exe`) — core embedded,
+  no install; run from any directory.
+- **No-build fallback** `packaging/windows/install.ps1` — copies two raw
+  `.exe` files to PATH.
 
-**TUI** — install `catcode` + `catcode-core` via one of:
-
-- **Per-user MSI** (`catcode-<ver>-windows.msi`) — double-click, or
-  `msiexec /i catcode-<ver>-windows.msi`. Installs to
-  `%LOCALAPPDATA%\Programs\catcode` and adds it to PATH. No admin, clean
-  Add/Remove Programs entry, in-place upgrades.
-- **Standalone `.exe`** (`catcode-<ver>-windows-x86_64.exe`) — core embedded, no
-  install; run from any CWD.
-- **No-build fallback** `packaging/windows/install.ps1` — copies two raw `.exe`
-  files to PATH.
-
-```powershell
-msiexec /i catcode-<ver>-windows.msi            # interactive (no UAC)
-msiexec /i catcode-<ver>-windows.msi /quiet     # silent
-```
-
-**Web service** — `packaging/windows/install-web.ps1` **downloads a prebuilt
-web bundle** (and `catcode-core.exe` if not already present) and installs it as
-a **Windows Service via [NSSM](https://nssm.cc)** (starts at boot, auto-restarts,
-runs with no user logged in) or, if NSSM isn't installed, a **Scheduled Task at
-logon** with a restart-loop wrapper (zero extra deps). No `next build`; needs
-Node or Bun to run. Add `-BuildFromSource` to compile from a checkout instead.
+**Web service** — `packaging/windows/install-web.ps1` downloads a prebuilt web
+bundle (and `catcode-core.exe` if missing) and installs it as a **Windows
+Service via [NSSM](https://nssm.cc)** (boot-start, auto-restart) or, without
+NSSM, a **logon Scheduled Task** with a restart-loop wrapper. Needs Node or
+Bun to run.
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1
@@ -164,30 +137,43 @@ pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1
 pwsh -ExecutionPolicy Bypass -File packaging\windows\install-web.ps1 -Uninstall
 ```
 
-Logs: `%LOCALAPPDATA%\catalyst-code\catalyst-code-web.log`.
+### Prebuilt binaries (standalone, no installer)
 
-### First run
+| Platform | Artifact | Run |
+|:---|:---|:---|
+| **Linux** | `catcode-<ver>-<arch>.AppImage` | `./catcode-<ver>-x86_64.AppImage` |
+| **macOS** | `catcode-<ver>-macos-{arm64,x86_64}.dmg` | mount → "Install catcode.command" |
+| **Windows** | `catcode-<ver>-windows.msi` | double-click / `msiexec` |
+
+Each platform also ships a **standalone executable** with the Rust core embedded
+(`-tags embed_core`) — one file, no install, run from any directory.
+
+> **Private repo?** Anonymous download works once the repo is **public**. If it
+> is private, point the installer at a public mirror with `--base-url <url>`
+> (Linux/macOS) / `-BaseUrl <url>` (Windows), or [build from source](#contributing).
+
+## Usage
+
+### Terminal — first run
 
 ```bash
-catcode              # launches in the current directory (your workspace)
+catcode            # launches in the current directory (your workspace)
 ```
 
 In the TUI:
 
-- `/login` — pick a provider (Umans / OpenAI / Gemini / Anthropic). An API key in
-  an env var logs in instantly; otherwise it prompts. Subscription accounts use
-  OAuth (no key) — see [Providers and login](#providers-and-login).
+- `/login` — pick a provider. An API key in an env var logs in instantly;
+  subscription accounts use OAuth (no key).
 - `/model [N|substr]` — list models, or switch (`/model 3`, `/model glm-5.2`).
-- type a prompt to chat.
-- `/help` — all commands.
+- `/approval never|destructive|always` — change the safety gate.
+- type a prompt to chat. `/help` lists every command.
 
-### Web frontend (as a service)
+### Web frontend
 
-The Next.js web frontend is the browser equivalent of the TUI — it spawns one
+The Next.js web app is the browser equivalent of the TUI — it spawns one
 `catcode-core` and streams events to the browser over SSE. The installer
-downloads a **prebuilt** standalone bundle (no `next build` on the host); it
-only needs a Node or Bun runtime to run. `catcode-core` is installed
-alongside it (or auto-downloaded on Windows).
+downloads a **prebuilt** standalone bundle (no `next build` on the host); it only
+needs a Node or Bun runtime to run.
 
 | Platform | Install command | Service manager |
 |:---|:---|:---|
@@ -209,78 +195,14 @@ Set `CATCODE_CORE=<path>` if the core isn't found automatically (it searches
 > For public exposure, bind to `127.0.0.1` and put a TLS reverse proxy
 > (Caddy / nginx / IIS) in front.
 
-### Prebuilt binaries (standalone)
-
-Prefer a single file with no installer? Grab a prebuilt artifact (built by the
-`release-*.sh` scripts; see [Releases](#releases)):
-
-| Platform | Artifact | Run |
-|:---|:---|:---|
-| **Linux** | `catcode-<ver>-<arch>.AppImage` | `./catcode-<ver>-x86_64.AppImage` |
-| **macOS** | `catcode-<ver>-macos-{arm64,x86_64}.dmg` | mount → "Install catcode.command" |
-| **Windows** | `catcode-<ver>-windows.msi` | double-click / `msiexec` |
-
-Each platform also ships a **standalone executable** with the Rust core embedded
-(`-tags embed_core`) — one file, no install, run from any CWD.
-
----
-
-## Features
-
-### Safety
-
-- **Workspace confinement** — every file op resolves against a workspace root;
-  absolute paths, `..`, and symlink escapes are rejected. `bash` runs with
-  `cwd = workspace`.
-- **Human-in-the-loop approval** — destructive tools (`bash`, `write_file`,
-  `edit`, …) require consent under the default `destructive` mode:
-  `y` approve once · `a` approve and stop asking for this kind · `n` deny.
-  Modes: `never` / `destructive` / `always`, switchable via `/approval`.
-  Restricted paths (`.env`, `.git`, `.ssh`, …) are approval-gated for reads
-  *and* writes.
-- **Optional hard sandbox** (Linux) — `--sandbox firejail` wraps bash in a
-  firejail profile (workspace + shell paths only, dropped caps/seccomp);
-  `--no-network` adds `unshare -n`. The denylist is a tripwire on top.
-
-### Robustness
-
-- **HTTP retry/backoff** — 429, 5xx, and transport errors retried with
-  exponential backoff (0.5s→8s), honoring `Retry-After`.
-- **Idle stream timeout** — `--idle-timeout` (default 120s); a stuck stream
-  aborts instead of hanging.
-- **Context compaction** — at 70% of the model window, oldest tool results are
-  dropped (system + recent turns kept) with **orphaned-tool-call sanitization**
-  so a compacted history never sends `tool_calls` without matching results.
-- **File-size guards** — `read_file` refuses >5 MiB / 10k lines (with
-  `offset`/`limit` pagination); `grep`/`glob` cap results.
-- **Crash-safe sessions** — append-only JSONL, fsync per message, atomic
-  rewrites; core-crash auto-recovery on restart.
-
-### Tooling
-
-Search-and-replace `edit` (exact, unique, atomic, multi-op) · `grep` + `glob` ·
-async `bash` (timeout, kill, denylist, 32 KB output cap) · `patch` ·
-`diagnostics` (cargo check / tsc / go build / py_compile) · `fetch` (read-only
-HTTP, egress-controlled) · `todo_write`/`todo_read` · `memory` · git tools ·
-`spawn` · `subagent` delegation.
-
-### Observability and persistence
-
-JSONL debug log (`--debug-log`) · per-turn metrics (TTFT, elapsed, tokens
-in/out, TPS) · per-workspace sessions under
-`~/.config/catalyst-code/sessions/<hex(cwd)>/` with `/sessions` · `/new` ·
-`/undo` · `/compact` · `/stats`.
-
----
-
 ## Providers and login
 
-`/login` opens a picker of the bundled presets. You can be logged into several at
-once; `/models` lists every provider's models (tagged `[umans]`, `[openai]`,
+`/login` opens a picker of the bundled presets. You can be logged into several
+at once; `/models` lists every provider's models (tagged `[umans]`, `[openai]`,
 `[gemini]`, `[anthropic]`), and any model you pick routes that turn to its
 endpoint.
 
-| Preset | Kind | Endpoint | Key env var |
+| Preset | Wire | Endpoint | Key env var |
 |:---|:---|:---|:---|
 | **Umans (GLM-5.2)** | OpenAI | `api.code.umans.ai/v1` | `UMANS_API_KEY` |
 | **OpenAI (Codex)** | OpenAI | `api.openai.com/v1` | `OPENAI_API_KEY` |
@@ -292,66 +214,60 @@ from the environment, so the secret never lands in a config file).
 
 ### Subscription login (OAuth) — no API key
 
-ChatGPT Plus/Pro (Codex), Google One AI (Gemini), and Claude Pro/Max are accessed
+ChatGPT Plus/Pro (Codex), Google One AI (Gemini), and Claude Pro/Max are reached
 via **OAuth**, performed by `/login` itself (no official CLI needed):
 
-- **Gemini** — authorization-code + PKCE + loopback-redirect (opens
-  accounts.google.com). Reuses `gcloud auth application-default login` if present.
-- **Anthropic Claude** — authorize + PKCE + loopback-redirect (opens claude.ai).
-  Reuses the `claude` CLI token if present.
-- **OpenAI Codex** — ⚠️ not yet wired (the ChatGPT token needs the Responses API,
-  a different request shape). Codex stays on `OPENAI_API_KEY` for now.
+- **Gemini** — authorization-code + PKCE + loopback redirect. Reuses
+  `gcloud auth application-default login` if present.
+- **Anthropic Claude** — authorize + PKCE + loopback redirect. Reuses the
+  `claude` CLI token if present.
+- **OpenAI Codex** — ⚠️ not yet wired (the ChatGPT token needs the Responses
+  API, a different request shape). Codex stays on `OPENAI_API_KEY` for now.
 
 Tokens are stored at `~/.config/catalyst-code/oauth/<id>.json` (`0600`) and
 refreshed automatically. An explicit API key always takes precedence over OAuth.
 
----
-
-## Build from source
-
-For development (no install, run from the repo):
-
-```bash
-cd core && cargo build --release      # -> core/target/release/core
-cd tui && go build -o catcode         # -> tui/catcode
-./tui/catcode                          # the TUI finds ../core/target/release/core
-```
-
-Requires Rust (stable) and **Go 1.24.2+**. The web frontend needs Bun or Node.js
-(see [Web frontend](#web-frontend-as-a-service)).
-
----
-
 ## Architecture
 
+Four cooperating components around one stdio JSONL protocol:
+
+| Component | Language | Role |
+|:---|:---|:---|
+| **`core/`** | Rust (async, tokio) | The engine — conversation, model streaming, the agentic tool loop with an approval gate, sessions, memory, plugins, and subagents. |
+| **`tui/`** | Go · [Bubble Tea](https://github.com/charmbracelet/bubbletea) | The terminal interface (`catcode`). Spawns the core, streams events, renders approvals and metrics. |
+| **`sdk/`** | TypeScript | A thin pi-compatible wrapper (`@catalyst-code/coding-agent`) so the web frontend can drive the core. |
+| **`web/`** | Next.js 15 · React 19 | The browser equivalent of the TUI — an SSE bridge to one core process. See [`web/README.md`](web/README.md). |
+
 ```
-core/                 Rust async engine (stdio JSONL)
-  src/main.rs         entry, State, turn loop, approval gate, compaction, ask
-  src/provider.rs     OpenAI/Anthropic streaming, retry/backoff, model discovery, sanitize
-  src/subagent.rs     subagent execution (single/parallel/chain), forked context, depth cap
-  src/intercom.rs     peer intercom bus (contact_supervisor / intercom ask/receive/reply)
-  src/plugins.rs      plugin manager + hooks (pre_*/post_*/lifecycle/pre_turn)
-  src/protocol.rs     wire types (Command / Event) + line emit
-  src/config.rs       CLI + env + JSON config, approval modes, providers
-  src/workspace.rs    path confinement (absolute/.. /symlink rejection)
-  src/tools.rs        tool schemas + classification + execution
-  src/session.rs      append-only JSONL session persistence
-  src/memory.rs       persistent memory store (injected into the system prompt)
-  src/git_ctx.rs      git status/branch context for the system prompt
-  src/vision.rs       vision model config + image attachment
-  src/fetch_tool.rs   HTTP fetch tool (read-only, egress-controlled)
-  src/oauth.rs        OAuth flows (Gemini, Anthropic, Codex)
-  src/logging.rs      JSONL debug log + token estimation
-  src/staging.rs      global default-file staging (~/.catalyst-code/)
-tui/                  Go + Bubble Tea terminal UI (spawns the core)
-sdk/                  TypeScript pi-compatible SDK wrapper
-web/                  Next.js web frontend (SSE bridge) — see web/README.md
-packaging/            per-platform install scripts + packaging (linux/ macos/ windows/)
-.catalyst-code/       bundled agents, plugins, skills (shipped defaults)
-.github/workflows/    CI (core clippy/test, tui vet/test/build + cross-compile, docker)
+core/        Rust async engine (stdio JSONL)   tui/   Go + Bubble Tea terminal UI
+sdk/         TypeScript pi-compatible wrapper   web/   Next.js web frontend (SSE bridge)
+packaging/   per-platform install scripts       .catalyst-code/   bundled agents, plugins, skills
 ```
 
----
+<details>
+<summary><strong>core/ source layout</strong></summary>
+
+```
+src/main.rs       entry, State, turn loop, approval gate, compaction, ask
+src/provider.rs   OpenAI/Anthropic streaming, retry/backoff, model discovery, sanitize
+src/subagent.rs   subagent execution (single/parallel/chain), forked context, depth cap
+src/intercom.rs   peer intercom bus (contact_supervisor / intercom ask/receive/reply)
+src/plugins.rs    plugin manager + hooks (pre_*/post_*/lifecycle/pre_turn)
+src/protocol.rs   wire types (Command / Event) + line emit
+src/config.rs     CLI + env + JSON config, approval modes, providers
+src/workspace.rs   path confinement (absolute/.. /symlink rejection)
+src/tools.rs      tool schemas + classification + execution
+src/session.rs    append-only JSONL session persistence
+src/memory.rs     persistent memory store (injected into the system prompt)
+src/git_ctx.rs    git status/branch context for the system prompt
+src/vision.rs     vision model config + image attachment
+src/fetch_tool.rs HTTP fetch tool (read-only, egress-controlled)
+src/oauth.rs      OAuth flows (Gemini, Anthropic, Codex)
+src/logging.rs    JSONL debug log + token estimation
+src/staging.rs    global default-file staging (~/.catalyst-code/)
+```
+
+</details>
 
 ## Subagents and intercom
 
@@ -364,10 +280,14 @@ peers over an in-process intercom bus.
 `researcher` · `planner` · `worker` · `reviewer` · `context-builder` · `oracle` ·
 `delegate`.
 
-**Execution modes:** single `{ agent, task }` · parallel `{ tasks, concurrency }`
-· chain `{ chain: [...] }` (with `{previous}`/`{outputs.name}` templating), plus
-management actions (`list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`/
-`resume`/`peek`/`steer`/`doctor`).
+**Execution modes:**
+
+```ts
+{ agent: "worker", task: "refactor auth" }                 // single
+{ tasks: [{ agent: "scout", task: "a" }, { ... }], concurrency: 2 }  // parallel
+{ chain: [{ agent: "scout" }, { agent: "planner" }, { agent: "worker" }] }  // chain
+// management: list / get / create / status / interrupt / resume / peek / steer
+```
 
 **Intercom:**
 
@@ -376,48 +296,45 @@ management actions (`list`/`get`/`create`/`update`/`delete`/`status`/`interrupt`
 - `intercom({ action: "send"|"ask"|"receive"|"reply"|"targets", to, message })`
   — peer-to-peer messaging between parallel subagents.
 
-**Slash commands:** `/run` · `/parallel` · `/chain` · `/subagents` ·
-`/subagents-status`. Config lives under `subagents` in settings JSON
-(`maxSubagentDepth`, `intercomBridge.mode`, `parallel.maxTasks`, …).
+## Contributing
 
----
+Contributions are welcome. This is a young project — issues and PRs that improve
+safety, provider coverage, or docs are especially useful.
 
-## Releases
+### Development setup
 
-`release-all.sh [version]` builds **all** distributable artifacts at once —
-Windows MSI + standalone `.exe`, macOS standalone + `.dmg` (arm64 + x86_64),
-Linux standalone + AppImage — running each platform script independently and
-reporting per-platform pass/fail (a host with a partial toolchain still ships
-what it can). `release-web.sh` builds the cross-platform prebuilt web bundle.
-All artifacts are published to a GitHub Release by `.github/workflows/release.yml`
-(on a `v*` tag push); the installers download them so users never compile.
+Run from the repo (no install needed):
 
-| Script | Outputs |
-|:---|:---|
-| `release-linux.sh` | standalone `catcode-<ver>-linux-<arch>` + `.AppImage` + `catcode-core-<ver>-linux-<arch>` |
-| `release-macos.sh` | standalone `catcode-<ver>-macos-{arm64,x86_64}` + `.dmg` + `catcode-core-<ver>-macos-{arm64,x86_64}` (cross-compiles via `cargo zigbuild`) |
-| `release-windows.sh` | `catcode-<ver>-windows.msi` + standalone `.exe` + `.zip` + `catcode-core-<ver>-windows-x86_64.exe` (cross-compiles `x86_64-pc-windows-gnu`) |
-| `release-web.sh` | `catcode-web-<ver>.tar.gz` — prebuilt Next.js standalone bundle (one cross-platform tarball) |
+```bash
+cd core && cargo build --release      # -> core/target/release/core
+cd tui && go build -o catcode         # -> tui/catcode
+./tui/catcode                          # finds ../core/target/release/core
+```
 
-Each standalone embeds the Rust core via `go:embed` (`-tags embed_core`) so it's
-one self-contained file. The separate `catcode-core-*` binaries are for the web
-service's `CATCODE_CORE`. Artifacts land in `dist/` with `.sha256` checksums.
+Requires Rust (stable) and **Go 1.24+**. The web frontend needs Bun or Node.js
+(see [Usage → Web frontend](#web-frontend)).
 
----
+### Running tests
 
-## Protocol
+```bash
+cd core && cargo test --locked     # 300+ unit tests (edit, confinement, bash, sanitize, session, …)
+cd tui && go test ./...            # TUI tests (handlers, blocks, mention, modal, intercom)
+```
+
+CI (`.github/workflows/ci.yml`) runs core clippy/test, tui vet/test/build, a Go
+cross-compile matrix (linux / darwin / windows), and a Docker image build.
+
+### Wire protocol
 
 Core reads commands from stdin and writes events to stdout — one JSON object per
-line.
+line. This is the integration point for alternative frontends:
 
 ```json
 {"type":"init"}
 {"type":"login","preset":"openai","api_key":"sk-..."}
 {"type":"send","prompt":"...","model":"umans-glm-5.2","reasoning_effort":"high"}
 {"type":"steer","prompt":"..."}
-{"type":"abort"}
 {"type":"approve","request_id":"<id>","decision":"yes|no|always"}
-{"type":"set_approval","mode":"never|destructive|always"}
 ```
 
 **Events:** `ready` · `authed` · `thinking` · `delta` · `tool_call_start` ·
@@ -425,36 +342,59 @@ line.
 `tool_result` · `compacted` · `http_retry` · `metrics` · `approval_changed` ·
 `done` · `aborted` · `reset` · `error` (plus subagent / memory / session events).
 
----
+## Releases
 
-## Testing
+`release-all.sh [version]` builds **all** distributable artifacts at once and
+reports per-platform pass/fail (a host with a partial toolchain still ships what
+it can). All artifacts are published to a GitHub Release by
+`.github/workflows/release.yml` on a `v*` tag push; the installers download them
+so users never compile. Each standalone embeds the Rust core via `go:embed`
+(`-tags embed_core`); the separate `catcode-core-*` binaries are for the web
+service's `CATCODE_CORE`.
 
-```bash
-cd core && cargo test --locked     # 314 unit tests (edit, confinement, bash, sanitize, session, …)
-cd tui && go test ./...            # TUI tests (handlers, blocks, mention, modal, intercom)
-```
+<details>
+<summary><strong>Release scripts &amp; outputs</strong></summary>
 
-CI (`.github/workflows/ci.yml`) runs core clippy/test, tui vet/test/build, a Go
-cross-compile matrix (linux / darwin / windows), and a Docker image build.
+| Script | Outputs |
+|:---|:---|
+| `release-linux.sh` | standalone `catcode-<ver>-linux-<arch>` + `.AppImage` + `catcode-core-<ver>-linux-<arch>` |
+| `release-macos.sh` | standalone `catcode-<ver>-macos-{arm64,x86_64}` + `.dmg` + `catcode-core-<ver>-macos-{arch}` (cross-compiles via `cargo zigbuild`) |
+| `release-windows.sh` | `catcode-<ver>-windows.msi` + standalone `.exe` + `.zip` + `catcode-core-<ver>-windows-x86_64.exe` (cross-compiles `x86_64-pc-windows-gnu`) |
+| `release-web.sh` | `catcode-web-<ver>.tar.gz` — prebuilt Next.js standalone bundle (one cross-platform tarball) |
 
----
+Artifacts land in `dist/` with `.sha256` checksums.
 
-## Security and notes
+</details>
+
+## Security notes
 
 - **OpenAI-compatible** — point `--base-url` at any OpenAI-shaped endpoint.
-  Umans-specific logic (GLM `reasoning_effort=high` clamp, `reasoning_content`
-  replay, `/models/info` discovery) is isolated to `provider.rs`.
+  Provider-specific logic (GLM `reasoning_effort=high` clamp,
+  `reasoning_content` replay, `/models/info` discovery) is isolated to
+  `provider.rs`.
 - **No fixed turn cap** — the ceiling is the session token budget
   (`--max-session-tokens`, `0` = unlimited). The model can call `finish` to exit
-  cleanly or `spawn` a nested sub-agent.
-- **Hard security boundary** — pass `--sandbox firejail --no-network` (or set in
-  the TUI settings modal). The denylist is a tripwire on top; workspace
-  confinement covers file paths, but `bash` is only sandboxed when `--sandbox` is
-  set. Sandboxing is **Linux-only**; on macOS/Windows leave it `none`.
+  cleanly or `spawn` a nested agent.
+- **Hard security boundary** — pass `--sandbox firejail --no-network` (or set it
+  in the TUI settings). The denylist is a tripwire on top; workspace confinement
+  covers file paths, but `bash` is only sandboxed when `--sandbox` is set.
+  Sandboxing is **Linux-only**.
 - **Windows bash** — the agent's `bash` tool needs bash on PATH (Git Bash or
   WSL); chat and the file tools work without it.
 
----
+## Roadmap
+
+- [ ] Wire OpenAI Codex subscription OAuth (Responses API).
+- [ ] More provider presets (local gateways, additional OAuth flows).
+- [ ] macOS/Windows sandboxing options.
+- [ ] Broader plugin / skill ecosystem.
+
+## Acknowledgments
+
+- [pi-subagents](https://github.com/nicobailon/pi-subagents) — the subagent +
+  intercom design this project's orchestration is ported from.
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) (TUI),
+  [Next.js](https://nextjs.org) (web), and the Rust async ecosystem.
 
 ## License
 

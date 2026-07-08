@@ -1,7 +1,7 @@
 // Built-in tools the agent can call. OpenAI function-calling schema.
 // All file ops are confined to the workspace root; bash runs with cwd=workspace
 // and a real timeout+kill. read_file returns plain content; edit uses search/replace.
-use crate::config::Config;
+use crate::config::{Approval, Config};
 use crate::workspace;
 use serde_json::{json, Value};
 
@@ -643,8 +643,24 @@ impl Outcome {
 
 // ---- file tools ----
 
+/// Resolve a tool's path argument against the workspace root, honoring the
+/// approval mode. Under `Approval::Never` ALL path confinement is disabled —
+/// absolute paths, `..` traversal, and symlink escapes are allowed (the model
+/// is fully trusted, so it may read/write anywhere on the host). Under
+/// `Destructive`/`Always` the full confinement applies (reject absolute,
+/// reject `..`, reject symlink-outside-workspace). The dangerous-path list
+/// (.env/.git/.ssh) is gated separately in the approval gate
+/// (main::restricted_path_for_tool), which is also Never-off.
+fn resolve_ws(cfg: &Config, input: &str) -> Result<std::path::PathBuf, String> {
+    if matches!(cfg.approval, Approval::Never) {
+        workspace::resolve_unconfined(&cfg.workspace, input)
+    } else {
+        workspace::resolve(&cfg.workspace, input)
+    }
+}
+
 fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -734,7 +750,7 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
     // (main::restricted_path_for_tool) so that under Approval::Never ALL
     // restrictions are disabled, and under Destructive/Always a restricted
     // path prompts (instead of an unconditional kill) for reads AND writes.
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -757,7 +773,7 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
 }
 
 fn list_dir(input: &str, cfg: &Config) -> Outcome {
-    let path = match workspace::resolve(&cfg.workspace, input) {
+    let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -790,7 +806,7 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
     let root = if input.is_empty() {
         cfg.workspace.clone()
     } else {
-        match workspace::resolve(&cfg.workspace, input) {
+        match resolve_ws(cfg, input) {
             Ok(p) => p,
             Err(e) => return Outcome::err(e),
         }
@@ -1555,7 +1571,7 @@ fn plan_edit(
     edits: &[Value],
     cfg: &Config,
 ) -> Result<(std::path::PathBuf, String, String), String> {
-    let path = workspace::resolve(&cfg.workspace, input)?;
+    let path = resolve_ws(cfg, input)?;
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
     let mut new_content = content.clone();
@@ -1639,7 +1655,7 @@ pub fn preview_diff_edit(input: &str, edits: &[Value], cfg: &Config) -> Result<S
 
 /// Compute the unified diff a `patch` call *would* produce, without writing.
 pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<String, String> {
-    let resolved = workspace::resolve(&cfg.workspace, path)?;
+    let resolved = resolve_ws(cfg, path)?;
     let original = std::fs::read_to_string(&resolved).unwrap_or_default();
     let new = apply_unified_diff(&original, patch)?;
     Ok(make_unified_diff(&original, &new, path, 3))
@@ -1648,7 +1664,7 @@ pub fn preview_diff_patch(path: &str, patch: &str, cfg: &Config) -> Result<Strin
 /// Compute the unified diff a `write_file` call *would* produce, without
 /// writing. For a new file the diff is the whole content as additions.
 pub fn preview_diff_write(input: &str, content: &str, cfg: &Config) -> Result<String, String> {
-    let path = workspace::resolve(&cfg.workspace, input)?;
+    let path = resolve_ws(cfg, input)?;
     let old_content = std::fs::read_to_string(&path).unwrap_or_default();
     Ok(make_unified_diff(&old_content, content, input, 3))
 }
@@ -1891,7 +1907,7 @@ fn apply_patch(args: &Value, cfg: &Config) -> Outcome {
     if path.is_empty() || patch.is_empty() {
         return Outcome::err("patch requires 'path' and 'patch'");
     }
-    let resolved = match workspace::resolve(&cfg.workspace, path) {
+    let resolved = match resolve_ws(cfg, path) {
         Ok(p) => p,
         Err(e) => return Outcome::err(e),
     };
@@ -2028,7 +2044,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     let target = if path.is_empty() {
         cfg.workspace.clone()
     } else {
-        match workspace::resolve(&cfg.workspace, path) {
+        match resolve_ws(cfg, path) {
             Ok(p) => p,
             Err(e) => return Outcome::err(e),
         }
@@ -2935,6 +2951,39 @@ mod tests {
         fs::write(cfg.workspace.join("inside.txt"), "ok").unwrap();
         let o = execute("read_file", &json!({"path":"inside.txt"}), &cfg);
         assert!(o.ok, "{}", o.output);
+    }
+
+    #[test]
+    fn never_mode_disables_path_confinement() {
+        // Under Approval::Never ALL file restrictions are disabled: absolute
+        // paths and `..` traversal are allowed (the model is fully trusted), so
+        // path confinement is OFF — not just the dangerous-path list. This is
+        // the counterpart to `workspace_confines_paths` (which asserts the
+        // Destructive rejection of the same paths).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let (_root, mut cfg) = tmp_ws();
+        cfg.approval = crate::config::Approval::Never;
+        // A small file in the PARENT of the workspace, reached both by absolute
+        // path and by `..` traversal from inside the workspace.
+        let parent = cfg.workspace.parent().unwrap().to_path_buf();
+        let name = format!("catalyst_code_never_out_{n}.txt");
+        let outside = parent.join(&name);
+        fs::write(&outside, "leaked").unwrap();
+        // Absolute path: allowed under Never (rejected under Destructive).
+        let o = execute(
+            "read_file",
+            &json!({ "path": outside.to_str().unwrap() }),
+            &cfg,
+        );
+        assert!(o.ok, "absolute read must be allowed under Never: {}", o.output);
+        assert!(o.output.contains("leaked"), "{}", o.output);
+        // `..` traversal: allowed under Never.
+        let o = execute("read_file", &json!({ "path": format!("../{name}") }), &cfg);
+        assert!(o.ok, "`..` read must be allowed under Never: {}", o.output);
+        assert!(o.output.contains("leaked"), "{}", o.output);
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]

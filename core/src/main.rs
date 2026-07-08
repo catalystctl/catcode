@@ -118,6 +118,25 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
     prompt
 }
 
+/// Build the MAIN agent's system prompt: the base prompt (git context +
+/// memory + PLUGIN_DOCS + orchestrator skill manifest) PLUS any text plugins
+/// inject via their `system_prompt` manifest field. Plugin injection is empty
+/// (so the prompt + its prefix cache are untouched) when no enabled plugin
+/// declares one — mirroring how `build_system_prompt` stays cheap in the common
+/// case. Subagents do NOT get plugin injection (they use the built-in tool set
+/// only), matching the plugin-tools-are-main-agent-scoped design.
+fn build_main_system_prompt(
+    workspace: &std::path::Path,
+    pm: &plugins::PluginManager,
+) -> String {
+    let mut prompt = build_system_prompt(workspace, true);
+    let inj = pm.system_prompt_injection();
+    if !inj.is_empty() {
+        prompt.push_str(&inj);
+    }
+    prompt
+}
+
 /// Load the bundled pi-subagents SKILL.md (project then user scope) for the
 /// orchestrator's system prompt. Returns None if no skill file is found.
 fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
@@ -1220,6 +1239,7 @@ async fn main() {
                         .with("providers", json!(cfg.provider_names()))
                         .with("providerPresets", json!(provider_presets_json(&cfg)))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
+                        .with("auto_compact", json!(cfg.auto_compact))
                         .with("resumed_messages", json!(conv_len)),
                 );
                 // Tell the user when the harness staged its global defaults
@@ -1595,11 +1615,20 @@ async fn main() {
                 emit(&Event::new("approval_changed").with("mode", json!(new.as_str())));
             }
             Command::SetConfig { key, value } => {
-                // ponytail: minimal runtime knob setter for the two values the
-                // TUI settings modal edits. Coerce string-or-number to u64.
+                // Minimal runtime knob setter for the values the TUI settings
+                // modal edits. Coerce string-or-number to u64, string-or-bool
+                // to bool.
                 let as_u64 = |v: &Value| {
                     v.as_u64()
                         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                };
+                let as_bool = |v: &Value| {
+                    v.as_bool()
+                        .or_else(|| v.as_str().and_then(|s| match s {
+                            "1" | "true" | "on" => Some(true),
+                            "0" | "false" | "off" => Some(false),
+                            _ => None,
+                        }))
                 };
                 let mut cfg = state.cfg.write().await;
                 let out_key = key.clone();
@@ -1609,6 +1638,12 @@ async fn main() {
                         if let Some(n) = as_u64(&value) {
                             cfg.bash_timeout_secs = n;
                             out_val = json!(n);
+                        }
+                    }
+                    "auto_compact" => {
+                        if let Some(b) = as_bool(&value) {
+                            cfg.auto_compact = b;
+                            out_val = json!(b);
                         }
                     }
                     _ => {
@@ -1669,15 +1704,17 @@ async fn main() {
                 clear_work_state(&state).await;
                 emit(&Event::new("reset")); // TUI clears blocks; core keeps the trimmed conv
             }
-            Command::Compact => {
-                // Force compaction now, then emit a compacted event.
+            Command::Compact { instructions } => {
+                // Force compaction now, then emit a compacted event. Uses the
+                // summarize strategy (honoring any `/compact <instructions>`
+                // override or the configured `compact_instructions`) when an api
+                // key is present; falls back to naive drop-oldest otherwise.
                 let mut messages = state.conversation.lock().await.clone();
                 if messages.len() > 2 {
                     dispatch_lifecycle(&state, "pre_compact").await;
                     let before_est = estimate_messages_tokens(&messages);
                     // Size the reclaim against the user's actual model window,
-                    // not a hardcoded 200k — and let compact_conversation digest
-                    // oversized tool results when the tail alone is too big.
+                    // not a hardcoded 200k.
                     let model_ctx = {
                         let last = state.last_model.lock().await.clone();
                         let models = state.models.read().await;
@@ -1686,7 +1723,44 @@ async fn main() {
                             .map(|m| m.context_window as u64)
                             .unwrap_or(200_000)
                     };
-                    compact_conversation(&mut messages, model_ctx);
+                    emit(
+                        &Event::new("compacting")
+                            .with("before_tokens", json!(before_est))
+                            .with("trigger", json!("manual")),
+                    );
+                    let cfg = state.cfg.read().await.clone();
+                    let model_name = state.last_model.lock().await.clone().unwrap_or_default();
+                    let rp = state.resolve_provider_for_model(&model_name).await;
+                    // A `/compact <instructions>` override takes precedence over
+                    // the configured default; empty/whitespace falls back.
+                    let instr = match instructions
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(s) => Some(s),
+                        None => cfg.compact_instructions.as_deref(),
+                    };
+                    // Manual compact is a one-shot — a fresh (never-cancelled)
+                    // token is fine; there's no in-flight turn to abort it.
+                    let cancel = CancellationToken::new();
+                    let summary_chars = if rp.api_key.is_some() && !model_name.is_empty() {
+                        compact_with_summary(
+                            &client,
+                            &cfg,
+                            &rp,
+                            &model_name,
+                            &mut messages,
+                            &cancel,
+                            false,
+                            model_ctx,
+                            instr,
+                        )
+                        .await
+                    } else {
+                        compact_conversation(&mut messages, model_ctx);
+                        0
+                    };
                     *state.conversation.lock().await = messages.clone();
                     let after_est = estimate_messages_tokens(&messages);
                     *state.estimated_tokens.lock().await = after_est;
@@ -1698,7 +1772,8 @@ async fn main() {
                     emit(
                         &Event::new("compacted")
                             .with("before_tokens", json!(before_est))
-                            .with("after_tokens", json!(after_est)),
+                            .with("after_tokens", json!(after_est))
+                            .with("summary_chars", json!(summary_chars)),
                     );
                 } else {
                     emit(&Event::new("info").with("message", json!("nothing to compact yet")));
@@ -1910,6 +1985,88 @@ async fn main() {
                         .with("turns", json!(turns))
                         .with("messages", json!(msg_count))
                         .with("session_file", json!(session_file)),
+                );
+            }
+            Command::Context => {
+                // Token-breakdown: where is the context window being spent?
+                // Aggregates per-message token estimates (same char/4 heuristic
+                // the footer uses) so the user can see the biggest consumers
+                // before compaction fires. Read-only — never mutates state.
+                let conv = state.conversation.lock().await.clone();
+                let total = {
+                    let last_real = *state.last_real_prompt_tokens.lock().await;
+                    let len_at = *state.conv_len_at_last_real.lock().await;
+                    grounded_estimate(&conv, last_real, len_at)
+                };
+                let model_ctx = {
+                    let last = state.last_model.lock().await.clone();
+                    let models = state.models.read().await;
+                    last.as_deref()
+                        .and_then(|m| models.iter().find(|mi| mi.id == m))
+                        .map(|m| m.context_window as u64)
+                        .unwrap_or(200_000)
+                };
+                let pct = if model_ctx > 0 {
+                    (total as f64 / model_ctx as f64 * 100.0).round() as u64
+                } else {
+                    0
+                };
+                // Per-message estimates; role buckets are aggregated below from
+                // the entries for clean u64 values.
+                let mut entries: Vec<Value> = Vec::with_capacity(conv.len());
+                for (i, m) in conv.iter().enumerate() {
+                    let tokens = estimate_messages_tokens(std::slice::from_ref(m));
+                    let role = m.role();
+                    let preview: String = m
+                        .content_text()
+                        .map(|t| {
+                            let t = t.replace('\n', " ");
+                            if t.chars().count() > 100 {
+                                format!("{}…", t.chars().take(100).collect::<String>())
+                            } else {
+                                t
+                            }
+                        })
+                        .unwrap_or_else(|| "(no text / multimodal)".to_string());
+                    entries.push(json!({
+                        "index": i,
+                        "role": role,
+                        "tokens": tokens,
+                        "preview": preview,
+                    }));
+                }
+                // Aggregate per-role token totals.
+                let role_obj: Value = {
+                    let mut counts: std::collections::BTreeMap<String, u64> =
+                        std::collections::BTreeMap::new();
+                    for e in &entries {
+                        let r = e["role"].as_str().unwrap_or("").to_string();
+                        let t = e["tokens"].as_u64().unwrap_or(0);
+                        *counts.entry(r).or_insert(0) += t;
+                    }
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in counts {
+                        map.insert(k, json!(v));
+                    }
+                    Value::Object(map)
+                };
+                let system_tokens = entries
+                    .iter()
+                    .filter(|e| e["role"].as_str() == Some("system"))
+                    .map(|e| e["tokens"].as_u64().unwrap_or(0))
+                    .sum::<u64>();
+                // Top 10 consumers by tokens (descending).
+                entries.sort_by(|a, b| b["tokens"].as_u64().cmp(&a["tokens"].as_u64()));
+                let top: Vec<Value> = entries.iter().take(10).cloned().collect();
+                emit(
+                    &Event::new("context_breakdown")
+                        .with("total_tokens", json!(total))
+                        .with("context_window", json!(model_ctx))
+                        .with("pct", json!(pct))
+                        .with("messages", json!(conv.len()))
+                        .with("system_tokens", json!(system_tokens))
+                        .with("by_role", role_obj)
+                        .with("top_consumers", json!(top)),
                 );
             }
             Command::InstallPlugin { path } => {
@@ -2473,6 +2630,127 @@ fn build_skill_prompt(skill: &subagent::SkillEntry, task: Option<&str>) -> Strin
     p
 }
 
+/// Expand `@<path>` file mentions in a prompt by inlining the referenced
+/// file's contents directly, so the model sees them without a `read_file`
+/// round-trip — mirroring how `apply_skill` inlines a skill body. The
+/// transcript still shows the concise `@path` (the TUI/web logged the raw
+/// text before the core received it); only the message the model reads is
+/// expanded.
+///
+/// A mention is `@` followed by a non-whitespace path, where the `@` is at
+/// start-of-string or preceded by whitespace (so emails / `foo@bar` and
+/// inline `@param` tags without a leading space don't trigger). Paths resolve
+/// relative to the workspace; absolute paths (leading `/`) and `..`/`.` paths
+/// are honored as-is — the core has unrestricted FS access, so `@../` and
+/// `@/abs` reach outside the workspace (matching the TUI's mention completion).
+/// Directories, files larger than `max_bytes`, and unreadable paths are left
+/// as-is so the model can fall back to `read_file`. Returns the expanded
+/// prompt and the list of paths successfully inlined.
+fn expand_file_mentions(
+    prompt: &str,
+    workspace: &std::path::Path,
+    max_bytes: u64,
+) -> (String, Vec<String>) {
+    let chars: Vec<(usize, char)> = prompt.char_indices().collect();
+    let mut out = String::with_capacity(prompt.len() + 256);
+    let mut attached: Vec<String> = Vec::new();
+    let mut k = 0;
+    let mut prev_ws_or_start = true;
+    while k < chars.len() {
+        let (idx, ch) = chars[k];
+        if ch == '@' && prev_ws_or_start {
+            // Span from after '@' to the next whitespace char (or end).
+            let tok_byte_start = idx + '@'.len_utf8();
+            let mut m = k + 1;
+            while m < chars.len() && !is_mention_ws(chars[m].1) {
+                m += 1;
+            }
+            let tok_byte_end = if m < chars.len() {
+                chars[m].0
+            } else {
+                prompt.len()
+            };
+            let raw = &prompt[tok_byte_start..tok_byte_end];
+            if !raw.is_empty() {
+                if let Some((path, content)) = read_mentioned_file(raw, workspace, max_bytes) {
+                    out.push('@');
+                    out.push_str(&path);
+                    out.push_str("\n<file path=\"");
+                    out.push_str(&path);
+                    out.push_str("\">\n");
+                    out.push_str(&content);
+                    if !content.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("</file>\n");
+                    attached.push(path);
+                    k = m;
+                    prev_ws_or_start = true; // the block ends in '\n'
+                    continue;
+                }
+            }
+            // Not an attachable mention: emit the '@' and keep scanning.
+            out.push('@');
+            k += 1;
+            prev_ws_or_start = false;
+        } else {
+            out.push(ch);
+            prev_ws_or_start = is_mention_ws(ch);
+            k += 1;
+        }
+    }
+    (out, attached)
+}
+
+fn is_mention_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Try to read a mentioned file. The raw token may carry trailing prose
+/// punctuation ("see @file.rs." → "file.rs"); try the token verbatim first,
+/// then with trailing punctuation stripped, so legitimate paths keep their
+/// characters while common prose edge cases still resolve.
+fn read_mentioned_file(
+    token: &str,
+    workspace: &std::path::Path,
+    max_bytes: u64,
+) -> Option<(String, String)> {
+    let trimmed = token.trim_end_matches(|c: char| {
+        matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
+    });
+    for cand in [token, trimmed] {
+        if cand.is_empty() {
+            continue;
+        }
+        if let Some(res) = try_read_mentioned_file(cand, workspace, max_bytes) {
+            return Some(res);
+        }
+    }
+    None
+}
+
+fn try_read_mentioned_file(
+    token: &str,
+    workspace: &std::path::Path,
+    max_bytes: u64,
+) -> Option<(String, String)> {
+    let p = std::path::Path::new(token);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace.join(p)
+    };
+    let meta = std::fs::metadata(&resolved).ok()?;
+    if meta.is_dir() {
+        return None;
+    }
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let content = std::fs::read_to_string(&resolved).ok()?;
+    Some((token.to_string(), content))
+}
+
 /// Start (or queue) an assistant turn for `prompt`. Shared by `send` and
 /// `apply_skill`: if a turn is already running, buffer this prompt one-deep
 /// (the running turn's drain picks it up); otherwise spawn run_turn_and_drain.
@@ -2615,6 +2893,123 @@ pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
             config.pass_args,
         );
         let _ = plugins::execute_hook(hook, plugin_name, config, &ctx).await;
+    }
+}
+
+/// Run every enabled plugin's pre-execution hook for `hook_name` against a tool
+/// call, composing each hook's `modify` into `exec_args` and recording reasons
+/// into `hook_notes`. Returns `Some(deny_message)` when a hook denies the call
+/// (the caller emits the tool_result and skips the tool), or `None` to proceed.
+/// Used for BOTH the tool-specific pre_* hook (pre_bash/pre_write/pre_read) and
+/// the catch-all `pre_tool` that fires for every tool call — giving a plugin the
+/// same per-call reach over `memory`/`todo_write`/`git_*`/`subagent`/… that a
+/// core edit of the dispatch loop has.
+async fn run_pre_hooks(
+    st: &Arc<State>,
+    cfg: &crate::config::Config,
+    hook_name: &str,
+    tool_name: &str,
+    exec_args: &mut Value,
+    hook_notes: &mut Vec<String>,
+) -> Option<String> {
+    let configs = st.plugin_manager.get_hook_configs(hook_name);
+    if configs.is_empty() {
+        return None;
+    }
+    let session_id = cfg
+        .session_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ws = cfg.workspace.display().to_string();
+    for (plugin_name, config) in &configs {
+        let ctx = plugins::build_context(
+            hook_name,
+            tool_name,
+            &ws,
+            Some(exec_args),
+            &session_id,
+            config.pass_args,
+        );
+        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+        if !result.allow {
+            return Some(format!(
+                "tool call '{}' denied by plugin '{}' hook '{}': {}",
+                tool_name, plugin_name, hook_name, result.reason
+            ));
+        }
+        if let Some(ref modify) = result.modify {
+            plugins::apply_modify(exec_args, modify);
+        }
+        if !result.reason.is_empty() {
+            hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
+        }
+    }
+    None
+}
+
+/// Run every enabled plugin's post-execution hook for `hook_name`, handing each
+/// the tool's CURRENT result (so it can read it) and letting it MODIFY that
+/// result. A post hook returns `modify: { "output": "…", "ok": false }` to
+/// replace the result text / flip success — e.g. redact a secret, append
+/// context, or reformat. Post hooks never block (the op already ran), so
+/// `allow:false` is ignored (only its `reason` is surfaced). Used for BOTH the
+/// tool-specific post_* hook and the catch-all `post_tool`.
+async fn run_post_hooks(
+    st: &Arc<State>,
+    cfg: &crate::config::Config,
+    hook_name: &str,
+    tool_name: &str,
+    exec_args: &Value,
+    outcome: &mut tools::Outcome,
+    hook_notes: &mut Vec<String>,
+) {
+    let configs = st.plugin_manager.get_hook_configs(hook_name);
+    if configs.is_empty() {
+        return;
+    }
+    let session_id = cfg
+        .session_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ws = cfg.workspace.display().to_string();
+    for (plugin_name, config) in &configs {
+        // Give the hook the current result so it can redact/append/transform it.
+        let result_json = json!({
+            "ok": outcome.ok,
+            "output": outcome.output,
+            "diff": outcome.diff,
+        });
+        let mut ctx = plugins::build_context(
+            hook_name,
+            tool_name,
+            &ws,
+            Some(exec_args),
+            &session_id,
+            config.pass_args,
+        );
+        if let Some(obj) = ctx.as_object_mut() {
+            obj.insert("result".to_string(), result_json);
+        }
+        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+        // Post hooks can't block; a deny is treated as an observed note only.
+        if !result.reason.is_empty() {
+            hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
+        }
+        // Apply an optional result mutation: `output` replaces the text, `ok`
+        // flips success, `diff` (string) replaces / (null) clears the diff.
+        if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
+            if let Some(out) = obj.get("output").and_then(|v| v.as_str()) {
+                outcome.output = out.to_string();
+            }
+            if let Some(ok) = obj.get("ok").and_then(|v| v.as_bool()) {
+                outcome.ok = ok;
+            }
+            if let Some(diff) = obj.get("diff") {
+                outcome.diff = diff.as_str().map(String::from);
+            }
+        }
     }
 }
 
@@ -2789,11 +3184,29 @@ async fn run_turn(
 
     // Ensure system prompt is present; persist every finalized message to the session file.
     let mut init_est_add = 0u64;
+    // Expand `@<path>` file mentions so the model sees the referenced file's
+    // contents directly (no `read_file` round-trip) — mirroring how
+    // `apply_skill` inlines a skill body. The transcript keeps the concise
+    // `@path` the user typed (the TUI/web already logged the raw text).
+    let (user_text, attached_files) = {
+        let c = st.cfg.read().await;
+        expand_file_mentions(&prompt, &c.workspace, c.max_read_bytes)
+    };
+    if !attached_files.is_empty() {
+        emit(&Event::new("info").with(
+            "message",
+            json!(format!(
+                "attached {} file(s) from @mentions: {}",
+                attached_files.len(),
+                attached_files.join(", ")
+            )),
+        ));
+    }
     {
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
             let workspace = st.cfg.read().await.workspace.clone();
-            let sys_msg = Message::system(build_system_prompt(&workspace, true));
+            let sys_msg = Message::system(build_main_system_prompt(&workspace, &st.plugin_manager));
             init_est_add += estimate_message_tokens(&sys_msg);
             conv.push(sys_msg);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -2806,7 +3219,7 @@ async fn run_turn(
         let user_msg = match (&images, allow_vision) {
             (Some(imgs), true) if !imgs.is_empty() => {
                 let mut parts: Vec<ContentPart> = vec![ContentPart::Text {
-                    text: prompt.clone(),
+                    text: user_text.clone(),
                 }];
                 for img in imgs {
                     let url = image_to_data_url(img);
@@ -2816,7 +3229,7 @@ async fn run_turn(
                 }
                 Message::user_multimodal(parts)
             }
-            _ => Message::user(prompt.clone()),
+            _ => Message::user(user_text.clone()),
         };
         init_est_add += estimate_message_tokens(&user_msg);
         conv.push(user_msg);
@@ -2944,10 +3357,21 @@ async fn run_turn(
 
     // Main agent tool list: built-in tools (minus the subagent-only intercom
     // coordination tools contact_supervisor/intercom, registered only inside
-    // child runs) MERGED with tools declared by enabled plugins. Plugin tools
-    // that collide with a built-in (or an already-registered plugin tool) name
-    // are skipped — a plugin can never shadow a core tool, and the first plugin
-    // to claim a name wins (matching the project>global plugin override model).
+    // child runs) MERGED with tools declared by enabled plugins, then filtered
+    // by every plugin's `disable_tools`. Three plugin capabilities converge
+    // here, mirroring what a direct core edit can do to the tool list:
+    //   • ADD       — a plugin `tools` entry adds a new capability.
+    //   • OVERRIDE  — a plugin tool with `override:true` whose name matches a
+    //                  built-in REPLACES that built-in: the plugin's declared
+    //                  schema is shown to the model and calls route to the
+    //                  plugin handler (see the dispatch below).
+    //   • REMOVE    — `disable_tools` names are dropped from the final list
+    //                  (built-in OR override). `disable_tools` is the strongest
+    //                  lever: a disabled name is gone, period.
+    // A plugin tool that merely collides with a built-in name (no `override`)
+    // is still skipped — the built-in wins, unchanged.
+    let overridden = st.plugin_manager.overridden_tool_names();
+    let disabled = st.plugin_manager.disabled_tools();
     let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
     reserved.insert("contact_supervisor".into());
     reserved.insert("intercom".into());
@@ -2960,7 +3384,9 @@ async fn run_turn(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             reserved.insert(n.to_string());
-            n != "contact_supervisor" && n != "intercom"
+            // Hide the reserved subagent-only tools, AND any built-in a plugin
+            // is overriding (its plugin version is added below instead).
+            n != "contact_supervisor" && n != "intercom" && !overridden.contains(n)
         })
         .collect();
     for d in st.plugin_manager.tool_definitions() {
@@ -2969,7 +3395,11 @@ async fn run_turn(
             .and_then(|f| f.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !reserved.insert(n.to_string()) {
+        // An override tool replaces the built-in (already excluded above), so
+        // it's always added and claims the name. A plain custom tool is added
+        // only if its name isn't already taken (built-in or another plugin).
+        let is_override = overridden.contains(n);
+        if !is_override && !reserved.insert(n.to_string()) {
             eprintln!(
                 "[plugins] tool '{}' collides with a built-in or already-registered tool; skipping",
                 n
@@ -2978,6 +3408,17 @@ async fn run_turn(
         }
         tool_defs.push(d);
     }
+    // REMOVE: `disable_tools` is a final, composition-winning filter — a
+    // disabled name vanishes whether it was a built-in, an override, or a
+    // custom plugin tool. (No-op when no plugin disables anything.)
+    if !disabled.is_empty() {
+        tool_defs.retain(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .is_none_or(|n| !disabled.contains(n))
+        });
+    }
     let mut timer = TurnTimer::new();
 
     // Idle compaction: if 60+ minutes since the last turn completed, compact the
@@ -2985,11 +3426,17 @@ async fn run_turn(
     // as the threshold path; falls back to naive drop-oldest without an api key.
     {
         let last = *st.last_turn_time.lock().await;
-        if last.elapsed().as_secs() > 3600 {
+        let auto_compact = st.cfg.read().await.auto_compact;
+        if auto_compact && last.elapsed().as_secs() > 3600 {
             let mut messages = st.conversation.lock().await.clone();
             if messages.len() > 4 {
-                dispatch_lifecycle(st, "pre_compact").await;
                 let est = { *st.estimated_tokens.lock().await };
+                emit(
+                    &Event::new("compacting")
+                        .with("before_tokens", json!(est))
+                        .with("trigger", json!("idle")),
+                );
+                dispatch_lifecycle(st, "pre_compact").await;
                 let cfg = st.cfg.read().await.clone();
                 let rp = st.resolve_provider_for_model(&model).await;
                 let idle_ctx = st
@@ -3010,6 +3457,7 @@ async fn run_turn(
                         &cancel,
                         false,
                         idle_ctx,
+                        cfg.compact_instructions.as_deref(),
                     )
                     .await
                 } else {
@@ -3081,9 +3529,13 @@ async fn run_turn(
 
         let cfg = st.cfg.read().await.clone();
         // Context window management: compact once past the configured threshold
-        // (default 70%). The 95% hard cap is a floor — compact by then even if the
+        // (default 90%). The 95% hard cap is a floor — compact by then even if the
         // configured threshold is higher, and force the summarize strategy even
         // when disabled (naive drop-oldest may not reclaim enough at critical capacity).
+        // `auto_compact` (default true) gates ALL automatic compaction (this threshold
+        // path + the idle-compaction block below). When false, no compaction fires
+        // automatically — the user must /compact manually (or /clear). Mirrors Claude
+        // Code's autoCompactEnabled / DISABLE_AUTO_COMPACT.
         let mut messages = st.conversation.lock().await.clone();
         let (model_ctx, thinking_levels, max_tokens) = st
             .models
@@ -3147,8 +3599,13 @@ async fn run_turn(
                 );
             }
         }
-        if est > threshold.min(hard_cap) && messages.len() > 4 {
+        if cfg.auto_compact && est > threshold.min(hard_cap) && messages.len() > 4 {
             let force_summarize = est > hard_cap;
+            emit(
+                &Event::new("compacting")
+                    .with("before_tokens", json!(est))
+                    .with("trigger", json!("threshold")),
+            );
             dispatch_lifecycle(st, "pre_compact").await;
             let summary_chars = compact_with_summary(
                 client,
@@ -3159,6 +3616,7 @@ async fn run_turn(
                 &cancel,
                 force_summarize,
                 model_ctx,
+                cfg.compact_instructions.as_deref(),
             )
             .await;
             *st.conversation.lock().await = messages.clone();
@@ -3372,19 +3830,16 @@ async fn run_turn(
                         }
                     };
 
-                    // Approval gate for destructive tools. Plugin-declared tools
-                    // carry their own kind (default Destructive); built-ins use
-                    // the static classify() table. A plugin tool that collides
-                    // with a built-in name is hidden from the model's tool list
-                    // (the merge gives built-ins precedence), and `is_builtin`
-                    // here ensures its kind never overrides the built-in's either.
+                    // Approval gate for destructive tools. A plugin tool that
+                    // dispatches (a custom name, OR an `override:true` tool that
+                    // replaces a built-in) carries its own kind; everything else
+                    // uses the static classify() table. A plugin tool that merely
+                    // collides with a built-in name (no override) does NOT
+                    // dispatch to the plugin, so it falls through to classify().
                     let cfg = st.cfg.read().await.clone();
-                    let kind = if tools::is_builtin(&name) {
-                        tools::classify(&name)
-                    } else {
-                        st.plugin_manager
-                            .tool_kind(&name)
-                            .unwrap_or_else(|| tools::classify(&name))
+                    let kind = match st.plugin_manager.tool_config(&name) {
+                        Some(tc) if tc.override_builtin || !tools::is_builtin(&name) => tc.kind,
+                        _ => tools::classify(&name),
                     };
                     let kind_str: &'static str = match kind {
                         tools::ToolKind::ReadOnly => "readonly",
@@ -3482,89 +3937,58 @@ async fn run_turn(
                         }
                     }
 
-                    // Dispatch pre-execution hooks for this tool. Each enabled
-                    // plugin registered for this hook point runs exactly once, in
-                    // order. A hook may: allow (optionally overriding specific arg
-                    // fields via `modify`, and/or posting a `reason` the model will
-                    // see), or deny (the tool call is skipped and the reason is
-                    // returned to the model). Hooks compose: each sees the args as
-                    // amended by earlier hooks.
+                    // Dispatch pre-execution hooks for this tool. Two phases compose:
+                    //   1. the tool-SPECIFIC pre_* hook (pre_bash/pre_write/pre_read)
+                    //      — transforms/audits/denies that tool's call; and
+                    //   2. the catch-all `pre_tool` hook, which fires for EVERY tool
+                    //      (memory, todo_write, git_*, subagent, plugin tools, …)
+                    //      so a plugin can intercept any call — the same reach a
+                    //      core edit of this dispatch loop has. pre_tool runs AFTER
+                    //      the specific hook so it sees the final amended args.
+                    // Each hook may allow (optionally overriding arg fields via
+                    // `modify`, and/or posting a `reason`), or deny (the call is
+                    // skipped and the reason is returned to the model). Hooks
+                    // compose: each sees the args as amended by earlier hooks.
                     let hook_name = match name.as_str() {
                         "bash" => "pre_bash",
                         "write_file" | "edit" => "pre_write",
                         "read_file" | "grep" | "glob" => "pre_read",
                         _ => "",
                     };
-                    let pre_configs = if hook_name.is_empty() {
-                        Vec::new()
-                    } else {
-                        st.plugin_manager.get_hook_configs(hook_name)
-                    };
-                    // exec_args starts as the original args and is amended in
-                    // place by pre-hooks. Only clone when hooks will actually run,
-                    // so large write payloads aren't copied in the common case.
-                    let mut exec_args = if pre_configs.is_empty() {
-                        args
-                    } else {
-                        args.clone()
-                    };
+                    let any_pre = (!hook_name.is_empty()
+                        && st.plugin_manager.has_hook(hook_name))
+                        || st.plugin_manager.has_hook("pre_tool");
+                    // exec_args starts as the original args and is amended in place
+                    // by pre-hooks. Only clone when a hook will actually run, so
+                    // large write payloads aren't copied in the common case.
+                    let mut exec_args = if any_pre { args.clone() } else { args };
                     let mut hook_notes: Vec<String> = Vec::new();
-                    let mut denied_by_hook = false;
-                    for (plugin_name, config) in &pre_configs {
-                        let session_id = cfg
-                            .session_file
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let ctx = plugins::build_context(
-                            hook_name,
-                            &name,
-                            &cfg.workspace.display().to_string(),
-                            Some(&exec_args),
-                            &session_id,
-                            config.pass_args,
-                        );
-                        let result =
-                            plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
-                        if !result.allow {
-                            // Deny: skip the tool call and tell the model why.
-                            let msg = format!(
-                                "tool call '{}' denied by plugin '{}' hook '{}': {}",
-                                name, plugin_name, hook_name, result.reason
-                            );
-                            emit(
-                                &Event::new("tool_result")
-                                    .with("id", json!(id))
-                                    .with("ok", json!(false))
-                                    .with("output", json!(msg)),
-                            );
-                            let tool_result = Message::tool(id.clone(), msg);
-                            let est = estimate_message_tokens(&tool_result);
-                            let mut conv = st.conversation.lock().await;
-                            conv.push(tool_result);
-                            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                session::append(p, conv.last().unwrap());
-                            }
-                            *st.estimated_tokens.lock().await += est;
-                            denied_by_hook = true;
-                            break;
-                        }
-                        // Allow: merge `modify` over the running args so a hook
-                        // can override specific fields (e.g. reformatted `content`
-                        // or a fixed `command`) without dropping the rest (e.g.
-                        // `path`, `edits`). The contract is "return only the keys
-                        // you want to change"; anything else is preserved.
-                        if let Some(ref modify) = result.modify {
-                            plugins::apply_modify(&mut exec_args, modify);
-                        }
-                        // Remember non-empty reasons so the model is told its tool
-                        // call was inspected/modified (and can react accordingly).
-                        if !result.reason.is_empty() {
-                            hook_notes
-                                .push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
-                        }
+                    let mut denied: Option<String> = None;
+                    if !hook_name.is_empty() {
+                        denied =
+                            run_pre_hooks(st, &cfg, hook_name, &name, &mut exec_args, &mut hook_notes)
+                                .await;
                     }
-                    if denied_by_hook {
+                    if denied.is_none() && name != "finish" {
+                        denied =
+                            run_pre_hooks(st, &cfg, "pre_tool", &name, &mut exec_args, &mut hook_notes)
+                                .await;
+                    }
+                    if let Some(msg) = denied {
+                        emit(
+                            &Event::new("tool_result")
+                                .with("id", json!(id))
+                                .with("ok", json!(false))
+                                .with("output", json!(msg)),
+                        );
+                        let tool_result = Message::tool(id.clone(), msg);
+                        let est = estimate_message_tokens(&tool_result);
+                        let mut conv = st.conversation.lock().await;
+                        conv.push(tool_result);
+                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                            session::append(p, conv.last().unwrap());
+                        }
+                        *st.estimated_tokens.lock().await += est;
                         continue;
                     }
 
@@ -3658,7 +4082,32 @@ async fn run_turn(
                     // The async ones are wrapped in a `select!` on the turn cancel
                     // so /abort can interrupt them mid-flight — kill_on_drop frees
                     // the spawned child when the future is dropped.
-                    let mut outcome = if name == "bash" {
+                    let mut outcome = if let Some(tc) = st
+                        .plugin_manager
+                        .tool_config(&name)
+                        .filter(|tc| tc.override_builtin || !tools::is_builtin(&name))
+                    {
+                        // Plugin-declared tool: dispatch to its handler script
+                        // (subprocess, stdin=args JSON, stdout={ok,output}).
+                        // This branch covers BOTH custom plugin tools (a name no
+                        // built-in owns) AND `override:true` tools that REPLACE
+                        // a built-in's implementation — the filter admits a
+                        // built-in name only when the plugin explicitly opted
+                        // into overriding it, so a mere name collision still
+                        // falls through to the built-in handler below. Wrapped in
+                        // a select! on the turn cancel so /abort can interrupt it
+                        // mid-flight; kill_on_drop frees the child.
+                        let session_id = cfg
+                            .session_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let ws = cfg.workspace.display().to_string();
+                        tokio::select! {
+                            o = plugins::execute_plugin_tool(&name, &tc, &exec_args, &ws, &session_id) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err(format!("{name} aborted")),
+                        }
+                    } else if name == "bash" {
                         let cmd = exec_args
                             .get("command")
                             .and_then(|v| v.as_str())
@@ -3717,28 +4166,6 @@ async fn run_turn(
                                 return;
                             }
                         }
-                    } else if let Some(tc) = st
-                        .plugin_manager
-                        .tool_config(&name)
-                        .filter(|_| !tools::is_builtin(&name))
-                    {
-                        // Plugin-declared tool: dispatch to its handler script
-                        // (subprocess, stdin=args JSON, stdout={ok,output}). The
-                        // `is_builtin` guard means a plugin tool that collides
-                        // with a built-in name can never hijack it (the built-in
-                        // is always routed to its own handler below). Wrapped in
-                        // a select! on the turn cancel so /abort can interrupt it
-                        // mid-flight; kill_on_drop frees the child.
-                        let session_id = cfg
-                            .session_file
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let ws = cfg.workspace.display().to_string();
-                        tokio::select! {
-                            o = plugins::execute_plugin_tool(&name, &tc, &exec_args, &ws, &session_id) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err(format!("{name} aborted")),
-                        }
                     } else {
                         tools::execute(&name, &exec_args, &cfg)
                     };
@@ -3773,7 +4200,15 @@ async fn run_turn(
                         }
                     }
 
-                    // Dispatch post-execution hooks for this tool.
+                    // Dispatch post-execution hooks for this tool. Two phases,
+                    // mirroring the pre-hook structure: the tool-SPECIFIC post_*
+                    // hook (post_bash/post_write/post_read), then the catch-all
+                    // `post_tool` that fires for EVERY tool. Each hook receives the
+                    // tool's CURRENT result and may MODIFY it (return
+                    // `modify: {"output":…, "ok":…, "diff":…}`) — e.g. redact a
+                    // secret, append context, reformat. Post-hooks never block (the
+                    // op already ran); `allow:false` is ignored, only `reason` +
+                    // `modify` are honored.
                     let post_hook = match name.as_str() {
                         "bash" => "post_bash",
                         "write_file" | "edit" => "post_write",
@@ -3781,32 +4216,28 @@ async fn run_turn(
                         _ => "",
                     };
                     if !post_hook.is_empty() {
-                        let configs = st.plugin_manager.get_hook_configs(post_hook);
-                        for (plugin_name, config) in &configs {
-                            let session_id = cfg
-                                .session_file
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            let ctx = plugins::build_context(
-                                post_hook,
-                                &name,
-                                &cfg.workspace.display().to_string(),
-                                Some(&exec_args),
-                                &session_id,
-                                config.pass_args,
-                            );
-                            // Post-hooks can't block (the op already ran), but their
-                            // reason is surfaced to the model as a note.
-                            let result =
-                                plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
-                            if !result.reason.is_empty() {
-                                hook_notes.push(format!(
-                                    "{}/{}: {}",
-                                    plugin_name, post_hook, result.reason
-                                ));
-                            }
-                        }
+                        run_post_hooks(
+                            st,
+                            &cfg,
+                            post_hook,
+                            &name,
+                            &exec_args,
+                            &mut outcome,
+                            &mut hook_notes,
+                        )
+                        .await;
+                    }
+                    if name != "finish" {
+                        run_post_hooks(
+                            st,
+                            &cfg,
+                            "post_tool",
+                            &name,
+                            &exec_args,
+                            &mut outcome,
+                            &mut hook_notes,
+                        )
+                        .await;
                     }
 
                     // finish sentinel: the model signaled completion.
@@ -4546,7 +4977,7 @@ fn truncate_str(s: &str, n: usize) -> String {
 async fn refresh_memory_injection(state: &State) -> String {
     let ws = state.cfg.read().await.workspace.clone();
     let mem = memory_injection(&ws, "");
-    let new_system = build_system_prompt(&ws, true);
+    let new_system = build_main_system_prompt(&ws, &state.plugin_manager);
     let mut conv = state.conversation.lock().await;
     if let Some(first) = conv.first() {
         let old_content = first.content_text().unwrap_or("");
@@ -4666,6 +5097,7 @@ pub async fn compact_with_summary(
     cancel: &CancellationToken,
     force_summarize: bool,
     context_window: u64,
+    instructions: Option<&str>,
 ) -> usize {
     // Returns the character count of the produced summary system message (0
     // when no summary was generated — naive drop-oldest fallback or a
@@ -4685,7 +5117,7 @@ pub async fn compact_with_summary(
     }
     let to_summarize: Vec<Message> = messages[1..tail_start].to_vec();
     let kept: Vec<Message> = messages[tail_start..].to_vec();
-    let summary = provider::summarize(client, provider, model, &to_summarize, cancel).await;
+    let summary = provider::summarize(client, provider, model, &to_summarize, cancel, instructions).await;
     let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
@@ -5540,5 +5972,133 @@ mod ask_tests {
         let out = format_ask_answers(&qs, &json!({"a": "hello"}));
         assert!(out.contains("a (Q1): hello"));
         assert!(!out.contains("(skipped)"));
+    }
+}
+
+#[cfg(test)]
+mod expand_mentions_tests {
+    use super::*;
+
+    fn fresh_workspace() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "catalyst-code-mentions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn inlines_existing_file() {
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("main.rs"), "fn main() {}\n").unwrap();
+        let (out, attached) = expand_file_mentions("fix @main.rs please", &ws, u64::MAX);
+        assert_eq!(attached, vec!["main.rs".to_string()]);
+        assert!(out.contains("<file path=\"main.rs\">"));
+        assert!(out.contains("fn main() {}"));
+        assert!(out.contains("</file>"));
+        // The surrounding prose is preserved (no trailing newline in input).
+        assert!(out.starts_with("fix "));
+        assert!(out.ends_with(" please"));
+    }
+
+    #[test]
+    fn leaves_missing_path_as_is() {
+        let ws = fresh_workspace();
+        let (out, attached) = expand_file_mentions("look at @nope.rs", &ws, u64::MAX);
+        assert!(attached.is_empty());
+        assert_eq!(out, "look at @nope.rs");
+    }
+
+    #[test]
+    fn email_not_triggered() {
+        // `foo@bar` has no whitespace before `@`, so it must NOT be a mention.
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("bar"), "x").unwrap();
+        let (out, attached) = expand_file_mentions("email foo@bar.com here", &ws, u64::MAX);
+        assert!(attached.is_empty());
+        assert_eq!(out, "email foo@bar.com here");
+    }
+
+    #[test]
+    fn inline_param_tag_not_triggered_without_space() {
+        // `@param` embedded mid-word (no leading space) is left alone even if a
+        // file named `param` exists.
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("param"), "x").unwrap();
+        let (out, attached) =
+            expand_file_mentions("see the@param tag", &ws, u64::MAX);
+        assert!(attached.is_empty());
+        assert_eq!(out, "see the@param tag");
+    }
+
+    #[test]
+    fn strips_trailing_punctuation() {
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("file.rs"), "pub fn f() {}\n").unwrap();
+        let (out, attached) = expand_file_mentions("see @file.rs.", &ws, u64::MAX);
+        assert_eq!(attached, vec!["file.rs".to_string()]);
+        assert!(out.contains("<file path=\"file.rs\">"));
+        // A file with a trailing dot literally does not exist, so the literal
+        // candidate is skipped and the trimmed one wins.
+        assert!(!out.contains("<file path=\"file.rs.\">"));
+    }
+
+    #[test]
+    fn skips_directory() {
+        let ws = fresh_workspace();
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        let (out, attached) = expand_file_mentions("look at @sub", &ws, u64::MAX);
+        assert!(attached.is_empty());
+        // Directory left as-is so the model can fall back to read_file/list_dir.
+        assert_eq!(out, "look at @sub");
+    }
+
+    #[test]
+    fn skips_oversized_file() {
+        let ws = fresh_workspace();
+        // max_bytes = 3, file is 10 bytes → skipped, left as-is.
+        std::fs::write(ws.join("big.txt"), "0123456789").unwrap();
+        let (out, attached) = expand_file_mentions("@big.txt", &ws, 3);
+        assert!(attached.is_empty());
+        assert_eq!(out, "@big.txt");
+    }
+
+    #[test]
+    fn multiple_mentions_inlined() {
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("a.rs"), "a\n").unwrap();
+        std::fs::write(ws.join("b.go"), "b\n").unwrap();
+        let (out, attached) = expand_file_mentions("@a.rs and @b.go", &ws, u64::MAX);
+        assert_eq!(attached, vec!["a.rs".to_string(), "b.go".to_string()]);
+        assert!(out.contains("<file path=\"a.rs\">"));
+        assert!(out.contains("<file path=\"b.go\">"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_inlined() {
+        // Absolute paths are honored (core has unrestricted FS access), even
+        // though they lie outside the workspace.
+        let dir = std::env::temp_dir().join(format!(
+            "catalyst-code-abs-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("abs.txt");
+        std::fs::write(&f, "abs content\n").unwrap();
+        let ws = fresh_workspace();
+        let mention = format!("@{}", f.display());
+        let (out, attached) = expand_file_mentions(&mention, &ws, u64::MAX);
+        assert_eq!(attached.len(), 1);
+        assert!(out.contains("abs content"));
+        assert!(out.contains("<file path=\""));
     }
 }

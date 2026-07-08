@@ -35,6 +35,7 @@ const (
 	modalLogout
 	modalKeybinds
 	modalOauthCode
+	modalContext
 )
 
 type modal struct {
@@ -406,10 +407,11 @@ func (s *session) commandItems() []listItem {
 		{label: "/reset", desc: "wipe conversation + session file"},
 		{label: "/clear", desc: "clear view (keep session file)"},
 		{label: "/undo", desc: "drop last turn"},
-		{label: "/compact", desc: "force context compaction"},
+		{label: "/compact", desc: "force compaction (opt: /compact <instructions>)"},
 		{label: "/sessions", desc: "open session picker"},
 		{label: "/new", desc: "start a fresh session file"},
 		{label: "/stats", desc: "token + turn totals"},
+		{label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{label: "/abort", desc: "stop running turn (or Esc)"},
 		{label: "/steer", desc: "steer an in-flight turn (or Ctrl+Enter)"},
 		{label: "/settings", desc: "open settings modal"},
@@ -596,6 +598,12 @@ func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return s.handleSettingsKey(msg)
 	case modalHelp:
 		return s.handleHelpKey(msg)
+	case modalContext:
+		// Display-only modal: enter or esc dismisses it.
+		if msg.String() == "enter" || s.kb(msg, "select") || s.kbAny(msg, "close", "quit") {
+			s.closeModal()
+		}
+		return s, nil
 	}
 	return s, nil
 }
@@ -948,6 +956,7 @@ func (s *session) settingsFields() []settingsField {
 		{label: "Reasoning", value: s.settings.ReasoningEffort, hint: "enter to cycle"},
 		{label: "Theme", value: activeTheme.name, hint: "enter to pick"},
 		{label: "Bash Timeout", value: fmt.Sprintf("%ds", s.coreBashTimeout), hint: "enter to edit"},
+		{label: "Auto Compact", value: boolStr(s.coreAutoCompact), hint: "enter to toggle"},
 		{label: "Sandbox", value: s.settings.Sandbox, hint: "enter to cycle"},
 		{label: "No Network", value: boolStr(s.settings.NoNetwork), hint: "enter to toggle"},
 		{label: "Mouse Wheel", value: boolStr(s.settings.MouseWheel), hint: "enter to toggle"},
@@ -961,6 +970,18 @@ func boolStr(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// humanTokens renders a token count compactly (e.g. 1.2k, 47k, 128k) for the
+// /context breakdown modal.
+func humanTokens(n uint64) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1_000_000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
 }
 
 // settingsFieldIndex returns the index of the settings field whose label
@@ -1033,6 +1054,10 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 		s.settings.NoNetwork = !s.settings.NoNetwork
 		_ = s.settings.save()
 		s.logInfo(fmt.Sprintf("no-network: %s (applies on next launch)", boolStr(s.settings.NoNetwork)))
+	case "Auto Compact":
+		s.coreAutoCompact = !s.coreAutoCompact
+		s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": s.coreAutoCompact})
+		s.logInfo(fmt.Sprintf("auto-compact: %s", boolStr(s.coreAutoCompact)))
 	case "Mouse Wheel":
 		s.settings.MouseWheel = !s.settings.MouseWheel
 		_ = s.settings.save()
@@ -1467,6 +1492,8 @@ func (s *session) renderModalBody() string {
 		return s.renderHelpModal()
 	case modalKeybinds:
 		return s.renderKeybindsModal()
+	case modalContext:
+		return s.renderContextModal()
 	}
 	return ""
 }
@@ -1611,6 +1638,67 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	body := strings.Join(lines, "\n")
 	return modalBox(w, body)
+}
+
+// renderContextModal renders the /context token-usage breakdown: total/window,
+// per-role buckets, and the top token consumers. Read-only display.
+func (s *session) renderContextModal() string {
+	w := s.modalWidth(78)
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ Context Breakdown"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+	cb := s.ctxBreakdown
+	if cb == nil {
+		lines = append(lines, mutedStyle.Render("  no data"))
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("  esc close"))
+		return modalBox(w, strings.Join(lines, "\n"))
+	}
+	lines = append(lines, fmt.Sprintf("%s: %s / %s  (%s%%)",
+		baseStyle.Render("Total"),
+		accentStyle.Render(humanTokens(cb.Total)),
+		mutedStyle.Render(humanTokens(cb.Window)),
+		accentStyle.Render(fmt.Sprintf("%d", cb.Pct))))
+	lines = append(lines, fmt.Sprintf("%s: %d", baseStyle.Render("Messages"), cb.Messages))
+	// Per-role buckets.
+	if len(cb.ByRole) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("  by role:"))
+		// Stable order: system, user, assistant, tool, then any others.
+		order := []string{"system", "user", "assistant", "tool"}
+		seen := map[string]bool{}
+		for _, r := range order {
+			if v, ok := cb.ByRole[r]; ok {
+				lines = append(lines, fmt.Sprintf("    %-9s %s", r, humanTokens(v)))
+				seen[r] = true
+			}
+		}
+		for r, v := range cb.ByRole {
+			if !seen[r] {
+				lines = append(lines, fmt.Sprintf("    %-9s %s", r, humanTokens(v)))
+			}
+		}
+	}
+	// Top consumers.
+	if len(cb.TopConsumers) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("  top consumers:"))
+		for _, c := range cb.TopConsumers {
+			prev := c.Preview
+			maxRunes := w - 34
+			if maxRunes < 20 {
+				maxRunes = 20
+			}
+			if len([]rune(prev)) > maxRunes {
+				prev = string([]rune(prev)[:maxRunes]) + "…"
+			}
+			lines = append(lines, fmt.Sprintf("    #%d %-9s %s  %s",
+				c.Index, c.Role, humanTokens(c.Tokens), mutedStyle.Render(prev)))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("  esc close"))
+	return modalBox(w, strings.Join(lines, "\n"))
 }
 
 func (s *session) renderSettingsModal() string {

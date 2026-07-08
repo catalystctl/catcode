@@ -100,8 +100,12 @@ JSON object to stdout before exiting. Stderr is captured for error reporting.
   the fields you want to change; everything else is preserved. Examples:
   pre_write `{ "content": "reformatted" }` overrides content but keeps `path`/
   `edits`; pre_bash `{ "command": "fixed command" }` overrides the command;
-  pre_read `{ "path": "new/path" }` redirects the read. For post hooks, modify
-  is ignored (the operation already completed).
+  pre_read `{ "path": "new/path" }` redirects the read. For **post hooks**,
+  `modify` transforms the tool's RESULT: `{ "output": "...", "ok": false,
+  "diff": "..." }` replaces the result text, flips success, or replaces/clears
+  the diff — e.g. redact a secret, append context, or reformat. (The post
+  context includes the current result under the `result` key so the hook can
+  read it.)
 
 Safety rules enforced by the core:
 - pre_* hooks: non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks the tool)
@@ -120,6 +124,8 @@ Safety rules enforced by the core:
 | post_bash     | After a bash command completes          | post |
 | post_write    | After a file write/edit completes       | post |
 | post_read     | After a file is read                    | post |
+| pre_tool      | Before ANY tool executes (catch-all)    | pre  |
+| post_tool     | After ANY tool executes (catch-all)     | post |
 | session_start | When a session begins (prompt received) | lifecycle |
 | session_stop  | When a session ends (done/abort)        | lifecycle |
 | pre_compact   | Before conversation compaction         | pre  |
@@ -182,9 +188,10 @@ hooks, or both):
 ```
 
 Fields:
-- `name` (required): tool name. Must not collide with a built-in tool
-  (bash, read_file, edit, subagent, …) — built-ins always win, so a colliding
-  plugin tool is skipped with a warning.
+- `name` (required): tool name. By default it must not collide with a built-in
+  tool (bash, read_file, edit, subagent, …) — a colliding plugin tool is skipped
+  and the built-in wins. Set `override: true` (below) to instead REPLACE the
+  built-in's implementation with this plugin's handler.
 - `description` (optional): shown to the model.
 - `parameters` (optional): a JSON Schema for the tool's arguments. Defaults
   to an empty object.
@@ -193,6 +200,12 @@ Fields:
 - `kind` (optional): `"readonly"` (skips the approval gate) or `"destructive"`
   (prompts under Approval::Destructive — the default). Arbitrary external code
   runs on every call, so default to `destructive`.
+- `override` (optional, bool): when `true` AND `name` matches a built-in tool,
+  this plugin's handler REPLACES that built-in — the model still sees a tool of
+  that name (this plugin's declared `description`/`parameters`), but calls route
+  to the plugin script instead of the core handler. This is the no-recompile way
+  to fully override a core tool (a sandboxed `bash`, a redacting `read_file`, a
+  rate-limited `git_commit`, …). Default `false`: a name collision stays built-in.
 - `timeout_ms` (optional): hard per-call timeout (default 30s).
 
 Tool handler contract (one JSON object on stdin, one on stdout):
@@ -231,6 +244,75 @@ jq -n --arg o "Order #$id: shipped" '{ "ok": true, "output": $o }'
 ```
 
 Remember: `chmod +x` the handler.
+
+### Add, override, and remove core behavior
+
+A plugin can do everything a direct core edit can — add, override, and remove
+behavior — without recompiling. Five mechanisms cover the full surface:
+
+| Operation | Mechanism | Notes |
+|-----------|-----------|-------|
+| **ADD a tool** | `tools` array | A new capability the model can call. |
+| **OVERRIDE a tool** | a tool with `override: true` | Replaces a built-in's implementation (the model still sees that tool name; calls route to the plugin script). |
+| **REMOVE a tool** | `disable_tools` | Drops the named tool from the model's toolset entirely (built-in or override). The strongest lever — wins over `override`. |
+| **MODIFY tool input** | `pre_bash`/`pre_write`/`pre_read`/`pre_tool` `modify` | Override specific args before execution. |
+| **MODIFY tool output** | `post_*`/`post_tool` `modify` | Replace the result text / flip success / change the diff after execution. |
+| **MODIFY the model** | `pre_turn` `modify.model` | Remap the turn's model (advisory). |
+| **ADD to the system prompt** | `system_prompt` field | Static text appended to the system prompt. |
+
+#### `disable_tools` — remove a capability
+
+```json
+{
+  "name": "no-bash",
+  "version": "1.0.0",
+  "disable_tools": ["bash", "git_commit"]
+}
+```
+
+The listed tool names vanish from the model's toolset — it can never call them
+(this is stronger than a per-call `pre_bash` deny). Composes across plugins (the
+union is removed). Applied as a final filter, so it also removes a tool another
+plugin `override`s.
+
+#### `system_prompt` — inject context
+
+```json
+{
+  "name": "domain-rules",
+  "version": "1.0.0",
+  "system_prompt": "All database access must go through the `db_query` tool. Never construct raw SQL in bash."
+}
+```
+
+The text is appended to the system prompt (after the plugin docs), framed with
+the plugin name + version — the same surface a core edit of the system prompt
+touches. Empty by default, so the prompt + its prefix cache are untouched when no
+plugin declares one. (Main agent only; subagents use the built-in tool set.)
+
+#### `override: true` — replace a core tool
+
+```json
+{
+  "name": "sandboxed-bash",
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "bash",
+      "override": true,
+      "description": "Run a command in the project sandbox.",
+      "parameters": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]},
+      "script": "tools/bash.sh",
+      "kind": "destructive"
+    }
+  ]
+}
+```
+
+The model calls `bash` as usual, but the call routes to `tools/bash.sh` instead
+of the core handler — and the plugin controls the description/schema. The tool's
+`kind` (approval gate) is the plugin's. The specific `pre_bash`/`post_bash`
+hooks still fire (keyed on the tool name), and `pre_tool`/`post_tool` fire too.
 
 ### Example: a pre_write linter plugin
 
@@ -282,6 +364,14 @@ pub const HOOK_POINTS: &[&str] = &[
     "session_stop",
     "pre_compact",
     "pre_turn",
+    // Catch-all hooks that fire for EVERY tool call (in addition to the
+    // specific pre_bash/pre_write/pre_read). They cover tools with no
+    // dedicated hook (memory, todo_write, git_*, subagent, plugin tools, …)
+    // so a plugin can audit/modify/deny ANY tool — the same reach a core edit
+    // of the dispatch loop has. pre_tool runs after the specific pre-hook;
+    // post_tool runs after the specific post-hook.
+    "pre_tool",
+    "post_tool",
 ];
 
 /// Default timeout in milliseconds for pre_* hooks (blocking — keep short).
@@ -303,6 +393,12 @@ struct PluginManifest {
     /// Optional user-declared tools (custom capabilities, no MCP needed).
     #[serde(default)]
     tools: Vec<ToolManifestEntry>,
+    /// Built-in/plugin tool names to REMOVE from the model's toolset.
+    #[serde(default)]
+    disable_tools: Vec<String>,
+    /// Static text injected into the system prompt (empty = none).
+    #[serde(default)]
+    system_prompt: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -330,6 +426,14 @@ struct ToolManifestEntry {
     kind: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// When true AND `name` matches a built-in tool, this plugin's handler
+    /// REPLACES the built-in's implementation: the model still sees a tool of
+    /// that name (the plugin's declared schema), but calls route to the plugin
+    /// script instead of the core handler. Lets a plugin fully override a
+    /// core tool (a sandboxed bash, a redacting read_file, …) without
+    /// recompiling. Default false: a name collision stays built-in (unchanged).
+    #[serde(default, rename = "override")]
+    override_builtin: bool,
 }
 
 // ---- public types ----
@@ -347,6 +451,10 @@ pub struct Plugin {
     pub hooks: HashMap<String, HookConfig>,
     /// Tools this plugin declares (custom capabilities; no MCP needed).
     pub tools: Vec<ToolConfig>,
+    /// Built-in/plugin tool names to REMOVE from the model's toolset.
+    pub disable_tools: Vec<String>,
+    /// Static text injected into the system prompt (empty = none).
+    pub system_prompt: String,
 }
 
 /// Configuration for one hook within a plugin.
@@ -373,6 +481,8 @@ pub struct ToolConfig {
     pub timeout_ms: u64,
     /// Approval classification: ReadOnly skips the gate, Destructive prompts.
     pub kind: ToolKind,
+    /// True → this tool's handler replaces the built-in of the same name.
+    pub override_builtin: bool,
 }
 
 /// Result returned from executing a hook.
@@ -710,6 +820,7 @@ impl PluginManager {
                 script: canon_script,
                 timeout_ms,
                 kind,
+                override_builtin: t.override_builtin,
             });
         }
 
@@ -721,6 +832,8 @@ impl PluginManager {
             source_path: canon_dir,
             hooks,
             tools: tools_vec,
+            disable_tools: manifest.disable_tools,
+            system_prompt: manifest.system_prompt,
         })
     }
 
@@ -828,6 +941,18 @@ impl PluginManager {
             .collect()
     }
 
+    /// Cheap existence check (no config clone): does any enabled plugin register
+    /// this hook point? Used to decide whether to clone tool args before the
+    /// pre-hook phase without paying for a full `get_hook_configs`.
+    pub fn has_hook(&self, hook_name: &str) -> bool {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .any(|p| p.hooks.contains_key(hook_name))
+    }
+
     /// Look up a single plugin by name.
     pub fn get_plugin(&self, name: &str) -> Option<Plugin> {
         self.plugins.read().unwrap().get(name).cloned()
@@ -868,6 +993,59 @@ impl PluginManager {
     /// Approval classification for a plugin-declared tool, if it exists.
     pub fn tool_kind(&self, name: &str) -> Option<ToolKind> {
         self.tool_config(name).map(|t| t.kind)
+    }
+
+    /// Union of tool names every enabled plugin asks to disable (the
+    /// `disable_tools` manifest field). Applied as a FINAL filter on the
+    /// model's tool list, so a disabled name is gone whether it's a built-in
+    /// or an override — `disable_tools` is the strongest "remove a feature"
+    /// lever and always wins over `override`.
+    pub fn disabled_tools(&self) -> std::collections::HashSet<String> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .flat_map(|p| p.disable_tools.iter().cloned())
+            .collect()
+    }
+
+    /// Built-in tool names for which an enabled plugin declares an
+    /// `override: true` tool — the plugin's handler replaces the built-in's
+    /// implementation. A plugin tool named like a built-in WITHOUT
+    /// `override: true` does NOT appear here (it stays a no-op collision,
+    /// built-in wins — unchanged behavior).
+    pub fn overridden_tool_names(&self) -> std::collections::HashSet<String> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .flat_map(|p| p.tools.iter())
+            .filter(|t| t.override_builtin && crate::tools::is_builtin(&t.name))
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    /// Concatenated `system_prompt` text from every enabled plugin that
+    /// declares one, each framed with its plugin name + version. Empty (so the
+    /// system prompt + its prefix cache are untouched) when no plugin declares
+    /// any. Lets a plugin inject domain rules / persona / context into the
+    /// system prompt — the same surface a core edit of SYSTEM_PROMPT_BASE
+    /// touches.
+    pub fn system_prompt_injection(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+            let s = p.system_prompt.trim();
+            if !s.is_empty() {
+                parts.push(format!("# Plugin: {} (v{})\n{}", p.name, p.version, s));
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Plugin-injected context\n\n{}", parts.join("\n\n"))
+        }
     }
 }
 
@@ -2272,6 +2450,172 @@ mod tests {
 
     // ---- execute_plugin_tool ----
 
+    /// Write a `plugin.json` with arbitrary manifest JSON into `dir`.
+    fn write_manifest(dir: &Path, manifest: &str) {
+        fs::write(dir.join("plugin.json"), manifest).unwrap();
+    }
+
+    #[test]
+    fn hook_points_include_catch_all() {
+        assert!(HOOK_POINTS.contains(&"pre_tool"));
+        assert!(HOOK_POINTS.contains(&"post_tool"));
+        // pre_* get the short timeout; post_* the long one.
+        assert_eq!(default_hook_timeout("pre_tool"), DEFAULT_PRE_TIMEOUT_MS);
+        assert_eq!(default_hook_timeout("post_tool"), DEFAULT_POST_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn disable_tools_manifest_loaded() {
+        let tmp = TmpDir::new("disable_loaded");
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"no-bash","version":"1.0.0","disable_tools":["bash","git_commit"]}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        assert_eq!(plugin.disable_tools, vec!["bash".to_string(), "git_commit".to_string()]);
+    }
+
+    #[test]
+    fn system_prompt_manifest_loaded() {
+        let tmp = TmpDir::new("sysprompt_loaded");
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"rules","version":"2.0.0","system_prompt":"Never run raw SQL."}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        assert_eq!(plugin.system_prompt, "Never run raw SQL.");
+    }
+
+    #[test]
+    fn override_field_loaded() {
+        let tmp = TmpDir::new("override_loaded");
+        let pdir = write_plugin_with_tool(&tmp.path, "bash", r#""override":true"#);
+        let plugin = PluginManager::load_plugin_from_dir(&pdir).unwrap();
+        assert!(plugin.tools[0].override_builtin);
+
+        // Without override, it stays false.
+        let tmp2 = TmpDir::new("override_false");
+        let pdir2 = write_plugin_with_tool(&tmp2.path, "my_tool", "");
+        let plugin2 = PluginManager::load_plugin_from_dir(&pdir2).unwrap();
+        assert!(!plugin2.tools[0].override_builtin);
+    }
+
+    #[test]
+    fn manager_disabled_tools_unions_across_plugins() {
+        let tmp = TmpDir::new("disable_union");
+        let a = tmp.path.join("a");
+        let b = tmp.path.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        write_manifest(&a, r#"{"name":"a","version":"1.0.0","disable_tools":["bash"]}"#);
+        write_manifest(
+            &b,
+            r#"{"name":"b","version":"1.0.0","disable_tools":["bash","edit"]}"#,
+        );
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        let disabled = mgr.disabled_tools();
+        assert!(disabled.contains("bash"));
+        assert!(disabled.contains("edit"));
+        assert_eq!(disabled.len(), 2);
+    }
+
+    #[test]
+    fn overridden_tool_names_only_when_override_and_builtin() {
+        // override:true on a built-in name → overridden. override:false (or a
+        // custom name) → NOT overridden.
+        let tmp = TmpDir::new("override_names");
+        write_plugin_with_tool(&tmp.path, "bash", r#""override":true"#);
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        let names = mgr.overridden_tool_names();
+        assert!(names.contains("bash"));
+
+        // override:true on a NON-built-in name → not in overridden set (there's
+        // nothing to override; it's just a custom tool).
+        let tmp2 = TmpDir::new("override_custom");
+        write_plugin_with_tool(&tmp2.path, "my_domain_tool", r#""override":true"#);
+        let mgr2 = PluginManager::new(tmp2.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr2.overridden_tool_names().is_empty());
+
+        // A plain collision (no override) on a built-in → NOT overridden.
+        let tmp3 = TmpDir::new("override_none");
+        write_plugin_with_tool(&tmp3.path, "read_file", r#""kind":"readonly""#);
+        let mgr3 = PluginManager::new(tmp3.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr3.overridden_tool_names().is_empty());
+    }
+
+    #[test]
+    fn system_prompt_injection_concat_and_framed() {
+        let tmp = TmpDir::new("sysprompt_inject");
+        let a = tmp.path.join("a");
+        let b = tmp.path.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        write_manifest(
+            &a,
+            r#"{"name":"alpha","version":"1.0.0","system_prompt":"rule A"}"#,
+        );
+        write_manifest(
+            &b,
+            r#"{"name":"beta","version":"2.0.0","system_prompt":"rule B"}"#,
+        );
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        let inj = mgr.system_prompt_injection();
+        assert!(inj.starts_with("\n\n## Plugin-injected context\n\n"));
+        assert!(inj.contains("# Plugin: alpha (v1.0.0)\nrule A"));
+        assert!(inj.contains("# Plugin: beta (v2.0.0)\nrule B"));
+
+        // Empty when no plugin declares one (prefix-cache-safe).
+        let tmp2 = TmpDir::new("sysprompt_empty");
+        write_manifest(&tmp2.path, r#"{"name":"plain","version":"1.0.0"}"#);
+        let mgr2 = PluginManager::new(tmp2.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr2.system_prompt_injection().is_empty());
+    }
+
+    #[test]
+    fn has_hook_existence_check() {
+        let tmp = TmpDir::new("has_hook");
+        // PluginManager::new scans SUBDIRECTORIES of its root for plugins,
+        // so the plugin must live in a subdir.
+        let pdir = tmp.path.join("h");
+        let hooks_dir = pdir.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        write_hook_script(&hooks_dir, "h.sh", r#"{"allow":true}"#, 0);
+        write_manifest(
+            &pdir,
+            r#"{"name":"h","version":"1.0.0","hooks":{"pre_tool":{"script":"hooks/h.sh"}}}"#,
+        );
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr.has_hook("pre_tool"));
+        assert!(!mgr.has_hook("pre_bash"));
+        // Disabled plugin is excluded.
+        mgr.disable("h").unwrap();
+        assert!(!mgr.has_hook("pre_tool"));
+    }
+
+    #[test]
+    fn disabled_plugin_excluded_from_new_capabilities() {
+        // A disabled plugin contributes nothing to disable_tools / overrides /
+        // system_prompt — mirroring how disabled plugins are excluded from
+        // hook configs and tool definitions.
+        let tmp = TmpDir::new("disabled_excluded");
+        let pdir = write_plugin_with_tool(&tmp.path, "bash", r#""override":true"#);
+        // Augment with disable_tools + system_prompt.
+        let manifest = fs::read_to_string(pdir.join("plugin.json")).unwrap();
+        let manifest = manifest.trim_end_matches('}').to_string()
+            + r#","disable_tools":["edit"],"system_prompt":"ctx"}"#;
+        fs::write(pdir.join("plugin.json"), &manifest).unwrap();
+
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr.overridden_tool_names().contains("bash"));
+        assert!(mgr.disabled_tools().contains("edit"));
+        assert!(mgr.system_prompt_injection().contains("ctx"));
+
+        mgr.disable("tools-plugin").unwrap();
+        assert!(mgr.overridden_tool_names().is_empty());
+        assert!(mgr.disabled_tools().is_empty());
+        assert!(mgr.system_prompt_injection().is_empty());
+    }
+
     fn tool_config_for(script: PathBuf, timeout_ms: u64, kind: ToolKind) -> ToolConfig {
         ToolConfig {
             name: "ut".into(),
@@ -2280,6 +2624,7 @@ mod tests {
             script,
             timeout_ms,
             kind,
+            override_builtin: false,
         }
     }
 

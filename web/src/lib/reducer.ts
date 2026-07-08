@@ -466,6 +466,15 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           `Agent asks: ${ev.questions.length} question${ev.questions.length === 1 ? "" : "s"}`,
         ),
       };
+    case "compacting":
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Compacting context${ev.trigger ? ` (${ev.trigger})` : ""}…`,
+        ),
+      };
     case "compacted":
       return {
         ...state,
@@ -499,6 +508,20 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         stats: ev,
         currentSessionFile: ev.session_file || state.currentSessionFile,
       };
+    case "context_breakdown": {
+      const top = (ev.top_consumers ?? [])
+        .slice(0, 3)
+        .map((c) => `${c.role} #${c.index}: ${c.tokens.toLocaleString()}`)
+        .join(" · ");
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Context: ${ev.total_tokens.toLocaleString()} / ${ev.context_window.toLocaleString()} tokens (${ev.pct}%)${top ? ` — top: ${top}` : ""}`,
+        ),
+      };
+    }
     case "history":
       return {
         ...state,

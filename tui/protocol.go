@@ -95,6 +95,26 @@ type memoryEntry struct {
 	Tags []string `json:"tags"`
 }
 
+// contextConsumer is one row of the core's "context_breakdown" event
+// top_consumers array (the biggest token consumers in the conversation).
+type contextConsumer struct {
+	Index   int    `json:"index"`
+	Role    string `json:"role"`
+	Tokens  uint64 `json:"tokens"`
+	Preview string `json:"preview"`
+}
+
+// contextBreakdown mirrors the core's "context_breakdown" event payload so the
+// TUI can render a /context modal showing where the context budget is spent.
+type contextBreakdown struct {
+	Total       uint64            `json:"total_tokens"`
+	Window      uint64            `json:"context_window"`
+	Pct         uint64            `json:"pct"`
+	Messages    int               `json:"messages"`
+	ByRole      map[string]uint64 `json:"by_role"`
+	TopConsumers []contextConsumer  `json:"top_consumers"`
+}
+
 // skillInfo mirrors one element of the core's "skills" event array. The
 // content (SKILL.md body) is sent by the core so /skill:<name> can apply a
 // skill without the read_file path restriction blocking global skills.

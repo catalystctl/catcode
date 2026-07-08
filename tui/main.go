@@ -60,6 +60,8 @@ type session struct {
 	sessionList         []sessionEntry
 	skillsList          []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
 	coreBashTimeout     int
+	coreAutoCompact     bool
+	ctxBreakdown        *contextBreakdown
 	coreRestarts        int
 	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)
 	visionModel         string          // preferred handoff target ("" = pick dynamically)

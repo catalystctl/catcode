@@ -167,14 +167,21 @@ pub async fn summarize(
     model: &str,
     messages: &[Message],
     cancel: &CancellationToken,
+    instructions: Option<&str>,
 ) -> Option<String> {
-    const SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
+    const BASE_SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
+    let sys = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!(
+            "{BASE_SYS}\n\nThe user provided the following guidance for what to preserve in this summary — honor it above the default priorities:\n{extra}"
+        ),
+        None => BASE_SYS.to_string(),
+    };
     let user = messages
         .iter()
         .map(message_for_summary)
         .collect::<Vec<_>>()
         .join("\n");
-    complete_text(client, provider, model, SYS, &user, 1024, cancel).await
+    complete_text(client, provider, model, &sys, &user, 1024, cancel).await
 }
 
 /// Extract durable facts worth remembering across future sessions from a slice of
@@ -4726,7 +4733,7 @@ mod tests {
             Message::user("please refactor the auth module"),
             Message::assistant("on it"),
         ];
-        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
         assert_eq!(out.as_deref(), Some("<summary>mocked</summary>"));
     }
 
@@ -4753,7 +4760,7 @@ mod tests {
         let provider = mock_provider(base);
         let cancel = CancellationToken::new();
         let msgs: Vec<Message> = vec![Message::user("x")];
-        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel).await;
+        let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
         assert!(out.is_none());
     }
 }

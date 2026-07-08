@@ -1311,6 +1311,7 @@ async fn run_agent_inner(
                 cancel,
                 est > hard_cap,
                 model_ctx,
+                cfg.compact_instructions.as_deref(),
             )
             .await;
             // Compaction rewrote `sub`; the real baseline no longer applies.
