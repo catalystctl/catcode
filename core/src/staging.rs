@@ -250,7 +250,15 @@ fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 /// no-op once everything is staged. The `.staged` marker records the schema
 /// version so a bump can backfill newly-added defaults.
 pub fn stage_if_needed() -> StageResult {
-    let home = global_home();
+    stage_if_needed_in(&global_home())
+}
+
+/// Testable core: stage defaults into `home` (the `~/.catalyst-code` dir),
+/// with no `$HOME` env dependency so tests don't race with other env-mutating
+/// tests (mutating `HOME` is process-global and breaks parallel tests that
+/// read it, e.g. `workspace_activity_lists_peers`).
+pub(super) fn stage_if_needed_in(home: &std::path::Path) -> StageResult {
+    let home = home.to_path_buf();
     // Best-effort: create the tree up front; individual file parents are also
     // created below, but this guarantees the top-level dir exists for the marker.
     let _ = std::fs::create_dir_all(&home);
@@ -346,10 +354,9 @@ mod tests {
     fn staging_is_idempotent_and_nonclobbering() {
         let tmp = tempfile_dir();
         let home = tmp.join(".catalyst-code");
-        std::env::set_var("HOME", &tmp);
 
         // First run: everything missing → all staged, first_run true.
-        let r1 = stage_if_needed();
+        let r1 = stage_if_needed_in(&home);
         assert!(r1.first_run, "first run should be marked first_run");
         assert!(!r1.written.is_empty(), "first run should write defaults");
         assert!(home.join("agents/scout.md").exists());
@@ -373,7 +380,7 @@ mod tests {
         );
 
         // Second run: marker present → not first_run, nothing re-written.
-        let r2 = stage_if_needed();
+        let r2 = stage_if_needed_in(&home);
         assert!(!r2.first_run, "second run should not be first_run");
         assert!(r2.written.is_empty(), "second run should write nothing");
 
@@ -381,7 +388,7 @@ mod tests {
         // confirm the edit survives.
         let scout = home.join("agents/scout.md");
         std::fs::write(&scout, "USER EDITED").unwrap();
-        let r3 = stage_if_needed();
+        let r3 = stage_if_needed_in(&home);
         assert_eq!(std::fs::read_to_string(&scout).unwrap(), "USER EDITED");
         assert!(
             !r3.written.contains(&"agents/scout.md".to_string()),
@@ -392,7 +399,7 @@ mod tests {
         // marker/first_run stays stable.
         let skill = home.join("skills/pi-subagents/SKILL.md");
         std::fs::remove_file(&skill).unwrap();
-        let r4 = stage_if_needed();
+        let r4 = stage_if_needed_in(&home);
         assert!(skill.exists(), "deleted default should be restored");
         assert!(r4
             .written
@@ -416,8 +423,6 @@ mod tests {
                 "telemetry hook script must be executable"
             );
         }
-
-        std::env::remove_var("HOME");
     }
 
     #[test]

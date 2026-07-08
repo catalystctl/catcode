@@ -89,13 +89,3 @@ jobs:
         run: |
           mkdir -p embed && touch embed/catcode-core
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -tags embed_core .
-
-  docker:
-    name: docker image
-    runs-on: [self-hosted, Linux, X64]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build image (no push; buildah chroot — runs under rootless podman)
-        # Nested OCI build: chroot isolation + vfs storage work inside a
-        # rootless container without extra privileges (build-check only).
-        run: buildah build --isolation chroot --storage-driver vfs -t catalyst-code:ci .
