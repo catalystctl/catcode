@@ -180,8 +180,7 @@ fn atomic_write_json(path: &Path, rec: &PresenceRecord) -> std::io::Result<()> {
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        let body = serde_json::to_vec_pretty(rec)
-            .map_err(std::io::Error::other)?;
+        let body = serde_json::to_vec_pretty(rec).map_err(std::io::Error::other)?;
         f.write_all(&body)?;
         f.sync_all()?;
     }
@@ -240,13 +239,8 @@ mod tests {
     fn stale_record_is_reaped() {
         let dir = ws_dir();
         // Write a record, then backdate its mtime beyond STALE_SECS.
-        let rec = PresenceRecord::from_work_state(
-            &WorkState::default(),
-            5555,
-            None,
-            None,
-            unix_now(),
-        );
+        let rec =
+            PresenceRecord::from_work_state(&WorkState::default(), 5555, None, None, unix_now());
         write_presence(&dir, 5555, &rec);
         let file = presence_file(&dir, 5555).unwrap();
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(STALE_SECS + 60);

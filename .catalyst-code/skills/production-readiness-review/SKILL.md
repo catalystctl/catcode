@@ -95,3 +95,41 @@ absent). End by offering to implement the P1 fixes.
 - **The subagent hard cap.** If you need >8 parallel reviewers, batch them ≤8
   (the `tasks` mode rejects > `parallel_max_tasks` instantly). See
   `parallel-subagent-cap` memory.
+
+## Applying the findings (fix-all)
+
+When the user says "fix all issues" / "fix everything found" after a review,
+this is the apply-and-verify counterpart. The risk is volume + correctness
+across two codebases — structure it so each file tree has ONE writer and the
+trickiest fix is yours.
+
+1. **Delegate a cohesive same-tree cluster to ONE worker.** Group all fixes
+   that share files (e.g. every `tui/main.go` lifecycle fix: atomic process
+   ptr, signal-handler quit, startup watchdog, double-`Wait`) into a single
+   worker so it keeps coherence across its own edits. Give it EXACT fixes
+   (file:line + the change + the rationale) — workers execute well-specified
+   edits reliably; vague ones they botch. Tell it what's expected-incomplete
+   ("presence feature is mid-impl — don't touch it") and that it's the SOLE
+   writer of its tree (so it may run the formatter itself, no race).
+2. **Keep the security-sensitive / judgment-heavy fix for yourself.** SSRF
+   range-blocking, sandbox-bypass fixes, lifecycle redesigns — read the file,
+   design carefully, write tests. Don't hand these to a worker.
+3. **Verify with the EXACT CI gates, not just "it compiles":**
+   - core: `cargo fmt --all -- --check` · `cargo clippy --all-targets` ·
+     `cargo test --locked`
+   - tui: `gofmt -l .` (empty) · `go vet ./...` · `go build ./...` ·
+     `go test -race ./...` (the `-race` matters — it catches the data-race
+     fixes a plain `go test` won't).
+4. **Isolate failures to your own edits.** A test failing in a file you didn't
+   touch is almost certainly the user's concurrent work (or a pre-existing
+   issue) — confirm with `git status --short` which modified files are yours
+   vs. theirs before "fixing" it. (See `concurrent-user-edits-isolate-errors`.)
+5. **Spot-check worker output — build-passing ≠ fixes-correct.** A worker
+   that claims "all 10 fixes done, tests green" may have no-op'd a tricky one.
+   `grep` for the specific fix markers (e.g. `atomic.Pointer`, `s.busy = false`
+   in the reset handler, `go fillMentionCache`, `modelIdx = -1`) and read the
+   one or two trickiest regions yourself. (The `grep` TOOL is flaky — use
+   `bash grep -n` instead.)
+6. **Run the formatters yourself at the end** (`cargo fmt --all`, `gofmt -w .`)
+   and confirm `--check`/`-l` is clean — this is both a fix (P1 fmt drift) and
+   the CI gate.

@@ -107,6 +107,13 @@ JSON object to stdout before exiting. Stderr is captured for error reporting.
   context includes the current result under the `result` key so the hook can
   read it.)
 
+  Note: pre-hook `modify` runs AFTER the approval gate + diff preview (which use
+  the original args), so a rewritten `path`/`command` is NOT re-prompted. File
+  tools still re-confine the path internally and `bash` re-checks its denylist,
+  so the security boundaries hold — but a plugin that redirects a safe path to a
+  sensitive one bypasses the user-facing prompt. Pre-hooks are trusted,
+  user-installed code (project hooks gated by `--trust-project-plugins`).
+
 Safety rules enforced by the core:
 - pre_* hooks: non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks the tool)
 - post_* hooks: non-zero exit, timeout, or JSON parse failure → silently skipped (tool already ran)
@@ -2472,7 +2479,10 @@ mod tests {
             r#"{"name":"no-bash","version":"1.0.0","disable_tools":["bash","git_commit"]}"#,
         );
         let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
-        assert_eq!(plugin.disable_tools, vec!["bash".to_string(), "git_commit".to_string()]);
+        assert_eq!(
+            plugin.disable_tools,
+            vec!["bash".to_string(), "git_commit".to_string()]
+        );
     }
 
     #[test]
@@ -2507,7 +2517,10 @@ mod tests {
         let b = tmp.path.join("b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        write_manifest(&a, r#"{"name":"a","version":"1.0.0","disable_tools":["bash"]}"#);
+        write_manifest(
+            &a,
+            r#"{"name":"a","version":"1.0.0","disable_tools":["bash"]}"#,
+        );
         write_manifest(
             &b,
             r#"{"name":"b","version":"1.0.0","disable_tools":["bash","edit"]}"#,

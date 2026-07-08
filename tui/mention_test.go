@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -42,15 +43,26 @@ func TestMentionRecursiveFilter(t *testing.T) {
 	if !s.mentionActive {
 		t.Fatal("flyout should be active after @main")
 	}
+	// recursiveSearch fills its cache from a background goroutine (a
+	// synchronous walk would freeze the UI on large repos). Poll until the
+	// walk completes and main.go appears in the flyout.
+	deadline := time.Now().Add(2 * time.Second)
 	idx := -1
-	for i, it := range s.mentionItems {
-		if it.display == "main.go" {
-			idx = i
+	for {
+		for i, it := range s.mentionItems {
+			if it.display == "main.go" {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
 			break
 		}
-	}
-	if idx < 0 {
-		t.Fatalf("flyout should contain main.go; got %v", itemsDisplay(s.mentionItems))
+		if time.Now().After(deadline) {
+			t.Fatalf("flyout should contain main.go after walk completes; got %v", itemsDisplay(s.mentionItems))
+		}
+		s.evalMention() // re-eval against the now-populated cache
+		time.Sleep(5 * time.Millisecond)
 	}
 	// Move the cursor to the main.go entry and accept with Tab.
 	s.mentionCursor = idx

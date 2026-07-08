@@ -35,6 +35,7 @@ func (s *session) accumulateSaved(ev *coreEvent) {
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	switch ev.Type {
 	case "ready":
+		s.coreReady = true // disarm the startup watchdog
 		var models []modelInfo
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
@@ -205,7 +206,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 		if match != nil {
-			match.output = out
+			match.output = capOutput(out)
 			match.diff = ev.get("diff")
 			match.ok = ev.get("ok") == "true"
 			match.hasOk = true
@@ -275,6 +276,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "reset":
+		s.busy = false // a reset is a conversation boundary — no turn is in flight
 		s.blocks = nil
 		s.cur = nil
 		s.contextTokens = 0
@@ -291,6 +293,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logInfo("conversation reset")
 
 	case "history":
+		// Loading a session is a conversation boundary — clear any in-flight
+		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with
+		// busy=true and a wiped transcript.
+		s.busy = false
+		s.cur = nil
+		s.queuedNext = false
+		s.queued = nil
 		var m map[string]json.RawMessage
 		if json.Unmarshal(ev.Raw, &m) == nil {
 			if raw, ok := m["messages"]; ok {
@@ -506,7 +515,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// local terminal, which writes its clipboard, so the user can just paste.
 		// Best-effort: terminals that lack OSC 52 (e.g. macOS Terminal.app) ignore
 		// it and the user copies from the hard-wrapped URL shown below instead.
-		copyToClipboardOSC52(url)
+		clipCmd := writeOSC52Cmd(url)
 		var b strings.Builder
 		b.WriteString(message)
 		if url != "" {
@@ -530,6 +539,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if url != "" {
 			openURL(url)
 		}
+		return clipCmd // OSC 52 write is a tea.Cmd so it's serialized with the renderer
 
 	case "steer":
 		// Core acknowledged a steer: the running turn was interrupted and the
@@ -706,7 +716,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 func (s *session) applyModels(models []modelInfo) {
 	s.models = models
 	s.modelIdx = 0
-	if sel := s.settings.SelectedModel; sel != "" {
+	if len(models) == 0 {
+		s.modelIdx = -1 // no model: -1 is an explicit "invalid" sentinel (downstream guards accept it)
+	} else if sel := s.settings.SelectedModel; sel != "" {
 		for i, mm := range models {
 			if mm.ID == sel || strings.Contains(mm.ID, sel) {
 				s.modelIdx = i
@@ -1007,9 +1019,13 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// global: the quit key (default Ctrl+C) quits unless a modal is open
 	// (where esc / ctrl+c closes the modal instead).
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
+		// Mark teardown so the core's stdout EOF doesn't trigger an auto-restart,
+		// then kill the core. The stdout-reader goroutine reaps it via cmd.Wait()
+		// on EOF — do NOT Wait() here, that would race the reader's Wait on the
+		// same Cmd (double-reap).
+		quitting.Store(true)
 		if s.coreCmd != nil && s.coreCmd.Process != nil {
 			_ = s.coreCmd.Process.Kill()
-			_, _ = s.coreCmd.Process.Wait() // reap the core child so it isn't a zombie
 		}
 		return s, tea.Quit
 	}
@@ -1709,22 +1725,30 @@ func openURL(url string) {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	_ = cmd.Start()
+	// Run (Start+Wait) in a goroutine so the opener is reaped instead of
+	// leaving a zombie; fire-and-forget Start() never collects the child.
+	go func() { _ = cmd.Run() }()
 }
 
-// copyToClipboardOSC52 writes the OSC 52 escape sequence to set the LOCAL
-// terminal's clipboard to text. Over SSH the sequence passes through to the
-// user's local terminal, which writes its clipboard — so the user can paste
-// (Ctrl/Cmd+V) into their local browser without copying from the (wrapped,
-// hard-to-select) transcript. Best-effort: terminals that don't support OSC 52
-// ignore it. The sequence is invisible (no cursor move / no text), so it is
-// safe to emit from a Bubble Tea handler between render frames.
-func copyToClipboardOSC52(text string) {
+// writeOSC52Cmd returns a tea.Cmd that writes the OSC 52 escape sequence to set
+// the LOCAL terminal's clipboard to text. Over SSH the sequence passes through
+// to the user's local terminal, which writes its clipboard — so the user can
+// paste (Ctrl/Cmd+V) into their local browser without copying from the
+// (wrapped, hard-to-select) transcript. Best-effort: terminals that don't
+// support OSC 52 ignore it. The sequence is invisible (no cursor move / no
+// text). Routing the stdout write through a returned tea.Cmd serializes it with
+// Bubble Tea's renderer goroutine (which also writes stdout) — a direct
+// os.Stdout write from Update races the renderer and can garble the screen.
+func writeOSC52Cmd(text string) tea.Cmd {
 	if text == "" {
-		return
+		return nil
 	}
 	// OSC 52: ESC ] 52 ; <selection> ; <base64> BEL.  'c' = the CLIPBOARD
 	// selection (the Ctrl/Cmd+V paste buffer).
 	enc := base64.StdEncoding.EncodeToString([]byte(text))
-	os.Stdout.WriteString("\x1b]52;c;" + enc + "\x07")
+	seq := "\x1b]52;c;" + enc + "\x07"
+	return func() tea.Msg {
+		os.Stdout.WriteString(seq)
+		return nil
+	}
 }

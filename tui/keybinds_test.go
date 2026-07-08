@@ -38,10 +38,10 @@ func TestDefaultKeybindsCoverAll(t *testing.T) {
 // unknown actions are dropped.
 func TestEffectiveKeybindsMerge(t *testing.T) {
 	user := map[string]string{
-		"quit":              "ctrl+q", // override
-		"toggle_reasoning":  "ctrl+e", // override
+		"quit":               "ctrl+q", // override
+		"toggle_reasoning":   "ctrl+e", // override
 		"nonexistent_action": "ctrl+z", // unknown — must be dropped
-		"send":              "",       // empty — means DISABLED (not default)
+		"send":               "",       // empty — means DISABLED (not default)
 	}
 	m := effectiveKeybinds(user)
 	if m["quit"] != "ctrl+q" {

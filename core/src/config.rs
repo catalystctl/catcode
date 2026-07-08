@@ -128,17 +128,21 @@ pub struct Config {
     pub context_compact_at: f32, // fraction of context_window that triggers compaction
     pub context_digest_at: f32, // fraction of context_window that triggers stale-tool-result digesting (sub-threshold reclaim; 0 disables)
     pub auto_compact: bool, // automatically compact when context approaches the limit (threshold + idle); manual /compact always works regardless
+    /// Opt-in JSONL debug log path. Records every tool call with its full
+    /// arguments (file contents, bash commands) — which may include secrets the
+    /// model writes (e.g. into a `.env`). User-owned, off by default, rotates at
+    /// 64 MiB. Enable only when debugging.
     pub debug_log: Option<PathBuf>,
     pub session_file: Option<PathBuf>,
     pub default_model: Option<String>,
     // --- production knobs (items 3,4,7) ---
-    pub sandbox: Sandbox,           // --sandbox firejail wraps bash
-    pub no_network: bool,           // --no-network: unshare -n on bash
-    pub idle_timeout_secs: u64,     // per-chunk SSE idle timeout
-    pub max_session_tokens: u64,    // hard session token budget (0 = unlimited)
-    pub summarize_on_compact: bool, // use a model call to summarize dropped turns
+    pub sandbox: Sandbox,                     // --sandbox firejail wraps bash
+    pub no_network: bool,                     // --no-network: unshare -n on bash
+    pub idle_timeout_secs: u64,               // per-chunk SSE idle timeout
+    pub max_session_tokens: u64,              // hard session token budget (0 = unlimited)
+    pub summarize_on_compact: bool,           // use a model call to summarize dropped turns
     pub compact_instructions: Option<String>, // optional guidance woven into the summarize prompt (e.g. "Focus on code samples and API usage"); /compact <instructions> overrides per-call
-    pub rolling_state: bool,        // inject a transient tail work-state summary (KV-cache-aware)
+    pub rolling_state: bool, // inject a transient tail work-state summary (KV-cache-aware)
     /// Auto-reflect: on a non-trivial turn (≥ `auto_reflect_min_tool_calls` tool
     /// calls), inject a reflection continuation before `finish` exits so durable
     /// facts get persisted (memory) and recurring patterns get written as skills
@@ -561,6 +565,11 @@ pub fn save_providers_config(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     // Read existing config.json (if any) and merge so other keys survive.
     let mut root: Value = std::fs::read_to_string(&path)
@@ -578,7 +587,17 @@ pub fn save_providers_config(
     let data = serde_json::to_string_pretty(&root).unwrap_or_default();
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
     std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -1154,7 +1173,11 @@ fn apply_json(c: &mut Config, v: &Value) {
         c.auto_compact = b;
     }
     if let Some(s) = v.get("compact_instructions").and_then(|x| x.as_str()) {
-        c.compact_instructions = if s.trim().is_empty() { None } else { Some(s.to_string()) };
+        c.compact_instructions = if s.trim().is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
     }
     if let Some(f) = v.get("context_compact_at").and_then(|x| x.as_f64()) {
         c.context_compact_at = f as f32;

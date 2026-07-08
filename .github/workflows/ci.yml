@@ -45,6 +45,9 @@ jobs:
             ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('tui/go.sum') }}
           restore-keys: ${{ runner.os }}-go-
+      - name: gofmt check
+        working-directory: tui
+        run: test -z "$(gofmt -l .)"
       - name: go vet
         working-directory: tui
         run: go vet ./...

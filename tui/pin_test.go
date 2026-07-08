@@ -13,7 +13,7 @@ import (
 type nopWriteCloser struct{}
 
 func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
-func (nopWriteCloser) Close() error                 { return nil }
+func (nopWriteCloser) Close() error                { return nil }
 
 // wireCoreStub gives the session a capture channel for sendCore commands.
 func wireCoreStub(s *session) {

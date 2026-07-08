@@ -107,12 +107,12 @@ type contextConsumer struct {
 // contextBreakdown mirrors the core's "context_breakdown" event payload so the
 // TUI can render a /context modal showing where the context budget is spent.
 type contextBreakdown struct {
-	Total       uint64            `json:"total_tokens"`
-	Window      uint64            `json:"context_window"`
-	Pct         uint64            `json:"pct"`
-	Messages    int               `json:"messages"`
-	ByRole      map[string]uint64 `json:"by_role"`
-	TopConsumers []contextConsumer  `json:"top_consumers"`
+	Total        uint64            `json:"total_tokens"`
+	Window       uint64            `json:"context_window"`
+	Pct          uint64            `json:"pct"`
+	Messages     int               `json:"messages"`
+	ByRole       map[string]uint64 `json:"by_role"`
+	TopConsumers []contextConsumer `json:"top_consumers"`
 }
 
 // skillInfo mirrors one element of the core's "skills" event array. The

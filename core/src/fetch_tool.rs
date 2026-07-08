@@ -2,10 +2,12 @@
 // NOT subject to the bash sandbox / `--no-network` (`unshare -n` only wraps the
 // bash command), so the agent can still look up docs under the hard-security
 // config. A host allowlist (`cfg.fetch_allowlist`) restricts egress; empty
-// allowlist = any http(s) host.
+// allowlist = any public http(s) host (private/loopback/link-local ranges are
+// blocked by default as SSRF hardening; an explicit allowlist entry overrides).
 use crate::config::Config;
 use crate::tools::{smart_truncate, Outcome};
 use serde_json::Value;
+use std::net::IpAddr;
 
 /// Parse an absolute http(s) URL enough to validate it and extract the host
 /// (lowercased) for allowlist matching. Returns (scheme, host). No `url` crate
@@ -16,8 +18,14 @@ fn parse_http_host(url: &str) -> Option<(String, String)> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let end = rest.find(&['/', '?', '#', ':'][..]).unwrap_or(rest.len());
-    let host = rest[..end].to_ascii_lowercase();
+    // IPv6 literal: [::1]:8080 — host is the bracketed content.
+    let host = if let Some(rest) = rest.strip_prefix('[') {
+        let end = rest.find(']')?;
+        rest[..end].to_ascii_lowercase()
+    } else {
+        let end = rest.find(&['/', '?', '#', ':'][..]).unwrap_or(rest.len());
+        rest[..end].to_ascii_lowercase()
+    };
     if host.is_empty() {
         return None;
     }
@@ -37,11 +45,54 @@ fn host_matches(host: &str, pattern: &str) -> bool {
     }
 }
 
-fn host_allowed(host: &str, allowlist: &[String]) -> bool {
-    if allowlist.is_empty() {
-        return true;
+/// Is `ip` in a private/loopback/link-local/unspecified range? These are
+/// blocked by default (empty fetch_allowlist) to harden against SSRF — e.g.
+/// cloud-metadata at 169.254.169.254, localhost services, RFC-1918 internals.
+/// An explicit fetch_allowlist entry overrides this (operator opt-in).
+fn ip_is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 127 // loopback 127.0.0.0/8
+                || (o[0] == 169 && o[1] == 254) // link-local 169.254.0.0/16 (cloud-metadata)
+                || o[0] == 10 // private 10.0.0.0/8
+                || (o[0] == 172 && (16..=31).contains(&o[1])) // private 172.16.0.0/12
+                || (o[0] == 192 && o[1] == 168) // private 192.168.0.0/16
+                || o[0] == 0 // 0.0.0.0/8 (unspecified + "this network")
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback() // ::1
+                || v6.is_unspecified() // ::
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || v6
+                    .to_ipv4()
+                    .map(|v4| ip_is_private(IpAddr::V4(v4)))
+                    .unwrap_or(false) // ::ffff:a.b.c.d (IPv4-mapped)
+        }
     }
-    allowlist.iter().any(|p| host_matches(host, p))
+}
+
+/// Is `host` a private address? Checks IP literals directly (no DNS — fast and
+/// side-effect-free, so it's safe in the sync redirect policy). A hostname
+/// that resolves to a private IP is a residual risk controlled by the
+/// allowlist; we deliberately don't do DNS here to keep the check hang-proof.
+fn host_is_private(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip_is_private(ip),
+        Err(_) => false,
+    }
+}
+
+/// Decide whether `host` is permitted. A non-empty allowlist means the operator
+/// explicitly opted in to exactly those hosts (a listed private host is allowed
+/// — explicit opt-in wins). An empty allowlist allows any PUBLIC host;
+/// private/loopback/link-local ranges are blocked by default (SSRF hardening).
+fn host_allowed(host: &str, allowlist: &[String]) -> bool {
+    if !allowlist.is_empty() {
+        return allowlist.iter().any(|p| host_matches(host, p));
+    }
+    !host_is_private(host)
 }
 
 /// A redirect policy that re-checks the fetch_allowlist on EVERY redirect hop,
@@ -51,8 +102,9 @@ fn host_allowed(host: &str, allowlist: &[String]) -> bool {
 /// security model (the whole point: bash stays offline, fetch reaches only
 /// listed hosts). A redirect whose target host isn't allowed is stopped — the
 /// 3xx response is returned without following, and the disallowed host is
-/// never contacted. Shared by `fetch` and `web_search` so both honor the same
-/// redirect policy.
+/// never contacted. With an empty allowlist, private/loopback/link-local
+/// redirect targets are also stopped (SSRF hardening — see `host_allowed`).
+/// Shared by `fetch` and `web_search` so both honor the same redirect policy.
 pub(crate) fn allowlist_redirect_policy(allowlist: Vec<String>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         let host = attempt.url().host_str().unwrap_or("").to_ascii_lowercase();
@@ -154,8 +206,13 @@ pub(crate) fn egress_check(label: &str, url: &str, cfg: &Config) -> Option<Strin
         ));
     }
     if !host_allowed(&host, &cfg.fetch_allowlist) {
+        if cfg.fetch_allowlist.is_empty() {
+            return Some(format!(
+                "{label}: host '{host}' is a private/loopback/link-local address and is blocked by default (empty fetch_allowlist); add it to fetch_allowlist to explicitly opt in"
+            ));
+        }
         return Some(format!(
-            "{label}: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it, or leave the allowlist empty to allow any host",
+            "{label}: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it",
             cfg.fetch_allowlist.len()
         ));
     }
@@ -204,8 +261,13 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
         );
     }
     if !host_allowed(&host, &cfg.fetch_allowlist) {
+        if cfg.fetch_allowlist.is_empty() {
+            return Outcome::err(format!(
+                "fetch: host '{host}' is a private/loopback/link-local address and is blocked by default (empty fetch_allowlist); add it to fetch_allowlist to explicitly opt in"
+            ));
+        }
         return Outcome::err(format!(
-            "fetch: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it, or leave the allowlist empty to allow any host",
+            "fetch: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it",
             cfg.fetch_allowlist.len()
         ));
     }
@@ -298,6 +360,10 @@ mod tests {
         );
         assert_eq!(parse_http_host("file:///etc/passwd"), None);
         assert_eq!(parse_http_host("not a url"), None);
+        assert_eq!(
+            parse_http_host("http://[::1]:8080/x"),
+            Some(("http".into(), "::1".into()))
+        );
     }
 
     #[test]
@@ -307,12 +373,44 @@ mod tests {
         assert!(!host_matches("evilrust-lang.org", "*.rust-lang.org"));
         assert!(host_matches("docs.rs", "docs.rs"));
         assert!(!host_matches("docs.rs", "crates.io"));
-        // empty allowlist = allow all
+        // empty allowlist = allow any public host (private ranges blocked)
         assert!(host_allowed("anything.example", &[]));
         let list = vec!["*.rust-lang.org".into(), "docs.rs".into()];
         assert!(host_allowed("doc.rust-lang.org", &list));
         assert!(host_allowed("docs.rs", &list));
         assert!(!host_allowed("evil.com", &list));
+    }
+
+    #[test]
+    fn private_ranges_blocked_by_default() {
+        // empty allowlist: private/loopback/link-local blocked; public allowed.
+        assert!(!host_allowed("169.254.169.254", &[])); // cloud-metadata
+        assert!(!host_allowed("127.0.0.1", &[])); // loopback
+        assert!(!host_allowed("127.255.255.255", &[])); // loopback edge
+        assert!(!host_allowed("10.0.0.5", &[])); // private 10/8
+        assert!(!host_allowed("192.168.1.1", &[])); // private 192.168/16
+        assert!(!host_allowed("172.16.0.1", &[])); // private 172.16/12 start
+        assert!(!host_allowed("172.31.255.255", &[])); // private 172.16/12 end
+        assert!(host_allowed("172.32.0.1", &[])); // just outside → public
+        assert!(host_allowed("8.8.8.8", &[])); // public
+        assert!(host_allowed("1.1.1.1", &[])); // public
+        assert!(host_allowed("example.com", &[])); // hostname → allowed (no DNS)
+                                                   // IPv6
+        assert!(!host_allowed("::1", &[])); // v6 loopback
+        assert!(!host_allowed("fe80::1", &[])); // v6 link-local
+        assert!(!host_allowed("fc00::1", &[])); // v6 unique-local
+        assert!(!host_allowed("fd00::1", &[])); // v6 unique-local
+        assert!(!host_allowed("::ffff:169.254.169.254", &[])); // v4-mapped metadata
+        assert!(host_allowed("2606:4700:4700::1111", &[])); // public v6
+    }
+
+    #[test]
+    fn explicit_allowlist_overrides_private_block() {
+        // operator explicitly allowlists a private host → allowed (opt-in wins).
+        let list = vec!["127.0.0.1".into(), "localhost".into()];
+        assert!(host_allowed("127.0.0.1", &list));
+        assert!(host_allowed("localhost", &list));
+        assert!(!host_allowed("169.254.169.254", &list)); // not listed → denied
     }
 
     #[test]
@@ -385,7 +483,8 @@ mod tests {
         );
         let (url, _h) = mock_http(html, "text/html; charset=utf-8").await;
         let cfg = crate::config::Config {
-            fetch_allowlist: Vec::new(),
+            // 127.0.0.1 is loopback → blocked by default; allowlist the mock host.
+            fetch_allowlist: vec!["127.0.0.1".into(), "localhost".into()],
             fetch_timeout_secs: 10,
             fetch_max_bytes: 1 << 20,
             ..crate::config::Config::default()

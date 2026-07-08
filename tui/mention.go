@@ -239,27 +239,49 @@ func dirCompletion(query string) []mentionItem {
 // prefix is microseconds. A short TTL keeps it fresh as files are added.
 var mentionCache = struct {
 	sync.Mutex
-	cwd  string
-	list []mentionItem
-	at   time.Time
+	cwd     string
+	list    []mentionItem
+	at      time.Time
+	walking bool // a background walk for `cwd` is in flight (prevents duplicate/clobbering walks)
 }{}
 
 const mentionCacheTTL = 2 * time.Second
 const mentionCacheCap = 10000
 
+// recursiveSearch returns files under the CWD whose path contains the prefix.
+// The expensive walk (up to 40k stat calls) runs in a BACKGROUND goroutine so
+// it never freezes the UI thread — evalMention reads the cached list and
+// returns an empty result while the first walk is in flight. The `walking` flag
+// guarantees only one walk per cwd at a time (no duplicate or clobbering fills).
 func recursiveSearch(prefix string) []mentionItem {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
 	mentionCache.Lock()
+	needWalk := false
 	if mentionCache.cwd != cwd || time.Since(mentionCache.at) > mentionCacheTTL {
-		mentionCache.list = walkMentionList(cwd)
-		mentionCache.cwd = cwd
-		mentionCache.at = time.Now()
+		// Stale or missing: kick a background walk unless one is already running
+		// for this cwd (a concurrent evalMention may have started it).
+		if !mentionCache.walking || mentionCache.cwd != cwd {
+			mentionCache.walking = true
+			mentionCache.cwd = cwd // claim this cwd so a concurrent call doesn't re-walk
+			needWalk = true
+		}
 	}
 	list := mentionCache.list
 	mentionCache.Unlock()
+
+	if needWalk {
+		go fillMentionCache(cwd)
+	}
+
+	// While the first walk is in flight the cache is empty — return nothing so
+	// the flyout stays open (the next keystroke re-evals against the filled
+	// cache). On a large repo the walk completes well within a few keystrokes.
+	if len(list) == 0 {
+		return nil
+	}
 
 	lp := strings.ToLower(prefix)
 	var items []mentionItem
@@ -273,6 +295,20 @@ func recursiveSearch(prefix string) []mentionItem {
 	}
 	sortMentionItems(items)
 	return items
+}
+
+// fillMentionCache walks the CWD once and stores the result. Runs in a goroutine
+// so it never blocks the UI thread; only commits if the cwd hasn't changed
+// under us (a cd race), and always clears the in-progress flag.
+func fillMentionCache(cwd string) {
+	walked := walkMentionList(cwd)
+	mentionCache.Lock()
+	defer mentionCache.Unlock()
+	if mentionCache.cwd == cwd {
+		mentionCache.list = walked
+		mentionCache.at = time.Now()
+	}
+	mentionCache.walking = false
 }
 
 // walkMentionList walks the CWD once, collecting non-ignored entries (capped at

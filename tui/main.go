@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +64,8 @@ type session struct {
 	coreAutoCompact     bool
 	ctxBreakdown        *contextBreakdown
 	coreRestarts        int
+	coreReady           bool            // true once the core emitted `ready` (disarms the startup watchdog)
+	coreStartGen        uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
 	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)
 	visionModel         string          // preferred handoff target ("" = pick dynamically)
 	pendingVisionPicker bool            // open the vision picker once the config arrives
@@ -192,7 +195,7 @@ func coreBinaryPath() string {
 	}
 	sfx := coreExeSuffix()
 	coreName := "catcode-core" + sfx // installed beside the TUI
-	devName := "core" + sfx        // cargo's bin name in the dev build
+	devName := "core" + sfx          // cargo's bin name in the dev build
 	candidates := []string{
 		"core/target/release/" + devName,
 		"../core/target/release/" + devName,
@@ -217,13 +220,24 @@ func coreBinaryPath() string {
 }
 
 // coreProcess holds the running core's *os.Process so a signal handler can
-// kill+wait it on SIGHUP/SIGTERM — otherwise closing the terminal (SIGHUP) or
-// `kill` (SIGTERM) kills the TUI but orphans catcode-core, which keeps running.
-// Set in startCore after cmd.Start(); best-effort only (read under a nil check
-// from the signal goroutine, so the benign pointer race is harmless).
-var coreProcess *os.Process
+// kill it on SIGHUP/SIGTERM — otherwise closing the terminal (SIGHUP) or `kill`
+// (SIGTERM) kills the TUI but orphans catcode-core, which keeps running.
+// Set in startCore after cmd.Start() (UI thread); read from the signal-handler
+// goroutine. An atomic.Pointer is used because the field is shared across
+// goroutines — a plain var would be a data race.
+var coreProcess atomic.Pointer[os.Process]
+
+// quitting is set by the signal handler / quit key before killing the core, so
+// the coreEOFMsg auto-restart path doesn't spawn a fresh core while the TUI is
+// tearing down (a killed core's stdout EOF would otherwise look like a crash).
+var quitting atomic.Bool
 
 func (s *session) startCore() tea.Cmd {
+	// Reset startup-tracking state and arm a fresh watchdog generation so a stale
+	// watchdog tick from a previous (crashed) core is ignored once `ready` lands.
+	s.coreReady = false
+	s.coreStartGen++
+	gen := s.coreStartGen
 	bin := coreBinaryPath()
 	approval := s.settings.Approval
 	if approval == "" {
@@ -272,7 +286,7 @@ func (s *session) startCore() tea.Cmd {
 		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to start core (%s): %s", bin, err)} }
 	}
 	s.coreCmd = cmd
-	coreProcess = cmd.Process // expose to the signal handler (M8): kill+wait on SIGHUP/SIGTERM
+	coreProcess.Store(cmd.Process) // expose to the signal handler (M8): kill on SIGHUP/SIGTERM
 	s.coreIn = in
 	s.coreEvents = make(chan *coreEvent, 256)
 	s.stdinCh = make(chan []byte, 256)
@@ -353,12 +367,34 @@ func (s *session) startCore() tea.Cmd {
 	}()
 
 	s.sendCore(map[string]any{"type": "init"})
-	return waitForEvent(s.coreEvents)
+	// Arm a startup watchdog: if the core starts but never emits `ready` within
+	// coreStartupTimeout (e.g. a bad UMANS_CORE path or a config that panics),
+	// surface a clear error instead of spinning "starting core…" forever. The
+	// tick carries the generation captured above so a tick from a previous
+	// (crashed+restarted) core is ignored once `ready` disarms it.
+	return tea.Batch(
+		waitForEvent(s.coreEvents),
+		tea.Tick(coreStartupTimeout, func(time.Time) tea.Msg { return readyTimeoutMsg{gen: gen} }),
+	)
 }
 
 // coreStartErrorMsg reports a core subprocess start failure (P1-14: logged on
 // the UI thread, not from the startCore goroutine).
 type coreStartErrorMsg struct{ err error }
+
+// coreStartupTimeout is how long startCore's watchdog waits for a `ready` event
+// before declaring the core failed to start.
+const coreStartupTimeout = 30 * time.Second
+
+// readyTimeoutMsg is delivered by the startup watchdog when the core has not
+// emitted `ready` within coreStartupTimeout. gen ties it to a specific start so
+// a tick from a previous (restarted) core is ignored.
+type readyTimeoutMsg struct{ gen uint64 }
+
+// sigtermMsg is sent by the SIGHUP/SIGTERM handler so Bubble Tea restores the
+// terminal (alt-screen / raw-mode) via its normal tea.Quit path instead of a
+// raw os.Exit that would leave the terminal broken.
+type sigtermMsg struct{}
 
 func waitForEvent(ch <-chan *coreEvent) tea.Cmd {
 	return func() tea.Msg {
@@ -433,7 +469,27 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.logError(msg.err.Error())
 		return s, nil
 
+	case readyTimeoutMsg:
+		// The startup watchdog fired. Ignore if `ready` already arrived or this
+		// tick belongs to a previous (restarted) core; otherwise the core never
+		// came up — surface a clear error instead of spinning forever.
+		if s.coreReady || msg.gen != s.coreStartGen {
+			return s, nil
+		}
+		s.logError("core did not start within 30s — check UMANS_CORE path / config (Ctrl+C to quit)")
+		return s, nil
+
+	case sigtermMsg:
+		// SIGHUP/SIGTERM: restore the terminal via the normal quit path (the
+		// signal goroutine already killed the core; the reader reaps it).
+		return s, tea.Quit
+
 	case coreEOFMsg:
+		// A signal-driven teardown (SIGHUP/SIGTERM) or the quit key killed the
+		// core; the reader then reports EOF. Don't auto-restart — we're quitting.
+		if quitting.Load() {
+			return s, tea.Quit
+		}
 		// Core crashed or exited unexpectedly. Auto-restart once so the user
 		// isn't stranded, and re-auth with the persisted key if we had one.
 		// P1-17: coreRestarts is reset to 0 after every successful turn (see the
@@ -529,25 +585,30 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	// Kill+wait the core child on SIGHUP (terminal closed) / SIGTERM (kill) so it
-	// isn't orphaned and left running after the TUI exits. Best-effort: a missing
-	// handle (core not yet started) just exits.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP)
-	go func() {
-		<-sigCh
-		if p := coreProcess; p != nil {
-			_ = p.Kill()
-			_, _ = p.Wait()
-		}
-		os.Exit(0)
-	}()
-
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
 	if loadSettings().MouseWheel {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
 	prog := tea.NewProgram(initialSession(), opts...)
+
+	// Kill the core child on SIGHUP (terminal closed) / SIGTERM (kill) so it
+	// isn't orphaned and left running after the TUI exits. Best-effort: a missing
+	// handle (core not yet started) just sends the quit msg. Instead of os.Exit
+	// we send a sigtermMsg so Bubble Tea restores the terminal (alt-screen /
+	// raw-mode) via its normal quit path — os.Exit would leave the terminal
+	// broken. `quitting` is set first so the core's stdout EOF (from the kill)
+	// doesn't trigger an auto-restart; the reader goroutine reaps the process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		<-sigCh
+		quitting.Store(true)
+		if p := coreProcess.Load(); p != nil {
+			_ = p.Kill()
+		}
+		prog.Send(sigtermMsg{})
+	}()
+
 	if _, err := prog.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

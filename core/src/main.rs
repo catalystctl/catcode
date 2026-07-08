@@ -126,10 +126,7 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
 /// declares one — mirroring how `build_system_prompt` stays cheap in the common
 /// case. Subagents do NOT get plugin injection (they use the built-in tool set
 /// only), matching the plugin-tools-are-main-agent-scoped design.
-fn build_main_system_prompt(
-    workspace: &std::path::Path,
-    pm: &plugins::PluginManager,
-) -> String {
+fn build_main_system_prompt(workspace: &std::path::Path, pm: &plugins::PluginManager) -> String {
     let mut prompt = build_system_prompt(workspace, true);
     let inj = pm.system_prompt_injection();
     if !inj.is_empty() {
@@ -1011,7 +1008,11 @@ fn peers_touching(peers: &[presence::PresenceRecord], tool_name: &str, args: &Va
     let target = path.replace('\\', "/");
     let hitting: Vec<_> = peers
         .iter()
-        .filter(|p| p.recent_files.iter().any(|f| f.replace('\\', "/") == target))
+        .filter(|p| {
+            p.recent_files
+                .iter()
+                .any(|f| f.replace('\\', "/") == target)
+        })
         .map(|p| format!("pid {}", p.pid))
         .collect();
     hitting.join(", ")
@@ -1346,9 +1347,8 @@ async fn main() {
                     .and_then(|n| n.to_str())
                     .map(String::from);
                 let model = st.last_model.lock().await.clone();
-                let rec = presence::PresenceRecord::from_work_state(
-                    &ws, pid, session_id, model, started,
-                );
+                let rec =
+                    presence::PresenceRecord::from_work_state(&ws, pid, session_id, model, started);
                 drop(ws);
                 presence::write_presence(&presence_ws, pid, &rec);
                 // Refresh the cached peer snapshot so the anomaly nudge stays
@@ -1775,12 +1775,13 @@ async fn main() {
                         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                 };
                 let as_bool = |v: &Value| {
-                    v.as_bool()
-                        .or_else(|| v.as_str().and_then(|s| match s {
+                    v.as_bool().or_else(|| {
+                        v.as_str().and_then(|s| match s {
                             "1" | "true" | "on" => Some(true),
                             "0" | "false" | "off" => Some(false),
                             _ => None,
-                        }))
+                        })
+                    })
                 };
                 let mut cfg = state.cfg.write().await;
                 let out_key = key.clone();
@@ -2876,7 +2877,10 @@ fn read_mentioned_file(
     max_bytes: u64,
 ) -> Option<(String, String)> {
     let trimmed = token.trim_end_matches(|c: char| {
-        matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
+        )
     });
     for cand in [token, trimmed] {
         if cand.is_empty() {
@@ -4115,8 +4119,7 @@ async fn run_turn(
                         "read_file" | "grep" | "glob" => "pre_read",
                         _ => "",
                     };
-                    let any_pre = (!hook_name.is_empty()
-                        && st.plugin_manager.has_hook(hook_name))
+                    let any_pre = (!hook_name.is_empty() && st.plugin_manager.has_hook(hook_name))
                         || st.plugin_manager.has_hook("pre_tool");
                     // exec_args starts as the original args and is amended in place
                     // by pre-hooks. Only clone when a hook will actually run, so
@@ -4125,14 +4128,26 @@ async fn run_turn(
                     let mut hook_notes: Vec<String> = Vec::new();
                     let mut denied: Option<String> = None;
                     if !hook_name.is_empty() {
-                        denied =
-                            run_pre_hooks(st, &cfg, hook_name, &name, &mut exec_args, &mut hook_notes)
-                                .await;
+                        denied = run_pre_hooks(
+                            st,
+                            &cfg,
+                            hook_name,
+                            &name,
+                            &mut exec_args,
+                            &mut hook_notes,
+                        )
+                        .await;
                     }
                     if denied.is_none() && name != "finish" {
-                        denied =
-                            run_pre_hooks(st, &cfg, "pre_tool", &name, &mut exec_args, &mut hook_notes)
-                                .await;
+                        denied = run_pre_hooks(
+                            st,
+                            &cfg,
+                            "pre_tool",
+                            &name,
+                            &mut exec_args,
+                            &mut hook_notes,
+                        )
+                        .await;
                     }
                     if let Some(msg) = denied {
                         emit(
@@ -4475,6 +4490,8 @@ async fn run_turn(
                         outcome.output.push_str("\n\n");
                         outcome.output.push_str(&note);
                     }
+                    // Debug log: records full tool args (file contents, commands) which may
+                    // include secrets the model handles. Opt-in (cfg.debug_log), user-owned.
                     st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
                     let mut ev = Event::new("tool_result")
                         .with("id", json!(id))
@@ -5288,7 +5305,8 @@ pub async fn compact_with_summary(
     }
     let to_summarize: Vec<Message> = messages[1..tail_start].to_vec();
     let kept: Vec<Message> = messages[tail_start..].to_vec();
-    let summary = provider::summarize(client, provider, model, &to_summarize, cancel, instructions).await;
+    let summary =
+        provider::summarize(client, provider, model, &to_summarize, cancel, instructions).await;
     let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
     if let Some(s) = summary {
@@ -5892,10 +5910,7 @@ mod work_state_tests {
             last_activity: String::new(),
             model: None,
         };
-        let peers = vec![
-            mk(111, &["core/src/main.rs"]),
-            mk(222, &["other.go"]),
-        ];
+        let peers = vec![mk(111, &["core/src/main.rs"]), mk(222, &["other.go"])];
         // exact match → the touching peer's pid
         assert_eq!(
             peers_touching(&peers, "edit", &json!({"path":"core/src/main.rs"})),
@@ -5903,22 +5918,18 @@ mod work_state_tests {
         );
         // separator-normalized (backslash) still matches
         assert_eq!(
-            peers_touching(
-                &peers,
-                "write_file",
-                &json!({"path":"core\\src\\main.rs"})
-            ),
+            peers_touching(&peers, "write_file", &json!({"path":"core\\src\\main.rs"})),
             "pid 111"
         );
         // a path nobody is touching → empty (no false positive)
-        assert_eq!(peers_touching(&peers, "read_file", &json!({"path":"foo.rs"})), "");
+        assert_eq!(
+            peers_touching(&peers, "read_file", &json!({"path":"foo.rs"})),
+            ""
+        );
         // a non-file tool (bash) → empty
         assert_eq!(peers_touching(&peers, "bash", &json!({"command":"ls"})), "");
         // multiple touching peers → comma-list
-        let peers2 = vec![
-            mk(111, &["shared.rs"]),
-            mk(333, &["shared.rs"]),
-        ];
+        let peers2 = vec![mk(111, &["shared.rs"]), mk(333, &["shared.rs"])];
         let s = peers_touching(&peers2, "edit", &json!({"path":"shared.rs"}));
         assert!(s.contains("pid 111") && s.contains("pid 333"));
     }
@@ -6246,8 +6257,7 @@ mod expand_mentions_tests {
         // file named `param` exists.
         let ws = fresh_workspace();
         std::fs::write(ws.join("param"), "x").unwrap();
-        let (out, attached) =
-            expand_file_mentions("see the@param tag", &ws, u64::MAX);
+        let (out, attached) = expand_file_mentions("see the@param tag", &ws, u64::MAX);
         assert!(attached.is_empty());
         assert_eq!(out, "see the@param tag");
     }

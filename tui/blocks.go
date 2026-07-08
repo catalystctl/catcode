@@ -222,9 +222,24 @@ func (s *session) allTodosComplete() bool {
 	return pend == 0 && run == 0 && done == len(s.todos)
 }
 
+// maxStoredOutput bounds the tool-result text retained in a block. A multi-MB
+// result (e.g. a huge file dump) is stored verbatim though only ~3 lines ever
+// render; this caps retention so one result can't pin megabytes of memory for
+// the session. The renderer already truncates the visible portion.
+const maxStoredOutput = 256 * 1024 // 256 KiB
+
+// capOutput truncates a stored tool-result string to maxStoredOutput bytes,
+// appending a marker when it cut content.
+func capOutput(s string) string {
+	if len(s) <= maxStoredOutput {
+		return s
+	}
+	return s[:maxStoredOutput] + "\n…[truncated]"
+}
+
 func (s *session) logToolResult(output string) {
 	b := s.push(blkToolResult)
-	b.output = output
+	b.output = capOutput(output)
 	s.refresh()
 }
 
@@ -689,11 +704,11 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 			out := contentText(msg["content"])
 			id := get(msg, "tool_call_id")
 			if b, ok := pending[id]; ok && id != "" {
-				b.output = out
+				b.output = capOutput(out)
 				delete(pending, id)
 			} else {
 				b := s.push(blkToolResult)
-				b.output = out
+				b.output = capOutput(out)
 			}
 		}
 	}

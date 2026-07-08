@@ -2513,7 +2513,10 @@ fn workspace_activity(_args: &Value, cfg: &Config) -> Outcome {
             ));
         }
         if !p.last_activity.is_empty() {
-            out.push_str(&format!("\n  last: {}", truncate(p.last_activity.as_str(), 140)));
+            out.push_str(&format!(
+                "\n  last: {}",
+                truncate(p.last_activity.as_str(), 140)
+            ));
         }
     }
     Outcome::ok(out)
@@ -3073,7 +3076,11 @@ mod tests {
             &json!({ "path": outside.to_str().unwrap() }),
             &cfg,
         );
-        assert!(o.ok, "absolute read must be allowed under Never: {}", o.output);
+        assert!(
+            o.ok,
+            "absolute read must be allowed under Never: {}",
+            o.output
+        );
         assert!(o.output.contains("leaked"), "{}", o.output);
         // `..` traversal: allowed under Never.
         let o = execute("read_file", &json!({ "path": format!("../{name}") }), &cfg);
@@ -3649,9 +3656,21 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("1 other active session"), "{}", o.output);
         assert!(o.output.contains("fix CI"), "goal missing: {}", o.output);
-        assert!(o.output.contains("core/src/main.rs"), "recent file missing: {}", o.output);
-        assert!(o.output.contains("green build"), "in-progress missing: {}", o.output);
-        assert!(o.output.contains(&format!("pid {peer_pid}")), "pid missing: {}", o.output);
+        assert!(
+            o.output.contains("core/src/main.rs"),
+            "recent file missing: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("green build"),
+            "in-progress missing: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains(&format!("pid {peer_pid}")),
+            "pid missing: {}",
+            o.output
+        );
 
         // Self (my_pid) must never appear even if our own presence file exists.
         let me = crate::presence::PresenceRecord::from_work_state(
@@ -3663,7 +3682,11 @@ mod tests {
         );
         crate::presence::write_presence(&cfg.workspace, my_pid, &me);
         let o = execute("workspace_activity", &json!({}), &cfg);
-        assert!(!o.output.contains(&format!("pid {my_pid}\n")), "self leaked: {}", o.output);
+        assert!(
+            !o.output.contains(&format!("pid {my_pid}\n")),
+            "self leaked: {}",
+            o.output
+        );
 
         crate::presence::clear_presence(&cfg.workspace, peer_pid);
         crate::presence::clear_presence(&cfg.workspace, my_pid);
