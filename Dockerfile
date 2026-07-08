@@ -11,7 +11,11 @@ FROM rust:1.82-slim AS core-builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY core/ ./core/
-RUN cd core && cargo build --release
+# --locked: use the committed Cargo.lock (matches the CI `cargo test --locked` job).
+# CARGO_NET_RETRY: the image has no cargo registry cache (unlike the CI runner's
+# Swatinem/rust-cache), so crates are fetched fresh — retry transient blips that
+# otherwise surface as "failed to parse manifest at .../time-core-0.1.9/Cargo.toml".
+RUN cd core && CARGO_NET_RETRY=10 cargo build --release --locked
 
 # 1.24: tui/go.mod requires go 1.24.2 (hard min since Go 1.21); 1.23 silently
 # pulled 1.24 via GOTOOLCHAIN (P0-6). Dockerfile FROM lines cannot carry an
