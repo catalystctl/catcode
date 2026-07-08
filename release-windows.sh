@@ -54,13 +54,22 @@ CORE_ART="dist/catcode-core-${VERSION}-windows-x86_64.exe"
 cp "$CORE_EXE" "$CORE_ART"
 echo "    -> ${CORE_ART}  ($(du -h "$CORE_ART" | cut -f1))"
 
-echo "[4/5] staging + building MSI (wixl)..."
+echo "[4/5] staging + (optional) MSI (wixl)..."
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp "$CORE_EXE"            "$STAGE/catcode-core.exe"
 cp tui/catcode.exe           "$STAGE/catcode.exe"
 cp packaging/windows/catcode.wxs "$STAGE/catcode.wxs"
-( cd "$STAGE" && wixl -D Version="$VERSION" catcode.wxs -o "catcode-${VERSION}-windows.msi" )
-mv "$STAGE/catcode-${VERSION}-windows.msi" "$MSI"
+# The MSI is an OPTIONAL no-install convenience installer — the installer only
+# downloads the standalone .exe + catcode-core.exe (already built in steps 2-3).
+# Skip the MSI if wixl (msitools) is unavailable, instead of failing the release.
+if command -v wixl >/dev/null 2>&1; then
+	( cd "$STAGE" && wixl -D Version="$VERSION" catcode.wxs -o "catcode-${VERSION}-windows.msi" ) \
+		&& mv "$STAGE/catcode-${VERSION}-windows.msi" "$MSI" \
+		|| { echo "warning: wixl failed — skipping MSI" >&2; MSI=""; }
+else
+	echo "warning: wixl not found — skipping MSI (apt install msitools to produce it)" >&2
+	MSI=""
+fi
 rm -f tui/catcode.exe
 
 echo "[5/5] zip fallback + checksums..."
@@ -72,13 +81,15 @@ ZIP="dist/catcode-${VERSION}-windows.zip"
 		|| echo "warning: zip unavailable; skipping fallback archive" )
 rm -rf "$STAGE"
 ( cd dist
-  sha256sum "$(basename "$MSI")"        > "$(basename "$MSI")".sha256
+  [[ -n "$MSI" ]] && sha256sum "$(basename "$MSI")" > "$(basename "$MSI")".sha256 || true
   sha256sum "$(basename "$STANDALONE")" > "$(basename "$STANDALONE")".sha256
   sha256sum "$(basename "$CORE_ART")"    > "$(basename "$CORE_ART")".sha256
   sha256sum "$(basename "$ZIP")"        > "$(basename "$ZIP")".sha256 2>/dev/null || true )
 
-echo "==> ${MSI}            (installer; ($(du -h "$MSI" | cut -f1)))"
-echo "==> ${MSI}.sha256"
+if [[ -n "$MSI" ]]; then
+	echo "==> ${MSI}            (installer; ($(du -h "$MSI" | cut -f1)))"
+	echo "==> ${MSI}.sha256"
+fi
 echo "==> ${STANDALONE}      (standalone; ($(du -h "$STANDALONE" | cut -f1)))"
 echo "==> ${STANDALONE}.sha256"
 echo "==> ${CORE_ART}  (core binary; web service CATCODE_CORE)"

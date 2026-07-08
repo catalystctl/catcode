@@ -93,46 +93,56 @@ resolve_appimagetool() {
 	# 3) cached fetch
 	local cache="$HOME/.cache/appimagetool/appimagetool-${APPIMG_ARCH}.AppImage"
 	if [[ -x "$cache" ]]; then echo "$cache"; return; fi
-	# 4) download once (needs network)
-	echo "    downloading appimagetool (${APPIMG_ARCH})..."
+	# 4) download once (needs network). Progress + warnings go to STDERR so the
+	# captured stdout is ONLY the resolved path — otherwise $TOOL gets polluted
+	# with the "downloading..." line and the exec fails ("No such file").
+	echo "    downloading appimagetool (${APPIMG_ARCH})..." >&2
 	mkdir -p "$(dirname "$cache")"
 	local url="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${APPIMG_ARCH}.AppImage"
 	if ! curl -fsSL -o "$cache" "$url"; then
-		echo "error: failed to download appimagetool from $url" >&2
-		echo "       set APPIMAGETOOL=<path> to point at a local copy, or install appimagetool." >&2
-		exit 1
+		echo "warning: failed to download appimagetool from $url — skipping AppImage" >&2
+		return 1
 	fi
 	chmod +x "$cache"
 	echo "$cache"
 }
-TOOL="$(resolve_appimagetool)"
+TOOL="$(resolve_appimagetool || true)"
 # appimagetool is itself an AppImage; in headless/CI containers without FUSE
 # (libfuse.so.2) it refuses to mount, so run it with APPIMAGE_EXTRACT_AND_RUN=1,
 # which extracts to a temp dir and execs the payload — no FUSE required.
-if ! APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$APPIMG" >/dev/null 2>&1; then
-	# retry, surfacing stderr so a real failure isn't hidden behind the >/dev/null
-	echo "    (retry with output)" >&2
-	APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$APPIMG"
+# The AppImage is an OPTIONAL no-install convenience — the installer only needs
+# the standalone + core (already built). If appimagetool is unavailable or its
+# build fails, skip the AppImage rather than failing the whole release.
+APPIMG=""
+_imglog="$(mktemp)"
+if [[ -n "$TOOL" && -x "$TOOL" ]] && APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$APPIMG" >"$_imglog" 2>&1; then
+	chmod +x "$APPIMG"
+	echo "    -> ${APPIMG}  ($(du -h "$APPIMG" | cut -f1))"
+else
+	echo "    warning: appimagetool unavailable or AppImage build failed — skipping" >&2
+	[[ -s "$_imglog" ]] && { echo "    --- appimagetool output: ---" >&2; sed 's/^/      /' "$_imglog" >&2; }
+	APPIMG=""
 fi
-chmod +x "$APPIMG"
+rm -f "$_imglog"
 rm -rf "$(dirname "$APPDIR")"
-echo "    -> ${APPIMG}  ($(du -h "$APPIMG" | cut -f1))"
 
 echo "[6/6] checksums..."
 ( cd dist
   sha256sum "$(basename "$STANDALONE")" > "$(basename "$STANDALONE")".sha256
   sha256sum "$(basename "$CORE_ART")"    > "$(basename "$CORE_ART")".sha256
-  sha256sum "$(basename "$APPIMG")"     > "$(basename "$APPIMG")".sha256 )
+  [[ -n "$APPIMG" ]] && sha256sum "$(basename "$APPIMG")" > "$(basename "$APPIMG")".sha256 || true )
 
 echo "==> ${STANDALONE}        (standalone; run from any dir)"
 echo "==> ${STANDALONE}.sha256"
 echo "==> ${CORE_ART}   (core binary; for the web service CATCODE_CORE)"
 echo "==> ${CORE_ART}.sha256"
-echo "==> ${APPIMG}            (AppImage; run from a terminal)"
-echo "==> ${APPIMG}.sha256"
-echo
-echo "Run the AppImage:"
-echo "  chmod +x ${APPIMG##*/}  &&  ./${APPIMG##*/}      # launches the TUI in this CWD"
+if [[ -n "$APPIMG" ]]; then
+	echo "==> ${APPIMG}            (AppImage; run from a terminal)"
+	echo "==> ${APPIMG}.sha256"
+	echo
+	echo "Run the AppImage:"
+	echo "  chmod +x ${APPIMG##*/}  &&  ./${APPIMG##*/}      # launches the TUI in this CWD"
+fi
 echo "Run the standalone:"
 echo "  chmod +x ${STANDALONE##*/}  &&  ./${STANDALONE##*/}"
 echo "First run inside either:  /key sk-...   then /model, then type a prompt."
