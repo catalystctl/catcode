@@ -17,6 +17,7 @@ mod message;
 mod oauth;
 mod pattern_log;
 mod plugins;
+mod presence;
 mod protocol;
 mod provider;
 mod search_tool;
@@ -372,6 +373,14 @@ pub struct State {
     /// set when `/login` picks the manual flow (SSH/headless) and consumed by
     /// the `oauth_code` command when the user pastes the code.
     pub pending_oauth: Mutex<Option<oauth::PendingOauth>>,
+    /// Cached live peer sessions in this workspace, refreshed every heartbeat
+    /// (~8s) by the presence task. Kept in-memory so the anomaly nudge in
+    /// `run_turn` can check for concurrent activity WITHOUT a filesystem read
+    /// on every tool result (the hot path). Empty when alone. See `presence`.
+    pub peers: Mutex<Vec<presence::PresenceRecord>>,
+    /// Last time the concurrency anomaly note was emitted, for per-session
+    /// rate-limiting so a pathological tool-call loop can't nag every result.
+    pub last_concurrency_note: Mutex<Option<std::time::Instant>>,
 }
 
 /// Shared tail of `login_oauth` (web flow) and `oauth_code` (manual flow):
@@ -928,6 +937,86 @@ async fn record_file_touch(st: &State, tool: &str, args: &Value) {
     emit_work_state(st).await;
 }
 
+/// Cooldown between concurrency-anomaly notes (seconds). Prevents nagging in a
+/// tight tool-call loop; one nudge per minute is enough to change behavior from
+/// "fix the phantom error" to "check the neighbors".
+const CONCURRENCY_NOTE_COOLDOWN: u64 = 60;
+
+/// If another session is active in this workspace AND something looks off (a
+/// tool failed, or we're touching a file a peer recently touched), surface a
+/// short note appended to the tool result — so the agent doesn't assume every
+/// error is its own fault and "fix" a neighbor's in-flight work. Uses the cached
+/// peer snapshot (refreshed by the heartbeat) so the hot path does NO filesystem
+/// read. Rate-limited per session to avoid nagging.
+async fn maybe_concurrency_note(
+    st: &State,
+    tool_name: &str,
+    args: &Value,
+    outcome_ok: bool,
+) -> Option<String> {
+    // Cooldown: at most one note per window. Checked first (before cloning the
+    // peer snapshot) so a tight loop short-circuits cheaply after the first nudge.
+    {
+        let last = st.last_concurrency_note.lock().await;
+        if let Some(t) = *last {
+            if t.elapsed() < std::time::Duration::from_secs(CONCURRENCY_NOTE_COOLDOWN) {
+                return None;
+            }
+        }
+    }
+    let peers = st.peers.lock().await.clone();
+    if peers.is_empty() {
+        return None; // alone — nothing to surface; don't arm the cooldown
+    }
+    let touching = peers_touching(&peers, tool_name, args);
+    // (a) a tool failed — could be a neighbor leaving the tree inconsistent.
+    if !outcome_ok {
+        *st.last_concurrency_note.lock().await = Some(std::time::Instant::now());
+        let mut s = format!(
+            "⚠ {} other agent session(s) are active in this workspace. This error may \
+             not be from your changes — another session may have left the tree in an \
+             inconsistent state. Consider `workspace_activity` to inspect before \
+             'fixing' it.",
+            peers.len()
+        );
+        if !touching.is_empty() {
+            s.push_str(&format!(" Active sessions recently touched: {touching}."));
+        }
+        return Some(s);
+    }
+    // (b) a file tool touching a path a peer recently touched (a real conflict).
+    if !touching.is_empty() {
+        *st.last_concurrency_note.lock().await = Some(std::time::Instant::now());
+        return Some(format!(
+            "ℹ Another agent session in this workspace recently touched: {touching}. \
+             You may be reading/editing in-flight work — consider `workspace_activity` \
+             to coordinate."
+        ));
+    }
+    None
+}
+
+/// Return a comma-list of "pid N" for peers whose recent_files contain the
+/// current tool's target path. Exact separator-normalized match — precise to
+/// avoid false-positive nagging; a miss just means no warning (safe).
+fn peers_touching(peers: &[presence::PresenceRecord], tool_name: &str, args: &Value) -> String {
+    let path = match tool_name {
+        "read_file" | "edit" | "write_file" | "patch" | "bulk_read" | "bulk_write"
+        | "bulk_edit" => args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+        _ => "",
+    };
+    if path.is_empty() {
+        return String::new();
+    }
+    let target = path.replace('\\', "/");
+    let hitting: Vec<_> = peers
+        .iter()
+        .filter(|p| p.recent_files.iter().any(|f| f.replace('\\', "/") == target))
+        .map(|p| format!("pid {}", p.pid))
+        .collect();
+    hitting.join(", ")
+}
+
 /// Build the transient work-state system message, or `None` when disabled or
 /// when there is no state to show yet. The caller pushes it as the LAST message
 /// before the model request and pops it right after, so it never reaches the
@@ -1127,6 +1216,8 @@ async fn main() {
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
         pending_oauth: Mutex::new(None),
+        peers: Mutex::new(Vec::new()),
+        last_concurrency_note: Mutex::new(None),
     });
 
     // Apply disabled plugin list from config.
@@ -1202,6 +1293,67 @@ async fn main() {
                     }
                 }
                 tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    // Cross-session presence: publish this session's rolling work-state so other
+    // processes in the SAME workspace can detect concurrent activity (and stop
+    // "fixing" phantom errors caused by a neighbor's in-flight edits). Per-pid
+    // JSON file under ~/.config/catalyst-code/presence/<hash(cwd)>/, rewritten
+    // every few seconds; stale records reaped by readers. Awareness only — no
+    // coordination/locking. The `workspace_activity` tool + the anomaly nudge
+    // in `run_turn` consume this; the cached peer snapshot avoids a filesystem
+    // read on every tool result.
+    {
+        let st = state.clone();
+        let pid = std::process::id();
+        let started = presence::unix_now();
+        let presence_ws = {
+            let cfg = state.cfg.read().await;
+            cfg.workspace.clone()
+        };
+        // Publish immediately so a peer checking right after we start sees us.
+        {
+            let ws = st.work_state.lock().await;
+            let session_id = st
+                .cfg
+                .read()
+                .await
+                .session_file
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(String::from);
+            let model = st.last_model.lock().await.clone();
+            let rec =
+                presence::PresenceRecord::from_work_state(&ws, pid, session_id, model, started);
+            drop(ws);
+            presence::write_presence(&presence_ws, pid, &rec);
+        }
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(8);
+            loop {
+                tokio::time::sleep(interval).await;
+                let ws = st.work_state.lock().await;
+                let session_id = st
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(String::from);
+                let model = st.last_model.lock().await.clone();
+                let rec = presence::PresenceRecord::from_work_state(
+                    &ws, pid, session_id, model, started,
+                );
+                drop(ws);
+                presence::write_presence(&presence_ws, pid, &rec);
+                // Refresh the cached peer snapshot so the anomaly nudge stays
+                // current without a filesystem read on the hot path.
+                *st.peers.lock().await = presence::read_peers(&presence_ws, pid);
             }
         });
     }
@@ -2468,6 +2620,14 @@ async fn main() {
     let h = state.handle.lock().await.take();
     if let Some(h) = h {
         let _ = h.await;
+    }
+    // Clean up our presence record so peers don't see a stale session. Best
+    // effort — a kill -9 / crash leaves a stale file that `read_peers` reaps
+    // by mtime, so this is an optimization (instant disappearance), not a
+    // correctness requirement.
+    {
+        let ws = state.cfg.read().await.workspace.clone();
+        presence::clear_presence(&ws, std::process::id());
     }
 }
 
@@ -4304,6 +4464,17 @@ async fn run_turn(
                         outcome.output.push_str("\n\nPlugin hooks:\n- ");
                         outcome.output.push_str(&hook_notes.join("\n- "));
                     }
+                    // Cross-session anomaly nudge: if another session is
+                    // active in this workspace and this tool failed (or touched
+                    // a file a peer is editing), append a note so the agent
+                    // checks the neighbors before assuming it caused the error.
+                    // Uses the cached peer snapshot — no filesystem read here.
+                    if let Some(note) =
+                        maybe_concurrency_note(st, &name, &exec_args, outcome.ok).await
+                    {
+                        outcome.output.push_str("\n\n");
+                        outcome.output.push_str(&note);
+                    }
                     st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
                     let mut ev = Event::new("tool_result")
                         .with("id", json!(id))
@@ -5705,6 +5876,51 @@ mod work_state_tests {
         assert_eq!(ws.recent_files.len(), 8);
         // Most-recent (f11) is at the front.
         assert_eq!(ws.recent_files[0], "f11.rs");
+    }
+
+    #[test]
+    fn peers_touching_matches_exact_normalized_path() {
+        let mk = |pid: u32, files: &[&str]| presence::PresenceRecord {
+            pid,
+            session_id: None,
+            started_at: 0,
+            last_heartbeat: 0,
+            goal: String::new(),
+            in_progress: vec![],
+            next: vec![],
+            recent_files: files.iter().map(|s| s.to_string()).collect(),
+            last_activity: String::new(),
+            model: None,
+        };
+        let peers = vec![
+            mk(111, &["core/src/main.rs"]),
+            mk(222, &["other.go"]),
+        ];
+        // exact match → the touching peer's pid
+        assert_eq!(
+            peers_touching(&peers, "edit", &json!({"path":"core/src/main.rs"})),
+            "pid 111"
+        );
+        // separator-normalized (backslash) still matches
+        assert_eq!(
+            peers_touching(
+                &peers,
+                "write_file",
+                &json!({"path":"core\\src\\main.rs"})
+            ),
+            "pid 111"
+        );
+        // a path nobody is touching → empty (no false positive)
+        assert_eq!(peers_touching(&peers, "read_file", &json!({"path":"foo.rs"})), "");
+        // a non-file tool (bash) → empty
+        assert_eq!(peers_touching(&peers, "bash", &json!({"command":"ls"})), "");
+        // multiple touching peers → comma-list
+        let peers2 = vec![
+            mk(111, &["shared.rs"]),
+            mk(333, &["shared.rs"]),
+        ];
+        let s = peers_touching(&peers2, "edit", &json!({"path":"shared.rs"}));
+        assert!(s.contains("pid 111") && s.contains("pid 333"));
     }
 }
 

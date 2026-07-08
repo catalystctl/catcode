@@ -23,6 +23,7 @@ pub fn classify(name: &str) -> ToolKind {
         | "memory" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
+        "workspace_activity" => ToolKind::ReadOnly,
         _ => ToolKind::Destructive,
     }
 }
@@ -468,6 +469,17 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "workspace_activity",
+                "description": "List OTHER active catalyst-code agent sessions running in THIS workspace (separate processes), with each one's goal, what it's working on, and the files it recently touched. Use this when something seems off (a build failing for reasons you didn't cause, a file that changed unexpectedly, a test suddenly breaking) to check whether another session is the cause before assuming you introduced the error. Read-only — awareness only, no coordination. Returns the live peers (stale/crashed sessions are auto-pruned).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git_add",
                 "description": "Stage files for commit (`git add -- <paths>`). Paths must be workspace-relative; absolute paths and `..` escapes are rejected. Destructive (modifies the index).",
                 "parameters": {
@@ -615,6 +627,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_status" => git_status(args, cfg),
         "git_diff" => git_diff(args, cfg),
         "git_log" => git_log(args, cfg),
+        "workspace_activity" => workspace_activity(args, cfg),
         "git_add" => git_add(args, cfg),
         "git_commit" => git_commit(args, cfg),
         "memory" => memory_tool(args, cfg),
@@ -2452,6 +2465,89 @@ fn git_log(args: &Value, cfg: &Config) -> Outcome {
     }
 }
 
+/// List OTHER active catalyst-code sessions in this workspace (separate
+/// processes), each with its goal, in-progress work, and recently touched
+/// files. Awareness only — read-only broadcast of "who is here". Use when
+/// something seems off to decide whether a neighbor caused it before assuming
+/// you introduced the error. Stale/crashed sessions are auto-pruned by mtime.
+fn workspace_activity(_args: &Value, cfg: &Config) -> Outcome {
+    let my_pid = std::process::id();
+    let peers = crate::presence::read_peers(&cfg.workspace, my_pid);
+    if peers.is_empty() {
+        return Outcome::ok(
+            "No other active catalyst-code sessions in this workspace. Any error \
+             you are seeing is from your own work or the environment.",
+        );
+    }
+    let now = crate::presence::unix_now();
+    let mut out = format!(
+        "{} other active session(s) in this workspace:\n",
+        peers.len()
+    );
+    for p in &peers {
+        out.push_str(&format!(
+            "\n- pid {} (started {}, last active {})",
+            p.pid,
+            age(now, p.started_at),
+            age(now, p.last_heartbeat)
+        ));
+        if let Some(sid) = &p.session_id {
+            out.push_str(&format!(", session {sid}"));
+        }
+        if let Some(m) = &p.model {
+            out.push_str(&format!(", model {m}"));
+        }
+        if !p.goal.is_empty() {
+            out.push_str(&format!("\n  goal: {}", truncate(p.goal.as_str(), 140)));
+        }
+        if !p.in_progress.is_empty() {
+            out.push_str(&format!("\n  in progress: {}", p.in_progress.join("; ")));
+        }
+        if !p.next.is_empty() {
+            out.push_str(&format!("\n  next: {}", p.next.join("; ")));
+        }
+        if !p.recent_files.is_empty() {
+            out.push_str(&format!(
+                "\n  recently touched: {}",
+                p.recent_files.join(", ")
+            ));
+        }
+        if !p.last_activity.is_empty() {
+            out.push_str(&format!("\n  last: {}", truncate(p.last_activity.as_str(), 140)));
+        }
+    }
+    Outcome::ok(out)
+}
+
+/// Render a unix-seconds delta as a compact human age ("3m", "2h", "just now").
+fn age(now: u64, then: u64) -> String {
+    let s = now.saturating_sub(then);
+    if s < 5 {
+        "just now".to_string()
+    } else if s < 60 {
+        format!("{}s ago", s)
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
+}
+
+/// Truncate `s` to at most `n` chars, appending an ellipsis if cut. A small
+/// local copy of main.rs's `truncate_str` (kept private there) so this module
+/// stays self-contained.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
 fn git_add(args: &Value, cfg: &Config) -> Outcome {
     let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
         return Outcome::err("git_add requires a 'paths' array");
@@ -3521,5 +3617,55 @@ mod tests {
             .ok
         );
         assert!(!execute("memory", &json!({ "action": "append", "name": "x" }), &cfg).ok);
+    }
+
+    #[test]
+    fn workspace_activity_lists_peers() {
+        let (_root, cfg) = tmp_ws();
+        let my_pid = std::process::id();
+
+        // No peers → reassuring "you're alone" message.
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("No other active"), "{}", o.output);
+
+        // Seed a fake peer (a different pid) in this workspace's presence dir.
+        let peer_pid = my_pid.wrapping_add(1);
+        let peer = crate::presence::PresenceRecord::from_work_state(
+            &crate::WorkState {
+                goal: "fix CI".into(),
+                recent_files: vec!["core/src/main.rs".into()],
+                in_progress: vec!["green build".into()],
+                ..Default::default()
+            },
+            peer_pid,
+            Some("peer.json".into()),
+            None,
+            crate::presence::unix_now(),
+        );
+        crate::presence::write_presence(&cfg.workspace, peer_pid, &peer);
+
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("1 other active session"), "{}", o.output);
+        assert!(o.output.contains("fix CI"), "goal missing: {}", o.output);
+        assert!(o.output.contains("core/src/main.rs"), "recent file missing: {}", o.output);
+        assert!(o.output.contains("green build"), "in-progress missing: {}", o.output);
+        assert!(o.output.contains(&format!("pid {peer_pid}")), "pid missing: {}", o.output);
+
+        // Self (my_pid) must never appear even if our own presence file exists.
+        let me = crate::presence::PresenceRecord::from_work_state(
+            &crate::WorkState::default(),
+            my_pid,
+            None,
+            None,
+            crate::presence::unix_now(),
+        );
+        crate::presence::write_presence(&cfg.workspace, my_pid, &me);
+        let o = execute("workspace_activity", &json!({}), &cfg);
+        assert!(!o.output.contains(&format!("pid {my_pid}\n")), "self leaked: {}", o.output);
+
+        crate::presence::clear_presence(&cfg.workspace, peer_pid);
+        crate::presence::clear_presence(&cfg.workspace, my_pid);
     }
 }

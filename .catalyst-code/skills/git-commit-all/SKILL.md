@@ -21,16 +21,18 @@ Do NOT use for:
 ## Steps
 
 1. **Show what will be committed**: `git status --short` and `git diff --stat` so the user can confirm.
-2. **Stage everything**: `git add --all` (stages modified, new, and deleted files).
-3. **Build a commit message** from the diff summary:
-   - Read the file list from `git diff --cached --stat`
+2. **Verify it compiles** (don't land broken code): run the project's type checker / build for each *changed* component before committing — e.g. `cd core && cargo check` (main binary; avoid `cargo check --tests` if a pre-existing test-binary breakage unrelated to your change is known), `cd tui && go build ./... && go vet ./...`, `cd web && npx tsc --noEmit`. Run the changed ones in parallel; only block the commit on errors in files YOU touched (isolate concurrent-user edits — see the concurrent-user-edits-isolate-errors gotcha). Skip components you didn't touch.
+3. **Stage everything**: `git add --all` (stages modified, new, and deleted files).
+4. **Build a commit message** from the diff:
+   - For a SMALL change, `git diff --cached --stat` (file list + churn) is enough.
+   - For a LARGE or multi-feature diff (hundreds of lines, many files), read the FULL `git diff` (not just `--stat`) — `--stat` won't reveal the distinct features interleaved across shared files like `main.rs`; the actual hunks let you enumerate each feature accurately in the body.
    - Group by directory/module (e.g. "core: …", "tui: …", "web: …")
    - Include the primary change type (e.g. "refactor", "fix", "add feature X")
    - If a single logical change spans files, use one sentence; if multiple, use bullet points
    - Keep the subject line ≤72 chars; body wraps at 72
-4. **Commit**: `git commit -m "<message>"`
-5. **Show the commit**: `git log -1 --oneline`
-6. **Push (only if the user asked to push)**:
+5. **Commit**: `git commit -m "<message>"`
+6. **Show the commit**: `git log -1 --oneline`
+7. **Push (only if the user asked to push)**:
    - Current branch: `git rev-parse --abbrev-ref HEAD` (if it prints `HEAD`, you're in detached HEAD — abort and tell the user to checkout a branch first).
    - If the branch has an upstream (`git rev-parse --abbrev-ref @{u}` succeeds): `git push`.
    - If it has NO upstream: `git push -u origin <branch>` (sets upstream on first push).
