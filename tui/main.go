@@ -56,6 +56,7 @@ type session struct {
 	pendingIntercom     *intercomPrompt
 	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
 	pendingAsk          *askPrompt
+	updateInfo          *updateInfo // non-nil when a newer release is available (drives the top banner)
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
 	sessionList         []sessionEntry
@@ -469,6 +470,13 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.logError(msg.err.Error())
 		return s, nil
 
+	case updateAvailableMsg:
+		// A newer GitHub release was found by the launch-time check. Store it so
+		// renderUpdateBanner shows a one-line notice; re-layout to claim the line.
+		s.updateInfo = &msg.info
+		s.layout()
+		return s, nil
+
 	case readyTimeoutMsg:
 		// The startup watchdog fired. Ignore if `ready` already arrived or this
 		// tick belongs to a previous (restarted) core; otherwise the core never
@@ -585,11 +593,23 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// CLI flags (--update / --check-update / --version / --help) are handled
+	// before the TUI starts so they run in a plain terminal (no alt-screen) and
+	// can exit cleanly.
+	if code, handled := handleCLIArgs(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
 	if loadSettings().MouseWheel {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
 	prog := tea.NewProgram(initialSession(), opts...)
+
+	// Background, non-blocking check for a newer release. On a fresh cache it
+	// answers instantly (no network); otherwise it fetches asynchronously and
+	// sends updateAvailableMsg when one is found. Silent on any failure.
+	launchUpdateCheck(prog)
 
 	// Kill the core child on SIGHUP (terminal closed) / SIGTERM (kill) so it
 	// isn't orphaned and left running after the TUI exits. Best-effort: a missing

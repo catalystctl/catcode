@@ -39,6 +39,9 @@ func (s *session) layout() {
 		return
 	}
 	extra := s.activeTasksHeight()
+	if s.updateInfo != nil {
+		extra++
+	}
 	if s.pendingApproval != nil {
 		extra += s.approvalHeight()
 	}
@@ -828,9 +831,11 @@ func (s *session) View() string {
 	parts := []string{
 		s.renderHeader(),
 		s.renderSeparator(),
-		s.viewport.View(),
-		s.renderPositionBar(),
 	}
+	if b := s.renderUpdateBanner(); b != "" {
+		parts = append(parts, b)
+	}
+	parts = append(parts, s.viewport.View(), s.renderPositionBar())
 	if p := s.renderTodoPanel(); p != "" {
 		parts = append(parts, p)
 	}
