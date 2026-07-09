@@ -2,6 +2,8 @@
 // Each plugin is a subdirectory with a plugin.json manifest and hook scripts.
 // Hooks are spawned as subprocesses with stdin JSON context, stdout JSON response.
 // Broken hooks never crash the core; timeouts and parse failures are handled gracefully.
+use crate::config::{ProviderConfig, ProviderKind, ResolvedProvider};
+use crate::oauth::{LoginOutcome, OAuthPrompt, PendingOauth};
 use crate::tools::{Outcome, ToolKind};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -321,6 +323,125 @@ of the core handler — and the plugin controls the description/schema. The tool
 `kind` (approval gate) is the plugin's. The specific `pre_bash`/`post_bash`
 hooks still fire (keyed on the tool name), and `pre_tool`/`post_tool` fire too.
 
+### Declaring an OAuth provider (subscription auth)
+
+A plugin can add a subscription-OAuth provider — the same mechanism the
+built-in OpenAI (ChatGPT), Google (Gemini), and Anthropic (Claude) providers
+use, but for any vendor — with no recompile. The plugin supplies ONE script
+that handles four actions (`login`, `complete`, `token`, `clear`); the
+harness owns the loopback redirect server (web flow) and the `/oauth-code`
+paste path (manual/device flow), exactly like the built-in flows.
+
+Add an `oauth` block to `plugin.json`:
+
+```json
+{
+  "name": "grok-oauth",
+  "version": "0.1.0",
+  "oauth": {
+    "provider_id": "grok",
+    "label": "Grok (xAI)",
+    "kind": "openai",
+    "base_url": "https://api.x.ai/v1",
+    "description": "Grok via xAI device-code OAuth.",
+    "headers": [["X-Source", "catalyst-code"]],
+    "token_path": "grok.json",
+    "script": "oauth/oauth.sh",
+    "login_timeout_ms": 180000,
+    "token_timeout_ms": 30000
+  }
+}
+```
+
+Fields:
+- `provider_id` (required): the provider identity. The harness creates the
+  provider config with this `name` on a successful `/login`, and `/oauth-code`
+  + `/logout` dispatch on it.
+- `label` (optional): shown in the `/login` picker (defaults to provider_id).
+- `kind` (optional, default `"openai"`): `"openai"` (OpenAI-compatible
+  `/chat/completions`) or `"anthropic"` (`/v1/messages`). Decides the wire
+  protocol + auth header.
+- `base_url` (required): the endpoint, including `/v1`. Paths are appended
+  directly.
+- `description` (optional): shown in the picker.
+- `headers` (optional): extra HTTP headers on every request, `[[key,val],…]`.
+  These are persisted into the provider config.
+- `token_path` (optional, default `<provider_id>.json`): the token-file name,
+  relative to `~/.config/catalyst-code/oauth/`. The plugin owns the token's
+  on-disk format; the harness only checks existence (for the "logged in"
+  status) and passes the absolute path to the script.
+- `script` (required unless every action has an explicit override): the script
+  handling ALL actions, dispatched by the `action` field in stdin.
+- `login_script` / `complete_script` / `token_script` (optional): per-action
+  overrides. When absent, the action falls back to `script`.
+- `login_timeout_ms` (optional, default 120000): timeout for `login` +
+  `complete`.
+- `token_timeout_ms` (optional, default 30000): timeout for `token` + `clear`.
+
+#### Script action contract
+
+Every invocation receives ONE JSON object on stdin (with `action` + the base
+context) and MUST write ONE JSON object to stdout. The base context always
+includes `action`, `provider_id`, `token_path` (absolute), `workspace`, and
+`timestamp`; each action adds its own fields.
+
+**`login`** — build the authorize/verify URL. Input adds `headless` (bool) and,
+for the web flow, `redirect_uri` (a `http://localhost:<port>/callback` the
+harness already bound — embed it verbatim in your authorize URL). Output:
+```json
+{ "url": "https://auth.example.com/device?...", "code": "ABCD-EFGH",
+  "message": "Open the URL and enter the code",
+  "flow": "web" | "manual",
+  "state": "<csrf>", "pending": { "verifier": "...", "device_id": "..." } }
+```
+- `flow`: `"web"` = the harness waits for the loopback redirect (local
+  machine); `"manual"` = the user pastes a code back via `/oauth-code`
+  (SSH/headless, or device-code flows). Honor `headless`: return `"manual"`
+  when there is no usable browser.
+- `state` (web flow): the CSRF state you put in the authorize URL, so the
+  harness can verify the redirect.
+- `pending` (both flows): an opaque JSON blob you need to carry to `complete`
+  (e.g. a PKCE verifier, a device-auth id). The harness stashes it and passes
+  it back verbatim.
+- `code` (optional, manual/device flow): a user-code to display.
+
+**`complete`** — exchange the code for a token and WRITE it to `token_path`.
+Input adds `code` (the pasted/redirected code) and `redirect_uri` (web flow) or
+`pending` (manual flow). Output:
+```json
+{ "ok": true }
+{ "ok": false, "error": "expired code" }
+```
+
+**`token`** — resolve/refresh the access token. Read `token_path`; if expired,
+refresh (make your own HTTP call) and write the updated token back. Output:
+```json
+{ "access_token": "<bearer>", "expires_at": 1719003600 }
+{ "access_token": null }
+{ "ok": false, "error": "refresh failed" }
+```
+`expires_at` is unix seconds (optional; if 0/absent the harness caches for ~5
+min). This runs on the per-turn hot path, so it is cached until near expiry.
+
+**`clear`** — delete any credentials + extra state you manage. The harness
+ALSO deletes `token_path`, so this is optional (use it for sidecar files).
+Output: `{ "ok": true }`.
+
+#### How it fits together
+
+- `/login <provider_id>`: the harness runs `login`, emits the URL as an
+  `oauth_prompt`, and either waits for the redirect (web) or stashes `pending`
+  and waits for `/oauth-code` (manual). On success it creates the provider
+  config (name = provider_id, your base_url/kind/headers, no api_key) and
+  refreshes `/models`.
+- At turn + discovery time: the harness runs `token` (cached), injects the
+  access token as `Authorization: Bearer`, and routes the turn to your
+  `base_url` over your declared `kind`.
+- `/logout <provider_id>`: deletes `token_path` + runs `clear` + drops the
+  provider config.
+
+The plugin's token format is entirely its own — the harness never parses it.
+
 ### Example: a pre_write linter plugin
 
 `.catalyst-code/plugins/lint-check/plugin.json`:
@@ -406,6 +527,10 @@ struct PluginManifest {
     /// Static text injected into the system prompt (empty = none).
     #[serde(default)]
     system_prompt: String,
+    /// Optional OAuth subscription provider this plugin adds (login flow +
+    /// token resolution), mirroring the built-in OpenAI/Claude/Gemini OAuth.
+    #[serde(default)]
+    oauth: Option<OauthManifestEntry>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -443,6 +568,55 @@ struct ToolManifestEntry {
     override_builtin: bool,
 }
 
+/// An OAuth provider declared by a plugin manifest's `oauth` block. Lets a
+/// plugin add a subscription-OAuth provider (login flow + token resolution)
+/// the same way the built-in OpenAI/Claude/Gemini providers work — no
+/// recompile. The plugin supplies ONE script that handles four actions
+/// (`login`, `complete`, `token`, `clear`) dispatched by an `action` field in
+/// the stdin context; per-action script overrides are optional. See
+/// PLUGIN_DOCS for the full contract.
+#[derive(Deserialize, Debug, Clone)]
+struct OauthManifestEntry {
+    /// The provider identity. Must match the provider-config `name` created on
+    /// `/login` (the harness creates the config with this name). Also the key
+    /// `/oauth-code` and `/logout` dispatch on.
+    provider_id: String,
+    /// Human label shown in the `/login` picker (defaults to provider_id).
+    #[serde(default)]
+    label: Option<String>,
+    /// Wire protocol: "openai" (default) or "anthropic".
+    #[serde(default)]
+    kind: Option<String>,
+    /// The endpoint base URL (include `/v1`; paths appended directly).
+    base_url: String,
+    #[serde(default)]
+    description: Option<String>,
+    /// Extra HTTP headers appended to every request, `[[key,val],…]`.
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    /// Token-file name, relative to `~/.config/catalyst-code/oauth/`. Defaults
+    /// to `<provider_id>.json`. The harness passes the ABSOLUTE resolved path to
+    /// every script invocation, so the plugin owns the token's on-disk format.
+    #[serde(default)]
+    token_path: Option<String>,
+    /// The script handling ALL actions (login/complete/token/clear). Required
+    /// unless every action has an explicit override.
+    #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
+    login_script: Option<String>,
+    #[serde(default)]
+    complete_script: Option<String>,
+    #[serde(default)]
+    token_script: Option<String>,
+    /// Timeout for the login + complete actions (default 120s).
+    #[serde(default)]
+    login_timeout_ms: Option<u64>,
+    /// Timeout for the token (resolve/refresh) action (default 30s).
+    #[serde(default)]
+    token_timeout_ms: Option<u64>,
+}
+
 // ---- public types ----
 
 /// A loaded plugin with its registered hooks and declared tools.
@@ -462,6 +636,8 @@ pub struct Plugin {
     pub disable_tools: Vec<String>,
     /// Static text injected into the system prompt (empty = none).
     pub system_prompt: String,
+    /// OAuth subscription provider this plugin declares, if any.
+    pub oauth: Option<PluginOauthConfig>,
 }
 
 /// Configuration for one hook within a plugin.
@@ -490,6 +666,46 @@ pub struct ToolConfig {
     pub kind: ToolKind,
     /// True → this tool's handler replaces the built-in of the same name.
     pub override_builtin: bool,
+}
+
+/// A loaded OAuth-provider declaration (manifest `oauth` block with script
+/// paths resolved to absolute, path-confined, executable files). The plugin
+/// owns the token's on-disk format; the harness owns the loopback redirect
+/// server (web flow) and the `/oauth-code` paste path (manual flow).
+#[derive(Clone, Debug)]
+pub struct PluginOauthConfig {
+    pub provider_id: String,
+    pub label: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub description: String,
+    pub headers: Vec<(String, String)>,
+    /// Absolute path the plugin reads/writes its token at.
+    pub token_path: PathBuf,
+    /// Resolved absolute script paths per action (override else the default).
+    pub scripts: HashMap<String, PathBuf>,
+    pub login_timeout_ms: u64,
+    pub token_timeout_ms: u64,
+}
+
+impl PluginOauthConfig {
+    /// Resolve which script runs `action` (the action-specific override, else
+    /// the shared `script` fallback).
+    pub fn script_for(&self, action: &str) -> Option<&Path> {
+        self.scripts
+            .get(action)
+            .or_else(|| self.scripts.get("*"))
+            .map(|p| p.as_path())
+    }
+}
+
+/// A cached OAuth access token + its absolute-seconds expiry, keyed by
+/// provider_id in the PluginManager. Keeps the per-turn hot path (enrich_oauth)
+/// from spawning the token script on every request.
+#[derive(Clone)]
+struct CachedToken {
+    token: String,
+    expires_at: u64,
 }
 
 /// Result returned from executing a hook.
@@ -525,6 +741,10 @@ pub struct PluginManager {
     plugins: RwLock<HashMap<String, Plugin>>,
     /// Project-scoped plugin names skipped because trust_project is false.
     skipped_project: Mutex<Vec<String>>,
+    /// In-memory cache of resolved OAuth access tokens (provider_id → token),
+    /// so the per-turn hot path (`enrich_oauth`) doesn't spawn the token script
+    /// on every request. Refreshed when near expiry.
+    token_cache: Mutex<HashMap<String, CachedToken>>,
 }
 
 impl PluginManager {
@@ -543,6 +763,7 @@ impl PluginManager {
             trust_project,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
+            token_cache: Mutex::new(HashMap::new()),
         };
         mgr.scan_and_load();
         mgr
@@ -566,6 +787,7 @@ impl PluginManager {
             trust_project,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
+            token_cache: Mutex::new(HashMap::new()),
         };
         mgr.scan_and_load();
         mgr
@@ -588,6 +810,7 @@ impl PluginManager {
             trust_project,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
+            token_cache: Mutex::new(HashMap::new()),
         };
         mgr.scan_and_load();
         mgr
@@ -831,6 +1054,12 @@ impl PluginManager {
             });
         }
 
+        // --- plugin-declared OAuth provider (subscription auth, no recompile) ---
+        let oauth_config = match manifest.oauth {
+            Some(entry) => Some(load_oauth_entry(&canon_dir, entry)?),
+            None => None,
+        };
+
         Ok(Plugin {
             name: manifest.name,
             version: manifest.version,
@@ -841,6 +1070,7 @@ impl PluginManager {
             tools: tools_vec,
             disable_tools: manifest.disable_tools,
             system_prompt: manifest.system_prompt,
+            oauth: oauth_config,
         })
     }
 
@@ -1052,6 +1282,398 @@ impl PluginManager {
             String::new()
         } else {
             format!("\n\n## Plugin-injected context\n\n{}", parts.join("\n\n"))
+        }
+    }
+
+    // ---- OAuth provider declarations (subscription auth, no recompile) ----
+
+    /// All OAuth providers declared by enabled plugins (one per plugin that
+    /// declares an `oauth` block). Used to populate the `/login` picker and to
+    /// dispatch `/login` / `/oauth-code` / `/logout`.
+    pub fn oauth_configs(&self) -> Vec<PluginOauthConfig> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .filter_map(|p| p.oauth.clone())
+            .collect()
+    }
+
+    /// Look up a plugin-declared OAuth provider by its provider_id.
+    pub fn oauth_config(&self, provider_id: &str) -> Option<PluginOauthConfig> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .find_map(|p| p.oauth.as_ref().filter(|o| o.provider_id == provider_id).cloned())
+    }
+
+    /// Find the plugin OAuth provider that should authenticate a resolved
+    /// provider at turn time. Matches by provider-config name == provider_id
+    /// first (the `/login` flow creates the config with that name), then by
+    /// base_url host (a manually-configured provider pointing at the plugin's
+    /// declared endpoint).
+    pub fn oauth_config_for_provider(&self, rp: &ResolvedProvider) -> Option<PluginOauthConfig> {
+        let configs = self.oauth_configs();
+        if let Some(c) = configs.iter().find(|c| c.provider_id == rp.name) {
+            return Some(c.clone());
+        }
+        if let (Some(host),) = (url_host(&rp.base_url),) {
+            if let Some(c) = configs
+                .iter()
+                .find(|c| url_host(&c.base_url).as_deref() == Some(host.as_str()))
+            {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Build the `ProviderConfig` to create on a successful `/login` for a
+    /// plugin OAuth provider (no api_key — the token is resolved + refreshed at
+    /// turn time). `finalize_oauth` uses this in place of a built-in preset.
+    pub fn oauth_provider_config(&self, provider_id: &str) -> Option<ProviderConfig> {
+        let cfg = self.oauth_config(provider_id)?;
+        Some(ProviderConfig {
+            name: cfg.provider_id.clone(),
+            kind: cfg.kind,
+            base_url: cfg.base_url.clone(),
+            api_key: None,
+            api_key_env: None,
+            headers: cfg.headers.clone(),
+        })
+    }
+
+    /// True when a plugin declares an OAuth login flow for `provider_id` (the
+    /// login action has a resolvable script).
+    pub fn supports_oauth_login(&self, provider_id: &str) -> bool {
+        let Some(cfg) = self.oauth_config(provider_id) else {
+            return false;
+        };
+        cfg.script_for("login").is_some()
+    }
+
+    /// Cheap sync check (no subprocess): does the plugin's token file exist?
+    /// Used to gate an OAuth-only provider into model aggregation so `/models`
+    /// shows it without an API key.
+    pub fn has_oauth_creds(&self, provider_id: &str) -> bool {
+        self.oauth_config(provider_id)
+            .map(|c| c.token_path.exists())
+            .unwrap_or(false)
+    }
+
+    /// Delete the plugin's stored token + invalidate the cache. Called by
+    /// `/logout` so the provider is fully logged out (not just its config).
+    /// Best-effort: also invokes the plugin's `clear` action so the plugin can
+    /// tear down any extra state it manages.
+    pub async fn clear_oauth(&self, provider_id: &str) {
+        if let Some(cfg) = self.oauth_config(provider_id) {
+            let _ = std::fs::remove_file(&cfg.token_path);
+            if let Some(script) = cfg.script_for("clear") {
+                let ctx = self.oauth_action_ctx(
+                    "clear",
+                    provider_id,
+                    &cfg.token_path.to_string_lossy(),
+                );
+                let _ = self
+                    .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
+                    .await;
+            }
+        }
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.remove(provider_id);
+        }
+    }
+
+    /// Resolve a fresh (cached) OAuth access token for `provider_id` at turn /
+    /// discovery time. Spawns the plugin's `token` action only when the cached
+    /// token is missing or near expiry. Returns None when no creds exist or the
+    /// script fails — callers fall back to the API-key path (no regression).
+    pub async fn resolve_oauth_token(&self, provider_id: &str) -> Option<String> {
+        let cfg = self.oauth_config(provider_id)?;
+        // Cache hit?
+        {
+            let cache = self.token_cache.lock().ok()?;
+            if let Some(c) = cache.get(provider_id) {
+                let now = now_secs();
+                if c.expires_at == 0 || c.expires_at > now + 60 {
+                    return Some(c.token.clone());
+                }
+            }
+        }
+        let script = cfg.script_for("token")?;
+        let ctx = self.oauth_action_ctx(
+            "token",
+            provider_id,
+            &cfg.token_path.to_string_lossy(),
+        );
+        let resp = self
+            .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
+            .await
+            .ok()?;
+        let token = resp
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if let Some(t) = &token {
+            let now = now_secs();
+            let exp = resp
+                .get("expires_at")
+                .and_then(|e| e.as_u64())
+                .filter(|e| *e > 0)
+                .unwrap_or(now + 300);
+            if let Ok(mut cache) = self.token_cache.lock() {
+                cache.insert(
+                    provider_id.to_string(),
+                    CachedToken {
+                        token: t.clone(),
+                        expires_at: exp,
+                    },
+                );
+            }
+        }
+        token
+    }
+
+    /// Drive the interactive OAuth login for a plugin provider. Picks the flow
+    /// from the script's returned `flow` field:
+    ///  - `web` (default for a local machine): the harness binds a loopback
+    ///    redirect, the script builds the authorize URL with that redirect_uri,
+    ///    the harness waits for the browser redirect, then calls `complete`.
+    ///  - `manual` (default for SSH/headless, or when the script chooses it):
+    ///    the script returns a URL + an opaque `pending` blob; the user pastes
+    ///    the code back via `/oauth-code`, which calls `complete`.
+    pub async fn oauth_login(
+        &self,
+        provider_id: &str,
+        emit: &dyn Fn(OAuthPrompt),
+    ) -> Result<LoginOutcome, String> {
+        let cfg = self
+            .oauth_config(provider_id)
+            .ok_or_else(|| format!("'{provider_id}' has no plugin OAuth login flow"))?;
+        let token_path = cfg.token_path.to_string_lossy().to_string();
+        let headless = crate::oauth::likely_headless();
+
+        if !headless {
+            // Web flow: bind a loopback redirect the script embeds in its URL.
+            let (listener, listener_v6, port) = crate::oauth::bind_loopback(0).await?;
+            let redirect_uri = format!("http://localhost:{port}/callback");
+            let mut ctx = self.oauth_action_ctx("login", provider_id, &token_path);
+            ctx["headless"] = json!(false);
+            ctx["redirect_uri"] = json!(redirect_uri);
+            let resp = self
+                .execute_oauth_script(
+                    cfg.script_for("login").ok_or("no login script")?,
+                    ctx,
+                    cfg.login_timeout_ms,
+                )
+                .await?;
+            let url = resp
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("login script did not return a url")?
+                .to_string();
+            let flow = resp
+                .get("flow")
+                .and_then(|v| v.as_str())
+                .unwrap_or("web")
+                .to_string();
+            let code = resp.get("code").and_then(|v| v.as_str()).map(String::from);
+            let state = resp
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let message = resp
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Open the URL to log in.")
+                .to_string();
+            let pending = resp.get("pending").cloned();
+            emit(OAuthPrompt {
+                url: url.clone(),
+                code,
+                message,
+            });
+            let _ = crate::oauth::open_browser(&url);
+
+            if flow == "manual" {
+                // The script insisted on the manual flow even locally.
+                return Ok(LoginOutcome::AwaitingCode {
+                    pending: PendingOauth::plugin(provider_id, state, pending),
+                });
+            }
+            // Wait for the browser redirect, then complete the exchange.
+            let code = crate::oauth::await_redirect_dual(listener, listener_v6, &state, None)
+                .await?;
+            let mut ctx = self.oauth_action_ctx("complete", provider_id, &token_path);
+            ctx["code"] = json!(code);
+            ctx["redirect_uri"] = json!(redirect_uri);
+            if let Some(p) = &pending {
+                ctx["pending"] = p.clone();
+            }
+            let resp = self
+                .execute_oauth_script(
+                    cfg.script_for("complete").ok_or("no complete script")?,
+                    ctx,
+                    cfg.login_timeout_ms,
+                )
+                .await?;
+            if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let err = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                return Err(format!("OAuth complete failed: {err}"));
+            }
+            // Invalidate the cache so the next turn resolves the fresh token.
+            if let Ok(mut cache) = self.token_cache.lock() {
+                cache.remove(provider_id);
+            }
+            Ok(LoginOutcome::Done)
+        } else {
+            // Manual / device-code flow: emit the URL, stash `pending`, wait
+            // for the user to paste the code via `/oauth-code`.
+            let mut ctx = self.oauth_action_ctx("login", provider_id, &token_path);
+            ctx["headless"] = json!(true);
+            let resp = self
+                .execute_oauth_script(
+                    cfg.script_for("login").ok_or("no login script")?,
+                    ctx,
+                    cfg.login_timeout_ms,
+                )
+                .await?;
+            let url = resp
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("login script did not return a url")?
+                .to_string();
+            let code = resp.get("code").and_then(|v| v.as_str()).map(String::from);
+            let message = resp
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Open the URL, approve, then paste the code via /oauth-code.")
+                .to_string();
+            let pending = resp.get("pending").cloned();
+            emit(OAuthPrompt { url, code, message });
+            Ok(LoginOutcome::AwaitingCode {
+                pending: PendingOauth::plugin(provider_id, String::new(), pending),
+            })
+        }
+    }
+
+    /// Complete a pending manual (paste-code) plugin OAuth login: exchange the
+    /// code for a token via the plugin's `complete` action. The plugin writes
+    /// the token to its token_path; the harness never parses the token format.
+    pub async fn oauth_complete(
+        &self,
+        provider_id: &str,
+        pending: &PendingOauth,
+        code: &str,
+    ) -> Result<(), String> {
+        let cfg = self
+            .oauth_config(provider_id)
+            .ok_or_else(|| format!("'{provider_id}' has no plugin OAuth flow"))?;
+        let script = cfg
+            .script_for("complete")
+            .ok_or_else(|| format!("'{provider_id}' has no complete script"))?;
+        let token_path = cfg.token_path.to_string_lossy().to_string();
+        let mut ctx = self.oauth_action_ctx("complete", provider_id, &token_path);
+        ctx["code"] = json!(code);
+        if let Some(p) = &pending.plugin_pending {
+            ctx["pending"] = p.clone();
+        }
+        let resp = self
+            .execute_oauth_script(script, ctx, cfg.login_timeout_ms)
+            .await?;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("OAuth complete failed: {err}"));
+        }
+        // Invalidate the cache so the next turn resolves the fresh token.
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.remove(provider_id);
+        }
+        Ok(())
+    }
+
+    /// Build the base context JSON passed to every OAuth script invocation
+    /// (action-specific fields are added by the caller via `ctx["..."] = ...`).
+    fn oauth_action_ctx(&self, action: &str, provider_id: &str, token_path: &str) -> Value {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        json!({
+            "action": action,
+            "provider_id": provider_id,
+            "token_path": token_path,
+            "workspace": self.workspace.to_string_lossy(),
+            "timestamp": timestamp,
+        })
+    }
+
+    /// Spawn an OAuth script, write the context JSON to its stdin, read one
+    /// JSON object from stdout. Bounded by `timeout_ms` (stdin-write + wait).
+    /// Mirrors `execute_hook` / `execute_plugin_tool` (kill_on_drop, bounded
+    /// stdin write, timeout). Non-zero exit / timeout / parse failure → Err.
+    async fn execute_oauth_script(
+        &self,
+        script: &Path,
+        context: Value,
+        timeout_ms: u64,
+    ) -> Result<Value, String> {
+        let ctx_bytes = serde_json::to_vec(&context).unwrap_or_default();
+        let mut child = match hook_command(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("failed to spawn oauth script {script:?}: {e}")),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let stdin_timeout = Duration::from_millis(timeout_ms.max(1000));
+            let write_fut = async {
+                let _ = stdin.write_all(&ctx_bytes).await;
+                let _ = stdin.shutdown().await;
+            };
+            if tokio::time::timeout(stdin_timeout, write_fut).await.is_err() {
+                let _ = child.start_kill();
+                return Err(format!(
+                    "oauth script did not consume stdin within {}ms",
+                    stdin_timeout.as_millis()
+                ));
+            }
+        }
+        let timeout_dur = Duration::from_millis(timeout_ms);
+        match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "oauth script exited with {}: {}",
+                        output.status,
+                        stderr.trim()
+                    ));
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if stdout.is_empty() {
+                    return Err("oauth script returned empty stdout".into());
+                }
+                serde_json::from_str::<Value>(&stdout)
+                    .map_err(|e| format!("oauth script returned invalid JSON: {e}"))
+            }
+            Ok(Err(e)) => Err(format!("oauth script wait error: {e}")),
+            Err(_) => Err(format!("oauth script timed out after {}ms", timeout_ms)),
         }
     }
 }
@@ -1445,6 +2067,78 @@ fn validate_plugin_script(canon_dir: &Path, script_rel: &str) -> Result<PathBuf,
     Ok(canon)
 }
 
+/// Resolve a plugin manifest `oauth` block into a loaded [`PluginOauthConfig`]:
+/// validates the provider_id/base_url/kind, resolves the token-file path under
+/// `~/.config/catalyst-code/oauth/`, and resolves every declared script (shared
+/// `script` default + per-action overrides) to an absolute, path-confined,
+/// executable file. Token resolution is mandatory (a provider that can never
+/// produce a token is useless); login/complete fall back to the shared script
+/// and error at runtime only if neither exists.
+fn load_oauth_entry(canon_dir: &Path, entry: OauthManifestEntry) -> Result<PluginOauthConfig, String> {
+    let provider_id = entry.provider_id.clone();
+    if provider_id.is_empty() {
+        return Err("oauth provider_id is empty".into());
+    }
+    if entry.base_url.is_empty() {
+        return Err(format!("oauth provider '{provider_id}' has an empty base_url"));
+    }
+    let kind = match entry.kind.as_deref().unwrap_or("openai") {
+        "openai" => ProviderKind::OpenAI,
+        "anthropic" => ProviderKind::Anthropic,
+        other => {
+            return Err(format!(
+                "oauth provider '{provider_id}' has invalid kind '{other}' (use 'openai' or 'anthropic')"
+            ))
+        }
+    };
+    // Token file lives under ~/.config/catalyst-code/oauth/ (created lazily by
+    // the plugin's complete/token scripts on first write).
+    let token_dir = crate::config::home_dir()
+        .map(|h| h.join(".config/catalyst-code/oauth"))
+        .unwrap_or_else(|| PathBuf::from(".config/catalyst-code/oauth"));
+    let token_name = entry
+        .token_path
+        .clone()
+        .unwrap_or_else(|| format!("{provider_id}.json"));
+    let token_path = token_dir.join(&token_name);
+
+    // Resolve the shared default (keyed "*") + per-action overrides.
+    let mut scripts: HashMap<String, PathBuf> = HashMap::new();
+    if let Some(s) = &entry.script {
+        scripts.insert("*".to_string(), validate_plugin_script(canon_dir, s)?);
+    }
+    for (action, opt) in [
+        ("login", &entry.login_script),
+        ("complete", &entry.complete_script),
+        ("token", &entry.token_script),
+    ] {
+        if let Some(s) = opt {
+            scripts.insert(action.to_string(), validate_plugin_script(canon_dir, s)?);
+        }
+    }
+    // Token resolution is essential — without it the provider can never
+    // authenticate a turn.
+    if scripts.get("token").or_else(|| scripts.get("*")).is_none() {
+        return Err(format!(
+            "oauth provider '{provider_id}' has no token script: set 'script' (handles all actions) or 'token_script'"
+        ));
+    }
+
+    let label = entry.label.unwrap_or_else(|| provider_id.clone());
+    Ok(PluginOauthConfig {
+        provider_id,
+        label,
+        kind,
+        base_url: entry.base_url,
+        description: entry.description.unwrap_or_default(),
+        headers: entry.headers,
+        token_path,
+        scripts,
+        login_timeout_ms: entry.login_timeout_ms.unwrap_or(120_000),
+        token_timeout_ms: entry.token_timeout_ms.unwrap_or(30_000),
+    })
+}
+
 /// Cross-platform check for whether a hook script is executable.
 /// - Unix: any executable permission bit set (owner/group/other).
 /// - Windows / non-Unix: no permission bit exists, so any file that exists
@@ -1461,6 +2155,28 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         path.exists()
+    }
+}
+
+/// Current unix time in seconds (0 on clock error). Used by the OAuth token
+/// cache expiry check.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Extract the lowercased host from a URL (best-effort, no `url` crate dep).
+/// `https://api.x.ai/v1` → `api.x.ai`. Used to match a manually-configured
+/// provider to a plugin OAuth declaration by endpoint host.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, h)| h).unwrap_or(url);
+    let host = rest.split(['/', ':']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
     }
 }
 
@@ -2508,6 +3224,122 @@ mod tests {
         let pdir2 = write_plugin_with_tool(&tmp2.path, "my_tool", "");
         let plugin2 = PluginManager::load_plugin_from_dir(&pdir2).unwrap();
         assert!(!plugin2.tools[0].override_builtin);
+    }
+
+    // ---- plugin-declared OAuth provider loading ----
+
+    #[test]
+    fn load_oauth_minimal() {
+        let tmp = TmpDir::new("oauth_minimal");
+        let odir = tmp.path.join("oauth");
+        fs::create_dir_all(&odir).unwrap();
+        write_hook_script(&odir, "oauth.sh", r#"{"access_token":null}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"grok-oauth","version":"0.1.0","oauth":{
+               "provider_id":"grok",
+               "base_url":"https://api.x.ai/v1",
+               "script":"oauth/oauth.sh"
+            }}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let oauth = plugin.oauth.expect("oauth config loaded");
+        assert_eq!(oauth.provider_id, "grok");
+        assert_eq!(oauth.base_url, "https://api.x.ai/v1");
+        assert_eq!(oauth.kind, ProviderKind::OpenAI);
+        assert_eq!(oauth.label, "grok"); // defaults to provider_id
+        // token_path defaults to <provider_id>.json under the oauth dir.
+        assert!(oauth.token_path.ends_with("grok.json"));
+        // The shared script resolves for every action.
+        assert!(oauth.script_for("login").is_some());
+        assert!(oauth.script_for("complete").is_some());
+        assert!(oauth.script_for("token").is_some());
+        assert!(oauth.script_for("clear").is_some());
+    }
+
+    #[test]
+    fn load_oauth_rejects_missing_token_script() {
+        let tmp = TmpDir::new("oauth_no_token");
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"bad","version":"0.1.0","oauth":{
+               "provider_id":"bad","base_url":"https://x.example/v1"
+            }}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("no token script"), "got: {err}");
+    }
+
+    #[test]
+    fn load_oauth_rejects_invalid_kind() {
+        let tmp = TmpDir::new("oauth_bad_kind");
+        let odir = tmp.path.join("oauth");
+        fs::create_dir_all(&odir).unwrap();
+        write_hook_script(&odir, "oauth.sh", r#"{"access_token":null}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"bad","version":"0.1.0","oauth":{
+               "provider_id":"bad","base_url":"https://x.example/v1",
+               "kind":"weird","script":"oauth/oauth.sh"
+            }}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("invalid kind"), "got: {err}");
+    }
+
+    #[test]
+    fn load_oauth_per_action_overrides() {
+        let tmp = TmpDir::new("oauth_overrides");
+        let odir = tmp.path.join("oauth");
+        fs::create_dir_all(&odir).unwrap();
+        write_hook_script(&odir, "login.sh", r#"{"url":"https://x"}"#, 0);
+        write_hook_script(&odir, "complete.sh", r#"{"ok":true}"#, 0);
+        write_hook_script(&odir, "token.sh", r#"{"access_token":"t"}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"ov","version":"0.1.0","oauth":{
+               "provider_id":"ov","base_url":"https://x.example/v1","kind":"anthropic",
+               "login_script":"oauth/login.sh","complete_script":"oauth/complete.sh",
+               "token_script":"oauth/token.sh"
+            }}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let oauth = plugin.oauth.unwrap();
+        assert_eq!(oauth.kind, ProviderKind::Anthropic);
+        // No shared script → only the per-action overrides resolve.
+        assert!(oauth.script_for("login").is_some());
+        assert!(oauth.script_for("complete").is_some());
+        assert!(oauth.script_for("token").is_some());
+        assert!(oauth.script_for("clear").is_none());
+    }
+
+    #[test]
+    fn oauth_provider_config_builds_config() {
+        let tmp = TmpDir::new("oauth_provider_cfg");
+        // PluginManager::new scans SUBDIRS of plugins_dir, so the plugin lives
+        // in its own subdir.
+        let pdir = tmp.path.join("grok-oauth");
+        let odir = pdir.join("oauth");
+        fs::create_dir_all(&odir).unwrap();
+        write_hook_script(&odir, "oauth.sh", r#"{"access_token":null}"#, 0);
+        write_manifest(
+            &pdir,
+            r#"{"name":"grok-oauth","version":"0.1.0","oauth":{
+               "provider_id":"grok","base_url":"https://api.x.ai/v1",
+               "headers":[["X-Source","cc"]],"script":"oauth/oauth.sh"
+            }}"#,
+        );
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/__t_ws__"), true);
+        assert!(mgr.supports_oauth_login("grok"));
+        let pc = mgr.oauth_provider_config("grok").expect("provider config");
+        assert_eq!(pc.name, "grok");
+        assert_eq!(pc.base_url, "https://api.x.ai/v1");
+        assert_eq!(pc.kind, ProviderKind::OpenAI);
+        assert!(pc.api_key.is_none());
+        assert_eq!(pc.headers, vec![("X-Source".to_string(), "cc".to_string())]);
+        // Unknown provider_id → None / not supported.
+        assert!(mgr.oauth_provider_config("nope").is_none());
+        assert!(!mgr.supports_oauth_login("nope"));
     }
 
     #[test]

@@ -79,7 +79,7 @@ Be concise. Prefer standard tools. When done, summarize what you did in two line
 
 Self-learning — you compound knowledge across sessions, so future you starts smarter:
 - The `memory` tool (actions: save/append/list/forget) persists durable facts. By default memories are scoped to this workspace (per-codebase); pass `scope: "global"` for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
-- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation before `finish` exits and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `CATALYST_CODE_AUTO_REFLECT=0`).
+- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation BEFORE you write your completion summary — you reflect (save memories, no prose), then write your summary as the final message — and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `CATALYST_CODE_AUTO_REFLECT=0`).
 - Reusable skills live as markdown + YAML frontmatter under `.catalyst-code/skills/<name>/SKILL.md`. Discover them with `list_dir .catalyst-code/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
 - `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
 
@@ -127,11 +127,33 @@ pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> Str
 /// declares one — mirroring how `build_system_prompt` stays cheap in the common
 /// case. Subagents do NOT get plugin injection (they use the built-in tool set
 /// only), matching the plugin-tools-are-main-agent-scoped design.
-fn build_main_system_prompt(workspace: &std::path::Path, pm: &plugins::PluginManager) -> String {
+fn build_main_system_prompt(
+    workspace: &std::path::Path,
+    pm: &plugins::PluginManager,
+    auto_reflect: bool,
+) -> String {
     let mut prompt = build_system_prompt(workspace, true);
     let inj = pm.system_prompt_injection();
     if !inj.is_empty() {
         prompt.push_str(&inj);
+    }
+    // When auto-reflect is on, defer the completion summary until AFTER the
+    // reflection step so the summary is the last message the user reads, not
+    // buried under reflection output. Supersedes the "summarize when done"
+    // line in SYSTEM_PROMPT_BASE (kept for subagents + the auto_reflect-off
+    // case). Safe to defer: when auto_reflect is on, reflect ALWAYS fires for
+    // a real work turn (>=1 tool call, not a /reflect or /index learning turn,
+    // not cancelled) — the only turns where it doesn't fire (pure chat with 0
+    // tools, or a learning delegation) don't need a separate summary.
+    if auto_reflect {
+        prompt.push_str(
+            "\n\nCompletion flow (auto-reflect is enabled): when your work is verified and \
+             complete, call `finish` WITHOUT writing a summary first. The harness injects a \
+             reflection step — save any durable memories via the `memory` tool (no user-facing \
+             prose), then write your completion summary as the final message and call `finish`. \
+             This supersedes the \"summarize when done\" guidance above so your summary is the \
+             last thing the user reads.",
+        );
     }
     prompt
 }
@@ -223,8 +245,8 @@ fn emit_skills_event(workspace: &std::path::Path) {
 /// already available (env var set, or a literal key in the provider config)
 /// and whether the provider is already logged in — so a picker can show
 /// "log in" vs "log out" and warn when a key is missing.
-fn provider_presets_json(cfg: &Config) -> Vec<Value> {
-    config::PROVIDER_PRESETS
+fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> Vec<Value> {
+    let mut out: Vec<Value> = config::PROVIDER_PRESETS
         .iter()
         .map(|p| {
             let configured = cfg.find_provider(p.id).is_some();
@@ -258,7 +280,32 @@ fn provider_presets_json(cfg: &Config) -> Vec<Value> {
                 "supportsOauth": oauth::supports_login(p.id),
             })
         })
-        .collect()
+        .collect();
+    // Append plugin-declared OAuth providers so they appear in the /login picker
+    // (built-in presets win on a colliding id).
+    if let Some(pm) = pm {
+        for c in pm.oauth_configs() {
+            if config::PROVIDER_PRESETS.iter().any(|p| p.id == c.provider_id) {
+                continue;
+            }
+            let configured = cfg.find_provider(&c.provider_id).is_some();
+            let has_key = pm.has_oauth_creds(&c.provider_id);
+            out.push(json!({
+                "id": c.provider_id,
+                "label": c.label,
+                "kind": c.kind.as_str(),
+                "base_url": c.base_url,
+                "envVar": null,
+                "altEnvs": [],
+                "description": c.description,
+                "hasKey": has_key,
+                "configured": configured,
+                "loggedIn": configured && has_key,
+                "supportsOauth": true,
+            }));
+        }
+    }
+    out
 }
 
 /// A pending approval request the TUI must answer before the tool runs.
@@ -397,6 +444,10 @@ async fn finalize_oauth(
         if cfg.find_provider(preset).is_none() {
             if let Some(p) = config::find_preset(preset) {
                 cfg.providers.push(p.to_provider_config(None));
+            } else if let Some(p) = state.plugin_manager.oauth_provider_config(preset) {
+                // A plugin-declared OAuth provider (no built-in preset): build
+                // the config from the plugin's declared base_url/kind/headers.
+                cfg.providers.push(p);
             }
         }
     }
@@ -489,11 +540,11 @@ impl State {
             .filter(|s| !s.is_empty());
         if let Some(name) = provider_name {
             if let Some(rp) = self.resolve_provider_by_name(&name).await {
-                return oauth::enrich_oauth(rp, &self.client).await;
+                return oauth::enrich_oauth(rp, &self.client, Some(&self.plugin_manager)).await;
             }
         }
         let rp = self.resolved_provider().await;
-        oauth::enrich_oauth(rp, &self.client).await
+        oauth::enrich_oauth(rp, &self.client, Some(&self.plugin_manager)).await
     }
 
     /// The set of provider names that are "logged in": configured providers
@@ -504,7 +555,7 @@ impl State {
     pub async fn logged_in_providers(&self) -> Vec<String> {
         let cfg = self.cfg.read().await;
         let keys = self.api_keys.read().await;
-        logged_in_providers_for(&cfg, &keys)
+        logged_in_providers_for(&cfg, &keys, Some(&self.plugin_manager))
     }
 
     /// Aggregate models across ALL logged-in providers, tagging each model with
@@ -516,7 +567,7 @@ impl State {
         let cfg = self.cfg.read().await.clone();
         let keys = self.api_keys.read().await.clone();
         let active = self.active_provider.read().await.clone();
-        aggregate_models_for(&cfg, &keys, active.as_deref(), client).await
+        aggregate_models_for(&cfg, &keys, active.as_deref(), client, Some(&self.plugin_manager)).await
     }
 
     /// Re-aggregate models, store them, and emit a `models` event + a refreshed
@@ -528,7 +579,7 @@ impl State {
         emit(&Event::new("models").with("models", json!(models)));
         let presets = {
             let cfg = self.cfg.read().await;
-            provider_presets_json(&cfg)
+            provider_presets_json(&cfg, Some(&self.plugin_manager))
         };
         emit(&Event::new("provider_presets").with("presets", json!(presets)));
     }
@@ -618,7 +669,11 @@ pub fn resolve_provider_from_config(
 /// `aggregate_models_for`'s `names.is_empty()` branch handles the legacy
 /// default discovery — returning a synthetic "default" name here would break,
 /// because `find_provider("default")` finds no explicit entry to resolve.
-pub fn logged_in_providers_for(cfg: &Config, keys: &HashMap<String, String>) -> Vec<String> {
+pub fn logged_in_providers_for(
+    cfg: &Config,
+    keys: &HashMap<String, String>,
+    pm: Option<&plugins::PluginManager>,
+) -> Vec<String> {
     if cfg.providers.is_empty() {
         return Vec::new();
     }
@@ -633,7 +688,7 @@ pub fn logged_in_providers_for(cfg: &Config, keys: &HashMap<String, String>) -> 
                 .or_else(|| p.api_key.clone())
                 .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
                 .is_some()
-                || oauth_creds_for_provider(p)
+                || oauth_creds_for_provider(p, pm)
         })
         .map(|p| p.name.clone())
         .collect()
@@ -643,7 +698,17 @@ pub fn logged_in_providers_for(cfg: &Config, keys: &HashMap<String, String>) -> 
 /// check, no refresh). Used by `logged_in_providers_for` to gate OAuth-only
 /// providers into aggregation. The actual token refresh happens at turn/
 /// discovery time via `oauth::enrich_oauth`.
-fn oauth_creds_for_provider(p: &config::ProviderConfig) -> bool {
+fn oauth_creds_for_provider(
+    p: &config::ProviderConfig,
+    pm: Option<&plugins::PluginManager>,
+) -> bool {
+    // A plugin-declared OAuth provider owns its token check exclusively (so a
+    // plugin anthropic-kind provider isn't wrongly gated on Claude CLI creds).
+    if let Some(pm) = pm {
+        if pm.oauth_config(&p.name).is_some() {
+            return pm.has_oauth_creds(&p.name);
+        }
+    }
     if p.kind == config::ProviderKind::Anthropic {
         return oauth::has_claude_creds();
     }
@@ -665,8 +730,9 @@ pub async fn aggregate_models_for(
     keys: &HashMap<String, String>,
     active: Option<&str>,
     client: &reqwest::Client,
+    pm: Option<&plugins::PluginManager>,
 ) -> Vec<ModelInfo> {
-    let names = logged_in_providers_for(cfg, keys);
+    let names = logged_in_providers_for(cfg, keys, pm);
     if names.is_empty() {
         let rp = cfg.resolve_provider_with(keys, active);
         let mut models = provider::discover_models(client, &rp).await;
@@ -689,7 +755,7 @@ pub async fn aggregate_models_for(
         let rp = resolve_provider_from_config(pc, keys);
         // Enrich with an OAuth subscription token (gcloud/`claude` CLI) when the
         // provider has no API key, so OAuth-only providers can discover models.
-        let rp = oauth::enrich_oauth(rp, client).await;
+        let rp = oauth::enrich_oauth(rp, client, pm).await;
         let mut discovered = provider::discover_models(client, &rp).await;
         for m in &mut discovered {
             m.provider = rp.name.clone();
@@ -1131,7 +1197,7 @@ async fn main() {
     let init_provider = cfg.resolve_provider(&HashMap::new());
     let init_keys = cfg.persisted_keys.clone();
     let models =
-        aggregate_models_for(&cfg, &init_keys, cfg.active_provider.as_deref(), &client).await;
+        aggregate_models_for(&cfg, &init_keys, cfg.active_provider.as_deref(), &client, None).await;
     let logger = Logger::new(cfg.debug_log.as_deref());
     logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
 
@@ -1390,7 +1456,7 @@ async fn main() {
                         .with("provider", json!(rp.name))
                         .with("providerKind", json!(rp.kind.as_str()))
                         .with("providers", json!(cfg.provider_names()))
-                        .with("providerPresets", json!(provider_presets_json(&cfg)))
+                        .with("providerPresets", json!(provider_presets_json(&cfg, Some(&state.plugin_manager))))
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("auto_compact", json!(cfg.auto_compact))
                         .with("resumed_messages", json!(conv_len)),
@@ -1500,7 +1566,7 @@ async fn main() {
                 let cfg = state.cfg.read().await;
                 emit(
                     &Event::new("provider_presets")
-                        .with("presets", json!(provider_presets_json(&cfg))),
+                        .with("presets", json!(provider_presets_json(&cfg, Some(&state.plugin_manager)))),
                 );
             }
             Command::Login { preset, api_key } => {
@@ -1630,6 +1696,9 @@ async fn main() {
                 // the next session, with the stale token silently used for turns.
                 for n in &to_remove {
                     oauth::clear_oauth_creds(n);
+                    // Plugin-declared OAuth providers: delete their token file +
+                    // run the plugin's clear action + drop the cached token.
+                    state.plugin_manager.clear_oauth(n).await;
                 }
                 // If the active provider was one of those logged out, clear the
                 // override so the fallback resolves to the first remaining / legacy.
@@ -1671,7 +1740,10 @@ async fn main() {
                 // authorize+PKCE+loopback), emitting `oauth_prompt` events with
                 // the URL/code to visit, stores the token, ensures the provider is
                 // configured, and re-aggregates so its models appear in /models.
-                if !oauth::supports_login(&preset) {
+                // A plugin may declare an OAuth login flow for this provider_id;
+                // otherwise fall back to the built-in OpenAI/Claude/Gemini flows.
+                let plugin_login = state.plugin_manager.supports_oauth_login(&preset);
+                if !oauth::supports_login(&preset) && !plugin_login {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
@@ -1683,6 +1755,7 @@ async fn main() {
                 }
                 let label = config::find_preset(&preset)
                     .map(|p| p.label.to_string())
+                    .or_else(|| state.plugin_manager.oauth_config(&preset).map(|c| c.label))
                     .unwrap_or_else(|| preset.clone());
                 emit(&Event::new("info").with(
                     "message",
@@ -1696,7 +1769,12 @@ async fn main() {
                             .with("message", json!(p.message)),
                     );
                 };
-                match oauth::login(&preset, &client, &prompt_emit).await {
+                let outcome = if plugin_login {
+                    state.plugin_manager.oauth_login(&preset, &prompt_emit).await
+                } else {
+                    oauth::login(&preset, &client, &prompt_emit).await
+                };
+                match outcome {
                     Ok(oauth::LoginOutcome::Done) => {
                         finalize_oauth(&state, &client, &emit, &preset, &label).await;
                     }
@@ -1741,9 +1819,19 @@ async fn main() {
                 let preset = pending.kind.clone();
                 let label = config::find_preset(&preset)
                     .map(|p| p.label.to_string())
+                    .or_else(|| state.plugin_manager.oauth_config(&preset).map(|c| c.label))
                     .unwrap_or_else(|| preset.clone());
-                match oauth::complete_oauth(&preset, &client, &pending, &code).await {
-                    Ok(_) => {
+                // A plugin owns the exchange when this pending login is for a
+                // plugin-declared OAuth provider; otherwise the built-in flow.
+                let result = if state.plugin_manager.oauth_config(&preset).is_some() {
+                    state.plugin_manager.oauth_complete(&preset, &pending, &code).await
+                } else {
+                    oauth::complete_oauth(&preset, &client, &pending, &code)
+                        .await
+                        .map(|_| ())
+                };
+                match result {
+                    Ok(()) => {
                         finalize_oauth(&state, &client, &emit, &preset, &label).await;
                     }
                     Err(e) => {
@@ -3208,16 +3296,18 @@ fn is_learning_turn(prompt: &str) -> bool {
 /// evaluable instead of a vibes check the model can't track across sessions.
 fn build_reflect_text(recurring: &[(usize, String)]) -> String {
     let mut s = String::from(
-        "[auto-reflect] Before completing, take one reflection step. \n\
-         (1) If you learned a durable convention, architecture fact, decision, \n\
-         or gotcha, persist it with the `memory` tool (action: append if a topic \n\
-         memory exists, else save; use scope: \"global\" for cross-codebase facts \n\
-         like the user's identity, tech-stack preferences, or harness conventions) \n\
-         — skip transient task state. \n\
-         (2) If you just performed a reusable workflow, consider writing a skill \n\
-         under `.catalyst-code/skills/<name>/SKILL.md` (run \n\
-         `list_dir .catalyst-code/skills/` first to extend rather than duplicate). \n\
-         Then call `finish` to complete.",
+        "[auto-reflect] Before you write your completion summary, reflect on this turn. \n\
+         (1) If you learned a durable convention, architecture fact, decision, or \n\
+         gotcha, persist it with the `memory` tool (action: append if a topic memory \n\
+         exists, else save; use scope: \"global\" for cross-codebase facts like the \n\
+         user's identity, tech-stack preferences, or harness conventions) — skip \n\
+         transient task state. Use ONLY tool calls here; do NOT write user-facing prose. \n\
+         (2) If you just performed a reusable workflow, consider writing a skill under \n\
+         `.catalyst-code/skills/<name>/SKILL.md` (run `list_dir .catalyst-code/skills/` \n\
+         first to extend rather than duplicate). \n\
+         After reflecting (or if nothing to save), write your final completion summary \n\
+         to the user and call `finish` — it should be the last message. If you already \n\
+         wrote a summary above, do not repeat it; just save memories and call `finish`.",
     );
     if !recurring.is_empty() {
         s.push_str("\n\nRecurring patterns detected (performed 2+ times across sessions):");
@@ -3370,8 +3460,15 @@ async fn run_turn(
     {
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
-            let workspace = st.cfg.read().await.workspace.clone();
-            let sys_msg = Message::system(build_main_system_prompt(&workspace, &st.plugin_manager));
+            let (workspace, auto_reflect) = {
+                let c = st.cfg.read().await;
+                (c.workspace.clone(), c.auto_reflect)
+            };
+            let sys_msg = Message::system(build_main_system_prompt(
+                &workspace,
+                &st.plugin_manager,
+                auto_reflect,
+            ));
             init_est_add += estimate_message_tokens(&sys_msg);
             conv.push(sys_msg);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -5164,9 +5261,12 @@ fn truncate_str(s: &str, n: usize) -> String {
 /// the prompt is unchanged. Shared by RefreshMemory and the save/forget
 /// commands so a saved/removed memory is visible to the very next turn.
 async fn refresh_memory_injection(state: &State) -> String {
-    let ws = state.cfg.read().await.workspace.clone();
+    let (ws, auto_reflect) = {
+        let c = state.cfg.read().await;
+        (c.workspace.clone(), c.auto_reflect)
+    };
     let mem = memory_injection(&ws, "");
-    let new_system = build_main_system_prompt(&ws, &state.plugin_manager);
+    let new_system = build_main_system_prompt(&ws, &state.plugin_manager, auto_reflect);
     let mut conv = state.conversation.lock().await;
     if let Some(first) = conv.first() {
         let old_content = first.content_text().unwrap_or("");

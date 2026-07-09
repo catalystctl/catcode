@@ -984,7 +984,11 @@ pub async fn codex_token(client: &reqwest::Client) -> Option<String> {
 /// explicit API key always wins (manual override / env). Returns `rp` unchanged
 /// (still keyless) when no token is available — callers fall back to the API-key
 /// path. Flips `rp.oauth = true` for Anthropic (Bearer + oauth-beta header).
-pub async fn enrich_oauth(mut rp: ResolvedProvider, client: &reqwest::Client) -> ResolvedProvider {
+pub async fn enrich_oauth(
+    mut rp: ResolvedProvider,
+    client: &reqwest::Client,
+    pm: Option<&crate::plugins::PluginManager>,
+) -> ResolvedProvider {
     // The Codex (ChatGPT subscription) backend at chatgpt.com/backend-api/codex
     // requires the same default headers the official `codex` CLI sets on EVERY
     // request (`codex-rs/login/src/auth/default_client.rs::default_headers`):
@@ -1032,6 +1036,21 @@ pub async fn enrich_oauth(mut rp: ResolvedProvider, client: &reqwest::Client) ->
             }
         }
         _ => {}
+    }
+    // Plugin-declared OAuth providers: when no built-in flow matched and there
+    // is still no API key, consult plugins. A plugin owns its token's on-disk
+    // format; we just resolve (cached) and inject as `Authorization: Bearer`.
+    // This is the no-recompile path to add a subscription-OAuth provider
+    // (Grok device-code, a corporate SSO, …) the way OpenAI/Claude/Gemini work.
+    if rp.api_key.is_none() {
+        if let Some(pm) = pm {
+            if let Some(cfg) = pm.oauth_config_for_provider(&rp) {
+                if let Some(token) = pm.resolve_oauth_token(&cfg.provider_id).await {
+                    rp.api_key = Some(token);
+                    rp.oauth = true;
+                }
+            }
+        }
     }
     rp
 }
@@ -1148,6 +1167,36 @@ async fn bind_callback() -> Result<(tokio::net::TcpListener, u16), String> {
     Ok((listener, bound_port))
 }
 
+/// Bind a loopback OAuth callback server for a plugin's web flow: IPv4 on
+/// `127.0.0.1:<port>` (port 0 = OS-assigned ephemeral) plus IPv6 best-effort on
+/// `::1:<same port>`, because browsers often resolve `localhost` to `::1`
+/// before `127.0.0.1`. Returns the IPv4 listener, an optional IPv6 listener,
+/// and the port actually bound (use it to build the redirect_uri). Mirrors
+/// `bind_claude_callback` but parametric on the port so a plugin can request a
+/// registered port when its provider requires one.
+pub async fn bind_loopback(
+    port: u16,
+) -> Result<
+    (
+        tokio::net::TcpListener,
+        Option<tokio::net::TcpListener>,
+        u16,
+    ),
+    String,
+> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("could not bind localhost OAuth callback: {e}"))?;
+    let bound_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| e.to_string())?;
+    let listener_v6 = tokio::net::TcpListener::bind(("::1", bound_port))
+        .await
+        .ok();
+    Ok((listener, listener_v6, bound_port))
+}
+
 /// Wait for the OAuth redirect on a bound loopback server: accept one
 /// connection, parse `?code=&state=` from the GET line, verify `state`, respond
 /// (a 302 to `success_url` when given — matching gemini-cli's success page — or
@@ -1160,7 +1209,7 @@ async fn await_redirect(
     await_redirect_dual(listener, None, state, success_url).await
 }
 
-async fn await_redirect_dual(
+pub async fn await_redirect_dual(
     listener: tokio::net::TcpListener,
     listener_v6: Option<tokio::net::TcpListener>,
     state: &str,
@@ -1229,7 +1278,10 @@ async fn handle_redirect_stream(
             st = Some(percent_decode(v));
         }
     }
-    if st.as_deref() == Some(state) {
+    // An empty `state` means the caller requested no CSRF protection (plugin
+    // OAuth web flows that don't use state) — accept any redirect. A non-empty
+    // state requires an exact match (the built-in flows always pass one).
+    if state.is_empty() || st.as_deref() == Some(state) {
         return code
             .map(Some)
             .ok_or_else(|| "no code in redirect".to_string());
@@ -1252,6 +1304,25 @@ pub struct PendingOauth {
     pub state: String,
     /// The redirect_uri used (e.g. `https://codeassist.google.com/authcode`).
     pub redirect_uri: String,
+    /// Opaque JSON blob a plugin's `login` action returned and `complete` needs
+    /// (e.g. a PKCE verifier, a device-auth id). Only set for plugin OAuth
+    /// providers; `None` for the built-in flows (which carry state inline).
+    pub plugin_pending: Option<serde_json::Value>,
+}
+
+impl PendingOauth {
+    /// Build a `PendingOauth` for a plugin OAuth provider (manual flow). The
+    /// opaque `pending` blob returned by the plugin's `login` action is stashed
+    /// here and passed back to its `complete` action verbatim.
+    pub fn plugin(provider_id: &str, state: String, pending: Option<serde_json::Value>) -> Self {
+        PendingOauth {
+            kind: provider_id.to_string(),
+            code_verifier: String::new(),
+            state,
+            redirect_uri: String::new(),
+            plugin_pending: pending,
+        }
+    }
 }
 
 /// Outcome of starting an interactive OAuth login (`oauth::login`). The web
@@ -1346,6 +1417,7 @@ fn google_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, Strin
             code_verifier: verifier,
             state,
             redirect_uri: redirect,
+            plugin_pending: None,
         },
     })
 }
@@ -1621,6 +1693,7 @@ fn claude_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, Strin
             code_verifier: verifier,
             state,
             redirect_uri: redirect,
+            plugin_pending: None,
         },
     })
 }
@@ -2005,7 +2078,7 @@ pub async fn login(
     }
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+pub fn open_browser(url: &str) -> std::io::Result<()> {
     let (prog, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {

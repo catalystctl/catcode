@@ -144,11 +144,12 @@ pub struct Config {
     pub compact_instructions: Option<String>, // optional guidance woven into the summarize prompt (e.g. "Focus on code samples and API usage"); /compact <instructions> overrides per-call
     pub rolling_state: bool, // inject a transient tail work-state summary (KV-cache-aware)
     /// Auto-reflect: on a non-trivial turn (≥ `auto_reflect_min_tool_calls` tool
-    /// calls), inject a reflection continuation before `finish` exits so durable
-    /// facts get persisted (memory) and recurring patterns get written as skills
-    /// — without relying on the model remembering to reflect. The deterministic
-    /// seam SELF_LEARNING.md §11 deferred. Skips reflect/index turns and trivial
-    /// turns. Default on.
+    /// calls), inject a reflection continuation BEFORE the model writes its
+    /// completion summary so durable facts get persisted (memory) and recurring
+    /// patterns get written as skills — without relying on the model remembering
+    /// to reflect. The model then writes its summary as the final message. The
+    /// deterministic seam SELF_LEARNING.md §11 deferred. Skips reflect/index
+    /// turns and trivial turns. Default on.
     pub auto_reflect: bool,
     /// Minimum non-trivial tool-call count for auto-reflect to fire. 1 = any
     /// real work. 0 is treated as 1 (a no-work turn should never reflect).

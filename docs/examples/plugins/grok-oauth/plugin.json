@@ -1,0 +1,17 @@
+{
+  "name": "grok-oauth",
+  "version": "0.1.0",
+  "description": "Example: add Grok (xAI) as a subscription-OAuth provider via the device-code flow. Demonstrates the plugin OAuth contract (login/complete/token/clear). Fill in CLIENT_ID + the real endpoints for your vendor before using.",
+  "oauth": {
+    "provider_id": "grok",
+    "label": "Grok (xAI)",
+    "kind": "openai",
+    "base_url": "https://api.x.ai/v1",
+    "description": "Grok via xAI device-code OAuth.",
+    "headers": [["X-Client", "catalyst-code"]],
+    "token_path": "grok.json",
+    "script": "oauth/oauth.sh",
+    "login_timeout_ms": 180000,
+    "token_timeout_ms": 30000
+  }
+}
