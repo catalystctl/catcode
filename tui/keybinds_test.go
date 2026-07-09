@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -109,8 +109,8 @@ func TestKbMatch(t *testing.T) {
 	if !s.kb(keyMsg("Y"), "approve") {
 		t.Error("kb should match 'Y' for approve (case-insensitive)")
 	}
-	// Enter via tea.KeyMsg{Type: KeyEnter} has String()=="enter".
-	if !s.kb(tea.KeyMsg{Type: tea.KeyEnter}, "send") {
+	// Enter via tea.KeyPressMsg{Code: tea.KeyEnter} has String()=="enter".
+	if !s.kb(tea.KeyPressMsg{Code: tea.KeyEnter}, "send") {
 		t.Error("kb should match KeyEnter for send")
 	}
 }
@@ -333,7 +333,7 @@ func TestKeybindsModalReset(t *testing.T) {
 
 	// Navigate to quit (index 0) and press backspace to reset.
 	s.modal.cursor = 0
-	_, _ = s.handleKeybindsKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	_, _ = s.handleKeybindsKey(tea.KeyPressMsg{Code: tea.KeyBackspace})
 	if s.keybinds["quit"] != "ctrl+c" {
 		t.Fatalf("after backspace reset: quit=%q, want ctrl+c", s.keybinds["quit"])
 	}
@@ -735,7 +735,7 @@ func TestKeybindsModalClearViaDelete(t *testing.T) {
 			break
 		}
 	}
-	_, _ = s.handleKeybindsKey(tea.KeyMsg{Type: tea.KeyDelete})
+	_, _ = s.handleKeybindsKey(tea.KeyPressMsg{Code: tea.KeyDelete})
 	if s.keybinds["command_palette_alt"] != "" {
 		t.Fatalf("after Delete: command_palette_alt=%q, want empty", s.keybinds["command_palette_alt"])
 	}
@@ -757,13 +757,13 @@ func TestKeybindsModalResetThenClear(t *testing.T) {
 	// Backspace resets to default (ctrl+c).
 	s.openKeybindsModal()
 	s.modal.cursor = 0
-	_, _ = s.handleKeybindsKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	_, _ = s.handleKeybindsKey(tea.KeyPressMsg{Code: tea.KeyBackspace})
 	if s.keybinds["quit"] != "ctrl+c" {
 		t.Fatalf("after Backspace (reset): quit=%q, want ctrl+c", s.keybinds["quit"])
 	}
 
 	// Delete clears (disables) — sets to empty.
-	_, _ = s.handleKeybindsKey(tea.KeyMsg{Type: tea.KeyDelete})
+	_, _ = s.handleKeybindsKey(tea.KeyPressMsg{Code: tea.KeyDelete})
 	if s.keybinds["quit"] != "" {
 		t.Fatalf("after Delete (clear): quit=%q, want empty", s.keybinds["quit"])
 	}

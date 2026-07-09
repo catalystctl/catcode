@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ func (s *session) renderBlocks() string {
 	if len(s.blocks) == 0 {
 		return s.renderWelcome()
 	}
-	w := s.viewport.Width
+	w := s.viewport.Width()
 	for s.cacheIdx < len(s.blocks) {
 		blk := s.blocks[s.cacheIdx]
 		if blk == s.cur || isInFlight(blk) {
@@ -592,8 +592,8 @@ var welcomeExamples = []string{
 }
 
 func (s *session) renderWelcome() string {
-	w := s.viewport.Width
-	h := s.viewport.Height
+	w := s.viewport.Width()
+	h := s.viewport.Height()
 
 	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
 	sub := mutedStyle.Render("a multi-provider coding agent")

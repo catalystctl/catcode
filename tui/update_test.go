@@ -77,7 +77,10 @@ func TestAssetName(t *testing.T) {
 }
 
 func TestHumanBytes(t *testing.T) {
-	cases := []struct{ in int64; want string }{
+	cases := []struct {
+		in   int64
+		want string
+	}{
 		{512, "512B"},
 		{2048, "2.0KB"},
 		{1 << 20, "1.0MB"},

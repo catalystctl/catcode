@@ -52,7 +52,7 @@ jobs:
       # --- Go (TUI builds) ------------------------------------------------
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
 
       # --- zig + cargo-zigbuild (macOS cross-compile from Linux) ----------
       - uses: goto-bus-stop/setup-zig@v2

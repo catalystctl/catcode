@@ -117,7 +117,7 @@ Get up and running in under a minute — no clone, no compiler.
 * `curl` + coreutils (always). No compiler unless you build from source.
 * For the web frontend: a [Node](https://nodejs.org) or [Bun](https://bun.sh)
   runtime to *run* the service (not to build it).
-* To build from source: Rust (stable) + **Go 1.24+**.
+* To build from source: Rust (stable) + **Go 1.25+**.
 
 ### Installation
 
@@ -127,13 +127,13 @@ The installer pulls prebuilt binaries straight from GitHub Releases.
 **Linux & macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.sh | bash
 ```
 
 Including the web frontend:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/master/install.sh | bash -s -- --with-web
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.sh | bash -s -- --with-web
 ```
 
 Then run `catcode` from any folder to work on that project. Other options:
@@ -167,14 +167,14 @@ Then run `catcode` from any folder to work on that project. Other options:
 **Windows:**
 
 ```powershell
-irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex
 ```
 
 Including the web frontend (pass arguments via the scriptblock form, since `iex`
 cannot forward parameters):
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1))) -WithWeb
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1))) -WithWeb
 ```
 
 No admin, no compiler. Open a NEW PowerShell window (so PATH reloads) and run
@@ -525,7 +525,7 @@ Project Link: [https://github.com/catalystctl/catcode](https://github.com/cataly
 [website-url]: https://code.catalystctl.com
 [Rust-badge]: https://img.shields.io/badge/Rust-stable-ce422b?style=for-the-badge&logo=rust&logoColor=white
 [Rust-url]: https://www.rust-lang.org/
-[Go-badge]: https://img.shields.io/badge/Go-1.24%2B-00add8?style=for-the-badge&logo=go&logoColor=white
+[Go-badge]: https://img.shields.io/badge/Go-1.25%2B-00add8?style=for-the-badge&logo=go&logoColor=white
 [Go-url]: https://go.dev/
 [Next.js-badge]: https://img.shields.io/badge/Next.js-15-000000?style=for-the-badge&logo=nextdotjs&logoColor=white
 [Next.js-url]: https://nextjs.org/

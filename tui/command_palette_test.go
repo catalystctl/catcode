@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestSkillPaletteInsertsIntoInput: selecting a /skill:<name> entry from the
@@ -64,7 +64,7 @@ func TestEnterSelectsEvenWhenSelectUnbound(t *testing.T) {
 	if before != modalCommand {
 		t.Fatalf("precondition: palette should be open; kind=%v", before)
 	}
-	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.modal.kind == modalCommand {
 		t.Fatal("enter should select in the palette even with select unbound; palette stayed open")
 	}

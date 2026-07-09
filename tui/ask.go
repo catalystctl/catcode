@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // askPrompt is the TUI state for a pending `ask` tool call. The core emits an
@@ -125,7 +125,12 @@ func parseAskRequest(requestID string, raw json.RawMessage) *askPrompt {
 				ti.Placeholder = "Type a custom answer…"
 			}
 		}
-		ti.PlaceholderStyle = placeholderStyle
+		// textinput v2 dropped the public PlaceholderStyle field; the placeholder
+		// style now lives on Styles().{Focused,Blurred}.Placeholder.
+		st := ti.Styles()
+		st.Focused.Placeholder = placeholderStyle
+		st.Blurred.Placeholder = placeholderStyle
+		ti.SetStyles(st)
 		q.input = ti
 		out.questions = append(out.questions, q)
 	}
@@ -180,7 +185,7 @@ func (s *session) sendAskReply(a *askPrompt, answers any) {
 }
 
 // handleAskKey owns all keys while the ask flyout is open.
-func (s *session) handleAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	a := s.pendingAsk
 	if a == nil {
 		return s, nil
@@ -332,7 +337,7 @@ func (s *session) renderAskBox() string {
 			b.WriteString("    " + hint + "\n")
 		} else {
 			// Text input (text question, or select-in-custom-mode).
-			q.input.Width = inner - 8
+			q.input.SetWidth(inner - 8)
 			if q.isCustom() {
 				b.WriteString("    " + mutedStyle.Render("Custom answer:") + "\n")
 			}

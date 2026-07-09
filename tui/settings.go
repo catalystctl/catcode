@@ -42,7 +42,7 @@ type settingsStore struct {
 	ProviderKeys   map[string]string `json:"provider_keys,omitempty"`
 
 	// Custom keybindings (TUI-only). Maps action name → canonical key (the
-	// string tea.KeyMsg.String() produces). Only user overrides are stored; the
+	// string tea.KeyPressMsg.String() produces). Only user overrides are stored; the
 	// full effective map (defaults + overrides) is computed at startup via
 	// effectiveKeybinds(). See keybinds.go.
 	Keybinds map[string]string `json:"keybinds,omitempty"`

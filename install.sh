@@ -46,7 +46,7 @@ DEFAULT_HOST="0.0.0.0"
 STATE_FILE="/etc/catalyst-code/installer.state"
 UNIT_NAME="catalyst-code-web.service"   # systemd unit (Linux)
 LAUNCHD_LABEL="com.catalyst-code.web"   # launchd agent (macOS)
-GO_MIN="1.24.2"
+GO_MIN="1.25.0"
 
 # ── platform ────────────────────────────────────────────────
 PLATFORM="$(uname -s)"   # Linux | Darwin

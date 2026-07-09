@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestTypingDuringBusy proves the chat input stays editable while a turn runs.
@@ -36,7 +36,7 @@ func TestTypingDuringBusy(t *testing.T) {
 	// no-op without a running core, but queuedNext must flip and the input
 	// must clear).
 	s.queuedNext = false
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.input.Value() != "" {
 		t.Fatalf("input should clear after queuing a follow-up; got %q", s.input.Value())
 	}

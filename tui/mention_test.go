@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // typeRune types a string into the session input via handleKey, the way a
@@ -131,7 +131,7 @@ func TestMentionEnterWithNoMatchesSends(t *testing.T) {
 		t.Fatalf("expected no matches, got %v", itemsDisplay(s.mentionItems))
 	}
 	// Enter should fall through (no match) and send the line.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.mentionActive {
 		t.Fatal("sending the message should clear the flyout")
 	}
@@ -170,7 +170,7 @@ func TestMentionRendersInFullView(t *testing.T) {
 		t.Fatal("flyout should be active")
 	}
 	s.layout()
-	out := s.View()
+	out := s.View().Content
 	if !strings.Contains(out, "navigate") {
 		t.Fatal("flyout hint should appear in the full view")
 	}

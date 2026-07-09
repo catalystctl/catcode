@@ -2,30 +2,22 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
+// ansiRe matches CSI escape sequences (SGR colors, cursor moves, clears, …).
+// lipgloss v2 emits 24-bit SGR like \x1b[38;2;r;g;bm and bare \x1b[m resets;
+// the old char-walker stayed in "skip" mode after the final 'm' and ate a
+// following 'm' (e.g. the first letter of "main.go"), so use a real regex.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
 func stripANSI(s string) string {
-	var b strings.Builder
-	in := false
-	for _, r := range s {
-		if r == 0x1b {
-			in = true
-			continue
-		}
-		if in {
-			if r == 'm' || r == 'H' || r == 'J' || r == 'K' || r == '[' || r == ';' || r == '?' || (r >= '0' && r <= '9') {
-				continue
-			}
-			in = false
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
+	return ansiRe.ReplaceAllString(s, "")
 }
 
 func TestRenderSmoke(t *testing.T) {
@@ -170,10 +162,10 @@ func TestScrollFollow(t *testing.T) {
 
 	// streaming while paused keeps the view offset (no yank)
 	s.follow = false
-	yoff := s.viewport.YOffset
+	yoff := s.viewport.YOffset()
 	s.logInfo("a new line arrives while reading")
-	if s.viewport.YOffset != yoff {
-		t.Errorf("view yanked while paused: was %d now %d", yoff, s.viewport.YOffset)
+	if s.viewport.YOffset() != yoff {
+		t.Errorf("view yanked while paused: was %d now %d", yoff, s.viewport.YOffset())
 	}
 }
 
@@ -302,10 +294,14 @@ func TestThemeAndMetrics(t *testing.T) {
 	t.Logf("LONG LIST:\n%s", body)
 }
 
-// keyMsg builds a tea.KeyMsg from its string form (tea.KeyType defaults to
-// KeyRunes so the String() matches).
-func keyMsg(name string) tea.KeyMsg {
-	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(name)}
+// keyMsg builds a tea.KeyPressMsg from its string form. v2 KeyPressMsg carries
+// Code (the rune) and Text (the printed string); String() derives from Text.
+func keyMsg(name string) tea.KeyPressMsg {
+	r := []rune(name)
+	if len(r) == 0 {
+		return tea.KeyPressMsg{}
+	}
+	return tea.KeyPressMsg{Code: r[0], Text: name}
 }
 
 // TestFullView assembles the complete chrome (header + viewport + position bar
@@ -332,7 +328,7 @@ func TestFullView(t *testing.T) {
 	s.invalidateAll()
 	s.refresh()
 
-	view := stripANSI(s.View())
+	view := stripANSI(s.View().Content)
 	for _, want := range []string{"Catalyst Code", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "tok/s", "Chat with the agent"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("full view missing %q:\n%s", want, view)
@@ -421,7 +417,7 @@ func TestSubToolCollapse(t *testing.T) {
 	s.invalidateAll()
 	s.refresh()
 
-	rendered := stripANSI(s.renderBlock(sub, s.viewport.Width))
+	rendered := stripANSI(s.renderBlock(sub, s.viewport.Width()))
 	// collapsed: a dim one-liner with the name + args, NO result panel body
 	if !strings.Contains(rendered, "read_file") || !strings.Contains(rendered, "src/main.rs") {
 		t.Errorf("sub-tool line missing name/args:\n%s", rendered)
@@ -446,7 +442,7 @@ func TestToolOutputTruncation(t *testing.T) {
 	tb.dur = 10 * time.Millisecond
 	s.invalidateAll()
 
-	collapsed := stripANSI(s.renderBlock(tb, s.viewport.Width))
+	collapsed := stripANSI(s.renderBlock(tb, s.viewport.Width()))
 	if !strings.Contains(collapsed, "line3") {
 		t.Errorf("collapsed should show first 3 lines:\n%s", collapsed)
 	}
@@ -458,7 +454,7 @@ func TestToolOutputTruncation(t *testing.T) {
 	}
 
 	tb.expanded = true
-	expanded := stripANSI(s.renderBlock(tb, s.viewport.Width))
+	expanded := stripANSI(s.renderBlock(tb, s.viewport.Width()))
 	if !strings.Contains(expanded, "line5") {
 		t.Errorf("expanded should show full output:\n%s", expanded)
 	}

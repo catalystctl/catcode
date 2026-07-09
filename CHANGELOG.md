@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — TUI modified Enter in SSH/Konsole
+- **Shift+Enter** now inserts a newline reliably in terminals that support
+  enhanced keyboard reporting (including Konsole over SSH). The TUI enables
+  xterm `modifyOtherKeys` level 2 and Kitty progressive keyboard reporting
+  after Bubble Tea enters the alternate screen, so modified Enter keys are
+  reported distinctly instead of arriving as plain Enter or leaking `OM` into
+  the input.
+- **Ctrl+Enter** now steers instead of queueing a follow-up when the terminal
+  reports the modifier. Enhanced Ctrl+letter reports are translated back into
+  Bubble Tea's normal key messages, preserving existing bindings such as
+  Ctrl+C, Ctrl+P, Ctrl+K, Ctrl+T, and Ctrl+O.
+- Added regression coverage for modified-Enter CSI sequences and the legacy
+  SS3 keypad-Enter fallback.
+
 ### Added — cross-platform installers & standalone executables
 - All three desktop platforms now ship BOTH a native installer AND a
   self-contained standalone executable, so `catcode` runs from the terminal with

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -13,7 +13,7 @@ import (
 //
 // Every key the TUI matches is routed through a named action in a keymap so the
 // user can rebind it via /keybinds. The keymap is a map[actionName]canonicalKey
-// where canonicalKey is the string form that tea.KeyMsg.String() produces
+// where canonicalKey is the string form that tea.KeyPressMsg.String() produces
 // (e.g. "ctrl+t", "enter", "pgup"). Defaults are declared in keybindDefs; user
 // overrides are persisted in settings.json and merged over the defaults on load.
 //
@@ -27,7 +27,7 @@ type keybindDef struct {
 	Action  string // stable id, used as the keymap key and in settings.json
 	Group   string // display group (Global, Scrolling, …)
 	Desc    string // human-readable description
-	Default string // default canonical key (tea.KeyMsg.String() form)
+	Default string // default canonical key (tea.KeyPressMsg.String() form)
 }
 
 // keybindDefs is the complete, ordered list of every bindable action. This is
@@ -135,21 +135,35 @@ var caseInsensitiveActions = map[string]bool{
 // in caseInsensitiveActions are compared case-insensitively (so "y" matches
 // "Y"); everything else — including multi-character key names (ctrl+t, enter,
 // pgup, …) and vim-style nav alts (j/k/h/l) — is compared exactly.
-func (s *session) kb(msg tea.KeyMsg, action string) bool {
+func (s *session) kb(msg tea.KeyPressMsg, action string) bool {
 	key, ok := s.keybinds[action]
 	if !ok || key == "" {
 		return false
 	}
 	got := msg.String()
+	// Bubble Tea v2 renders the space bar as "space" (v1 returned " "). The
+	// vision_toggle default is stored as " ", so normalize both sides so existing
+	// settings keep working and a freshly captured space binds consistently.
+	got = spaceNorm(got)
+	key = spaceNorm(key)
 	if caseInsensitiveActions[action] && len([]rune(key)) == 1 {
 		return strings.EqualFold(got, key)
 	}
 	return got == key
 }
 
+// spaceNorm maps the two space representations to one canonical form so kb()
+// matches regardless of which Bubble Tea major version emitted the key string.
+func spaceNorm(s string) string {
+	if s == " " {
+		return "space"
+	}
+	return s
+}
+
 // kbAny reports whether msg matches any of the named actions (shortcut for the
 // common "primary OR alternate" pattern, e.g. command_palette / command_palette_alt).
-func (s *session) kbAny(msg tea.KeyMsg, actions ...string) bool {
+func (s *session) kbAny(msg tea.KeyPressMsg, actions ...string) bool {
 	for _, a := range actions {
 		if s.kb(msg, a) {
 			return true
@@ -160,7 +174,7 @@ func (s *session) kbAny(msg tea.KeyMsg, actions ...string) bool {
 
 // isBindableKey reports whether a canonical key string is acceptable as a
 // binding. Rejects empty/blank strings and a few sentinel values that
-// tea.KeyMsg can produce for non-physical-key events. Everything else (ctrl+*,
+// tea.KeyPressMsg can produce for non-physical-key events. Everything else (ctrl+*,
 // enter, esc, pgup, single chars, …) is bindable.
 func isBindableKey(key string) bool {
 	if key == "" {
@@ -223,7 +237,7 @@ func (s *session) openKeybindsModal() {
 // (up/down/enter/esc) in addition to the keymap bindings, so the modal stays
 // usable even if the user disables all nav/select/close bindings — you can
 // never trap yourself inside the keybinds editor.
-func (s *session) handleKeybindsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleKeybindsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	n := len(keybindDefs)
 
 	if s.modal.editing {

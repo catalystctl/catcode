@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -31,36 +32,70 @@ import (
 const (
 	headerLines      = 3 // brand row + cwd row + separator
 	positionBarLines = 1 // scroll-position / new-messages bar
-	minBodyLines     = 3
 )
 
-func (s *session) layout() {
+// relayoutHeights recomputes the viewport height to fit the current input-box
+// height + panels and applies it. It is CHEAP: it does not re-render the
+// transcript blocks (their content is unchanged; only the viewport's visible
+// window height moves). Called after every input update so a growing
+// multi-line input shrinks the viewport instead of pushing the footer off the
+// bottom of the screen.
+func (s *session) relayoutHeights() {
 	if !s.ready {
 		return
 	}
-	extra := s.activeTasksHeight()
+	// Fixed-height optional panels (everything except the active-tasks panel,
+	// whose entry count we cap below to fit).
+	fixedExtra := 0
 	if s.updateInfo != nil {
-		extra++
+		fixedExtra++
 	}
 	if s.pendingApproval != nil {
-		extra += s.approvalHeight()
+		fixedExtra += s.approvalHeight()
 	}
 	if s.pendingIntercom != nil {
-		extra++
+		fixedExtra++
 	}
-	extra += s.mentionFlyoutHeight()
-	extra += s.todoPanelHeight() + s.queueBannerHeight()
-	h := s.height - headerLines - positionBarLines - s.footerHeight() - extra
-	if h < minBodyLines {
-		h = minBodyLines
+	fixedExtra += s.mentionFlyoutHeight()
+	fixedExtra += s.todoPanelHeight() + s.queueBannerHeight()
+	// Space left for the viewport + the active-tasks panel, leaving 1 line of
+	// slack for v2's cursed renderer (it scrolls/overlaps when the view fills
+	// the terminal exactly).
+	avail := s.height - headerLines - positionBarLines - s.footerHeight() - fixedExtra - 1
+	// Cap the active-tasks panel so it (plus a 1-line viewport) fits the
+	// available height. Each entry renders up to 2 rows; the panel adds 3
+	// (border + header). Measured AFTER setting the cap so activeTasksHeight()
+	// reflects the truncated panel.
+	const perEntry, panelOverhead, minViewport = 2, 3, 1
+	fit := (avail - panelOverhead - minViewport) / perEntry
+	if fit > 4 {
+		fit = 4
 	}
+	if fit < 0 {
+		fit = 0
+	}
+	s.maxTaskRows = fit
+	tasksH := s.activeTasksHeight()
+	h := avail - tasksH
+	if h < 0 {
+		h = 0 // panels fill the screen; hide the transcript rather than overflow
+	}
+	s.viewport.SetWidth(s.width)
+	s.viewport.SetHeight(h)
+	s.input.SetWidth(s.width - 4)
+}
+
+// layout recomputes heights AND re-renders the transcript. Use it on events
+// that change or re-wrap the blocks (terminal resize, task start/finish). For
+// input-only changes (typing/pasting) use relayoutHeights() — re-rendering
+// every keystroke is expensive.
+func (s *session) layout() {
+	prevW, prevH := s.viewport.Width(), s.viewport.Height()
+	s.relayoutHeights()
 	// width/height changed → cached wrapped renders are stale; re-render.
-	if s.viewport.Width != s.width || s.viewport.Height != h {
+	if s.viewport.Width() != prevW || s.viewport.Height() != prevH {
 		s.invalidateAll()
 	}
-	s.viewport.Width = s.width
-	s.viewport.Height = h
-	s.input.Width = s.width - 4
 	s.refresh()
 }
 
@@ -104,7 +139,7 @@ func (s *session) renderPositionBar() string {
 		w = 1
 	}
 	// lines hidden below the current viewport window (0 when pinned to bottom)
-	below := s.viewport.TotalLineCount() - s.viewport.YOffset - s.viewport.VisibleLineCount()
+	below := s.viewport.TotalLineCount() - s.viewport.YOffset() - s.viewport.VisibleLineCount()
 	if below < 0 {
 		below = 0
 	}
@@ -466,18 +501,25 @@ func (s *session) renderInputBox() string {
 
 // maxInputLines caps the input box height: a very long message shows a
 // cursor-centered window (with … markers) instead of consuming the screen.
-const maxInputLines = 8
+const maxInputLines = 5
 
 // inputContent renders the chat input value soft-wrapped to width w, with the
 // textinput cursor cell placed on the correct wrapped line. Returns the
-// placeholder when the value is empty. Reuses s.input.Cursor so blink and
-// focus/blur behavior are identical to the stock textinput (which also calls
-// Cursor.SetChar + Cursor.View() per render).
+// placeholder when the value is empty. textinput v2 no longer exposes its
+// internal Cursor (SetChar/View) or top-level TextStyle/PlaceholderStyle
+// fields, so the active StyleState (Focused/Blurred) is read via Styles() and
+// the cursor cell is rendered directly as reverse video when focused.
 func (s *session) inputContent(w int) string {
 	if w < 1 {
 		w = 1
 	}
 	value := s.input.Value()
+	// Active style state depends on focus; v2 keeps Focused()/Styles().
+	st := s.input.Styles()
+	active := st.Focused
+	if !s.input.Focused() {
+		active = st.Blurred
+	}
 	if value == "" {
 		ph := s.input.Placeholder
 		// When a subagent is waiting on an intercom reply, make it obvious the
@@ -489,7 +531,7 @@ func (s *session) inputContent(w int) string {
 		if ph == "" {
 			return ""
 		}
-		return s.input.PlaceholderStyle.Render(truncateRunes(ph, w))
+		return active.Placeholder.Render(truncateRunes(ph, w))
 	}
 	pos := s.input.Position()
 	r := []rune(value)
@@ -565,15 +607,21 @@ func (s *session) inputContent(w int) string {
 		restLines = wrapRunesMultiline(restAfter, w)
 	}
 
-	styleText := s.input.TextStyle.Inline(true).Render
+	styleText := active.Text.Inline(true).Render
 	out := make([]string, 0, cLine+1+len(restLines)+1)
 	for i := 0; i < cLine; i++ {
 		out = append(out, styleText(string(beforeLines[i])))
 	}
-	// cursor line: text before cursor + cursor cell + text after (on this line)
+	// cursor line: text before cursor + cursor cell + text after (on this line).
+	// v2 dropped textinput's internal Cursor.SetChar/View, so the cursor cell is
+	// rendered as reverse video when focused (a solid block cursor) and plain
+	// text when blurred — focus/blur distinction is preserved.
 	line := styleText(string(beforeLines[cLine]))
-	s.input.Cursor.SetChar(curChar)
-	line += s.input.Cursor.View()
+	if s.input.Focused() {
+		line += lipgloss.NewStyle().Reverse(true).Render(curChar)
+	} else {
+		line += styleText(curChar)
+	}
 	if len(restOnLine) > 0 {
 		line += styleText(string(restOnLine))
 	}
@@ -675,12 +723,12 @@ func (s *session) footerHeight() int {
 // context budget is shown in the footer instead. Add per-scout metrics if the
 // core grows a subagent-usage event.
 func (s *session) renderActiveTasks(w int) string {
-	if len(s.subProgress) == 0 {
+	if len(s.subProgress) == 0 || s.maxTaskRows == 0 {
 		return ""
 	}
 	entries := s.subProgress
-	if len(entries) > 4 {
-		entries = entries[:4]
+	if len(entries) > s.maxTaskRows {
+		entries = entries[:s.maxTaskRows]
 	}
 	var rows []string
 	for _, e := range entries {
@@ -824,44 +872,64 @@ func (s *session) queueBannerHeight() int {
 	return 1
 }
 
-func (s *session) View() string {
+func (s *session) View() tea.View {
+	var content string
 	if !s.ready {
-		return baseStyle.Render("starting core…")
-	}
-	parts := []string{
-		s.renderHeader(),
-		s.renderSeparator(),
-	}
-	if b := s.renderUpdateBanner(); b != "" {
-		parts = append(parts, b)
-	}
-	parts = append(parts, s.viewport.View(), s.renderPositionBar())
-	if p := s.renderTodoPanel(); p != "" {
-		parts = append(parts, p)
-	}
-	if q := s.renderQueueBanner(); q != "" {
-		parts = append(parts, q)
-	}
-	if s.pendingApproval != nil {
-		parts = append(parts, s.renderApprovalBanner())
-	}
-	if s.pendingIntercom != nil {
-		parts = append(parts, s.renderIntercomBanner())
-	}
+		content = baseStyle.Render("starting core…")
+	} else {
+		// Recompute the viewport height from the CURRENT input-box + tasks-panel
+		// height on every render. This is the single source of truth: paths that
+		// mutate the input (insertNewline on Shift+Enter, paste) or the tasks panel
+		// (mid-run tool updates) don't all call relayoutHeights themselves, so doing
+		// it here guarantees the viewport shrinks to fit before we render — no
+		// overflow that pushes the footer off-screen between events. It's cheap
+		// (height math only; no transcript block re-render).
+		s.relayoutHeights()
+		parts := []string{
+			s.renderHeader(),
+			s.renderSeparator(),
+		}
+		if b := s.renderUpdateBanner(); b != "" {
+			parts = append(parts, b)
+		}
+		parts = append(parts, s.viewport.View(), s.renderPositionBar())
+		if p := s.renderTodoPanel(); p != "" {
+			parts = append(parts, p)
+		}
+		if q := s.renderQueueBanner(); q != "" {
+			parts = append(parts, q)
+		}
+		if s.pendingApproval != nil {
+			parts = append(parts, s.renderApprovalBanner())
+		}
+		if s.pendingIntercom != nil {
+			parts = append(parts, s.renderIntercomBanner())
+		}
 
-	if p := s.renderActiveTasks(s.width); p != "" {
-		parts = append(parts, p)
+		if p := s.renderActiveTasks(s.width); p != "" {
+			parts = append(parts, p)
+		}
+		if f := s.renderMentionFlyout(); f != "" {
+			parts = append(parts, f)
+		}
+		parts = append(parts, s.renderInputBox(), s.renderFooter())
+		view := strings.Join(parts, "\n")
+		if s.modal.kind != modalNone {
+			view = s.renderModalOverlay(view)
+		}
+		// ask flyout: a blocking `ask` prompt renders as a centered overlay on
+		// top of the full view (like the modal above). renderAskOverlay is a
+		// no-op (returns base unchanged) when s.pendingAsk is nil.
+		content = s.renderAskOverlay(view)
 	}
-	if f := s.renderMentionFlyout(); f != "" {
-		parts = append(parts, f)
+	v := tea.NewView(content)
+	// v2 is declarative: alt-screen + mouse mode are View fields, not program
+	// options. The renderer also always enables Kitty progressive-keyboard
+	// disambiguation + xterm modifyOtherKeys level 2 (restoring them on exit),
+	// so modified keys (Shift/Ctrl+Enter, Esc) arrive as real KeyPressMsgs.
+	v.AltScreen = true
+	if s.settings.MouseWheel {
+		v.MouseMode = tea.MouseModeCellMotion
 	}
-	parts = append(parts, s.renderInputBox(), s.renderFooter())
-	view := strings.Join(parts, "\n")
-	if s.modal.kind != modalNone {
-		view = s.renderModalOverlay(view)
-	}
-	// ask flyout: a blocking `ask` prompt renders as a centered overlay on top
-	// of the full view (like the modal above). renderAskOverlay is a no-op
-	// (returns base unchanged) when s.pendingAsk is nil.
-	return s.renderAskOverlay(view)
+	return v
 }

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestInputBoxRendersLiteralNewline: a value containing a line break renders
@@ -96,37 +96,31 @@ func TestInsertNewlineAtCursor(t *testing.T) {
 	}
 }
 
-// TestShiftEnterCSIInsertsNewline simulates the Kitty/xterm Shift+Enter CSI
-// arriving as bubbletea's unrecognized-CSI message and verifies it inserts a
-// line break (rather than, say, sending the message).
-func TestShiftEnterCSIInsertsNewline(t *testing.T) {
+// TestShiftEnterInsertsNewline: in v2, modified Enter arrives as a real
+// KeyPressMsg with modifier bits (Code: KeyEnter, Mod: ModShift). handleKey's
+// kb(msg, "newline") matches it (String() == "shift+enter") and inserts a line
+// break rather than sending the message.
+func TestShiftEnterInsertsNewline(t *testing.T) {
 	s := newInputSession(t, 60)
 	s.input.SetValue("foo")
 	s.input.SetCursor(len(s.input.Value())) // cursor at end
 
-	// A plain []byte has the same reflect shape as bubbletea's unexported
-	// unknownCSISequenceMsg, so Update()'s default arm reaches it via reflection.
-	for _, csi := range [][]byte{[]byte("\x1b[13;2u"), []byte("\x1b[27;2;13~")} {
-		s.input.Reset()
-		s.input.SetValue("foo")
-		s.input.SetCursor(len(s.input.Value()))
-		m, _ := s.Update(csi)
-		if m != s {
-			t.Fatalf("Update should return the same session")
-		}
-		if got := s.input.Value(); got != "foo\n" {
-			t.Fatalf("CSI %q should insert a newline → %q, got %q", csi, "foo\\n", got)
-		}
+	m, _ := s.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
+	if m != s {
+		t.Fatalf("Update should return the same session")
+	}
+	if got := s.input.Value(); got != "foo\n" {
+		t.Fatalf("Shift+Enter should insert a newline → %q, got %q", "foo\\n", got)
 	}
 }
 
-// TestShiftEnterCSIDoesNothingInModal: a Shift+Enter while a modal is open must
+// TestShiftEnterDoesNothingInModal: a Shift+Enter while a modal is open must
 // not mutate the input (it has no meaning there).
-func TestShiftEnterCSIDoesNothingInModal(t *testing.T) {
+func TestShiftEnterDoesNothingInModal(t *testing.T) {
 	s := newInputSession(t, 60)
 	s.input.SetValue("foo")
 	s.openSettings() // any modal
-	m, _ := s.Update([]byte("\x1b[13;2u"))
+	m, _ := s.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
 	if m != s {
 		t.Fatalf("Update should return the same session")
 	}
@@ -144,7 +138,7 @@ func TestSentMultilineMessageKeepsBreaks(t *testing.T) {
 
 	// render the pushed user block the same way the transcript does
 	b := s.blocks[len(s.blocks)-1]
-	rendered := stripANSI(s.renderBlock(b, s.viewport.Width))
+	rendered := stripANSI(s.renderBlock(b, s.viewport.Width()))
 	lines := strings.Split(rendered, "\n")
 
 	// find the two source lines on distinct rows
@@ -165,109 +159,5 @@ func TestSentMultilineMessageKeepsBreaks(t *testing.T) {
 		if strings.Contains(ln, "line1") && strings.Contains(ln, "line2") {
 			t.Fatalf("both lines collapsed onto one row: %q", ln)
 		}
-	}
-}
-func TestIsShiftEnterUnknownCSI(t *testing.T) {
-	cases := []struct {
-		name string
-		msg  tea.Msg
-		want bool
-	}{
-		{"kitty_csi_u", []byte("\x1b[13;2u"), true},
-		{"xterm_modifyother", []byte("\x1b[27;2;13~"), true},
-		{"ctrl_enter_kitty", []byte("\x1b[13;5u"), false},
-		{"ctrl_enter_xterm", []byte("\x1b[27;5;13~"), false},
-		{"plain_enter_cr", []byte("\r"), false},
-		{"empty", []byte(""), false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := isShiftEnterUnknownCSI(c.msg); got != c.want {
-				t.Errorf("isShiftEnterUnknownCSI(%q) = %v, want %v", c.msg, got, c.want)
-			}
-		})
-	}
-	if isShiftEnterUnknownCSI(tea.KeyMsg{Type: tea.KeyEnter}) {
-		t.Error("KeyMsg should not match")
-	}
-}
-
-// TestSS3EnterClassification covers the two halves of an \x1bOM (SS3
-// keypad-Enter) sequence as bubbletea v1.3.10 splits it: an Alt-'O' lead and
-// a plain 'M' trailer.
-func TestSS3EnterClassification(t *testing.T) {
-	lead := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true}
-	trail := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}}
-	if !isSS3EnterLead(lead) {
-		t.Error("Alt+'O' KeyRunes should be the SS3 Enter lead")
-	}
-	if isSS3EnterLead(trail) {
-		t.Error("plain 'M' should not be the SS3 Enter lead")
-	}
-	if !isSS3EnterRune(trail) {
-		t.Error("plain 'M' KeyRunes should be the SS3 Enter trailing rune")
-	}
-	if isSS3EnterRune(lead) {
-		t.Error("Alt+'O' should not be the SS3 Enter trailing rune")
-	}
-	// plain 'O' (no Alt) is NOT the lead — the ESC prefix is what sets Alt.
-	if isSS3EnterLead(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}}) {
-		t.Error("plain 'O' without Alt should not be the SS3 Enter lead")
-	}
-	if isSS3EnterLead(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}, Alt: true}) {
-		t.Error("Alt+'A' should not be the SS3 Enter lead")
-	}
-}
-
-// TestShiftEnterSS3InsertsNewline: VS Code's and Konsole's terminals send
-// \x1bOM (SS3 keypad-Enter) for Shift+Enter. bubbletea v1.3.10 has no \x1bOM
-// mapping and it's not a CSI, so detectOneMsg splits it into two KeyMsgs —
-// Alt-'O' then 'M'. handleKey must buffer the lead and resolve the trailing
-// 'M' as a Shift+Enter → insertNewline (rather than leaking "OM" into input).
-func TestShiftEnterSS3InsertsNewline(t *testing.T) {
-	s := newInputSession(t, 60)
-	s.input.SetValue("foo")
-	s.input.SetCursor(len(s.input.Value()))
-
-	// First half of \x1bOM: Alt-'O'. Consumed (sets pendingSS3), nothing inserted.
-	m, _ := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true})
-	if m != s {
-		t.Fatalf("Update should return the same session")
-	}
-	if got := s.input.Value(); got != "foo" {
-		t.Fatalf("Alt-'O' lead should not insert anything, got %q", got)
-	}
-	// Second half: plain 'M'. Resolves as Shift+Enter → insertNewline.
-	m, _ = s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
-	if m != s {
-		t.Fatalf("Update should return the same session")
-	}
-	if got := s.input.Value(); got != "foo\n" {
-		t.Fatalf("trailing 'M' of \\x1bOM should insert a newline → %q, got %q", "foo\\n", got)
-	}
-	if s.pendingSS3 {
-		t.Fatalf("pendingSS3 should be cleared after resolving")
-	}
-}
-
-// TestSS3LeadFollowedByOtherKeyDropsO: if the Alt-'O' lead is NOT followed by
-// 'M' (a spurious Alt-'O', rare), the buffered 'O' is dropped and the
-// following key is handled normally — pendingSS3 must not get stuck.
-func TestSS3LeadFollowedByOtherKeyDropsO(t *testing.T) {
-	s := newInputSession(t, 60)
-	s.input.SetValue("foo")
-	s.input.SetCursor(len(s.input.Value()))
-
-	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true}) // lead
-	m, _ := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
-	if m != s {
-		t.Fatalf("Update should return the same session")
-	}
-	if s.pendingSS3 {
-		t.Fatalf("pendingSS3 should be cleared after a non-'M' follow-up")
-	}
-	// 'O' is dropped (Alt-'O' isn't a real chat input); 'x' is inserted normally.
-	if got := s.input.Value(); got != "foox" {
-		t.Fatalf("after spurious Alt-'O' + 'x', input should be %q, got %q", "foox", got)
 	}
 }

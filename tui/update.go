@@ -30,13 +30,13 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 const (
-	githubRepo      = "catalystctl/catcode"
-	updateCacheTTL  = 6 * time.Hour
+	githubRepo       = "catalystctl/catcode"
+	updateCacheTTL   = 6 * time.Hour
 	updateAPITimeout = 12 * time.Second
 	updateDLOTimeout = 10 * time.Minute
 )

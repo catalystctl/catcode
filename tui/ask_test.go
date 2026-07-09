@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // askRequestEvent builds a *coreEvent simulating the core's `ask_request`
@@ -105,7 +105,7 @@ func TestAskSubmitSendsReplyAndClears(t *testing.T) {
 	}
 
 	// Enter on a select defaults to the first option ("Ephemeral").
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.pendingAsk != nil {
 		t.Fatal("Enter should submit the answer and clear s.pendingAsk")
 	}
@@ -125,7 +125,7 @@ func TestAskSkipClears(t *testing.T) {
 		t.Fatal("setup: ask_request did not set pendingAsk")
 	}
 
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if s.pendingAsk != nil {
 		t.Fatal("Esc should skip the ask prompt and clear s.pendingAsk")
 	}
@@ -154,38 +154,38 @@ func TestAskNavigationKeys(t *testing.T) {
 	}
 
 	// ↓ moves to question 2.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.pendingAsk.focusIdx != 1 {
 		t.Fatalf("Down should move focus 0→1; got %d", s.pendingAsk.focusIdx)
 	}
 	// ↓ at the last question clamps (no wrap).
-	s.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.pendingAsk.focusIdx != 1 {
 		t.Fatalf("Down at last should clamp; got %d", s.pendingAsk.focusIdx)
 	}
 	// ↑ moves back to question 1.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if s.pendingAsk.focusIdx != 0 {
 		t.Fatalf("Up should move focus 1→0; got %d", s.pendingAsk.focusIdx)
 	}
 	// ↑ at the first question clamps.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
 	if s.pendingAsk.focusIdx != 0 {
 		t.Fatalf("Up at first should clamp; got %d", s.pendingAsk.focusIdx)
 	}
 	// Tab also moves forward.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	if s.pendingAsk.focusIdx != 1 {
 		t.Fatalf("Tab should move focus 0→1; got %d", s.pendingAsk.focusIdx)
 	}
 	// j (nav_down_alt) also moves forward from 0.
 	s.pendingAsk.focusIdx = 0
-	s.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	s.handleKey(tea.KeyPressMsg{Code: 'j', Text: "j"})
 	if s.pendingAsk.focusIdx != 1 {
 		t.Fatalf("j should move focus 0→1; got %d", s.pendingAsk.focusIdx)
 	}
 	// k (nav_up_alt) moves back.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	s.handleKey(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	if s.pendingAsk.focusIdx != 0 {
 		t.Fatalf("k should move focus 1→0; got %d", s.pendingAsk.focusIdx)
 	}
@@ -210,7 +210,7 @@ func TestAskRequiredErrorIsInlineNotSpam(t *testing.T) {
 
 	// Mash Enter 6× on the empty required text field.
 	for i := 0; i < 6; i++ {
-		s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+		s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	}
 
 	// The flyout must still be open (submit was blocked by the empty required field).
@@ -233,7 +233,7 @@ func TestAskRequiredErrorIsInlineNotSpam(t *testing.T) {
 	}
 
 	// Typing clears the stale inline error.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	s.handleKey(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	if s.pendingAsk.errMsg != "" {
 		t.Fatal("typing should clear the stale inline error")
 	}

@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ func (s *session) evalMention() {
 // handleMentionNav owns arrow/tab/enter/esc while the flyout is open. Returns
 // true when it consumed the key. Printable/editing keys return false so they
 // flow into the input (and then evalMention re-runs).
-func (s *session) handleMentionNav(msg tea.KeyMsg) bool {
+func (s *session) handleMentionNav(msg tea.KeyPressMsg) bool {
 	if !s.mentionActive {
 		return false
 	}

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // nopWriteCloser is a non-nil io.WriteCloser sink so sendCore's coreIn-nil guard
@@ -57,7 +57,7 @@ func TestEscDropsQueuedFollowUp(t *testing.T) {
 	s.queued = &queuedMsg{kind: "follow-up", text: "then do X"}
 	s.queuedNext = true
 
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if s.queued != nil {
 		t.Fatalf("Esc should clear the queued message; still set: %+v", s.queued)
@@ -79,7 +79,7 @@ func TestEscAbortsWhenNothingQueued(t *testing.T) {
 	s.queued = nil
 	s.queuedNext = false
 
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if got := sentType(s); got != "abort" {
 		t.Fatalf("Esc with nothing queued should send abort, got %q", got)
@@ -93,7 +93,7 @@ func TestEscDropsQueuedSteer(t *testing.T) {
 	s.queued = &queuedMsg{kind: "steer", text: "refocus"}
 	s.queuedNext = true
 
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if s.queued != nil {
 		t.Fatalf("Esc should clear the queued steer; still set: %+v", s.queued)

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestIntercomEmptyEnterNudges guards against the regression where hitting
@@ -29,7 +29,7 @@ func TestIntercomEmptyEnterNudges(t *testing.T) {
 	s.layout()
 
 	// Empty Enter: must not clear the prompt (no reply sent) and must arm the nudge.
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.pendingIntercom == nil {
 		t.Fatal("empty Enter must NOT send an intercom_reply (pendingIntercom was cleared)")
 	}
@@ -59,7 +59,7 @@ func TestIntercomTypedEnterReplies(t *testing.T) {
 	s.input.Focus()
 	s.layout()
 
-	s.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.pendingIntercom != nil {
 		t.Fatal("typed Enter should send the reply and clear pendingIntercom")
 	}

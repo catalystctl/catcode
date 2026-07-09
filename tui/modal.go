@@ -5,17 +5,18 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
 // Modal framework
 //
 // An overlay layer that renders on top of the viewport and intercepts keys.
-// Four modal kinds share a filterable-list core; the settings modal adds
-// editable/cyclable fields. Rendering is a centred bordered box via Place.
+// List modals share a filterable-list core; value-edit modals capture a single
+// free-form field (API key, timeouts). /settings is a hub that opens the
+// dedicated modal (or slash command) for each preference.
 // ---------------------------------------------------------------------------
 
 type modalKind int
@@ -24,7 +25,7 @@ const (
 	modalNone modalKind = iota
 	modalCommand
 	modalModels
-	modalSettings
+	modalSettings // hub of setting commands → dedicated modals
 	modalHelp
 	modalTheme
 	modalSessions
@@ -36,16 +37,31 @@ const (
 	modalKeybinds
 	modalOauthCode
 	modalContext
+	modalApproval
+	modalSandbox
+	modalAutoCompact
+	modalNoNetwork
+	modalMouseWheel
+	modalValueEdit // free-form edit (api_key, bash_timeout, idle_timeout, max_session_tokens)
+)
+
+// Value-edit targets for modalValueEdit (stored in modal.editTarget).
+const (
+	editTargetAPIKey            = "api_key"
+	editTargetBashTimeout       = "bash_timeout"
+	editTargetIdleTimeout       = "idle_timeout"
+	editTargetMaxSessionTokens  = "max_session_tokens"
 )
 
 type modal struct {
-	kind     modalKind
-	filter   string // typed filter (list modals)
-	cursor   int    // selected index in the filtered list
-	scroll   int    // help modal vertical scroll
-	fieldIdx int    // settings: active field
-	editing  bool   // settings: a field is being edited
-	editBuf  textinput.Model
+	kind       modalKind
+	filter     string // typed filter (list modals)
+	cursor     int    // selected index in the filtered list
+	scroll     int    // help modal vertical scroll
+	fieldIdx   int    // legacy field index (unused by hub; kept for edit buffer routing)
+	editing    bool   // value-edit / login key capture
+	editBuf    textinput.Model
+	editTarget string // which setting modalValueEdit is editing
 }
 
 // openReasoningPicker opens a list of the selected model's advertised
@@ -97,10 +113,110 @@ func (s *session) openModelPicker() {
 	s.modal.cursor = s.modelIdx
 }
 
+// openSettings opens the settings hub — a list of dedicated setting commands.
+// Each entry dispatches to its own modal (or slash command) rather than the
+// old multi-field settings editor.
 func (s *session) openSettings() {
 	s.modal = newModal()
 	s.modal.kind = modalSettings
-	s.modal.fieldIdx = 0
+	s.modal.cursor = 0
+}
+
+// openApprovalPicker lists never / destructive / always for the safety gate.
+func (s *session) openApprovalPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalApproval
+	s.modal.cursor = 0
+	modes := []string{"never", "destructive", "always"}
+	cur := s.approvalMode()
+	for i, m := range modes {
+		if m == cur {
+			s.modal.cursor = i
+			break
+		}
+	}
+}
+
+// openSandboxPicker lists sandbox modes (none | firejail).
+func (s *session) openSandboxPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalSandbox
+	s.modal.cursor = 0
+	modes := []string{"none", "firejail"}
+	for i, m := range modes {
+		if m == s.settings.Sandbox {
+			s.modal.cursor = i
+			break
+		}
+	}
+}
+
+// openAutoCompactPicker toggles auto context compaction via a two-item list.
+func (s *session) openAutoCompactPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalAutoCompact
+	if s.coreAutoCompact {
+		s.modal.cursor = 0 // on
+	} else {
+		s.modal.cursor = 1 // off
+	}
+}
+
+// openNoNetworkPicker toggles the no-network sandbox flag.
+func (s *session) openNoNetworkPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalNoNetwork
+	if s.settings.NoNetwork {
+		s.modal.cursor = 0
+	} else {
+		s.modal.cursor = 1
+	}
+}
+
+// openMouseWheelPicker toggles mouse-wheel scrolling.
+func (s *session) openMouseWheelPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalMouseWheel
+	if s.settings.MouseWheel {
+		s.modal.cursor = 0
+	} else {
+		s.modal.cursor = 1
+	}
+}
+
+// openValueEditModal opens a free-form edit box for a single numeric/text setting.
+func (s *session) openValueEditModal(target, title, placeholder, initial string) {
+	s.modal = newModal()
+	s.modal.kind = modalValueEdit
+	s.modal.editing = true
+	s.modal.editTarget = target
+	s.modal.filter = title // reuse filter as the modal title for value edit
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.Placeholder = placeholder
+	ti.SetValue(initial)
+	ti.CursorEnd()
+	ti.Focus()
+	s.modal.editBuf = ti
+}
+
+func (s *session) openAPIKeyModal() {
+	s.openValueEditModal(editTargetAPIKey, "API Key", "sk-... (active provider)", "")
+}
+
+func (s *session) openBashTimeoutModal() {
+	s.openValueEditModal(editTargetBashTimeout, "Bash Timeout (seconds)",
+		fmt.Sprintf("%d", s.coreBashTimeout), fmt.Sprintf("%d", s.coreBashTimeout))
+}
+
+func (s *session) openIdleTimeoutModal() {
+	s.openValueEditModal(editTargetIdleTimeout, "Idle Timeout (seconds)",
+		fmt.Sprintf("%d", s.settings.IdleTimeout), fmt.Sprintf("%d", s.settings.IdleTimeout))
+}
+
+func (s *session) openMaxSessionTokensModal() {
+	s.openValueEditModal(editTargetMaxSessionTokens, "Max Session Tokens (0=unlimited)",
+		fmt.Sprintf("%d", s.settings.MaxSessionTokens), fmt.Sprintf("%d", s.settings.MaxSessionTokens))
 }
 
 func (s *session) openHelp() {
@@ -298,7 +414,7 @@ func (s *session) saveVisionConfig() {
 // the highlighted model, enter sets/clears the preferred handoff target (★).
 // Both live-persist via saveVisionConfig; the modal stays open. Filter typing
 // works like the other list modals.
-func (s *session) handleVisionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleVisionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	items := s.visionItems()
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -401,9 +517,18 @@ func (s *session) commandItems() []listItem {
 		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
 		{label: "/logout", desc: "log out of a provider"},
 		{label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
+		{label: "/key", desc: "set API key for active provider"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
 		{label: "/reasoning", desc: "set reasoning effort (per model)"},
+		{label: "/theme", desc: "switch colour theme"},
+		{label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
+		{label: "/auto-compact", desc: "auto context compaction on/off"},
+		{label: "/sandbox", desc: "sandbox mode (none · firejail)"},
+		{label: "/no-network", desc: "block network in sandbox on/off"},
+		{label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
+		{label: "/idle-timeout", desc: "idle timeout (seconds)"},
+		{label: "/max-session-tokens", desc: "max session tokens (0=unlimited)"},
 		{label: "/reset", desc: "wipe conversation + session file"},
 		{label: "/clear", desc: "clear view (keep session file)"},
 		{label: "/undo", desc: "drop last turn"},
@@ -414,9 +539,8 @@ func (s *session) commandItems() []listItem {
 		{label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{label: "/abort", desc: "stop running turn (or Esc)"},
 		{label: "/steer", desc: "steer an in-flight turn (or Ctrl+Enter)"},
-		{label: "/settings", desc: "open settings modal"},
+		{label: "/settings", desc: "settings hub (dedicated modals per option)"},
 		{label: "/keybinds", desc: "view & customize keybindings"},
-		{label: "/theme", desc: "switch colour theme"},
 		{label: "/help", desc: "keybindings & commands"},
 		{label: "/copy", desc: "copy last assistant reply"},
 		{label: "/attach", desc: "attach an image (vision)"},
@@ -491,6 +615,95 @@ func (s *session) reasoningItems() []listItem {
 		items[i] = listItem{label: l, desc: desc}
 	}
 	return items
+}
+
+// settingsHubItems is the /settings list — one entry per preference, each
+// opening its dedicated modal (or slash command). Values shown in the desc
+// so the hub is a live overview, not a second settings editor.
+func (s *session) settingsHubItems() []listItem {
+	return []listItem{
+		{label: "/login", desc: "provider · " + s.providerFieldLabel()},
+		{label: "/key", desc: "API key for active provider"},
+		{label: "/approval", desc: "safety gate · " + s.approvalMode()},
+		{label: "/reasoning", desc: "effort · " + s.settings.ReasoningEffort},
+		{label: "/theme", desc: "colour · " + activeTheme.name},
+		{label: "/bash-timeout", desc: fmt.Sprintf("%ds", s.coreBashTimeout)},
+		{label: "/auto-compact", desc: boolStr(s.coreAutoCompact)},
+		{label: "/sandbox", desc: s.settings.Sandbox},
+		{label: "/no-network", desc: boolStr(s.settings.NoNetwork) + " (next launch)"},
+		{label: "/mouse-wheel", desc: boolStr(s.settings.MouseWheel)},
+		{label: "/idle-timeout", desc: fmt.Sprintf("%ds (next launch)", s.settings.IdleTimeout)},
+		{label: "/max-session-tokens", desc: fmt.Sprintf("%d (next launch)", s.settings.MaxSessionTokens)},
+		{label: "/keybinds", desc: "view & customize keybindings"},
+	}
+}
+
+func (s *session) approvalItems() []listItem {
+	modes := []struct {
+		mode, desc string
+	}{
+		{"never", "auto-approve all tools"},
+		{"destructive", "prompt for write / bash / destructive only"},
+		{"always", "prompt for every tool call"},
+	}
+	cur := s.approvalMode()
+	items := make([]listItem, len(modes))
+	for i, m := range modes {
+		desc := m.desc
+		if m.mode == cur {
+			desc = "current · " + desc
+		}
+		items[i] = listItem{label: m.mode, desc: desc}
+	}
+	return items
+}
+
+func (s *session) sandboxItems() []listItem {
+	modes := []struct {
+		mode, desc string
+	}{
+		{"none", "no sandbox (applies on next launch)"},
+		{"firejail", "firejail sandbox (applies on next launch)"},
+	}
+	items := make([]listItem, len(modes))
+	for i, m := range modes {
+		desc := m.desc
+		if m.mode == s.settings.Sandbox {
+			desc = "current · " + desc
+		}
+		items[i] = listItem{label: m.mode, desc: desc}
+	}
+	return items
+}
+
+// toggleItems builds a two-option on/off list with "current" marked.
+func toggleItems(on bool, onDesc, offDesc string) []listItem {
+	onItem := listItem{label: "on", desc: onDesc}
+	offItem := listItem{label: "off", desc: offDesc}
+	if on {
+		onItem.desc = "current · " + onDesc
+	} else {
+		offItem.desc = "current · " + offDesc
+	}
+	return []listItem{onItem, offItem}
+}
+
+func (s *session) autoCompactItems() []listItem {
+	return toggleItems(s.coreAutoCompact,
+		"compact context automatically when full",
+		"never auto-compact")
+}
+
+func (s *session) noNetworkItems() []listItem {
+	return toggleItems(s.settings.NoNetwork,
+		"block network in sandbox (next launch)",
+		"allow network (next launch)")
+}
+
+func (s *session) mouseWheelItems() []listItem {
+	return toggleItems(s.settings.MouseWheel,
+		"wheel scrolls transcript (Shift+drag to select)",
+		"native click-drag select/copy")
 }
 
 func (s *session) pluginItems() []listItem {
@@ -570,14 +783,14 @@ func filterList(items []listItem, q string) []int {
 // Key handling
 // ---------------------------------------------------------------------------
 
-func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// The keybinds modal has its own capture mode (editing flag) and navigation;
 	// route to it first so capture works even while editing is active.
 	if s.modal.kind == modalKeybinds {
 		return s.handleKeybindsKey(msg)
 	}
-	// While editing a settings field (or the login key box), route keys to the
-	// edit buffer.
+	// While editing a value field (settings value-edit, login key, oauth code),
+	// route keys to the edit buffer.
 	if s.modal.editing {
 		return s.handleSettingsEditKey(msg)
 	}
@@ -590,12 +803,12 @@ func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch s.modal.kind {
-	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning, modalProviders, modalLogout:
+	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
+		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
+		modalAutoCompact, modalNoNetwork, modalMouseWheel:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
-	case modalSettings:
-		return s.handleSettingsKey(msg)
 	case modalHelp:
 		return s.handleHelpKey(msg)
 	case modalContext:
@@ -608,7 +821,7 @@ func (s *session) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
-func (s *session) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var items []listItem
 	switch s.modal.kind {
 	case modalCommand:
@@ -627,6 +840,18 @@ func (s *session) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items = s.providerItems()
 	case modalLogout:
 		items = s.logoutItems()
+	case modalSettings:
+		items = s.settingsHubItems()
+	case modalApproval:
+		items = s.approvalItems()
+	case modalSandbox:
+		items = s.sandboxItems()
+	case modalAutoCompact:
+		items = s.autoCompactItems()
+	case modalNoNetwork:
+		items = s.noNetworkItems()
+	case modalMouseWheel:
+		items = s.mouseWheelItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -677,6 +902,16 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	case modalCommand:
 		s.closeModal()
 		return s, s.runCommandByIndex(abs)
+	case modalSettings:
+		// Hub entry → open the dedicated modal / run the command for that option.
+		items := s.settingsHubItems()
+		if abs < 0 || abs >= len(items) {
+			s.closeModal()
+			return s, nil
+		}
+		label := items[abs].label
+		s.closeModal()
+		return s, s.dispatchSettingsCommand(label)
 	case modalSessions:
 		if abs >= 0 && abs < len(s.sessionList) {
 			e := s.sessionList[abs]
@@ -725,6 +960,59 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.closeModal()
 		return s, nil
+	case modalApproval:
+		items := s.approvalItems()
+		if abs >= 0 && abs < len(items) {
+			mode := items[abs].label
+			s.applyApprovalMode(mode)
+		}
+		s.closeModal()
+		return s, nil
+	case modalSandbox:
+		items := s.sandboxItems()
+		if abs >= 0 && abs < len(items) {
+			mode := items[abs].label
+			s.settings.Sandbox = mode
+			_ = s.settings.save()
+			s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", mode))
+		}
+		s.closeModal()
+		return s, nil
+	case modalAutoCompact:
+		items := s.autoCompactItems()
+		if abs >= 0 && abs < len(items) {
+			on := items[abs].label == "on"
+			s.coreAutoCompact = on
+			s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": on})
+			s.logInfo(fmt.Sprintf("auto-compact: %s", boolStr(on)))
+		}
+		s.closeModal()
+		return s, nil
+	case modalNoNetwork:
+		items := s.noNetworkItems()
+		if abs >= 0 && abs < len(items) {
+			on := items[abs].label == "on"
+			s.settings.NoNetwork = on
+			_ = s.settings.save()
+			s.logInfo(fmt.Sprintf("no-network: %s (applies on next launch)", boolStr(on)))
+		}
+		s.closeModal()
+		return s, nil
+	case modalMouseWheel:
+		items := s.mouseWheelItems()
+		if abs >= 0 && abs < len(items) {
+			on := items[abs].label == "on"
+			s.settings.MouseWheel = on
+			_ = s.settings.save()
+			if on {
+				s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
+			} else {
+				s.logInfo("mouse wheel: off (click-drag to select/copy text)")
+			}
+			s.invalidateAll()
+		}
+		s.closeModal()
+		return s, nil
 	case modalProviders:
 		return s.selectProviderItem(abs)
 	case modalLogout:
@@ -732,6 +1020,50 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	}
 	s.closeModal()
 	return s, nil
+}
+
+// applyApprovalMode persists and sends the approval gate mode to the core.
+func (s *session) applyApprovalMode(mode string) {
+	s.sendCore(map[string]any{"type": "set_approval", "mode": mode})
+	s.settings.Approval = mode
+	_ = s.settings.save()
+	s.logInfo("approval: " + mode)
+}
+
+// dispatchSettingsCommand opens the dedicated modal (or runs the command) for
+// a settings-hub entry. Shared by the hub list and runCommandByIndex.
+func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
+	switch label {
+	case "/login":
+		s.openLoginPicker()
+	case "/key":
+		s.openAPIKeyModal()
+	case "/approval", "/approvals":
+		s.openApprovalPicker()
+	case "/reasoning":
+		s.openReasoningPicker()
+	case "/theme":
+		s.openThemePicker()
+	case "/bash-timeout":
+		s.openBashTimeoutModal()
+	case "/auto-compact":
+		s.openAutoCompactPicker()
+	case "/sandbox":
+		s.openSandboxPicker()
+	case "/no-network":
+		s.openNoNetworkPicker()
+	case "/mouse-wheel":
+		s.openMouseWheelPicker()
+	case "/idle-timeout":
+		s.openIdleTimeoutModal()
+	case "/max-session-tokens":
+		s.openMaxSessionTokensModal()
+	case "/keybinds":
+		s.openKeybindsModal()
+	default:
+		return s.handleUserLine(label)
+	}
+	return nil
 }
 
 // selectProviderItem handles a pick in the provider modal: a preset entry adds
@@ -886,15 +1218,38 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	case "/logout":
 		s.openLogoutPicker()
 		return nil
+	case "/key":
+		s.openAPIKeyModal()
+		return nil
 	case "/model":
 		s.openModelPicker()
 		return nil
-	case "/approval":
-		s.openSettings()
-		s.modal.fieldIdx = s.settingsFieldIndex("Approval")
+	case "/approval", "/approvals":
+		s.openApprovalPicker()
 		return nil
 	case "/reasoning":
 		s.openReasoningPicker()
+		return nil
+	case "/bash-timeout":
+		s.openBashTimeoutModal()
+		return nil
+	case "/auto-compact":
+		s.openAutoCompactPicker()
+		return nil
+	case "/sandbox":
+		s.openSandboxPicker()
+		return nil
+	case "/no-network":
+		s.openNoNetworkPicker()
+		return nil
+	case "/mouse-wheel":
+		s.openMouseWheelPicker()
+		return nil
+	case "/idle-timeout":
+		s.openIdleTimeoutModal()
+		return nil
+	case "/max-session-tokens":
+		s.openMaxSessionTokensModal()
 		return nil
 	case "/reset":
 		s.sendCore(map[string]any{"type": "reset"})
@@ -999,7 +1354,7 @@ func (s *session) settingsFieldIndex(label string) int {
 	return -1
 }
 
-func (s *session) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleSettingsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	fields := s.settingsFields()
 	n := len(fields)
 	switch {
@@ -1063,10 +1418,13 @@ func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
 		_ = s.settings.save()
 		if s.settings.MouseWheel {
 			s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
-			return s, tea.EnableMouseCellMotion
+		} else {
+			s.logInfo("mouse wheel: off (click-drag to select/copy text)")
 		}
-		s.logInfo("mouse wheel: off (click-drag to select/copy text)")
-		return s, tea.DisableMouse
+		// v2: mouse mode is a declarative View field set from s.settings.MouseWheel
+		// in View(); the re-render from s.invalidateAll() applies it. No command.
+		s.invalidateAll()
+		return s, nil
 	case "Idle Timeout":
 		s.startEditField(idx)
 		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.settings.IdleTimeout))
@@ -1104,7 +1462,7 @@ func (s *session) startEditField(idx int) {
 	s.modal.editBuf = ti
 }
 
-func (s *session) handleSettingsEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleSettingsEditKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case s.kb(msg, "close"):
 		if s.modal.kind == modalOauthCode {
@@ -1372,7 +1730,7 @@ func (s *session) preferredLevel(levels []string) string {
 // Help modal
 // ---------------------------------------------------------------------------
 
-func (s *session) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case s.kbAny(msg, "nav_up", "nav_up_alt"):
 		if s.modal.scroll > 0 {
@@ -1763,7 +2121,7 @@ func modalBox(w int, body string) string {
 		Render(body)
 }
 
-func isPrintable(msg tea.KeyMsg) bool {
+func isPrintable(msg tea.KeyPressMsg) bool {
 	r := []rune(msg.String())
 	if len(r) != 1 {
 		return false

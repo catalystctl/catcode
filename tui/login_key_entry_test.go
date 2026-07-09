@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestLoginKeyEntryEnterCommits reproduces the reported bug surface: after
@@ -34,7 +34,7 @@ func TestLoginKeyEntryEnterCommits(t *testing.T) {
 	}
 
 	// Select the preset (Enter on the first list item).
-	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.modal.editing != true {
 		t.Fatalf("expected editing=true after picking preset, got false (pendingLogin=%q)", s.pendingLogin)
 	}
@@ -43,14 +43,14 @@ func TestLoginKeyEntryEnterCommits(t *testing.T) {
 	}
 
 	for _, r := range "sk-test-key-1234" {
-		s.handleModalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		s.handleModalKey(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	if got := s.modal.editBuf.Value(); got != "sk-test-key-1234" {
 		t.Fatalf("editBuf value after typing = %q, want sk-test-key-1234", got)
 	}
 
 	// Press Enter to commit.
-	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if s.modal.kind != modalNone {
 		t.Errorf("modal should be closed after Enter; kind=%v editing=%v", s.modal.kind, s.modal.editing)
@@ -79,15 +79,15 @@ func TestLoginKeyEntryEnterUnboundSelect(t *testing.T) {
 		EnvVar: "UMANS_API_KEY", HasKey: false, LoggedIn: false,
 	}}
 	s.openLoginPicker()
-	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter}) // pick preset (list select has fallback)
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter}) // pick preset (list select has fallback)
 	if s.pendingLogin != "umans" || !s.modal.editing {
 		t.Fatalf("setup failed: pendingLogin=%q editing=%v", s.pendingLogin, s.modal.editing)
 	}
 	for _, r := range "sk-x" {
-		s.handleModalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		s.handleModalKey(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	// Enter to commit — must work even with select unbound.
-	s.handleModalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.modal.kind != modalNone {
 		t.Errorf("modal should close on Enter even with select unbound; kind=%v editing=%v", s.modal.kind, s.modal.editing)
 	}

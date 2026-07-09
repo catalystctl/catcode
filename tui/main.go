@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,6 @@ type session struct {
 	pendingIntercom     *intercomPrompt
 	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
 	pendingAsk          *askPrompt
-	pendingSS3          bool        // buffering the Alt-'O' lead of an \x1bOM (SS3 Enter) split — see handleKey
 	updateInfo          *updateInfo // non-nil when a newer release is available (drives the top banner)
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
@@ -109,6 +108,7 @@ type session struct {
 	umansConcLimit    *int64              // Umans plan concurrency ceiling; nil => unlimited (render ∞); only meaningful when used != nil
 	umansConcProvider string              // the Umans provider name the poll is tracking; conc shows only when the selected model routes here
 	subProgress       []*subProgressEntry // live subagent runs (drives the progress panel)
+	maxTaskRows       int                 // cap on task-panel entries (set by layout() to fit available height)
 	cwd               string              // working dir, shown in the header as ~/
 
 	// @-mention file flyout state (see mention.go): active when an
@@ -122,6 +122,7 @@ type session struct {
 	viewport viewport.Model
 	input    textinput.Model
 	spinner  spinner.Model
+	spinnerActive bool // whether the spinner animation cycle is running (stopped when idle to avoid re-render storms that disrupt text selection)
 
 	width, height int
 	ready         bool
@@ -138,17 +139,23 @@ func initialSession() *session {
 	s.thinkExpanded = s.settings.ThinkExpanded
 	s.follow = true // pin viewport to newest line until the user scrolls up
 	s.cwd = cwdDisplay()
+	s.maxTaskRows = 4 // cap on task-panel entries; layout() shrinks it to fit available height
 	s.coreBashTimeout = 30
 	s.visionModels = map[string]bool{}
 
 	s.input = textinput.New()
 	s.input.Placeholder = "Chat with the agent…  (/ for commands)"
-	s.input.PlaceholderStyle = placeholderStyle
+	// textinput v2: placeholder style lives on Styles().{Focused,Blurred}.Placeholder
+	// (the top-level PlaceholderStyle field was removed).
+	ist := s.input.Styles()
+	ist.Focused.Placeholder = placeholderStyle
+	ist.Blurred.Placeholder = placeholderStyle
+	s.input.SetStyles(ist)
 	s.input.Prompt = ""
 	s.input.Focus()
 	s.enableMultilineInput() // keep typed/pasted newlines (see extras.go)
 
-	s.viewport = viewport.New(80, 20)
+	s.viewport = viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
 	s.viewport.SetContent("")
 
 	sp := spinner.New()
@@ -435,19 +442,7 @@ func (s *session) sendCore(m map[string]any) {
 // ---------------------------------------------------------------------------
 
 func (s *session) Init() tea.Cmd {
-	return tea.Batch(enableKeyboardProtocol(), s.startCore(), tick(), s.spinner.Tick)
-}
-
-func enableKeyboardProtocol() tea.Cmd {
-	return func() tea.Msg {
-		// This MUST be emitted after Bubble Tea has entered alt-screen. Kitty-family
-		// terminals (including Konsole) keep independent keyboard-mode stacks for the
-		// main and alternate screens, so doing this before prog.Run() only changes
-		// the main screen and has no effect on the TUI. See the comment in main()
-		// for the protocol details.
-		_, _ = os.Stdout.WriteString("\x1b[>4;2m\x1b[>1u")
-		return nil
-	}
+	return tea.Batch(s.startCore(), tick(), s.spinner.Tick)
 }
 
 func tick() tea.Cmd {
@@ -470,12 +465,29 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if s.hasLiveContent() {
 			s.refresh()
 		}
-		return s, tick()
+		cmds := []tea.Cmd{tick()}
+		// (Re)start the spinner animation if a turn is in flight but the spinner
+		// cycle has stopped. The cycle stops when idle (see spinner.TickMsg) to
+		// avoid a ~20x/sec re-render storm that disrupts mouse text selection
+		// (copy); tickMsg (every 500ms) catches the busy transition and restarts it.
+		if (s.busy || !s.ready) && !s.spinnerActive {
+			s.spinnerActive = true
+			cmds = append(cmds, s.spinner.Tick)
+		}
+		return s, tea.Batch(cmds...)
 
 	case spinner.TickMsg:
-		var cmd tea.Cmd
-		s.spinner, cmd = s.spinner.Update(msg)
-		return s, cmd
+		s.spinner, _ = s.spinner.Update(msg)
+		// Only keep the spinner animating while it's actually shown (a running turn
+		// or still starting). When idle, stop ticking so the cursed renderer isn't
+		// driven ~20x/sec — that constant re-render makes mouse text selection
+		// (copy) impossible. tickMsg restarts the cycle when activity resumes.
+		if s.busy || !s.ready {
+			s.spinnerActive = true
+			return s, s.spinner.Tick
+		}
+		s.spinnerActive = false
+		return s, nil
 
 	case coreStartErrorMsg:
 		// P1-14: a core start failure is logged on the UI thread (startCore ran in
@@ -529,7 +541,6 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.queuedNext = false
 		s.pendingApproval = nil
 		s.pendingIntercom = nil
-		s.pendingSS3 = false
 		s.subProgress = nil
 		// clear stale per-core state so a crash-restart starts clean: a leftover
 		// queued follow-up, pinned todos, a pending ask, footer metrics, or an
@@ -560,47 +571,36 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case coreEventMsg:
 		return s, s.handleCoreEvent(msg.event)
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		model, cmd := s.handleKey(msg)
 		return model, cmd
 
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		return s, s.handleMouseWheel(msg)
 
+	case tea.PasteMsg:
+		// v2 enables bracketed-paste by default, so every paste arrives as a
+		// PasteMsg (v1 delivered paste differently and this case was absent, which
+		// silently dropped all pastes after the migration). Route the pasted text
+		// to whichever input owns the keys right now — mirroring the key dispatch
+		// in handleKey — so paste works in the chat box, the ask flyout, and modal
+		// edit fields (e.g. pasting an API key). textinput v2 inserts the text.
+		switch {
+		case s.modal.kind != modalNone && s.modal.editing:
+			s.modal.editBuf, _ = s.modal.editBuf.Update(msg)
+		case s.pendingAsk != nil:
+			q := &s.pendingAsk.questions[s.pendingAsk.focusIdx]
+			q.input, _ = q.input.Update(msg)
+		default:
+			s.input, _ = s.input.Update(msg)
+		}
+		return s, nil
+
 	default:
-		// bubbletea v1.3 can't decode enhanced keyboard reports (the Key type carries
-		// no modifier bits), so they arrive as unrecognized CSI sequences. Intercept
-		// modified Enter for newline/steer, and translate enhanced Ctrl+letter reports
-		// back through the normal KeyMsg path so enabling richer keyboard protocols
-		// doesn't break Ctrl+C / Ctrl+P / Ctrl+K / Ctrl+T / Ctrl+O.
-		if key, ok := ctrlLetterKeyFromModifiedCSI(msg); ok {
-			return s.handleKey(key)
-		}
-		if isCtrlEnterUnknownCSI(msg) {
-			// /keybinds capture mode: assign ctrl+enter to the selected action.
-			if s.modal.kind == modalKeybinds && s.modal.editing {
-				s.captureKeybind("ctrl+enter")
-				return s, nil
-			}
-			// Steer only if ctrl+enter is still the bound steer key (the user may
-			// have rebound it to something else via /keybinds).
-			if s.modal.kind == modalNone && s.keybinds["steer"] == "ctrl+enter" {
-				return s, s.steerFromInput()
-			}
-		}
-		// Shift+Enter arrives the same way (a modified-Enter CSI) and inserts a
-		// line break in the input box so the user can compose multi-line
-		// messages. Like ctrl+enter it can only ever fire for its one action.
-		if isShiftEnterUnknownCSI(msg) {
-			if s.modal.kind == modalKeybinds && s.modal.editing {
-				s.captureKeybind("shift+enter")
-				return s, nil
-			}
-			if s.modal.kind == modalNone && s.keybinds["newline"] == "shift+enter" {
-				s.insertNewline()
-				return s, nil
-			}
-		}
+		// In v2, enhanced keyboard protocols (Kitty progressive keyboard + xterm
+		// modifyOtherKeys) are auto-enabled by the renderer and every modified key
+		// — Shift/Ctrl+Enter, Esc, Ctrl+letter — arrives as a real KeyPressMsg
+		// dispatched by the case above. Nothing else to do here.
 	}
 	return s, nil
 }
@@ -617,11 +617,12 @@ func main() {
 		os.Exit(code)
 	}
 
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
-	if loadSettings().MouseWheel {
-		opts = append(opts, tea.WithMouseCellMotion())
-	}
-	prog := tea.NewProgram(initialSession(), opts...)
+	// v2 is declarative: alt-screen, mouse mode, and enhanced keyboard protocols
+	// are set as fields on the View returned by View() rather than program options,
+	// so NewProgram takes only the model. The renderer auto-enables the Kitty
+	// progressive-keyboard + xterm modifyOtherKeys protocols (and restores the
+	// terminal on exit), so the hand-rolled enable/disable sequences are gone.
+	prog := tea.NewProgram(initialSession())
 
 	// Background, non-blocking check for a newer release. On a fresh cache it
 	// answers instantly (no network); otherwise it fetches asynchronously and
@@ -646,25 +647,7 @@ func main() {
 		prog.Send(sigtermMsg{})
 	}()
 
-	// Ask terminals for an unambiguous modified-Enter encoding. This fixes SSH /
-	// Konsole cases where Ctrl+Enter otherwise arrives as a plain Enter (queued
-	// follow-up) and Shift+Enter arrives as keypad Enter / "OM" instead of a
-	// newline.
-	//
-	// 1) xterm modifyOtherKeys level 2: Ctrl+Enter -> ESC[27;5;13~ and
-	//    Shift+Enter -> ESC[27;2;13~ on xterm-compatible terminals.
-	// 2) Kitty progressive keyboard flag 1: disambiguate escape codes; Konsole and
-	//    kitty-family terminals then report Ctrl+Enter / Shift+Enter as CSI-u
-	//    (ESC[13;5u / ESC[13;2u). It may also report Ctrl+letter as CSI-u, so
-	//    Update translates those back to ordinary Bubble Tea KeyMsgs.
-	//
-	// IMPORTANT: the enable sequence is sent from Init(), not here. Bubble Tea
-	// enters alt-screen inside prog.Run(), and Kitty/Konsole maintain separate
-	// keyboard-mode stacks for main vs alt screen. Sending it before Run() changes
-	// the wrong screen, which was why the first fix did nothing. Disabled after
-	// Run so the user's shell is restored even if the terminal applied it globally.
 	_, err := prog.Run()
-	os.Stdout.WriteString("\x1b[<u\x1b[>0u\x1b[>4;0m") // disable Kitty keyboard + modifyOtherKeys
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

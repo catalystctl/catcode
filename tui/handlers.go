@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -804,23 +804,20 @@ func (s *session) reauthActiveProvider() {
 	}
 }
 
-// (tea.EnableMouseCellMotion / tea.DisableMouse). Off (the default) leaves
-// native click-drag text selection/copy to the terminal; when on, hold Shift
-// to select/copy. Only wheel presses scroll; clicks and drags are ignored.
-func (s *session) handleMouseWheel(msg tea.MouseMsg) tea.Cmd {
+// In v2 mouse mode is a declarative View field (set in View() from
+// s.settings.MouseWheel); only wheel events reach here, routed to the
+// transcript viewport. Off (the default) leaves native click-drag text
+// selection/copy to the terminal; when on, hold Shift to select/copy.
+func (s *session) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	// Modal overlays own the whole screen; never scroll the transcript behind one.
 	if s.modal.kind != modalNone {
 		return nil
 	}
-	// Only react to wheel presses; let clicks and drags fall through untouched.
-	if msg.Action != tea.MouseActionPress {
-		return nil
-	}
 	switch msg.Button {
-	case tea.MouseButtonWheelUp:
+	case tea.MouseWheelUp:
 		s.follow = false
 		s.viewport.ScrollUp(s.viewport.MouseWheelDelta)
-	case tea.MouseButtonWheelDown:
+	case tea.MouseWheelDown:
 		s.viewport.ScrollDown(s.viewport.MouseWheelDelta)
 		if s.viewport.AtBottom() {
 			s.follow = true
@@ -1015,7 +1012,7 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 // Key handling
 // ---------------------------------------------------------------------------
 
-func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// global: the quit key (default Ctrl+C) quits unless a modal is open
 	// (where esc / ctrl+c closes the modal instead).
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
@@ -1033,27 +1030,14 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.modal.kind != modalNone {
 		return s.handleModalKey(msg)
 	}
-	// SS3 (\x1bOM) Shift+Enter: VS Code's and Konsole's terminals send \x1bOM
-	// (SS3 keypad-Enter) for Shift+Enter. bubbletea has no \x1bOM mapping and
-	// it's not a CSI, so it splits into two KeyMsgs — Alt-'O' then 'M' (see
-	// extras.go) — which without this buffer leak into the input as "OM". Buffer
-	// the Alt-'O' lead; the trailing 'M' resolves it as Shift+Enter. When newline
-	// is bound to shift+enter (the default) that inserts a line break; otherwise
-	// the pair is consumed silently so it never produces "OM". (When
-	// modifyOtherKeys is engaged the terminal sends a proper CSI instead, so this
-	// only fires for the legacy \x1bOM form.)
-	if s.pendingSS3 {
-		s.pendingSS3 = false
-		if isSS3EnterRune(msg) {
-			if s.keybinds["newline"] == "shift+enter" {
-				s.insertNewline()
-			}
-			return s, nil
-		}
-		// not the expected 'M' — spurious Alt-'O'; fall through normally
-	}
-	if isSS3EnterLead(msg) {
-		s.pendingSS3 = true
+	// Shift+Enter inserts a line break so the user can compose multi-line
+	// messages. This works while idle AND while a turn runs (so a follow-up can
+	// be drafted mid-flight), as long as no modal owns the keys. Bubble Tea v2
+	// delivers modified Enter as a real KeyPressMsg with modifier bits, so we
+	// match it through the keybind system like any other key — no SS3/CSI
+	// buffering needed.
+	if s.kb(msg, "newline") {
+		s.insertNewline()
 		return s, nil
 	}
 	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
@@ -1275,7 +1259,7 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // Returns true when it consumed the key. Scroll-up motions pause follow (so the
 // view isn't yanked to the bottom on the next token); scroll-down re-pins
 // follow once the bottom is reached.
-func (s *session) handleScrollKey(msg tea.KeyMsg) bool {
+func (s *session) handleScrollKey(msg tea.KeyPressMsg) bool {
 	switch {
 	case s.kb(msg, "scroll_page_up"):
 		s.follow = false
@@ -1289,10 +1273,10 @@ func (s *session) handleScrollKey(msg tea.KeyMsg) bool {
 		return true
 	case s.kb(msg, "scroll_line_up"):
 		s.follow = false
-		s.viewport.LineUp(1)
+		s.viewport.ScrollUp(1)
 		return true
 	case s.kb(msg, "scroll_line_down"):
-		s.viewport.LineDown(1)
+		s.viewport.ScrollDown(1)
 		if s.viewport.AtBottom() {
 			s.follow = true
 		}
