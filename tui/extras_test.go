@@ -66,3 +66,39 @@ func TestModifiedEnterCSIClassification(t *testing.T) {
 		t.Error("ctrl-enter xterm CSI not recognized")
 	}
 }
+
+func TestCtrlLetterKeyFromModifiedCSI(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.Msg
+		want string
+	}{
+		{"kitty_ctrl_c", []byte("\x1b[99;5u"), "ctrl+c"},
+		{"kitty_ctrl_shift_p", []byte("\x1b[80;6u"), "ctrl+p"},
+		{"xterm_ctrl_k", []byte("\x1b[27;5;107~"), "ctrl+k"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ctrlLetterKeyFromModifiedCSI(c.msg)
+			if !ok {
+				t.Fatalf("expected %q to be translated", c.msg)
+			}
+			if got.String() != c.want {
+				t.Fatalf("translated key = %q, want %q", got.String(), c.want)
+			}
+		})
+	}
+
+	nonMatches := []tea.Msg{
+		[]byte("\x1b[13;5u"),    // Ctrl+Enter is handled separately, not as a letter.
+		[]byte("\x1b[99;2u"),    // Shift+C, no ctrl bit.
+		[]byte("\x1b[27;5;13~"), // Ctrl+Enter xterm form, handled separately.
+		tea.KeyMsg{Type: tea.KeyCtrlC},
+		"not bytes",
+	}
+	for _, msg := range nonMatches {
+		if got, ok := ctrlLetterKeyFromModifiedCSI(msg); ok {
+			t.Fatalf("expected no translation for %T %q, got %q", msg, msg, got.String())
+		}
+	}
+}

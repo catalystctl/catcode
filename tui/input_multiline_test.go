@@ -191,3 +191,83 @@ func TestIsShiftEnterUnknownCSI(t *testing.T) {
 		t.Error("KeyMsg should not match")
 	}
 }
+
+// TestSS3EnterClassification covers the two halves of an \x1bOM (SS3
+// keypad-Enter) sequence as bubbletea v1.3.10 splits it: an Alt-'O' lead and
+// a plain 'M' trailer.
+func TestSS3EnterClassification(t *testing.T) {
+	lead := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true}
+	trail := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}}
+	if !isSS3EnterLead(lead) {
+		t.Error("Alt+'O' KeyRunes should be the SS3 Enter lead")
+	}
+	if isSS3EnterLead(trail) {
+		t.Error("plain 'M' should not be the SS3 Enter lead")
+	}
+	if !isSS3EnterRune(trail) {
+		t.Error("plain 'M' KeyRunes should be the SS3 Enter trailing rune")
+	}
+	if isSS3EnterRune(lead) {
+		t.Error("Alt+'O' should not be the SS3 Enter trailing rune")
+	}
+	// plain 'O' (no Alt) is NOT the lead — the ESC prefix is what sets Alt.
+	if isSS3EnterLead(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}}) {
+		t.Error("plain 'O' without Alt should not be the SS3 Enter lead")
+	}
+	if isSS3EnterLead(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}, Alt: true}) {
+		t.Error("Alt+'A' should not be the SS3 Enter lead")
+	}
+}
+
+// TestShiftEnterSS3InsertsNewline: VS Code's and Konsole's terminals send
+// \x1bOM (SS3 keypad-Enter) for Shift+Enter. bubbletea v1.3.10 has no \x1bOM
+// mapping and it's not a CSI, so detectOneMsg splits it into two KeyMsgs —
+// Alt-'O' then 'M'. handleKey must buffer the lead and resolve the trailing
+// 'M' as a Shift+Enter → insertNewline (rather than leaking "OM" into input).
+func TestShiftEnterSS3InsertsNewline(t *testing.T) {
+	s := newInputSession(t, 60)
+	s.input.SetValue("foo")
+	s.input.SetCursor(len(s.input.Value()))
+
+	// First half of \x1bOM: Alt-'O'. Consumed (sets pendingSS3), nothing inserted.
+	m, _ := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true})
+	if m != s {
+		t.Fatalf("Update should return the same session")
+	}
+	if got := s.input.Value(); got != "foo" {
+		t.Fatalf("Alt-'O' lead should not insert anything, got %q", got)
+	}
+	// Second half: plain 'M'. Resolves as Shift+Enter → insertNewline.
+	m, _ = s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	if m != s {
+		t.Fatalf("Update should return the same session")
+	}
+	if got := s.input.Value(); got != "foo\n" {
+		t.Fatalf("trailing 'M' of \\x1bOM should insert a newline → %q, got %q", "foo\\n", got)
+	}
+	if s.pendingSS3 {
+		t.Fatalf("pendingSS3 should be cleared after resolving")
+	}
+}
+
+// TestSS3LeadFollowedByOtherKeyDropsO: if the Alt-'O' lead is NOT followed by
+// 'M' (a spurious Alt-'O', rare), the buffered 'O' is dropped and the
+// following key is handled normally — pendingSS3 must not get stuck.
+func TestSS3LeadFollowedByOtherKeyDropsO(t *testing.T) {
+	s := newInputSession(t, 60)
+	s.input.SetValue("foo")
+	s.input.SetCursor(len(s.input.Value()))
+
+	s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}, Alt: true}) // lead
+	m, _ := s.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if m != s {
+		t.Fatalf("Update should return the same session")
+	}
+	if s.pendingSS3 {
+		t.Fatalf("pendingSS3 should be cleared after a non-'M' follow-up")
+	}
+	// 'O' is dropped (Alt-'O' isn't a real chat input); 'x' is inserted normally.
+	if got := s.input.Value(); got != "foox" {
+		t.Fatalf("after spurious Alt-'O' + 'x', input should be %q, got %q", "foox", got)
+	}
+}

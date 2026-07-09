@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -76,6 +77,103 @@ func isCtrlEnterUnknownCSI(msg tea.Msg) bool { return isModifiedEnterCSI(msg, 5)
 
 // isShiftEnterUnknownCSI reports whether msg is a Shift+Enter modified-Enter CSI.
 func isShiftEnterUnknownCSI(msg tea.Msg) bool { return isModifiedEnterCSI(msg, 2) }
+
+// ctrlLetterKeyFromModifiedCSI converts the non-Enter CSI-u / modifyOtherKeys
+// sequences produced by terminals after we request enhanced keyboard reporting
+// back into ordinary Bubble Tea Ctrl+letter KeyMsgs. This lets us enable the
+// more reliable protocols needed for Ctrl+Enter / Shift+Enter without breaking
+// existing bindings like Ctrl+C, Ctrl+P, Ctrl+K, Ctrl+T, and Ctrl+O.
+//
+// Supported forms:
+//   - Kitty progressive keyboard: ESC [ <codepoint> ; <mods> u
+//   - xterm modifyOtherKeys level 2: ESC [ 27 ; <mods> ; <codepoint> ~
+//
+// Modifier encoding is the same in both protocols: 1 + bitmask where ctrl is
+// bit 4 (so ctrl alone is 5, ctrl+shift is 6, ctrl+alt is 7, ...). We only
+// synthesize Ctrl+A..Ctrl+Z; other enhanced keys either have dedicated handling
+// (Enter above) or should remain ignored rather than guessed.
+func ctrlLetterKeyFromModifiedCSI(msg tea.Msg) (tea.KeyMsg, bool) {
+	v := reflect.ValueOf(msg)
+	if v.Kind() != reflect.Slice || v.Type().Elem().Kind() != reflect.Uint8 {
+		return tea.KeyMsg{}, false
+	}
+	s := string(v.Bytes())
+	if !strings.HasPrefix(s, "\x1b[") {
+		return tea.KeyMsg{}, false
+	}
+
+	var code, mods int
+	var err error
+	body := strings.TrimPrefix(s, "\x1b[")
+	switch {
+	case strings.HasSuffix(body, "u"):
+		parts := strings.Split(strings.TrimSuffix(body, "u"), ";")
+		if len(parts) != 2 {
+			return tea.KeyMsg{}, false
+		}
+		code, err = strconv.Atoi(parts[0])
+		if err != nil {
+			return tea.KeyMsg{}, false
+		}
+		mods, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return tea.KeyMsg{}, false
+		}
+	case strings.HasSuffix(body, "~"):
+		parts := strings.Split(strings.TrimSuffix(body, "~"), ";")
+		if len(parts) != 3 || parts[0] != "27" {
+			return tea.KeyMsg{}, false
+		}
+		mods, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return tea.KeyMsg{}, false
+		}
+		code, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return tea.KeyMsg{}, false
+		}
+	default:
+		return tea.KeyMsg{}, false
+	}
+
+	if mods&4 == 0 { // ctrl bit not set
+		return tea.KeyMsg{}, false
+	}
+	if code >= 'A' && code <= 'Z' {
+		code += 'a' - 'A'
+	}
+	if code < 'a' || code > 'z' {
+		return tea.KeyMsg{}, false
+	}
+	return tea.KeyMsg{Type: tea.KeyType(code - 'a' + 1)}, true
+}
+
+// SS3 Enter (\x1bOM) — the form VS Code's and Konsole's terminals send for
+// Shift+Enter when no keyboard protocol is engaged. bubbletea v1.3.10 has no
+// \x1bOM mapping (it only knows \x1bOA-D / \x1bOP-S) and \x1bOM is NOT a CSI
+// (\x1b[…), so it never becomes the `unknownCSISequenceMsg` the CSI helpers
+// above catch. detectOneMsg instead consumes ESC as an Alt-prefix and emits
+// TWO separate tea.KeyMsg values: first {KeyRunes, Runes:['O'], Alt:true},
+// then {KeyRunes, Runes:['M']} — both reach handleKey and (without the buffer
+// in handleKey) get inserted into the input as "OM".
+//
+// We can't catch \x1bOM as a single message, so handleKey buffers it: the
+// Alt-'O' lead sets s.pendingSS3 (and is consumed); the trailing 'M' then
+// resolves it as a Shift+Enter → insertNewline. These two helpers classify
+// each half. (When modifyOtherKeys is engaged the terminal sends a proper CSI
+// instead, so this buffer only fires for the legacy \x1bOM form.)
+
+// isSS3EnterLead reports whether msg is the Alt-'O' KeyRunes that bubbletea
+// emits as the first half of an \x1bOM (SS3 keypad-Enter) sequence.
+func isSS3EnterLead(msg tea.KeyMsg) bool {
+	return msg.Alt && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 'O'
+}
+
+// isSS3EnterRune reports whether msg is the trailing plain-'M' KeyRunes that
+// follows the Alt-'O' lead to complete an \x1bOM sequence.
+func isSS3EnterRune(msg tea.KeyMsg) bool {
+	return !msg.Alt && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 'M'
+}
 
 // insertNewline inserts a literal line break ('\n') at the textinput cursor so
 // Shift+Enter builds a multi-line message. Mirrors acceptMention's

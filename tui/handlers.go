@@ -1033,6 +1033,29 @@ func (s *session) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if s.modal.kind != modalNone {
 		return s.handleModalKey(msg)
 	}
+	// SS3 (\x1bOM) Shift+Enter: VS Code's and Konsole's terminals send \x1bOM
+	// (SS3 keypad-Enter) for Shift+Enter. bubbletea has no \x1bOM mapping and
+	// it's not a CSI, so it splits into two KeyMsgs — Alt-'O' then 'M' (see
+	// extras.go) — which without this buffer leak into the input as "OM". Buffer
+	// the Alt-'O' lead; the trailing 'M' resolves it as Shift+Enter. When newline
+	// is bound to shift+enter (the default) that inserts a line break; otherwise
+	// the pair is consumed silently so it never produces "OM". (When
+	// modifyOtherKeys is engaged the terminal sends a proper CSI instead, so this
+	// only fires for the legacy \x1bOM form.)
+	if s.pendingSS3 {
+		s.pendingSS3 = false
+		if isSS3EnterRune(msg) {
+			if s.keybinds["newline"] == "shift+enter" {
+				s.insertNewline()
+			}
+			return s, nil
+		}
+		// not the expected 'M' — spurious Alt-'O'; fall through normally
+	}
+	if isSS3EnterLead(msg) {
+		s.pendingSS3 = true
+		return s, nil
+	}
 	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
 	// all keys (option cycling, text entry, submit, skip). Dispatched before
 	// scrolling/global keys just like the modal above — without it the flyout

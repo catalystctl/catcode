@@ -56,6 +56,7 @@ type session struct {
 	pendingIntercom     *intercomPrompt
 	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
 	pendingAsk          *askPrompt
+	pendingSS3          bool        // buffering the Alt-'O' lead of an \x1bOM (SS3 Enter) split — see handleKey
 	updateInfo          *updateInfo // non-nil when a newer release is available (drives the top banner)
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
@@ -434,7 +435,19 @@ func (s *session) sendCore(m map[string]any) {
 // ---------------------------------------------------------------------------
 
 func (s *session) Init() tea.Cmd {
-	return tea.Batch(s.startCore(), tick(), s.spinner.Tick)
+	return tea.Batch(enableKeyboardProtocol(), s.startCore(), tick(), s.spinner.Tick)
+}
+
+func enableKeyboardProtocol() tea.Cmd {
+	return func() tea.Msg {
+		// This MUST be emitted after Bubble Tea has entered alt-screen. Kitty-family
+		// terminals (including Konsole) keep independent keyboard-mode stacks for the
+		// main and alternate screens, so doing this before prog.Run() only changes
+		// the main screen and has no effect on the TUI. See the comment in main()
+		// for the protocol details.
+		_, _ = os.Stdout.WriteString("\x1b[>4;2m\x1b[>1u")
+		return nil
+	}
 }
 
 func tick() tea.Cmd {
@@ -516,6 +529,7 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.queuedNext = false
 		s.pendingApproval = nil
 		s.pendingIntercom = nil
+		s.pendingSS3 = false
 		s.subProgress = nil
 		// clear stale per-core state so a crash-restart starts clean: a leftover
 		// queued follow-up, pinned todos, a pending ask, footer metrics, or an
@@ -554,11 +568,14 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, s.handleMouseWheel(msg)
 
 	default:
-		// bubbletea v1.3 can't decode modified-Enter (the Key type carries no
-		// modifier bits), so terminals send Ctrl+Enter as an unrecognized CSI sequence.
-		// Intercept it here so the user can both bind it (in /keybinds capture mode)
-		// and use it for steer. Terminals that send a plain CR for Ctrl+Enter instead
-		// receive it as a normal "enter" (follow-up).
+		// bubbletea v1.3 can't decode enhanced keyboard reports (the Key type carries
+		// no modifier bits), so they arrive as unrecognized CSI sequences. Intercept
+		// modified Enter for newline/steer, and translate enhanced Ctrl+letter reports
+		// back through the normal KeyMsg path so enabling richer keyboard protocols
+		// doesn't break Ctrl+C / Ctrl+P / Ctrl+K / Ctrl+T / Ctrl+O.
+		if key, ok := ctrlLetterKeyFromModifiedCSI(msg); ok {
+			return s.handleKey(key)
+		}
 		if isCtrlEnterUnknownCSI(msg) {
 			// /keybinds capture mode: assign ctrl+enter to the selected action.
 			if s.modal.kind == modalKeybinds && s.modal.editing {
@@ -629,7 +646,26 @@ func main() {
 		prog.Send(sigtermMsg{})
 	}()
 
-	if _, err := prog.Run(); err != nil {
+	// Ask terminals for an unambiguous modified-Enter encoding. This fixes SSH /
+	// Konsole cases where Ctrl+Enter otherwise arrives as a plain Enter (queued
+	// follow-up) and Shift+Enter arrives as keypad Enter / "OM" instead of a
+	// newline.
+	//
+	// 1) xterm modifyOtherKeys level 2: Ctrl+Enter -> ESC[27;5;13~ and
+	//    Shift+Enter -> ESC[27;2;13~ on xterm-compatible terminals.
+	// 2) Kitty progressive keyboard flag 1: disambiguate escape codes; Konsole and
+	//    kitty-family terminals then report Ctrl+Enter / Shift+Enter as CSI-u
+	//    (ESC[13;5u / ESC[13;2u). It may also report Ctrl+letter as CSI-u, so
+	//    Update translates those back to ordinary Bubble Tea KeyMsgs.
+	//
+	// IMPORTANT: the enable sequence is sent from Init(), not here. Bubble Tea
+	// enters alt-screen inside prog.Run(), and Kitty/Konsole maintain separate
+	// keyboard-mode stacks for main vs alt screen. Sending it before Run() changes
+	// the wrong screen, which was why the first fix did nothing. Disabled after
+	// Run so the user's shell is restored even if the terminal applied it globally.
+	_, err := prog.Run()
+	os.Stdout.WriteString("\x1b[<u\x1b[>0u\x1b[>4;0m") // disable Kitty keyboard + modifyOtherKeys
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
