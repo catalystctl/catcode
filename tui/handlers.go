@@ -709,7 +709,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 // take over the whole screen and are skipped.
 //
 // Mouse tracking is opt-in: it's enabled at startup only when the Mouse Wheel
-// setting is on, and toggled at runtime via /settings → Mouse Wheel
+// setting is on, and toggled at runtime via /mouse-wheel
 // applyModels sets the discovered model list and re-applies the persisted
 // model selection + reasoning clamp. Shared by the `ready` and `models`
 // events so a provider switch re-selects the same model id when present.
@@ -800,7 +800,7 @@ func (s *session) reauthActiveProvider() {
 	if s.sendProviderKey(s.activeProvider) {
 		s.logInfo("sending key…")
 	} else {
-		s.logWarn("set your key: /key sk-...  (or open settings)")
+		s.logWarn("set your key: /key sk-...  (or /login)")
 	}
 }
 
@@ -1329,15 +1329,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			// /key <value> sets the API key for the active provider. Kept as a
 			// convenience because the app's "not authenticated" errors direct the
 			// user here ("run /key sk-... first"); the full multi-provider flow is
-			// /login. With no argument, /key opens the settings modal on the API
-			// Key field so the user can paste one inline.
+			// /login. With no argument, /key opens a dedicated API-key modal.
 			if len(parts) < 2 {
-				s.openSettings()
-				s.modal.fieldIdx = s.settingsFieldIndex("API Key")
-				if s.modal.fieldIdx < 0 {
-					s.modal.fieldIdx = 0
-				}
-				s.logInfo("paste your key in the API Key field, then Enter")
+				s.openAPIKeyModal()
 				return nil
 			}
 			key := parts[1]
@@ -1420,14 +1414,152 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				return nil
 			}
 			return s.sendSteer(strings.Join(parts[1:], " "))
-		case "/approval":
+		case "/approval", "/approvals":
+			// Bare /approval opens the dedicated picker; with an arg, set directly.
 			if len(parts) < 2 {
-				s.logError("usage: /approval never|destructive|always")
+				s.openApprovalPicker()
 				return nil
 			}
-			s.settings.Approval = parts[1]
-			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_approval", "mode": parts[1]})
+			mode := parts[1]
+			switch mode {
+			case "never", "destructive", "always":
+				s.applyApprovalMode(mode)
+			default:
+				s.logError("usage: /approval never|destructive|always")
+			}
+			return nil
+		case "/reasoning":
+			if len(parts) >= 2 {
+				level := parts[1]
+				levels := s.thinkingLevels()
+				ok := false
+				for _, l := range levels {
+					if strings.EqualFold(l, level) {
+						s.settings.ReasoningEffort = l
+						_ = s.settings.save()
+						s.logInfo(fmt.Sprintf("reasoning: %s", l))
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					s.logError("usage: /reasoning [" + strings.Join(levels, "|") + "]")
+				}
+				return nil
+			}
+			s.openReasoningPicker()
+			return nil
+		case "/bash-timeout":
+			if len(parts) >= 2 {
+				var n int
+				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n > 0 {
+					s.coreBashTimeout = n
+					s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": n})
+					s.logInfo(fmt.Sprintf("bash timeout: %ds", n))
+				} else {
+					s.logError("usage: /bash-timeout <seconds>")
+				}
+				return nil
+			}
+			s.openBashTimeoutModal()
+			return nil
+		case "/auto-compact":
+			if len(parts) >= 2 {
+				switch strings.ToLower(parts[1]) {
+				case "on", "true", "1":
+					s.coreAutoCompact = true
+					s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": true})
+					s.logInfo("auto-compact: on")
+				case "off", "false", "0":
+					s.coreAutoCompact = false
+					s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": false})
+					s.logInfo("auto-compact: off")
+				default:
+					s.logError("usage: /auto-compact [on|off]")
+				}
+				return nil
+			}
+			s.openAutoCompactPicker()
+			return nil
+		case "/sandbox":
+			if len(parts) >= 2 {
+				mode := parts[1]
+				if mode == "none" || mode == "firejail" {
+					s.settings.Sandbox = mode
+					_ = s.settings.save()
+					s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", mode))
+				} else {
+					s.logError("usage: /sandbox none|firejail")
+				}
+				return nil
+			}
+			s.openSandboxPicker()
+			return nil
+		case "/no-network":
+			if len(parts) >= 2 {
+				switch strings.ToLower(parts[1]) {
+				case "on", "true", "1":
+					s.settings.NoNetwork = true
+					_ = s.settings.save()
+					s.logInfo("no-network: on (applies on next launch)")
+				case "off", "false", "0":
+					s.settings.NoNetwork = false
+					_ = s.settings.save()
+					s.logInfo("no-network: off (applies on next launch)")
+				default:
+					s.logError("usage: /no-network [on|off]")
+				}
+				return nil
+			}
+			s.openNoNetworkPicker()
+			return nil
+		case "/mouse-wheel":
+			if len(parts) >= 2 {
+				switch strings.ToLower(parts[1]) {
+				case "on", "true", "1":
+					s.settings.MouseWheel = true
+					_ = s.settings.save()
+					s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
+					s.invalidateAll()
+				case "off", "false", "0":
+					s.settings.MouseWheel = false
+					_ = s.settings.save()
+					s.logInfo("mouse wheel: off (click-drag to select/copy text)")
+					s.invalidateAll()
+				default:
+					s.logError("usage: /mouse-wheel [on|off]")
+				}
+				return nil
+			}
+			s.openMouseWheelPicker()
+			return nil
+		case "/idle-timeout":
+			if len(parts) >= 2 {
+				var n int
+				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n >= 10 {
+					s.settings.IdleTimeout = n
+					_ = s.settings.save()
+					s.logInfo(fmt.Sprintf("idle timeout: %ds (applies on next launch)", n))
+				} else {
+					s.logError("usage: /idle-timeout <seconds≥10>")
+				}
+				return nil
+			}
+			s.openIdleTimeoutModal()
+			return nil
+		case "/max-session-tokens":
+			if len(parts) >= 2 {
+				var n int
+				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n >= 0 {
+					s.settings.MaxSessionTokens = n
+					_ = s.settings.save()
+					s.logInfo(fmt.Sprintf("max session tokens: %d (applies on next launch)", n))
+				} else {
+					s.logError("usage: /max-session-tokens <n≥0>  (0=unlimited)")
+				}
+				return nil
+			}
+			s.openMaxSessionTokensModal()
 			return nil
 		case "/help", "/?":
 			s.openHelp()

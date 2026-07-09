@@ -75,13 +75,14 @@ var keybindDefs = []keybindDef{
 	// Mention — @-mention file flyout.
 	{"mention_accept", "Mention", "Accept @-mention selection", "tab"},
 
-	// Settings modal — field navigation and value cycling.
-	{"field_next", "Settings", "Next settings field", "tab"},
-	{"field_prev", "Settings", "Previous settings field", "shift+tab"},
-	{"cycle_left", "Settings", "Cycle value left", "left"},
-	{"cycle_left_alt", "Settings", "Cycle value left (alternate)", "h"},
-	{"cycle_right", "Settings", "Cycle value right", "right"},
-	{"cycle_right_alt", "Settings", "Cycle value right (alternate)", "l"},
+	// Settings list navigation (kept for remaps / help; list modals also
+	// accept bare up/down/enter/esc so they stay usable if these are unbound).
+	{"field_next", "Settings", "Next list item (settings hub)", "tab"},
+	{"field_prev", "Settings", "Previous list item (settings hub)", "shift+tab"},
+	{"cycle_left", "Settings", "Cycle value left (legacy)", "left"},
+	{"cycle_left_alt", "Settings", "Cycle value left alternate (legacy)", "h"},
+	{"cycle_right", "Settings", "Cycle value right (legacy)", "right"},
+	{"cycle_right_alt", "Settings", "Cycle value right alternate (legacy)", "l"},
 
 	// Vision modal — toggle vision-capable models.
 	{"vision_toggle", "Vision", "Toggle vision-capable", " "},

@@ -1284,41 +1284,8 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 }
 
 // ---------------------------------------------------------------------------
-// Settings modal
+// Value-edit modals + helpers (API key, timeouts, etc.)
 // ---------------------------------------------------------------------------
-
-type settingsField struct {
-	label string
-	value string
-	hint  string
-}
-
-func (s *session) settingsFields() []settingsField {
-	key := s.settings.APIKey
-	if key != "" {
-		if len(key) > 8 {
-			key = key[:4] + "…" + key[len(key)-4:]
-		} else {
-			key = "…"
-		}
-	} else {
-		key = "(not set)"
-	}
-	return []settingsField{
-		{label: "Provider", value: s.providerFieldLabel(), hint: s.providerFieldHint()},
-		{label: "API Key", value: key, hint: "enter to edit"},
-		{label: "Approval", value: s.approvalMode(), hint: "enter to cycle"},
-		{label: "Reasoning", value: s.settings.ReasoningEffort, hint: "enter to cycle"},
-		{label: "Theme", value: activeTheme.name, hint: "enter to pick"},
-		{label: "Bash Timeout", value: fmt.Sprintf("%ds", s.coreBashTimeout), hint: "enter to edit"},
-		{label: "Auto Compact", value: boolStr(s.coreAutoCompact), hint: "enter to toggle"},
-		{label: "Sandbox", value: s.settings.Sandbox, hint: "enter to cycle"},
-		{label: "No Network", value: boolStr(s.settings.NoNetwork), hint: "enter to toggle"},
-		{label: "Mouse Wheel", value: boolStr(s.settings.MouseWheel), hint: "enter to toggle"},
-		{label: "Idle Timeout", value: fmt.Sprintf("%ds", s.settings.IdleTimeout), hint: "enter to edit"},
-		{label: "Max Session Tok", value: fmt.Sprintf("%d", s.settings.MaxSessionTokens), hint: "enter to edit"},
-	}
-}
 
 func boolStr(b bool) string {
 	if b {
@@ -1339,143 +1306,22 @@ func humanTokens(n uint64) string {
 	return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
 }
 
-// settingsFieldIndex returns the index of the settings field whose label
-// matches, or -1 if none. Palette shortcuts (/key, /approval) use this so
-// they target the correct row regardless of the field ordering in
-// settingsFields() — hard-coded indices broke when "Provider" was added at
-// index 0 (e.g. /key landed on Provider instead of API Key, and the typed
-// key was then dropped on commit since Provider has no edit handler).
-func (s *session) settingsFieldIndex(label string) int {
-	for i, f := range s.settingsFields() {
-		if f.label == label {
-			return i
-		}
-	}
-	return -1
-}
-
-func (s *session) handleSettingsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	fields := s.settingsFields()
-	n := len(fields)
-	switch {
-	case s.kbAny(msg, "nav_up", "nav_up_alt"):
-		s.modal.fieldIdx = (s.modal.fieldIdx - 1 + n) % n
-	case s.kbAny(msg, "nav_down", "nav_down_alt") || s.kb(msg, "field_next"):
-		s.modal.fieldIdx = (s.modal.fieldIdx + 1) % n
-	case s.kb(msg, "field_prev"):
-		s.modal.fieldIdx = (s.modal.fieldIdx - 1 + n) % n
-	case msg.String() == "enter" || s.kb(msg, "select"):
-		// hardcoded "enter" fallback + keymap binding — stays usable even if
-		// select is unbound (mirrors the list modals' guaranteed-escape rule).
-		return s.activateField(s.modal.fieldIdx)
-	case s.kbAny(msg, "cycle_left", "cycle_left_alt"):
-		// cycle approval / reasoning left
-		s.cycleField(s.modal.fieldIdx, -1)
-	case s.kbAny(msg, "cycle_right", "cycle_right_alt"):
-		s.cycleField(s.modal.fieldIdx, +1)
-	}
-	return s, nil
-}
-
-// activateField handles enter on a settings field.
-func (s *session) activateField(idx int) (tea.Model, tea.Cmd) {
-	fields := s.settingsFields()
-	if idx < 0 || idx >= len(fields) {
-		return s, nil
-	}
-	switch fields[idx].label {
-	case "Provider":
-		s.cycleProvider(+1)
-	case "API Key":
-		s.startEditField(idx)
-		s.modal.editBuf.SetValue("")
-		s.modal.editBuf.Placeholder = "sk-..."
-		s.modal.editBuf.Focus()
-		return s, textinput.Blink
-	case "Approval":
-		s.cycleApproval(+1)
-	case "Reasoning":
-		s.cycleReasoning(+1)
-	case "Theme":
-		s.openThemePicker()
-	case "Bash Timeout":
-		s.startEditField(idx)
-		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.coreBashTimeout))
-		s.modal.editBuf.Focus()
-		return s, textinput.Blink
-	case "Sandbox":
-		s.cycleSandbox(+1)
-	case "No Network":
-		s.settings.NoNetwork = !s.settings.NoNetwork
-		_ = s.settings.save()
-		s.logInfo(fmt.Sprintf("no-network: %s (applies on next launch)", boolStr(s.settings.NoNetwork)))
-	case "Auto Compact":
-		s.coreAutoCompact = !s.coreAutoCompact
-		s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": s.coreAutoCompact})
-		s.logInfo(fmt.Sprintf("auto-compact: %s", boolStr(s.coreAutoCompact)))
-	case "Mouse Wheel":
-		s.settings.MouseWheel = !s.settings.MouseWheel
-		_ = s.settings.save()
-		if s.settings.MouseWheel {
-			s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
-		} else {
-			s.logInfo("mouse wheel: off (click-drag to select/copy text)")
-		}
-		// v2: mouse mode is a declarative View field set from s.settings.MouseWheel
-		// in View(); the re-render from s.invalidateAll() applies it. No command.
-		s.invalidateAll()
-		return s, nil
-	case "Idle Timeout":
-		s.startEditField(idx)
-		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.settings.IdleTimeout))
-		s.modal.editBuf.Focus()
-		return s, textinput.Blink
-	case "Max Session Tok":
-		s.startEditField(idx)
-		s.modal.editBuf.SetValue(fmt.Sprintf("%d", s.settings.MaxSessionTokens))
-		s.modal.editBuf.Focus()
-		return s, textinput.Blink
-	}
-	return s, nil
-}
-
-func (s *session) cycleSandbox(dir int) {
-	modes := []string{"none", "firejail"}
-	cur := 0
-	for i, m := range modes {
-		if m == s.settings.Sandbox {
-			cur = i
-			break
-		}
-	}
-	next := (cur + dir + len(modes)) % len(modes)
-	s.settings.Sandbox = modes[next]
-	_ = s.settings.save()
-	s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", modes[next]))
-}
-
-func (s *session) startEditField(idx int) {
-	s.modal.editing = true
-	s.modal.fieldIdx = idx
-	ti := textinput.New()
-	ti.Prompt = ""
-	s.modal.editBuf = ti
-}
-
 func (s *session) handleSettingsEditKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case s.kb(msg, "close"):
-		if s.modal.kind == modalOauthCode {
-			// Esc cancels the OAuth code modal entirely (there's no list to
-			// return to, unlike the settings inline edit).
+		// Standalone edit modals (oauth code, value edit) dismiss entirely.
+		// Login key capture returns to the provider list so the user can pick
+		// another preset.
+		if s.modal.kind == modalOauthCode || s.modal.kind == modalValueEdit {
 			s.closeModal()
 			return s, nil
 		}
+		s.pendingLogin = ""
 		s.modal.editing = false
 		return s, nil
 	case msg.String() == "enter" || s.kb(msg, "select"):
-		// hardcoded "enter" fallback so committing a pasted key (login/settings)
-		// can't be trapped by an unbound select binding (mirrors list modals).
+		// hardcoded "enter" fallback so committing a pasted key can't be trapped
+		// by an unbound select binding (mirrors list modals).
 		return s.commitEditField()
 	}
 	var cmd tea.Cmd
@@ -1535,73 +1381,71 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 		s.closeModal()
 		return s, nil
 	}
-	fields := s.settingsFields()
-	idx := s.modal.fieldIdx
-	val := s.modal.editBuf.Value()
-	s.modal.editing = false
-	if idx < 0 || idx >= len(fields) {
-		return s, nil
+	// Dedicated value-edit modals (/key, /bash-timeout, /idle-timeout, …).
+	if s.modal.kind == modalValueEdit {
+		return s.commitValueEdit()
 	}
-	switch fields[idx].label {
-	case "API Key":
-		if strings.TrimSpace(val) != "" {
-			key := strings.TrimSpace(val)
-			// Scope the key to the active provider (per-provider keys).
-			name := s.activeProvider
-			if name == "" {
-				name = "default"
-			}
-			if s.settings.ProviderKeys == nil {
-				s.settings.ProviderKeys = map[string]string{}
-			}
-			s.settings.ProviderKeys[name] = key
-			s.settings.APIKey = key
-			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_key", "provider": name, "api_key": key})
-			s.logInfo("sending key…")
+	s.modal.editing = false
+	return s, nil
+}
+
+// commitValueEdit applies a free-form setting from modalValueEdit and closes.
+func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
+	val := strings.TrimSpace(s.modal.editBuf.Value())
+	target := s.modal.editTarget
+	s.modal.editing = false
+	s.closeModal()
+	switch target {
+	case editTargetAPIKey:
+		if val == "" {
+			s.logError("no key entered")
+			return s, nil
 		}
-	case "Bash Timeout":
+		name := s.activeProvider
+		if name == "" {
+			name = "default"
+		}
+		if s.settings.ProviderKeys == nil {
+			s.settings.ProviderKeys = map[string]string{}
+		}
+		s.settings.ProviderKeys[name] = val
+		s.settings.APIKey = val
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_key", "provider": name, "api_key": val})
+		s.logInfo(fmt.Sprintf("sending key for provider '%s'…", name))
+	case editTargetBashTimeout:
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
 			s.coreBashTimeout = n
 			s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": n})
+			s.logInfo(fmt.Sprintf("bash timeout: %ds", n))
+		} else {
+			s.logError("bash timeout must be a positive integer (seconds)")
 		}
-	case "Idle Timeout":
+	case editTargetIdleTimeout:
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 10 {
 			s.settings.IdleTimeout = n
 			_ = s.settings.save()
 			s.logInfo(fmt.Sprintf("idle timeout: %ds (applies on next launch)", n))
+		} else {
+			s.logError("idle timeout must be ≥ 10 seconds")
 		}
-	case "Max Session Tok":
+	case editTargetMaxSessionTokens:
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 0 {
 			s.settings.MaxSessionTokens = n
 			_ = s.settings.save()
 			s.logInfo(fmt.Sprintf("max session tokens: %d (applies on next launch)", n))
+		} else {
+			s.logError("max session tokens must be ≥ 0 (0=unlimited)")
 		}
 	}
 	return s, nil
 }
 
-// cycleField cycles a cyclable field (approval, reasoning, provider) by dir (+1/-1).
-func (s *session) cycleField(idx, dir int) {
-	fields := s.settingsFields()
-	if idx < 0 || idx >= len(fields) {
-		return
-	}
-	switch fields[idx].label {
-	case "Provider":
-		s.cycleProvider(dir)
-	case "Approval":
-		s.cycleApproval(dir)
-	case "Reasoning":
-		s.cycleReasoning(dir)
-	}
-}
-
-// providerFieldLabel renders the active provider's name + kind for the settings
-// modal (e.g. "anthropic [anthropic]"). Shows "default" when none configured.
+// providerFieldLabel renders the active provider's name + kind (e.g.
+// "anthropic [anthropic]"). Shows "default" when none configured.
 func (s *session) providerFieldLabel() string {
 	name := s.activeProvider
 	if name == "" {
@@ -1611,66 +1455,6 @@ func (s *session) providerFieldLabel() string {
 		return fmt.Sprintf("%s [%s]", name, s.providerKind)
 	}
 	return name
-}
-
-// providerFieldHint tells the user what enter/cycle does; "(configured in
-// config.json)" when no custom providers are defined (nothing to cycle).
-func (s *session) providerFieldHint() string {
-	if len(s.providers) > 0 {
-		return "←→ cycle · enter apply"
-	}
-	return "configured in config.json"
-}
-
-// cycleProvider switches to the next/previous configured provider and tells
-// the core to switch (re-discovers models + re-resolves the key). No-op when
-// no providers are configured.
-func (s *session) cycleProvider(dir int) {
-	if len(s.providers) == 0 {
-		return
-	}
-	cur := 0
-	for i, p := range s.providers {
-		if p == s.activeProvider {
-			cur = i
-			break
-		}
-	}
-	next := (cur + dir + len(s.providers)) % len(s.providers)
-	name := s.providers[next]
-	s.settings.ActiveProvider = name
-	_ = s.settings.save()
-	s.sendCore(map[string]any{"type": "set_provider", "name": name})
-	s.logInfo(fmt.Sprintf("switching provider: %s", name))
-}
-
-func (s *session) cycleApproval(dir int) {
-	modes := []string{"never", "destructive", "always"}
-	cur := 1
-	for i, m := range modes {
-		if m == s.approvalMode() {
-			cur = i
-			break
-		}
-	}
-	next := (cur + dir + len(modes)) % len(modes)
-	s.sendCore(map[string]any{"type": "set_approval", "mode": modes[next]})
-	s.settings.Approval = modes[next]
-	_ = s.settings.save()
-}
-
-func (s *session) cycleReasoning(dir int) {
-	efforts := s.thinkingLevels()
-	cur := 0
-	for i, e := range efforts {
-		if strings.EqualFold(e, s.settings.ReasoningEffort) {
-			cur = i
-			break
-		}
-	}
-	next := (cur + dir + len(efforts)) % len(efforts)
-	s.settings.ReasoningEffort = efforts[next]
-	_ = s.settings.save()
 }
 
 // thinkingLevels returns the reasoning levels available for the currently
@@ -1752,16 +1536,25 @@ func (s *session) helpText() string {
 		"",
 		"Mouse & copy",
 		"  click-drag selects/copies text (mouse off by default)",
-		"  /settings → Mouse Wheel enables wheel scrolling",
+		"  /mouse-wheel on  enables wheel scrolling",
 		"  (hold Shift to select/copy while the mouse is on)",
 		"",
 		"Slash commands",
 		"  /login           log in / switch provider (OpenAI · Gemini · Anthropic)",
 		"  /logout          log out of a provider",
 		"  /oauth-code <c>  paste OAuth code (SSH/headless Google login)",
+		"  /key [sk-…]      set API key (modal if omitted)",
 		"  /model [N|substr] list or switch model",
-		"  /approval <mode>  never | destructive | always",
-		"  /reasoning        set reasoning effort (per model)",
+		"  /approval [mode] never | destructive | always (modal if omitted)",
+		"  /reasoning [lvl] set reasoning effort (per model)",
+		"  /theme           switch colour theme",
+		"  /bash-timeout    bash tool timeout (seconds)",
+		"  /auto-compact    auto context compaction on/off",
+		"  /sandbox         sandbox mode (none · firejail)",
+		"  /no-network      block network in sandbox on/off",
+		"  /mouse-wheel     mouse-wheel scrolling on/off",
+		"  /idle-timeout    idle timeout (seconds)",
+		"  /max-session-tokens  max session tokens (0=unlimited)",
 		"  /reset            wipe conversation + session file",
 		"  /clear            clear view (keep session file)",
 		"  /undo             drop last turn",
@@ -1770,9 +1563,8 @@ func (s *session) helpText() string {
 		"  /new              start a fresh session file",
 		"  /stats            token + turn totals",
 		"  /abort            stop running turn",
-		"  /settings         open settings modal",
+		"  /settings         settings hub (opens dedicated modals)",
 		"  /keybinds         view & customize keybindings",
-		"  /theme            switch colour theme",
 		"  /copy             copy last assistant reply",
 		"  /attach <path>   send an image (vision) with the current input",
 		"  /vision          configure vision models & handoff target",
@@ -1787,7 +1579,7 @@ func (s *session) helpText() string {
 		"      \"api_key_env\": \"ANTHROPIC_API_KEY\" }",
 		"    { \"name\": \"local\", \"kind\": \"openai\", \"base_url\": \"http://localhost:11434/v1\" }",
 		"  Select one at startup with `--provider <name>` or UMANS_ACTIVE_PROVIDER.",
-		"  Switch at runtime: /settings -> Provider (cycles + re-discovers models).",
+		"  Switch at runtime: /login (or /settings → /login).",
 		"  Each provider keeps its own key (/key stores per-provider).",
 	)
 	return strings.Join(lines, "\n")
@@ -1845,7 +1637,19 @@ func (s *session) renderModalBody() string {
 	case modalVision:
 		return s.renderListModal("Vision Models", s.visionItems(), true)
 	case modalSettings:
-		return s.renderSettingsModal()
+		return s.renderListModal("Settings", s.settingsHubItems(), true)
+	case modalApproval:
+		return s.renderListModal("Approval Mode", s.approvalItems(), false)
+	case modalSandbox:
+		return s.renderListModal("Sandbox", s.sandboxItems(), false)
+	case modalAutoCompact:
+		return s.renderListModal("Auto Compact", s.autoCompactItems(), false)
+	case modalNoNetwork:
+		return s.renderListModal("No Network", s.noNetworkItems(), false)
+	case modalMouseWheel:
+		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
+	case modalValueEdit:
+		return s.renderValueEditModal()
 	case modalHelp:
 		return s.renderHelpModal()
 	case modalKeybinds:
@@ -2059,29 +1863,31 @@ func (s *session) renderContextModal() string {
 	return modalBox(w, strings.Join(lines, "\n"))
 }
 
-func (s *session) renderSettingsModal() string {
+// renderValueEditModal renders a free-form edit box for a single setting
+// (API key, bash timeout, idle timeout, max session tokens). Built by hand
+// (not via renderListModal) so the title is never treated as a list filter.
+func (s *session) renderValueEditModal() string {
 	w := s.modalWidth(72)
-	fields := s.settingsFields()
-	var lines []string
-	lines = append(lines, accentStyle.Render("◆ Settings"))
-	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
-	for i, f := range fields {
-		marker := "  "
-		if i == s.modal.fieldIdx {
-			marker = accentStyle.Render("▸ ")
-		}
-		label := baseStyle.Render(f.label)
-		val := mutedStyle.Render(f.value)
-		if s.modal.editing && i == s.modal.fieldIdx {
-			val = accentStyle.Render("[") + s.modal.editBuf.View() + accentStyle.Render("]")
-		}
-		hint := "  " + dimStyle.Render(f.hint)
-		lines = append(lines, marker+label+": "+val+hint)
+	title := s.modal.filter // openValueEditModal stores the title here
+	if title == "" {
+		title = "Edit value"
 	}
+	val := s.modal.editBuf.Value()
+	// Mask API keys while typing.
+	display := val
+	if s.modal.editTarget == editTargetAPIKey && val != "" {
+		display = strings.Repeat("•", len(val))
+	}
+	if display == "" && s.modal.editBuf.Placeholder != "" {
+		display = s.modal.editBuf.Placeholder
+	}
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ "+title))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+	lines = append(lines, accentStyle.Render("▸ ")+baseStyle.Render(display))
 	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  ↑↓ navigate · enter edit/apply · ←→ cycle · esc close"))
-	body := strings.Join(lines, "\n")
-	return modalBox(w, body)
+	lines = append(lines, dimStyle.Render("  type a value · enter save · esc cancel"))
+	return modalBox(w, strings.Join(lines, "\n"))
 }
 
 func (s *session) renderHelpModal() string {

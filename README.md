@@ -230,7 +230,8 @@ In the TUI:
 * `/login` — pick a provider. An API key in an env var logs in instantly;
   subscription accounts use OAuth (no key).
 * `/model [N|substr]` — list models, or switch (`/model 3`, `/model glm-5.2`).
-* `/approval never|destructive|always` — change the safety gate.
+* `/approval` — open the approval-mode picker (`never` · `destructive` · `always`); or `/approval always` to set directly.
+* `/settings` — settings hub; each option opens its own dedicated modal (`/theme`, `/sandbox`, `/mouse-wheel`, …).
 * type a prompt to chat. `/help` lists every command.
 
 ### Web frontend
