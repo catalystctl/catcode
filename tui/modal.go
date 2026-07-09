@@ -37,20 +37,139 @@ const (
 	modalKeybinds
 	modalOauthCode
 	modalContext
+	modalUsage // provider plan / rate-limit usage (/usage)
 	modalApproval
 	modalSandbox
 	modalAutoCompact
 	modalNoNetwork
 	modalMouseWheel
-	modalValueEdit // free-form edit (api_key, bash_timeout, idle_timeout, max_session_tokens)
+	modalValueEdit // free-form edit (api_key, timeouts, remember, attach, run, …)
+	modalMemory    // pick a memory to forget
+	modalGoal      // multi-field /goal form (goal, concurrency, models, providers)
+	modalGoalPlan  // plan-ready review (approve / revise / cancel)
 )
+
+// goalDraft is the multi-field form state for modalGoal.
+type goalDraft struct {
+	goal               string
+	concurrency        int
+	maxTasks           int
+	allowedModels      map[string]bool // model id → selected; empty map = unrestricted
+	allowedProviders   map[string]bool // provider name → selected; empty = unrestricted
+	reviewBeforeDeploy bool            // auto_deploy = !reviewBeforeDeploy
+	// Advanced section
+	advanced         bool
+	plannerModel     string         // empty = default (orchestrator)
+	workerModel      string
+	reviewerModel    string
+	modelConcurrency map[string]int // model id → max concurrent (capped by concurrency)
+	field            int            // focused field id (goalField*)
+	listCursor       int            // cursor within models/providers/model-conc lists
+	editing          bool           // free-text capture for goal field
+}
+
+const (
+	goalFieldGoal = iota
+	goalFieldConcurrency
+	goalFieldMaxTasks
+	goalFieldProviders
+	goalFieldModels
+	goalFieldReview
+	goalFieldAdvanced // checkbox — expand advanced role/model limits
+	goalFieldPlanner
+	goalFieldWorker
+	goalFieldReviewer
+	goalFieldModelConc // per-model concurrency list
+	goalFieldStart
+)
+
+// goalVisibleFields returns the field order for the current advanced state.
+func goalVisibleFields(advanced bool) []int {
+	base := []int{
+		goalFieldGoal,
+		goalFieldConcurrency,
+		goalFieldMaxTasks,
+		goalFieldProviders,
+		goalFieldModels,
+		goalFieldReview,
+		goalFieldAdvanced,
+	}
+	if advanced {
+		base = append(base,
+			goalFieldPlanner,
+			goalFieldWorker,
+			goalFieldReviewer,
+			goalFieldModelConc,
+		)
+	}
+	return append(base, goalFieldStart)
+}
+
+func goalFieldIndex(fields []int, field int) int {
+	for i, f := range fields {
+		if f == field {
+			return i
+		}
+	}
+	return 0
+}
+
+func goalNextField(fields []int, field, delta int) int {
+	i := goalFieldIndex(fields, field)
+	n := len(fields)
+	if n == 0 {
+		return field
+	}
+	i = (i + delta%n + n) % n
+	return fields[i]
+}
+
+// goalStateSnap is a lightweight view of the core's goal_state event.
+type goalStateSnap struct {
+	ID        string
+	Goal      string
+	Phase     string
+	Error     string
+	AutoDeploy bool
+	Prompts   []goalPromptSnap
+	Version   uint64
+}
+
+type goalPromptSnap struct {
+	StepID string
+	Agent  string
+	Title  string
+	Status string
+	Summary string
+}
+
+type goalPlanSnap struct {
+	Summary    string
+	Steps      []map[string]any
+	Risks      []string
+	Validation []string
+}
 
 // Value-edit targets for modalValueEdit (stored in modal.editTarget).
 const (
-	editTargetAPIKey            = "api_key"
-	editTargetBashTimeout       = "bash_timeout"
-	editTargetIdleTimeout       = "idle_timeout"
-	editTargetMaxSessionTokens  = "max_session_tokens"
+	editTargetAPIKey           = "api_key"
+	editTargetBashTimeout      = "bash_timeout"
+	editTargetIdleTimeout      = "idle_timeout"
+	editTargetMaxSessionTokens = "max_session_tokens"
+	editTargetRemember         = "remember"
+	editTargetAttach           = "attach"
+	editTargetPluginInstall    = "plugin_install"
+	editTargetSteer            = "steer"
+	editTargetRun              = "run"
+	editTargetParallel         = "parallel"
+	editTargetChain            = "chain"
+	editTargetCompact          = "compact"
+)
+
+// Plugin picker modes (session.pluginPickerMode).
+const (
+	pluginModeToggle = "toggle"
+	pluginModeRemove = "remove"
 )
 
 type modal struct {
@@ -219,6 +338,117 @@ func (s *session) openMaxSessionTokensModal() {
 		fmt.Sprintf("%d", s.settings.MaxSessionTokens), fmt.Sprintf("%d", s.settings.MaxSessionTokens))
 }
 
+// openRememberModal collects a durable memory note without requiring
+// `/remember <text>` on the command line.
+func (s *session) openRememberModal() {
+	s.openValueEditModal(editTargetRemember, "Remember", "durable note for future sessions", "")
+}
+
+// openAttachModal collects an image path for vision (optional prompt uses the
+// current composer text, same as `/attach <path>` with no trailing prompt).
+func (s *session) openAttachModal() {
+	s.openValueEditModal(editTargetAttach, "Attach Image", "/path/to/image.png", "")
+}
+
+// openPluginInstallModal collects a filesystem path to a plugin directory.
+func (s *session) openPluginInstallModal() {
+	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "/path/to/plugin-dir", "")
+}
+
+// openSteerModal collects a mid-turn steer message.
+func (s *session) openSteerModal() {
+	s.openValueEditModal(editTargetSteer, "Steer", "mid-turn instruction for the agent", "")
+}
+
+// openRunModal / openParallelModal / openChainModal collect the free-form
+// remainder of a subagent slash command (agent + task syntax).
+func (s *session) openRunModal() {
+	s.openValueEditModal(editTargetRun, "Run Subagent", `agent "task description"`, "")
+}
+
+func (s *session) openParallelModal() {
+	s.openValueEditModal(editTargetParallel, "Parallel Subagents",
+		`a1 "task1" | a2 "task2"`, "")
+}
+
+func (s *session) openChainModal() {
+	s.openValueEditModal(editTargetChain, "Chain Subagents",
+		`a1 "task1" -> a2 "task2"`, "")
+}
+
+// openCompactModal optionally collects compaction instructions; empty Enter
+// forces a default compaction (same as bare `/compact`).
+func (s *session) openCompactModal() {
+	s.openValueEditModal(editTargetCompact, "Compact Context",
+		"optional: what to preserve (blank = default)", "")
+}
+
+// openGoalModal opens the multi-field goal form. prefill seeds the goal text
+// when the user typed `/goal fix auth` (still confirm concurrency/models).
+func (s *session) openGoalModal(prefill string) {
+	s.modal = newModal()
+	s.modal.kind = modalGoal
+	d := goalDraft{
+		goal:               strings.TrimSpace(prefill),
+		concurrency:        4,
+		maxTasks:           8,
+		allowedModels:      map[string]bool{},
+		allowedProviders:   map[string]bool{},
+		reviewBeforeDeploy: false,
+		advanced:           false,
+		modelConcurrency:   map[string]int{},
+		field:              goalFieldGoal,
+	}
+	if d.goal == "" {
+		d.editing = true
+		ti := textinput.New()
+		ti.Prompt = ""
+		ti.Placeholder = "describe the goal to plan & deploy…"
+		ti.Focus()
+		s.modal.editBuf = ti
+		s.modal.editing = true
+	}
+	s.goalDraft = d
+}
+
+// openGoalPlanReview shows approve / revise / cancel for a plan_ready goal.
+func (s *session) openGoalPlanReview() {
+	s.modal = newModal()
+	s.modal.kind = modalGoalPlan
+	s.modal.cursor = 0
+}
+
+// openMemoryPicker shows saved memories so the user can forget one by Enter.
+// Call after memoryList has been populated from a list_memory core event.
+func (s *session) openMemoryPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalMemory
+	s.modal.cursor = 0
+}
+
+// requestMemoryPicker asks the core for the memory list and opens the picker
+// once the response arrives (see memory_list event handling).
+func (s *session) requestMemoryPicker() {
+	s.pendingMemoryPicker = true
+	s.sendCore(map[string]any{"type": "list_memory"})
+	s.logInfo("loading memories…")
+}
+
+// requestPluginPicker asks the core for plugins and opens the plugin modal
+// (toggle or remove mode) when plugins_list arrives.
+func (s *session) requestPluginPicker(mode string) {
+	if mode == "" {
+		mode = pluginModeToggle
+	}
+	s.pluginPickerMode = mode
+	s.sendCore(map[string]any{"type": "list_plugins"})
+	if mode == pluginModeRemove {
+		s.logInfo("loading plugins (enter to uninstall)…")
+	} else {
+		s.logInfo("loading plugins…")
+	}
+}
+
 func (s *session) openHelp() {
 	s.modal = newModal()
 	s.modal.kind = modalHelp
@@ -288,17 +518,30 @@ func (s *session) providerItems() []listItem {
 		switch {
 		case p.LoggedIn:
 			label = "✓ " + p.Label
-			if p.ID == s.activeProvider {
+			if p.SupportsOauth && p.EnvVar == "" {
+				// OAuth-only (e.g. xAI SuperGrok) — no API key override.
+				if p.ID == s.activeProvider {
+					desc = "logged in · active · enter to switch · " + desc
+				} else {
+					desc = "logged in · enter to switch · " + desc
+				}
+			} else if p.ID == s.activeProvider {
 				desc = "logged in · active · enter to override key (empty = switch) · " + desc
 			} else {
 				desc = "logged in · enter to override key (empty = switch) · " + desc
 			}
 		case p.HasKey:
 			label = "▸ " + p.Label
-			desc = "ready (key in " + p.EnvVar + ") · enter to log in · " + desc
+			if p.SupportsOauth && p.EnvVar == "" {
+				desc = "OAuth credentials on disk · enter to re-login · " + desc
+			} else {
+				desc = "ready (key in " + p.EnvVar + ") · enter to log in · " + desc
+			}
 		default:
 			label = "▸ " + p.Label
-			if p.SupportsOauth {
+			if p.SupportsOauth && p.EnvVar == "" {
+				desc = "enter to log in via OAuth (SuperGrok / X Premium+) · " + desc
+			} else if p.SupportsOauth {
 				desc = "enter to log in via OAuth (browser) · or set " + p.EnvVar + " · " + desc
 			} else {
 				desc = "enter key to log in · needs " + p.EnvVar + " · " + desc
@@ -506,6 +749,7 @@ func (s *session) openThemePicker() {
 func (s *session) closeModal() {
 	s.modal.kind = modalNone
 	s.modal.editing = false
+	s.pluginPickerMode = ""
 }
 
 // ---------------------------------------------------------------------------
@@ -532,31 +776,34 @@ func (s *session) commandItems() []listItem {
 		{label: "/reset", desc: "wipe conversation + session file"},
 		{label: "/clear", desc: "clear view (keep session file)"},
 		{label: "/undo", desc: "drop last turn"},
-		{label: "/compact", desc: "force compaction (opt: /compact <instructions>)"},
+		{label: "/compact", desc: "force compaction (modal for optional instructions)"},
 		{label: "/sessions", desc: "open session picker"},
 		{label: "/new", desc: "start a fresh session file"},
 		{label: "/stats", desc: "token + turn totals"},
 		{label: "/context", desc: "token-usage breakdown (top consumers)"},
+		{label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
 		{label: "/abort", desc: "stop running turn (or Esc)"},
-		{label: "/steer", desc: "steer an in-flight turn (or Ctrl+Enter)"},
+		{label: "/steer", desc: "steer an in-flight turn (modal)"},
 		{label: "/settings", desc: "settings hub (dedicated modals per option)"},
 		{label: "/keybinds", desc: "view & customize keybindings"},
 		{label: "/help", desc: "keybindings & commands"},
 		{label: "/copy", desc: "copy last assistant reply"},
-		{label: "/attach", desc: "attach an image (vision)"},
+		{label: "/attach", desc: "attach an image (vision) — path modal"},
 		{label: "/vision", desc: "configure vision models & handoff target"},
-		{label: "/plugin-install", desc: "install a plugin from directory"},
+		{label: "/plugin-install", desc: "install a plugin from directory (path modal)"},
 		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
-		{label: "/plugin-remove", desc: "uninstall a plugin"},
-		{label: "/run", desc: "delegate to a subagent (single)"},
-		{label: "/parallel", desc: "run subagents in parallel"},
-		{label: "/chain", desc: "run a subagent chain (->)"},
+		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
+		{label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
+		{label: "/run", desc: "delegate to a subagent (single) — modal"},
+		{label: "/parallel", desc: "run subagents in parallel — modal"},
+		{label: "/chain", desc: "run a subagent chain — modal"},
 		{label: "/subagents", desc: "list available subagents"},
+		{label: "/cancel-goal", desc: "cancel active goal mode"},
 		{label: "/subagents-doctor", desc: "subagent setup diagnostics"},
 		{label: "/subagents-status", desc: "show active subagent runs"},
-		{label: "/remember", desc: "save a memory note (persisted across sessions)"},
-		{label: "/memory", desc: "list saved memories"},
-		{label: "/forget", desc: "forget a memory by id"},
+		{label: "/remember", desc: "save a memory note (modal)"},
+		{label: "/memory", desc: "list / forget saved memories (picker)"},
+		{label: "/forget", desc: "forget a memory (picker)"},
 		{label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
 		{label: "/reflect", desc: "reflect on this session, persist durable learnings"},
 	}
@@ -707,6 +954,7 @@ func (s *session) mouseWheelItems() []listItem {
 }
 
 func (s *session) pluginItems() []listItem {
+	removeMode := s.pluginPickerMode == pluginModeRemove
 	var items []listItem
 	for _, raw := range sPluginStore {
 		var m map[string]json.RawMessage
@@ -718,12 +966,16 @@ func (s *session) pluginItems() []listItem {
 		desc := get(m, "description")
 		enabled := get(m, "enabled")
 		label := name + " v" + version
-		action := "disable"
-		if enabled == "false" {
+		var action string
+		if removeMode {
+			label += " · uninstall"
+			action = "uninstall"
+		} else if enabled == "false" {
 			label += " (disabled)"
 			action = "enable"
 		} else {
 			label += " (enabled)"
+			action = "disable"
 		}
 		hint := "enter to " + action
 		if desc != "" {
@@ -732,9 +984,53 @@ func (s *session) pluginItems() []listItem {
 		items = append(items, listItem{label: label, desc: hint})
 	}
 	if len(items) == 0 {
-		items = append(items, listItem{label: "(no plugins installed)", desc: "use /plugin-install <dir> to add one"})
+		items = append(items, listItem{label: "(no plugins installed)", desc: "use /plugin-install to add one"})
 	}
 	return items
+}
+
+// memoryItems builds the pick-to-forget list for modalMemory.
+func (s *session) memoryItems() []listItem {
+	items := make([]listItem, 0, len(s.memoryList))
+	for _, e := range s.memoryList {
+		id := e.ID
+		if id == "" {
+			id = "?"
+		}
+		label := truncateRunes(e.Text, 80)
+		if label == "" {
+			label = "(empty)"
+		}
+		desc := "id " + id + " · enter to forget"
+		if len(e.Tags) > 0 {
+			desc = "[" + strings.Join(e.Tags, ",") + "] · " + desc
+		}
+		items = append(items, listItem{label: label, desc: desc, meta: id})
+	}
+	if len(items) == 0 {
+		items = append(items, listItem{label: "(no memories)", desc: "use /remember to add one"})
+	}
+	return items
+}
+
+// removePlugin uninstalls the plugin at store index idx and drops it from the
+// cached store so the picker re-renders immediately.
+func (s *session) removePlugin(idx int) {
+	if idx < 0 || idx >= len(sPluginStore) {
+		return
+	}
+	var m map[string]any
+	if json.Unmarshal(sPluginStore[idx], &m) != nil {
+		return
+	}
+	name, _ := m["name"].(string)
+	if name == "" {
+		return
+	}
+	s.sendCore(map[string]any{"type": "remove_plugin", "name": name})
+	s.logInfo("removing plugin: " + name)
+	// Drop from cache so the row disappears without a list_plugins round-trip.
+	sPluginStore = append(sPluginStore[:idx], sPluginStore[idx+1:]...)
 }
 
 // togglePlugin flips the enabled state of the plugin at store index idx. It
@@ -789,6 +1085,14 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if s.modal.kind == modalKeybinds {
 		return s.handleKeybindsKey(msg)
 	}
+	// Goal form owns its own text capture (goalDraft.editing) — do not route
+	// through the single-field value-edit commit path.
+	if s.modal.kind == modalGoal {
+		return s.handleGoalKey(msg)
+	}
+	if s.modal.kind == modalGoalPlan {
+		return s.handleGoalPlanKey(msg)
+	}
 	// While editing a value field (settings value-edit, login key, oauth code),
 	// route keys to the edit buffer.
 	if s.modal.editing {
@@ -805,17 +1109,447 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel:
+		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
 	case modalHelp:
 		return s.handleHelpKey(msg)
-	case modalContext:
+	case modalContext, modalUsage:
 		// Display-only modal: enter or esc dismisses it.
 		if msg.String() == "enter" || s.kb(msg, "select") || s.kbAny(msg, "close", "quit") {
 			s.closeModal()
 		}
+		return s, nil
+	}
+	return s, nil
+}
+
+// handleGoalKey drives the multi-field /goal form.
+func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	d := &s.goalDraft
+	key := msg.String()
+	fields := goalVisibleFields(d.advanced)
+
+	// Ctrl+Enter submits from any field.
+	if key == "ctrl+enter" || key == "ctrl+j" {
+		return s, s.submitGoalModal()
+	}
+
+	// While editing the goal text field, route to textinput.
+	if d.editing && d.field == goalFieldGoal {
+		if key == "esc" {
+			d.goal = s.modal.editBuf.Value()
+			d.editing = false
+			s.modal.editing = false
+			return s, nil
+		}
+		if key == "enter" {
+			d.goal = strings.TrimSpace(s.modal.editBuf.Value())
+			d.editing = false
+			s.modal.editing = false
+			d.field = goalFieldConcurrency
+			return s, nil
+		}
+		var cmd tea.Cmd
+		s.modal.editBuf, cmd = s.modal.editBuf.Update(msg)
+		return s, cmd
+	}
+
+	switch {
+	case key == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
+		if d.field == goalFieldProviders || d.field == goalFieldModels || d.field == goalFieldModelConc {
+			if d.listCursor > 0 {
+				d.listCursor--
+				return s, nil
+			}
+		}
+		d.field = goalNextField(fields, d.field, -1)
+		d.listCursor = 0
+	case key == "down" || key == "tab" || s.kbAny(msg, "nav_down", "nav_down_alt"):
+		if d.field == goalFieldProviders || d.field == goalFieldModels || d.field == goalFieldModelConc {
+			n := s.goalListLen(d.field)
+			if d.listCursor+1 < n {
+				d.listCursor++
+				return s, nil
+			}
+		}
+		d.field = goalNextField(fields, d.field, 1)
+		d.listCursor = 0
+	case key == "left":
+		switch d.field {
+		case goalFieldConcurrency:
+			if d.concurrency > 1 {
+				d.concurrency--
+			}
+		case goalFieldMaxTasks:
+			if d.maxTasks > 1 {
+				d.maxTasks--
+			}
+		case goalFieldPlanner:
+			d.plannerModel = s.cycleGoalRoleModel(d.plannerModel, -1)
+		case goalFieldWorker:
+			d.workerModel = s.cycleGoalRoleModel(d.workerModel, -1)
+		case goalFieldReviewer:
+			d.reviewerModel = s.cycleGoalRoleModel(d.reviewerModel, -1)
+		case goalFieldModelConc:
+			s.adjustGoalModelConc(d.listCursor, -1)
+		}
+	case key == "right":
+		switch d.field {
+		case goalFieldConcurrency:
+			if d.concurrency < d.maxTasks {
+				d.concurrency++
+			}
+		case goalFieldMaxTasks:
+			if d.maxTasks < 64 {
+				d.maxTasks++
+			}
+		case goalFieldPlanner:
+			d.plannerModel = s.cycleGoalRoleModel(d.plannerModel, 1)
+		case goalFieldWorker:
+			d.workerModel = s.cycleGoalRoleModel(d.workerModel, 1)
+		case goalFieldReviewer:
+			d.reviewerModel = s.cycleGoalRoleModel(d.reviewerModel, 1)
+		case goalFieldModelConc:
+			s.adjustGoalModelConc(d.listCursor, 1)
+		}
+	case key == " " || key == "space":
+		switch d.field {
+		case goalFieldProviders:
+			s.toggleGoalProvider(d.listCursor)
+		case goalFieldModels:
+			s.toggleGoalModel(d.listCursor)
+		case goalFieldReview:
+			d.reviewBeforeDeploy = !d.reviewBeforeDeploy
+		case goalFieldAdvanced:
+			d.advanced = !d.advanced
+			if !d.advanced {
+				// Leave advanced fields; clamp focus to visible set.
+				d.field = goalFieldAdvanced
+			}
+		}
+	case key == "enter" || s.kb(msg, "select"):
+		switch d.field {
+		case goalFieldGoal:
+			d.editing = true
+			s.modal.editing = true
+			ti := textinput.New()
+			ti.Prompt = ""
+			ti.Placeholder = "describe the goal to plan & deploy…"
+			ti.SetValue(d.goal)
+			ti.CursorEnd()
+			ti.Focus()
+			s.modal.editBuf = ti
+		case goalFieldReview:
+			d.reviewBeforeDeploy = !d.reviewBeforeDeploy
+		case goalFieldAdvanced:
+			d.advanced = !d.advanced
+		case goalFieldProviders:
+			s.toggleGoalProvider(d.listCursor)
+		case goalFieldModels:
+			s.toggleGoalModel(d.listCursor)
+		case goalFieldPlanner:
+			d.plannerModel = s.cycleGoalRoleModel(d.plannerModel, 1)
+		case goalFieldWorker:
+			d.workerModel = s.cycleGoalRoleModel(d.workerModel, 1)
+		case goalFieldReviewer:
+			d.reviewerModel = s.cycleGoalRoleModel(d.reviewerModel, 1)
+		case goalFieldStart:
+			return s, s.submitGoalModal()
+		case goalFieldConcurrency:
+			d.concurrency++
+			if d.concurrency > d.maxTasks {
+				d.concurrency = 1
+			}
+		case goalFieldMaxTasks:
+			d.maxTasks++
+			if d.maxTasks > 64 {
+				d.maxTasks = 1
+			}
+			if d.concurrency > d.maxTasks {
+				d.concurrency = d.maxTasks
+			}
+		}
+	case key == "esc":
+		s.closeModal()
+	}
+	return s, nil
+}
+
+func (s *session) goalListLen(field int) int {
+	switch field {
+	case goalFieldProviders:
+		return len(s.goalProviderOptions())
+	case goalFieldModels:
+		return len(s.goalModelOptions())
+	case goalFieldModelConc:
+		return len(s.goalModelConcOptions())
+	}
+	return 0
+}
+
+// cycleGoalRoleModel walks models including "" (default). delta ±1.
+func (s *session) cycleGoalRoleModel(cur string, delta int) string {
+	opts := s.goalModelOptions()
+	// Leading empty = default (parent / allowlist).
+	all := append([]string{""}, opts...)
+	idx := 0
+	for i, m := range all {
+		if m == cur {
+			idx = i
+			break
+		}
+	}
+	n := len(all)
+	if n == 0 {
+		return ""
+	}
+	idx = (idx + delta%n + n) % n
+	return all[idx]
+}
+
+// goalModelConcOptions lists models that can have per-model concurrency:
+// selected allowlist models if any, else all models (filtered by provider).
+func (s *session) goalModelConcOptions() []string {
+	opts := s.goalModelOptions()
+	if len(s.goalDraft.allowedModels) == 0 {
+		return opts
+	}
+	var out []string
+	for _, m := range opts {
+		if s.goalDraft.allowedModels[m] {
+			out = append(out, m)
+		}
+	}
+	// Always include role pins so their limits can be set.
+	for _, role := range []string{s.goalDraft.plannerModel, s.goalDraft.workerModel, s.goalDraft.reviewerModel} {
+		if role == "" {
+			continue
+		}
+		found := false
+		for _, m := range out {
+			if m == role {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, role)
+		}
+	}
+	return out
+}
+
+func (s *session) adjustGoalModelConc(idx, delta int) {
+	opts := s.goalModelConcOptions()
+	if idx < 0 || idx >= len(opts) {
+		return
+	}
+	if s.goalDraft.modelConcurrency == nil {
+		s.goalDraft.modelConcurrency = map[string]int{}
+	}
+	id := opts[idx]
+	cur := s.goalDraft.modelConcurrency[id]
+	if cur == 0 {
+		cur = s.goalDraft.concurrency
+	}
+	cur += delta
+	if cur < 1 {
+		cur = 1
+	}
+	if cur > s.goalDraft.concurrency {
+		cur = s.goalDraft.concurrency
+	}
+	// If equal to global, drop the override to keep payload clean.
+	if cur == s.goalDraft.concurrency {
+		delete(s.goalDraft.modelConcurrency, id)
+	} else {
+		s.goalDraft.modelConcurrency[id] = cur
+	}
+}
+
+func (s *session) goalProviderOptions() []string {
+	if len(s.providers) > 0 {
+		return append([]string{}, s.providers...)
+	}
+	// Fall back to preset ids that are logged in.
+	var out []string
+	for _, p := range s.providerPresets {
+		if p.LoggedIn || p.Configured {
+			out = append(out, p.ID)
+		}
+	}
+	return out
+}
+
+func (s *session) goalModelOptions() []string {
+	provSel := s.goalDraft.allowedProviders
+	restrictProv := len(provSel) > 0
+	var out []string
+	for _, m := range s.models {
+		if restrictProv {
+			// Count how many providers are selected; if none match this model's
+			// provider, skip. Empty provider on model still included.
+			if m.Provider != "" {
+				if !provSel[m.Provider] {
+					// also try case-insensitive
+					ok := false
+					for p, on := range provSel {
+						if on && strings.EqualFold(p, m.Provider) {
+							ok = true
+							break
+						}
+					}
+					if !ok {
+						continue
+					}
+				}
+			}
+		}
+		out = append(out, m.ID)
+	}
+	return out
+}
+
+func (s *session) toggleGoalProvider(idx int) {
+	opts := s.goalProviderOptions()
+	if idx < 0 || idx >= len(opts) {
+		return
+	}
+	if s.goalDraft.allowedProviders == nil {
+		s.goalDraft.allowedProviders = map[string]bool{}
+	}
+	id := opts[idx]
+	if s.goalDraft.allowedProviders[id] {
+		delete(s.goalDraft.allowedProviders, id)
+	} else {
+		s.goalDraft.allowedProviders[id] = true
+	}
+}
+
+func (s *session) toggleGoalModel(idx int) {
+	opts := s.goalModelOptions()
+	if idx < 0 || idx >= len(opts) {
+		return
+	}
+	if s.goalDraft.allowedModels == nil {
+		s.goalDraft.allowedModels = map[string]bool{}
+	}
+	id := opts[idx]
+	if s.goalDraft.allowedModels[id] {
+		delete(s.goalDraft.allowedModels, id)
+	} else {
+		s.goalDraft.allowedModels[id] = true
+	}
+}
+
+// submitGoalModal sends start_goal to the core.
+func (s *session) submitGoalModal() tea.Cmd {
+	d := s.goalDraft
+	if d.editing {
+		d.goal = strings.TrimSpace(s.modal.editBuf.Value())
+	}
+	goal := strings.TrimSpace(d.goal)
+	if goal == "" {
+		s.logError("goal text is required")
+		return nil
+	}
+	if !s.authed {
+		s.logError("not authenticated — run /login first")
+		return nil
+	}
+	if len(s.models) == 0 {
+		s.logError("no models loaded yet")
+		return nil
+	}
+	model := s.models[s.modelIdx].ID
+	var models []string
+	for id, on := range d.allowedModels {
+		if on {
+			models = append(models, id)
+		}
+	}
+	var providers []string
+	for id, on := range d.allowedProviders {
+		if on {
+			providers = append(providers, id)
+		}
+	}
+	concurrency := d.concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	maxTasks := d.maxTasks
+	if maxTasks < 1 {
+		maxTasks = 8
+	}
+	if concurrency > maxTasks {
+		concurrency = maxTasks
+	}
+	cmd := map[string]any{
+		"type":             "start_goal",
+		"goal":             goal,
+		"concurrency":      concurrency,
+		"max_tasks":        maxTasks,
+		"auto_deploy":      !d.reviewBeforeDeploy,
+		"model":            model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}
+	if len(models) > 0 {
+		cmd["allowed_models"] = models
+	}
+	if len(providers) > 0 {
+		cmd["allowed_providers"] = providers
+	}
+	if d.advanced {
+		if d.plannerModel != "" {
+			cmd["planner_model"] = d.plannerModel
+		}
+		if d.workerModel != "" {
+			cmd["worker_model"] = d.workerModel
+		}
+		if d.reviewerModel != "" {
+			cmd["reviewer_model"] = d.reviewerModel
+		}
+		if len(d.modelConcurrency) > 0 {
+			mc := map[string]int{}
+			for k, v := range d.modelConcurrency {
+				if v > 0 && v < concurrency {
+					mc[k] = v
+				}
+			}
+			if len(mc) > 0 {
+				cmd["model_concurrency"] = mc
+			}
+		}
+	}
+	s.closeModal()
+	s.follow = true
+	s.busy = true
+	s.logUser(fmt.Sprintf("🎯 Goal: %s  ↳ /goal", goal))
+	s.sendCore(cmd)
+	return nil
+}
+
+func (s *session) handleGoalPlanKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch {
+	case key == "a" || key == "enter" || s.kb(msg, "select"):
+		s.closeModal()
+		s.sendCore(map[string]any{"type": "approve_goal_plan"})
+		s.logInfo("approving goal plan…")
+		s.busy = true
+		return s, nil
+	case key == "r":
+		s.closeModal()
+		// Open a value-edit for revise feedback.
+		s.openValueEditModal("goal_revise", "Revise Goal Plan", "what should change?", "")
+		return s, nil
+	case key == "q" || key == "c" || key == "esc":
+		s.closeModal()
+		s.sendCore(map[string]any{"type": "cancel_goal"})
+		s.logInfo("cancelling goal…")
 		return s, nil
 	}
 	return s, nil
@@ -834,6 +1568,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.sessionItems()
 	case modalPlugins:
 		items = s.pluginItems()
+	case modalMemory:
+		items = s.memoryItems()
 	case modalReasoning:
 		items = s.reasoningItems()
 	case modalProviders:
@@ -947,9 +1683,37 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		s.closeModal()
 		return s, nil
 	case modalPlugins:
-		// Enter toggles the selected plugin's enabled state; the modal
-		// stays open so several can be toggled in one visit.
-		s.togglePlugin(abs)
+		// Toggle mode: enter flips enable/disable (modal stays open).
+		// Remove mode (/plugin-remove): enter uninstalls and stays open.
+		if s.pluginPickerMode == pluginModeRemove {
+			s.removePlugin(abs)
+			if s.modal.cursor >= len(sPluginStore) && s.modal.cursor > 0 {
+				s.modal.cursor--
+			}
+		} else {
+			s.togglePlugin(abs)
+		}
+		return s, nil
+	case modalMemory:
+		// Enter forgets the selected memory and drops it from the local list.
+		items := s.memoryItems()
+		if abs >= 0 && abs < len(items) {
+			id := items[abs].meta
+			if id != "" && id != "?" {
+				s.sendCore(map[string]any{"type": "forget_memory", "id": id})
+				s.logInfo("forgetting memory " + id)
+				// Drop from cache so the row vanishes without a re-fetch.
+				if abs < len(s.memoryList) {
+					s.memoryList = append(s.memoryList[:abs], s.memoryList[abs+1:]...)
+				}
+				if s.modal.cursor >= len(s.memoryList) && s.modal.cursor > 0 {
+					s.modal.cursor--
+				}
+			}
+		}
+		if len(s.memoryList) == 0 {
+			s.closeModal()
+		}
 		return s, nil
 	case modalReasoning:
 		levels := s.thinkingLevels()
@@ -1084,6 +1848,24 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 			s.closeModal()
 			return s, nil
 		}
+		// OAuth-only presets (empty EnvVar, e.g. xAI SuperGrok): never prompt
+		// for an API key. Logged-in → switch active provider; otherwise start
+		// the device-code / browser OAuth flow.
+		oauthOnly := preset.SupportsOauth && preset.EnvVar == ""
+		if oauthOnly {
+			if preset.LoggedIn {
+				s.settings.ActiveProvider = name
+				_ = s.settings.save()
+				s.sendCore(map[string]any{"type": "set_provider", "name": name})
+				s.logInfo("switching provider: " + preset.Label)
+				s.closeModal()
+				return s, nil
+			}
+			s.sendCore(map[string]any{"type": "login_oauth", "preset": name})
+			s.logInfo("OAuth login: " + preset.Label + " — follow the prompt to log in")
+			s.closeModal()
+			return s, nil
+		}
 		// Already logged in: let the user OVERRIDE the key (e.g. fix a bad env
 		// var that caused a 401). Opens the inline key-entry box; an empty submit
 		// just switches to it instead of overriding. A pasted key replaces the
@@ -1149,6 +1931,17 @@ func (s *session) selectLogoutItem(abs int) (tea.Model, tea.Cmd) {
 	s.deleteProviderKey(name)
 	if s.settings.ActiveProvider == name {
 		s.settings.ActiveProvider = ""
+	}
+	// Optimistic UI: clear logged-in until core's provider_changed/presets arrive.
+	// Without this the picker can still show ✓ while the OAuth token is gone.
+	if p := s.presetByID(name); p != nil {
+		p.LoggedIn = false
+		p.HasKey = false
+		p.Configured = false
+	}
+	if s.activeProvider == name {
+		s.authed = false
+		s.providerHasKey = false
 	}
 	_ = s.settings.save()
 	s.logInfo("logged out of " + name)
@@ -1440,6 +2233,63 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		} else {
 			s.logError("max session tokens must be ≥ 0 (0=unlimited)")
 		}
+	case editTargetRemember:
+		if val == "" {
+			s.logError("no memory text entered")
+			return s, nil
+		}
+		s.sendCore(map[string]any{"type": "save_memory", "text": val})
+		s.sendCore(map[string]any{"type": "refresh_memory"})
+		s.logSuccess("memory saved")
+	case editTargetAttach:
+		if val == "" {
+			s.logError("no image path entered")
+			return s, nil
+		}
+		return s, s.sendAttach(val, "")
+	case editTargetPluginInstall:
+		if val == "" {
+			s.logError("no plugin path entered")
+			return s, nil
+		}
+		s.sendCore(map[string]any{"type": "install_plugin", "path": val})
+		s.logInfo(fmt.Sprintf("installing plugin from %s…", val))
+	case editTargetSteer:
+		if val == "" {
+			s.logError("no steer message entered")
+			return s, nil
+		}
+		return s, s.sendSteer(val)
+	case editTargetRun:
+		return s, s.runSubagentRest(val, "single")
+	case editTargetParallel:
+		return s, s.runSubagentRest(val, "parallel")
+	case editTargetChain:
+		return s, s.runSubagentRest(val, "chain")
+	case editTargetCompact:
+		if val == "" {
+			s.sendCore(map[string]any{"type": "compact"})
+		} else {
+			s.sendCore(map[string]any{"type": "compact", "instructions": val})
+		}
+		s.logInfo("forcing context compaction…")
+	case "goal_revise":
+		if val == "" {
+			s.logError("revision feedback is empty")
+			return s, nil
+		}
+		if len(s.models) == 0 {
+			s.logError("no models loaded yet")
+			return s, nil
+		}
+		s.sendCore(map[string]any{
+			"type":             "revise_goal",
+			"feedback":         val,
+			"model":            s.models[s.modelIdx].ID,
+			"reasoning_effort": s.settings.ReasoningEffort,
+		})
+		s.busy = true
+		s.logInfo("revising goal plan…")
 	}
 	return s, nil
 }
@@ -1540,13 +2390,14 @@ func (s *session) helpText() string {
 		"  (hold Shift to select/copy while the mouse is on)",
 		"",
 		"Slash commands",
+		"  (bare commands open modals; skills still take optional task text)",
 		"  /login           log in / switch provider (OpenAI · Gemini · Anthropic)",
 		"  /logout          log out of a provider",
-		"  /oauth-code <c>  paste OAuth code (SSH/headless Google login)",
-		"  /key [sk-…]      set API key (modal if omitted)",
-		"  /model [N|substr] list or switch model",
-		"  /approval [mode] never | destructive | always (modal if omitted)",
-		"  /reasoning [lvl] set reasoning effort (per model)",
+		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
+		"  /key             set API key for active provider",
+		"  /model           switch model",
+		"  /approval        never | destructive | always",
+		"  /reasoning       set reasoning effort (per model)",
 		"  /theme           switch colour theme",
 		"  /bash-timeout    bash tool timeout (seconds)",
 		"  /auto-compact    auto context compaction on/off",
@@ -1562,12 +2413,24 @@ func (s *session) helpText() string {
 		"  /sessions         open session picker",
 		"  /new              start a fresh session file",
 		"  /stats            token + turn totals",
+		"  /context          token-usage breakdown (top consumers)",
+		"  /usage            provider plan limits (5h · weekly · …)",
 		"  /abort            stop running turn",
+		"  /steer            steer an in-flight turn",
 		"  /settings         settings hub (opens dedicated modals)",
 		"  /keybinds         view & customize keybindings",
 		"  /copy             copy last assistant reply",
-		"  /attach <path>   send an image (vision) with the current input",
-		"  /vision          configure vision models & handoff target",
+		"  /attach           send an image (vision)",
+		"  /vision           configure vision models & handoff target",
+		"  /remember         save a memory note",
+		"  /memory · /forget list / forget memories",
+		"  /plugin-install   install a plugin from a directory",
+		"  /plugin-config    enable / disable plugins",
+		"  /plugin-remove    uninstall a plugin",
+		"  /goal             goal mode — plan & deploy subagents (modal)",
+		"  /cancel-goal      cancel active goal mode",
+		"  /run · /parallel · /chain  subagent delegation",
+		"  /skill:<name> [task]  apply a skill (task optional)",
 		"",
 		"Settings persist to ~/.config/catalyst-code/settings.json",
 		"Config (core) persists to ~/.config/catalyst-code/config.json",
@@ -1622,7 +2485,13 @@ func (s *session) renderModalBody() string {
 	case modalSessions:
 		return s.renderListModal("Sessions", s.sessionItems(), true)
 	case modalPlugins:
-		return s.renderListModal("Plugins", s.pluginItems(), false)
+		title := "Plugins"
+		if s.pluginPickerMode == pluginModeRemove {
+			title = "Uninstall Plugin"
+		}
+		return s.renderListModal(title, s.pluginItems(), false)
+	case modalMemory:
+		return s.renderListModal("Memories (enter to forget)", s.memoryItems(), true)
 	case modalReasoning:
 		return s.renderListModal("Reasoning Effort", s.reasoningItems(), true)
 	case modalProviders:
@@ -1650,14 +2519,228 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
 	case modalValueEdit:
 		return s.renderValueEditModal()
+	case modalGoal:
+		return s.renderGoalModal()
+	case modalGoalPlan:
+		return s.renderGoalPlanModal()
 	case modalHelp:
 		return s.renderHelpModal()
 	case modalKeybinds:
 		return s.renderKeybindsModal()
 	case modalContext:
 		return s.renderContextModal()
+	case modalUsage:
+		return s.renderUsageModal()
 	}
 	return ""
+}
+
+func (s *session) renderGoalModal() string {
+	w := s.modalWidth(78)
+	d := s.goalDraft
+	row := func(idx int, label, value string) string {
+		marker := "  "
+		style := dimStyle
+		if d.field == idx {
+			marker = "▸ "
+			style = accentStyle
+		}
+		return style.Render(marker+label) + " " + baseStyle.Render(value)
+	}
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ Goal Mode"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+
+	goalVal := d.goal
+	if d.editing && d.field == goalFieldGoal {
+		goalVal = s.modal.editBuf.Value()
+		if goalVal == "" {
+			goalVal = s.modal.editBuf.Placeholder
+		}
+	}
+	if goalVal == "" {
+		goalVal = "(empty — enter to edit)"
+	}
+	// Truncate long goals for the form view.
+	if len([]rune(goalVal)) > w-14 {
+		goalVal = string([]rune(goalVal)[:w-15]) + "…"
+	}
+	lines = append(lines, row(goalFieldGoal, "Goal", goalVal))
+	lines = append(lines, row(goalFieldConcurrency, "Concurrency", fmt.Sprintf("%d  (←/→)", d.concurrency)))
+	lines = append(lines, row(goalFieldMaxTasks, "Max tasks", fmt.Sprintf("%d  (←/→)", d.maxTasks)))
+
+	// Providers multi-select
+	provs := s.goalProviderOptions()
+	provLabel := "all"
+	if len(d.allowedProviders) > 0 {
+		var sel []string
+		for _, p := range provs {
+			if d.allowedProviders[p] {
+				sel = append(sel, p)
+			}
+		}
+		if len(sel) == 0 {
+			provLabel = "all"
+		} else {
+			provLabel = strings.Join(sel, ", ")
+		}
+	}
+	lines = append(lines, row(goalFieldProviders, "Providers", provLabel+"  (space toggle)"))
+	if d.field == goalFieldProviders {
+		if len(provs) == 0 {
+			lines = append(lines, dimStyle.Render("    (no providers logged in)"))
+		}
+		for i, p := range provs {
+			mark := " "
+			if d.allowedProviders[p] {
+				mark = "✓"
+			}
+			cur := "  "
+			if i == d.listCursor {
+				cur = "▸ "
+			}
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, p)))
+		}
+	}
+
+	// Models multi-select
+	mods := s.goalModelOptions()
+	modLabel := "all"
+	if len(d.allowedModels) > 0 {
+		var sel []string
+		for _, m := range mods {
+			if d.allowedModels[m] {
+				sel = append(sel, m)
+			}
+		}
+		if len(sel) > 0 {
+			modLabel = strings.Join(sel, ", ")
+			if len(modLabel) > w-20 {
+				modLabel = fmt.Sprintf("%d selected", len(sel))
+			}
+		}
+	}
+	lines = append(lines, row(goalFieldModels, "Models", modLabel+"  (space toggle)"))
+	if d.field == goalFieldModels {
+		// Show a window of models around the cursor.
+		start := d.listCursor - 3
+		if start < 0 {
+			start = 0
+		}
+		end := start + 7
+		if end > len(mods) {
+			end = len(mods)
+		}
+		if len(mods) == 0 {
+			lines = append(lines, dimStyle.Render("    (no models)"))
+		}
+		for i := start; i < end; i++ {
+			m := mods[i]
+			mark := " "
+			if d.allowedModels[m] {
+				mark = "✓"
+			}
+			cur := "  "
+			if i == d.listCursor {
+				cur = "▸ "
+			}
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, m)))
+		}
+	}
+
+	review := "off — deploy after plan"
+	if d.reviewBeforeDeploy {
+		review = "on — wait for approval"
+	}
+	lines = append(lines, row(goalFieldReview, "Review plan", review+"  (space)"))
+
+	advLabel := "off"
+	if d.advanced {
+		advLabel = "on"
+	}
+	lines = append(lines, row(goalFieldAdvanced, "Advanced", advLabel+"  (space) — role models & per-model concurrency"))
+
+	if d.advanced {
+		roleVal := func(m string) string {
+			if m == "" {
+				return "(default)"
+			}
+			return m
+		}
+		lines = append(lines, row(goalFieldPlanner, "  Planner model", roleVal(d.plannerModel)+"  (←/→)"))
+		lines = append(lines, row(goalFieldWorker, "  Worker model", roleVal(d.workerModel)+"  (←/→)"))
+		lines = append(lines, row(goalFieldReviewer, "  Reviewer model", roleVal(d.reviewerModel)+"  (←/→)"))
+
+		// Per-model concurrency list
+		concOpts := s.goalModelConcOptions()
+		lines = append(lines, row(goalFieldModelConc, "  Model concurrency", "←/→ adjust · empty = global"))
+		if d.field == goalFieldModelConc {
+			if len(concOpts) == 0 {
+				lines = append(lines, dimStyle.Render("    (no models)"))
+			}
+			start := d.listCursor - 3
+			if start < 0 {
+				start = 0
+			}
+			end := start + 7
+			if end > len(concOpts) {
+				end = len(concOpts)
+			}
+			for i := start; i < end; i++ {
+				id := concOpts[i]
+				cap := d.concurrency
+				if v, ok := d.modelConcurrency[id]; ok && v > 0 {
+					cap = v
+				}
+				cur := "  "
+				if i == d.listCursor {
+					cur = "▸ "
+				}
+				lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s%s  %d/%d", cur, id, cap, d.concurrency)))
+			}
+		}
+	}
+
+	startLabel := "Start goal"
+	if d.field == goalFieldStart {
+		lines = append(lines, accentStyle.Render("▸ ▶ "+startLabel+"  (enter)"))
+	} else {
+		lines = append(lines, dimStyle.Render("  ▶ "+startLabel))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("  ↑↓ fields · space toggle · ←/→ cycle · ctrl+enter submit · esc cancel"))
+	return modalBox(w, strings.Join(lines, "\n"))
+}
+
+func (s *session) renderGoalPlanModal() string {
+	w := s.modalWidth(78)
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ Goal Plan Ready"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+	if s.goalState != nil {
+		g := s.goalState.Goal
+		if len([]rune(g)) > w-10 {
+			g = string([]rune(g)[:w-11]) + "…"
+		}
+		lines = append(lines, baseStyle.Render("  "+g))
+		lines = append(lines, "")
+		for i, p := range s.goalState.Prompts {
+			title := p.Title
+			if title == "" {
+				title = p.StepID
+			}
+			lines = append(lines, fmt.Sprintf("  %d. [%s] %s", i+1, p.Agent, title))
+		}
+		if len(s.goalState.Prompts) == 0 {
+			lines = append(lines, dimStyle.Render("  (no steps in plan)"))
+		}
+	} else {
+		lines = append(lines, dimStyle.Render("  (no goal_state yet)"))
+	}
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("  a/enter approve · r revise · q/esc cancel"))
+	return modalBox(w, strings.Join(lines, "\n"))
 }
 
 // fitListRow builds a single-line list row — marker + label + desc — that
@@ -1792,7 +2875,14 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	lines = append(lines, "")
 	footer := "  ↑↓ navigate · enter select · esc close"
 	if s.modal.kind == modalPlugins {
-		footer = "  ↑↓ navigate · enter toggle enable/disable · esc close"
+		if s.pluginPickerMode == pluginModeRemove {
+			footer = "  ↑↓ navigate · enter uninstall · esc close"
+		} else {
+			footer = "  ↑↓ navigate · enter toggle enable/disable · esc close"
+		}
+	}
+	if s.modal.kind == modalMemory {
+		footer = "  ↑↓ navigate · enter forget · esc close"
 	}
 	if s.modal.kind == modalVision {
 		footer = "  ↑↓ navigate · space toggle vision · enter set target · esc close"
@@ -1800,6 +2890,215 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	body := strings.Join(lines, "\n")
 	return modalBox(w, body)
+}
+
+// renderUsageModal renders the /usage provider plan/rate-limit report: which
+// provider the selected model routes to, plan name, and one row per window
+// (5-hour, weekly, concurrency, …). Read-only display.
+func (s *session) renderUsageModal() string {
+	w := s.modalWidth(78)
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ Provider Usage"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+	ur := s.usageReport
+	if ur == nil {
+		lines = append(lines, mutedStyle.Render("  loading…"))
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("  esc close"))
+		return modalBox(w, strings.Join(lines, "\n"))
+	}
+	// Header: provider + model.
+	prov := ur.Provider
+	if prov == "" {
+		prov = "unknown"
+	}
+	header := fmt.Sprintf("%s", accentStyle.Render(prov))
+	if ur.Plan != "" {
+		header += mutedStyle.Render(" · ") + baseStyle.Render(ur.Plan)
+	}
+	lines = append(lines, "  "+header)
+	if ur.Model != "" {
+		lines = append(lines, "  "+dimStyle.Render("model ")+ur.Model)
+	}
+	lines = append(lines, "")
+
+	if !ur.Available {
+		msg := ur.Message
+		if msg == "" {
+			msg = "Usage stats are not available for this provider."
+		}
+		// Word-wrap the message to the modal width.
+		for _, ln := range wrapUsageText(msg, w-4) {
+			lines = append(lines, "  "+mutedStyle.Render(ln))
+		}
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("  esc close"))
+		return modalBox(w, strings.Join(lines, "\n"))
+	}
+
+	if len(ur.Windows) == 0 {
+		lines = append(lines, mutedStyle.Render("  no limit windows reported"))
+	} else {
+		barWidth := w - 28
+		if barWidth < 12 {
+			barWidth = 12
+		}
+		if barWidth > 40 {
+			barWidth = 40
+		}
+		for _, win := range ur.Windows {
+			label := win.Label
+			if label == "" {
+				label = win.ID
+			}
+			lines = append(lines, "  "+baseStyle.Render(label))
+			usedStr, barRatio := formatUsageAmount(win)
+			// Progress bar only when a limit is available (ratio > 0 or limit set).
+			// Unlimited rows skip the empty bar so they don't look like 0% used.
+			row := "    "
+			if win.Limit != nil && *win.Limit > 0 {
+				row += renderUsageBar(barRatio, barWidth)
+				if usedStr != "" {
+					row += "  "
+				}
+			}
+			if usedStr != "" {
+				row += accentStyle.Render(usedStr)
+			}
+			lines = append(lines, row)
+			if win.Detail != "" {
+				lines = append(lines, "    "+dimStyle.Render(win.Detail))
+			}
+		}
+	}
+	if ur.Message != "" {
+		lines = append(lines, "")
+		for _, ln := range wrapUsageText(ur.Message, w-4) {
+			lines = append(lines, "  "+mutedStyle.Render(ln))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("  esc close"))
+	return modalBox(w, strings.Join(lines, "\n"))
+}
+
+// formatUsageAmount returns a human used/limit string and a 0–1 bar ratio.
+// Percentage is only shown when a positive limit is available; unlimited /
+// unknown ceilings never get a "%" suffix (just the raw used amount).
+func formatUsageAmount(win usageWindow) (string, float64) {
+	unit := strings.ToLower(win.Unit)
+	used := 0.0
+	hasUsed := win.Used != nil
+	if hasUsed {
+		used = *win.Used
+	}
+	limit := 0.0
+	hasLimit := win.Limit != nil && *win.Limit > 0
+	if hasLimit {
+		limit = *win.Limit
+	}
+
+	switch unit {
+	case "percent":
+		// unit==percent already encodes utilization 0–100 (limit is 100).
+		// Only show "%" when we have a used value (the percentage itself).
+		if !hasUsed {
+			return "", 0
+		}
+		ratio := used / 100.0
+		if ratio < 0 {
+			ratio = 0
+		}
+		if ratio > 1 {
+			ratio = 1
+		}
+		return fmt.Sprintf("%.0f%% used", used), ratio
+	default:
+		// count-like units: sessions, requests, tokens, credits, count
+		if hasUsed && hasLimit {
+			ratio := used / limit
+			if ratio < 0 {
+				ratio = 0
+			}
+			if ratio > 1 {
+				ratio = 1
+			}
+			pct := ratio * 100
+			// "885 / 15.0k (6%)" — percentage only when limit is known.
+			return fmt.Sprintf("%s / %s (%.0f%%)",
+				formatUsageNumber(used), formatUsageNumber(limit), pct), ratio
+		}
+		if hasUsed {
+			// No limit → never show a percentage; just the used amount.
+			return formatUsageNumber(used) + " used", 0
+		}
+		if hasLimit {
+			return formatUsageNumber(limit) + " limit", 0
+		}
+		return "", 0
+	}
+}
+
+func formatUsageNumber(n float64) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", n/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fk", n/1_000)
+	}
+	// Prefer integers when close.
+	if n == float64(int64(n)) {
+		return fmt.Sprintf("%d", int64(n))
+	}
+	return fmt.Sprintf("%.1f", n)
+}
+
+// renderUsageBar draws a filled/empty progress bar using block characters.
+func renderUsageBar(ratio float64, width int) string {
+	if width < 4 {
+		width = 4
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(ratio*float64(width) + 0.5)
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	// Color by pressure: green < 70%, yellow < 90%, red otherwise.
+	style := successStyle
+	if ratio >= 0.9 {
+		style = errStyle
+	} else if ratio >= 0.7 {
+		style = warnStyle
+	}
+	return style.Render(bar)
+}
+
+func wrapUsageText(s string, width int) []string {
+	if width < 20 {
+		width = 20
+	}
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return nil
+	}
+	var lines []string
+	cur := words[0]
+	for _, w := range words[1:] {
+		if len(cur)+1+len(w) <= width {
+			cur += " " + w
+		} else {
+			lines = append(lines, cur)
+			cur = w
+		}
+	}
+	lines = append(lines, cur)
+	return lines
 }
 
 // renderContextModal renders the /context token-usage breakdown: total/window,

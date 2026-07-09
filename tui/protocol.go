@@ -115,6 +115,30 @@ type contextBreakdown struct {
 	TopConsumers []contextConsumer `json:"top_consumers"`
 }
 
+// usageWindow is one rate-limit / quota row in a provider usage report.
+type usageWindow struct {
+	ID       string   `json:"id"`
+	Label    string   `json:"label"`
+	Used     *float64 `json:"used"`
+	Limit    *float64 `json:"limit"`
+	Unit     string   `json:"unit"`
+	ResetsAt *int64   `json:"resets_at"`
+	Detail   string   `json:"detail"`
+}
+
+// usageReport mirrors the core's "usage" event — plan/window limits for the
+// provider that owns the currently selected model (/usage command).
+type usageReport struct {
+	Provider     string        `json:"provider"`
+	ProviderKind string        `json:"provider_kind"`
+	Model        string        `json:"model"`
+	BaseURL      string        `json:"base_url"`
+	Available    bool          `json:"available"`
+	Plan         string        `json:"plan"`
+	Message      string        `json:"message"`
+	Windows      []usageWindow `json:"windows"`
+}
+
 // skillInfo mirrors one element of the core's "skills" event array. The
 // content (SKILL.md body) is sent by the core so /skill:<name> can apply a
 // skill without the read_file path restriction blocking global skills.

@@ -23,6 +23,7 @@ import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
 import { SettingsModal } from "./settings";
 import { HelpModal } from "./help-modal";
+import { GoalModal, GoalPlanBanner, GoalStatusChip } from "./goal-modal";
 import { ErrorBoundary } from "./error-boundary";
 import { SparkIcon, ShieldIcon, SendIcon } from "./icons";
 
@@ -58,7 +59,9 @@ export function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [modal, setModal] = useState<null | "memory" | "plugins" | "settings" | "subagents" | "help">(null);
+  const [modal, setModal] = useState<
+    null | "memory" | "plugins" | "settings" | "subagents" | "help" | "goal"
+  >(null);
   const [images, setImages] = useState<string[]>([]);
   const [theme, setTheme] = useState<string>(() => lsGet("umans:theme") ?? "dark");
 
@@ -243,6 +246,10 @@ export function Chat() {
         return composerRef.current?.focus();
       case "attach":
         return composerRef.current?.openAttach();
+      case "goal":
+        return setModal("goal");
+      case "cancel-goal":
+        return void a.cancelGoal();
       case "run":
         composerRef.current?.insert("Delegate to a subagent: ");
         return;
@@ -425,6 +432,39 @@ export function Chat() {
                   />
                 </div>
               )}
+              {state.goalMode &&
+                state.goalMode.phase === "plan_ready" &&
+                !state.goalMode.auto_deploy && (
+                  <div className="mx-4 mb-2 sm:mx-6">
+                    <GoalPlanBanner
+                      goal={state.goalMode.goal}
+                      summary={state.goalPlan?.summary}
+                      steps={
+                        state.goalMode.prompts.map((p) => ({
+                          agent: p.agent,
+                          title: p.title || p.step_id,
+                        })) || []
+                      }
+                      onApprove={() => void agent.approveGoalPlan()}
+                      onRevise={() => {
+                        const fb = window.prompt("What should change in the plan?");
+                        if (fb?.trim()) void agent.reviseGoal(fb.trim());
+                      }}
+                      onCancel={() => void agent.cancelGoal()}
+                    />
+                  </div>
+                )}
+              {state.goalMode &&
+                state.goalMode.phase !== "idle" &&
+                state.goalMode.phase !== "plan_ready" && (
+                  <div className="mx-4 mb-2 sm:mx-6">
+                    <GoalStatusChip
+                      phase={state.goalMode.phase}
+                      goal={state.goalMode.goal}
+                      onCancel={() => void agent.cancelGoal()}
+                    />
+                  </div>
+                )}
               <div className="h-4" />
             </div>
           )}
@@ -501,6 +541,15 @@ export function Chat() {
         />
       )}
       {modal === "help" && <HelpModal onClose={() => setModal(null)} />}
+      {modal === "goal" && (
+        <GoalModal
+          models={state.models}
+          providerPresets={state.providerPresets}
+          providers={state.ready?.providers ?? []}
+          onStart={(opts) => void agent.startGoal(opts)}
+          onClose={() => setModal(null)}
+        />
+      )}
 
       {needKey && (
         <KeyOverlay

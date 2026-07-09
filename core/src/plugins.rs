@@ -1449,7 +1449,7 @@ impl PluginManager {
     pub async fn oauth_login(
         &self,
         provider_id: &str,
-        emit: &dyn Fn(OAuthPrompt),
+        emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
     ) -> Result<LoginOutcome, String> {
         let cfg = self
             .oauth_config(provider_id)

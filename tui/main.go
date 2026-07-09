@@ -61,9 +61,13 @@ type session struct {
 	approvalModeStr     string
 	sessionList         []sessionEntry
 	skillsList          []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
+	memoryList          []memoryEntry
+	pendingMemoryPicker bool   // open memory picker once list_memory arrives
+	pluginPickerMode    string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
 	coreBashTimeout     int
 	coreAutoCompact     bool
 	ctxBreakdown        *contextBreakdown
+	usageReport         *usageReport // last /usage reply (provider plan limits)
 	coreRestarts        int
 	coreReady           bool            // true once the core emitted `ready` (disarms the startup watchdog)
 	coreStartGen        uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
@@ -81,6 +85,11 @@ type session struct {
 	providerHasKey  bool
 	providerPresets []providerPreset
 	pendingLogin    string // preset id awaiting a pasted API key in the /login modal
+
+	// Goal mode: draft form for the multi-field /goal modal, plus the last
+	// goal_state snapshot from the core (drives status + plan-ready review).
+	goalDraft goalDraft
+	goalState *goalStateSnap
 
 	settings *settingsStore
 	keybinds map[string]string // effective keymap (defaults + user overrides); see keybinds.go
@@ -119,9 +128,16 @@ type session struct {
 	mentionScroll int
 	mentionAt     int
 
-	viewport viewport.Model
-	input    textinput.Model
-	spinner  spinner.Model
+	// pendingImages are staged image attachments (absolute paths or data
+	// URLs) from paste / clipboard / drag-drop. Merged into the next send via
+	// withImages and cleared after the turn is dispatched. Shown as chips in
+	// the input box so image paste works over SSH / VS Code (path or base64
+	// arrives via bracketed paste) as well as local clipboard grab.
+	pendingImages []string
+
+	viewport      viewport.Model
+	input         textinput.Model
+	spinner       spinner.Model
 	spinnerActive bool // whether the spinner animation cycle is running (stopped when idle to avoid re-render storms that disrupt text selection)
 
 	width, height int
@@ -585,6 +601,13 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// to whichever input owns the keys right now — mirroring the key dispatch
 		// in handleKey — so paste works in the chat box, the ask flyout, and modal
 		// edit fields (e.g. pasting an API key). textinput v2 inserts the text.
+		//
+		// Chat-box paste also inspects the payload for images (path / file:// /
+		// data URL / raw base64 / binary magic). Over SSH and VS Code Remote,
+		// clipboard image tools on the remote host are empty — the only reliable
+		// path is bracketed-paste of a remote file path or image data injected by
+		// the local terminal / a VS Code extension. When we detect an image we
+		// stage it as a pending attachment instead of dumping base64 into the box.
 		switch {
 		case s.modal.kind != modalNone && s.modal.editing:
 			s.modal.editBuf, _ = s.modal.editBuf.Update(msg)
@@ -592,7 +615,28 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			q := &s.pendingAsk.questions[s.pendingAsk.focusIdx]
 			q.input, _ = q.input.Update(msg)
 		default:
+			res := s.handlePasteContent(msg.Content)
+			if res.consumed {
+				// Image-only paste: chips update the input box; nothing to insert.
+				return s, nil
+			}
+			if len(res.attached) > 0 && res.text != "" {
+				// Mixed paste: images staged, residual text still goes in.
+				s.input, _ = s.input.Update(tea.PasteMsg{Content: res.text})
+				return s, nil
+			}
 			s.input, _ = s.input.Update(msg)
+		}
+		return s, nil
+
+	case clipboardImageMsg:
+		// Async result of paste_image keybind (local clipboard grab).
+		if msg.err != nil {
+			s.logError(msg.err.Error())
+			return s, nil
+		}
+		if msg.path != "" && s.addPendingImage(msg.path) {
+			s.logSuccess(fmt.Sprintf("attached image → %s", filepath.Base(msg.path)))
 		}
 		return s, nil
 

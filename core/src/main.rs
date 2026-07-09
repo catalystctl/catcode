@@ -11,6 +11,7 @@ mod config;
 mod fetch_tool;
 mod fsutil;
 mod git_ctx;
+mod goal;
 mod intercom;
 mod logging;
 mod memory;
@@ -257,6 +258,7 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
                 "openai" => oauth::has_codex_creds(),
                 "gemini" => oauth::has_google_creds(),
                 "anthropic" => oauth::has_claude_creds(),
+                "xai" => oauth::has_xai_creds(),
                 _ => false,
             };
             let has_key = p.env_key().is_some()
@@ -409,6 +411,12 @@ pub struct State {
     /// never persisted — so it never invalidates the cached conversation prefix.
     /// See the `WorkState` block comment for the full cache strategy.
     pub work_state: Mutex<WorkState>,
+    /// First-class goal mode (plan → deploy subagents). See `goal.rs`.
+    pub goal: Mutex<goal::GoalMode>,
+    /// Cancel token for an in-flight goal deploy task (separate from the
+    /// planning turn's token so cancel_goal can stop deploy without racing
+    /// the turn join handle).
+    pub goal_deploy_cancel: Mutex<Option<CancellationToken>>,
     /// Intercom bus: in-process mailboxes for subagent ↔ orchestrator and
     /// subagent ↔ subagent coordination.
     pub intercom: IntercomBus,
@@ -432,10 +440,11 @@ pub struct State {
 /// ensure the provider is configured (no api_key — the token is resolved +
 /// refreshed at turn time by enrich_oauth), set it active, persist, emit the
 /// success + provider_changed events, and refresh the model list.
+/// Uses the free `protocol::emit` so this is safe to call from a `tokio::spawn`
+/// task (no non-Send `&dyn Fn` borrow).
 async fn finalize_oauth(
     state: &State,
     client: &reqwest::Client,
-    emit: &dyn Fn(&Event),
     preset: &str,
     label: &str,
 ) {
@@ -459,8 +468,17 @@ async fn finalize_oauth(
     state
         .logger
         .log("login_oauth", json!({ "provider": preset }));
-    emit(&Event::new("info").with("message", json!(format!("logged into {label} via OAuth."))));
-    let rp = state.resolved_provider().await;
+    emit(&Event::new("info").with(
+        "message",
+        json!(format!(
+            "logged into {label} via OAuth — you're signed in. Pick a Grok model with /models if needed."
+        )),
+    ));
+    // TUI gates prompt send on `authed`; API-key login emits this, OAuth must too.
+    emit(&Event::new("authed").with("ok", json!(true)));
+    let rp = state.resolved_provider_enriched().await;
+    // Always report has_key=true after a successful OAuth exchange — even if
+    // a transient enrich glitch can't re-read the token yet (it's on disk).
     emit(
         &Event::new("provider_changed")
             .with("provider", json!(rp.name))
@@ -469,6 +487,21 @@ async fn finalize_oauth(
             .with("has_key", json!(true)),
     );
     state.refresh_models(client).await;
+    // Confirm models landed so the user isn't left staring at an empty list.
+    let n = state.models.read().await.len();
+    let mine = state
+        .models
+        .read()
+        .await
+        .iter()
+        .filter(|m| m.provider == preset)
+        .count();
+    emit(&Event::new("info").with(
+        "message",
+        json!(format!(
+            "OAuth ready: {mine} {label} model(s) available ({n} total across providers)."
+        )),
+    ));
 }
 
 impl State {
@@ -478,11 +511,24 @@ impl State {
     /// active-provider override and per-provider keys. This is the single
     /// source of truth every provider call site uses, so switching providers
     /// (or setting a key) takes effect on the next call with no other wiring.
+    ///
+    /// Note: does **not** inject OAuth subscription tokens — use
+    /// [`Self::resolved_provider_enriched`] for that (turns, ready/authed).
     pub async fn resolved_provider(&self) -> ResolvedProvider {
         let cfg = self.cfg.read().await;
         let active = self.active_provider.read().await.clone();
         let keys = self.api_keys.read().await.clone();
         cfg.resolve_provider_with(&keys, active.as_deref())
+    }
+
+    /// Like [`Self::resolved_provider`], then fill in a SuperGrok / Claude /
+    /// Gemini / plugin OAuth bearer when no API key is configured. Use this
+    /// for status (`authed` / `has_key`) and any call that must talk to the
+    /// vendor — OAuth-only providers (xAI) have no env key and would otherwise
+    /// look permanently signed-out.
+    pub async fn resolved_provider_enriched(&self) -> ResolvedProvider {
+        let rp = self.resolved_provider().await;
+        oauth::enrich_oauth(rp, &self.client, Some(&self.plugin_manager)).await
     }
 
     /// Resolve a named provider into a `ResolvedProvider` (key included when
@@ -718,6 +764,12 @@ fn oauth_creds_for_provider(
     if provider::is_gemini_endpoint(&p.base_url) {
         return oauth::has_google_creds();
     }
+    // xAI SuperGrok OAuth (OAuth-only preset — no API key). Without this,
+    // login writes tokens + config but aggregation skips the provider, so
+    // /models never shows Grok and the TUI looks like sign-in failed.
+    if provider::is_xai_endpoint(&p.base_url) || p.name == "xai" {
+        return oauth::has_xai_creds();
+    }
     false
 }
 
@@ -939,6 +991,56 @@ async fn emit_work_state(st: &State) {
     );
 }
 
+/// Cancel an in-flight goal deploy task (if any).
+async fn cancel_goal_deploy(st: &State) {
+    if let Some(tok) = st.goal_deploy_cancel.lock().await.take() {
+        tok.cancel();
+    }
+}
+
+/// Spawn the deterministic goal deploy loop on a child cancel token.
+async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
+    cancel_goal_deploy(&st).await;
+    let tok = CancellationToken::new();
+    *st.goal_deploy_cancel.lock().await = Some(tok.clone());
+    tokio::spawn(async move {
+        goal::deploy_goal(st.clone(), client, tok.clone()).await;
+        // Clear cancel slot if we still own it.
+        let mut slot = st.goal_deploy_cancel.lock().await;
+        if slot.as_ref().is_some_and(|t| t.is_cancelled() || true) {
+            // Always clear when the deploy task exits.
+            *slot = None;
+        }
+    });
+}
+
+/// After a planning turn ends: fail if no plan, or kick deploy if requested.
+async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
+    let should_deploy = {
+        let mut g = st.goal.lock().await;
+        // Deploy path: plan was written this turn (or earlier) and auto-deploy is armed.
+        if g.deploy_after_turn && g.plan.is_some() && !g.prompts.is_empty() {
+            g.deploy_after_turn = false;
+            true
+        } else if g.phase == goal::GoalPhase::Planning {
+            if cancelled {
+                goal::fail_goal(&mut g, "planning aborted");
+            } else if g.plan.is_none() {
+                goal::fail_goal(
+                    &mut g,
+                    "planning turn ended without goal_write_plan — re-run /goal",
+                );
+            }
+            false
+        } else {
+            false
+        }
+    };
+    if should_deploy {
+        spawn_goal_deploy(st.clone(), client.clone()).await;
+    }
+}
+
 /// Seed the work-state goal from a user prompt (the first substantive message).
 /// Subsequent calls are no-ops once a goal is set, so the goal reflects the
 /// session's original intent rather than every follow-up. Slash commands and
@@ -1103,8 +1205,16 @@ async fn work_state_message(st: &State) -> Option<Message> {
 }
 
 /// Reset the rolling work-state (new session / reset / clear / undo / load).
-/// Emits an empty `work_state` so frontends clear their panel.
+/// Emits an empty `work_state` so frontends clear their panel. Also clears
+/// goal mode so a new session doesn't inherit a stale plan/deploy.
 async fn clear_work_state(st: &State) {
+    cancel_goal_deploy(st).await;
+    {
+        let mut g = st.goal.lock().await;
+        if g.phase != goal::GoalPhase::Idle {
+            goal::clear_goal(&mut g);
+        }
+    }
     *st.work_state.lock().await = WorkState::default();
     emit_work_state(st).await;
 }
@@ -1281,6 +1391,8 @@ async fn main() {
         last_turn_metrics: Mutex::new(None),
 
         work_state: Mutex::new(WorkState::default()),
+        goal: Mutex::new(goal::GoalMode::default()),
+        goal_deploy_cancel: Mutex::new(None),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
         pending_oauth: Mutex::new(None),
@@ -1442,7 +1554,9 @@ async fn main() {
         match cmd {
             Command::Init => {
                 let models = state.models.read().await.clone();
-                let rp = state.resolved_provider().await;
+                // Enrich OAuth so SuperGrok / Claude / Gemini look signed-in on
+                // startup (they store tokens on disk, not as api_key in config).
+                let rp = state.resolved_provider_enriched().await;
                 let authed = rp.api_key.is_some();
                 let cfg = state.cfg.read().await;
                 let conv_len = state.conversation.lock().await.len();
@@ -1548,7 +1662,7 @@ async fn main() {
                     }
                 }
                 *state.active_provider.write().await = Some(name.clone());
-                let rp = state.resolved_provider().await;
+                let rp = state.resolved_provider_enriched().await;
                 state.logger.log(
                     "set_provider",
                     json!({ "provider": rp.name, "kind": rp.kind.as_str(), "base_url": rp.base_url }),
@@ -1560,6 +1674,13 @@ async fn main() {
                         .with("base_url", json!(rp.base_url))
                         .with("has_key", json!(rp.api_key.is_some())),
                 );
+                if rp.api_key.is_some() {
+                    emit(
+                        &Event::new("authed")
+                            .with("ok", json!(true))
+                            .with("provider", json!(rp.name)),
+                    );
+                }
                 state.refresh_models(&client).await;
             }
             Command::ListProviderPresets => {
@@ -1581,11 +1702,20 @@ async fn main() {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "unknown provider preset '{preset}'; available: umans, openai, gemini, anthropic, opencode-go"
+                            "unknown provider preset '{preset}'; available: umans, openai, gemini, anthropic, opencode-go, xai"
                         )),
                     ));
                     return;
                 };
+                // xAI is OAuth-only (SuperGrok / X Premium+). Never accept an
+                // API key — redirect to the device-code flow.
+                if p.id == "xai" {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!("xAI Grok uses SuperGrok / X Premium+ OAuth only — use /login and pick xAI (no API key)."),
+                    ));
+                    return;
+                }
                 let key = api_key.or_else(|| p.env_key());
                 let configs = config::preset_provider_configs(p, key.clone());
                 let name = configs[0].name.clone();
@@ -1724,7 +1854,7 @@ async fn main() {
                     &Event::new("info")
                         .with("message", json!(format!("logged out of '{}'", provider))),
                 );
-                let rp = state.resolved_provider().await;
+                let rp = state.resolved_provider_enriched().await;
                 emit(
                     &Event::new("provider_changed")
                         .with("provider", json!(rp.name))
@@ -1732,16 +1862,33 @@ async fn main() {
                         .with("base_url", json!(rp.base_url))
                         .with("has_key", json!(rp.api_key.is_some())),
                 );
+                if rp.api_key.is_some() {
+                    emit(
+                        &Event::new("authed")
+                            .with("ok", json!(true))
+                            .with("provider", json!(rp.name)),
+                    );
+                } else {
+                    emit(
+                        &Event::new("authed")
+                            .with("ok", json!(false))
+                            .with("provider", json!(rp.name)),
+                    );
+                }
                 state.refresh_models(&client).await;
             }
             Command::LoginOauth { preset } => {
                 // Perform the interactive OAuth subscription login (no official
                 // CLI needed). Runs the flow (Google device-code / Claude
-                // authorize+PKCE+loopback), emitting `oauth_prompt` events with
-                // the URL/code to visit, stores the token, ensures the provider is
-                // configured, and re-aggregates so its models appear in /models.
-                // A plugin may declare an OAuth login flow for this provider_id;
-                // otherwise fall back to the built-in OpenAI/Claude/Gemini flows.
+                // authorize+PKCE+loopback / xAI device-code), emitting
+                // `oauth_prompt` events with the URL/code to visit, stores the
+                // token, ensures the provider is configured, and re-aggregates
+                // so its models appear in /models.
+                //
+                // Spawned on a background task so a multi-minute device-code
+                // poll (xAI SuperGrok) does not freeze the stdin command loop
+                // — otherwise the TUI looks hung for 30s+ while waiting for
+                // browser approval.
                 let plugin_login = state.plugin_manager.supports_oauth_login(&preset);
                 if !oauth::supports_login(&preset) && !plugin_login {
                     emit(&Event::new("error").with(
@@ -1761,44 +1908,67 @@ async fn main() {
                     "message",
                     json!(format!("starting OAuth login for {label}…")),
                 ));
-                let prompt_emit = |p: oauth::OAuthPrompt| {
-                    emit(
-                        &Event::new("oauth_prompt")
-                            .with("url", json!(p.url))
-                            .with("code", json!(p.code))
-                            .with("message", json!(p.message)),
-                    );
-                };
-                let outcome = if plugin_login {
-                    state.plugin_manager.oauth_login(&preset, &prompt_emit).await
-                } else {
-                    oauth::login(&preset, &client, &prompt_emit).await
-                };
-                match outcome {
-                    Ok(oauth::LoginOutcome::Done) => {
-                        finalize_oauth(&state, &client, &emit, &preset, &label).await;
-                    }
-                    Ok(oauth::LoginOutcome::AwaitingCode { pending }) => {
-                        // No-browser (SSH/headless) flow: the prompt was already
-                        // emitted; stash the PKCE verifier + redirect_uri and
-                        // wait for the user to paste the code/redirect URL via
-                        // the `oauth_code` command.
-                        let kind = pending.kind.clone();
-                        *state.pending_oauth.lock().await = Some(pending);
-                        let msg = match kind.as_str() {
-                            "openai" => "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>.",
-                            "anthropic" => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code or final callback URL via /oauth-code <code-or-url>.",
-                            _ => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>.",
-                        };
-                        emit(&Event::new("info").with("message", json!(msg)));
-                    }
-                    Err(e) => {
+                let st = state.clone();
+                let cl = client.clone();
+                // Generation counter: a second /login cancels applying an older
+                // in-flight OAuth (user re-ran login with a new device code).
+                static OAUTH_GEN: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let gen = OAUTH_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    // Use free protocol::emit (Send) — not a captured &dyn Fn.
+                    let prompt_emit = |p: oauth::OAuthPrompt| {
                         emit(
-                            &Event::new("error")
-                                .with("message", json!(format!("OAuth login failed: {e}"))),
+                            &Event::new("oauth_prompt")
+                                .with("url", json!(p.url))
+                                .with("code", json!(p.code))
+                                .with("message", json!(p.message)),
                         );
+                    };
+                    let outcome = if plugin_login {
+                        st.plugin_manager.oauth_login(&preset, &prompt_emit).await
+                    } else {
+                        oauth::login(&preset, &cl, &prompt_emit).await
+                    };
+                    // Stale attempt (user started another login) — drop result.
+                    if OAUTH_GEN.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!("Ignoring a superseded OAuth attempt (a newer /login is in progress)."),
+                        ));
+                        return;
                     }
-                }
+                    match outcome {
+                        Ok(oauth::LoginOutcome::Done) => {
+                            finalize_oauth(&st, &cl, &preset, &label).await;
+                        }
+                        Ok(oauth::LoginOutcome::AwaitingCode { pending }) => {
+                            // No-browser (SSH/headless) flow: the prompt was already
+                            // emitted; stash the PKCE verifier + redirect_uri and
+                            // wait for the user to paste the code/redirect URL via
+                            // the `oauth_code` command.
+                            let kind = pending.kind.clone();
+                            *st.pending_oauth.lock().await = Some(pending);
+                            let msg = match kind.as_str() {
+                                "openai" => "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>.",
+                                "anthropic" => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code or final callback URL via /oauth-code <code-or-url>.",
+                                "xai" | "grok" => "OAuth login awaiting approval. Open the URL above on any device and click Approve — it finishes automatically (no /oauth-code needed for xAI device-code).",
+                                _ => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>.",
+                            };
+                            emit(&Event::new("info").with("message", json!(msg)));
+                        }
+                        Err(e) => {
+                            st.logger.log(
+                                "login_oauth_error",
+                                json!({ "provider": preset, "error": e }),
+                            );
+                            emit(
+                                &Event::new("error")
+                                    .with("message", json!(format!("OAuth login failed: {e}"))),
+                            );
+                        }
+                    }
+                });
             }
             Command::OauthCode { code } => {
                 // Complete a pending no-browser (manual-code) OAuth login — the
@@ -1832,7 +2002,7 @@ async fn main() {
                 };
                 match result {
                     Ok(()) => {
-                        finalize_oauth(&state, &client, &emit, &preset, &label).await;
+                        finalize_oauth(&state, &client, &preset, &label).await;
                     }
                     Err(e) => {
                         // Restore the pending state so the user can retry with a
@@ -2229,6 +2399,49 @@ async fn main() {
                         .with("session_file", json!(session_file)),
                 );
             }
+            Command::Usage { model } => {
+                // Provider plan/rate-limit usage for the model the user is on.
+                // Resolve model → owning provider → provider-specific usage
+                // endpoint (Umans / Codex / Claude OAuth / …). Read-only.
+                let model_name = match model.filter(|m| !m.is_empty()) {
+                    Some(m) => m,
+                    None => state
+                        .last_model
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_default(),
+                };
+                // When we still have no model (fresh session, never sent), fall
+                // back to the first discovered model so /usage still works.
+                let model_name = if model_name.is_empty() {
+                    state
+                        .models
+                        .read()
+                        .await
+                        .first()
+                        .map(|m| m.id.clone())
+                        .unwrap_or_default()
+                } else {
+                    model_name
+                };
+                let rp = if model_name.is_empty() {
+                    let rp = state.resolved_provider().await;
+                    oauth::enrich_oauth(rp, &client, Some(&state.plugin_manager)).await
+                } else {
+                    state.resolve_provider_for_model(&model_name).await
+                };
+                let usage = provider::fetch_provider_usage(&client, &rp).await;
+                let mut ev = Event::new("usage")
+                    .with("provider", json!(rp.name))
+                    .with("provider_kind", json!(rp.kind.to_string()))
+                    .with("model", json!(model_name))
+                    .with("base_url", json!(rp.base_url));
+                for (k, v) in usage.to_event_fields() {
+                    ev = ev.with(&k, v);
+                }
+                emit(&ev);
+            }
             Command::Context => {
                 // Token-breakdown: where is the context window being spent?
                 // Aggregates per-message token estimates (same char/4 heuristic
@@ -2449,6 +2662,198 @@ async fn main() {
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
                 let prompt = build_skill_prompt(&skill, task.as_deref());
                 start_turn(&st, &client, model, prompt, effort, None).await;
+            }
+            Command::StartGoal {
+                goal: goal_text,
+                concurrency,
+                max_tasks,
+                allowed_models,
+                allowed_providers,
+                auto_deploy,
+                planner_model,
+                worker_model,
+                reviewer_model,
+                model_concurrency,
+                model,
+                reasoning_effort,
+            } => {
+                let models = state.models.read().await.clone();
+                if !models.iter().any(|m| m.id == model) {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown model: {model}"))),
+                    );
+                    continue;
+                }
+                // Cancel any prior goal deploy.
+                cancel_goal_deploy(&state).await;
+                let cfg = state.cfg.read().await;
+                let defaults = (
+                    cfg.subagents.parallel_concurrency,
+                    cfg.subagents.parallel_max_tasks,
+                );
+                drop(cfg);
+                match goal::new_goal(goal::StartGoalArgs {
+                    goal: goal_text,
+                    concurrency,
+                    max_tasks,
+                    allowed_models: allowed_models.unwrap_or_default(),
+                    allowed_providers: allowed_providers.unwrap_or_default(),
+                    auto_deploy,
+                    role_models: goal::RoleModels {
+                        planner: planner_model,
+                        worker: worker_model,
+                        reviewer: reviewer_model,
+                    },
+                    model_concurrency: model_concurrency.unwrap_or_default(),
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    default_concurrency: defaults.0,
+                    default_max_tasks: defaults.1,
+                }) {
+                    Ok(mode) => {
+                        let prompt = goal::planning_prompt(&mode);
+                        let effort = mode.reasoning_effort.clone();
+                        // Planning turn uses parent_model (may be planner role pin).
+                        let plan_model = mode.parent_model.clone();
+                        // Seed WorkState.goal (replace, not one-shot).
+                        {
+                            let mut ws = state.work_state.lock().await;
+                            ws.goal = truncate_str(&mode.goal, 240);
+                            ws.done.clear();
+                            ws.in_progress.clear();
+                            ws.next.clear();
+                            ws.last_activity = "goal:planning".into();
+                            ws.touch();
+                        }
+                        emit_work_state(&state).await;
+                        {
+                            let mut g = state.goal.lock().await;
+                            *g = mode;
+                            goal::emit_goal_state(&g);
+                        }
+                        emit(
+                            &Event::new("info")
+                                .with("message", json!("Goal mode: planning…")),
+                        );
+                        // Prefer planner role model when set; else selected model.
+                        let turn_model = if models.iter().any(|m| m.id == plan_model) {
+                            plan_model
+                        } else {
+                            model
+                        };
+                        start_turn(
+                            &state,
+                            &client,
+                            turn_model,
+                            prompt,
+                            effort,
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        emit(&Event::new("error").with("message", json!(e)));
+                    }
+                }
+            }
+            Command::CancelGoal => {
+                cancel_goal_deploy(&state).await;
+                // Also abort a planning turn if active.
+                if let Some(tok) = state.current.lock().await.take() {
+                    tok.cancel();
+                }
+                let mut g = state.goal.lock().await;
+                if g.phase == goal::GoalPhase::Idle {
+                    emit(
+                        &Event::new("info")
+                            .with("message", json!("no active goal to cancel")),
+                    );
+                } else {
+                    goal::fail_goal(&mut g, "cancelled by user");
+                    emit(
+                        &Event::new("info")
+                            .with("message", json!("goal cancelled")),
+                    );
+                }
+            }
+            Command::GoalStatus => {
+                let g = state.goal.lock().await;
+                goal::emit_goal_state(&g);
+                goal::emit_goal_plan(&g);
+            }
+            Command::ApproveGoalPlan => {
+                let (should_deploy, model) = {
+                    let mut g = state.goal.lock().await;
+                    if g.phase != goal::GoalPhase::PlanReady {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "approve_goal_plan requires phase plan_ready (got {})",
+                                g.phase.as_str()
+                            )),
+                        ));
+                        (false, String::new())
+                    } else if g.prompts.is_empty() {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!("no plan prompts to deploy")),
+                        );
+                        (false, String::new())
+                    } else {
+                        g.deploy_after_turn = false;
+                        g.auto_deploy = true;
+                        (true, g.parent_model.clone())
+                    }
+                };
+                if should_deploy {
+                    let _ = model;
+                    spawn_goal_deploy(state.clone(), client.clone()).await;
+                }
+            }
+            Command::ReviseGoal {
+                feedback,
+                model,
+                reasoning_effort,
+            } => {
+                let models = state.models.read().await.clone();
+                if !models.iter().any(|m| m.id == model) {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown model: {model}"))),
+                    );
+                    continue;
+                }
+                cancel_goal_deploy(&state).await;
+                let prompt = {
+                    let mut g = state.goal.lock().await;
+                    if g.goal.is_empty() {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!("no goal to revise — use start_goal first")),
+                        );
+                        None
+                    } else {
+                        g.revise_feedback = Some(feedback);
+                        g.plan = None;
+                        g.prompts.clear();
+                        g.error = None;
+                        g.deploy_after_turn = false;
+                        g.parent_model = model.clone();
+                        if let Some(e) = reasoning_effort {
+                            g.reasoning_effort = e;
+                        }
+                        goal::transition(
+                            &mut g,
+                            goal::GoalPhase::Planning,
+                            Some("revising plan"),
+                        );
+                        Some((goal::planning_prompt(&g), g.reasoning_effort.clone()))
+                    }
+                };
+                if let Some((prompt, effort)) = prompt {
+                    start_turn(&state, &client, model, prompt, effort, None).await;
+                }
             }
             Command::RefreshMemory => {
                 let msg = refresh_memory_injection(&state).await;
@@ -3362,6 +3767,12 @@ fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
 /// if auto-reflect should fire for this turn, else `None`. As a side effect,
 /// records the turn's shape to the pattern log so recurrence is tracked.
 /// Callers guard with `!reflected` (one reflection per turn).
+///
+/// Goal mode: skip while a goal is mid-flight (planning / plan_ready /
+/// deploying / running / blocked). Planning only writes a plan — there is
+/// nothing durable to reflect on until the goal finishes. Deploy is
+/// core-driven after the planning turn ends, so reflecting here would also
+/// delay `maybe_finish_goal_planning`.
 async fn maybe_reflect_prompt(
     st: &Arc<State>,
     prompt: &str,
@@ -3370,8 +3781,19 @@ async fn maybe_reflect_prompt(
     shape_files: &[String],
     cancelled: bool,
 ) -> Option<(String, usize)> {
+    if cancelled {
+        return None;
+    }
+    // Skip while goal mode is still working — planning is not "task complete".
+    // Check before taking cfg so we never nest cfg + goal locks.
+    {
+        let g = st.goal.lock().await;
+        if g.is_active() {
+            return None;
+        }
+    }
     let cfg = st.cfg.read().await;
-    if !cfg.auto_reflect || cancelled {
+    if !cfg.auto_reflect {
         return None;
     }
     if turn_tool_calls < cfg.auto_reflect_min_tool_calls {
@@ -4411,16 +4833,33 @@ async fn run_turn(
                             _ = cancel.cancelled() => tools::Outcome::err("diagnostics aborted"),
                         }
                     } else if name == "spawn" || name == "subagent" {
+                        // When goal mode is active, cap concurrency on parallel
+                        // fan-out to the goal's limit (defense in depth).
+                        let mut sub_args = exec_args.clone();
+                        {
+                            let g = st.goal.lock().await;
+                            if g.is_active() {
+                                if let Some(c) = sub_args.get("concurrency").and_then(|v| v.as_u64())
+                                {
+                                    sub_args["concurrency"] =
+                                        json!(goal::cap_concurrency(c as u32, &g));
+                                } else if sub_args.get("tasks").is_some() {
+                                    sub_args["concurrency"] = json!(g.concurrency);
+                                }
+                            }
+                        }
                         subagent::execute(
                             st.clone(),
                             client.clone(),
                             provider.clone(),
                             model.clone(),
-                            exec_args.clone(),
+                            sub_args,
                             cancel.clone(),
                             0,
                         )
                         .await
+                    } else if name == "goal_write_plan" {
+                        goal::handle_goal_write_plan(st, &exec_args).await
                     } else if name == "ask" {
                         // Blocking user-interaction tool: surface a flyout and
                         // wait for the answer (or skip/abort). Validation errors
@@ -4565,6 +5004,7 @@ async fn run_turn(
                             st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                             st.logger.record_turn();
                             persist_stats(st).await;
+                            maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
                             emit(&Event::new("done"));
                             return;
                         }
@@ -4673,6 +5113,7 @@ async fn run_turn(
                     st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                     st.logger.record_turn();
                     persist_stats(st).await;
+                    maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
                     emit(&Event::new("done"));
                     return;
                 }

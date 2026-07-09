@@ -55,7 +55,7 @@ pub enum Command {
     /// available (env var set) and whether the provider is logged in.
     #[serde(rename = "list_provider_presets")]
     ListProviderPresets,
-    /// Log in to a first-party provider (`openai` | `gemini` | `anthropic`):
+    /// Log in to a first-party provider (`openai` | `gemini` | `anthropic` | `xai` | …):
     /// create the provider config, set its API key, persist, and re-aggregate
     /// models so the provider's models appear in `/models` alongside any others
     /// already logged in. An optional `api_key` overrides the preset's standard
@@ -156,6 +156,15 @@ pub enum Command {
     /// and the top token consumers (biggest messages). Read-only.
     #[serde(rename = "context")]
     Context,
+    /// Request provider plan/rate-limit usage for the currently selected model
+    /// (returns a `usage` event). Each provider implements its own stats
+    /// (Umans concurrency/requests, Claude 5h/weekly, Codex 5h/weekly, …).
+    /// Optional `model` overrides the last-used model for routing.
+    #[serde(rename = "usage")]
+    Usage {
+        #[serde(default)]
+        model: Option<String>,
+    },
     /// Approve a pending tool call. decision: "yes" | "no" | "always".
     /// "always" upgrades the session approval mode so subsequent same-tool calls skip the gate.
     #[serde(rename = "approve")]
@@ -252,6 +261,55 @@ pub enum Command {
         name: String,
         #[serde(default)]
         task: Option<String>,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+    },
+    /// Start goal mode: plan then (optionally) deploy subagents under the
+    /// given concurrency and model/provider allowlists. Emits `goal_state`
+    /// and kicks a planning turn that must call `goal_write_plan`.
+    #[serde(rename = "start_goal")]
+    StartGoal {
+        goal: String,
+        #[serde(default)]
+        concurrency: Option<u32>,
+        #[serde(default)]
+        max_tasks: Option<u32>,
+        #[serde(default)]
+        allowed_models: Option<Vec<String>>,
+        #[serde(default)]
+        allowed_providers: Option<Vec<String>>,
+        /// Default true: deploy immediately after a valid plan.
+        /// When false, stop at plan_ready until `approve_goal_plan`.
+        #[serde(default)]
+        auto_deploy: Option<bool>,
+        /// Advanced: pin models for planner / worker / reviewer agents.
+        #[serde(default)]
+        planner_model: Option<String>,
+        #[serde(default)]
+        worker_model: Option<String>,
+        #[serde(default)]
+        reviewer_model: Option<String>,
+        /// Advanced: max concurrent runs per model id (capped by `concurrency`).
+        #[serde(default)]
+        model_concurrency: Option<std::collections::HashMap<String, u32>>,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+    },
+    /// Cancel the active goal (interrupt planning/deploy runs).
+    #[serde(rename = "cancel_goal")]
+    CancelGoal,
+    /// Re-emit the current goal_state (+ goal_plan if present).
+    #[serde(rename = "goal_status")]
+    GoalStatus,
+    /// Approve a plan that is waiting at plan_ready (auto_deploy=false).
+    #[serde(rename = "approve_goal_plan")]
+    ApproveGoalPlan,
+    /// Re-enter planning with user feedback (from plan_ready / failed).
+    #[serde(rename = "revise_goal")]
+    ReviseGoal {
+        feedback: String,
         model: String,
         #[serde(default)]
         reasoning_effort: Option<String>,

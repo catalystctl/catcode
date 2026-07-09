@@ -32,6 +32,65 @@ func (s *session) accumulateSaved(ev *coreEvent) {
 	s.tokensSaved += before - after
 }
 
+// applyGoalState parses a goal_state event into s.goalState and opens the
+// plan-ready review modal when the user asked to review before deploy.
+func (s *session) applyGoalState(raw json.RawMessage) {
+	var m struct {
+		ID         string `json:"id"`
+		Goal       string `json:"goal"`
+		Phase      string `json:"phase"`
+		Error      string `json:"error"`
+		AutoDeploy bool   `json:"auto_deploy"`
+		Version    uint64 `json:"version"`
+		Prompts    []struct {
+			StepID  string `json:"step_id"`
+			Agent   string `json:"agent"`
+			Title   string `json:"title"`
+			Status  string `json:"status"`
+			Summary string `json:"summary"`
+		} `json:"prompts"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return
+	}
+	if m.Phase == "idle" || m.ID == "" {
+		s.goalState = nil
+		return
+	}
+	snap := &goalStateSnap{
+		ID:         m.ID,
+		Goal:       m.Goal,
+		Phase:      m.Phase,
+		Error:      m.Error,
+		AutoDeploy: m.AutoDeploy,
+		Version:    m.Version,
+	}
+	for _, p := range m.Prompts {
+		snap.Prompts = append(snap.Prompts, goalPromptSnap{
+			StepID:  p.StepID,
+			Agent:   p.Agent,
+			Title:   p.Title,
+			Status:  p.Status,
+			Summary: p.Summary,
+		})
+	}
+	prevPhase := ""
+	if s.goalState != nil {
+		prevPhase = s.goalState.Phase
+	}
+	s.goalState = snap
+	// Open plan review when we first land on plan_ready with review mode.
+	if m.Phase == "plan_ready" && prevPhase != "plan_ready" && !m.AutoDeploy {
+		s.openGoalPlanReview()
+	}
+	if m.Phase == "failed" && m.Error != "" {
+		s.logError("goal failed: " + m.Error)
+	}
+	if m.Phase == "done" {
+		s.logSuccess("goal complete")
+	}
+}
+
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	switch ev.Type {
 	case "ready":
@@ -105,6 +164,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				var b bool
 				_ = json.Unmarshal([]byte(hk), &b)
 				s.providerHasKey = b
+				// OAuth login finalizes with provider_changed + has_key=true but
+				// historically omitted the separate `authed` event. Without this,
+				// prompt send stays blocked after SuperGrok / Claude / Gemini OAuth.
+				// Mirror has_key into authed so logout/switch-without-key also clears it.
+				s.authed = b
 			}
 		}
 		// Persist the selection so the next session restores it.
@@ -115,9 +179,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.reauthActiveProvider()
 
 	case "authed":
-		s.authed = true
-		s.providerHasKey = true
-		s.logSuccess("authenticated")
+		// Honor ok=false (e.g. future unauth signals); default missing ok to true.
+		ok := true
+		if raw := ev.get("ok"); raw != "" && raw != "null" {
+			if raw == "false" || raw == "0" {
+				ok = false
+			}
+		}
+		s.authed = ok
+		s.providerHasKey = ok
+		if ok {
+			s.logSuccess("authenticated")
+		}
+		s.refresh()
 
 	case "provider_presets":
 		// The core advertises the first-party presets (and refreshes them after
@@ -135,9 +209,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 		s.providerPresets = presets
-		if s.modal.kind == modalProviders {
-			s.refresh()
-		}
+		// Always repaint so footer / next /login open shows ✓ without a restart.
+		s.refresh()
 
 	case "models":
 		// The core emits this after a provider switch (and on demand). Re-apply the
@@ -155,6 +228,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.applyModels(models)
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
+		s.refresh()
 
 	case "delta":
 		if s.cur == nil || s.cur.kind != blkAssistant {
@@ -497,6 +571,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
 		if msg := ev.get("message"); msg != "" {
 			s.logInfo(msg)
+			// OAuth finalize messages — belt-and-suspenders if `authed` was
+			// missed so the user can type immediately after SuperGrok login.
+			low := strings.ToLower(msg)
+			if strings.Contains(low, "logged into") && strings.Contains(low, "oauth") {
+				s.authed = true
+				s.providerHasKey = true
+				s.logSuccess("authenticated (OAuth)")
+			}
 		}
 
 	case "oauth_prompt":
@@ -536,10 +618,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			b.WriteString(code)
 		}
 		s.logInfo(b.String())
-		if url != "" {
+		// Progress heartbeats re-use oauth_prompt without a new URL — don't
+		// re-open the browser on every "still waiting…" tick.
+		if url != "" && !strings.Contains(strings.ToLower(message), "still waiting") {
 			openURL(url)
 		}
-		return clipCmd // OSC 52 write is a tea.Cmd so it's serialized with the renderer
+		// CRITICAL: always re-arm waitForEvent. Returning only clipCmd used to
+		// drop the core event pump after the first oauth_prompt — so the later
+		// "logged into … OAuth" / authed / models events sat unread until a TUI
+		// restart. That made SuperGrok login look stuck after browser approval.
+		if clipCmd != nil {
+			return tea.Batch(clipCmd, waitForEvent(s.coreEvents))
+		}
+		// fall through to the shared waitForEvent return below
 
 	case "steer":
 		// Core acknowledged a steer: the running turn was interrupted and the
@@ -606,6 +697,41 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.modal.editing = false
 		s.modal.fieldIdx = 0
 
+	case "usage":
+		// /usage reply: provider plan / rate-limit windows for the model the
+		// user is on. Open a modal with progress bars per window.
+		var ur usageReport
+		if err := json.Unmarshal(ev.Raw, &ur); err != nil {
+			s.logError("failed to parse usage report")
+			break
+		}
+		s.usageReport = &ur
+		s.modal.kind = modalUsage
+		s.modal.editing = false
+		s.modal.fieldIdx = 0
+		if !ur.Available && ur.Message != "" {
+			// Also log so headless/log readers see why.
+			s.logInfo(ur.Message)
+		}
+
+	case "goal_state":
+		s.applyGoalState(ev.Raw)
+	case "goal_plan":
+		// Keep plan summary as info; detailed steps land via goal_state prompts.
+		if sum := ev.get("summary"); sum != "" {
+			s.logInfo("plan: " + sum)
+		}
+	case "goal_phase":
+		from, to := ev.get("from"), ev.get("to")
+		msg := ev.get("message")
+		if msg != "" {
+			s.logInfo(fmt.Sprintf("goal %s → %s: %s", from, to, msg))
+		} else {
+			s.logInfo(fmt.Sprintf("goal %s → %s", from, to))
+		}
+		if to == "plan_ready" && s.goalState != nil && !s.goalState.AutoDeploy {
+			s.openGoalPlanReview()
+		}
 	case "memory_saved":
 		if msg := ev.get("message"); msg != "" {
 			s.logSuccess(msg)
@@ -619,6 +745,18 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			if raw, ok := m["entries"]; ok {
 				_ = json.Unmarshal(raw, &entries)
 			}
+		}
+		s.memoryList = entries
+		// Bare /memory and /forget open a pick-to-forget modal instead of
+		// requiring `/forget <id>` on the command line.
+		if s.pendingMemoryPicker {
+			s.pendingMemoryPicker = false
+			if len(entries) == 0 {
+				s.logInfo("no memories saved")
+				break
+			}
+			s.openMemoryPicker()
+			break
 		}
 		if len(entries) == 0 {
 			s.logInfo("no memories saved")
@@ -861,28 +999,56 @@ func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
 //	/run <agent> "<task>"            (single)
 //	/parallel <a1> "<t1>" | <a2> "<t2>"   (parallel)
 //	/chain <a1> "<t1>" -> <a2> "<t2>"      (chain, {previous} flows)
+//
+// Bare commands (no remainder) open a value-edit modal instead of printing usage.
 func (s *session) runSubagentCommand(parts []string, mode string) tea.Cmd {
 	if len(parts) < 2 {
-		usage := map[string]string{"single": "/run <agent> \"<task>\"", "parallel": "/parallel <a1> \"<t1>\" | <a2> \"<t2>\"", "chain": "/chain <a1> \"<t1>\" -> <a2> \"<t2>\""}
-		s.logError("usage: " + usage[mode])
+		switch mode {
+		case "single":
+			s.openRunModal()
+		case "parallel":
+			s.openParallelModal()
+		case "chain":
+			s.openChainModal()
+		}
 		return nil
 	}
-	rest := strings.TrimSpace(strings.Join(parts[1:], " "))
+	return s.runSubagentRest(strings.TrimSpace(strings.Join(parts[1:], " ")), mode)
+}
+
+// runSubagentRest applies a free-form remainder (from the slash line or a modal)
+// for /run, /parallel, or /chain.
+func (s *session) runSubagentRest(rest, mode string) tea.Cmd {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		s.logError("empty subagent task")
+		return nil
+	}
 	var prompt string
 	switch mode {
 	case "single":
 		agent, task := splitAgentTask(rest)
 		if agent == "" {
-			s.logError("usage: /run <agent> \"<task>\"")
+			s.logError(`need: agent "task description"`)
 			return nil
 		}
 		prompt = fmt.Sprintf("Run the subagent tool: agent=%q, task=%q. Return its result.", agent, task)
 	case "parallel":
 		tasks := splitParallel(rest)
+		if strings.TrimSpace(tasks) == "" {
+			s.logError(`need: a1 "task1" | a2 "task2"`)
+			return nil
+		}
 		prompt = "Run the subagent tool in parallel mode with these tasks:\n" + tasks
 	case "chain":
 		steps := splitChain(rest)
+		if strings.TrimSpace(steps) == "" {
+			s.logError(`need: a1 "task1" -> a2 "task2"`)
+			return nil
+		}
 		prompt = "Run the subagent tool as a chain with these steps (use {previous} to pass the prior step's output):\n" + steps
+	default:
+		return nil
 	}
 	return s.sendDelegation(prompt, "/"+mode)
 }
@@ -961,20 +1127,27 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 	s.queuedNext = true
 	s.queued = &queuedMsg{kind: "steer", text: prompt, at: time.Now()}
 	s.layout()
-	s.sendCore(s.withImages(map[string]any{
+	// Steer currently has no images field in the core protocol; path tokens in
+	// the prompt still help for context, but pending image bytes are not
+	// forwarded. Clear them so they don't stick around for a later send.
+	s.sendCore(map[string]any{
 		"type":             "steer",
 		"prompt":           prompt,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
-	}, prompt))
+	})
+	s.clearPendingImages()
 	return nil
 }
 
 // steerFromInput sends the current input as a steer (Ctrl+Enter).
 func (s *session) steerFromInput() tea.Cmd {
 	text := strings.TrimSpace(s.input.Value())
-	if text == "" {
+	if text == "" && len(s.pendingImages) == 0 {
 		return nil
+	}
+	if text == "" {
+		text = "Describe this image."
 	}
 	s.input.Reset()
 	return s.sendSteer(text)
@@ -994,7 +1167,11 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	s.follow = true
-	s.logUser(text + "  ↳ queued")
+	disp := text + "  ↳ queued"
+	if n := len(s.pendingImages); n > 0 {
+		disp = text + fmt.Sprintf("  [%d image%s]  ↳ queued", n, pluralS(n))
+	}
+	s.logUser(disp)
 	s.pushHistory(text)
 	s.queuedNext = true
 	s.queued = &queuedMsg{kind: "follow-up", text: text, at: time.Now()}
@@ -1005,6 +1182,7 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, text))
+	s.clearPendingImages()
 	return nil
 }
 
@@ -1038,6 +1216,19 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// buffering needed.
 	if s.kb(msg, "newline") {
 		s.insertNewline()
+		return s, nil
+	}
+	// Paste image from the local clipboard (ctrl+shift+v by default). Works on
+	// a local GUI session; over SSH prefer bracketed paste of a path / data
+	// URL (handled in Update on tea.PasteMsg).
+	if s.kb(msg, "paste_image") {
+		return s, readClipboardImageCmd()
+	}
+	// Remove the last staged image attachment.
+	if s.kb(msg, "detach_image") {
+		if s.popPendingImage() {
+			s.logInfo("detached last image")
+		}
 		return s, nil
 	}
 	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
@@ -1189,15 +1380,26 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return s, s.steerFromInput()
 		case s.kb(msg, "send"):
 			text := strings.TrimSpace(s.input.Value())
-			if text == "" {
+			if text == "" && len(s.pendingImages) == 0 {
 				return s, nil
+			}
+			// Image-only follow-up: default caption so the core still gets a prompt.
+			if text == "" {
+				text = "Describe this image."
 			}
 			s.input.Reset()
 			s.evalMention()
-			if strings.HasPrefix(text, "/") {
+			if strings.HasPrefix(text, "/") && len(s.pendingImages) == 0 {
 				return s, s.handleUserLine(text)
 			}
 			return s, s.queueFollowUp(text)
+		}
+		// Backspace on empty input pops the last attached image (same affordance
+		// as removing a chip in the web composer).
+		if (msg.Code == tea.KeyBackspace || msg.String() == "backspace" || msg.String() == "ctrl+h") &&
+			s.input.Value() == "" && len(s.pendingImages) > 0 {
+			s.popPendingImage()
+			return s, nil
 		}
 		var cmd tea.Cmd
 		s.input, cmd = s.input.Update(msg)
@@ -1241,13 +1443,24 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	if s.kb(msg, "send") {
 		text := strings.TrimSpace(s.input.Value())
-		if text == "" {
+		if text == "" && len(s.pendingImages) == 0 {
 			return s, nil
+		}
+		// Image-only send: give the model a default caption prompt.
+		if text == "" {
+			text = "Describe this image."
 		}
 		s.input.Reset()
 		s.evalMention()
 		s.histIdx = len(s.history)
 		return s, s.handleUserLine(text)
+	}
+
+	// Backspace on empty input removes the last attached image.
+	if (msg.Code == tea.KeyBackspace || msg.String() == "backspace" || msg.String() == "ctrl+h") &&
+		s.input.Value() == "" && len(s.pendingImages) > 0 {
+		s.popPendingImage()
+		return s, nil
 	}
 
 	s.input, _ = s.input.Update(msg)
@@ -1408,9 +1621,10 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/steer":
 			// Steer via command: works on every terminal (Ctrl+Enter is only detected
-			// on terminals that send a distinct CSI for it).
+			// on terminals that send a distinct CSI for it). Bare /steer opens a
+			// modal so the user does not have to type the message on the slash line.
 			if len(parts) < 2 {
-				s.logError("usage: /steer <message>")
+				s.openSteerModal()
 				return nil
 			}
 			return s.sendSteer(strings.Join(parts[1:], " "))
@@ -1576,51 +1790,16 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/copy":
 			return s.copyLastAssistant()
 		case "/attach":
-			// /attach <path> [prompt] — send the current input (or the given prompt) with an image.
+			// Bare /attach opens a path modal; with args it sends immediately.
 			if len(parts) < 2 {
-				s.logError("usage: /attach <image-path> [optional prompt]")
+				s.openAttachModal()
 				return nil
 			}
-			imgPath := parts[1]
-			// P2-12: validate the image like the main send paths do (via withImages),
-			// so /attach can't base64-encode a non-image or a >20MiB file (it
-			// previously set "images" directly with no checks).
-			abs, err := validateImage(imgPath)
-			if err != nil {
-				s.logError(err.Error())
-				return nil
-			}
-			// Remaining parts joined become the prompt; fall back to the current input value.
 			promptText := ""
 			if len(parts) > 2 {
 				promptText = strings.Join(parts[2:], " ")
-			} else {
-				promptText = s.input.Value()
 			}
-			if strings.TrimSpace(promptText) == "" {
-				promptText = "Describe this image."
-			}
-			if !s.authed {
-				s.logError("not authenticated — run /key sk-... first")
-				return nil
-			}
-			if len(s.models) == 0 {
-				s.logError("no models loaded yet")
-				return nil
-			}
-			model := s.models[s.modelIdx].ID
-			s.follow = true // jump to bottom so the user sees their turn
-			s.logUser(promptText + " [image: " + imgPath + "]")
-			s.sendCore(s.withImages(map[string]any{
-				"type":             "send",
-				"prompt":           promptText,
-				"model":            model,
-				"reasoning_effort": s.settings.ReasoningEffort,
-				"images":           []string{abs},
-			}, promptText))
-			s.busy = true
-			s.input.Reset()
-			return nil
+			return s.sendAttach(parts[1], promptText)
 		case "/clear":
 			s.sendCore(map[string]any{"type": "clear"})
 			s.blocks = nil
@@ -1641,21 +1820,36 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logInfo("dropped last turn")
 			return nil
 		case "/compact":
+			// Bare /compact opens a modal for optional preserve-instructions;
+			// with args it still compacts immediately.
 			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
 			if rest == "" {
-				s.sendCore(map[string]any{"type": "compact"})
-			} else {
-				s.sendCore(map[string]any{"type": "compact", "instructions": rest})
+				s.openCompactModal()
+				return nil
 			}
+			s.sendCore(map[string]any{"type": "compact", "instructions": rest})
 			s.logInfo("forcing context compaction…")
 			return nil
 		case "/context":
 			s.sendCore(map[string]any{"type": "context"})
 			return nil
+		case "/usage":
+			// Provider plan limits for the currently selected model. Core
+			// resolves model → provider and fetches the appropriate endpoint.
+			cmd := map[string]any{"type": "usage"}
+			if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+				cmd["model"] = s.models[s.modelIdx].ID
+			}
+			s.usageReport = nil // show "loading…" until the event lands
+			s.modal.kind = modalUsage
+			s.modal.editing = false
+			s.modal.fieldIdx = 0
+			s.sendCore(cmd)
+			return nil
 		case "/remember":
 			rest := strings.TrimSpace(strings.Join(parts[1:], " "))
 			if rest == "" {
-				s.logError("usage: /remember <text>")
+				s.openRememberModal()
 				return nil
 			}
 			s.sendCore(map[string]any{"type": "save_memory", "text": rest})
@@ -1663,11 +1857,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logSuccess("memory saved")
 			return nil
 		case "/memory":
-			s.sendCore(map[string]any{"type": "list_memory"})
+			// Open the memory picker (enter forgets); falls back to a log line
+			// only when the list is empty.
+			s.requestMemoryPicker()
 			return nil
 		case "/forget":
 			if len(parts) < 2 {
-				s.logError("usage: /forget <id>")
+				s.requestMemoryPicker()
 				return nil
 			}
 			s.sendCore(map[string]any{"type": "forget_memory", "id": parts[1]})
@@ -1717,40 +1913,48 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/plugin-install":
 			if len(parts) < 2 {
-				s.logError("usage: /plugin-install <path-to-plugin-dir>")
+				s.openPluginInstallModal()
 				return nil
 			}
 			s.sendCore(map[string]any{"type": "install_plugin", "path": parts[1]})
 			s.logInfo(fmt.Sprintf("installing plugin from %s…", parts[1]))
 			return nil
-		case "/plugin-list", "/plugin-config":
-			s.sendCore(map[string]any{"type": "list_plugins"})
+		case "/plugin-list", "/plugin-config", "/plugin-enable", "/plugin-disable":
+			// Bare enable/disable open the toggle picker (same as /plugin-config);
+			// with a name they still act immediately.
+			if (parts[0] == "/plugin-enable" || parts[0] == "/plugin-disable") && len(parts) >= 2 {
+				if parts[0] == "/plugin-enable" {
+					s.sendCore(map[string]any{"type": "enable_plugin", "name": parts[1]})
+				} else {
+					s.sendCore(map[string]any{"type": "disable_plugin", "name": parts[1]})
+				}
+				return nil
+			}
+			s.requestPluginPicker(pluginModeToggle)
 			return nil
 		case "/vision":
 			s.pendingVisionPicker = true
 			s.sendCore(map[string]any{"type": "get_vision_config"})
 			s.logInfo("loading vision config…")
 			return nil
-		case "/plugin-enable":
-			if len(parts) < 2 {
-				s.logError("usage: /plugin-enable <name>")
-				return nil
-			}
-			s.sendCore(map[string]any{"type": "enable_plugin", "name": parts[1]})
-			return nil
-		case "/plugin-disable":
-			if len(parts) < 2 {
-				s.logError("usage: /plugin-disable <name>")
-				return nil
-			}
-			s.sendCore(map[string]any{"type": "disable_plugin", "name": parts[1]})
-			return nil
 		case "/plugin-remove":
-			if len(parts) < 2 {
-				s.logError("usage: /plugin-remove <name>")
+			if len(parts) >= 2 {
+				s.sendCore(map[string]any{"type": "remove_plugin", "name": parts[1]})
 				return nil
 			}
-			s.sendCore(map[string]any{"type": "remove_plugin", "name": parts[1]})
+			s.requestPluginPicker(pluginModeRemove)
+			return nil
+		case "/goal":
+			prefill := ""
+			if len(parts) >= 2 {
+				// Keep everything after "/goal " as the goal text.
+				prefill = strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
+			}
+			s.openGoalModal(prefill)
+			return nil
+		case "/cancel-goal":
+			s.sendCore(map[string]any{"type": "cancel_goal"})
+			s.logInfo("cancelling goal…")
 			return nil
 		case "/run":
 			return s.runSubagentCommand(parts, "single")
@@ -1782,7 +1986,11 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	s.follow = true // jump to bottom so the user sees their turn + the response
-	s.logUser(text)
+	disp := text
+	if n := len(s.pendingImages); n > 0 {
+		disp = text + fmt.Sprintf("  [%d image%s]", n, pluralS(n))
+	}
+	s.logUser(disp)
 	s.pushHistory(text)
 	s.sendCore(s.withImages(map[string]any{
 		"type":             "send",
@@ -1790,7 +1998,49 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, text))
+	s.clearPendingImages()
 	s.busy = true
+	return nil
+}
+
+// sendAttach validates imgPath and sends a vision turn. promptText may be empty
+// (falls back to the composer value, then a default caption prompt). Shared by
+// `/attach <path> [prompt]` and the attach value-edit modal.
+func (s *session) sendAttach(imgPath, promptText string) tea.Cmd {
+	// P2-12: validate the image like the main send paths do (via withImages),
+	// so /attach can't base64-encode a non-image or a >20MiB file.
+	abs, err := validateImage(imgPath)
+	if err != nil {
+		s.logError(err.Error())
+		return nil
+	}
+	if strings.TrimSpace(promptText) == "" {
+		promptText = s.input.Value()
+	}
+	if strings.TrimSpace(promptText) == "" {
+		promptText = "Describe this image."
+	}
+	if !s.authed {
+		s.logError("not authenticated — run /key sk-... first")
+		return nil
+	}
+	if len(s.models) == 0 {
+		s.logError("no models loaded yet")
+		return nil
+	}
+	model := s.models[s.modelIdx].ID
+	s.follow = true
+	s.logUser(promptText + " [image: " + imgPath + "]")
+	s.sendCore(s.withImages(map[string]any{
+		"type":             "send",
+		"prompt":           promptText,
+		"model":            model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+		"images":           []string{abs},
+	}, promptText))
+	s.clearPendingImages()
+	s.busy = true
+	s.input.Reset()
 	return nil
 }
 
@@ -1800,6 +2050,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 // read_file's path restriction so global skills work too) and runs a turn that
 // applies it. The displayed user line is the concise "/skill:<name> [task]";
 // the full skill body is injected by the core, not shown in the transcript.
+// Skills are the exception to the "bare slash → modal" rule: they stay
+// argument-oriented so the user can append a task after the skill token.
 func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 	token := parts[0] // "/skill:<name>"
 	name := strings.TrimPrefix(token, "/skill:")

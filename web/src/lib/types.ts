@@ -250,6 +250,57 @@ export interface WorkState {
   last_activity: string;
 }
 
+/** First-class goal mode snapshot from `goal_state` events. */
+export interface GoalModeState {
+  id: string;
+  goal: string;
+  phase: string;
+  concurrency: number;
+  max_tasks: number;
+  allowed_models: string[];
+  allowed_providers: string[];
+  auto_deploy: boolean;
+  role_models?: {
+    planner?: string | null;
+    worker?: string | null;
+    reviewer?: string | null;
+  };
+  model_concurrency?: Record<string, number>;
+  prompts: GoalPrompt[];
+  active_run_ids: string[];
+  version: number;
+  error: string | null;
+  parent_model: string;
+}
+
+export interface GoalPrompt {
+  step_id: string;
+  agent: string;
+  title: string;
+  task: string;
+  model?: string | null;
+  status: string;
+  run_id?: string | null;
+  summary?: string | null;
+}
+
+export interface GoalPlan {
+  id: string;
+  summary: string;
+  steps: Array<{
+    id: string;
+    agent: string;
+    title: string;
+    task: string;
+    model?: string;
+    depends_on?: string[];
+    parallel_group?: string;
+  }>;
+  risks: string[];
+  validation: string[];
+  version: number;
+}
+
 /** Core events (server → client). A typed subset of what the core emits. */
 export type CoreEvent =
   | ReadyPayload
@@ -272,6 +323,25 @@ export type CoreEvent =
   | { type: "compacted"; before_tokens: number; after_tokens: number; summary_chars?: number }
   | { type: "compacting"; before_tokens: number; trigger: string }
   | { type: "context_breakdown"; total_tokens: number; context_window: number; pct: number; messages: number; system_tokens: number; by_role: Record<string, number>; top_consumers: { index: number; role: string; tokens: number; preview: string }[] }
+  | {
+      type: "usage";
+      provider: string;
+      provider_kind?: string;
+      model?: string;
+      base_url?: string;
+      available: boolean;
+      plan?: string;
+      message?: string;
+      windows: Array<{
+        id: string;
+        label: string;
+        used?: number;
+        limit?: number;
+        unit: string;
+        resets_at?: number;
+        detail?: string;
+      }>;
+    }
   | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
   | Stats
@@ -313,6 +383,10 @@ export type CoreEvent =
   | { type: "oauth_prompt"; url: string; code?: string; message?: string }
   | { type: "reflecting"; recurrence: number | string }
   | { type: "work_state"; version: number; goal: string; done: string[]; in_progress: string[]; next: string[]; recent_files: string[]; last_activity: string }
+  // ── Goal mode ──
+  | ({ type: "goal_state" } & GoalModeState)
+  | ({ type: "goal_plan" } & GoalPlan)
+  | { type: "goal_phase"; from: string; to: string; message?: string }
   // ── Skills ──
   | { type: "skills"; skills: SkillInfo[] };
 
@@ -325,6 +399,7 @@ export type CoreCommand =
   | { type: "clear" }
   | { type: "compact"; instructions?: string }
   | { type: "context" }
+  | { type: "usage"; model?: string }
   | { type: "approve"; request_id: string; decision: "yes" | "no" | "always" }
   | { type: "set_approval"; mode: "never" | "destructive" | "always" }
   | { type: "set_key"; api_key: string; provider?: string }
@@ -368,7 +443,27 @@ export type CoreCommand =
   | { type: "delete_session"; path: string }
   // ── Skills ──
   | { type: "list_skills" }
-  | { type: "apply_skill"; name: string; task?: string; model: string; reasoning_effort?: string };
+  | { type: "apply_skill"; name: string; task?: string; model: string; reasoning_effort?: string }
+  // ── Goal mode ──
+  | {
+      type: "start_goal";
+      goal: string;
+      concurrency?: number;
+      max_tasks?: number;
+      allowed_models?: string[];
+      allowed_providers?: string[];
+      auto_deploy?: boolean;
+      planner_model?: string;
+      worker_model?: string;
+      reviewer_model?: string;
+      model_concurrency?: Record<string, number>;
+      model: string;
+      reasoning_effort?: string;
+    }
+  | { type: "cancel_goal" }
+  | { type: "goal_status" }
+  | { type: "approve_goal_plan" }
+  | { type: "revise_goal"; feedback: string; model: string; reasoning_effort?: string };
 
 /** Synthetic events produced by the bridge/client (not from the core). */
 export type SyntheticEvent =
@@ -514,6 +609,10 @@ export interface AgentState {
   /** Rolling work-state summary (goal/done/doing/next/recent files) from
    *  `work_state` events — drives the ambient status panel. */
   workState: WorkState | null;
+  /** Active goal mode (plan → deploy). Null when idle. */
+  goalMode: GoalModeState | null;
+  /** Last structured plan from `goal_plan` (for plan-ready review). */
+  goalPlan: GoalPlan | null;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;
 }

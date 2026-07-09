@@ -72,7 +72,7 @@ subagents. You can drive it from the terminal, the browser, or your own code.
 
 Key highlights:
 
-* **Multi-provider, no lock-in** — one `/login` picker for Umans, OpenAI, Gemini,
+* **Multi-provider, no lock-in** — one `/login` picker for Umans, OpenAI, Gemini, xAI,
   and Anthropic. Be logged into several at once; any model you pick routes that
   turn to its endpoint. API key *and* subscription OAuth (no key) supported.
 * **Human-in-the-loop safety** — destructive tools (`bash`, `write_file`,
@@ -232,6 +232,10 @@ In the TUI:
 * `/model [N|substr]` — list models, or switch (`/model 3`, `/model glm-5.2`).
 * `/approval` — open the approval-mode picker (`never` · `destructive` · `always`); or `/approval always` to set directly.
 * `/settings` — settings hub; each option opens its own dedicated modal (`/theme`, `/sandbox`, `/mouse-wheel`, …).
+* `/goal` — goal mode: multi-field modal for a high-level objective, concurrency,
+  and model/provider allowlists. The core plans (`goal_write_plan`) then deploys
+  subagents under those caps. `/cancel-goal` aborts. Optional “review plan before
+  deploy” stops at plan-ready for approve/revise.
 * type a prompt to chat. `/help` lists every command.
 
 ### Web frontend
@@ -276,9 +280,11 @@ endpoint.
 | Preset | Wire | Endpoint | Key env var |
 |:---|:---|:---|:---|
 | **Umans (GLM-5.2)** | OpenAI | `api.code.umans.ai/v1` | `UMANS_API_KEY` |
-| **OpenAI (Codex)** | OpenAI | `api.openai.com/v1` | `OPENAI_API_KEY` |
-| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) |
-| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
+| **OpenAI (Codex)** | OpenAI | `chatgpt.com/backend-api/codex` | `OPENAI_API_KEY` or OAuth |
+| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) or OAuth |
+| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` or OAuth |
+| **xAI Grok** | OpenAI | `api.x.ai/v1` | **OAuth only** (SuperGrok / X Premium+) |
+| **OpenCode Go** | OpenAI + Anthropic | `opencode.ai/zen/go/v1` | `OPENCODE_GO_API_KEY` |
 
 Keys are persisted per-provider (the env-var *name* is stored when a key came
 from the environment, so the secret never lands in a config file).
@@ -287,18 +293,21 @@ from the environment, so the secret never lands in a config file).
 
 ### Subscription login (OAuth) — no API key
 
-ChatGPT Plus/Pro (Codex), Google One AI (Gemini), and Claude Pro/Max are reached
-via **OAuth**, performed by `/login` itself (no official CLI needed):
+ChatGPT Plus/Pro (Codex), Google One AI (Gemini), Claude Pro/Max, and SuperGrok
+are reached via **OAuth**, performed by `/login` itself (no official CLI needed):
 
 * **Gemini** — authorization-code + PKCE + loopback redirect. Reuses
   `gcloud auth application-default login` if present.
 * **Anthropic Claude** — authorize + PKCE + loopback redirect. Reuses the
   `claude` CLI token if present.
-* **OpenAI Codex** — ⚠️ not yet wired (the ChatGPT token needs the Responses
-  API, a different request shape). Codex stays on `OPENAI_API_KEY` for now.
+* **OpenAI Codex** — device-code / loopback OAuth against ChatGPT subscription.
+* **xAI Grok** — **OAuth device-code only** (SuperGrok or X Premium+). Opens
+  `accounts.x.ai`, polls until you approve; no `XAI_API_KEY`. Works over SSH
+  (print URL + user code). Default model: `grok-build-0.1`.
 
 Tokens are stored at `~/.config/catalyst-code/oauth/<id>.json` (`0600`) and
-refreshed automatically. An explicit API key always takes precedence over OAuth.
+refreshed automatically. An explicit API key always takes precedence over OAuth
+(except xAI, which is OAuth-only).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -377,10 +386,10 @@ peers over an in-process intercom bus.
 
 ## Roadmap
 
-- [x] Multi-provider login (Umans, OpenAI, Gemini, Anthropic)
+- [x] Multi-provider login (Umans, OpenAI, Gemini, Anthropic, xAI)
 - [x] Subagents + intercom bus
 - [x] Plugin system (hooks + custom tools, no MCP)
-- [ ] Wire OpenAI Codex subscription OAuth (Responses API)
+- [x] xAI Grok SuperGrok / X Premium+ OAuth (device-code, no API key)
 - [ ] More provider presets (local gateways, additional OAuth flows)
 - [ ] macOS/Windows sandboxing options
 - [ ] Broader plugin / skill ecosystem

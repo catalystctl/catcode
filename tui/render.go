@@ -482,8 +482,29 @@ func (s *session) renderInputBox() string {
 		w = 6
 	}
 	innerW := w - 4 // "│ " + content + " │"
+	// Attachment chips sit above the typed text so pasted images are visible
+	// even when the text field is empty (image-only send).
+	var chipLine string
+	if n := len(s.pendingImages); n > 0 {
+		parts := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			parts = append(parts, s.pendingImageLabel(i))
+		}
+		chip := strings.Join(parts, " ")
+		// Hint for detaching — only when there's room.
+		hint := "  ctrl+shift+x remove"
+		if lipgloss.Width(chip)+lipgloss.Width(hint) <= innerW {
+			chipLine = accentStyle.Render(chip) + dimStyle.Render(hint)
+		} else {
+			chipLine = accentStyle.Render(truncate(chip, innerW))
+		}
+	}
 	content := s.inputContent(innerW)
-	lines := strings.Split(content, "\n")
+	var lines []string
+	if chipLine != "" {
+		lines = append(lines, chipLine)
+	}
+	lines = append(lines, strings.Split(content, "\n")...)
 	top := "╭" + strings.Repeat("─", w-2) + "╮"
 	bot := "╰" + strings.Repeat("─", w-2) + "╯"
 	var b strings.Builder

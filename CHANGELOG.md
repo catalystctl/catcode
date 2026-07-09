@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added — `/goal` Advanced: role models + per-model concurrency
+- Checkbox **Advanced** on the TUI and web `/goal` forms:
+  - Pin models for **planner**, **worker**, and **reviewer** agents.
+  - Set **per-model concurrency** (capped by the global concurrency).
+- Core applies role pins when materializing deploy prompts; planning turn uses
+  the planner model when set. Deploy schedules each step with a global semaphore
+  plus a per-model semaphore.
+
+### Fixed — no auto-reflect during active goal mode
+- Auto-reflect is skipped while a goal is mid-flight (planning, plan_ready,
+  deploying, running, blocked). Planning only produces a plan — reflecting
+  there delayed deploy and had nothing durable to learn from. Reflect still
+  runs on normal turns after the goal is done/failed/idle.
+
+### Added — `/goal` mode (plan then deploy subagents)
+- **Core goal protocol** (`start_goal`, `cancel_goal`, `goal_status`,
+  `approve_goal_plan`, `revise_goal`) with a phase machine:
+  planning → plan_ready → deploying → running → done|failed.
+- Planning turns call the new **`goal_write_plan`** tool to submit a structured
+  multi-step plan; the core materializes per-subagent prompts and deploys them
+  under the user's **concurrency** and **model/provider allowlists**.
+- Subagent model resolution now routes each candidate through
+  `resolve_provider_for_model` and filters by active goal allowlists.
+- **TUI**: multi-field `/goal` modal (goal text, concurrency, max tasks,
+  providers, models, review-before-deploy). Plan-ready review with
+  approve / revise / cancel. `/cancel-goal` aborts.
+- **Web**: matching Goal modal, plan-ready banner, and goal status chip.
+- WorkState.goal is set from `/goal` (replace, not one-shot seed).
+
 ### Fixed — TUI modified Enter in SSH/Konsole
 - **Shift+Enter** now inserts a newline reliably in terminals that support
   enhanced keyboard reporting (including Konsole over SSH). The TUI enables

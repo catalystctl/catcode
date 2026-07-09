@@ -66,6 +66,13 @@ var keybindDefs = []keybindDef{
 	{"steer", "Input", "Steer (interrupt + redirect the model)", "ctrl+enter"},
 	{"history_prev", "Input", "Recall previous input", "up"},
 	{"history_next", "Input", "Recall next input", "down"},
+	// paste_image reads an image from the local clipboard (wl-paste/xclip/
+	// pngpaste/osascript/PowerShell). Over SSH the remote host usually has no
+	// display, so prefer Ctrl/Cmd+V which delivers a bracketed PasteMsg — paths
+	// and base64 image data are auto-detected. This keybind is for local GUI
+	// sessions and reverse-forwarded clipboard helpers.
+	{"paste_image", "Input", "Paste image from clipboard", "ctrl+shift+v"},
+	{"detach_image", "Input", "Remove last attached image", "ctrl+shift+x"},
 
 	// Approval — when a destructive action is pending.
 	{"approve", "Approval", "Approve once", "y"},

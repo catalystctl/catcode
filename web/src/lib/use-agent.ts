@@ -85,6 +85,22 @@ export interface AgentApi {
   // ── Skills ──
   listSkills: () => Promise<void>;
   applySkill: (name: string, task?: string) => Promise<void>;
+  // ── Goal mode ──
+  startGoal: (opts: {
+    goal: string;
+    concurrency?: number;
+    max_tasks?: number;
+    allowed_models?: string[];
+    allowed_providers?: string[];
+    auto_deploy?: boolean;
+    planner_model?: string;
+    worker_model?: string;
+    reviewer_model?: string;
+    model_concurrency?: Record<string, number>;
+  }) => Promise<void>;
+  cancelGoal: () => Promise<void>;
+  approveGoalPlan: () => Promise<void>;
+  reviseGoal: (feedback: string) => Promise<void>;
   // ── Vision ──
   getVisionConfig: () => Promise<void>;
   setVisionConfig: (vision_model: string | null, vision_models?: string[]) => Promise<void>;
@@ -522,6 +538,64 @@ export function useAgent(): AgentApi {
     [post, effortFor],
   );
 
+  // ── Goal mode ──
+  const startGoal = useCallback(
+    async (opts: {
+      goal: string;
+      concurrency?: number;
+      max_tasks?: number;
+      allowed_models?: string[];
+      allowed_providers?: string[];
+      auto_deploy?: boolean;
+      planner_model?: string;
+      worker_model?: string;
+      reviewer_model?: string;
+      model_concurrency?: Record<string, number>;
+    }) => {
+      const s = stateRef.current;
+      const model = s.selectedModel ?? s.models[0]?.id ?? "";
+      const cmd: CoreCommand = {
+        type: "start_goal",
+        goal: opts.goal,
+        model,
+        concurrency: opts.concurrency,
+        max_tasks: opts.max_tasks,
+        allowed_models: opts.allowed_models,
+        allowed_providers: opts.allowed_providers,
+        auto_deploy: opts.auto_deploy,
+        planner_model: opts.planner_model,
+        worker_model: opts.worker_model,
+        reviewer_model: opts.reviewer_model,
+        model_concurrency: opts.model_concurrency,
+      };
+      const eff = effortFor(s.thinkingLevel);
+      if (eff) cmd.reasoning_effort = eff;
+      setState((st) =>
+        reduce(st, {
+          type: "_user",
+          text: `🎯 Goal: ${opts.goal}`,
+          model,
+          steer: false,
+        }),
+      );
+      await post(cmd);
+    },
+    [post, effortFor],
+  );
+  const cancelGoal = useCallback(() => send({ type: "cancel_goal" }), [send]);
+  const approveGoalPlan = useCallback(() => send({ type: "approve_goal_plan" }), [send]);
+  const reviseGoal = useCallback(
+    async (feedback: string) => {
+      const s = stateRef.current;
+      const model = s.selectedModel ?? s.models[0]?.id ?? "";
+      const cmd: CoreCommand = { type: "revise_goal", feedback, model };
+      const eff = effortFor(s.thinkingLevel);
+      if (eff) cmd.reasoning_effort = eff;
+      await post(cmd);
+    },
+    [post, effortFor],
+  );
+
   // ── Vision ──
   const getVisionConfig = useCallback(() => send({ type: "get_vision_config" }), [send]);
   const setVisionConfig = useCallback(
@@ -654,6 +728,10 @@ export function useAgent(): AgentApi {
       listPlugins,
       listSkills,
       applySkill,
+      startGoal,
+      cancelGoal,
+      approveGoalPlan,
+      reviseGoal,
       getVisionConfig,
       setVisionConfig,
       setConfig,

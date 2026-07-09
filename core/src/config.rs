@@ -433,6 +433,19 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         alt_envs: &[],
         description: "OpenCode Go — low-cost subscription for popular open coding models (GLM, Kimi, DeepSeek, MiMo, MiniMax, Qwen). One API key; models route to the OpenAI-compatible or Anthropic endpoint automatically. Uses your OPENCODE_GO_API_KEY.",
     },
+    ProviderPreset {
+        id: "xai",
+        label: "xAI Grok (SuperGrok OAuth)",
+        kind: ProviderKind::OpenAI,
+        // OpenAI-compatible chat completions at api.x.ai/v1. Auth is OAuth
+        // only (SuperGrok / X Premium+) — no XAI_API_KEY path.
+        base_url: "https://api.x.ai/v1",
+        // Empty: this preset is OAuth-only. env_key() returns None; /login
+        // always runs the device-code flow.
+        api_key_env: "",
+        alt_envs: &[],
+        description: "xAI Grok via SuperGrok or X Premium+ subscription OAuth (device-code login at accounts.x.ai). No API key — use /login to sign in. Default model: grok-build-0.1.",
+    },
 ];
 
 /// Look up a first-party preset by id.
@@ -442,8 +455,12 @@ pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
 
 impl ProviderPreset {
     /// Resolve an API key for this preset from its env vars (primary first,
-    /// then alternates). None when none are set.
+    /// then alternates). None when none are set. Empty `api_key_env` means
+    /// OAuth-only (e.g. xAI SuperGrok) — always returns None.
     pub fn env_key(&self) -> Option<String> {
+        if self.api_key_env.is_empty() {
+            return None;
+        }
         std::env::var(self.api_key_env)
             .ok()
             .filter(|s| !s.is_empty())
@@ -645,10 +662,12 @@ pub fn auto_login_env_presets(cfg: &mut Config) -> Vec<String> {
 
 /// True when a preset's reusable OAuth credentials exist (cheap sync file
 /// check). OpenAI/Codex is intentionally excluded: no Codex CLI auto-detect.
+/// xAI is included so a prior SuperGrok OAuth login reappears on restart.
 fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
     match p.id {
         "gemini" => crate::oauth::has_google_creds(),
         "anthropic" => crate::oauth::has_claude_creds(),
+        "xai" => crate::oauth::has_xai_creds(),
         _ => false,
     }
 }
@@ -1721,5 +1740,18 @@ mod tests {
         let configs = preset_provider_configs(p, Some("sk".to_string()));
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "openai");
+    }
+
+    #[test]
+    fn xai_preset_is_oauth_only() {
+        let p = find_preset("xai").expect("xai preset exists");
+        assert_eq!(p.base_url, "https://api.x.ai/v1");
+        assert!(p.api_key_env.is_empty());
+        assert!(p.env_key().is_none());
+        assert!(crate::oauth::supports_login(p.id));
+        let configs = preset_provider_configs(p, None);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "xai");
+        assert!(configs[0].api_key.is_none());
     }
 }

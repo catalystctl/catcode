@@ -41,6 +41,8 @@ export const COMMANDS: CommandDef[] = [
 
   // ── Agent ──
   { label: "/steer", desc: "steer an in-flight turn", category: "agent", action: "steer", streaming: true },
+  { label: "/goal", desc: "goal mode — plan & deploy subagents", category: "agent", action: "goal" },
+  { label: "/cancel-goal", desc: "cancel active goal mode", category: "agent", action: "cancel-goal" },
   { label: "/run", desc: "delegate to a subagent", category: "agent", action: "run" },
   { label: "/parallel", desc: "run subagents in parallel", category: "agent", action: "parallel" },
   { label: "/chain", desc: "run a subagent chain", category: "agent", action: "chain" },

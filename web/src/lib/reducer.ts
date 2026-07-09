@@ -55,6 +55,8 @@ export const initialState: AgentState = {
   subagentRuns: {},
   visionConfig: null,
   workState: null,
+  goalMode: null,
+  goalPlan: null,
   switching: false,
 };
 
@@ -508,6 +510,51 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         stats: ev,
         currentSessionFile: ev.session_file || state.currentSessionFile,
       };
+    case "usage": {
+      // Provider plan/rate-limit snapshot for the selected model. Surface a
+      // toast summary; full window list is available on the event for UI that
+      // wants a dedicated panel later.
+      const avail = ev.available;
+      const plan = ev.plan;
+      const provider = ev.provider || "provider";
+      const windows = ev.windows ?? [];
+      const msg = ev.message;
+      if (!avail) {
+        return {
+          ...state,
+          toasts: pushToast(state.toasts, "info", msg || `${provider}: usage not available`),
+        };
+      }
+      const summary = windows
+        .slice(0, 3)
+        .map((w) => {
+          const label = w.label || "limit";
+          // Percentage only when a positive limit is known (or unit is already %).
+          if (w.unit === "percent" && typeof w.used === "number") {
+            return `${label} ${Math.round(w.used)}%`;
+          }
+          if (
+            typeof w.used === "number" &&
+            typeof w.limit === "number" &&
+            w.limit > 0
+          ) {
+            const pct = Math.round((w.used / w.limit) * 100);
+            return `${label} ${w.used}/${w.limit} (${pct}%)`;
+          }
+          if (typeof w.used === "number") return `${label} ${w.used}`;
+          return label;
+        })
+        .join(" · ");
+      const head = plan ? `${provider} (${plan})` : provider;
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          summary ? `${head}: ${summary}` : `${head}: usage ok`,
+        ),
+      };
+    }
     case "context_breakdown": {
       const top = (ev.top_consumers ?? [])
         .slice(0, 3)
@@ -543,6 +590,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         // pending intercom ask is now stale — drop the banner so it can't hang.
         pendingIntercom: null,
         workState: null,
+        goalMode: null,
+        goalPlan: null,
       };
     case "done":
       return finishTurn(state);
@@ -730,6 +779,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentSessionFile: null,
         stats: null,
         workState: null,
+        goalMode: null,
+        goalPlan: null,
       };
     case "session_renamed": {
       const sessions = state.sessions.map((s) =>
@@ -793,6 +844,52 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           last_activity: ev.last_activity,
         },
       };
+    case "goal_state": {
+      if (!ev.id || ev.phase === "idle") {
+        return { ...state, goalMode: null };
+      }
+      return {
+        ...state,
+        goalMode: {
+          id: ev.id,
+          goal: ev.goal,
+          phase: ev.phase,
+          concurrency: ev.concurrency,
+          max_tasks: ev.max_tasks,
+          allowed_models: ev.allowed_models ?? [],
+          allowed_providers: ev.allowed_providers ?? [],
+          auto_deploy: ev.auto_deploy,
+          role_models: ev.role_models,
+          model_concurrency: ev.model_concurrency,
+          prompts: ev.prompts ?? [],
+          active_run_ids: ev.active_run_ids ?? [],
+          version: ev.version,
+          error: ev.error ?? null,
+          parent_model: ev.parent_model ?? "",
+        },
+      };
+    }
+    case "goal_plan":
+      return {
+        ...state,
+        goalPlan: {
+          id: ev.id,
+          summary: ev.summary,
+          steps: ev.steps ?? [],
+          risks: ev.risks ?? [],
+          validation: ev.validation ?? [],
+          version: ev.version,
+        },
+      };
+    case "goal_phase": {
+      const msg = ev.message
+        ? `Goal ${ev.from} → ${ev.to}: ${ev.message}`
+        : `Goal ${ev.from} → ${ev.to}`;
+      return {
+        ...state,
+        toasts: pushToast(state.toasts, "info", msg),
+      };
+    }
 
     default:
       return state;

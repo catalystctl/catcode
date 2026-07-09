@@ -20,7 +20,7 @@ pub fn classify(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
         | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
-        | "memory" => ToolKind::ReadOnly,
+        | "memory" | "goal_write_plan" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
         "workspace_activity" => ToolKind::ReadOnly,
@@ -363,6 +363,39 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "goal_write_plan",
+                "description": "GOAL MODE ONLY. Submit a structured multi-subagent deployment plan for the active /goal. Call exactly once during the planning turn. Each step becomes a subagent prompt that the harness deploys under the goal's concurrency and model/provider caps.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string", "description": "short plan summary" },
+                        "steps": {
+                            "type": "array",
+                            "description": "ordered deploy steps; use depends_on for sequencing and parallel_group for concurrent batches",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "agent": { "type": "string", "description": "scout|researcher|planner|worker|reviewer|context-builder|oracle|delegate|custom" },
+                                    "title": { "type": "string" },
+                                    "task": { "type": "string", "description": "full self-contained prompt for the subagent" },
+                                    "model": { "type": "string", "description": "optional model override (must be on the goal allowlist)" },
+                                    "depends_on": { "type": "array", "items": { "type": "string" } },
+                                    "parallel_group": { "type": "string" }
+                                },
+                                "required": ["agent", "task"]
+                            }
+                        },
+                        "risks": { "type": "array", "items": { "type": "string" } },
+                        "validation": { "type": "array", "items": { "type": "string" }, "description": "how to know the goal succeeded" }
+                    },
+                    "required": ["summary", "steps"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "finish",
                 "description": "Signal that the task is complete. Call this when you have finished the user's request and verified your work; it exits the agentic loop cleanly.",
                 "parameters": { "type": "object", "properties": {} }
@@ -631,6 +664,9 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_add" => git_add(args, cfg),
         "git_commit" => git_commit(args, cfg),
         "memory" => memory_tool(args, cfg),
+        "goal_write_plan" => Outcome::err(
+            "goal_write_plan must be dispatched through handle_goal_write_plan (async, goal mode only)",
+        ),
         "bash" => Outcome::err("bash must be dispatched through execute_bash (async)"),
         "bulk" => Outcome::err("bulk must be dispatched through execute_bulk (async)"),
         other => Outcome::err(format!("unknown tool: {other}")),

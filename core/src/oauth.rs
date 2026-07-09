@@ -38,9 +38,14 @@
 //!    page and `/oauth-code`, so no port forwarding is required. Uses Claude
 //!    Code's public client_id, authorize/token endpoints, scopes, JSON token
 //!    exchange, and `oauth-2025-04-20` API beta header.
+//!  - xAI Grok: **OAuth 2.0 device-code** against `auth.x.ai` (same public
+//!    client + scopes Hermes / Grok CLI use). SuperGrok or X Premium+ only —
+//!    no `XAI_API_KEY` path. Works on local machines and over SSH/headless
+//!    (prints verification URL + user code; polls until approved). Tokens
+//!    refresh automatically against `https://auth.x.ai/oauth2/token`.
 //!
 //! Tokens from `/login` are stored at `~/.gemini/oauth_creds.json` (Google,
-//! 0600) or `~/.config/catalyst-code/oauth/<id>.json` (OpenAI/Claude, 0600)
+//! 0600) or `~/.config/catalyst-code/oauth/<id>.json` (OpenAI/Claude/xAI, 0600)
 //! and refreshed in place. OpenAI/Codex deliberately does NOT reuse the
 //! official Codex CLI's `~/.codex/auth.json`; use this app's OAuth flow so the
 //! selected account/subscription is explicit.
@@ -145,6 +150,18 @@ const CLAUDE_SCOPES: &[&str] = &[
 fn claude_scope_string() -> String {
     CLAUDE_SCOPES.join(" ")
 }
+
+// --- xAI (Grok SuperGrok / X Premium+) constants ------------------------------
+// Public OAuth client used by Hermes Agent and the Grok CLI for SuperGrok /
+// X Premium+ subscription access (no XAI_API_KEY). Verified against
+// hermes_cli/auth.py and live OIDC discovery at auth.x.ai.
+const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+/// xAI access tokens are short-lived (~6h). Refresh up to an hour early so
+/// idle sessions don't hit a 401 on the next turn.
+const XAI_REFRESH_SKEW_SECS: u64 = 3600;
 
 /// A prompt shown to the user during an interactive OAuth login. Emitted as an
 /// `oauth_prompt` event by the core handler.
@@ -275,6 +292,12 @@ pub fn has_codex_creds() -> bool {
     codex_auth_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// True when an xAI SuperGrok OAuth token file exists
+/// (`~/.config/catalyst-code/oauth/xai.json`).
+pub fn has_xai_creds() -> bool {
+    stored_token_path("xai").map(|p| p.exists()).unwrap_or(false)
+}
+
 /// Delete the OAuth credential files that our `/login` flow created for a
 /// provider, so `/logout` fully clears the credentials (not just the provider
 /// config + runtime key). Without this, `has_*_creds()` still returns true
@@ -313,6 +336,9 @@ pub fn clear_oauth_creds(preset_id: &str) {
         }
         "openai" => {
             try_remove(codex_auth_path());
+        }
+        "xai" => {
+            try_remove(stored_token_path("xai"));
         }
         _ => {}
     }
@@ -633,6 +659,43 @@ async fn refresh_codex_token(client: &reqwest::Client, tok: &OAuthToken) -> Opti
     }
     let new_id = v.get("id_token").and_then(|t| t.as_str());
     write_codex_auth(&updated, new_id);
+    Some(access)
+}
+
+/// Refresh an xAI SuperGrok OAuth access token. Form-urlencoded body matching
+/// Hermes / the xAI token endpoint (`grant_type=refresh_token`, `client_id`,
+/// `refresh_token`). None on any failure (caller surfaces re-auth).
+async fn refresh_xai_token(client: &reqwest::Client, tok: &OAuthToken) -> Option<String> {
+    let refresh_token = tok.refresh_token.as_ref()?.clone();
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("client_id", XAI_CLIENT_ID),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    let resp = client
+        .post(XAI_TOKEN_URL)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    let access = v.get("access_token").and_then(|t| t.as_str())?.to_string();
+    let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(21600);
+    let mut updated = tok.clone();
+    updated.access_token = access.clone();
+    updated.expires_at = now_secs().saturating_add(expires_in);
+    updated.client_id = Some(XAI_CLIENT_ID.to_string());
+    if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str()) {
+        updated.refresh_token = Some(rt.to_string());
+    }
+    if let Some(id) = v.get("id_token").and_then(|t| t.as_str()) {
+        updated.id_token = Some(id.to_string());
+    }
+    let _ = store_token("xai", &updated);
     Some(access)
 }
 
@@ -980,6 +1043,30 @@ pub async fn codex_token(client: &reqwest::Client) -> Option<String> {
     None
 }
 
+/// Resolve an xAI SuperGrok OAuth access token from
+/// `~/.config/catalyst-code/oauth/xai.json`, refreshing proactively (up to
+/// [`XAI_REFRESH_SKEW_SECS`] early) when a refresh_token is present.
+pub async fn xai_token(client: &reqwest::Client) -> Option<String> {
+    let tok = read_stored_token("xai")?;
+    if tok.access_token.is_empty() {
+        return None;
+    }
+    let near_expiry = tok.expires_at != 0
+        && tok.expires_at <= now_secs().saturating_add(XAI_REFRESH_SKEW_SECS);
+    if !near_expiry {
+        return Some(tok.access_token);
+    }
+    if let Some(refreshed) = refresh_xai_token(client, &tok).await {
+        return Some(refreshed);
+    }
+    // Refresh failed — still try the existing access token if it hasn't fully
+    // expired (skew window only). Otherwise force re-login.
+    if tok.expires_at == 0 || tok.expires_at > now_secs() + 30 {
+        return Some(tok.access_token);
+    }
+    None
+}
+
 /// Fill in a subscription OAuth token for `rp` when it has no API key. An
 /// explicit API key always wins (manual override / env). Returns `rp` unchanged
 /// (still keyless) when no token is available — callers fall back to the API-key
@@ -1033,6 +1120,13 @@ pub async fn enrich_oauth(
                 // which proxies Gemini requests for personal Google accounts.
                 // Route all turns through the Code Assist API when using OAuth.
                 rp.base_url = CODE_ASSIST_BASE_URL.to_string();
+            }
+        }
+        _ if crate::provider::is_xai_endpoint(&rp.base_url) || rp.name == "xai" => {
+            // SuperGrok / X Premium+ subscription token only (no XAI_API_KEY).
+            if let Some(t) = xai_token(client).await {
+                rp.api_key = Some(t);
+                rp.oauth = true;
             }
         }
         _ => {}
@@ -1381,7 +1475,7 @@ pub fn likely_headless() -> bool {
 ///    port forwarding.
 pub async fn google_login(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<LoginOutcome, String> {
     if likely_headless() {
         return google_login_manual(emit);
@@ -1396,7 +1490,7 @@ pub async fn google_login(
 /// out-of-band page that displays the code to copy) + PKCE. Emits the URL;
 /// returns `AwaitingCode` with the stashed verifier. `complete_oauth` finishes
 /// the exchange once the user pastes the code.
-fn google_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, String> {
+fn google_login_manual(emit: &(dyn Fn(OAuthPrompt) + Send + Sync)) -> Result<LoginOutcome, String> {
     let verifier = random_b64url(96); // 128 chars (matches gemini-cli's verifier length)
     let challenge = pkce_challenge(&verifier);
     let state = random_hex(32); // 64 hex chars
@@ -1557,7 +1651,7 @@ fn hex_val(b: u8) -> Option<u8> {
 /// flow (`google_login_manual`) over SSH.
 async fn google_login_web(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<OAuthToken, String> {
     let (listener, port) = bind_callback().await?;
     // redirect_uri sent to Google always uses the 127.0.0.1 loopback literal
@@ -1644,7 +1738,7 @@ async fn google_login_web(
 /// is required.
 pub async fn claude_login(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<LoginOutcome, String> {
     if likely_headless() {
         return claude_login_manual(emit);
@@ -1676,7 +1770,7 @@ fn claude_authorize_url(challenge: &str, state: &str, redirect_uri: &str) -> Str
     format!("{CLAUDE_AUTHORIZE_URL}?{query}")
 }
 
-fn claude_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, String> {
+fn claude_login_manual(emit: &(dyn Fn(OAuthPrompt) + Send + Sync)) -> Result<LoginOutcome, String> {
     let verifier = random_b64url(48);
     let challenge = pkce_challenge(&verifier);
     let state = random_b64url(32);
@@ -1700,7 +1794,7 @@ fn claude_login_manual(emit: &dyn Fn(OAuthPrompt)) -> Result<LoginOutcome, Strin
 
 async fn claude_login_web(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<OAuthToken, String> {
     let verifier = random_b64url(48);
     let challenge = pkce_challenge(&verifier);
@@ -1853,7 +1947,7 @@ where
 
 async fn codex_device_login(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<OAuthToken, String> {
     let base = "https://auth.openai.com/api/accounts";
     let uc: CodexDeviceUserCode = client
@@ -1920,7 +2014,7 @@ async fn codex_device_login(
 
 pub async fn codex_login(
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<LoginOutcome, String> {
     if likely_headless() {
         return codex_device_login(client, emit)
@@ -2056,7 +2150,7 @@ async fn exchange_codex_code(
 
 /// Which presets support an interactive OAuth login flow here.
 pub fn supports_login(preset_id: &str) -> bool {
-    matches!(preset_id, "openai" | "gemini" | "anthropic")
+    matches!(preset_id, "openai" | "gemini" | "anthropic" | "xai")
 }
 
 /// Drive the interactive OAuth login for a preset. For the web flow this
@@ -2064,17 +2158,240 @@ pub fn supports_login(preset_id: &str) -> bool {
 /// no-browser flow (Google over SSH/headless) it emits the URL and returns
 /// `LoginOutcome::AwaitingCode`; the caller stashes the `pending` state and
 /// the user submits the code via the `oauth_code` command, which calls
-/// `complete_oauth`.
+/// `complete_oauth`. xAI always uses device-code and completes in-process
+/// (no paste step).
 pub async fn login(
     preset_id: &str,
     client: &reqwest::Client,
-    emit: &dyn Fn(OAuthPrompt),
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<LoginOutcome, String> {
     match preset_id {
         "openai" => codex_login(client, emit).await,
         "gemini" => google_login(client, emit).await,
         "anthropic" => claude_login(client, emit).await,
+        "xai" => xai_login(client, emit).await,
         other => Err(format!("'{other}' has no OAuth login flow yet")),
+    }
+}
+
+/// xAI SuperGrok / X Premium+ device-code login (RFC 8628).
+///
+/// 1. POST `auth.x.ai/oauth2/device/code` with the public Grok-CLI client_id.
+/// 2. Emit verification URL + user code (and open the browser when possible).
+/// 3. Poll `auth.x.ai/oauth2/token` with `grant_type=device_code` until approved.
+/// 4. Persist tokens to `~/.config/catalyst-code/oauth/xai.json`.
+///
+/// Works over SSH/headless without port forwarding — the user opens the URL on
+/// any device. Completes when xAI reports approval (`LoginOutcome::Done`).
+/// Progress prompts are re-emitted every ~15s so a headless session does not
+/// look stuck while waiting for browser approval.
+pub async fn xai_login(
+    client: &reqwest::Client,
+    emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
+) -> Result<LoginOutcome, String> {
+    let resp = client
+        .post(XAI_DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("client_id", XAI_CLIENT_ID),
+            ("scope", XAI_SCOPE),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("xAI device-code request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "xAI device-code request failed (HTTP {status}): {body}"
+        ));
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("xAI device-code parse failed: {e}"))?;
+    let device_code = data
+        .get("device_code")
+        .and_then(|v| v.as_str())
+        .ok_or("xAI device-code response missing device_code")?
+        .to_string();
+    let user_code = data
+        .get("user_code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let verification_url = data
+        .get("verification_uri_complete")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("verification_uri").and_then(|v| v.as_str()))
+        .unwrap_or("https://accounts.x.ai/oauth2/device")
+        .to_string();
+    let expires_in = data
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1800);
+    let interval = data
+        .get("interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .max(1);
+
+    let headless = likely_headless()
+        || std::env::var("DISPLAY").ok().filter(|s| !s.is_empty()).is_none()
+            && std::env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none();
+
+    let code_opt = if user_code.is_empty() {
+        None
+    } else {
+        Some(user_code.clone())
+    };
+    let code_hint = if user_code.is_empty() {
+        String::new()
+    } else {
+        format!(" If prompted, enter code: {user_code}.")
+    };
+    let open_hint = if headless {
+        "This machine has no graphical browser — paste the URL on your laptop (it was copied to your clipboard if your terminal supports OSC 52)."
+    } else {
+        "Opening your browser if possible — if nothing opens, paste the URL manually."
+    };
+    let initial_msg = format!(
+        "xAI SuperGrok OAuth: open the URL below, sign in, and APPROVE access.{code_hint} {open_hint} Waiting for approval (auto-completes within a few seconds after you approve; polls every {interval}s, expires in {expires_in}s)…"
+    );
+    emit(OAuthPrompt {
+        url: verification_url.clone(),
+        code: code_opt.clone(),
+        message: initial_msg,
+    });
+    if !headless {
+        if let Err(e) = open_browser(&verification_url) {
+            emit(OAuthPrompt {
+                url: verification_url.clone(),
+                code: code_opt.clone(),
+                message: format!(
+                    "Could not open a browser automatically ({e}). Paste this URL on any device and approve:{code_hint}"
+                ),
+            });
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(expires_in);
+    let mut current_interval = interval;
+    let mut last_progress = Instant::now();
+    let started = Instant::now();
+    // Poll immediately, then sleep on authorization_pending. After the user
+    // clicks Approve in the browser, the next poll (≤ interval) completes.
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "Timed out waiting for xAI device authorization. Open the verification URL, click Approve, then run /login again."
+                    .to_string(),
+            );
+        }
+        let poll = client
+            .post(XAI_TOKEN_URL)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:device_code",
+                ),
+                ("client_id", XAI_CLIENT_ID),
+                ("device_code", device_code.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("xAI device-code poll failed: {e}"))?;
+
+        let status = poll.status();
+        let body: Value = poll.json().await.unwrap_or(Value::Null);
+
+        if status.is_success() {
+            let access = body
+                .get("access_token")
+                .and_then(|t| t.as_str())
+                .ok_or("xAI token response missing access_token")?
+                .to_string();
+            let refresh = body
+                .get("refresh_token")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+                .ok_or(
+                    "xAI token response missing refresh_token — re-run /login and fully Approve in the browser",
+                )?;
+            let expires_in_tok = body
+                .get("expires_in")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(21600);
+            let id_token = body
+                .get("id_token")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            let tok = OAuthToken {
+                access_token: access,
+                refresh_token: Some(refresh),
+                expires_at: now_secs().saturating_add(expires_in_tok),
+                client_id: Some(XAI_CLIENT_ID.to_string()),
+                client_secret: None,
+                kind: "xai".to_string(),
+                id_token,
+            };
+            store_token("xai", &tok)
+                .ok_or("could not write xAI OAuth credentials to disk")?;
+            return Ok(LoginOutcome::Done);
+        }
+
+        // Pending / slow_down / errors. xAI returns authorization_pending as
+        // a non-2xx body with {"error":"authorization_pending",...}.
+        let err = body
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        match err {
+            "authorization_pending" | "slow_down" => {
+                if err == "slow_down" {
+                    current_interval = (current_interval + 1).min(30);
+                }
+                // Heartbeat so a 30s wait doesn't look hung — especially over
+                // SSH where no browser ever pops open on this machine.
+                if last_progress.elapsed() >= Duration::from_secs(15) {
+                    let elapsed = started.elapsed().as_secs();
+                    let left = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs();
+                    emit(OAuthPrompt {
+                        url: verification_url.clone(),
+                        code: code_opt.clone(),
+                        message: format!(
+                            "Still waiting for xAI approval… ({elapsed}s elapsed, ~{left}s left). Open the URL, sign in with SuperGrok / X Premium+, and click Approve — login finishes automatically after that.{code_hint}"
+                        ),
+                    });
+                    last_progress = Instant::now();
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(remaining.min(Duration::from_secs(current_interval)))
+                    .await;
+                continue;
+            }
+            other if other.is_empty() => {
+                // Non-JSON or unexpected body — don't hang forever; surface it.
+                return Err(format!(
+                    "xAI device-code token polling failed (HTTP {status}): {body}"
+                ));
+            }
+            other => {
+                let desc = body
+                    .get("error_description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or(other);
+                return Err(format!("xAI device-code token polling failed: {desc}"));
+            }
+        }
     }
 }
 
@@ -2139,6 +2456,17 @@ mod tests {
              https://www.googleapis.com/auth/userinfo.email \
              https://www.googleapis.com/auth/userinfo.profile"
         );
+    }
+
+    #[test]
+    fn xai_constants_match_hermes() {
+        assert_eq!(XAI_CLIENT_ID, "b1a00492-073a-47ea-816f-4c329264a828");
+        assert_eq!(XAI_DEVICE_CODE_URL, "https://auth.x.ai/oauth2/device/code");
+        assert_eq!(XAI_TOKEN_URL, "https://auth.x.ai/oauth2/token");
+        assert!(XAI_SCOPE.contains("offline_access"));
+        assert!(XAI_SCOPE.contains("grok-cli:access"));
+        assert!(XAI_SCOPE.contains("api:access"));
+        assert_eq!(XAI_REFRESH_SKEW_SECS, 3600);
     }
 
     #[test]

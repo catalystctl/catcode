@@ -1346,6 +1346,7 @@ async fn run_agent_inner(
             &models_registry,
             cancel,
             &mut timer,
+            Some(st),
         )
         .await
         {
@@ -1846,7 +1847,7 @@ fn resolve_model_candidates(
     agent: &AgentConfig,
     parent_model: &str,
     override_model: Option<String>,
-    _st: &Arc<State>,
+    st: &Arc<State>,
 ) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
     if let Some(m) = override_model {
@@ -1865,11 +1866,42 @@ fn resolve_model_candidates(
     // be valid ids the registry didn't list); just dedup preserving order.
     let mut seen = std::collections::HashSet::new();
     cands.retain(|c| seen.insert(c.clone()));
+
+    // Goal-mode allowlists: filter candidates by allowed models/providers when
+    // an active goal is constraining the run. Falls back to parent_model (or
+    // first allowed model) if everything was filtered out.
+    if let Ok(g) = st.goal.try_lock() {
+        if g.is_active()
+            && (!g.allowed_models.is_empty() || !g.allowed_providers.is_empty())
+        {
+            let model_providers: std::collections::HashMap<String, String> = st
+                .models
+                .try_read()
+                .map(|reg| {
+                    reg.iter()
+                        .map(|m| (m.id.clone(), m.provider.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let filtered = crate::goal::filter_model_candidates(&cands, &g, &model_providers);
+            if !filtered.is_empty() {
+                return filtered;
+            }
+            if let Some(m) = g.allowed_models.first() {
+                return vec![m.clone()];
+            }
+            return vec![parent_model.to_string()];
+        }
+    }
     cands
 }
 
 /// stream_turn with model fallback: try each candidate in order until one
 /// succeeds (or all fail). Aborted errors are not retried.
+///
+/// When `st` is provided, each candidate resolves its own provider via
+/// `resolve_provider_for_model` so multi-provider goal allowlists work. Falls
+/// back to the parent `provider` clone when resolution isn't available.
 async fn stream_with_fallback(
     client: &reqwest::Client,
     cfg: &Config,
@@ -1882,6 +1914,7 @@ async fn stream_with_fallback(
     models: &[ModelInfo],
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
+    st: Option<&Arc<State>>,
 ) -> Result<(Message, String, u64, u64, u64, String), String> {
     let mut last_err = String::from("no model candidates");
     for (i, model) in candidates.iter().enumerate() {
@@ -1899,9 +1932,18 @@ async fn stream_with_fallback(
             .find(|m| m.id == *model)
             .map(|m| m.max_tokens)
             .unwrap_or(8_192);
+        // Multi-provider: route each candidate to its owning endpoint when we
+        // have State; otherwise keep the inherited parent provider.
+        let resolved;
+        let use_provider = if let Some(st) = st {
+            resolved = st.resolve_provider_for_model(model).await;
+            &resolved
+        } else {
+            provider
+        };
         match crate::provider::stream_turn(
             client,
-            provider,
+            use_provider,
             cfg.idle_timeout_secs,
             model,
             messages,
