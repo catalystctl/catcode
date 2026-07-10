@@ -316,24 +316,24 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		return roleLine("▹", "result", "", c.success) + "\n" +
 			renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w, "lines", false)
 	case blkSuccess:
-		return successStyle.Render("✓ ") + baseStyle.Render(b.text.String())
+		return renderStatusLine("✓ ", successStyle, baseStyle, b.text.String(), w)
 	case blkWarn:
-		return warnStyle.Render("! ") + baseStyle.Render(b.text.String())
+		return renderStatusLine("! ", warnStyle, baseStyle, b.text.String(), w)
 	case blkError:
 		// Multi-line errors (core crashes, stack traces) get a red rule panel so
 		// real failures stand out from the success/info toasts around them.
 		text := strings.TrimSpace(b.text.String())
 		if strings.Contains(text, "\n") {
 			parts := strings.SplitN(text, "\n", 2)
-			head := errStyle.Render("✗ ") + baseStyle.Render(parts[0])
+			head := renderStatusLine("✗ ", errStyle, baseStyle, parts[0], w)
 			if len(parts) > 1 {
 				head += "\n" + panelLines(parts[1], w, errRuleStyle, errOutStyle)
 			}
 			return head
 		}
-		return errStyle.Render("✗ ") + baseStyle.Render(text)
+		return renderStatusLine("✗ ", errStyle, baseStyle, text, w)
 	case blkInfo:
-		return mutedStyle.Render("· ") + mutedStyle.Render(b.text.String())
+		return renderStatusLine("· ", mutedStyle, mutedStyle, b.text.String(), w)
 	case blkApprove:
 		// compact history marker; the live decision is the sticky banner. Reuses
 		// the per-tool head grammar so the marker names the target, not a JSON blob.
@@ -351,6 +351,36 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		return b.text.String()
 	}
 	return ""
+}
+
+// renderStatusLine renders a toast-style status line (info/success/warn/error)
+// with a 2-cell prefix, word-wrapping the body to the terminal width so long
+// plugin descriptions / error messages aren't clipped mid-sentence.
+func renderStatusLine(prefix string, prefixStyle, bodyStyle lipgloss.Style, text string, w int) string {
+	const prefixCells = 2 // "✓ ", "· ", "! ", "✗ "
+	avail := w - prefixCells
+	if avail < 8 {
+		avail = 8
+	}
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		return prefixStyle.Render(prefix)
+	}
+	lines := strings.Split(wrapPlain(text, avail), "\n")
+	var b strings.Builder
+	pad := strings.Repeat(" ", prefixCells)
+	for i, ln := range lines {
+		if i == 0 {
+			b.WriteString(prefixStyle.Render(prefix))
+		} else {
+			b.WriteString(pad)
+		}
+		b.WriteString(bodyStyle.Render(ln))
+		if i < len(lines)-1 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 // renderToolBlock dispatches to a per-tool renderer so each call gets a layout

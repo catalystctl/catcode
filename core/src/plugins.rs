@@ -41,9 +41,22 @@ session lifecycle events to inspect, approve, modify, or log operations.
 Install from a **local directory** or a **GitHub Release**:
 
 - Local: `/plugin-install /path/to/plugin-dir`
+- Local (this repo only): `/plugin-install /path/to/plugin-dir workspace`
 - GitHub (latest release): `/plugin-install https://github.com/owner/repo`
 - GitHub (pinned release): `/plugin-install https://github.com/owner/repo@v1.2.0`
 - Shorthand: `/plugin-install owner/repo@v1.2.0`
+- Scope flags: append `global` (default) or `workspace`, or use `--global` / `--workspace`
+
+**Install scope**
+
+| Scope | Destination | Loads when |
+|-------|-------------|------------|
+| `global` (default) | `~/.catalyst-code/plugins/<name>/` | Every workspace, always |
+| `workspace` | `<repo>/.catalyst-code/plugins/<name>/` | This repo only (user installs load without `--trust-project-plugins`) |
+
+Prefer **global** for personal plugins (memory backends, OAuth, vision handoff).
+Use **workspace** when the plugin should stay repo-local. Repo-shipped plugins
+(without the user-install marker) still need `--trust-project-plugins` to load.
 
 **Prefer GitHub Releases for distribution.** Tag a release so the install
 downloads that release's source `.zip` (via the GitHub API `zipball_url`).
@@ -301,6 +314,51 @@ behavior — without recompiling. Five mechanisms cover the full surface:
 | **MODIFY tool output** | `post_*`/`post_tool` `modify` | Replace the result text / flip success / change the diff after execution. |
 | **MODIFY the model** | `pre_turn` `modify.model` | Remap the turn's model (advisory). |
 | **ADD to the system prompt** | `system_prompt` field | Static text appended to the system prompt. |
+| **REPLACE the memory store** | `memory_provider` block | Replaces standing-prompt injection, slash `/remember`/`/memory`/`/forget`, compaction extract, and (unless a tool `override`s `memory`) the built-in `memory` tool. Only one enabled provider should be active. |
+
+#### `memory_provider` — replace the memory backend
+
+A plugin can replace the built-in markdown memory store with an external
+engine (vector DB, Engraphis, remote API, …). Declare a single script that
+handles all memory actions, same pattern as `oauth`:
+
+```json
+{
+  "name": "engraphis-memory",
+  "version": "1.0.0",
+  "memory_provider": {
+    "script": "memory/provider.py",
+    "timeout_ms": 30000
+  }
+}
+```
+
+Fields:
+- `script` (required): path relative to the plugin directory
+- `timeout_ms` (optional, default 30000): hard timeout per action
+
+**Action contract** — stdin is one JSON object; stdout is one JSON object.
+
+Base context always includes `action`, `workspace`, `session_id`, `timestamp`.
+Action-specific fields live under `args`.
+
+| action | args | success response |
+|--------|------|------------------|
+| `inject` | optional `query` | `{ "ok": true, "injection": "…" }` (empty string = no memories) |
+| `save` | `name`, `content`, optional `type`, `description`, `scope` | `{ "ok": true, "output": "…", "id": "…" }` |
+| `append` | same as save | same |
+| `list` | optional `scope` | `{ "ok": true, "output": "…", "entries": […] }` |
+| `forget` | `id`, optional `scope` | `{ "ok": true, "output": "…" }` |
+| `compact_append` | `content`, optional `name`, `cap_bytes` | `{ "ok": true, "output": "…" }` |
+
+On failure return `{ "ok": false, "output": "reason" }` (or `{ "error": "…" }`).
+`inject` failures are soft — the core uses an empty injection and continues.
+Write failures surface to the model / slash-command caller.
+
+When a `memory_provider` is loaded, the core skips the markdown store for
+injection, slash memory commands, and compaction extracts. The self-learning
+auto-reflect loop still calls the `memory` tool — those writes go to the
+provider (or to a plugin `memory` tool with `override: true` if declared).
 
 #### `disable_tools` — remove a capability
 
@@ -564,6 +622,19 @@ struct PluginManifest {
     /// token resolution), mirroring the built-in OpenAI/Claude/Gemini OAuth.
     #[serde(default)]
     oauth: Option<OauthManifestEntry>,
+    /// Optional memory backend that replaces the built-in markdown store for
+    /// standing-prompt injection, slash memory commands, compaction extracts,
+    /// and (when no tool overrides `memory`) the built-in `memory` tool.
+    #[serde(default)]
+    memory_provider: Option<MemoryProviderManifestEntry>,
+}
+
+/// A memory-provider declaration in `plugin.json` (`memory_provider` block).
+#[derive(Deserialize, Debug, Clone)]
+struct MemoryProviderManifestEntry {
+    script: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -671,6 +742,20 @@ pub struct Plugin {
     pub system_prompt: String,
     /// OAuth subscription provider this plugin declares, if any.
     pub oauth: Option<PluginOauthConfig>,
+    /// Memory backend that replaces the built-in markdown store, if any.
+    pub memory_provider: Option<PluginMemoryProviderConfig>,
+}
+
+/// A loaded memory-provider declaration (`memory_provider` block with the
+/// script resolved to an absolute, path-confined, executable file).
+#[derive(Clone, Debug)]
+pub struct PluginMemoryProviderConfig {
+    /// Plugin that owns this provider (for logging / framing).
+    pub plugin_name: String,
+    /// Absolute path to the provider script.
+    pub script: PathBuf,
+    /// Hard timeout in milliseconds per action.
+    pub timeout_ms: u64,
 }
 
 /// Configuration for one hook within a plugin.
@@ -754,6 +839,34 @@ pub struct HookResult {
 
 // ---- PluginManager ----
 
+/// Where `/plugin-install` copies a plugin on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginInstallScope {
+    /// `~/.catalyst-code/plugins` — available in every workspace.
+    Global,
+    /// `<workspace>/.catalyst-code/plugins` — this repo only.
+    Workspace,
+}
+
+impl PluginInstallScope {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_lowercase().as_str() {
+            "" | "global" | "user" | "g" | "-g" | "--global" => Ok(Self::Global),
+            "workspace" | "project" | "local" | "w" | "-w" | "--workspace" => Ok(Self::Workspace),
+            other => Err(format!(
+                "unknown plugin scope '{other}' (use 'global' or 'workspace')"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
 /// Manages the lifecycle of all installed plugins.
 /// Holds an in-memory registry behind a `RwLock`.
 pub struct PluginManager {
@@ -781,6 +894,17 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
+    /// Resolve a possibly-relative project plugins dir against `workspace`.
+    /// Keeps install + scan on the same absolute path regardless of process cwd
+    /// (the TUI passes `--workspace .` but cwd can still drift across restarts).
+    fn resolve_plugins_dir(plugins_dir: PathBuf, workspace: &Path) -> PathBuf {
+        if plugins_dir.is_absolute() {
+            plugins_dir
+        } else {
+            workspace.join(plugins_dir)
+        }
+    }
+
     /// Create a new manager and scan/load all plugins from `plugins_dir` only
     /// (the project plugins dir). This is the **isolated** constructor used by
     /// tests; it does NOT scan the global `~/.catalyst-code/plugins` dir, so
@@ -789,6 +913,7 @@ impl PluginManager {
     /// Production code should use [`PluginManager::new_with_global_plugins`]
     /// instead, which also loads globally-staged plugins.
     pub fn new(plugins_dir: PathBuf, workspace: PathBuf, trust_project: bool) -> Self {
+        let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir: None,
@@ -812,6 +937,7 @@ impl PluginManager {
         workspace: PathBuf,
         trust_project: bool,
     ) -> Self {
+        let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
         let user_plugins_dir = crate::config::home_dir().map(|h| h.join(".catalyst-code/plugins"));
         let mgr = PluginManager {
             plugins_dir,
@@ -836,6 +962,7 @@ impl PluginManager {
         workspace: PathBuf,
         trust_project: bool,
     ) -> Self {
+        let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir,
@@ -936,7 +1063,8 @@ impl PluginManager {
             // project config file, so a repo can't self-enable.
             let canon_plugin = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let is_project = canon_plugin.starts_with(canon_ws);
-            if is_project && !self.trust_project {
+            let user_installed = path.join(PLUGIN_USER_INSTALLED_MARKER).is_file();
+            if is_project && !self.trust_project && !user_installed {
                 let name = std::fs::read_to_string(&manifest_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -948,7 +1076,7 @@ impl PluginManager {
                             .unwrap_or_default()
                     });
                 eprintln!(
-                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / CATALYST_CODE_TRUST_PROJECT_PLUGINS=1 to enable"
+                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / CATALYST_CODE_TRUST_PROJECT_PLUGINS=1 to enable, or reinstall with `/plugin-install … workspace`"
                 );
                 skipped.push(name);
                 continue;
@@ -1093,6 +1221,22 @@ impl PluginManager {
             None => None,
         };
 
+        // --- plugin-declared memory provider (replace markdown store) ---
+        let memory_provider = match manifest.memory_provider {
+            Some(entry) => {
+                if entry.script.trim().is_empty() {
+                    return Err("memory_provider.script is empty".into());
+                }
+                let script = validate_plugin_script(&canon_dir, &entry.script)?;
+                Some(PluginMemoryProviderConfig {
+                    plugin_name: manifest.name.clone(),
+                    script,
+                    timeout_ms: entry.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS),
+                })
+            }
+            None => None,
+        };
+
         Ok(Plugin {
             name: manifest.name,
             version: manifest.version,
@@ -1104,10 +1248,42 @@ impl PluginManager {
             disable_tools: manifest.disable_tools,
             system_prompt: manifest.system_prompt,
             oauth: oauth_config,
+            memory_provider,
         })
     }
 
-    /// Install a plugin from a local directory path OR a GitHub Release URL.
+    /// Resolve the on-disk directory for a given install scope.
+    pub fn install_dir_for(&self, scope: PluginInstallScope) -> Result<PathBuf, String> {
+        match scope {
+            PluginInstallScope::Global => self
+                .user_plugins_dir
+                .clone()
+                .ok_or_else(|| {
+                    "global plugin install unavailable (no ~/.catalyst-code/plugins)".into()
+                }),
+            // `plugins_dir` is absolute (resolved against workspace at construct).
+            PluginInstallScope::Workspace => Ok(self.plugins_dir.clone()),
+        }
+    }
+
+    /// Classify an installed plugin path as global vs workspace.
+    pub fn scope_of_path(&self, path: &Path) -> PluginInstallScope {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canon_ws =
+            std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
+        if canon.starts_with(&canon_ws) {
+            PluginInstallScope::Workspace
+        } else {
+            PluginInstallScope::Global
+        }
+    }
+
+    /// True when workspace-scoped plugins will actually load (trust opt-in).
+    pub fn trust_project(&self) -> bool {
+        self.trust_project
+    }
+
+    /// Install from a local path or GitHub Release URL into the given scope.
     ///
     /// GitHub sources download the release source `.zip` (latest, or a pinned
     /// tag) so installs are versioned and can later be auto-updated by
@@ -1117,7 +1293,11 @@ impl PluginManager {
     /// An existing local directory with `plugin.json` always wins over
     /// `owner/repo` shorthand, so relative paths like `./plugins/foo` stay
     /// unambiguous.
-    pub async fn install_source(&self, source: &str) -> Result<Plugin, String> {
+    pub async fn install_source(
+        &self,
+        source: &str,
+        scope: PluginInstallScope,
+    ) -> Result<Plugin, String> {
         let source = source.trim();
         if source.is_empty() {
             return Err("plugin source is empty".into());
@@ -1132,12 +1312,12 @@ impl PluginManager {
                 .join(local)
         };
         if local_resolved.is_dir() && local_resolved.join("plugin.json").is_file() {
-            return self.install(local);
+            return self.install(&local_resolved, scope);
         }
 
         if let Some(gh) = parse_github_plugin_source(source) {
             let (plugin_dir, meta, tmp_root) = fetch_github_release_plugin(&gh).await?;
-            let result = self.install(&plugin_dir);
+            let result = self.install(&plugin_dir, scope);
             // Always clean the temp extract tree (install copies into managed dir).
             let _ = std::fs::remove_dir_all(&tmp_root);
             let installed = result?;
@@ -1149,14 +1329,14 @@ impl PluginManager {
             }
             return Ok(installed);
         }
-        self.install(local)
+        self.install(local, scope)
     }
 
     /// Install a plugin from `source_path` (a directory containing plugin.json).
-    /// The plugin directory is copied into the managed plugins directory and
+    /// The plugin directory is copied into the scoped plugins directory and
     /// registered. Returns an error if a plugin with the same name already exists
     /// or if validation fails.
-    pub fn install(&self, source_path: &Path) -> Result<Plugin, String> {
+    pub fn install(&self, source_path: &Path, scope: PluginInstallScope) -> Result<Plugin, String> {
         let source = if source_path.is_absolute() {
             source_path.to_path_buf()
         } else {
@@ -1186,16 +1366,29 @@ impl PluginManager {
             }
         }
 
-        let dest_dir = self.plugins_dir.join(&plugin.name);
+        let dest_root = self.install_dir_for(scope)?;
+        let _ = std::fs::create_dir_all(&dest_root);
+        let dest_dir = dest_root.join(&plugin.name);
         if dest_dir.exists() {
             let _ = std::fs::remove_dir_all(&dest_dir);
         }
 
         copy_dir(&source, &dest_dir)?;
 
+        // Any install that lands inside the workspace must carry the
+        // user-installed marker so scan loads it without --trust-project-plugins.
+        // (Repo-shipped plugins lack this marker and stay gated.)
+        if scope == PluginInstallScope::Workspace
+            || self.scope_of_path(&dest_dir) == PluginInstallScope::Workspace
+        {
+            write_user_installed_marker(&dest_dir);
+        }
+
         // Re-load from the copied location so paths point to the managed dir.
         let installed = Self::load_plugin_from_dir(&dest_dir)?;
 
+        // Always register: global always loads; workspace user-installs carry
+        // the marker so they load even without --trust-project-plugins.
         self.plugins
             .write()
             .unwrap()
@@ -1361,6 +1554,23 @@ impl PluginManager {
         } else {
             format!("\n\n## Plugin-injected context\n\n{}", parts.join("\n\n"))
         }
+    }
+
+    /// The active memory provider, if any enabled plugin declares one.
+    /// First enabled plugin that declares `memory_provider` wins — only one
+    /// provider should be active; later ones are ignored.
+    pub fn memory_provider(&self) -> Option<PluginMemoryProviderConfig> {
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .find_map(|p| p.memory_provider.clone())
+    }
+
+    /// True when an enabled plugin replaces the built-in markdown memory store.
+    pub fn has_memory_provider(&self) -> bool {
+        self.memory_provider().is_some()
     }
 
     // ---- OAuth provider declarations (subscription auth, no recompile) ----
@@ -2096,6 +2306,263 @@ pub async fn execute_plugin_tool(
     }
 }
 
+/// Result of a `memory_provider` script invocation.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryProviderResult {
+    pub ok: bool,
+    pub output: String,
+    pub injection: String,
+    pub id: String,
+    pub entries: Vec<Value>,
+}
+
+impl MemoryProviderResult {
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            output: msg.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Convert a write/list/forget result into a tool [`Outcome`].
+    pub fn into_outcome(self) -> Outcome {
+        if self.ok {
+            Outcome::ok(self.output)
+        } else {
+            Outcome::err(self.output)
+        }
+    }
+}
+
+/// Invoke a plugin memory-provider script with the given `action` and `args`.
+/// Used for standing-prompt injection, slash memory commands, compaction
+/// extracts, and (when no tool overrides `memory`) the built-in memory tool.
+pub async fn execute_memory_provider(
+    config: &PluginMemoryProviderConfig,
+    action: &str,
+    args: &Value,
+    workspace: &str,
+    session_id: &str,
+) -> MemoryProviderResult {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ctx = json!({
+        "action": action,
+        "args": args,
+        "workspace": workspace,
+        "session_id": session_id,
+        "timestamp": timestamp,
+    });
+    let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+
+    let mut cmd = hook_command(&config.script);
+    // Memory backends often need their own config (e.g. ENGRAPHIS_DB_PATH).
+    // Re-inject Engraphis-related env after hook_command's env_clear.
+    for key in [
+        "ENGRAPHIS_DB_PATH",
+        "ENGRAPHIS_EMBED_MODEL",
+        "ENGRAPHIS_EMBED_DIM",
+        "ENGRAPHIS_EXTRACTOR",
+        "ENGRAPHIS_WORKSPACES",
+        "PYTHONPATH",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+
+    let mut child = match cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return MemoryProviderResult::err(format!(
+                "memory_provider '{}' failed to spawn: {e}",
+                config.plugin_name
+            ))
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
+        let write_fut = async {
+            let _ = stdin.write_all(&ctx_bytes).await;
+            let _ = stdin.shutdown().await;
+        };
+        if tokio::time::timeout(stdin_timeout, write_fut)
+            .await
+            .is_err()
+        {
+            let _ = child.start_kill();
+            return MemoryProviderResult::err(format!(
+                "memory_provider '{}' did not consume stdin within {}ms",
+                config.plugin_name,
+                stdin_timeout.as_millis()
+            ));
+        }
+    }
+
+    let timeout_dur = Duration::from_millis(config.timeout_ms);
+    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return MemoryProviderResult::err(format!(
+                    "memory_provider '{}' exited with {}: {}",
+                    config.plugin_name,
+                    output.status,
+                    stderr.trim()
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                return MemoryProviderResult::err(format!(
+                    "memory_provider '{}' returned empty stdout",
+                    config.plugin_name
+                ));
+            }
+            parse_memory_provider_stdout(&stdout)
+        }
+        Ok(Err(e)) => MemoryProviderResult::err(format!(
+            "memory_provider '{}' wait error: {e}",
+            config.plugin_name
+        )),
+        Err(_) => MemoryProviderResult::err(format!(
+            "memory_provider '{}' timed out after {}ms",
+            config.plugin_name, config.timeout_ms
+        )),
+    }
+}
+
+/// Blocking variant for sync call sites (system-prompt build). Spawns a
+/// dedicated thread with its own current-thread tokio runtime so we never
+/// nest `block_on` on an existing runtime.
+pub fn execute_memory_provider_blocking(
+    config: &PluginMemoryProviderConfig,
+    action: &str,
+    args: &Value,
+    workspace: &str,
+    session_id: &str,
+) -> MemoryProviderResult {
+    let config = config.clone();
+    let action = action.to_string();
+    let args = args.clone();
+    let workspace = workspace.to_string();
+    let session_id = session_id.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(MemoryProviderResult::err(format!(
+                    "memory_provider runtime: {e}"
+                )));
+                return;
+            }
+        };
+        let result = rt.block_on(execute_memory_provider(
+            &config,
+            &action,
+            &args,
+            &workspace,
+            &session_id,
+        ));
+        let _ = tx.send(result);
+    });
+    match rx.recv() {
+        Ok(r) => {
+            let _ = handle.join();
+            r
+        }
+        Err(_) => {
+            let _ = handle.join();
+            MemoryProviderResult::err("memory_provider worker thread died")
+        }
+    }
+}
+
+/// Standing-prompt injection via the active memory provider. Soft-fails to
+/// an empty string so a broken provider never blocks a turn.
+pub fn memory_provider_inject(
+    config: &PluginMemoryProviderConfig,
+    workspace: &str,
+    query: &str,
+) -> String {
+    let args = if query.is_empty() {
+        json!({})
+    } else {
+        json!({ "query": query })
+    };
+    let result = execute_memory_provider_blocking(config, "inject", &args, workspace, "");
+    if result.ok {
+        result.injection
+    } else {
+        String::new()
+    }
+}
+
+fn parse_memory_provider_stdout(stdout: &str) -> MemoryProviderResult {
+    match serde_json::from_str::<Value>(stdout) {
+        Ok(v) if v.is_object() => {
+            if let Some(err) = v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return MemoryProviderResult::err(err.to_string());
+            }
+            let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+            let output = v
+                .get("output")
+                .or_else(|| v.get("result"))
+                .and_then(|o| o.as_str())
+                .unwrap_or("")
+                .to_string();
+            let injection = v
+                .get("injection")
+                .and_then(|o| o.as_str())
+                .unwrap_or("")
+                .to_string();
+            let id = v
+                .get("id")
+                .and_then(|o| o.as_str())
+                .unwrap_or("")
+                .to_string();
+            let entries = v
+                .get("entries")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let output = if output.is_empty() && !ok {
+                format!("memory_provider failed (action response had ok=false)")
+            } else {
+                output
+            };
+            MemoryProviderResult {
+                ok,
+                output,
+                injection,
+                id,
+                entries,
+            }
+        }
+        Ok(_) | Err(_) => MemoryProviderResult::err(format!(
+            "memory_provider returned non-JSON stdout: {}",
+            stdout.chars().take(200).collect::<String>()
+        )),
+    }
+}
+
 // ---- helpers ----
 
 /// Return the default timeout for a hook point.
@@ -2351,12 +2818,44 @@ fn hook_command(script: &Path) -> Command {
     if let Ok(v) = std::env::var("USER") {
         c.env("USER", v);
     }
+    // Memory-provider plugins (Engraphis, etc.) need their DB/embed config and
+    // optionally a custom PYTHONPATH. These are not API secrets.
+    for key in [
+        "ENGRAPHIS_DB_PATH",
+        "ENGRAPHIS_EMBED_MODEL",
+        "ENGRAPHIS_EMBED_DIM",
+        "ENGRAPHIS_EXTRACTOR",
+        "ENGRAPHIS_WORKSPACES",
+        "PYTHONPATH",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            c.env(key, v);
+        }
+    }
     c
 }
 
 /// Sidecar written next to an installed plugin so a future auto-updater can
 /// re-fetch the same GitHub Release source zip (or a newer tag).
 const PLUGIN_SOURCE_META_FILE: &str = ".catalyst-plugin-source.json";
+
+/// Written when the user installs a workspace-scoped plugin via
+/// `/plugin-install … workspace`. Scan loads these even without
+/// `--trust-project-plugins` (that flag only gates repo-shipped plugins).
+const PLUGIN_USER_INSTALLED_MARKER: &str = ".catalyst-plugin-user-installed";
+
+fn write_user_installed_marker(dest_dir: &Path) {
+    let marker = dest_dir.join(PLUGIN_USER_INSTALLED_MARKER);
+    if let Err(e) = std::fs::write(
+        &marker,
+        "{\"installed_by\":\"plugin-install\",\"scope\":\"workspace\"}\n",
+    ) {
+        eprintln!(
+            "[plugins] warning: could not write {}: {e}",
+            PLUGIN_USER_INSTALLED_MARKER
+        );
+    }
+}
 
 /// A parsed GitHub plugin install source. Installs always go through a
 /// **Release** source zip so the tag is a real version pin.
@@ -2869,7 +3368,29 @@ fn truncate_err(s: &str, max: usize) -> String {
     }
 }
 
+/// Directory / file names skipped when copying a plugin into the managed
+/// plugins dir. Keeps local-path installs from dragging in venvs, git
+/// metadata, caches, etc. (and avoids failing on venv `lib64 -> lib` symlinks).
+const PLUGIN_COPY_SKIP: &[&str] = &[
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "node_modules",
+    ".DS_Store",
+    ".tox",
+    "dist",
+    "build",
+    ".eggs",
+];
+
 /// Recursively copy a directory from `src` to `dst`.
+/// Skips junk dirs (see [`PLUGIN_COPY_SKIP`]). Symlinks are recreated when
+/// possible; broken / unsupported link types are skipped with a warning rather
+/// than failing the whole install.
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {:?}: {e}", dst))?;
 
@@ -2877,17 +3398,54 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 
     for entry in rd {
         let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if PLUGIN_COPY_SKIP.iter().any(|s| *s == name_str) {
+            continue;
+        }
         let ft = entry
             .file_type()
             .map_err(|e| format!("file_type error: {e}"))?;
         let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let dst_path = dst.join(&name);
 
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            match std::fs::read_link(&src_path) {
+                Ok(target) => {
+                    #[cfg(unix)]
+                    {
+                        if let Err(e) = std::os::unix::fs::symlink(&target, &dst_path) {
+                            eprintln!(
+                                "[plugins] skip symlink {:?} -> {:?}: {e}",
+                                src_path, target
+                            );
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Best-effort: if the link points at a regular file, copy it.
+                        let resolved = src_path.parent().unwrap_or(src).join(&target);
+                        if resolved.is_file() {
+                            let _ = std::fs::copy(&resolved, &dst_path);
+                        } else {
+                            eprintln!(
+                                "[plugins] skip symlink {:?} (non-unix)",
+                                src_path
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[plugins] skip unreadable symlink {:?}: {e}", src_path);
+                }
+            }
+        } else if ft.is_dir() {
             copy_dir(&src_path, &dst_path)?;
-        } else {
+        } else if ft.is_file() {
             std::fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("copy {:?} -> {:?}: {e}", src_path, dst_path))?;
+        } else {
+            eprintln!("[plugins] skip non-file/dir {:?}", src_path);
         }
     }
     Ok(())
@@ -3221,7 +3779,7 @@ mod tests {
             r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
         );
 
-        let installed = mgr.install(&src.path).unwrap();
+        let installed = mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
         assert_eq!(installed.name, "fresh");
         assert_eq!(installed.version, "2.0.0");
 
@@ -3233,6 +3791,168 @@ mod tests {
         mgr.remove("fresh").unwrap();
         assert!(mgr.list().is_empty());
         assert!(!tmp.path.join("managed/fresh").exists());
+    }
+
+    #[test]
+    fn install_respects_global_vs_workspace_scope() {
+        let tmp = TmpDir::new("mgr_scope");
+        let ws = tmp.path.join("workspace");
+        let project_plugins = ws.join(".catalyst-code/plugins");
+        let global_plugins = tmp.path.join("global-plugins");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&project_plugins).unwrap();
+        fs::create_dir_all(&global_plugins).unwrap();
+
+        let mgr = PluginManager::new_with_user_plugins_dir(
+            project_plugins.clone(),
+            Some(global_plugins.clone()),
+            ws.clone(),
+            false, // trust off — workspace user-installs still load via marker
+        );
+
+        let src = TmpDir::new("scope_src");
+        fs::create_dir_all(src.path.join("hooks")).unwrap();
+        write_hook_script(&src.path.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
+        write_plugin(
+            &src.path,
+            "scoped",
+            "1.0.0",
+            r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
+        );
+
+        let global = mgr
+            .install(&src.path, PluginInstallScope::Global)
+            .unwrap();
+        assert_eq!(global.name, "scoped");
+        assert!(global_plugins.join("scoped/plugin.json").exists());
+        assert!(!project_plugins.join("scoped").exists());
+        assert_eq!(
+            mgr.scope_of_path(&global.source_path),
+            PluginInstallScope::Global
+        );
+        mgr.remove("scoped").unwrap();
+
+        write_plugin(
+            &src.path,
+            "scoped",
+            "1.0.0",
+            r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
+        );
+        let local = mgr
+            .install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
+        assert!(project_plugins.join("scoped/plugin.json").exists());
+        assert!(project_plugins
+            .join("scoped")
+            .join(PLUGIN_USER_INSTALLED_MARKER)
+            .exists());
+        assert_eq!(
+            mgr.scope_of_path(&local.source_path),
+            PluginInstallScope::Workspace
+        );
+        // Reloads without trust because of the user-install marker.
+        let mgr2 = PluginManager::new_with_user_plugins_dir(
+            project_plugins,
+            Some(global_plugins),
+            ws,
+            false,
+        );
+        assert!(mgr2.list().contains_key("scoped"));
+        assert!(mgr2.skipped_project_plugins().is_empty());
+    }
+
+    #[test]
+    fn relative_plugins_dir_resolves_against_workspace() {
+        let tmp = TmpDir::new("mgr_rel_dir");
+        let ws = tmp.path.join("workspace");
+        fs::create_dir_all(ws.join(".catalyst-code/plugins")).unwrap();
+
+        // Relative plugins_dir must not depend on process cwd.
+        let mgr = PluginManager::new(
+            PathBuf::from(".catalyst-code/plugins"),
+            ws.clone(),
+            false,
+        );
+
+        let src = TmpDir::new("rel_src");
+        fs::create_dir_all(src.path.join("hooks")).unwrap();
+        write_hook_script(&src.path.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
+        write_plugin(
+            &src.path,
+            "relplug",
+            "1.0.0",
+            r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
+        );
+
+        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        assert!(ws
+            .join(".catalyst-code/plugins/relplug/plugin.json")
+            .exists());
+        assert!(ws
+            .join(".catalyst-code/plugins/relplug")
+            .join(PLUGIN_USER_INSTALLED_MARKER)
+            .exists());
+
+        // Simulate restart: new manager, trust still off.
+        let mgr2 = PluginManager::new(
+            PathBuf::from(".catalyst-code/plugins"),
+            ws,
+            false,
+        );
+        assert!(
+            mgr2.list().contains_key("relplug"),
+            "workspace user-install must survive restart without trust"
+        );
+    }
+
+    #[test]
+    fn plugin_install_scope_parse() {
+        assert_eq!(
+            PluginInstallScope::parse("global").unwrap(),
+            PluginInstallScope::Global
+        );
+        assert_eq!(
+            PluginInstallScope::parse("--workspace").unwrap(),
+            PluginInstallScope::Workspace
+        );
+        assert!(PluginInstallScope::parse("nope").is_err());
+    }
+
+    #[test]
+    fn install_skips_venv_and_git() {
+        let tmp = TmpDir::new("mgr_skip_venv");
+        let mgr = PluginManager::new(
+            tmp.path.join("managed"),
+            PathBuf::from("/__pm_test_ws__"),
+            true,
+        );
+
+        let src = TmpDir::new("skip_src");
+        fs::create_dir_all(src.path.join("hooks")).unwrap();
+        write_hook_script(&src.path.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
+        write_plugin(
+            &src.path,
+            "clean",
+            "1.0.0",
+            r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
+        );
+        // Junk that must NOT be copied (lib64 symlink is what broke local installs).
+        fs::create_dir_all(src.path.join(".venv/lib")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("lib", src.path.join(".venv/lib64")).unwrap();
+        fs::write(src.path.join(".venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+        fs::create_dir_all(src.path.join(".git")).unwrap();
+        fs::write(src.path.join(".git/config"), "x").unwrap();
+
+        let installed = mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        assert_eq!(installed.name, "clean");
+        let dest = tmp.path.join("managed/clean");
+        assert!(dest.join("plugin.json").exists());
+        assert!(
+            !dest.join(".venv").exists(),
+            ".venv must be skipped on install"
+        );
+        assert!(!dest.join(".git").exists(), ".git must be skipped on install");
     }
 
     #[test]
@@ -3254,8 +3974,8 @@ mod tests {
             r#"{"pre_read": {"script": "hooks/h.sh"}}"#,
         );
 
-        mgr.install(&src.path).unwrap();
-        let result = mgr.install(&src.path);
+        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        let result = mgr.install(&src.path, PluginInstallScope::Workspace);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already installed"));
     }
@@ -3435,7 +4155,7 @@ mod tests {
             r#"{"pre_write": {"script": "hooks/h.sh"}}"#,
         );
 
-        mgr.install(&src.path).unwrap();
+        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
 
         // Initially enabled.
         assert!(mgr.get_plugin("toggle-me").unwrap().enabled);
@@ -3986,6 +4706,69 @@ mod tests {
         );
         let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
         assert_eq!(plugin.system_prompt, "Never run raw SQL.");
+    }
+
+    #[test]
+    fn memory_provider_manifest_loaded() {
+        let tmp = TmpDir::new("memprov_loaded");
+        let mdir = tmp.path.join("memory");
+        fs::create_dir_all(&mdir).unwrap();
+        write_hook_script(
+            &mdir,
+            "provider.sh",
+            r#"{"ok":true,"injection":"[PERSISTENT MEMORIES]\n- test"}"#,
+            0,
+        );
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"engraphis-memory","version":"1.0.0","memory_provider":{
+               "script":"memory/provider.sh","timeout_ms":12000
+            }}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let mp = plugin.memory_provider.expect("memory_provider loaded");
+        assert_eq!(mp.plugin_name, "engraphis-memory");
+        assert_eq!(mp.timeout_ms, 12_000);
+        assert!(mp.script.ends_with("provider.sh"));
+    }
+
+    #[test]
+    fn memory_provider_rejects_missing_script() {
+        let tmp = TmpDir::new("memprov_missing");
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"bad-mem","version":"1.0.0","memory_provider":{"script":"memory/nope.py"}}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(
+            err.contains("does not exist") || err.contains("not executable"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_memory_provider_inject() {
+        let tmp = TmpDir::new("memprov_exec");
+        let mdir = tmp.path.join("memory");
+        fs::create_dir_all(&mdir).unwrap();
+        // Read stdin (discard) then emit a fixed inject response.
+        let script = mdir.join("provider.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\necho '{\"ok\":true,\"injection\":\"[PERSISTENT MEMORIES]\\n- hello\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"mem","version":"1.0.0","memory_provider":{"script":"memory/provider.sh"}}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let mp = plugin.memory_provider.unwrap();
+        let result = execute_memory_provider(&mp, "inject", &json!({}), "/tmp/ws", "sess").await;
+        assert!(result.ok, "output={}", result.output);
+        assert!(result.injection.contains("PERSISTENT MEMORIES"));
+        assert!(result.injection.contains("hello"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ import type {
   AgentEvent,
   AgentState,
   AssistantMsg,
+  BashMsg,
   CoreEvent,
   IntercomEntry,
   SubagentChatItem,
@@ -424,6 +425,18 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return onToolCall(state, ev);
     case "tool_result":
       return onToolResult(state, ev);
+    case "bash_execution": {
+      const msg: BashMsg = {
+        id: newId("bash"),
+        role: "bash",
+        command: ev.command,
+        output: ev.output,
+        ok: ev.ok !== false,
+        excludeFromContext: !!ev.exclude_from_context,
+        ts: Date.now(),
+      };
+      return { ...state, messages: [...state.messages, msg] };
+    }
     case "umans_conc": {
       const { used, limit, provider } = ev;
       // Live account-wide Umans concurrency from the /v1/usage poll. null used

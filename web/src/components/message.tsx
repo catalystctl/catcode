@@ -9,7 +9,7 @@ import { memo, useState, useEffect, useRef } from "react";
 import type { ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AssistantMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
+import type { AssistantMsg, BashMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { Markdown } from "./markdown";
 import { Thinking } from "./thinking";
@@ -238,6 +238,28 @@ function ToolMessage({ m }: { m: ToolMsg }) {
   );
 }
 
+function BashMessage({ m }: { m: BashMsg }) {
+  const prefix = m.excludeFromContext ? "!!" : "!";
+  return (
+    <div className="px-4 py-1 sm:px-6">
+      <div className="ml-7 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2">
+        <div className="font-mono text-[11px] text-ink-400">
+          {prefix} bash · {m.ok ? "ok" : "error"}
+          {m.excludeFromContext ? " · no context" : ""}
+        </div>
+        <div className="mt-0.5 font-mono text-[12px] text-accent-soft">{m.command}</div>
+        <pre
+          className={`mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words text-[12px] ${
+            m.ok ? "text-ink-200" : "text-danger"
+          }`}
+        >
+          {m.output}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
 export const Message = memo(function Message({
   m,
   onEditUser,
@@ -261,5 +283,6 @@ export const Message = memo(function Message({
         onRegenerate={onRegenerate}
       />
     );
+  if (m.role === "bash") return <BashMessage m={m} />;
   return <ToolMessage m={m} />;
 });

@@ -237,6 +237,7 @@ In the TUI:
   subagents under those caps. `/cancel-goal` aborts. Optional “review plan before
   deploy” stops at plan-ready for approve/revise.
 * type a prompt to chat. `/help` lists every command.
+* `!command` runs bash and adds the output to model context; `!!command` runs without adding it (PI-compatible).
 
 ### Web frontend
 

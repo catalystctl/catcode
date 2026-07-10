@@ -88,13 +88,24 @@ Self-learning — you compound knowledge across sessions, so future you starts s
 
 /// Build the full system prompt by appending git context, memory context,
 /// and the plugin self-bootstrapping docs.
-pub fn build_system_prompt(workspace: &std::path::Path, with_skill: bool) -> String {
+/// When `memory_provider` is set, standing-prompt memories come from that
+/// plugin instead of the built-in markdown store.
+pub fn build_system_prompt(
+    workspace: &std::path::Path,
+    with_skill: bool,
+    memory_provider: Option<&plugins::PluginMemoryProviderConfig>,
+) -> String {
     let mut prompt = SYSTEM_PROMPT_BASE.to_string();
     if let Some(git) = read_git_context(workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&git_context_injection(&git));
     }
-    let mem = memory_injection(workspace, "");
+    let mem = match memory_provider {
+        Some(cfg) => {
+            plugins::memory_provider_inject(cfg, &workspace.display().to_string(), "")
+        }
+        None => memory_injection(workspace, ""),
+    };
     if !mem.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&mem);
@@ -135,7 +146,8 @@ fn build_main_system_prompt(
     pm: &plugins::PluginManager,
     auto_reflect: bool,
 ) -> String {
-    let mut prompt = build_system_prompt(workspace, true);
+    let mp = pm.memory_provider();
+    let mut prompt = build_system_prompt(workspace, true, mp.as_ref());
     let inj = pm.system_prompt_injection();
     if !inj.is_empty() {
         prompt.push_str(&inj);
@@ -404,6 +416,11 @@ pub struct State {
     pub escalated_kinds: Mutex<std::collections::HashSet<&'static str>>,
     /// Prompt queued while a turn was running (one-deep buffer).
     pub queued: Mutex<Option<QueuedPrompt>>,
+    /// User-bash (`!cmd`) context messages deferred while a turn is in flight.
+    /// Flushed after the turn ends so we never insert a user message between
+    /// an assistant `tool_calls` message and its `tool` results (providers
+    /// reject that ordering). PI does the same with `_pendingBashMessages`.
+    pub pending_bash: Mutex<Vec<Message>>,
     /// Plugin manager — scans, loads, and executes hooks.
     pub plugin_manager: PluginManager,
     /// Vision-handoff config (curated vision models + preferred target), persisted
@@ -1472,6 +1489,7 @@ async fn main() {
         cached_tokens: Mutex::new(init_stats.cached_tokens),
         escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
+        pending_bash: Mutex::new(Vec::new()),
         plugin_manager: PluginManager::new_with_global_plugins(
             plugin_dir,
             pm_workspace,
@@ -1656,6 +1674,16 @@ async fn main() {
                 let authed = rp.api_key.is_some();
                 let cfg = state.cfg.read().await;
                 let conv_len = state.conversation.lock().await.len();
+                let skipped_plugins = state.plugin_manager.skipped_project_plugins();
+                let loaded_plugins: Vec<String> =
+                    state.plugin_manager.list().keys().cloned().collect();
+                // Only surface skips that left the plugin unavailable (a same-named
+                // global copy may still be loaded — common for staged defaults).
+                let skipped_unavailable: Vec<String> = skipped_plugins
+                    .iter()
+                    .filter(|n| !loaded_plugins.iter().any(|l| l == *n))
+                    .cloned()
+                    .collect();
                 emit(
                     &Event::new("ready")
                         .with("models", json!(models))
@@ -1672,8 +1700,21 @@ async fn main() {
                         )
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("auto_compact", json!(cfg.auto_compact))
-                        .with("resumed_messages", json!(conv_len)),
+                        .with("resumed_messages", json!(conv_len))
+                        .with("plugins", json!(loaded_plugins))
+                        .with("plugins_skipped", json!(skipped_unavailable.clone())),
                 );
+                if !skipped_unavailable.is_empty() {
+                    let names = skipped_unavailable.join(", ");
+                    emit(
+                        &Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "Skipped project plugin(s): {names}. They live under .catalyst-code/plugins but need --trust-project-plugins, or reinstall with `/plugin-install <src> workspace` (user-install marker) or `/plugin-install <src> global`."
+                            )),
+                        ),
+                    );
+                }
                 // Tell the user when the harness staged its global defaults
                 // (first run) so the global ~/.catalyst-code/ layout is
                 // discoverable.
@@ -2183,6 +2224,7 @@ async fn main() {
             }
             Command::Reset => {
                 state.conversation.lock().await.clear();
+                state.pending_bash.lock().await.clear();
                 let cfg = state.cfg.read().await;
                 if let Some(p) = cfg.session_file.as_ref() {
                     session::rewrite(p, &[]);
@@ -2195,6 +2237,7 @@ async fn main() {
             Command::Clear => {
                 // In-memory only: keep the session file so a restart can still resume.
                 state.conversation.lock().await.clear();
+                state.pending_bash.lock().await.clear();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
                 reset_stats(&state).await;
@@ -2261,6 +2304,7 @@ async fn main() {
                     // token is fine; there's no in-flight turn to abort it.
                     let cancel = CancellationToken::new();
                     let summary_chars = if rp.api_key.is_some() && !model_name.is_empty() {
+                        let mp = state.plugin_manager.memory_provider();
                         compact_with_summary(
                             &client,
                             &cfg,
@@ -2271,6 +2315,7 @@ async fn main() {
                             false,
                             model_ctx,
                             instr,
+                            mp.as_ref(),
                         )
                         .await
                     } else {
@@ -2379,6 +2424,7 @@ async fn main() {
                     }
                 };
                 *state.conversation.lock().await = loaded.clone();
+                state.pending_bash.lock().await.clear();
                 // Restore the loaded session's cumulative stats so `/stats` shows
                 // its real totals, not the prior session's.
                 restore_stats(&state, &p).await;
@@ -2442,6 +2488,7 @@ async fn main() {
                 };
                 session::ensure(&new_path);
                 *state.conversation.lock().await = Vec::new();
+                state.pending_bash.lock().await.clear();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
                 state.cfg.write().await.session_file = Some(new_path.clone());
@@ -2623,8 +2670,21 @@ async fn main() {
                         .with("top_consumers", json!(top)),
                 );
             }
-            Command::InstallPlugin { path } => {
-                match state.plugin_manager.install_source(&path).await {
+            Command::InstallPlugin { path, scope } => {
+                let scope = match plugins::PluginInstallScope::parse(
+                    scope.as_deref().unwrap_or("global"),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        emit(
+                            &Event::new("plugin_error")
+                                .with("name", json!(path))
+                                .with("message", json!(e)),
+                        );
+                        continue;
+                    }
+                };
+                match state.plugin_manager.install_source(&path, scope).await {
                     Ok(plugin) => {
                         let hooks_list: Vec<String> = plugin.hooks.keys().cloned().collect();
                         emit(
@@ -2633,6 +2693,7 @@ async fn main() {
                                 .with("version", json!(plugin.version))
                                 .with("description", json!(plugin.description))
                                 .with("hooks", json!(hooks_list))
+                                .with("scope", json!(scope.as_str()))
                                 .with("path", json!(plugin.source_path.display().to_string())),
                         );
                     }
@@ -2663,12 +2724,15 @@ async fn main() {
                     .values()
                     .map(|p| {
                         let hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        let scope = state.plugin_manager.scope_of_path(&p.source_path);
                         json!({
                             "name": p.name,
                             "version": p.version,
                             "enabled": p.enabled,
                             "description": p.description,
                             "hooks": hooks,
+                            "path": p.source_path.display().to_string(),
+                            "scope": scope.as_str(),
                         })
                     })
                     .collect();
@@ -2932,6 +2996,12 @@ async fn main() {
                     start_turn(&state, &client, model, prompt, effort, None).await;
                 }
             }
+            Command::UserBash {
+                command,
+                exclude_from_context,
+            } => {
+                handle_user_bash(&state, command, exclude_from_context).await;
+            }
             Command::RefreshMemory => {
                 let msg = refresh_memory_injection(&state).await;
                 emit(&Event::new("info").with("message", json!(msg)));
@@ -2963,12 +3033,37 @@ async fn main() {
                         .unwrap_or_else(|| "note".to_string());
                     let ws = state.cfg.read().await.workspace.clone();
                     let mem_scope = memory::Scope::parse(scope.as_deref().unwrap_or("workspace"));
-                    match memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "") {
-                        Ok(p) => {
-                            let id = p
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
+                    let save_result = if let Some(mp) = state.plugin_manager.memory_provider() {
+                        let args = json!({
+                            "name": name,
+                            "content": text,
+                            "type": mem_type,
+                            "description": "",
+                            "scope": mem_scope.as_str(),
+                        });
+                        let r = plugins::execute_memory_provider(
+                            &mp,
+                            "save",
+                            &args,
+                            &ws.display().to_string(),
+                            "",
+                        )
+                        .await;
+                        if r.ok {
+                            Ok(r.id)
+                        } else {
+                            Err(r.output)
+                        }
+                    } else {
+                        memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "")
+                            .map(|p| {
+                                p.file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
+                            })
+                    };
+                    match save_result {
+                        Ok(id) => {
                             // Refresh the injection so the next turn sees the new memory.
                             let _ = refresh_memory_injection(&state).await;
                             emit(
@@ -2988,30 +3083,52 @@ async fn main() {
             }
             Command::ListMemory => {
                 let ws = state.cfg.read().await.workspace.clone();
-                let entries = memory::scan_all_memories(&ws);
-                let arr: Vec<Value> = entries
-                    .iter()
-                    .map(|m| {
-                        let id = m
-                            .path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        json!({
-                            "id": id,
-                            "name": m.name,
-                            "type": m.mem_type,
-                            "description": m.description,
-                            "content": m.content,
-                            "scope": m.scope.as_str(),
-                            // Display fields consumed by the TUI's /memory list:
-                            // `text` is the scannable label (the memory name),
-                            // `tags` surfaces the type as a single tag.
-                            "text": m.name,
-                            "tags": [m.mem_type],
+                let arr: Vec<Value> = if let Some(mp) = state.plugin_manager.memory_provider() {
+                    let r = plugins::execute_memory_provider(
+                        &mp,
+                        "list",
+                        &json!({}),
+                        &ws.display().to_string(),
+                        "",
+                    )
+                    .await;
+                    if r.ok && !r.entries.is_empty() {
+                        r.entries
+                    } else if r.ok {
+                        Vec::new()
+                    } else {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("list_memory failed: {}", r.output))),
+                        );
+                        Vec::new()
+                    }
+                } else {
+                    let entries = memory::scan_all_memories(&ws);
+                    entries
+                        .iter()
+                        .map(|m| {
+                            let id = m
+                                .path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            json!({
+                                "id": id,
+                                "name": m.name,
+                                "type": m.mem_type,
+                                "description": m.description,
+                                "content": m.content,
+                                "scope": m.scope.as_str(),
+                                // Display fields consumed by the TUI's /memory list:
+                                // `text` is the scannable label (the memory name),
+                                // `tags` surfaces the type as a single tag.
+                                "text": m.name,
+                                "tags": [m.mem_type],
+                            })
                         })
-                    })
-                    .collect();
+                        .collect()
+                };
                 emit(
                     &Event::new("memory_list")
                         .with("entries", json!(arr))
@@ -3020,11 +3137,31 @@ async fn main() {
             }
             Command::ForgetMemory { id, scope } => {
                 let ws = state.cfg.read().await.workspace.clone();
-                let result = match scope.as_deref() {
-                    Some(s) if !s.is_empty() => {
-                        memory::forget_memory_scoped(&ws, memory::Scope::parse(s), &id)
+                let result = if let Some(mp) = state.plugin_manager.memory_provider() {
+                    let mut args = json!({ "id": id });
+                    if let Some(s) = scope.as_deref().filter(|s| !s.is_empty()) {
+                        args["scope"] = json!(s);
                     }
-                    _ => memory::forget_memory_any(&ws, &id),
+                    let r = plugins::execute_memory_provider(
+                        &mp,
+                        "forget",
+                        &args,
+                        &ws.display().to_string(),
+                        "",
+                    )
+                    .await;
+                    if r.ok {
+                        Ok(())
+                    } else {
+                        Err(r.output)
+                    }
+                } else {
+                    match scope.as_deref() {
+                        Some(s) if !s.is_empty() => {
+                            memory::forget_memory_scoped(&ws, memory::Scope::parse(s), &id)
+                        }
+                        _ => memory::forget_memory_any(&ws, &id),
+                    }
                 };
                 match result {
                     Ok(()) => {
@@ -3594,6 +3731,9 @@ fn run_turn_and_drain(
         // the current-token slot unconditionally so new turns can start.
         dispatch_lifecycle(&st, "session_stop").await;
         st.current.lock().await.take();
+        // Flush any `!cmd` context messages that were deferred while this turn
+        // ran (must land after tool_use/tool_result pairs are complete).
+        flush_pending_bash(&st).await;
         // A turn freed several conversation clones + tool-result buffers
         // (compaction alone drops the old history). glibc malloc keeps those
         // freed bytes in its arenas, so RSS creeps up and never falls — trim the
@@ -4259,6 +4399,7 @@ async fn run_turn(
                 let cfg = st.cfg.read().await.clone();
                 let rp = st.resolve_provider_for_model(&model).await;
                 let summary_chars = if rp.api_key.is_some() {
+                    let mp = st.plugin_manager.memory_provider();
                     compact_with_summary(
                         client,
                         &cfg,
@@ -4269,6 +4410,7 @@ async fn run_turn(
                         false,
                         idle_ctx,
                         cfg.compact_instructions.as_deref(),
+                        mp.as_ref(),
                     )
                     .await
                 } else {
@@ -4421,18 +4563,22 @@ async fn run_turn(
                     .with("trigger", json!("threshold")),
             );
             dispatch_lifecycle(st, "pre_compact").await;
-            let summary_chars = compact_with_summary(
-                client,
-                &cfg,
-                &provider,
-                &model,
-                &mut messages,
-                &cancel,
-                force_summarize,
-                model_ctx,
-                cfg.compact_instructions.as_deref(),
-            )
-            .await;
+            let summary_chars = {
+                let mp = st.plugin_manager.memory_provider();
+                compact_with_summary(
+                    client,
+                    &cfg,
+                    &provider,
+                    &model,
+                    &mut messages,
+                    &cancel,
+                    force_summarize,
+                    model_ctx,
+                    cfg.compact_instructions.as_deref(),
+                    mp.as_ref(),
+                )
+                .await
+            };
             *st.conversation.lock().await = messages.clone();
             if let Some(p) = cfg.session_file.as_ref() {
                 session::rewrite(p, &messages);
@@ -5076,6 +5222,27 @@ async fn run_turn(
                                 return;
                             }
                         }
+                    } else if name == "memory" {
+                        // Route through the plugin memory_provider when one is
+                        // active and no tool override already handled this call.
+                        if let Some(mp) = st.plugin_manager.memory_provider() {
+                            let action = exec_args
+                                .get("action")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let session_id = cfg
+                                .session_file
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                            let ws = cfg.workspace.display().to_string();
+                            tokio::select! {
+                                r = plugins::execute_memory_provider(&mp, action, &exec_args, &ws, &session_id) => r.into_outcome(),
+                                _ = cancel.cancelled() => tools::Outcome::err("memory aborted"),
+                            }
+                        } else {
+                            tools::execute(&name, &exec_args, &cfg)
+                        }
                     } else {
                         tools::execute(&name, &exec_args, &cfg)
                     };
@@ -5649,6 +5816,139 @@ pub(crate) enum SudoResult {
 }
 
 /// Monotonic generator for globally-unique sudo-request ids.
+/// Format a user-initiated bash result the way PI's `bashExecutionToText` does,
+/// so the next model turn sees a clear "Ran `cmd`" + fenced output block.
+fn format_user_bash_context(command: &str, output: &str, ok: bool) -> String {
+    let mut text = format!("Ran `{command}`\n```\n{output}");
+    if !output.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("```");
+    if !ok {
+        text.push_str("\n(exit non-zero)");
+    }
+    text
+}
+
+/// Append deferred `!cmd` context messages now that no turn is in flight.
+async fn flush_pending_bash(st: &Arc<State>) {
+    let pending = {
+        let mut q = st.pending_bash.lock().await;
+        std::mem::take(&mut *q)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let cfg = st.cfg.read().await;
+    let session_file = cfg.session_file.clone();
+    drop(cfg);
+    let mut conv = st.conversation.lock().await;
+    for msg in pending {
+        let est = estimate_message_tokens(&msg);
+        conv.push(msg);
+        if let Some(p) = session_file.as_ref() {
+            session::append(p, conv.last().unwrap());
+        }
+        *st.estimated_tokens.lock().await += est;
+    }
+}
+
+/// Run a user-initiated bang command (`!cmd` / `!!cmd`).
+/// Emits `bash_execution` for the UI; optionally injects into conversation
+/// context (deferred while a turn is running).
+async fn handle_user_bash(st: &Arc<State>, command: String, exclude_from_context: bool) {
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        emit(
+            &Event::new("error").with("message", json!("empty bash command")),
+        );
+        return;
+    }
+
+    let cfg = st.cfg.read().await.clone();
+    // Independent of any in-flight turn — bang commands are user-owned.
+    let cancel = CancellationToken::new();
+
+    let outcome = if tools::command_uses_sudo(&command) {
+        let needs_prompt = match cfg.approval {
+            crate::config::Approval::Never => tools::sudo_needs_password(&cfg).await,
+            _ => true,
+        };
+        if needs_prompt {
+            match request_sudo(st, &command, &cancel).await {
+                SudoResult::Approved { password } => {
+                    tools::execute_bash(
+                        &command,
+                        &cfg,
+                        None,
+                        tools::SudoAuth::Password(password),
+                    )
+                    .await
+                }
+                SudoResult::Declined => {
+                    emit(
+                        &Event::new("bash_execution")
+                            .with("command", json!(command))
+                            .with("output", json!("(sudo declined — command was not run)"))
+                            .with("ok", json!(false))
+                            .with("exclude_from_context", json!(true)),
+                    );
+                    return;
+                }
+                SudoResult::Aborted => {
+                    emit(
+                        &Event::new("bash_execution")
+                            .with("command", json!(command))
+                            .with("output", json!("(aborted)"))
+                            .with("ok", json!(false))
+                            .with("exclude_from_context", json!(true)),
+                    );
+                    return;
+                }
+            }
+        } else {
+            tools::execute_bash(&command, &cfg, None, tools::SudoAuth::NonInteractive).await
+        }
+    } else {
+        tools::execute_bash(&command, &cfg, None, tools::SudoAuth::None).await
+    };
+
+    emit(
+        &Event::new("bash_execution")
+            .with("command", json!(command))
+            .with("output", json!(outcome.output))
+            .with("ok", json!(outcome.ok))
+            .with("exclude_from_context", json!(exclude_from_context)),
+    );
+
+    if exclude_from_context {
+        return;
+    }
+
+    let msg = Message::user(format_user_bash_context(
+        &command,
+        &outcome.output,
+        outcome.ok,
+    ));
+
+    // Defer while a turn is running so we don't break tool_use/tool_result order.
+    let busy = st.current.lock().await.is_some();
+    if busy {
+        st.pending_bash.lock().await.push(msg);
+        return;
+    }
+
+    let est = estimate_message_tokens(&msg);
+    {
+        let mut conv = st.conversation.lock().await;
+        conv.push(msg);
+        if let Some(p) = cfg.session_file.as_ref() {
+            session::append(p, conv.last().unwrap());
+        }
+    }
+    *st.estimated_tokens.lock().await += est;
+}
+
 static SUDO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Ask the user to approve a bash command that invokes `sudo`. Blocks until the
@@ -6078,7 +6378,13 @@ async fn refresh_memory_injection(state: &State) -> String {
         let c = state.cfg.read().await;
         (c.workspace.clone(), c.auto_reflect)
     };
-    let mem = memory_injection(&ws, "");
+    let mp = state.plugin_manager.memory_provider();
+    let mem = match mp.as_ref() {
+        Some(cfg) => {
+            plugins::memory_provider_inject(cfg, &ws.display().to_string(), "")
+        }
+        None => memory_injection(&ws, ""),
+    };
     let new_system = build_main_system_prompt(&ws, &state.plugin_manager, auto_reflect);
     let mut conv = state.conversation.lock().await;
     if let Some(first) = conv.first() {
@@ -6200,6 +6506,7 @@ pub async fn compact_with_summary(
     force_summarize: bool,
     context_window: u64,
     instructions: Option<&str>,
+    memory_provider: Option<&plugins::PluginMemoryProviderConfig>,
 ) -> usize {
     // Returns the character count of the produced summary system message (0
     // when no summary was generated — naive drop-oldest fallback or a
@@ -6238,14 +6545,32 @@ pub async fn compact_with_summary(
         if let Some(facts) =
             provider::extract_facts(client, provider, model, &to_summarize, cancel).await
         {
-            let _ = memory::append_memory(
-                &cfg.workspace,
-                "session-extract",
-                &facts,
-                "session",
-                "auto-extracted durable facts (accumulated on compaction)",
-                16_384,
-            );
+            if let Some(mp) = memory_provider {
+                let args = json!({
+                    "name": "session-extract",
+                    "content": facts,
+                    "type": "session",
+                    "description": "auto-extracted durable facts (accumulated on compaction)",
+                    "cap_bytes": 16384,
+                });
+                let _ = plugins::execute_memory_provider(
+                    mp,
+                    "compact_append",
+                    &args,
+                    &cfg.workspace.display().to_string(),
+                    "",
+                )
+                .await;
+            } else {
+                let _ = memory::append_memory(
+                    &cfg.workspace,
+                    "session-extract",
+                    &facts,
+                    "session",
+                    "auto-extracted durable facts (accumulated on compaction)",
+                    16_384,
+                );
+            }
         }
     }
     // The kept tail can still hold the bulk of the tokens when a few recent
@@ -7298,5 +7623,15 @@ mod expand_mentions_tests {
         assert_eq!(attached.len(), 1);
         assert!(out.contains("abs content"));
         assert!(out.contains("<file path=\""));
+    }
+
+    #[test]
+    fn user_bash_context_format_matches_pi() {
+        let text = format_user_bash_context("ls -la", "total 0\n", true);
+        assert!(text.starts_with("Ran `ls -la`\n```\n"));
+        assert!(text.contains("total 0\n"));
+        assert!(text.ends_with("```"));
+        let fail = format_user_bash_context("false", "(no output)", false);
+        assert!(fail.contains("(exit non-zero)"));
     }
 }

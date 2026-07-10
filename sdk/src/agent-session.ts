@@ -7,8 +7,6 @@
 // the surface so consumers written against `@earendil-works/pi-coding-agent`
 // work unchanged.
 
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -42,8 +40,6 @@ import {
   type ModelCycleResult,
   type PromptOptions,
 } from "./events.js";
-
-const execAsync = promisify(exec);
 
 export interface AgentSessionServices {
   cwd: string;
@@ -498,21 +494,79 @@ export class AgentSession {
   }
   abortRetry(): void {}
 
-  // ── Bash (user-initiated; runs locally, not via the model) ──
-  async executeBash(command: string, _onChunk?: (chunk: string) => void): Promise<BashResult> {
+  // ── Bash (user-initiated; PI `!cmd` / `!!cmd`) ──
+  async executeBash(
+    command: string,
+    onChunk?: (chunk: string) => void,
+    options?: { excludeFromContext?: boolean },
+  ): Promise<BashResult> {
+    this.assertNotDisposed();
     try {
-      const { stdout } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
-      return { output: stdout, exitCode: 0, cancelled: false, truncated: false };
-    } catch (err: any) {
-      return {
-        output: err?.stdout ?? "",
-        exitCode: err?.code ?? 1,
+      const ev = await this._awaitFirst(
+        ["bash_execution", "error"],
+        () => {
+          this.core.send({
+            type: "user_bash",
+            command,
+            exclude_from_context: !!options?.excludeFromContext,
+          });
+        },
+        120_000,
+      );
+      if (ev.type === "error") {
+        const result: BashResult = {
+          output: String((ev as any).message ?? "bash failed"),
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        };
+        this.recordBashResult(command, result, options);
+        return result;
+      }
+      const output = String((ev as any).output ?? "");
+      if (onChunk && output) onChunk(output);
+      const result: BashResult = {
+        output,
+        exitCode: (ev as any).ok === false ? 1 : 0,
         cancelled: false,
         truncated: false,
       };
+      this.recordBashResult(command, result, options);
+      return result;
+    } catch (err: any) {
+      // Do not fall back to a second local exec — the core may still be running
+      // the command (e.g. waiting on sudo). Surface the wait failure instead.
+      const result: BashResult = {
+        output: err?.message ?? "bash failed",
+        exitCode: 1,
+        cancelled: false,
+        truncated: false,
+      };
+      this.recordBashResult(command, result, options);
+      return result;
     }
   }
-  recordBashResult(_command: string, _result: BashResult): void {}
+  recordBashResult(
+    command: string,
+    result: BashResult,
+    options?: { excludeFromContext?: boolean },
+  ): void {
+    // PI BashExecutionMessage shape — kept in session.messages for consumers
+    // that walk the transcript. Core already injects into its own conversation
+    // when excludeFromContext is false; this mirrors that for the SDK list.
+    const msg = {
+      role: "bashExecution" as const,
+      command,
+      output: result.output,
+      exitCode: result.exitCode,
+      cancelled: result.cancelled,
+      truncated: result.truncated,
+      fullOutputPath: result.fullOutputPath,
+      timestamp: nowMs(),
+      excludeFromContext: options?.excludeFromContext,
+    };
+    this._messages.push(msg as any);
+  }
   abortBash(): void {}
 
   // ── Session / stats / export ──

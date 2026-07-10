@@ -22,7 +22,9 @@ type settingsStore struct {
 	path            string
 	APIKey          string `json:"api_key,omitempty"`
 	SelectedModel   string `json:"model,omitempty"`
-	Approval        string `json:"approval,omitempty"`
+	// Approval is intentionally NOT omitempty — an empty value must not drop the
+	// key on save (that looked like a "settings reset" after restart).
+	Approval        string `json:"approval"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	Theme           string `json:"theme,omitempty"`
 	ThinkExpanded   bool   `json:"think_expanded,omitempty"`
@@ -204,13 +206,59 @@ func loadSettings() *settingsStore {
 	return s
 }
 
+// normalizeApproval returns a valid approval mode, defaulting blank/unknown to
+// destructive (same as the core's Approval::parse fallback).
+func normalizeApproval(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "never", "destructive", "always":
+		return strings.ToLower(strings.TrimSpace(mode))
+	default:
+		return "destructive"
+	}
+}
+
 // save writes the store atomically with 0600 perms.
+//
+// Uses a read-merge-write against the on-disk JSON object so we never drop
+// keys that this process doesn't know about (forward-compat) and never blank
+// out approval if memory somehow lost it mid-session.
 func (s *settingsStore) save() error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(s, "", "  ")
+
+	// Start from on-disk document (preserve unknown keys), then overlay ours.
+	merged := map[string]any{}
+	if existing, err := os.ReadFile(s.path); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal(existing, &merged)
+		if merged == nil {
+			merged = map[string]any{}
+		}
+		// Guard: never let a blank in-memory approval erase a persisted one.
+		if strings.TrimSpace(s.Approval) == "" {
+			if prev, ok := merged["approval"].(string); ok && strings.TrimSpace(prev) != "" {
+				s.Approval = prev
+			}
+		}
+	}
+	s.Approval = normalizeApproval(s.Approval)
+
+	cur, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	var overlay map[string]any
+	if err := json.Unmarshal(cur, &overlay); err != nil {
+		return err
+	}
+	for k, v := range overlay {
+		merged[k] = v
+	}
+	// Always persist approval explicitly (overlay may omit zero values for other fields).
+	merged["approval"] = s.Approval
+
+	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err
 	}

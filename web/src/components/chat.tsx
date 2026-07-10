@@ -510,6 +510,7 @@ export function Chat() {
           onCommand={onCommand}
           skills={state.skills}
           onSkill={(name, task) => agent.applySkill(name, task)}
+          onBash={(command, exclude) => void agent.userBash(command, exclude)}
         />
       </div>
 

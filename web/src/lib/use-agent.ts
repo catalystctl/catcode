@@ -44,6 +44,8 @@ export interface AgentApi {
   send: (cmd: CoreCommand) => Promise<void>;
   prompt: (text: string, images?: string[]) => Promise<void>;
   steer: (text: string) => Promise<void>;
+  /** PI-compatible bang bash (`!cmd` / `!!cmd`). */
+  userBash: (command: string, excludeFromContext?: boolean) => Promise<void>;
   abort: () => Promise<void>;
   approve: (decision: "yes" | "no" | "always") => Promise<void>;
   setKey: (key: string) => Promise<void>;
@@ -328,6 +330,17 @@ export function useAgent(): AgentApi {
       await send(cmd);
     },
     [send, effortFor],
+  );
+
+  const userBash = useCallback(
+    async (command: string, excludeFromContext = false) => {
+      await send({
+        type: "user_bash",
+        command,
+        exclude_from_context: excludeFromContext,
+      });
+    },
+    [send],
   );
 
   const abort = useCallback(() => send({ type: "abort" }), [send]);
@@ -712,6 +725,7 @@ export function useAgent(): AgentApi {
       send,
       prompt,
       steer,
+      userBash,
       abort,
       approve,
       setKey,

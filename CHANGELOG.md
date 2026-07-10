@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — PI-compatible bang bash (`!` / `!!`)
+- Type `!command` in the TUI or web composer to run bash in the workspace and
+  add the output to model context (next turn sees it). Use `!!command` to run
+  without adding output to context.
+- Core `user_bash` command: same sandbox/denylist as the agent `bash` tool,
+  emits `bash_execution`, defers context injection while a turn is in flight.
+- SDK `executeBash` / `recordBashResult` wired for PI parity.
+
 ### Added — `/goal` Advanced: role models + per-model concurrency
 - Checkbox **Advanced** on the TUI and web `/goal` forms:
   - Pin models for **planner**, **worker**, and **reviewer** agents.

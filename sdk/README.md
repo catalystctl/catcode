@@ -158,8 +158,10 @@ pi-web can adapt if exact parity is needed:
   routes that parse raw session files directly (e.g. pi-web's `pi-sessions.ts`
   history export) may need to read via `AgentSession.messages` /
   `getSessionStats()` instead.
-- **`executeBash`** runs locally via `child_process` (user-initiated `/bash`
-  slash command), not through the model's bash tool.
+- **`executeBash`** runs via the core `user_bash` command (same sandbox/denylist
+  as the agent `bash` tool). Used for PI-compatible `!cmd` / `!!cmd` bang
+  commands; `!!` sets `excludeFromContext` so output is shown but not added to
+  the model transcript.
 - **`exportToHtml`** produces a minimal transcript HTML.
 - **Model discovery**: models arrive from the core's `ready`/`models` events
   (dynamic), so `ModelRegistry.getAvailable()` is empty until the first core

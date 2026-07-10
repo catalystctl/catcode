@@ -1298,11 +1298,32 @@ The core speaks newline-delimited JSON over stdio (commands in, events out). See
 ";
 
 /// Parse CLI args, env vars, and config file into a Config.
+///
+/// Precedence (highest last): defaults → config files → env → CLI flags.
+/// CLI is applied last so `--approval` from the TUI cannot be overwritten by
+/// `~/.config/catalyst-code/settings.json` (or the reverse race on restart).
 pub fn load() -> Config {
     let mut c = Config::default();
     let mut config_file: Option<PathBuf> = None;
     let mut help = false;
     let mut version = false;
+    // CLI flags collected here and re-applied after files + env.
+    let mut cli_approval: Option<Approval> = None;
+    let mut cli_workspace: Option<PathBuf> = None;
+    let mut cli_base_url: Option<String> = None;
+    let mut cli_bash_timeout: Option<u64> = None;
+    let mut cli_max_bash_timeout: Option<u64> = None;
+    let mut cli_fetch_timeout: Option<u64> = None;
+    let mut cli_diag_timeout: Option<u64> = None;
+    let mut cli_trust_project: Option<bool> = None;
+    let mut cli_debug_log: Option<PathBuf> = None;
+    let mut cli_session: Option<PathBuf> = None;
+    let mut cli_model: Option<String> = None;
+    let mut cli_provider: Option<String> = None;
+    let mut cli_sandbox: Option<Sandbox> = None;
+    let mut cli_no_network: Option<bool> = None;
+    let mut cli_idle_timeout: Option<u64> = None;
+    let mut cli_max_session_tokens: Option<u64> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -1321,67 +1342,81 @@ pub fn load() -> Config {
             "-V" | "--version" => version = true,
             "--workspace" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.workspace = PathBuf::from(v);
+                    cli_workspace = Some(PathBuf::from(v));
                 }
             }
             "--base-url" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.base_url = v;
+                    cli_base_url = Some(v);
                 }
             }
             "--approval" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.approval = Approval::parse(&v);
+                    cli_approval = Some(Approval::parse(&v));
                 }
             }
             "--bash-timeout" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.bash_timeout_secs = v.parse().unwrap_or(c.bash_timeout_secs);
+                    cli_bash_timeout = v.parse().ok();
                 }
             }
             "--max-bash-timeout" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.max_bash_timeout_secs = v.parse().unwrap_or(c.max_bash_timeout_secs);
+                    cli_max_bash_timeout = v.parse().ok();
                 }
             }
             "--fetch-timeout" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.fetch_timeout_secs = v.parse().unwrap_or(c.fetch_timeout_secs);
+                    cli_fetch_timeout = v.parse().ok();
                 }
             }
             "--diag-timeout" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.diag_timeout_secs = v.parse().unwrap_or(c.diag_timeout_secs);
+                    cli_diag_timeout = v.parse().ok();
                 }
             }
             "--trust-project-plugins" => {
-                c.trust_project_plugins = true;
+                cli_trust_project = Some(true);
             }
             "--no-trust-project-plugins" => {
-                c.trust_project_plugins = false;
+                cli_trust_project = Some(false);
             }
             "--debug-log" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.debug_log = Some(PathBuf::from(v));
+                    cli_debug_log = Some(PathBuf::from(v));
                 }
             }
             "--session" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.session_file = Some(PathBuf::from(v));
+                    cli_session = Some(PathBuf::from(v));
                 }
             }
             "--model" => {
                 if let Some(v) = take_val(&mut i) {
-                    c.default_model = Some(v);
+                    cli_model = Some(v);
                 }
             }
             "--provider" => {
-                // Select the active provider by name at startup (overrides
-                // config/env `activeProvider`). The provider must be defined in
-                // config/env; a name not in the list is ignored with a later
-                // `ready` event surfacing the effective provider.
                 if let Some(v) = take_val(&mut i) {
-                    c.active_provider = Some(v);
+                    cli_provider = Some(v);
+                }
+            }
+            "--sandbox" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox = Some(Sandbox::parse(&v));
+                }
+            }
+            "--no-network" => {
+                cli_no_network = Some(true);
+            }
+            "--idle-timeout" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_idle_timeout = v.parse().ok();
+                }
+            }
+            "--max-session-tokens" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_max_session_tokens = v.parse().ok();
                 }
             }
             "--config" => {
@@ -1402,18 +1437,7 @@ pub fn load() -> Config {
         std::process::exit(0);
     }
 
-    // Layer 1: config file (lowest precedence among the three, applied first so
-    // env/CLI can override). Pick explicit --config, else ./catalyst-code.json,
-    // else ~/.config/catalyst-code/config.json.
-    // Multi-layer: also load managed-settings and settings.local.json.
-    // `(path, untrusted)`: `untrusted` marks config files shipped by the repo
-    // itself (./settings.json, ./settings.local.json in the CWD) — those are
-    // merged with security-sensitive keys STRIPPED first (see
-    // `strip_untrusted_keys`) so a hostile repo can't silently disable the
-    // approval gate / sandbox / network block, widen the bash denylist, or —
-    // worst — define a provider whose `base_url` is an attacker endpoint that
-    // the user's stored OAuth tokens get Bearer-sent to. User-owned config
-    // (~/.config, managed.d, env, CLI, explicit --config) is trusted as-is.
+    // Layer 1: config files (lowest precedence).
     let candidates: Vec<(PathBuf, bool)> = match config_file {
         Some(p) => vec![(p, false)],
         None => {
@@ -1424,7 +1448,6 @@ pub fn load() -> Config {
             let local = PathBuf::from("settings.local.json");
             let proj = PathBuf::from("settings.json");
             let mut v = vec![(managed, false)];
-            // managed-settings.d/*.json
             if let Ok(rd) = std::fs::read_dir(&managed_dir) {
                 let mut entries: Vec<PathBuf> = rd
                     .filter_map(|e| e.ok())
@@ -1435,8 +1458,8 @@ pub fn load() -> Config {
                 v.extend(entries.into_iter().map(|p| (p, false)));
             }
             v.push((settings_path, false));
-            v.push((proj, true)); // project-scoped: untrusted
-            v.push((local, true)); // project-scoped: untrusted
+            v.push((proj, true));
+            v.push((local, true));
             v
         }
     };
@@ -1479,7 +1502,6 @@ pub fn load() -> Config {
             c.fetch_max_bytes = n;
         }
     }
-    // Comma-separated host glob allowlist for the fetch tool. Empty/unset = any host.
     if let Ok(v) = std::env::var("CATALYST_CODE_FETCH_ALLOWLIST") {
         c.fetch_allowlist = v
             .split(',')
@@ -1492,9 +1514,6 @@ pub fn load() -> Config {
             c.diag_timeout_secs = n;
         }
     }
-    // trust_project_plugins is intentionally NOT read from any JSON config file
-    // (those are merged from project-local settings.json, which an untrusted
-    // repo could ship to self-enable its own plugins). Env/CLI are user-owned.
     if let Ok(v) = std::env::var("CATALYST_CODE_TRUST_PROJECT_PLUGINS") {
         c.trust_project_plugins = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
     }
@@ -1504,14 +1523,10 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("CATALYST_CODE_SESSION") {
         c.session_file = Some(PathBuf::from(v));
     }
-    // Sandbox / network / token-budget knobs advertised in --help (P1-19: these
-    // were documented as env vars but never read, so the Dockerfile's
-    // `ENV CATALYST_CODE_SANDBOX=firejail` etc. were dead). Wire them up here.
     if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX") {
         c.sandbox = Sandbox::parse(&v);
     }
     if let Ok(v) = std::env::var("CATALYST_CODE_NO_NETWORK") {
-        // Present without a value, or "1"/"true", means block network; "0"/"false" off.
         let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
         c.no_network = on;
     }
@@ -1539,9 +1554,6 @@ pub fn load() -> Config {
             c.auto_reflect_min_tool_calls = n.max(1);
         }
     }
-    // auto_compact: toggle automatic context compaction (threshold-triggered +
-    // idle). Default true. Manual /compact always works regardless of this
-    // setting. Mirrors Claude Code's autoCompactEnabled / DISABLE_AUTO_COMPACT.
     if let Ok(v) = std::env::var("CATALYST_CODE_AUTO_COMPACT") {
         let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
         let off = v == "0" || v.eq_ignore_ascii_case("false");
@@ -1551,9 +1563,6 @@ pub fn load() -> Config {
             c.auto_compact = true;
         }
     }
-    // compact_instructions: optional guidance woven into the compaction summarize
-    // prompt ("Focus on code samples and API usage"). /compact <instructions>
-    // overrides per-call; this sets the default used by auto-compaction.
     if let Ok(v) = std::env::var("CATALYST_CODE_COMPACT_INSTRUCTIONS") {
         if v.trim().is_empty() {
             c.compact_instructions = None;
@@ -1562,11 +1571,6 @@ pub fn load() -> Config {
         }
     }
 
-    // Custom providers. `UMANS_PROVIDERS` is a JSON array of provider objects
-    // (same shape as the config-file `providers` field); merged after the file
-    // layers so env-defined providers are appended (and deduped by name, env
-    // winning). `UMANS_ACTIVE_PROVIDER` selects the active one. `--provider`
-    // (CLI) wins over both.
     if let Ok(v) = std::env::var("UMANS_PROVIDERS") {
         if let Ok(arr) = serde_json::from_str::<Value>(&v) {
             if let Some(list) = arr.as_array() {
@@ -1584,7 +1588,56 @@ pub fn load() -> Config {
         c.active_provider = Some(v);
     }
 
-    // Pre-compile bash denylist regexes once at startup.
+    // Layer 3: CLI flags (highest precedence).
+    if let Some(v) = cli_workspace {
+        c.workspace = v;
+    }
+    if let Some(v) = cli_base_url {
+        c.base_url = v;
+    }
+    if let Some(v) = cli_approval {
+        c.approval = v;
+    }
+    if let Some(v) = cli_bash_timeout {
+        c.bash_timeout_secs = v;
+    }
+    if let Some(v) = cli_max_bash_timeout {
+        c.max_bash_timeout_secs = v;
+    }
+    if let Some(v) = cli_fetch_timeout {
+        c.fetch_timeout_secs = v;
+    }
+    if let Some(v) = cli_diag_timeout {
+        c.diag_timeout_secs = v;
+    }
+    if let Some(v) = cli_trust_project {
+        c.trust_project_plugins = v;
+    }
+    if let Some(v) = cli_debug_log {
+        c.debug_log = Some(v);
+    }
+    if let Some(v) = cli_session {
+        c.session_file = Some(v);
+    }
+    if let Some(v) = cli_model {
+        c.default_model = Some(v);
+    }
+    if let Some(v) = cli_provider {
+        c.active_provider = Some(v);
+    }
+    if let Some(v) = cli_sandbox {
+        c.sandbox = v;
+    }
+    if let Some(v) = cli_no_network {
+        c.no_network = v;
+    }
+    if let Some(v) = cli_idle_timeout {
+        c.idle_timeout_secs = v;
+    }
+    if let Some(v) = cli_max_session_tokens {
+        c.max_session_tokens = v;
+    }
+
     c.bash_deny_regex_compiled = c
         .bash_deny_regex
         .iter()

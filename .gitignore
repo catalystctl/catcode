@@ -101,3 +101,4 @@ sdk/node_modules/
 !.catalyst-code/plugins
 !.catalyst-code/skills
 core/.config
+.catalyst-code/plugins/engraphis-memory/

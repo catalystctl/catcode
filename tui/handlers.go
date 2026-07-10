@@ -137,9 +137,27 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				_ = json.Unmarshal(raw, &s.providerPresets)
 			}
 			s.providerHasKey = s.authed // ready's authed reflects the active provider's key
+			if raw, ok := m["plugins_skipped"]; ok {
+				var skipped []string
+				if json.Unmarshal(raw, &skipped) == nil && len(skipped) > 0 {
+					s.logError(fmt.Sprintf(
+						"skipped project plugin(s): %s — reinstall with `/plugin-install <src> global` (or `workspace`), or start with --trust-project-plugins",
+						strings.Join(skipped, ", "),
+					))
+				}
+			}
 		}
 		s.applyModels(models)
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
+		// Settings.json is the source of truth for approval. Re-apply after ready
+		// so a stale core default / config-file layer can't silently diverge from
+		// what the TUI persisted (and so crash-restarts keep the user's choice).
+		desired := normalizeApproval(s.settings.Approval)
+		s.settings.Approval = desired
+		if s.approvalModeStr != desired {
+			s.sendCore(map[string]any{"type": "set_approval", "mode": desired})
+		}
+		s.approvalModeStr = desired
 		// Sync a persisted provider selection that differs from the core's
 		// startup choice (e.g. switched in a previous session). The core emits
 		// provider_changed + models, which re-resolves the key below.
@@ -295,6 +313,29 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		} else {
 			s.logToolResult(out)
 		}
+
+	case "bash_execution":
+		// User-initiated `!cmd` / `!!cmd` — render like a completed bash tool card.
+		// Must set dur > 0 and attach output on the tool block itself; dur==0 means
+		// in-flight and the spinner runs forever (isInFlight).
+		cmd := ev.get("command")
+		out := ev.get("output")
+		ok := ev.get("ok") == "true"
+		exclude := ev.get("exclude_from_context") == "true"
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		b := s.logTool("bash", string(args), false)
+		if exclude {
+			out = "(not added to model context)\n" + out
+		}
+		b.output = capOutput(out)
+		b.hasOk = true
+		b.ok = ok
+		b.dur = time.Since(b.started)
+		if b.dur == 0 {
+			b.dur = time.Millisecond
+		}
+		s.invalidateAll()
+		s.refresh()
 
 	case "done":
 		s.subProgress = nil
@@ -795,7 +836,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "error":
 		s.logError(ev.get("message"))
 	case "plugin_installed":
-		s.logSuccess(fmt.Sprintf("plugin installed: %s v%s — %s", ev.get("name"), ev.get("version"), ev.get("description")))
+		scope := ev.get("scope")
+		if scope == "" {
+			scope = "global"
+		}
+		s.logSuccess(fmt.Sprintf("plugin installed (%s): %s v%s — %s", scope, ev.get("name"), ev.get("version"), ev.get("description")))
 	case "plugin_removed":
 		s.logInfo(fmt.Sprintf("plugin removed: %s", ev.get("name")))
 	case "plugin_enabled":
@@ -1402,7 +1447,9 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			s.input.Reset()
 			s.evalMention()
-			if strings.HasPrefix(text, "/") && len(s.pendingImages) == 0 {
+			// Slash commands and bang bash (`!` / `!!`) run immediately even
+			// while a turn is in flight — same as PI interactive mode.
+			if len(s.pendingImages) == 0 && (strings.HasPrefix(text, "/") || isBangCommand(text)) {
 				return s, s.handleUserLine(text)
 			}
 			return s, s.queueFollowUp(text)
@@ -1537,6 +1584,17 @@ func (s *session) quit() tea.Cmd {
 }
 
 func (s *session) handleUserLine(text string) tea.Cmd {
+	// PI-compatible bang bash: `!cmd` runs and adds output to model context;
+	// `!!cmd` runs without adding to context. Empty `!` / `!!` fall through.
+	if cmd, exclude, ok := parseBangCommand(text); ok {
+		s.pushHistory(text)
+		s.sendCore(map[string]any{
+			"type":                  "user_bash",
+			"command":               cmd,
+			"exclude_from_context":  exclude,
+		})
+		return nil
+	}
 	if strings.HasPrefix(text, "/") {
 		parts := strings.Fields(text)
 		// /skill:<name> [optional task] — invoke a discoverable skill. Handled
@@ -1945,8 +2003,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				s.openPluginInstallModal()
 				return nil
 			}
-			s.sendCore(map[string]any{"type": "install_plugin", "path": parts[1]})
-			s.logInfo(fmt.Sprintf("installing plugin from %s…", parts[1]))
+			path, scope, err := parsePluginInstallArgs(parts[1:])
+			if err != nil {
+				s.logError(err.Error())
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
+			s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
 			return nil
 		case "/plugin-list", "/plugin-config", "/plugin-enable", "/plugin-disable":
 			// Bare enable/disable open the toggle picker (same as /plugin-config);
@@ -2171,4 +2234,59 @@ func writeOSC52Cmd(text string) tea.Cmd {
 		os.Stdout.WriteString(seq)
 		return nil
 	}
+}
+
+// parsePluginInstallArgs extracts the plugin source and install scope from
+// `/plugin-install` args (or the install modal value fields).
+// Scope defaults to "global". Recognizes global|workspace and --global/--workspace/-g/-w.
+func parsePluginInstallArgs(args []string) (path string, scope string, err error) {
+	scope = "global"
+	var pathParts []string
+	for _, a := range args {
+		switch strings.ToLower(strings.TrimSpace(a)) {
+		case "global", "--global", "-g", "user":
+			scope = "global"
+		case "workspace", "--workspace", "-w", "project", "local":
+			scope = "workspace"
+		case "":
+			continue
+		default:
+			pathParts = append(pathParts, a)
+		}
+	}
+	if len(pathParts) == 0 {
+		return "", "", fmt.Errorf("usage: /plugin-install <path|url> [global|workspace]")
+	}
+	if len(pathParts) > 1 {
+		return "", "", fmt.Errorf("unexpected extra args after plugin source: %s", strings.Join(pathParts[1:], " "))
+	}
+	return pathParts[0], scope, nil
+}
+
+// isBangCommand reports whether text is a PI-style bang bash invocation with a
+// non-empty command (`!cmd` or `!!cmd`). Bare `!` / `!!` are not bang commands.
+func isBangCommand(text string) bool {
+	_, _, ok := parseBangCommand(text)
+	return ok
+}
+
+// parseBangCommand extracts a PI-compatible bang bash command.
+//   !cmd  → command, excludeFromContext=false
+//   !!cmd → command, excludeFromContext=true
+// Returns ok=false when the text is not a bang command or the command is empty
+// (so bare `!` falls through as a normal prompt, matching PI).
+func parseBangCommand(text string) (command string, excludeFromContext bool, ok bool) {
+	if !strings.HasPrefix(text, "!") {
+		return "", false, false
+	}
+	excludeFromContext = strings.HasPrefix(text, "!!")
+	if excludeFromContext {
+		command = strings.TrimSpace(text[2:])
+	} else {
+		command = strings.TrimSpace(text[1:])
+	}
+	if command == "" {
+		return "", false, false
+	}
+	return command, excludeFromContext, true
 }

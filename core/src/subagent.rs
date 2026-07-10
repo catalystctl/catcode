@@ -1140,11 +1140,11 @@ async fn run_agent_inner(
     // --- system prompt ---
     let mut sys = match agent.system_prompt_mode {
         SystemPromptMode::Replace => String::new(),
-        SystemPromptMode::Append => crate::build_system_prompt(&workspace, false),
+        SystemPromptMode::Append => crate::build_system_prompt(&workspace, false, None),
     };
     if agent.inherit_project_context && agent.system_prompt_mode == SystemPromptMode::Replace {
         // even in replace mode, inherit git context + memory if asked
-        sys.push_str(&crate::build_system_prompt(&workspace, false));
+        sys.push_str(&crate::build_system_prompt(&workspace, false, None));
         sys.push_str("\n\n");
     }
     sys.push_str(&agent.system_prompt);
@@ -1302,6 +1302,7 @@ async fn run_agent_inner(
             // summarizing a subagent's context (otherwise subagent compaction
             // silently bypasses the hook the user configured).
             crate::dispatch_lifecycle(st, "pre_compact").await;
+            let mp = st.plugin_manager.memory_provider();
             crate::compact_with_summary(
                 client,
                 &cfg,
@@ -1312,6 +1313,7 @@ async fn run_agent_inner(
                 est > hard_cap,
                 model_ctx,
                 cfg.compact_instructions.as_deref(),
+                mp.as_ref(),
             )
             .await;
             // Compaction rewrote `sub`; the real baseline no longer applies.

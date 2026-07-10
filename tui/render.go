@@ -125,7 +125,7 @@ func (s *session) renderHeader() string {
 	row1 := fitRow(s.width, brand, tagline)
 
 	cwd := dimStyle.Render(truncatePath(s.cwd, max(20, s.width-40)))
-	tip := dimStyle.Render("Tip: / for commands · ? for help")
+	tip := dimStyle.Render("Tip: / for commands · ! for bash · ? for help")
 	row2 := fitRow(s.width, cwd, tip)
 	return row1 + "\n" + row2
 }

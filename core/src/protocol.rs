@@ -183,8 +183,15 @@ pub enum Command {
     /// Plugin lifecycle commands. `install_plugin.path` accepts a local
     /// directory **or** a GitHub Release source (`owner/repo[@tag]`, full
     /// github.com URL). Release installs download the source `.zip`.
+    /// `scope` is `"global"` (default — `~/.catalyst-code/plugins`, every
+    /// workspace) or `"workspace"` (this repo's `.catalyst-code/plugins` only).
+    /// Workspace user-installs load without `--trust-project-plugins`.
     #[serde(rename = "install_plugin")]
-    InstallPlugin { path: String },
+    InstallPlugin {
+        path: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     #[serde(rename = "remove_plugin")]
     RemovePlugin { name: String },
     #[serde(rename = "enable_plugin")]
@@ -328,6 +335,18 @@ pub enum Command {
         model: String,
         #[serde(default)]
         reasoning_effort: Option<String>,
+    },
+    /// User-initiated bash from the composer (`!cmd` / `!!cmd`), PI-compatible.
+    /// Runs in the workspace (same sandbox/denylist as the agent `bash` tool),
+    /// emits a `bash_execution` event for the UI, and — unless
+    /// `exclude_from_context` — appends a user message with the output so the
+    /// next model turn sees it. Does **not** start an assistant turn.
+    #[serde(rename = "user_bash")]
+    UserBash {
+        command: String,
+        /// `true` for `!!cmd` — run and show output, but do not add to LLM context.
+        #[serde(default)]
+        exclude_from_context: bool,
     },
 }
 

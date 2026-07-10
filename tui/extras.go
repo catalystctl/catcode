@@ -120,12 +120,17 @@ func (s *session) copyLastAssistant() tea.Cmd {
 // Accessors
 // ---------------------------------------------------------------------------
 
-// approvalMode returns the current approval mode tracked from core events.
+// approvalMode returns the current approval mode (settings-backed, updated from
+// core events). Never returns blank — falls back to the persisted setting, then
+// destructive.
 func (s *session) approvalMode() string {
-	if s.approvalModeStr == "" {
-		return "destructive"
+	if s.approvalModeStr != "" {
+		return normalizeApproval(s.approvalModeStr)
 	}
-	return s.approvalModeStr
+	if s.settings != nil && s.settings.Approval != "" {
+		return normalizeApproval(s.settings.Approval)
+	}
+	return "destructive"
 }
 
 // ---------------------------------------------------------------------------

@@ -150,6 +150,10 @@ func initialSession() *session {
 
 	s.settings = loadSettings()
 	s.keybinds = effectiveKeybinds(s.settings.Keybinds)
+	// Seed the status-line approval from settings immediately so we don't flash
+	// the "destructive" default before the core's ready event arrives (and so a
+	// pre-ready /approval picker doesn't overwrite the saved mode).
+	s.approvalModeStr = normalizeApproval(s.settings.Approval)
 	if s.settings.Theme != "" {
 		setTheme(s.settings.Theme)
 	}
@@ -265,10 +269,8 @@ func (s *session) startCore() tea.Cmd {
 	s.coreStartGen++
 	gen := s.coreStartGen
 	bin := coreBinaryPath()
-	approval := s.settings.Approval
-	if approval == "" {
-		approval = "destructive"
-	}
+	approval := normalizeApproval(s.settings.Approval)
+	s.settings.Approval = approval
 	debugLog := filepath.Join(configDir(), "debug.jsonl")
 	args := []string{
 		"--workspace", ".",

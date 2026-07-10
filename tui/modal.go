@@ -350,9 +350,10 @@ func (s *session) openAttachModal() {
 	s.openValueEditModal(editTargetAttach, "Attach Image", "/path/to/image.png", "")
 }
 
-// openPluginInstallModal collects a local path or GitHub Release URL.
+// openPluginInstallModal collects a local path or GitHub Release URL, with an
+// optional trailing scope (global|workspace).
 func (s *session) openPluginInstallModal() {
-	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "path or github.com/owner/repo[@tag]", "")
+	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "path|url [global|workspace]", "")
 }
 
 // openSteerModal collects a mid-turn steer message.
@@ -791,7 +792,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/copy", desc: "copy last assistant reply"},
 		{label: "/attach", desc: "attach an image (vision) — path modal"},
 		{label: "/vision", desc: "configure vision models & handoff target"},
-		{label: "/plugin-install", desc: "install from path or GitHub Release URL"},
+		{label: "/plugin-install", desc: "install path/URL · optional global|workspace"},
 		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
 		{label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
@@ -966,7 +967,11 @@ func (s *session) pluginItems() []listItem {
 		version := get(m, "version")
 		desc := get(m, "description")
 		enabled := get(m, "enabled")
+		scope := get(m, "scope")
 		label := name + " v" + version
+		if scope != "" {
+			label += " · " + scope
+		}
 		var action string
 		if removeMode {
 			label += " · uninstall"
@@ -1789,9 +1794,14 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 
 // applyApprovalMode persists and sends the approval gate mode to the core.
 func (s *session) applyApprovalMode(mode string) {
+	mode = normalizeApproval(mode)
 	s.sendCore(map[string]any{"type": "set_approval", "mode": mode})
 	s.settings.Approval = mode
-	_ = s.settings.save()
+	s.approvalModeStr = mode
+	if err := s.settings.save(); err != nil {
+		s.logError(fmt.Sprintf("failed to save settings: %v", err))
+		return
+	}
 	s.logInfo("approval: " + mode)
 }
 
@@ -2253,8 +2263,13 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 			s.logError("no plugin path or GitHub URL entered")
 			return s, nil
 		}
-		s.sendCore(map[string]any{"type": "install_plugin", "path": val})
-		s.logInfo(fmt.Sprintf("installing plugin from %s…", val))
+		path, scope, err := parsePluginInstallArgs(strings.Fields(val))
+		if err != nil {
+			s.logError(err.Error())
+			return s, nil
+		}
+		s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
+		s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
 	case editTargetSteer:
 		if val == "" {
 			s.logError("no steer message entered")
@@ -2392,6 +2407,8 @@ func (s *session) helpText() string {
 		"",
 		"Slash commands",
 		"  (bare commands open modals; skills still take optional task text)",
+		"  !command         run bash and add output to model context",
+		"  !!command        run bash without adding output to context",
 		"  /login           log in / switch provider (OpenAI · Gemini · Claude · xAI · Qwen · OpenRouter · …)",
 		"  /logout          log out of a provider",
 		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
@@ -2426,7 +2443,7 @@ func (s *session) helpText() string {
 		"  /vision           configure vision models & handoff target",
 		"  /remember         save a memory note",
 		"  /memory · /forget list / forget memories",
-		"  /plugin-install   install from a directory or GitHub Release URL",
+		"  /plugin-install   install from path/URL [global|workspace]",
 		"  /plugin-config    enable / disable plugins",
 		"  /plugin-remove    uninstall a plugin",
 		"  /goal             goal mode — plan & deploy subagents (modal)",

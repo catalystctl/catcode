@@ -341,6 +341,14 @@ export type CoreEvent =
   | { type: "tool_call_args"; index: number; args: string }
   | { type: "tool_call"; id: string; name: string; args: string }
   | { type: "tool_result"; id: string; ok: boolean; output: string; diff?: string; tool?: string }
+  /** User-initiated `!cmd` / `!!cmd` (PI-compatible bang bash). */
+  | {
+      type: "bash_execution";
+      command: string;
+      output: string;
+      ok: boolean;
+      exclude_from_context?: boolean;
+    }
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
   | { type: "ask_request"; request_id: string; questions: AskQuestion[] }
   | { type: "sudo_request"; request_id: string; command: string }
@@ -421,6 +429,7 @@ export type CoreCommand =
   | { type: "send"; prompt: string; model: string; reasoning_effort?: string; images?: string[] }
   | { type: "steer"; prompt: string; model: string; reasoning_effort?: string }
   | { type: "abort" }
+  | { type: "user_bash"; command: string; exclude_from_context?: boolean }
   | { type: "reset" }
   | { type: "clear" }
   | { type: "compact"; instructions?: string }
@@ -566,7 +575,19 @@ export interface ToolMsg {
   ts: number;
 }
 
-export type UIMessage = UserMsg | AssistantMsg | ToolMsg;
+/** User-initiated bang bash (`!` / `!!`) shown in the transcript. */
+export interface BashMsg {
+  id: string;
+  role: "bash";
+  command: string;
+  output: string;
+  ok: boolean;
+  /** True for `!!cmd` — output was not added to model context. */
+  excludeFromContext?: boolean;
+  ts: number;
+}
+
+export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg;
 
 export interface Toast {
   id: string;

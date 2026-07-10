@@ -45,6 +45,8 @@ interface Props {
   skills: SkillInfo[];
   /** Invoke a skill by name with an optional follow-up task. */
   onSkill: (name: string, task?: string) => void;
+  /** PI-compatible bang bash: `!cmd` / `!!cmd`. */
+  onBash?: (command: string, excludeFromContext: boolean) => void;
 }
 
 /** Imperative handle so Chat can drive the composer from slash commands. */
@@ -115,6 +117,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     onCommand,
     skills,
     onSkill,
+    onBash,
   },
   ref,
 ) {
@@ -318,6 +321,17 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       closeFlyouts();
       return;
     }
+    // PI-compatible bang bash: `!cmd` (include in context) / `!!cmd` (exclude).
+    if (onBash && t.startsWith("!")) {
+      const exclude = t.startsWith("!!");
+      const command = (exclude ? t.slice(2) : t.slice(1)).trim();
+      if (command) {
+        onBash(command, exclude);
+        setText("");
+        closeFlyouts();
+        return;
+      }
+    }
     const imgs = images.length ? images : undefined;
     if (streaming) {
       onSteer(t);
@@ -326,7 +340,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
     setText("");
     closeFlyouts();
-  }, [text, images, streaming, onCommand, onSteer, onPrompt, onSkill, closeFlyouts]);
+  }, [text, images, streaming, onCommand, onSteer, onPrompt, onSkill, onBash, closeFlyouts]);
 
   // Run a command from the flyout by action key.
   const runCommand = useCallback(

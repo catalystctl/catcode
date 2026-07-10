@@ -12,6 +12,7 @@ const KEYBINDS: Array<[string, string]> = [
   ["Enter", "Send message"],
   ["Shift + Enter", "Newline"],
   ["/", "Open command menu"],
+  ["!", "Run bash (!cmd · !!cmd no context)"],
   ["@", "Mention a file"],
   ["↑ / ↓", "Navigate flyout"],
   ["Tab / ↵", "Confirm flyout selection"],
