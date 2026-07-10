@@ -2288,6 +2288,15 @@ pub fn is_cline_endpoint(base_url: &str) -> bool {
     endpoint_host(base_url) == "api.cline.bot"
 }
 
+/// True when `base_url` points at Anthropic's API (`api.anthropic.com`).
+/// The Claude subscription OAuth token must ONLY be sent there — never to a
+/// third-party Anthropic-compatible endpoint (a proxy, a local server) — so
+/// `enrich_oauth` resolves it only when this is true (not on `kind` alone,
+/// which would leak the token to any `kind:"anthropic"` provider).
+pub fn is_anthropic_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.anthropic.com"
+}
+
 pub fn is_kimchi_endpoint(base_url: &str) -> bool {
     let h = endpoint_host(base_url);
     h == "llm.kimchi.dev" || h.ends_with(".kimchi.dev")

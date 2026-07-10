@@ -2217,7 +2217,7 @@ fn hook_command(script: &Path) -> Command {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
+    let mut c = match ext.as_str() {
         "bat" | "cmd" | "exe" | "com" => Command::new(script),
         "ps1" => {
             let mut c = Command::new("powershell");
@@ -2252,7 +2252,28 @@ fn hook_command(script: &Path) -> Command {
             }
         }
         _ => Command::new(script),
+    };
+    // Plugin/hook/oauth scripts are untrusted user/repo code: NEVER let them
+    // inherit the parent's environment — that would leak every *_API_KEY,
+    // UMANS_*, CATALYST_CODE_* the user exported. Clear the child env and
+    // re-inject only the minimal set the interpreter + scripts need (PATH to
+    // find the interpreter and any binaries the script calls, HOME + USER for
+    // ~ expansion, TMPDIR for temp). All real context travels via the stdin
+    // JSON. Mirrors execute_bash's env_clear (tools.rs).
+    c.env_clear();
+    if let Ok(v) = std::env::var("PATH") {
+        c.env("PATH", v);
     }
+    if let Ok(v) = std::env::var("HOME") {
+        c.env("HOME", v);
+    }
+    if let Ok(v) = std::env::var("TMPDIR") {
+        c.env("TMPDIR", v);
+    }
+    if let Ok(v) = std::env::var("USER") {
+        c.env("USER", v);
+    }
+    c
 }
 
 /// Recursively copy a directory from `src` to `dst`.

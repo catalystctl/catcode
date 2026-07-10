@@ -228,16 +228,14 @@ const CLINE_REFRESH_SKEW_SECS: u64 = 300;
 // --- Kimchi browser-token login ----------------------------------------------
 // Matches 9router kimchi.js: open app.kimchi.dev/cli-auth, paste the token.
 const KIMCHI_WEB_APP_URL: &str = "https://app.kimchi.dev";
-const KIMCHI_VALIDATION_URL: &str =
-    "https://api.cast.ai/v1/llm/openai/supported-providers";
+const KIMCHI_VALIDATION_URL: &str = "https://api.cast.ai/v1/llm/openai/supported-providers";
 const KIMCHI_USERINFO_URL: &str = "https://app.kimchi.dev/api/v1/me";
 
 // --- Tencent CodeBuddy CN (device-style state poll) --------------------------
 // Matches 9router codebuddy-cn.js + refreshCodebuddyToken.
 const CODEBUDDY_STATE_URL: &str = "https://copilot.tencent.com/v2/plugin/auth/state";
 const CODEBUDDY_TOKEN_URL: &str = "https://copilot.tencent.com/v2/plugin/auth/token";
-const CODEBUDDY_REFRESH_URL: &str =
-    "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
+const CODEBUDDY_REFRESH_URL: &str = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
 const CODEBUDDY_USER_AGENT: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
 const CODEBUDDY_PLATFORM: &str = "CLI";
 const CODEBUDDY_REFRESH_SKEW_SECS: u64 = 300;
@@ -479,14 +477,8 @@ pub fn clear_oauth_creds(preset_id: &str) {
         "qwen" => {
             try_remove(stored_token_path("qwen"));
         }
-        "github"
-        | "kimi-coding"
-        | "kilocode"
-        | "cline"
-        | "clinepass"
-        | "kimchi"
-        | "codebuddy-cn"
-        | "iflow" => {
+        "github" | "kimi-coding" | "kilocode" | "cline" | "clinepass" | "kimchi"
+        | "codebuddy-cn" | "iflow" => {
             try_remove(stored_token_path(preset_id));
         }
         _ => {}
@@ -1400,7 +1392,7 @@ pub async fn enrich_oauth(
         return rp;
     }
     match rp.kind {
-        ProviderKind::Anthropic => {
+        ProviderKind::Anthropic if crate::provider::is_anthropic_endpoint(&rp.base_url) => {
             if let Some(t) = claude_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
@@ -1429,32 +1421,32 @@ pub async fn enrich_oauth(
                 inject_antigravity_headers(&mut rp.headers);
             }
         }
-        _ if crate::provider::is_xai_endpoint(&rp.base_url) || rp.name == "xai" => {
+        _ if crate::provider::is_xai_endpoint(&rp.base_url) => {
             // SuperGrok / X Premium+ subscription token when no XAI_API_KEY is set.
             if let Some(t) = xai_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_qwen_endpoint(&rp.base_url) || rp.name == "qwen" => {
+        _ if crate::provider::is_qwen_endpoint(&rp.base_url) => {
             if let Some(t) = qwen_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_github_copilot_endpoint(&rp.base_url) || rp.name == "github" => {
+        _ if crate::provider::is_github_copilot_endpoint(&rp.base_url) => {
             if let Some(t) = github_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_kimi_coding_endpoint(&rp.base_url) || rp.name == "kimi-coding" => {
+        _ if crate::provider::is_kimi_coding_endpoint(&rp.base_url) => {
             if let Some(t) = kimi_coding_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_kilocode_endpoint(&rp.base_url) || rp.name == "kilocode" => {
+        _ if crate::provider::is_kilocode_endpoint(&rp.base_url) => {
             if let Some(t) = kilocode_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
@@ -1477,10 +1469,7 @@ pub async fn enrich_oauth(
                 }
             }
         }
-        _ if crate::provider::is_cline_endpoint(&rp.base_url)
-            || rp.name == "cline"
-            || rp.name == "clinepass" =>
-        {
+        _ if crate::provider::is_cline_endpoint(&rp.base_url) => {
             let store = if rp.name == "clinepass" {
                 "clinepass"
             } else {
@@ -1491,19 +1480,19 @@ pub async fn enrich_oauth(
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_kimchi_endpoint(&rp.base_url) || rp.name == "kimchi" => {
+        _ if crate::provider::is_kimchi_endpoint(&rp.base_url) => {
             if let Some(t) = kimchi_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_codebuddy_endpoint(&rp.base_url) || rp.name == "codebuddy-cn" => {
+        _ if crate::provider::is_codebuddy_endpoint(&rp.base_url) => {
             if let Some(t) = codebuddy_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
             }
         }
-        _ if crate::provider::is_iflow_endpoint(&rp.base_url) || rp.name == "iflow" => {
+        _ if crate::provider::is_iflow_endpoint(&rp.base_url) => {
             if let Some(t) = iflow_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
@@ -1849,9 +1838,9 @@ fn google_login_manual(emit: &(dyn Fn(OAuthPrompt) + Send + Sync)) -> Result<Log
     let verifier = random_b64url(96); // 128 chars (matches gemini-cli's verifier length)
     let challenge = pkce_challenge(&verifier);
     let state = random_hex(32); // 64 hex chars
-    // MUST match the Antigravity client's registered redirect. The gemini-cli
-    // OOB URI (codeassist.google.com/authcode) is NOT registered for this client
-    // and produces Error 400: redirect_uri_mismatch.
+                                // MUST match the Antigravity client's registered redirect. The gemini-cli
+                                // OOB URI (codeassist.google.com/authcode) is NOT registered for this client
+                                // and produces Error 400: redirect_uri_mismatch.
     let redirect = ANTIGRAVITY_REDIRECT_URI.to_string();
     let redirect_enc = pct_encode(&redirect);
     let scope_enc = pct_encode(&google_scope_string());
@@ -3454,7 +3443,6 @@ pub async fn kilocode_login(
     }
 }
 
-
 // --- Cline / ClinePass -------------------------------------------------------
 
 fn cline_workos_token(token: &str) -> String {
@@ -3564,9 +3552,7 @@ async fn cline_family_token(client: &reqwest::Client, store: &str) -> Option<Str
     if tok.access_token.is_empty() {
         return None;
     }
-    if tok.expires_at == 0
-        || tok.expires_at > now_secs().saturating_add(CLINE_REFRESH_SKEW_SECS)
-    {
+    if tok.expires_at == 0 || tok.expires_at > now_secs().saturating_add(CLINE_REFRESH_SKEW_SECS) {
         return Some(tok.access_token);
     }
     refresh_cline_family_token(client, store, &tok).await
@@ -3658,7 +3644,9 @@ pub async fn complete_cline_login(
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("Cline token exchange failed (HTTP {status}): {body}"));
+        return Err(format!(
+            "Cline token exchange failed (HTTP {status}): {body}"
+        ));
     }
     let data = body.get("data").cloned().unwrap_or(body);
     let access = data
@@ -3791,10 +3779,7 @@ fn codebuddy_auth_headers() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-async fn refresh_codebuddy_token(
-    client: &reqwest::Client,
-    tok: &OAuthToken,
-) -> Option<String> {
+async fn refresh_codebuddy_token(client: &reqwest::Client, tok: &OAuthToken) -> Option<String> {
     let refresh = tok.refresh_token.as_deref()?;
     let mut req = client
         .post(CODEBUDDY_REFRESH_URL)
@@ -3855,7 +3840,9 @@ pub async fn codebuddy_login(
     emit: &(dyn Fn(OAuthPrompt) + Send + Sync),
 ) -> Result<LoginOutcome, String> {
     let mut req = client
-        .post(format!("{CODEBUDDY_STATE_URL}?platform={CODEBUDDY_PLATFORM}"))
+        .post(format!(
+            "{CODEBUDDY_STATE_URL}?platform={CODEBUDDY_PLATFORM}"
+        ))
         .header("Content-Type", "application/json")
         .body("{}");
     for (k, v) in codebuddy_auth_headers() {
@@ -3893,9 +3880,7 @@ pub async fn codebuddy_login(
     let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if Instant::now() >= deadline {
-            return Err(
-                "Timed out waiting for CodeBuddy authorization. Run /login again.".into(),
-            );
+            return Err("Timed out waiting for CodeBuddy authorization. Run /login again.".into());
         }
         let mut req = client.get(format!(
             "{CODEBUDDY_TOKEN_URL}?state={}",
@@ -3945,8 +3930,7 @@ pub async fn codebuddy_login(
                 id_token: None,
                 extra: None,
             };
-            store_token("codebuddy-cn", &tok)
-                .ok_or("could not write CodeBuddy credentials")?;
+            store_token("codebuddy-cn", &tok).ok_or("could not write CodeBuddy credentials")?;
             return Ok(LoginOutcome::Done);
         }
         // 11217 = pending (RetryFetchToken)
@@ -3994,7 +3978,9 @@ async fn iflow_fetch_api_key(
     if body.get("success").and_then(Value::as_bool) == Some(false) {
         return Err(format!(
             "iFlow userInfo failed: {}",
-            body.get("message").and_then(Value::as_str).unwrap_or("unknown")
+            body.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
     let data = body.get("data").cloned().unwrap_or(body);
@@ -4050,9 +4036,7 @@ async fn iflow_token(client: &reqwest::Client) -> Option<String> {
         return None;
     }
     // access_token field holds the account apiKey used for chat.
-    if tok.expires_at == 0
-        || tok.expires_at > now_secs().saturating_add(IFLOW_REFRESH_SKEW_SECS)
-    {
+    if tok.expires_at == 0 || tok.expires_at > now_secs().saturating_add(IFLOW_REFRESH_SKEW_SECS) {
         return Some(tok.access_token);
     }
     refresh_iflow_token(client, &tok).await
@@ -4312,7 +4296,10 @@ mod tests {
         ] {
             assert!(supports_login(provider), "{provider} must support /login");
         }
-        assert_eq!(CLINE_AUTHORIZE_URL, "https://api.cline.bot/api/v1/auth/authorize");
+        assert_eq!(
+            CLINE_AUTHORIZE_URL,
+            "https://api.cline.bot/api/v1/auth/authorize"
+        );
         assert_eq!(IFLOW_CLIENT_ID, "10009311001");
         assert_eq!(
             CODEBUDDY_STATE_URL,
@@ -4531,7 +4518,10 @@ mod tests {
             !url.contains("codeassist.google.com"),
             "must not use gemini-cli OOB redirect: {url}"
         );
-        assert!(url.contains("prompt=consent"), "should request offline consent");
+        assert!(
+            url.contains("prompt=consent"),
+            "should request offline consent"
+        );
         match outcome {
             LoginOutcome::AwaitingCode { pending } => {
                 assert_eq!(pending.redirect_uri, ANTIGRAVITY_REDIRECT_URI);
@@ -4540,6 +4530,5 @@ mod tests {
             }
             LoginOutcome::Done => panic!("expected AwaitingCode, got Done"),
         }
-
     }
 }

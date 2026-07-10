@@ -4187,8 +4187,21 @@ async fn run_turn(
         let auto_compact = st.cfg.read().await.auto_compact;
         if auto_compact && last.elapsed().as_secs() > 3600 {
             let mut messages = st.conversation.lock().await.clone();
-            if messages.len() > 4 {
-                let est = { *st.estimated_tokens.lock().await };
+            let est = *st.estimated_tokens.lock().await;
+            // Fire idle compaction for tiny chats only when there's real
+            // content, but ALWAYS when the estimate is near the context
+            // window — a few-but-huge conversation (e.g. one giant pasted
+            // message) must compact even with <4 messages so the next turn
+            // doesn't hit an unrecoverable 400.
+            let idle_ctx = st
+                .models
+                .read()
+                .await
+                .iter()
+                .find(|m| m.id == model)
+                .map(|m| m.context_window as u64)
+                .unwrap_or(200_000);
+            if messages.len() > 4 || est > (idle_ctx as f32 * 0.95) as u64 {
                 emit(
                     &Event::new("compacting")
                         .with("before_tokens", json!(est))
@@ -4197,14 +4210,6 @@ async fn run_turn(
                 dispatch_lifecycle(st, "pre_compact").await;
                 let cfg = st.cfg.read().await.clone();
                 let rp = st.resolve_provider_for_model(&model).await;
-                let idle_ctx = st
-                    .models
-                    .read()
-                    .await
-                    .iter()
-                    .find(|m| m.id == model)
-                    .map(|m| m.context_window as u64)
-                    .unwrap_or(200_000);
                 let summary_chars = if rp.api_key.is_some() {
                     compact_with_summary(
                         client,
@@ -4357,8 +4362,11 @@ async fn run_turn(
                 );
             }
         }
-        if cfg.auto_compact && est > threshold.min(hard_cap) && messages.len() > 4 {
-            let force_summarize = est > hard_cap;
+        let force_summarize = est > hard_cap;
+        if cfg.auto_compact
+            && est > threshold.min(hard_cap)
+            && (force_summarize || messages.len() > 4)
+        {
             emit(
                 &Event::new("compacting")
                     .with("before_tokens", json!(est))
@@ -4537,6 +4545,18 @@ async fn run_turn(
         match tool_calls {
             Some(calls) if !calls.is_empty() => {
                 for tc in &calls {
+                    // Honor an abort mid-batch: without this, the synchronous
+                    // fall-through tools (write_file/edit/patch/read_file/…)
+                    // run to completion after the user hit /abort — only
+                    // bash/fetch/web_search/diagnostics were cancel-wrapped.
+                    // Check before each call so a batch's remaining
+                    // destructive writes don't execute once the turn is
+                    // cancelled. (Any orphaned tool_calls this leaves are
+                    // repaired by the always-run sanitizer next turn.)
+                    if cancel.is_cancelled() {
+                        emit(&Event::new("aborted"));
+                        return;
+                    }
                     let id = tc.id.clone();
                     let name = tc.function.name.clone();
                     let args_str = tc.function.arguments.clone();
@@ -5749,6 +5769,75 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Message>, keep: usize) -> us
 }
 
 /// Build a one-line digest for a tool result, preserving enough to navigate
+/// Reclaim oversized assistant `tool_call.arguments` (H3): the tool-result
+/// digest (`digest_to_budget`'s main loop) only collapses `role:"tool"`
+/// messages, so a huge NON-tool message — an assistant tool_call whose
+/// `arguments` JSON embeds a large payload (a `write_file`'s `content`, an
+/// `edit`'s `edits`, a `patch`'s diff) — survives compaction untouched. If it
+/// lands in the kept tail and alone approaches the window, the next request
+/// is oversized → HTTP 400 that repeats every turn. This replaces that payload
+/// field with a one-line digest (keeping id/name + valid JSON) oldest-first
+/// until `messages` fits `budget`. Returns the count digested.
+fn digest_oversized_call_args(messages: &mut [Message], budget: u64) -> usize {
+    if estimate_messages_tokens(messages) <= budget {
+        return 0;
+    }
+    let mut changed = 0usize;
+    for i in 0..messages.len() {
+        if estimate_messages_tokens(messages) <= budget {
+            break;
+        }
+        // Borrow this one message mutably (the immutable budget-check borrow
+        // above has already ended at the `;`).
+        if let Message::Assistant {
+            ref mut tool_calls, ..
+        } = messages[i]
+        {
+            if let Some(calls) = tool_calls.as_mut() {
+                for tc in calls.iter_mut() {
+                    if tc.function.arguments.len() <= 2048 {
+                        continue;
+                    }
+                    if let Some(digested) =
+                        digest_call_args_field(&tc.function.name, &tc.function.arguments)
+                    {
+                        tc.function.arguments = digested;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// If a tool-call's `arguments` JSON embeds a large payload field, replace just
+/// that field with a one-line digest, keeping the rest of the args + valid
+/// JSON. Returns the new arguments string, or `None` when there is nothing to
+/// trim (unknown tool, missing field, or the field is already small).
+fn digest_call_args_field(tool: &str, args_json: &str) -> Option<String> {
+    let mut v: Value = serde_json::from_str(args_json).ok()?;
+    let field = match tool {
+        "write_file" => "content",
+        "edit" | "bulk_edit" => "edits",
+        "patch" => "patch",
+        "bulk_write" => "files",
+        _ => return None,
+    };
+    let obj = v.as_object_mut()?;
+    let cur = obj.get(field)?;
+    let cur_len = serde_json::to_string(cur).map(|s| s.len()).unwrap_or(0);
+    if cur_len <= 2048 {
+        return None;
+    }
+    let digest = format!(
+        "[digested: {} `{}` was {} bytes — re-run to regenerate]",
+        tool, field, cur_len
+    );
+    obj.insert(field.to_string(), Value::String(digest));
+    Some(serde_json::to_string(&v).unwrap_or_else(|_| args_json.to_string()))
+}
+
 /// Last-resort token reclaim for compaction: collapse oversized `role:"tool"`
 /// results into one-line digests until `messages` fits under `budget` tokens.
 /// Unlike `digest_stale_tool_results` (which only touches results older than a
@@ -5816,6 +5905,13 @@ fn digest_to_budget(messages: &mut [Message], budget: u64) -> usize {
             changed += 1;
         }
     }
+    // Also reclaim huge NON-tool messages: an assistant tool_call.arguments
+    // (e.g. a write_file of a large file, whose content lives in the args JSON)
+    // is never touched by the tool-result digest above, so a single such
+    // message in the kept tail can keep the request oversized → HTTP 400 that
+    // repeats every turn. Replace the large payload field with a one-line
+    // digest (id/name kept) so the model still sees the call shape.
+    changed += digest_oversized_call_args(messages, budget);
     changed
 }
 
@@ -6414,6 +6510,46 @@ mod compact_tests {
         assert!(
             s >= m.len() - 7 && s <= m.len() - 6,
             "kept the giant result + min tail: {s}"
+        );
+    }
+
+    #[test]
+    fn digest_to_budget_reclaims_huge_tool_call_arguments() {
+        // H3: an assistant tool_call whose `arguments` JSON embeds a huge
+        // payload (a write_file of a large file) is a NON-tool message, so the
+        // tool-result digest loop never touches it. digest_to_budget must also
+        // replace that payload field with a one-line digest so a single such
+        // message in the kept tail can't keep the request oversized → 400.
+        let huge = "x".repeat(40_000);
+        let args = format!(
+            "{{\"path\":\"big.rs\",\"content\":{}}}",
+            serde_json::to_string(&huge).unwrap()
+        );
+        let mut m = vec![
+            sys(),
+            asst_tool_call("c1", "write_file", &args),
+            tool_result("c1", "ok"),
+        ];
+        // budget well under the args size → must digest the call args
+        let n = digest_to_budget(&mut m, 1000);
+        assert!(n >= 1, "should digest the oversized call args: {n}");
+        let call_args = match &m[1] {
+            Message::Assistant { tool_calls, .. } => {
+                tool_calls.as_ref().unwrap()[0].function.arguments.clone()
+            }
+            _ => panic!("expected assistant tool_call"),
+        };
+        assert!(
+            !call_args.contains(&huge),
+            "huge content should be replaced"
+        );
+        assert!(
+            call_args.contains("digested"),
+            "should carry the digest marker: {call_args}"
+        );
+        assert!(
+            call_args.contains("\"path\":\"big.rs\""),
+            "path field should be preserved: {call_args}"
         );
     }
 

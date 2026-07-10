@@ -1415,6 +1415,16 @@ async fn run_agent_inner(
         }
 
         for call in &calls {
+            // Honor an abort/interrupt mid-batch: without this, the
+            // synchronous fall-through tools (write_file/edit/patch/
+            // read_file/…) run to completion after the subagent was
+            // interrupted — only bash/fetch/web_search/diagnostics were
+            // cancel-wrapped. Check before each call so a batch's remaining
+            // destructive writes don't execute once cancelled.
+            if cancel.is_cancelled() {
+                emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
+                return Outcome::ok("[subagent aborted]");
+            }
             let id = call.id.clone();
             let name = call.function.name.clone();
             let args_str = call.function.arguments.clone();

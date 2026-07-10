@@ -138,7 +138,7 @@ pub fn save_escalations(session_path: &Path, kinds: &std::collections::HashSet<S
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = p.with_extension("esc.tmp");
+    let tmp = crate::fsutil::unique_tmp(&p);
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -191,7 +191,7 @@ pub fn save_stats(session_path: &Path, stats: &SessionStats) {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = p.with_extension("stats.tmp");
+    let tmp = crate::fsutil::unique_tmp(&p);
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -220,7 +220,7 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = crate::fsutil::unique_tmp(path);
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .truncate(true)

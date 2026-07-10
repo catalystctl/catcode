@@ -73,11 +73,36 @@ fn ip_is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// Hostnames that resolve to a private/loopback/internal address but don't
+/// parse as an IP literal, so `ip_is_private` misses them. Blocking them by
+/// name closes the SSRF gap where `fetch http://localhost:…` (or a redirect
+/// to `metadata.google.internal`) reaches a local/internal service under the
+/// default empty allowlist. An explicit `fetch_allowlist` entry overrides this.
+fn hostname_is_private(host: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.google.internal.",
+        "metadata.aws.internal",
+        "metadata.azure.com",
+        "ip6-allnodes",
+        "ip6-allrouters",
+        "broadcasthost",
+    ];
+    BLOCKED.iter().any(|b| b.eq_ignore_ascii_case(host))
+}
+
 /// Is `host` a private address? Checks IP literals directly (no DNS — fast and
 /// side-effect-free, so it's safe in the sync redirect policy). A hostname
 /// that resolves to a private IP is a residual risk controlled by the
 /// allowlist; we deliberately don't do DNS here to keep the check hang-proof.
 fn host_is_private(host: &str) -> bool {
+    if hostname_is_private(host) {
+        return true;
+    }
     match host.parse::<IpAddr>() {
         Ok(ip) => ip_is_private(ip),
         Err(_) => false,
@@ -364,6 +389,26 @@ mod tests {
             parse_http_host("http://[::1]:8080/x"),
             Some(("http".into(), "::1".into()))
         );
+    }
+
+    #[test]
+    fn hostname_aliases_blocked() {
+        // H6: hostnames that resolve to loopback/internal but don't parse as
+        // IP literals must be blocked, else `fetch http://localhost:…` (or a
+        // redirect to metadata.google.internal) reaches a local/internal
+        // service under the default empty allowlist.
+        for h in [
+            "localhost",
+            "LOCALHOST",
+            "ip6-localhost",
+            "ip6-loopback",
+            "metadata.google.internal",
+            "metadata",
+        ] {
+            assert!(hostname_is_private(h), "{} should be private", h);
+        }
+        // a real public host is not private
+        assert!(!hostname_is_private("example.com"));
     }
 
     #[test]
