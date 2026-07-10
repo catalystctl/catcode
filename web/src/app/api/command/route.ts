@@ -13,14 +13,15 @@
 // client can switch its active session.
 
 import { getBridge } from "@/server/core-bridge";
-import { authorized } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import type { CoreCommand } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
-  if (!authorized(req)) return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  if (!(await getSession(req.headers)))
+    return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
   const bridge = getBridge();
 
   let body: Record<string, unknown>;

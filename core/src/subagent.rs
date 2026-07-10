@@ -1871,9 +1871,7 @@ fn resolve_model_candidates(
     // an active goal is constraining the run. Falls back to parent_model (or
     // first allowed model) if everything was filtered out.
     if let Ok(g) = st.goal.try_lock() {
-        if g.is_active()
-            && (!g.allowed_models.is_empty() || !g.allowed_providers.is_empty())
-        {
+        if g.is_active() && (!g.allowed_models.is_empty() || !g.allowed_providers.is_empty()) {
             let model_providers: std::collections::HashMap<String, String> = st
                 .models
                 .try_read()

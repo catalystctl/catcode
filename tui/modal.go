@@ -1969,7 +1969,7 @@ func (s *session) openOauthCodeModal() {
 	s.modal.editing = true
 	ti := textinput.New()
 	ti.Prompt = ""
-	ti.Placeholder = "paste the code from codeassist.google.com"
+	ti.Placeholder = "paste code or full localhost:51121 redirect URL"
 	ti.Focus()
 	s.modal.editBuf = ti
 }
@@ -1982,7 +1982,7 @@ func (s *session) renderOauthCodeModal() string {
 	val := s.modal.editBuf.Value()
 	return s.renderListModal("Paste Google OAuth Code", []listItem{{
 		label: val,
-		desc:  "paste the code from codeassist.google.com, then Enter (Esc to cancel)",
+		desc:  "paste the code (or full localhost:51121 URL) from the browser redirect, then Enter (Esc to cancel)",
 	}}, true)
 }
 
@@ -2391,7 +2391,7 @@ func (s *session) helpText() string {
 		"",
 		"Slash commands",
 		"  (bare commands open modals; skills still take optional task text)",
-		"  /login           log in / switch provider (OpenAI · Gemini · Anthropic)",
+		"  /login           log in / switch provider (OpenAI · Gemini · Claude · xAI · Qwen · OpenRouter · …)",
 		"  /logout          log out of a provider",
 		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
 		"  /key             set API key for active provider",

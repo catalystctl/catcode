@@ -8,16 +8,26 @@
 # build) is needed on the host. The TUI needs zero host deps; the web
 # service only needs a Node OR Bun runtime to run (not to build).
 #
-#   bash install.sh                       # download + install catcode
+#   bash install.sh                       # interactive menu (no args, in a terminal)
+#   bash install.sh --install             # download + install catcode (skip menu)
 #   bash install.sh --with-web             # …also install the web service
+#   bash install.sh --add-web              # add the web service to an existing install
+#   bash install.sh --update               # re-download latest + reinstall
+#   bash install.sh --reinstall            # reinstall the currently-installed version
+#   bash install.sh --uninstall            # remove everything
+#   bash install.sh --status               # show the current install state
 #   bash install.sh --version 0.2.0        # pin a version
 #   bash install.sh --base-url <url>       # download from a mirror (not GitHub)
 #   bash install.sh --build-from-source    # fall back to cargo+go+next build
-#   bash install.sh --update               # re-download latest + reinstall
-#   bash install.sh --uninstall            # remove everything
 #
 # Options:
+#   --install             install (skip the interactive menu)
 #   --with-web            install the web frontend service
+#   --add-web             add the web service to an existing install
+#   --update              re-download latest + reinstall
+#   --reinstall           reinstall the currently-installed version
+#   --uninstall           remove everything
+#   --status              show the current install state
 #   --version <v>         pin a release version (e.g. 0.2.0 or v0.2.0)
 #   --base-url <url>      download base URL (default: GitHub Releases)
 #   --build-from-source   build locally instead of downloading prebuilt
@@ -253,6 +263,9 @@ parse_args() {
       --install)            ACTION="install" ;;
       --update|--upgrade)   ACTION="update" ;;
       --uninstall)          ACTION="uninstall" ;;
+      --add-web)            ACTION="add-web" ;;
+      --reinstall)          ACTION="reinstall" ;;
+      --status)             ACTION="status" ;;
       --dry-run)            DRY_RUN=true ;;
       --with-web)           WITH_WEB=true ;;
       --build-from-source)  BUILD_FROM_SOURCE=true; METHOD="source" ;;
@@ -1021,6 +1034,142 @@ do_uninstall() {
   summary_uninstall
 }
 
+# ── add-web: install the web service onto an existing install ─
+do_add_web() {
+  phase "Reading previous install state"
+  if ! load_state; then
+    die "no previous install found at $STATE_FILE — run 'bash install.sh' first to install catcode."
+  fi
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    log_warn "web service is already installed — reinstalling it"
+  fi
+  WITH_WEB=true
+  if [[ "${METHOD:-download}" == "source" ]]; then
+    do_add_web_source
+  else
+    do_add_web_download
+  fi
+  save_state
+  summary_add_web
+}
+
+do_add_web_download() {
+  phase "Checking dependencies"
+  check_deps_download
+  ensure_sudo
+  phase "Resolving release (matching installed version ${VERSION:-latest})"
+  detect_os_tag
+  detect_arch
+  VERSION_OVERRIDE="${VERSION:-}"
+  resolve_release
+  log_info "Version:  $VER (tag $TAG)"
+  log_info "Prefix:   $PREFIX"
+  # preserve a custom web dir recorded by the previous install
+  [[ -n "${WEB_DIR:-}" ]] && WEB_DIR_OVERRIDE="$WEB_DIR"
+
+  phase "Installing catcode-core (for the web service)"
+  local core_asset="catcode-core-${VER}-${OS_TAG}-${ARCH}"
+  fetch_asset "$core_asset"
+  run_root "Creating $PREFIX" mkdir -p "$PREFIX"
+  run_root "Installing catcode-core -> $PREFIX/catcode-core" install -m 0755 "$TMPDIR_SELF/$core_asset" "$PREFIX/catcode-core"
+
+  phase "Installing web service (prebuilt)"
+  install_web_download
+}
+
+do_add_web_source() {
+  phase "Checking dependencies (source build)"
+  check_deps_source
+  ensure_sudo
+  if [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR" ]]; then
+    cd "$REPO_DIR"
+  else
+    resolve_repo
+  fi
+  detect_version
+  phase "Building Rust core (catcode-core)"
+  build_core
+  phase "Building web frontend (SDK + Next.js)"
+  build_web_source
+  phase "Installing catcode-core"
+  install_bins_source
+  phase "Installing web service"
+  install_web_service_source
+}
+
+# ── reinstall: reinstall the currently-installed version ─────
+do_reinstall() {
+  phase "Reading previous install state"
+  if ! load_state; then
+    die "no previous install found at $STATE_FILE — run 'bash install.sh' first."
+  fi
+  VERSION_OVERRIDE="${VERSION:-}"
+  [[ "${WEB_INSTALLED:-no}" == yes ]] && WITH_WEB=true
+  log_info "Reinstalling version ${VERSION:-latest} (method: ${METHOD:-download}, web: ${WEB_INSTALLED:-no})"
+  if [[ "${METHOD:-download}" == "source" ]]; then
+    do_reinstall_source
+  else
+    do_install_download
+  fi
+}
+
+do_reinstall_source() {
+  phase "Rebuilding from source (no git pull)"
+  if [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR" ]]; then
+    cd "$REPO_DIR"
+  else
+    resolve_repo
+  fi
+  detect_version
+  ensure_sudo
+  phase "Rebuilding Rust core"
+  build_core
+  phase "Rebuilding Go TUI"
+  build_tui
+  phase "Reinstalling binaries"
+  install_bins_source
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    WITH_WEB=true
+    phase "Rebuilding web frontend"
+    build_web_source
+    phase "Restarting web service"
+    restart_web_service_source
+  fi
+  save_state
+  summary_install
+}
+
+# ── status: show the current install state ───────────────────
+do_status() {
+  phase "Install status"
+  if ! load_state; then
+    log_warn "no previous install found at $STATE_FILE"
+    log_info "Catalyst Code does not appear to be installed (no state file)."
+    return 0
+  fi
+  log_info "Version:      ${VERSION:-(unknown)}"
+  log_info "Method:       ${METHOD:-download}"
+  log_info "Prefix:       ${PREFIX:-/usr/local/bin}"
+  log_info "Web service:  ${WEB_INSTALLED:-no}"
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    log_info "Web dir:      ${WEB_DIR:-(unknown)}"
+    log_info "Web address:  http://${HOST:-0.0.0.0}:${PORT:-49283}"
+  fi
+  log_info "Installed at: ${INSTALLED_AT:-(unknown)}"
+  if [[ -x "${PREFIX:-/usr/local/bin}/catcode" ]]; then
+    log_ok "catcode present at ${PREFIX:-/usr/local/bin}/catcode"
+  else
+    log_warn "catcode NOT found at ${PREFIX:-/usr/local/bin}/catcode"
+  fi
+  if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
+    if [[ -x "${PREFIX:-/usr/local/bin}/catcode-core" ]]; then
+      log_ok "catcode-core present at ${PREFIX:-/usr/local/bin}/catcode-core"
+    else
+      log_warn "catcode-core NOT found at ${PREFIX:-/usr/local/bin}/catcode-core"
+    fi
+  fi
+}
+
 # ── summaries ───────────────────────────────────────────────
 summary_install() {
   local web_line="(not installed — run with --with-web)"
@@ -1076,9 +1225,71 @@ summary_uninstall() {
   fi
 }
 
+summary_add_web() {
+  local svc_id="$UNIT_NAME"
+  [[ "$PLATFORM" == "Darwin" ]] && svc_id="$LAUNCHD_LABEL (launchd)"
+  print_box "✓  Web service added  ${APP_NAME}  v${VERSION_DETECTED}" \
+    "core:      $PREFIX/catcode-core" \
+    "web:       http://${HOST}:${PORT}  (running as $svc_id)" \
+    "service:   $svc_id  (enabled, auto-restart)" \
+    "update:    bash install.sh --update" \
+    "uninstall: bash install.sh --uninstall"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    log_info "Web service logs:  tail -f $HOME/Library/Logs/catalyst-code-web.log"
+  else
+    log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
+  fi
+  log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
+}
+
+# ── interactive menu (no args + a terminal) ──────────────────
+show_menu() {
+  local v=""
+  [[ -f "$STATE_FILE" ]] && v="$(grep -E '^VERSION=' "$STATE_FILE" 2>/dev/null | head -1 | sed -E 's/.*="([^"]*)".*/\1/')"
+  local status_line="not installed"
+  [[ -n "$v" ]] && status_line="installed v${v}"
+  print_box "Catalyst Code — installer menu" \
+    "platform: ${PLATFORM} (${SVC_MGR})" \
+    "status:   ${status_line}"
+  local choice
+  while true; do
+    cat <<EOF
+  ${C_DIM}What would you like to do?${C_RST}
+
+    ${C_BOLD}1${C_RST}  Install              ${C_DIM}catcode TUI + core${C_RST}
+    ${C_BOLD}2${C_RST}  Install with web     ${C_DIM}TUI + core + 24/7 web service${C_RST}
+    ${C_BOLD}3${C_RST}  Add web service      ${C_DIM}add web to an existing install${C_RST}
+    ${C_BOLD}4${C_RST}  Update               ${C_DIM}download latest + reinstall${C_RST}
+    ${C_BOLD}5${C_RST}  Reinstall            ${C_DIM}reinstall the current version${C_RST}
+    ${C_BOLD}6${C_RST}  Uninstall            ${C_DIM}remove everything${C_RST}
+    ${C_BOLD}7${C_RST}  Status               ${C_DIM}show current install state${C_RST}
+    ${C_BOLD}0${C_RST}  Exit
+
+EOF
+    read -rp "  ${C_CYAN}Select [0-7]:${C_RST} " choice || { printf "\n  ${C_DIM}Bye.${C_RST}\n"; exit 0; }
+    case "$choice" in
+      1) ACTION="install"; break ;;
+      2) ACTION="install"; WITH_WEB=true; break ;;
+      3) ACTION="add-web"; break ;;
+      4) ACTION="update"; break ;;
+      5) ACTION="reinstall"; break ;;
+      6) ACTION="uninstall"; break ;;
+      7) ACTION="status"; break ;;
+      0) printf "  ${C_DIM}Bye.${C_RST}\n"; exit 0 ;;
+      *) printf "  ${C_YELLOW}invalid choice — try again${C_RST}\n" ;;
+    esac
+  done
+}
+
 # ── main ────────────────────────────────────────────────────
 main() {
-  parse_args "$@"
+  # No arguments + a real terminal → interactive menu. Anything else (flags,
+  # or a non-TTY stdin such as `curl … | bash`) runs the action directly.
+  if [[ $# -eq 0 && -t 0 ]]; then
+    show_menu
+  else
+    parse_args "$@"
+  fi
   if ! $USE_COLOR; then
     C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_DIM=""; C_BOLD=""; C_RST=""
   fi
@@ -1090,6 +1301,9 @@ main() {
     install)   do_install ;;
     update)    do_update ;;
     uninstall) do_uninstall ;;
+    add-web)   do_add_web ;;
+    reinstall) do_reinstall ;;
+    status)    do_status ;;
     *)         die "unknown action: $ACTION" ;;
   esac
 }

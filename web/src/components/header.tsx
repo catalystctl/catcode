@@ -76,7 +76,7 @@ export function Header(props: Props) {
       {/* Brand + workspace */}
       <div className="flex min-w-0 items-center gap-2">
         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-accent to-accent-deep text-sm font-bold text-white shadow-glow">
-          u
+          c
         </span>
         <div className="hidden min-w-0 sm:block">
           <div className="flex items-center gap-1 text-[13px] font-semibold text-ink-100">
@@ -143,7 +143,7 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {thinkOpen && (
-          <div role="menu" className="absolute right-0 z-30 mt-1 w-32 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
+          <div role="menu" className="absolute right-0 z-30 mt-1 w-40 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
             {effLevels.map((lv) => (
               <button
                 key={lv}

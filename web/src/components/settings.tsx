@@ -10,6 +10,7 @@ import type { ModelInfo, ReadyPayload } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, ModelIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
+import { AccountSecurity } from "./account-security";
 
 interface Props {
   ready: ReadyPayload | null;
@@ -76,6 +77,11 @@ export function SettingsModal(props: Props) {
         </div>
 
         <div className="overflow-y-auto px-5 py-4">
+          {/* Account & security */}
+          <Section label="Account & security">
+            <AccountSecurity />
+          </Section>
+
           {/* Model */}
           <Section label="Model">
             <div className="overflow-hidden rounded-xl border border-ink-800">

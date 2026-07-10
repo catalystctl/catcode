@@ -259,6 +259,15 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
                 "gemini" => oauth::has_google_creds(),
                 "anthropic" => oauth::has_claude_creds(),
                 "xai" => oauth::has_xai_creds(),
+                "qwen" => oauth::has_qwen_creds(),
+                "github" => oauth::has_github_creds(),
+                "kimi-coding" => oauth::has_kimi_coding_creds(),
+                "kilocode" => oauth::has_kilocode_creds(),
+                "cline" => oauth::has_cline_creds(),
+                "clinepass" => oauth::has_clinepass_creds(),
+                "kimchi" => oauth::has_kimchi_creds(),
+                "codebuddy-cn" => oauth::has_codebuddy_creds(),
+                "iflow" => oauth::has_iflow_creds(),
                 _ => false,
             };
             let has_key = p.env_key().is_some()
@@ -287,7 +296,10 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
     // (built-in presets win on a colliding id).
     if let Some(pm) = pm {
         for c in pm.oauth_configs() {
-            if config::PROVIDER_PRESETS.iter().any(|p| p.id == c.provider_id) {
+            if config::PROVIDER_PRESETS
+                .iter()
+                .any(|p| p.id == c.provider_id)
+            {
                 continue;
             }
             let configured = cfg.find_provider(&c.provider_id).is_some();
@@ -442,17 +454,16 @@ pub struct State {
 /// success + provider_changed events, and refresh the model list.
 /// Uses the free `protocol::emit` so this is safe to call from a `tokio::spawn`
 /// task (no non-Send `&dyn Fn` borrow).
-async fn finalize_oauth(
-    state: &State,
-    client: &reqwest::Client,
-    preset: &str,
-    label: &str,
-) {
+async fn finalize_oauth(state: &State, client: &reqwest::Client, preset: &str, label: &str) {
     {
         let mut cfg = state.cfg.write().await;
         if cfg.find_provider(preset).is_none() {
             if let Some(p) = config::find_preset(preset) {
-                cfg.providers.push(p.to_provider_config(None));
+                // OAuth-created configs need the same provider-specific
+                // transport headers as API-key configs (Copilot and Kimi are
+                // validated against their official client identities).
+                cfg.providers
+                    .extend(config::preset_provider_configs(p, None));
             } else if let Some(p) = state.plugin_manager.oauth_provider_config(preset) {
                 // A plugin-declared OAuth provider (no built-in preset): build
                 // the config from the plugin's declared base_url/kind/headers.
@@ -471,7 +482,7 @@ async fn finalize_oauth(
     emit(&Event::new("info").with(
         "message",
         json!(format!(
-            "logged into {label} via OAuth — you're signed in. Pick a Grok model with /models if needed."
+            "logged into {label} via OAuth — you're signed in. Pick a model with /models if needed."
         )),
     ));
     // TUI gates prompt send on `authed`; API-key login emits this, OAuth must too.
@@ -613,7 +624,14 @@ impl State {
         let cfg = self.cfg.read().await.clone();
         let keys = self.api_keys.read().await.clone();
         let active = self.active_provider.read().await.clone();
-        aggregate_models_for(&cfg, &keys, active.as_deref(), client, Some(&self.plugin_manager)).await
+        aggregate_models_for(
+            &cfg,
+            &keys,
+            active.as_deref(),
+            client,
+            Some(&self.plugin_manager),
+        )
+        .await
     }
 
     /// Re-aggregate models, store them, and emit a `models` event + a refreshed
@@ -769,6 +787,33 @@ fn oauth_creds_for_provider(
     // /models never shows Grok and the TUI looks like sign-in failed.
     if provider::is_xai_endpoint(&p.base_url) || p.name == "xai" {
         return oauth::has_xai_creds();
+    }
+    if provider::is_qwen_endpoint(&p.base_url) || p.name == "qwen" {
+        return oauth::has_qwen_creds();
+    }
+    if provider::is_github_copilot_endpoint(&p.base_url) || p.name == "github" {
+        return oauth::has_github_creds();
+    }
+    if provider::is_kimi_coding_endpoint(&p.base_url) || p.name == "kimi-coding" {
+        return oauth::has_kimi_coding_creds();
+    }
+    if provider::is_kilocode_endpoint(&p.base_url) || p.name == "kilocode" {
+        return oauth::has_kilocode_creds();
+    }
+    if provider::is_cline_endpoint(&p.base_url) || p.name == "cline" {
+        return oauth::has_cline_creds();
+    }
+    if provider::is_cline_endpoint(&p.base_url) || p.name == "clinepass" {
+        return oauth::has_clinepass_creds();
+    }
+    if provider::is_kimchi_endpoint(&p.base_url) || p.name == "kimchi" {
+        return oauth::has_kimchi_creds();
+    }
+    if provider::is_codebuddy_endpoint(&p.base_url) || p.name == "codebuddy-cn" {
+        return oauth::has_codebuddy_creds();
+    }
+    if provider::is_iflow_endpoint(&p.base_url) || p.name == "iflow" {
+        return oauth::has_iflow_creds();
     }
     false
 }
@@ -1306,8 +1351,14 @@ async fn main() {
     // persisted ones already in cfg, so this resolves from config/env.
     let init_provider = cfg.resolve_provider(&HashMap::new());
     let init_keys = cfg.persisted_keys.clone();
-    let models =
-        aggregate_models_for(&cfg, &init_keys, cfg.active_provider.as_deref(), &client, None).await;
+    let models = aggregate_models_for(
+        &cfg,
+        &init_keys,
+        cfg.active_provider.as_deref(),
+        &client,
+        None,
+    )
+    .await;
     let logger = Logger::new(cfg.debug_log.as_deref());
     logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
 
@@ -1570,7 +1621,10 @@ async fn main() {
                         .with("provider", json!(rp.name))
                         .with("providerKind", json!(rp.kind.as_str()))
                         .with("providers", json!(cfg.provider_names()))
-                        .with("providerPresets", json!(provider_presets_json(&cfg, Some(&state.plugin_manager))))
+                        .with(
+                            "providerPresets",
+                            json!(provider_presets_json(&cfg, Some(&state.plugin_manager))),
+                        )
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("auto_compact", json!(cfg.auto_compact))
                         .with("resumed_messages", json!(conv_len)),
@@ -1685,10 +1739,10 @@ async fn main() {
             }
             Command::ListProviderPresets => {
                 let cfg = state.cfg.read().await;
-                emit(
-                    &Event::new("provider_presets")
-                        .with("presets", json!(provider_presets_json(&cfg, Some(&state.plugin_manager)))),
-                );
+                emit(&Event::new("provider_presets").with(
+                    "presets",
+                    json!(provider_presets_json(&cfg, Some(&state.plugin_manager))),
+                ));
             }
             Command::Login { preset, api_key } => {
                 // Log in to a first-party provider from a preset: resolve the key
@@ -1699,23 +1753,22 @@ async fn main() {
                 // one config; OpenCode Go creates two (OpenAI-kind +
                 // Anthropic-kind) sharing the base URL + key.
                 let Some(p) = config::find_preset(&preset) else {
+                    let available = config::PROVIDER_PRESETS
+                        .iter()
+                        .map(|p| p.id)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "unknown provider preset '{preset}'; available: umans, openai, gemini, anthropic, opencode-go, xai"
+                            "unknown provider preset '{preset}'; available: {available}"
                         )),
                     ));
                     return;
                 };
-                // xAI is OAuth-only (SuperGrok / X Premium+). Never accept an
-                // API key — redirect to the device-code flow.
-                if p.id == "xai" {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!("xAI Grok uses SuperGrok / X Premium+ OAuth only — use /login and pick xAI (no API key)."),
-                    ));
-                    return;
-                }
+                // API-key path: accept an explicit key or env key. OAuth-capable
+                // presets (xAI, Qwen, OpenAI/Gemini/Claude) also work with no
+                // key via /login's OAuth branch when supports_login is true.
                 let key = api_key.or_else(|| p.env_key());
                 let configs = config::preset_provider_configs(p, key.clone());
                 let name = configs[0].name.clone();
@@ -1953,6 +2006,9 @@ async fn main() {
                                 "openai" => "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>.",
                                 "anthropic" => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code or final callback URL via /oauth-code <code-or-url>.",
                                 "xai" | "grok" => "OAuth login awaiting approval. Open the URL above on any device and click Approve — it finishes automatically (no /oauth-code needed for xAI device-code).",
+                                "qwen" => "OAuth login awaiting approval. Open the URL above on any device and approve — it finishes automatically (no /oauth-code needed for Qwen device-code).",
+                                "github" | "kimi-coding" | "kilocode" | "codebuddy-cn" => "OAuth login awaiting approval. Open the device URL above, sign in and approve — it finishes automatically (no /oauth-code needed).",
+                                "cline" | "clinepass" | "kimchi" | "iflow" => "OAuth login awaiting a code. Open the URL above, sign in, then paste the redirect URL or token via /oauth-code <value>.",
                                 _ => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>.",
                             };
                             emit(&Event::new("info").with("message", json!(msg)));
@@ -1994,7 +2050,10 @@ async fn main() {
                 // A plugin owns the exchange when this pending login is for a
                 // plugin-declared OAuth provider; otherwise the built-in flow.
                 let result = if state.plugin_manager.oauth_config(&preset).is_some() {
-                    state.plugin_manager.oauth_complete(&preset, &pending, &code).await
+                    state
+                        .plugin_manager
+                        .oauth_complete(&preset, &pending, &code)
+                        .await
                 } else {
                     oauth::complete_oauth(&preset, &client, &pending, &code)
                         .await
@@ -2405,12 +2464,7 @@ async fn main() {
                 // endpoint (Umans / Codex / Claude OAuth / …). Read-only.
                 let model_name = match model.filter(|m| !m.is_empty()) {
                     Some(m) => m,
-                    None => state
-                        .last_model
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or_default(),
+                    None => state.last_model.lock().await.clone().unwrap_or_default(),
                 };
                 // When we still have no model (fresh session, never sent), fall
                 // back to the first discovered model so /usage still works.
@@ -2732,25 +2786,14 @@ async fn main() {
                             *g = mode;
                             goal::emit_goal_state(&g);
                         }
-                        emit(
-                            &Event::new("info")
-                                .with("message", json!("Goal mode: planning…")),
-                        );
+                        emit(&Event::new("info").with("message", json!("Goal mode: planning…")));
                         // Prefer planner role model when set; else selected model.
                         let turn_model = if models.iter().any(|m| m.id == plan_model) {
                             plan_model
                         } else {
                             model
                         };
-                        start_turn(
-                            &state,
-                            &client,
-                            turn_model,
-                            prompt,
-                            effort,
-                            None,
-                        )
-                        .await;
+                        start_turn(&state, &client, turn_model, prompt, effort, None).await;
                     }
                     Err(e) => {
                         emit(&Event::new("error").with("message", json!(e)));
@@ -2765,16 +2808,10 @@ async fn main() {
                 }
                 let mut g = state.goal.lock().await;
                 if g.phase == goal::GoalPhase::Idle {
-                    emit(
-                        &Event::new("info")
-                            .with("message", json!("no active goal to cancel")),
-                    );
+                    emit(&Event::new("info").with("message", json!("no active goal to cancel")));
                 } else {
                     goal::fail_goal(&mut g, "cancelled by user");
-                    emit(
-                        &Event::new("info")
-                            .with("message", json!("goal cancelled")),
-                    );
+                    emit(&Event::new("info").with("message", json!("goal cancelled")));
                 }
             }
             Command::GoalStatus => {
@@ -2843,11 +2880,7 @@ async fn main() {
                         if let Some(e) = reasoning_effort {
                             g.reasoning_effort = e;
                         }
-                        goal::transition(
-                            &mut g,
-                            goal::GoalPhase::Planning,
-                            Some("revising plan"),
-                        );
+                        goal::transition(&mut g, goal::GoalPhase::Planning, Some("revising plan"));
                         Some((goal::planning_prompt(&g), g.reasoning_effort.clone()))
                     }
                 };
@@ -4839,7 +4872,8 @@ async fn run_turn(
                         {
                             let g = st.goal.lock().await;
                             if g.is_active() {
-                                if let Some(c) = sub_args.get("concurrency").and_then(|v| v.as_u64())
+                                if let Some(c) =
+                                    sub_args.get("concurrency").and_then(|v| v.as_u64())
                                 {
                                     sub_args["concurrency"] =
                                         json!(goal::cap_concurrency(c as u32, &g));

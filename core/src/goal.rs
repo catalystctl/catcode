@@ -244,7 +244,11 @@ impl GoalMode {
 }
 
 /// Resolve which model a step should run with, given role overrides + allowlist.
-pub fn resolve_step_model(mode: &GoalMode, agent: &str, step_model: Option<String>) -> Option<String> {
+pub fn resolve_step_model(
+    mode: &GoalMode,
+    agent: &str,
+    step_model: Option<String>,
+) -> Option<String> {
     let role = match agent {
         "planner" => mode.role_models.planner.clone(),
         "worker" => mode.role_models.worker.clone(),
@@ -252,9 +256,13 @@ pub fn resolve_step_model(mode: &GoalMode, agent: &str, step_model: Option<Strin
         _ => None,
     };
     // Role override wins when set (Advanced section is explicit).
-    let candidate = role.or(step_model).or_else(|| mode.allowed_models.first().cloned());
+    let candidate = role
+        .or(step_model)
+        .or_else(|| mode.allowed_models.first().cloned());
     match candidate {
-        Some(m) if !mode.allowed_models.is_empty() && !mode.allowed_models.iter().any(|a| a == &m) => {
+        Some(m)
+            if !mode.allowed_models.is_empty() && !mode.allowed_models.iter().any(|a| a == &m) =>
+        {
             // Role/step model outside allowlist → fall back to first allowed.
             mode.allowed_models.first().cloned()
         }
@@ -329,10 +337,7 @@ pub fn new_goal(args: StartGoalArgs) -> Result<GoalMode, String> {
         model_concurrency.insert(key, v.clamp(1, concurrency));
     }
     // Planning turn prefers planner role model when set.
-    let parent_model = role_models
-        .planner
-        .clone()
-        .unwrap_or(args.model);
+    let parent_model = role_models.planner.clone().unwrap_or(args.model);
 
     let id = format!("goal-{}", now_ms());
     Ok(GoalMode {
@@ -352,9 +357,7 @@ pub fn new_goal(args: StartGoalArgs) -> Result<GoalMode, String> {
         version: 1,
         error: None,
         parent_model,
-        reasoning_effort: args
-            .reasoning_effort
-            .unwrap_or_else(|| "medium".into()),
+        reasoning_effort: args.reasoning_effort.unwrap_or_else(|| "medium".into()),
         deploy_after_turn: false,
         revise_feedback: None,
     })
@@ -443,7 +446,10 @@ pub fn apply_plan(
             .filter(|m| !m.is_empty());
         // Strip models outside the allowlist (empty allowlist = unrestricted).
         let step_model = match step_model {
-            Some(m) if !mode.allowed_models.is_empty() && !mode.allowed_models.iter().any(|a| a == &m) => {
+            Some(m)
+                if !mode.allowed_models.is_empty()
+                    && !mode.allowed_models.iter().any(|a| a == &m) =>
+            {
                 None
             }
             other => other,
@@ -601,9 +607,7 @@ pub fn filter_model_candidates(
     candidates
         .iter()
         .filter(|m| {
-            if !mode.allowed_models.is_empty()
-                && !mode.allowed_models.iter().any(|a| a == *m)
-            {
+            if !mode.allowed_models.is_empty() && !mode.allowed_models.iter().any(|a| a == *m) {
                 return false;
             }
             if !mode.allowed_providers.is_empty() {
@@ -744,7 +748,10 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
         }
     };
     let model_conc = if mode.model_concurrency.is_empty() {
-        format!("Per-model concurrency: (use global cap {c})", c = mode.concurrency)
+        format!(
+            "Per-model concurrency: (use global cap {c})",
+            c = mode.concurrency
+        )
     } else {
         let mut pairs: Vec<String> = mode
             .model_concurrency
@@ -805,11 +812,7 @@ After goal_write_plan succeeds, briefly confirm the plan in one short paragraph.
 // ---------------------------------------------------------------------------
 
 /// Run deploy for the current plan. Caller must hold no goal lock across await.
-pub async fn deploy_goal(
-    st: Arc<State>,
-    client: reqwest::Client,
-    cancel: CancellationToken,
-) {
+pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: CancellationToken) {
     // Snapshot config for deploy.
     let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id) = {
         let mode = st.goal.lock().await;
@@ -831,7 +834,11 @@ pub async fn deploy_goal(
             return;
         }
         mode.deploy_after_turn = false;
-        transition(&mut mode, GoalPhase::Deploying, Some("deploying plan steps"));
+        transition(
+            &mut mode,
+            GoalPhase::Deploying,
+            Some("deploying plan steps"),
+        );
     }
 
     // Build step dependency map from plan.
@@ -904,10 +911,7 @@ pub async fn deploy_goal(
             if cancel.is_cancelled() {
                 break;
             }
-            let model_key = p
-                .model
-                .clone()
-                .unwrap_or_else(|| parent_model.clone());
+            let model_key = p.model.clone().unwrap_or_else(|| parent_model.clone());
             let g_sem = global_sem.clone();
             let m_sem = model_sems
                 .entry(model_key.clone())
@@ -942,19 +946,12 @@ pub async fn deploy_goal(
                 if let Some(m) = &p.model {
                     args["model"] = json!(m);
                 }
-                let provider = st_c.resolve_provider_for_model(
-                    p.model.as_deref().unwrap_or(&parent),
-                ).await;
-                let outcome = crate::subagent::execute(
-                    st_c,
-                    client_c,
-                    provider,
-                    parent,
-                    args,
-                    cancel_c,
-                    0,
-                )
-                .await;
+                let provider = st_c
+                    .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
+                    .await;
+                let outcome =
+                    crate::subagent::execute(st_c, client_c, provider, parent, args, cancel_c, 0)
+                        .await;
                 (step_id, outcome.ok, outcome.output)
             }));
         }
@@ -982,10 +979,10 @@ pub async fn deploy_goal(
                 Err(e) => {
                     any_failed = true;
                     wave_failed = true;
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("goal deploy task join error: {e}"))),
-                    );
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!("goal deploy task join error: {e}")),
+                    ));
                 }
             }
         }
@@ -1014,16 +1011,14 @@ pub async fn deploy_goal(
         sync_work_state_from_prompts(&st, &mode).await;
     }
 
-    emit(
-        &Event::new("info").with(
-            "message",
-            json!(if any_failed {
-                "Goal mode finished with failures — see goal_state prompts"
-            } else {
-                "Goal mode complete"
-            }),
-        ),
-    );
+    emit(&Event::new("info").with(
+        "message",
+        json!(if any_failed {
+            "Goal mode finished with failures — see goal_state prompts"
+        } else {
+            "Goal mode complete"
+        }),
+    ));
 }
 
 /// Mirror deploy prompt statuses into WorkState done/in_progress/next.
@@ -1374,11 +1369,7 @@ mod tests {
         map.insert("m1".into(), "openai".into());
         map.insert("m2".into(), "anthropic".into());
         map.insert("m3".into(), "openai".into());
-        let out = filter_model_candidates(
-            &["m1".into(), "m2".into(), "m3".into()],
-            &mode,
-            &map,
-        );
+        let out = filter_model_candidates(&["m1".into(), "m2".into(), "m3".into()], &mode, &map);
         assert_eq!(out, vec!["m1".to_string()]);
     }
 

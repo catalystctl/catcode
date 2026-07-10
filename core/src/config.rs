@@ -407,7 +407,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         api_key_env: "GEMINI_API_KEY",
         alt_envs: &["GOOGLE_API_KEY"],
-        description: "Google Gemini via its OpenAI-compatible endpoint — Gemini 2.5 Pro/Flash. Uses GEMINI_API_KEY (or GOOGLE_API_KEY), or `/login` for an OAuth subscription login (matches the `gemini` CLI exactly — supports both regular Google accounts and Google Cloud/ADC/service-account credentials).",
+        description: "Google Gemini via Antigravity OAuth (Gemini 3 Pro/Flash + Claude-via-Antigravity) or GEMINI_API_KEY / GOOGLE_API_KEY for the OpenAI-compatible endpoint. `/login` uses Antigravity's OAuth client (not the older gemini-cli client) and also accepts Google Cloud ADC / service-account credentials.",
     },
     ProviderPreset {
         id: "anthropic",
@@ -435,16 +435,396 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         id: "xai",
-        label: "xAI Grok (SuperGrok OAuth)",
+        label: "xAI Grok",
         kind: ProviderKind::OpenAI,
-        // OpenAI-compatible chat completions at api.x.ai/v1. Auth is OAuth
-        // only (SuperGrok / X Premium+) — no XAI_API_KEY path.
+        // OpenAI-compatible chat completions at api.x.ai/v1. Dual auth:
+        // XAI_API_KEY (console.x.ai) OR SuperGrok / X Premium+ OAuth via /login.
+        // Matches 9router's dual-mode surface (API key + OAuth).
         base_url: "https://api.x.ai/v1",
-        // Empty: this preset is OAuth-only. env_key() returns None; /login
-        // always runs the device-code flow.
-        api_key_env: "",
+        api_key_env: "XAI_API_KEY",
         alt_envs: &[],
-        description: "xAI Grok via SuperGrok or X Premium+ subscription OAuth (device-code login at accounts.x.ai). No API key — use /login to sign in. Default model: grok-build-0.1.",
+        description: "xAI Grok via XAI_API_KEY (console.x.ai) or SuperGrok / X Premium+ OAuth with /login (device-code at accounts.x.ai).",
+    },
+    // --- API-key providers aligned with 9router's OpenAI/Anthropic-compatible
+    // surface. All speak standard /chat/completions (or /messages) so discovery
+    // falls through the existing OpenAI/Anthropic parsers. ---
+    ProviderPreset {
+        id: "openrouter",
+        label: "OpenRouter",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://openrouter.ai/api/v1",
+        api_key_env: "OPENROUTER_API_KEY",
+        alt_envs: &[],
+        description: "OpenRouter multi-model gateway. Uses OPENROUTER_API_KEY (https://openrouter.ai/settings/keys).",
+    },
+    ProviderPreset {
+        id: "deepseek",
+        label: "DeepSeek",
+        kind: ProviderKind::OpenAI,
+        // 9router uses https://api.deepseek.com/chat/completions — base must
+        // end before the path segment so we append /chat/completions.
+        base_url: "https://api.deepseek.com",
+        api_key_env: "DEEPSEEK_API_KEY",
+        alt_envs: &[],
+        description: "DeepSeek (V3/R1) via DEEPSEEK_API_KEY (https://platform.deepseek.com/api_keys).",
+    },
+    ProviderPreset {
+        id: "groq",
+        label: "Groq",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.groq.com/openai/v1",
+        api_key_env: "GROQ_API_KEY",
+        alt_envs: &[],
+        description: "Groq OpenAI-compatible endpoint. Uses GROQ_API_KEY (https://console.groq.com/keys).",
+    },
+    ProviderPreset {
+        id: "mistral",
+        label: "Mistral",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.mistral.ai/v1",
+        api_key_env: "MISTRAL_API_KEY",
+        alt_envs: &[],
+        description: "Mistral AI via MISTRAL_API_KEY (https://console.mistral.ai/api-keys).",
+    },
+    ProviderPreset {
+        id: "together",
+        label: "Together AI",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.together.xyz/v1",
+        api_key_env: "TOGETHER_API_KEY",
+        alt_envs: &[],
+        description: "Together AI OpenAI-compatible gateway. Uses TOGETHER_API_KEY.",
+    },
+    ProviderPreset {
+        id: "fireworks",
+        label: "Fireworks",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.fireworks.ai/inference/v1",
+        api_key_env: "FIREWORKS_API_KEY",
+        alt_envs: &[],
+        description: "Fireworks AI via FIREWORKS_API_KEY (https://fireworks.ai/account/api-keys).",
+    },
+    ProviderPreset {
+        id: "cerebras",
+        label: "Cerebras",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.cerebras.ai/v1",
+        api_key_env: "CEREBRAS_API_KEY",
+        alt_envs: &[],
+        description: "Cerebras OpenAI-compatible endpoint. Uses CEREBRAS_API_KEY.",
+    },
+    ProviderPreset {
+        id: "nebius",
+        label: "Nebius",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.studio.nebius.ai/v1",
+        api_key_env: "NEBIUS_API_KEY",
+        alt_envs: &[],
+        description: "Nebius Token Factory via NEBIUS_API_KEY.",
+    },
+    ProviderPreset {
+        id: "hyperbolic",
+        label: "Hyperbolic",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.hyperbolic.xyz/v1",
+        api_key_env: "HYPERBOLIC_API_KEY",
+        alt_envs: &[],
+        description: "Hyperbolic via HYPERBOLIC_API_KEY.",
+    },
+    ProviderPreset {
+        id: "siliconflow",
+        label: "SiliconFlow",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.siliconflow.com/v1",
+        api_key_env: "SILICONFLOW_API_KEY",
+        alt_envs: &[],
+        description: "SiliconFlow OpenAI-compatible endpoint. Uses SILICONFLOW_API_KEY.",
+    },
+    ProviderPreset {
+        id: "glm",
+        label: "Zhipu GLM (intl)",
+        kind: ProviderKind::OpenAI,
+        // International Z.ai coding endpoint (OpenAI-compatible).
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        api_key_env: "ZAI_API_KEY",
+        alt_envs: &["GLM_API_KEY", "ZHIPU_API_KEY"],
+        description: "Zhipu GLM international (api.z.ai). Uses ZAI_API_KEY / GLM_API_KEY.",
+    },
+    ProviderPreset {
+        id: "glm-cn",
+        label: "Zhipu GLM (China)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+        api_key_env: "BIGMODEL_API_KEY",
+        alt_envs: &["GLM_API_KEY", "ZHIPU_API_KEY"],
+        description: "Zhipu GLM China (open.bigmodel.cn). Uses BIGMODEL_API_KEY / GLM_API_KEY.",
+    },
+    ProviderPreset {
+        id: "minimax",
+        label: "MiniMax (intl)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.minimax.io/v1",
+        api_key_env: "MINIMAX_API_KEY",
+        alt_envs: &[],
+        description: "MiniMax international OpenAI-compatible endpoint. Uses MINIMAX_API_KEY.",
+    },
+    ProviderPreset {
+        id: "minimax-cn",
+        label: "MiniMax (China)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.minimaxi.com/v1",
+        api_key_env: "MINIMAX_API_KEY",
+        alt_envs: &[],
+        description: "MiniMax China OpenAI-compatible endpoint. Uses MINIMAX_API_KEY.",
+    },
+    ProviderPreset {
+        id: "kimi",
+        label: "Moonshot Kimi",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.moonshot.ai/v1",
+        api_key_env: "MOONSHOT_API_KEY",
+        alt_envs: &["KIMI_API_KEY"],
+        description: "Moonshot Kimi API-key endpoint. Uses MOONSHOT_API_KEY / KIMI_API_KEY.",
+    },
+    ProviderPreset {
+        id: "cohere",
+        label: "Cohere",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.cohere.ai/v1",
+        api_key_env: "COHERE_API_KEY",
+        alt_envs: &[],
+        description: "Cohere OpenAI-compatible chat endpoint. Uses COHERE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "nvidia",
+        label: "NVIDIA NIM",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://integrate.api.nvidia.com/v1",
+        api_key_env: "NVIDIA_API_KEY",
+        alt_envs: &[],
+        description: "NVIDIA NIM OpenAI-compatible endpoint. Uses NVIDIA_API_KEY.",
+    },
+    ProviderPreset {
+        id: "perplexity",
+        label: "Perplexity",
+        kind: ProviderKind::OpenAI,
+        // Perplexity's chat path is /chat/completions at the host root (no /v1).
+        base_url: "https://api.perplexity.ai",
+        api_key_env: "PERPLEXITY_API_KEY",
+        alt_envs: &[],
+        description: "Perplexity Sonar via PERPLEXITY_API_KEY.",
+    },
+    ProviderPreset {
+        id: "venice",
+        label: "Venice AI",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.venice.ai/api/v1",
+        api_key_env: "VENICE_API_KEY",
+        alt_envs: &[],
+        description: "Venice AI via VENICE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "chutes",
+        label: "Chutes",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://llm.chutes.ai/v1",
+        api_key_env: "CHUTES_API_KEY",
+        alt_envs: &[],
+        description: "Chutes LLM gateway via CHUTES_API_KEY.",
+    },
+    ProviderPreset {
+        id: "vercel-ai-gateway",
+        label: "Vercel AI Gateway",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://ai-gateway.vercel.sh/v1",
+        api_key_env: "AI_GATEWAY_API_KEY",
+        alt_envs: &["VERCEL_AI_GATEWAY_API_KEY"],
+        description: "Vercel AI Gateway via AI_GATEWAY_API_KEY.",
+    },
+    ProviderPreset {
+        id: "openai-api",
+        label: "OpenAI API",
+        kind: ProviderKind::OpenAI,
+        // Distinct from the Codex subscription preset (`openai`) which hits
+        // chatgpt.com/backend-api/codex. This is the public api.openai.com path
+        // 9router exposes as its `openai` apikey provider.
+        base_url: "https://api.openai.com/v1",
+        api_key_env: "OPENAI_API_KEY",
+        alt_envs: &[],
+        description: "OpenAI public API (api.openai.com) via OPENAI_API_KEY. Prefer the `openai` preset for ChatGPT subscription OAuth.",
+    },
+    ProviderPreset {
+        id: "qwen",
+        label: "Qwen Code (OAuth)",
+        kind: ProviderKind::OpenAI,
+        // portal.qwen.ai OpenAI-compatible chat. Auth is Qwen Code device-code
+        // OAuth (matches 9router's qwen provider). API key optional via env.
+        base_url: "https://portal.qwen.ai/v1",
+        api_key_env: "QWEN_API_KEY",
+        alt_envs: &[],
+        description: "Qwen Code via device-code OAuth (/login) or QWEN_API_KEY. Models: qwen3-coder-plus/flash.",
+    },
+    // Remaining standard OpenAI-compatible coding endpoints in 9router's
+    // API-key catalog. Each has a fixed endpoint and normal Bearer auth.
+    ProviderPreset {
+        id: "alicode",
+        label: "Alibaba Coding Plan (China)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://coding.dashscope.aliyuncs.com/v1",
+        api_key_env: "DASHSCOPE_API_KEY",
+        alt_envs: &["ALIBABA_CLOUD_API_KEY"],
+        description: "Alibaba Cloud Coding Plan (China) via DASHSCOPE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "alicode-intl",
+        label: "Alibaba Coding Plan (International)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://coding-intl.dashscope.aliyuncs.com/v1",
+        api_key_env: "DASHSCOPE_API_KEY",
+        alt_envs: &["ALIBABA_CLOUD_API_KEY"],
+        description: "Alibaba Cloud Coding Plan (international) via DASHSCOPE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "blackbox",
+        label: "Blackbox AI",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.blackbox.ai/v1",
+        api_key_env: "BLACKBOX_API_KEY",
+        alt_envs: &[],
+        description: "Blackbox AI OpenAI-compatible coding endpoint via BLACKBOX_API_KEY.",
+    },
+    ProviderPreset {
+        id: "byteplus",
+        label: "BytePlus ModelArk",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        api_key_env: "BYTEPLUS_API_KEY",
+        alt_envs: &["ARK_API_KEY"],
+        description: "BytePlus ModelArk coding endpoint via BYTEPLUS_API_KEY / ARK_API_KEY.",
+    },
+    ProviderPreset {
+        id: "volcengine-ark",
+        label: "Volcengine Ark",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
+        api_key_env: "VOLCENGINE_API_KEY",
+        alt_envs: &["ARK_API_KEY"],
+        description: "Volcengine Ark coding endpoint via VOLCENGINE_API_KEY / ARK_API_KEY.",
+    },
+    ProviderPreset {
+        id: "xiaomi-mimo",
+        label: "Xiaomi MiMo",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.xiaomimimo.com/v1",
+        api_key_env: "XIAOMI_MIMO_API_KEY",
+        alt_envs: &["MIMO_API_KEY"],
+        description: "Xiaomi MiMo OpenAI-compatible endpoint via XIAOMI_MIMO_API_KEY / MIMO_API_KEY.",
+    },
+    ProviderPreset {
+        id: "xiaomi-tokenplan",
+        label: "Xiaomi MiMo Token Plan (Singapore)",
+        kind: ProviderKind::OpenAI,
+        // Token Plan keys are region-bound. Singapore is 9router's default;
+        // China/Amsterdam are available through a custom provider base URL.
+        base_url: "https://token-plan-sgp.xiaomimimo.com/v1",
+        api_key_env: "XIAOMI_TOKENPLAN_API_KEY",
+        alt_envs: &["MIMO_TOKENPLAN_API_KEY"],
+        description: "Xiaomi MiMo Token Plan (Singapore default) via XIAOMI_TOKENPLAN_API_KEY. Use a custom provider for China or Amsterdam clusters.",
+    },
+    ProviderPreset {
+        id: "cloudflare-ai",
+        label: "Cloudflare Workers AI",
+        kind: ProviderKind::OpenAI,
+        // Account ID is necessarily user-specific; replace `{accountId}` in a
+        // custom provider base URL or set CLOUDFLARE_ACCOUNT_ID before /login.
+        base_url: "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/v1",
+        api_key_env: "CLOUDFLARE_API_TOKEN",
+        alt_envs: &[],
+        description: "Cloudflare Workers AI. Set CLOUDFLARE_ACCOUNT_ID and use a custom base URL with it substituted; token comes from CLOUDFLARE_API_TOKEN.",
+    },
+    ProviderPreset {
+        id: "nanobanana",
+        label: "Nano Banana API",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.nanobananaapi.ai/v1",
+        api_key_env: "NANOBANANA_API_KEY",
+        alt_envs: &[],
+        description: "Nano Banana OpenAI-compatible chat endpoint via NANOBANANA_API_KEY.",
+    },
+    // OAuth coding providers. The presets below expose only flows whose
+    // request protocol is fully implemented here; see `oauth.rs` for token
+    // persistence/refresh and `preset_provider_configs` for required headers.
+    ProviderPreset {
+        id: "github",
+        label: "GitHub Copilot (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.githubcopilot.com",
+        api_key_env: "GITHUB_COPILOT_TOKEN",
+        alt_envs: &[],
+        description: "GitHub Copilot via device-code OAuth (/login) or GITHUB_COPILOT_TOKEN.",
+    },
+    ProviderPreset {
+        id: "kimi-coding",
+        label: "Kimi Coding (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.kimi.com/coding/v1",
+        api_key_env: "KIMI_CODING_API_KEY",
+        alt_envs: &[],
+        description: "Kimi Coding via device-code OAuth (/login) or KIMI_CODING_API_KEY.",
+    },
+    ProviderPreset {
+        id: "kilocode",
+        label: "Kilo Code (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.kilo.ai/api/openrouter",
+        api_key_env: "KILOCODE_API_KEY",
+        alt_envs: &[],
+        description: "Kilo Code via device authorization (/login) or KILOCODE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "cline",
+        label: "Cline (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.cline.bot/api/v1",
+        api_key_env: "CLINE_API_KEY",
+        alt_envs: &[],
+        description: "Cline subscription via browser OAuth (/login) or CLINE_API_KEY.",
+    },
+    ProviderPreset {
+        id: "clinepass",
+        label: "ClinePass (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://api.cline.bot/api/v1",
+        api_key_env: "CLINEPASS_API_KEY",
+        alt_envs: &[],
+        description: "ClinePass subscription via browser OAuth (/login) or CLINEPASS_API_KEY.",
+    },
+    ProviderPreset {
+        id: "kimchi",
+        label: "Kimchi (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://llm.kimchi.dev/openai/v1",
+        api_key_env: "KIMCHI_API_KEY",
+        alt_envs: &[],
+        description: "Kimchi via browser token login (/login + /oauth-code) or KIMCHI_API_KEY.",
+    },
+    ProviderPreset {
+        id: "codebuddy-cn",
+        label: "Tencent CodeBuddy (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://copilot.tencent.com/v2",
+        api_key_env: "CODEBUDDY_API_KEY",
+        alt_envs: &[],
+        description: "Tencent CodeBuddy CN via device-style OAuth (/login) or CODEBUDDY_API_KEY.",
+    },
+    ProviderPreset {
+        id: "iflow",
+        label: "iFlow AI (OAuth)",
+        kind: ProviderKind::OpenAI,
+        base_url: "https://apis.iflow.cn/v1",
+        api_key_env: "IFLOW_API_KEY",
+        alt_envs: &[],
+        description: "iFlow AI via browser OAuth (/login + /oauth-code) or IFLOW_API_KEY. Chat requests use iFlow HMAC headers.",
     },
 ];
 
@@ -536,9 +916,93 @@ pub fn preset_provider_configs(p: &ProviderPreset, api_key: Option<String>) -> V
             make("opencode-go-anthropic", ProviderKind::Anthropic),
         ]
     } else {
-        vec![p.to_provider_config(api_key)]
+        let mut cfg = p.to_provider_config(api_key);
+        // These are protocol requirements documented by 9router's provider
+        // registry, not cosmetic client-identification headers. Keep them on
+        // both API-key and OAuth configurations.
+        match p.id {
+            "github" => cfg.headers = github_copilot_headers(),
+            "kimi-coding" => cfg.headers = kimi_coding_headers(),
+            "cline" | "clinepass" => cfg.headers = cline_headers(),
+            "codebuddy-cn" => cfg.headers = codebuddy_headers(),
+            "iflow" => cfg.headers = iflow_headers(),
+            "kimchi" => cfg.headers = kimchi_headers(),
+            _ => {}
+        }
+        vec![cfg]
     }
 }
+
+fn github_copilot_headers() -> Vec<(String, String)> {
+    vec![
+        ("copilot-integration-id".into(), "vscode-chat".into()),
+        ("editor-version".into(), "vscode/1.110.0".into()),
+        ("editor-plugin-version".into(), "copilot-chat/0.38.0".into()),
+        ("user-agent".into(), "GitHubCopilotChat/0.38.0".into()),
+        ("openai-intent".into(), "conversation-panel".into()),
+        ("x-github-api-version".into(), "2025-04-01".into()),
+        (
+            "x-vscode-user-agent-library-version".into(),
+            "electron-fetch".into(),
+        ),
+        ("x-initiator".into(), "user".into()),
+    ]
+}
+
+pub(crate) fn kimi_coding_headers() -> Vec<(String, String)> {
+    vec![
+        ("x-msh-platform".into(), "catalyst-code".into()),
+        ("x-msh-version".into(), env!("CARGO_PKG_VERSION").into()),
+        (
+            "x-msh-device-model".into(),
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
+        // A stable, non-secret client identity. 9router generates the same
+        // header per launch; this installation-scoped form keeps token refresh
+        // identity stable without leaking a hardware identifier.
+        (
+            "x-msh-device-id".into(),
+            format!(
+                "catalyst-code-{}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        ),
+    ]
+}
+
+pub(crate) fn cline_headers() -> Vec<(String, String)> {
+    vec![
+        ("HTTP-Referer".into(), "https://cline.bot".into()),
+        ("X-Title".into(), "Cline".into()),
+        ("User-Agent".into(), format!("CatalystCode/{}", env!("CARGO_PKG_VERSION"))),
+        ("X-PLATFORM".into(), std::env::consts::OS.into()),
+        ("X-CLIENT-TYPE".into(), "catalyst-code".into()),
+        ("X-CLIENT-VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+        ("X-CORE-VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+        ("X-IS-MULTIROOT".into(), "false".into()),
+    ]
+}
+
+pub(crate) fn codebuddy_headers() -> Vec<(String, String)> {
+    vec![
+        ("User-Agent".into(), "CLI/2.108.1 CodeBuddy/2.108.1".into()),
+        ("X-Product".into(), "SaaS".into()),
+        ("X-IDE-Type".into(), "CLI".into()),
+        ("X-IDE-Name".into(), "CLI".into()),
+        ("x-requested-with".into(), "XMLHttpRequest".into()),
+        ("x-codebuddy-request".into(), "1".into()),
+    ]
+}
+
+pub(crate) fn iflow_headers() -> Vec<(String, String)> {
+    vec![("User-Agent".into(), "iFlow-Cli".into())]
+}
+
+pub(crate) fn kimchi_headers() -> Vec<(String, String)> {
+    vec![("User-Agent".into(), "kimchi/0.1.50".into())]
+}
+
 
 /// Serialize a `ProviderConfig` back to JSON for persistence. Only writes
 /// non-default fields so the file stays readable.
@@ -668,6 +1132,15 @@ fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
         "gemini" => crate::oauth::has_google_creds(),
         "anthropic" => crate::oauth::has_claude_creds(),
         "xai" => crate::oauth::has_xai_creds(),
+        "qwen" => crate::oauth::has_qwen_creds(),
+        "github" => crate::oauth::has_github_creds(),
+        "kimi-coding" => crate::oauth::has_kimi_coding_creds(),
+        "kilocode" => crate::oauth::has_kilocode_creds(),
+        "cline" => crate::oauth::has_cline_creds(),
+        "clinepass" => crate::oauth::has_clinepass_creds(),
+        "kimchi" => crate::oauth::has_kimchi_creds(),
+        "codebuddy-cn" => crate::oauth::has_codebuddy_creds(),
+        "iflow" => crate::oauth::has_iflow_creds(),
         _ => false,
     }
 }
@@ -1743,15 +2216,88 @@ mod tests {
     }
 
     #[test]
-    fn xai_preset_is_oauth_only() {
+    fn xai_preset_supports_api_key_and_oauth() {
         let p = find_preset("xai").expect("xai preset exists");
         assert_eq!(p.base_url, "https://api.x.ai/v1");
-        assert!(p.api_key_env.is_empty());
-        assert!(p.env_key().is_none());
+        assert_eq!(p.api_key_env, "XAI_API_KEY");
         assert!(crate::oauth::supports_login(p.id));
         let configs = preset_provider_configs(p, None);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "xai");
         assert!(configs[0].api_key.is_none());
+        assert_eq!(configs[0].api_key_env.as_deref(), Some("XAI_API_KEY"));
+    }
+
+    #[test]
+    fn nine_router_api_key_presets_exist() {
+        for id in [
+            "openrouter",
+            "deepseek",
+            "groq",
+            "mistral",
+            "together",
+            "fireworks",
+            "cerebras",
+            "nebius",
+            "hyperbolic",
+            "siliconflow",
+            "glm",
+            "glm-cn",
+            "minimax",
+            "minimax-cn",
+            "kimi",
+            "cohere",
+            "nvidia",
+            "perplexity",
+            "venice",
+            "chutes",
+            "vercel-ai-gateway",
+            "openai-api",
+            "qwen",
+            "alicode",
+            "alicode-intl",
+            "blackbox",
+            "byteplus",
+            "volcengine-ark",
+            "xiaomi-mimo",
+            "xiaomi-tokenplan",
+            "cloudflare-ai",
+            "nanobanana",
+        ] {
+            assert!(find_preset(id).is_some(), "missing preset {id}");
+        }
+        let qwen = find_preset("qwen").unwrap();
+        assert_eq!(qwen.base_url, "https://portal.qwen.ai/v1");
+        assert!(crate::oauth::supports_login("qwen"));
+    }
+
+    #[test]
+    fn nine_router_oauth_coding_presets_have_the_required_headers() {
+        for id in [
+            "github",
+            "kimi-coding",
+            "kilocode",
+            "cline",
+            "clinepass",
+            "kimchi",
+            "codebuddy-cn",
+            "iflow",
+        ] {
+            let p = find_preset(id).expect("OAuth coding preset exists");
+            assert!(crate::oauth::supports_login(p.id));
+        }
+        let cline = preset_provider_configs(find_preset("cline").unwrap(), None);
+        assert!(cline[0].headers.iter().any(|(k, _)| k == "HTTP-Referer"));
+        let codebuddy = preset_provider_configs(find_preset("codebuddy-cn").unwrap(), None);
+        assert!(codebuddy[0].headers.iter().any(|(k, _)| k == "X-Product"));
+        let github = preset_provider_configs(find_preset("github").unwrap(), None);
+        assert!(github[0]
+            .headers
+            .iter()
+            .any(|(k, _)| k == "copilot-integration-id"));
+        assert!(github[0].headers.iter().any(|(k, _)| k == "openai-intent"));
+        let kimi = preset_provider_configs(find_preset("kimi-coding").unwrap(), None);
+        assert!(kimi[0].headers.iter().any(|(k, _)| k == "x-msh-platform"));
+        assert!(kimi[0].headers.iter().any(|(k, _)| k == "x-msh-version"));
     }
 }

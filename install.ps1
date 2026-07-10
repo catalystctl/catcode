@@ -12,6 +12,9 @@
     No download needed — pipe it straight from the web:
         irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1 | iex
 
+    Run with no parameters in an interactive terminal to get a menu
+    (install, install with web, add web, update, reinstall, uninstall, status).
+
     With arguments (e.g. -WithWeb), use the scriptblock form:
         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1))) -WithWeb
 
@@ -53,6 +56,17 @@
 .PARAMETER Uninstall
     Stop + remove catcode, catcode-core, the web service/task, and install state.
 
+.PARAMETER AddWeb
+    Add the web service to an existing install (installs catcode-core.exe + the
+    prebuilt web bundle + service/task). Pins to the installed version unless
+    -Version is given.
+
+.PARAMETER Reinstall
+    Reinstall the currently-installed version (re-downloads the same release).
+
+.PARAMETER Status
+    Show the current install state (version, paths, web on/off) and exit.
+
 .PARAMETER DryRun
     Print the plan, execute nothing.
 
@@ -60,11 +74,14 @@
     Disable colored output.
 
 .EXAMPLE
-    .\install.ps1
+    .\install.ps1                  # interactive menu (no params, in a terminal)
     .\install.ps1 -WithWeb -Port 8080 -BindHost 127.0.0.1
     .\install.ps1 -Version 0.2.0
     .\install.ps1 -Update
+    .\install.ps1 -AddWeb
+    .\install.ps1 -Reinstall
     .\install.ps1 -Uninstall
+    .\install.ps1 -Status
 #>
 [CmdletBinding()]
 param(
@@ -78,6 +95,9 @@ param(
     [string]$WebInstallerUrl = '',
     [switch]$Update,
     [switch]$Uninstall,
+    [switch]$AddWeb,
+    [switch]$Reinstall,
+    [switch]$Status,
     [switch]$DryRun,
     [switch]$NoColor,
     [switch]$Help
@@ -136,8 +156,11 @@ function Show-Help {
     -BindHost <h>       web bind host             (default: 0.0.0.0)
     -WebDir <path>      web bundle install dir    (default: %LOCALAPPDATA%\catalyst-code\web)
     -WebInstallerUrl <url>  URL to install-web.ps1 (default: raw.githubusercontent.com master)
+    -AddWeb             add the web service to an existing install
     -Update             re-download latest + reinstall (+ restart the web service)
+    -Reinstall          reinstall the currently-installed version
     -Uninstall          stop + remove binaries, service, and state
+    -Status             show the current install state
     -DryRun             print the plan, execute nothing
     -NoColor            disable colored output
     -Help               show this help
@@ -407,9 +430,140 @@ function Do-Uninstall {
     Summary-Uninstall
 }
 
+function Show-Menu {
+    $st = Load-State
+    $status = if ($st) { "v$($st.version) (web: $($st.with_web))" } else { 'not installed' }
+    Write-Host ''
+    Write-Host '  Catalyst Code — installer menu' -ForegroundColor Cyan
+    Write-Host "  platform: Windows    status: $status" -ForegroundColor DarkGray
+    while ($true) {
+        Write-Host ''
+        Write-Host '  What would you like to do?' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '    1  Install              (catcode TUI + core)'
+        Write-Host '    2  Install with web     (TUI + core + 24/7 web service)'
+        Write-Host '    3  Add web service      (add web to an existing install)'
+        Write-Host '    4  Update               (download latest + reinstall)'
+        Write-Host '    5  Reinstall            (reinstall the current version)'
+        Write-Host '    6  Uninstall            (remove everything)'
+        Write-Host '    7  Status               (show current install state)'
+        Write-Host '    0  Exit'
+        Write-Host ''
+        $choice = Read-Host '  Select [0-7]'
+        if ([string]::IsNullOrWhiteSpace($choice)) { return 'install' }  # stdin closed → default
+        switch ($choice) {
+            '1' { return 'install' }
+            '2' { $script:WithWeb = $true; return 'install' }
+            '3' { return 'add-web' }
+            '4' { return 'update' }
+            '5' { return 'reinstall' }
+            '6' { return 'uninstall' }
+            '7' { return 'status' }
+            '0' { Write-Host '  Bye.' -ForegroundColor DarkGray; exit 0 }
+            default { Write-Host '  invalid choice — try again' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Do-AddWeb {
+    Write-Host ''
+    Write-Host '  Catalyst Code — add web service' -ForegroundColor Cyan
+    $st = Load-State
+    if (-not $st) { Die "no previous install found at $StateFile — run install.ps1 first to install catcode." }
+    if ($st.with_web -eq 'yes') { W-Warn 'web service is already installed — reinstalling it' }
+    $script:WithWeb = $true
+    # pin to the installed version unless one was explicitly given
+    if (-not $Version) { $Version = $st.version }
+    Resolve-Release
+    Write-Host "  version: $($script:Ver)   base: $($script:Base)" -ForegroundColor DarkGray
+    Write-Host "  install: $InstallDir" -ForegroundColor DarkGray
+
+    if ($DryRun) {
+        W-Info '[dry-run] would install catcode-core.exe + the web service'
+        return
+    }
+    Install-CoreForWeb
+    $rc = Invoke-WebInstaller
+    if ($rc -ne 0) { Die "web service install failed (install-web.ps1 exited $rc)." }
+    Save-State $true
+    Summary-AddWeb
+}
+
+function Do-Reinstall {
+    Write-Host ''
+    Write-Host '  Catalyst Code — reinstall' -ForegroundColor Cyan
+    $st = Load-State
+    if (-not $st) { Die "no previous install found at $StateFile — run install.ps1 first." }
+    W-Info "Reinstalling v$($st.version) (web: $($st.with_web))"
+    if (-not $Version) { $Version = $st.version }
+    if ($st.with_web -eq 'yes') { $script:WithWeb = $true }
+    Do-Install
+}
+
+function Do-Status {
+    Write-Host ''
+    Write-Host '  Catalyst Code — status' -ForegroundColor Cyan
+    $st = Load-State
+    if (-not $st) {
+        W-Warn "no previous install found at $StateFile"
+        W-Info 'Catalyst Code does not appear to be installed.'
+        return
+    }
+    W-Ok  "Version:      v$($st.version)"
+    W-Info "Install dir:  $($st.install_dir)"
+    W-Info "Web service:  $($st.with_web)"
+    if ($st.with_web -eq 'yes') {
+        W-Info "Web dir:      $($st.web_dir)"
+        W-Info "Web address:  http://localhost:$($st.port)"
+    }
+    if ($st.installed_at) { W-Info "Installed at: $($st.installed_at)" }
+    $exe = Join-Path $st.install_dir 'catcode.exe'
+    if (Test-Path -LiteralPath $exe) { W-Ok "catcode.exe present at $exe" }
+    else { W-Warn "catcode.exe NOT found at $exe" }
+}
+
+function Summary-AddWeb {
+    Write-Host ''
+    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host '  ✓  Web service added  Catalyst Code  v' -NoNewline -ForegroundColor Green
+    Write-Host "$($script:Ver)" -ForegroundColor Green
+    Write-Host "    core:  $InstallDir\catcode-core.exe" -ForegroundColor Green
+    Write-Host "    web:   http://localhost:$Port" -ForegroundColor Green
+    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host "  logs:  $env:LOCALAPPDATA\catalyst-code\catalyst-code-web.log" -ForegroundColor DarkGray
+}
+
 # ── main ─────────────────────────────────────────────────────
-if ($Help) { Show-Help; return }
-if ($Update -and $Uninstall) { Die 'cannot combine -Update and -Uninstall.' }
-if ($Update)   { Do-Update;   return }
-if ($Uninstall) { Do-Uninstall; return }
-Do-Install
+# Determine whether the user passed any explicit option. If nothing was
+# requested and we're in an interactive terminal, show the menu; otherwise
+# run the implied action directly (preserves CI / `irm | iex` automation).
+$canMenu = $false
+try { $canMenu = (-not [Console]::IsInputRedirected) -and [Environment]::UserInteractive } catch {}
+
+# Show the interactive menu only when NO parameters were passed (and we're in a
+# real terminal). Any explicit option — even -WithWeb or -Version — runs the
+# implied action directly, preserving CI / scripted use. $PSBoundParameters
+# reflects what the caller actually passed, unaffected by the default
+# resolution that happens earlier in the script.
+if ($PSBoundParameters.Count -eq 0 -and $canMenu) {
+    $action = Show-Menu
+} else {
+    if ($Help) { Show-Help; return }
+    if ($Update -and $Uninstall) { Die 'cannot combine -Update and -Uninstall.' }
+    if ($Update)        { $action = 'update' }
+    elseif ($Uninstall) { $action = 'uninstall' }
+    elseif ($AddWeb)    { $action = 'add-web' }
+    elseif ($Reinstall) { $action = 'reinstall' }
+    elseif ($Status)    { $action = 'status' }
+    else                { $action = 'install' }
+}
+
+switch ($action) {
+    'install'   { Do-Install }
+    'update'    { Do-Update }
+    'uninstall' { Do-Uninstall }
+    'add-web'   { Do-AddWeb }
+    'reinstall' { Do-Reinstall }
+    'status'    { Do-Status }
+    default     { Die "unknown action: $action" }
+}

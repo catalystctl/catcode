@@ -1,18 +1,28 @@
-// Next middleware — stamps an httpOnly umans_token cookie on page navigations
-// when UMANS_WEB_TOKEN is configured, so the browser auto-sends it to /api/*
-// routes (including SSE EventSource, which cannot set Authorization headers).
+import { NextResponse, type NextRequest } from "next/server";
 
-import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
+// Edge-runtime cookie check only (can't hit the DB here). Real session
+// validation happens server-side in the API routes + page.tsx. This just
+// bounces cookieless visitors to /login early for UX.
+const SESSION_COOKIE = "better-auth.session_token";
+const PUBLIC = ["/setup", "/login", "/api/auth"];
 
 export function middleware(req: NextRequest) {
-  const token = process.env.UMANS_WEB_TOKEN;
-  if (!token) return NextResponse.next();
-  // Only stamp the cookie on page navigations (not /api/*), idempotently.
-  if (req.nextUrl.pathname.startsWith("/api")) return NextResponse.next();
-  const res = NextResponse.next();
-  res.cookies.set("umans_token", token, { httpOnly: true, sameSite: "lax", path: "/" });
-  return res;
+  const { pathname } = req.nextUrl;
+  if (
+    PUBLIC.some((p) => pathname === p || pathname.startsWith(p + "/")) ||
+    pathname.startsWith("/_next") ||
+    pathname === "/favicon.ico"
+  ) {
+    return NextResponse.next();
+  }
+  const hasSession = req.cookies.get(SESSION_COOKIE);
+  if (!hasSession) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.search = "";
+    return NextResponse.redirect(url);
+  }
+  return NextResponse.next();
 }
 
 export const config = {

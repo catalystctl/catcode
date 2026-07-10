@@ -6,7 +6,7 @@
 import { readdirSync, statSync } from "node:fs";
 import { join, relative, normalize, sep } from "node:path";
 import { getBridge } from "@/server/core-bridge";
-import { authorized } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import type { FileEntry } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -38,7 +38,8 @@ const MAX_DEPTH = 8;
 const MAX_RESULTS = 50;
 
 export async function GET(req: Request) {
-  if (!authorized(req)) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await getSession(req.headers)))
+    return Response.json({ error: "unauthorized" }, { status: 401 });
   const bridge = getBridge();
   const url = new URL(req.url);
   const workspace = url.searchParams.get("workspace") ?? bridge.getDefaultWorkspace();

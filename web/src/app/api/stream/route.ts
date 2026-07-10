@@ -15,14 +15,15 @@
 // prevents proxies from closing the idle connection.
 
 import { getBridge } from "@/server/core-bridge";
-import { authorized } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import type { CoreEvent, ServerToClient } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(req: Request) {
-  if (!authorized(req)) return new Response("unauthorized", { status: 401 });
+  if (!(await getSession(req.headers)))
+    return new Response("unauthorized", { status: 401 });
   const bridge = getBridge();
 
   const url = new URL(req.url);

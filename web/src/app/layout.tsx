@@ -9,7 +9,7 @@ export const metadata: Metadata = {
   description: "A web interface for the Catalyst Code harness.",
   icons: {
     icon:
-      "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0a'/><text x='50' y='68' font-size='58' text-anchor='middle' font-family='monospace' fill='%23cf8a59'>u</text></svg>",
+      "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0a'/><text x='50' y='68' font-size='58' text-anchor='middle' font-family='monospace' fill='%23cf8a59'>c</text></svg>",
   },
 };
 

@@ -199,9 +199,7 @@ pub async fn fetch_provider_usage(
                         "Could not reach Anthropic OAuth usage — try /login again.",
                     ),
                 },
-                None => {
-                    ProviderUsage::unavailable("Anthropic is not authenticated — run /login.")
-                }
+                None => ProviderUsage::unavailable("Anthropic is not authenticated — run /login."),
             };
         }
         return ProviderUsage::unavailable(
@@ -473,13 +471,14 @@ pub fn parse_codex_usage(v: &Value) -> ProviderUsage {
         .map(|s| s.to_string())
         .or_else(|| {
             // Sometimes nested under plan
-            v.get("plan")
-                .and_then(|p| p.as_str().map(|s| s.to_string()).or_else(|| {
+            v.get("plan").and_then(|p| {
+                p.as_str().map(|s| s.to_string()).or_else(|| {
                     p.get("type")
                         .or_else(|| p.get("name"))
                         .and_then(|x| x.as_str())
                         .map(|s| s.to_string())
-                }))
+                })
+            })
         });
 
     let mut windows = Vec::new();
@@ -510,14 +509,12 @@ pub fn parse_codex_usage(v: &Value) -> ProviderUsage {
             .get("unlimited")
             .and_then(|u| u.as_bool())
             .unwrap_or(false);
-        let balance = credits
-            .get("balance")
-            .and_then(|b| {
-                b.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| b.as_f64())
-                    .or_else(|| b.as_u64().map(|u| u as f64))
-            });
+        let balance = credits.get("balance").and_then(|b| {
+            b.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| b.as_f64())
+                .or_else(|| b.as_u64().map(|u| u as f64))
+        });
         if unlimited {
             windows.push(UsageWindow {
                 id: "credits".into(),
@@ -632,9 +629,7 @@ async fn fetch_codex_usage(
     // Chat path is `{chatgpt.com/backend-api}/codex/...`; usage lives at
     // `{chatgpt.com/backend-api}/wham/usage` (official codex CLI).
     let trimmed = base_url.trim_end_matches('/');
-    let backend = trimmed
-        .strip_suffix("/codex")
-        .unwrap_or(trimmed);
+    let backend = trimmed.strip_suffix("/codex").unwrap_or(trimmed);
     let url = format!("{backend}/wham/usage");
     let mut req = client
         .get(&url)
@@ -690,11 +685,7 @@ pub fn parse_anthropic_oauth_usage(v: &Value) -> ProviderUsage {
                     id: "extra_usage".into(),
                     label: "Extra usage".into(),
                     used: util.or(used_credits),
-                    limit: if util.is_some() {
-                        Some(100.0)
-                    } else {
-                        monthly
-                    },
+                    limit: if util.is_some() { Some(100.0) } else { monthly },
                     unit: if util.is_some() {
                         "percent".into()
                     } else {
@@ -723,11 +714,7 @@ pub fn parse_anthropic_oauth_usage(v: &Value) -> ProviderUsage {
     }
 }
 
-fn parse_anthropic_rate_limit(
-    node: Option<&Value>,
-    id: &str,
-    label: &str,
-) -> Option<UsageWindow> {
+fn parse_anthropic_rate_limit(node: Option<&Value>, id: &str, label: &str) -> Option<UsageWindow> {
     let w = node.filter(|n| !n.is_null())?;
     let utilization = w
         .get("utilization")
@@ -830,8 +817,7 @@ async fn fetch_anthropic_oauth_usage(
 // the credits format. Optional plan enrichment from grok.com/rest/subscriptions.
 
 /// SuperGrok weekly-pool endpoint (Grok Build / website-compatible).
-const XAI_BILLING_URL: &str =
-    "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const XAI_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 /// Consumer subscription status (tier name) for SuperGrok / Premium+ accounts.
 const XAI_SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 
@@ -997,8 +983,8 @@ pub fn parse_xai_billing(v: &Value) -> ProviderUsage {
 
     // On-demand / prepaid (extra usage credits).
     let on_demand_cap = xai_val_number(cfg.get("onDemandCap"));
-    let on_demand_used = xai_val_number(cfg.get("onDemandUsed"))
-        .or_else(|| xai_val_number(cfg.get("onDemand")));
+    let on_demand_used =
+        xai_val_number(cfg.get("onDemandUsed")).or_else(|| xai_val_number(cfg.get("onDemand")));
     let prepaid = xai_val_number(cfg.get("prepaidBalance"));
 
     if let Some(cap) = on_demand_cap.filter(|c| *c > 0.0) {
@@ -1514,9 +1500,7 @@ async fn discover_models_openai(
                         // xAI-aware path, then enrich vision/chat filter from
                         // `/language-models` when available.
                         let mut models = parse_xai_models_list(&v);
-                        if let Some(lang) =
-                            fetch_xai_language_model_ids(client, provider).await
-                        {
+                        if let Some(lang) = fetch_xai_language_model_ids(client, provider).await {
                             apply_xai_language_models_enrichment(&mut models, &lang);
                         }
                         models
@@ -1554,7 +1538,8 @@ const MODELS_CACHE_TTL: u64 = 28800;
 /// for up to the TTL window.
 // v7: xAI models parse live `context_length` / vision from `/models` +
 // `/language-models` (previously hardcoded wrong windows for Grok).
-const MODELS_CACHE_VERSION: u64 = 7;
+// v8: Antigravity Gemini 3 + Claude-via-Antigravity catalog.
+const MODELS_CACHE_VERSION: u64 = 8;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -2143,38 +2128,67 @@ fn openai_model_caps(id: &str, name: &str) -> ModelInfo {
         .map(|s| s.to_string())
         .collect();
     // (context_window, max_tokens, reasoning, vision, thinking_levels)
-    let (ctx, max, reasoning, vision, levels): (u32, u32, bool, bool, Vec<String>) =
-        if l.contains("gpt-5-codex") {
-            (272_144, 163_840, true, true, std_levels.clone())
-        } else if l.contains("gpt-5") {
-            (272_144, 128_000, true, true, std_levels.clone())
-        } else if l.contains("o4-mini") {
-            (200_000, 100_000, true, true, std_levels.clone())
-        } else if l.starts_with("o4") || l.contains("o4-") {
-            (200_000, 100_000, true, true, std_levels.clone())
-        } else if l.starts_with("o3") || l.contains("o3-") {
-            (200_000, 100_000, true, false, std_levels.clone())
-        } else if l.contains("o1") {
-            (200_000, 100_000, true, false, vec!["high".to_string()])
-        } else if l.contains("gpt-4.1") {
-            (1_047_576, 32_768, false, true, Vec::new())
-        } else if l.contains("gpt-4o") {
-            (128_000, 16_384, false, true, Vec::new())
-        } else if l.contains("gemini-2.5-pro") || l.contains("gemini-2.5") {
-            (1_048_576, 65_536, true, true, std_levels.clone())
-        } else if l.contains("gemini-2.5-flash") {
-            (1_048_576, 65_536, true, true, std_levels.clone())
-        } else if l.contains("gemini-2.0-flash") {
-            (1_048_576, 8_192, false, true, Vec::new())
-        } else if l.contains("gemini") {
-            (1_048_576, 8_192, false, true, Vec::new())
-        } else if l.contains("grok") {
-            // Delegate to xai_model_caps so offline OpenAI-list parsing matches
-            // the SuperGrok catalog (context_length is overlaid from live API).
-            return xai_model_caps(id, name);
-        } else {
-            (200_000, 8_192, true, false, Vec::new())
-        };
+    let (ctx, max, reasoning, vision, levels): (u32, u32, bool, bool, Vec<String>) = if l
+        .contains("gpt-5-codex")
+    {
+        (272_144, 163_840, true, true, std_levels.clone())
+    } else if l.contains("gpt-5") {
+        (272_144, 128_000, true, true, std_levels.clone())
+    } else if l.contains("o4-mini") {
+        (200_000, 100_000, true, true, std_levels.clone())
+    } else if l.starts_with("o4") || l.contains("o4-") {
+        (200_000, 100_000, true, true, std_levels.clone())
+    } else if l.starts_with("o3") || l.contains("o3-") {
+        (200_000, 100_000, true, false, std_levels.clone())
+    } else if l.contains("o1") {
+        (200_000, 100_000, true, false, vec!["high".to_string()])
+    } else if l.contains("gpt-4.1") {
+        (1_047_576, 32_768, false, true, Vec::new())
+    } else if l.contains("gpt-4o") {
+        (128_000, 16_384, false, true, Vec::new())
+    } else if l.contains("gemini-3") && l.contains("flash") {
+        // Gemini 3 Flash (Antigravity): thinkingLevel minimal/low/medium/high.
+        (
+            1_048_576,
+            65_536,
+            true,
+            true,
+            vec![
+                "minimal".into(),
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+            ],
+        )
+    } else if l.contains("gemini-3") {
+        // Gemini 3 / 3.1 Pro (Antigravity): thinkingLevel low/high only.
+        (
+            1_048_576,
+            65_535,
+            true,
+            true,
+            vec!["low".into(), "high".into()],
+        )
+    } else if l.contains("claude-opus") && l.contains("thinking") {
+        // Claude-via-Antigravity (Opus thinking) — 200k ctx.
+        (200_000, 64_000, true, true, std_levels.clone())
+    } else if l.contains("claude-sonnet-4") || l.contains("claude-opus-4") {
+        (200_000, 64_000, false, true, Vec::new())
+    } else if l.contains("gemini-2.5-pro") || (l.contains("gemini-2.5") && !l.contains("flash")) {
+        (1_048_576, 65_536, true, true, std_levels.clone())
+    } else if l.contains("gemini-2.5-flash") {
+        (1_048_576, 65_536, true, true, std_levels.clone())
+    } else if l.contains("gemini-2.0-flash") {
+        (1_048_576, 8_192, false, true, Vec::new())
+    } else if l.contains("gemini") {
+        (1_048_576, 8_192, false, true, Vec::new())
+    } else if l.contains("grok") {
+        // Delegate to xai_model_caps so offline OpenAI-list parsing matches
+        // the SuperGrok catalog (context_length is overlaid from live API).
+        return xai_model_caps(id, name);
+    } else {
+        (200_000, 8_192, true, false, Vec::new())
+    };
     ModelInfo {
         id: id.to_string(),
         name: name.to_string(),
@@ -2200,9 +2214,10 @@ pub fn is_gemini_endpoint(base_url: &str) -> bool {
     host == "generativelanguage.googleapis.com"
 }
 
-/// True when the base URL points at the Code Assist API (cloudcode-pa.googleapis.com).
-/// This is where OAuth-authenticated Gemini requests are routed — the
-/// generativelanguage.googleapis.com endpoint only accepts API keys.
+/// True when the base URL points at a Code Assist / Antigravity gateway
+/// (`cloudcode-pa.googleapis.com` or the daily/autopush sandboxes). OAuth-
+/// authenticated Gemini/Claude-via-Antigravity requests are routed here —
+/// `generativelanguage.googleapis.com` only accepts API keys.
 pub fn is_code_assist_endpoint(base_url: &str) -> bool {
     let host = base_url
         .split("://")
@@ -2213,6 +2228,9 @@ pub fn is_code_assist_endpoint(base_url: &str) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     host == "cloudcode-pa.googleapis.com"
+        || host == "daily-cloudcode-pa.sandbox.googleapis.com"
+        || host == "autopush-cloudcode-pa.sandbox.googleapis.com"
+        || (host.ends_with(".sandbox.googleapis.com") && host.contains("cloudcode-pa"))
 }
 
 /// True when the base URL points at ChatGPT's Codex subscription backend.
@@ -2249,6 +2267,53 @@ pub fn is_opencode_go(base_url: &str) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     host == "opencode.ai" && base_url.to_ascii_lowercase().contains("/zen/go/")
+}
+
+/// True for GitHub Copilot's OpenAI-compatible chat endpoint.
+pub fn is_github_copilot_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.githubcopilot.com"
+}
+
+/// True for Kimi Coding's OpenAI-compatible subscription endpoint.
+pub fn is_kimi_coding_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.kimi.com" && base_url.to_ascii_lowercase().contains("/coding/")
+}
+
+/// True for Kilo Code's OpenRouter-compatible gateway endpoint.
+pub fn is_kilocode_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.kilo.ai"
+}
+
+pub fn is_cline_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.cline.bot"
+}
+
+pub fn is_kimchi_endpoint(base_url: &str) -> bool {
+    let h = endpoint_host(base_url);
+    h == "llm.kimchi.dev" || h.ends_with(".kimchi.dev")
+}
+
+pub fn is_codebuddy_endpoint(base_url: &str) -> bool {
+    endpoint_host(base_url) == "copilot.tencent.com"
+}
+
+pub fn is_iflow_endpoint(base_url: &str) -> bool {
+    let h = endpoint_host(base_url);
+    h == "apis.iflow.cn" || h == "iflow.cn" || h.ends_with(".iflow.cn")
+}
+
+fn endpoint_host(base_url: &str) -> String {
+    base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 /// Capabilities for an OpenCode Go model id. The OpenCode Go `/v1/models`
@@ -2567,11 +2632,27 @@ fn codex_fallback_models() -> Vec<ModelInfo> {
     .collect()
 }
 
-/// Static Gemini model list used when the Gemini OpenAI-compatible endpoint
-/// is unreachable.
+/// Static Antigravity / Gemini model list used when live discovery is
+/// unreachable. Antigravity quota models first (Gemini 3 + Claude), then the
+/// older Gemini 2.5 models as a secondary set.
 fn gemini_fallback_models() -> Vec<ModelInfo> {
-    let ids = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"];
-    ids.iter().map(|id| openai_model_caps(id, id)).collect()
+    // (id, display_name) — Antigravity model ids match the Code Assist gateway
+    // (no "models/" prefix; Gemini 3 Pro uses -low/-high tiers).
+    let ids: &[(&str, &str)] = &[
+        ("gemini-3.1-pro-high", "Gemini 3.1 Pro (Antigravity)"),
+        ("gemini-3-pro-high", "Gemini 3 Pro (Antigravity)"),
+        ("gemini-3-flash", "Gemini 3 Flash (Antigravity)"),
+        (
+            "claude-opus-4-6-thinking",
+            "Claude Opus 4.6 Thinking (Antigravity)",
+        ),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Antigravity)"),
+        ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+    ];
+    ids.iter()
+        .map(|(id, name)| openai_model_caps(id, name))
+        .collect()
 }
 
 /// Static xAI Grok model list used when `/models` is unreachable. Context
@@ -2604,6 +2685,24 @@ pub fn is_xai_endpoint(base_url: &str) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     host == "api.x.ai" || host == "x.ai" || host.ends_with(".x.ai")
+}
+
+/// True when `base_url` points at Qwen Code's portal chat endpoint
+/// (`portal.qwen.ai`). Used by `oauth::enrich_oauth` and presence checks so a
+/// user-added provider at that host still picks up the Qwen OAuth token.
+pub fn is_qwen_endpoint(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "portal.qwen.ai" || host.ends_with(".portal.qwen.ai") || host == "chat.qwen.ai"
 }
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
@@ -3497,14 +3596,100 @@ async fn stream_turn_openai(
 }
 
 // ===========================================================================
-// Gemini Code Assist API (cloudcode-pa.googleapis.com)
+// Antigravity / Code Assist API (daily-cloudcode-pa / cloudcode-pa)
 // ===========================================================================
 //
-// When a user signs in via the gemini-cli OAuth flow, the OAuth token is for
-// the Code Assist API — NOT for generativelanguage.googleapis.com (which only
-// accepts API keys). The Code Assist API uses the native Google GenAI wire
-// format (not OpenAI-compatible), so we need our own message converter,
-// request builder, and SSE response parser.
+// When a user signs in via the Antigravity OAuth flow, the OAuth token is for
+// the Code Assist / Antigravity gateway — NOT for generativelanguage.googleapis.com
+// (which only accepts API keys). The gateway uses the native Google GenAI wire
+// format (not OpenAI-compatible), so we need our own message converter, request
+// builder, and SSE response parser. Gemini 3 + Claude-via-Antigravity ride the
+// same path.
+
+/// Map a user-facing / catalog model id onto the Antigravity Code Assist wire
+/// id. Strips `models/` and `antigravity-` prefixes; for Gemini 3 Pro (which
+/// requires a `-low`/`-high` tier suffix on Antigravity) appends the tier from
+/// the requested reasoning effort when missing.
+fn resolve_antigravity_model_id(model: &str, reasoning_effort: &str) -> String {
+    let mut id = model.strip_prefix("models/").unwrap_or(model).to_string();
+    if let Some(rest) = id.strip_prefix("antigravity-") {
+        id = rest.to_string();
+    }
+    let lower = id.to_ascii_lowercase();
+    // Gemini 3 / 3.1 Pro on Antigravity requires an explicit -low/-high tier.
+    let is_pro = (lower.starts_with("gemini-3") || lower.starts_with("gemini-3.1"))
+        && lower.contains("pro")
+        && !lower.contains("flash");
+    let has_tier = lower.ends_with("-low") || lower.ends_with("-high");
+    if is_pro && !has_tier {
+        let tier = match reasoning_effort.to_ascii_lowercase().as_str() {
+            "low" | "minimal" | "none" | "" => "low",
+            _ => "high",
+        };
+        id = format!("{id}-{tier}");
+    }
+    id
+}
+
+/// Apply the right thinkingConfig shape for the Antigravity model family.
+fn apply_antigravity_thinking(request: &mut Value, model: &str, reasoning_effort: &str) {
+    let lower = model.to_ascii_lowercase();
+    let effort = reasoning_effort.to_ascii_lowercase();
+    let off = matches!(effort.as_str(), "" | "none" | "off");
+    if lower.contains("gemini-3") {
+        // Gemini 3 uses thinkingLevel strings, not numeric budgets.
+        if off {
+            // Still send a low level — Gemini 3 rejects budget 0; "low" is the
+            // cheapest tier Antigravity accepts for Pro, "minimal" for Flash.
+            let level = if lower.contains("flash") {
+                "minimal"
+            } else {
+                "low"
+            };
+            request["request"]["generationConfig"]["thinkingConfig"] =
+                json!({ "thinkingLevel": level, "includeThoughts": true });
+        } else {
+            let level = match effort.as_str() {
+                "minimal" => "minimal",
+                "low" => "low",
+                "medium" => "medium",
+                "high" | "max" => "high",
+                _ => {
+                    if lower.contains("flash") {
+                        "medium"
+                    } else {
+                        "high"
+                    }
+                }
+            };
+            // Pro only accepts low/high — clamp medium/minimal.
+            let level = if !lower.contains("flash") {
+                match level {
+                    "high" => "high",
+                    _ => "low",
+                }
+            } else {
+                level
+            };
+            request["request"]["generationConfig"]["thinkingConfig"] =
+                json!({ "thinkingLevel": level, "includeThoughts": true });
+        }
+        return;
+    }
+    // Gemini 2.5 / Claude-via-Antigravity: numeric budget.
+    if off {
+        request["request"]["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
+    } else {
+        let budget = match effort.as_str() {
+            "low" | "minimal" => 8192,
+            "medium" => 16384,
+            "high" | "max" => 32768,
+            _ => 16384,
+        };
+        request["request"]["generationConfig"]["thinkingConfig"] =
+            json!({ "thinkingBudget": budget, "includeThoughts": true });
+    }
+}
 
 /// Convert `&[Message]` to the Code Assist (native GenAI) `contents` array.
 /// Returns (contents, systemInstruction). System messages are extracted into a
@@ -3621,10 +3806,10 @@ fn tools_to_genai(tools: &[Value]) -> Vec<Value> {
     }
 }
 
-/// Stream a turn through the Code Assist API (native GenAI wire format).
-/// This is the OAuth path for Gemini — `generativelanguage.googleapis.com`
-/// only accepts API keys; the OAuth token authenticates against
-/// `cloudcode-pa.googleapis.com` which proxies Gemini for personal accounts.
+/// Stream a turn through the Antigravity / Code Assist API (native GenAI
+/// wire format). This is the OAuth path for Gemini 3 + Claude-via-Antigravity
+/// — `generativelanguage.googleapis.com` only accepts API keys; the OAuth
+/// token authenticates against the daily/prod `cloudcode-pa` gateways.
 async fn stream_turn_gemini(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
@@ -3657,13 +3842,15 @@ async fn stream_turn_gemini(
     let (contents, system_instruction) = messages_to_genai_contents(messages);
     let genai_tools = tools_to_genai(tools);
 
-    // Strip "models/" prefix if present — the Code Assist API expects bare IDs.
-    let model_name = model.strip_prefix("models/").unwrap_or(model);
+    // Strip "models/" / "antigravity-" prefixes; resolve Gemini 3 Pro tier.
+    let model_name = resolve_antigravity_model_id(model, reasoning_effort);
 
-    // Build the request body.
+    // Build the request body. `userAgent: "antigravity"` is required by the
+    // Antigravity gateway (CLIProxy / opencode-antigravity-auth send it).
     let mut request = json!({
         "model": model_name,
         "project": project,
+        "userAgent": "antigravity",
         "request": {
             "contents": contents,
             "generationConfig": {
@@ -3677,12 +3864,11 @@ async fn stream_turn_gemini(
     if !genai_tools.is_empty() {
         request["request"]["tools"] = json!(genai_tools);
     }
-    // Thinking config: disable for "none", enable with includeThoughts otherwise.
-    if reasoning_effort == "none" || reasoning_effort.is_empty() {
-        request["request"]["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": 0});
-    } else {
-        request["request"]["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
-    }
+    // Thinking config:
+    // - Gemini 3: thinkingLevel string (minimal/low/medium/high)
+    // - Gemini 2.5 / Claude-via-Antigravity: thinkingBudget numeric + includeThoughts
+    // - "none"/empty: disable (budget 0) for non-Gemini-3 families
+    apply_antigravity_thinking(&mut request, &model_name, reasoning_effort);
 
     let url = format!("{base_url}:streamGenerateContent?alt=sse");
     let idle = Duration::from_secs(idle_timeout_secs.max(5));
@@ -3943,6 +4129,69 @@ async fn stream_turn_gemini(
     ))
 }
 
+/// HMAC-SHA256 (RFC 2104) over `payload` with `key`, hex-encoded.
+/// Implemented with sha2 so we don't need an extra `hmac` crate.
+fn hmac_sha256_hex(key: &[u8], payload: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = if key.len() > BLOCK {
+        Sha256::digest(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    k.resize(BLOCK, 0);
+    let mut ipad = [0u8; BLOCK];
+    let mut opad = [0u8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(payload);
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner.finalize());
+    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// iFlow chat requests require per-request HMAC headers (session-id,
+/// x-iflow-timestamp, x-iflow-signature) matching 9router's IFlowExecutor.
+fn iflow_signed_headers(api_key: &str, headers: &[(String, String)]) -> Vec<(String, String)> {
+    use rand::RngCore;
+    let mut uuid = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut uuid);
+    // RFC 4122 variant bits for a random UUID (v4-ish).
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    let session_id = format!(
+        "session-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+    );
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let user_agent = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("iFlow-Cli");
+    let payload = format!("{user_agent}:{session_id}:{timestamp}");
+    let signature = hmac_sha256_hex(api_key.as_bytes(), payload.as_bytes());
+    let mut out = headers.to_vec();
+    // Drop any stale signature headers so retries re-sign cleanly.
+    out.retain(|(k, _)| {
+        let kl = k.to_ascii_lowercase();
+        kl != "session-id" && kl != "x-iflow-timestamp" && kl != "x-iflow-signature"
+    });
+    out.push(("session-id".into(), session_id));
+    out.push(("x-iflow-timestamp".into(), timestamp.to_string()));
+    out.push(("x-iflow-signature".into(), signature));
+    out
+}
+
 /// POST with retry on 429/5xx. Exponential backoff: 0.5s, 1s, 2s, 4s (cap 8s),
 /// honoring Retry-After if present. Up to 4 attempts. Cancellation-aware.
 async fn send_with_retry(
@@ -3961,6 +4210,15 @@ async fn send_with_retry(
         // that streams >5 min gets aborted mid-stream with "operation timed out".
         // Stalls are caught by connect_timeout (connect phase, on the client) +
         // the per-chunk idle timeout in stream_turn (body phase).
+        // iFlow requires a fresh HMAC signature on every request (9router
+        // IFlowExecutor). Re-sign on each attempt so retries stay valid.
+        let signed: Vec<(String, String)>;
+        let headers = if is_iflow_endpoint(url) {
+            signed = iflow_signed_headers(api_key, headers);
+            signed.as_slice()
+        } else {
+            headers
+        };
         let mut req = client.post(url).bearer_auth(api_key).json(body);
         for (k, v) in headers {
             req = req.header(k, v);

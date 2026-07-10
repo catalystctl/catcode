@@ -429,3 +429,59 @@ body {
   color: #c4122f;
   background: rgba(196, 18, 47, 0.08);
 }
+
+/* ── Auth screens (setup / login) ─────────────────────────────────────── */
+.auth-input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--ink-700));
+  background: rgb(var(--ink-950));
+  padding: 0.6rem 0.8rem;
+  font-size: 0.9rem;
+  color: rgb(var(--ink-100));
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.auth-input::placeholder {
+  color: rgb(var(--ink-500));
+}
+.auth-input:focus {
+  border-color: rgb(var(--accent));
+  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.15);
+}
+.auth-btn-primary {
+  width: 100%;
+  border-radius: 10px;
+  background: rgb(var(--accent));
+  padding: 0.6rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: rgb(var(--ink-950));
+  transition: opacity 0.15s, background 0.15s;
+}
+.auth-btn-primary:hover:not(:disabled) {
+  background: rgb(var(--accent-soft));
+}
+.auth-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.auth-btn-ghost {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--ink-700));
+  background: transparent;
+  padding: 0.6rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: rgb(var(--ink-200));
+  transition: border-color 0.15s, background 0.15s;
+}
+.auth-btn-ghost:hover:not(:disabled) {
+  border-color: rgb(var(--ink-500));
+  background: rgb(var(--ink-850) / 0.5);
+}
+.auth-btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -1307,7 +1307,12 @@ impl PluginManager {
             .unwrap()
             .values()
             .filter(|p| p.enabled)
-            .find_map(|p| p.oauth.as_ref().filter(|o| o.provider_id == provider_id).cloned())
+            .find_map(|p| {
+                p.oauth
+                    .as_ref()
+                    .filter(|o| o.provider_id == provider_id)
+                    .cloned()
+            })
     }
 
     /// Find the plugin OAuth provider that should authenticate a resolved
@@ -1372,11 +1377,8 @@ impl PluginManager {
         if let Some(cfg) = self.oauth_config(provider_id) {
             let _ = std::fs::remove_file(&cfg.token_path);
             if let Some(script) = cfg.script_for("clear") {
-                let ctx = self.oauth_action_ctx(
-                    "clear",
-                    provider_id,
-                    &cfg.token_path.to_string_lossy(),
-                );
+                let ctx =
+                    self.oauth_action_ctx("clear", provider_id, &cfg.token_path.to_string_lossy());
                 let _ = self
                     .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
                     .await;
@@ -1404,11 +1406,7 @@ impl PluginManager {
             }
         }
         let script = cfg.script_for("token")?;
-        let ctx = self.oauth_action_ctx(
-            "token",
-            provider_id,
-            &cfg.token_path.to_string_lossy(),
-        );
+        let ctx = self.oauth_action_ctx("token", provider_id, &cfg.token_path.to_string_lossy());
         let resp = self
             .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
             .await
@@ -1507,8 +1505,8 @@ impl PluginManager {
                 });
             }
             // Wait for the browser redirect, then complete the exchange.
-            let code = crate::oauth::await_redirect_dual(listener, listener_v6, &state, None)
-                .await?;
+            let code =
+                crate::oauth::await_redirect_dual(listener, listener_v6, &state, None).await?;
             let mut ctx = self.oauth_action_ctx("complete", provider_id, &token_path);
             ctx["code"] = json!(code);
             ctx["redirect_uri"] = json!(redirect_uri);
@@ -1646,7 +1644,10 @@ impl PluginManager {
                 let _ = stdin.write_all(&ctx_bytes).await;
                 let _ = stdin.shutdown().await;
             };
-            if tokio::time::timeout(stdin_timeout, write_fut).await.is_err() {
+            if tokio::time::timeout(stdin_timeout, write_fut)
+                .await
+                .is_err()
+            {
                 let _ = child.start_kill();
                 return Err(format!(
                     "oauth script did not consume stdin within {}ms",
@@ -2074,13 +2075,18 @@ fn validate_plugin_script(canon_dir: &Path, script_rel: &str) -> Result<PathBuf,
 /// executable file. Token resolution is mandatory (a provider that can never
 /// produce a token is useless); login/complete fall back to the shared script
 /// and error at runtime only if neither exists.
-fn load_oauth_entry(canon_dir: &Path, entry: OauthManifestEntry) -> Result<PluginOauthConfig, String> {
+fn load_oauth_entry(
+    canon_dir: &Path,
+    entry: OauthManifestEntry,
+) -> Result<PluginOauthConfig, String> {
     let provider_id = entry.provider_id.clone();
     if provider_id.is_empty() {
         return Err("oauth provider_id is empty".into());
     }
     if entry.base_url.is_empty() {
-        return Err(format!("oauth provider '{provider_id}' has an empty base_url"));
+        return Err(format!(
+            "oauth provider '{provider_id}' has an empty base_url"
+        ));
     }
     let kind = match entry.kind.as_deref().unwrap_or("openai") {
         "openai" => ProviderKind::OpenAI,
@@ -3248,7 +3254,7 @@ mod tests {
         assert_eq!(oauth.base_url, "https://api.x.ai/v1");
         assert_eq!(oauth.kind, ProviderKind::OpenAI);
         assert_eq!(oauth.label, "grok"); // defaults to provider_id
-        // token_path defaults to <provider_id>.json under the oauth dir.
+                                         // token_path defaults to <provider_id>.json under the oauth dir.
         assert!(oauth.token_path.ends_with("grok.json"));
         // The shared script resolves for every action.
         assert!(oauth.script_for("login").is_some());
