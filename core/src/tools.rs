@@ -1238,12 +1238,74 @@ pub(crate) fn smart_truncate(output: &str, cap: usize) -> String {
     out
 }
 
+/// Detect whether a bash command invokes `sudo`. Matches `sudo` as a
+/// standalone word (word-boundary) anywhere in the command. Over-matches on
+/// strings like `echo sudo` (false positive) — that's acceptable: better to
+/// prompt for approval than to let sudo grab /dev/tty and garble the TUI.
+pub fn command_uses_sudo(command: &str) -> bool {
+    static SUDO_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bsudo\b").expect("sudo regex"));
+    SUDO_RE.is_match(command)
+}
+
+/// Pre-check: does this system need a password for sudo? Runs `sudo -n true`
+/// (non-interactive — never opens /dev/tty). Returns true if a password is
+/// needed (NOPASSWD not configured + no cached credentials). Used by the
+/// dispatch layer when approval is `Never` to decide whether to show the
+/// sudo prompt: users with NOPASSWD sudo never see it.
+pub async fn sudo_needs_password(cfg: &Config) -> bool {
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c").arg("sudo -n true 2>/dev/null");
+    cmd.current_dir(&cfg.workspace);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.env_clear();
+    cmd.env(
+        "PATH",
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+    );
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    // `sudo -n true` exits 0 if NOPASSWD or cached; non-zero if a password
+    // is needed. A timeout guards against hangs.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.status()).await {
+        Ok(Ok(status)) => !status.success(),
+        _ => true, // Timeout or spawn failure → assume password needed (safe).
+    }
+}
+
+/// How to handle sudo when the command invokes it.
+pub enum SudoAuth {
+    /// No sudo auth available. If the command uses sudo, returns a clean error
+    /// so the caller can surface a prompt. Used by subagents / bulk.
+    None,
+    /// Run with `sudo -S` and feed this password on stdin (user approved).
+    Password(String),
+    /// Run with `sudo -n` (non-interactive). Succeeds if NOPASSWD or cached
+    /// credentials exist; fails cleanly (never opens /dev/tty) if a password
+    /// is needed. Used when approval is Never and NOPASSWD is confirmed.
+    NonInteractive,
+}
+
 /// Run bash with cwd=workspace, a real timeout, and a denylist tripwire.
 /// Optional hard sandbox: --sandbox firejail wraps the command in a
 /// firejail profile that whitelists only the workspace; --no-network adds
 /// `unshare -n` so the command can't phone home. Both are belt-and-suspenders
 /// on top of the denylist tripwire.
-pub async fn execute_bash(command: &str, cfg: &Config, timeout_override: Option<u64>) -> Outcome {
+///
+/// `sudo_password`: when Some, the command is known to invoke `sudo` and the
+/// user approved it + supplied a password. The password is fed on stdin and
+/// `sudo` is forced to read it (`-S`) instead of opening /dev/tty (which would
+/// garble the TUI). When None but the command uses sudo, a clean error is
+/// returned so the caller can surface an approval prompt instead.
+pub async fn execute_bash(
+    command: &str,
+    cfg: &Config,
+    timeout_override: Option<u64>,
+    sudo_auth: SudoAuth,
+) -> Outcome {
     // ponytail: denylist is a tripwire, not a sandbox. It blocks the most
     // catastrophic obvious commands; a determined model bypasses it.
     // Normalize whitespace first so `rm  -rf  /` (extra spaces) can't slip past
@@ -1270,17 +1332,50 @@ pub async fn execute_bash(command: &str, cfg: &Config, timeout_override: Option<
         }
     }
 
+    // Sudo handling: sudo by default reads the password from /dev/tty (the
+    // controlling terminal), which garbles the TUI's rendering. We never let
+    // sudo reach /dev/tty. Three modes:
+    //   Password(pw)  → redefine sudo to use `-S` (read pw from stdin).
+    //   NonInteractive → redefine sudo to use `-n` (fail if pw needed).
+    //   None          → clean error if sudo detected (caller must prompt).
+    let uses_sudo = command_uses_sudo(command);
+    let run_command = match &sudo_auth {
+        SudoAuth::Password(_) if uses_sudo => {
+            format!(r#"sudo() {{ command sudo -S "$@"; }}; {command}"#)
+        }
+        SudoAuth::NonInteractive if uses_sudo => {
+            format!(r#"sudo() {{ command sudo -n "$@"; }}; {command}"#)
+        }
+        _ => {
+            if uses_sudo {
+                return Outcome::err(
+                    "this command uses sudo, which requires interactive approval. \
+                     The user must approve it in the main session — ask them to run it \
+                     manually, or re-run without sudo.",
+                );
+            }
+            command.to_string()
+        }
+    };
+
     // Build the argv. If a sandbox is configured, we exec the sandbox wrapper
     // instead of bash directly; the wrapper runs bash -c <command> inside.
     // ponytail: firejail profile is generated per-run into a temp file so the
     // workspace whitelist is always the current cfg.workspace. One file per
     // call is wasteful under load but correct; cache if it ever matters.
-    let (_profile, mut cmd) = build_bash_command(command, cfg);
+    let (_profile, mut cmd) = build_bash_command(&run_command, cfg);
 
     cmd.current_dir(&cfg.workspace);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::null());
+    // When feeding a sudo password, stdin must be piped; otherwise null (the
+    // command can't read from the TUI and shouldn't block on stdin).
+    let feeding_password = matches!(&sudo_auth, SudoAuth::Password(_) if uses_sudo);
+    if feeding_password {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
     cmd.kill_on_drop(true);
     // P1-8: don't leak the parent environment (LD_PRELOAD, LD_LIBRARY_PATH,
     // UMANS_*, arbitrary PATH/HOME overrides) into bash — even inside a sandbox
@@ -1300,7 +1395,7 @@ pub async fn execute_bash(command: &str, cfg: &Config, timeout_override: Option<
         cmd.env("USER", user);
     }
 
-    let child: tokio::process::Child = match cmd.spawn() {
+    let mut child: tokio::process::Child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let hint = match cfg.sandbox {
@@ -1312,6 +1407,19 @@ pub async fn execute_bash(command: &str, cfg: &Config, timeout_override: Option<
             return Outcome::err(format!("bash failed to spawn: {e}{hint}"));
         }
     };
+
+    // Feed the sudo password on stdin (then close it) so `sudo -S` reads it
+    // instead of blocking on /dev/tty. Done before the timeout wait so sudo
+    // unblocks immediately. The stdin handle drops at end of block → EOF.
+    if uses_sudo {
+        if let SudoAuth::Password(pw) = &sudo_auth {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(format!("{pw}\n").as_bytes()).await;
+                // stdin drops here → the pipe closes; the command sees EOF.
+            }
+        }
+    }
 
     // Per-call timeout override (the bash tool's `timeout` arg): clamp to
     // [1, max_bash_timeout_secs] so a model can buy more time for a slow
@@ -1878,7 +1986,7 @@ pub async fn execute_bulk(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let timeout_override = inner_args.get("timeout").and_then(|v| v.as_u64());
-            execute_bash(cmd, cfg, timeout_override).await
+            execute_bash(cmd, cfg, timeout_override, SudoAuth::None).await
         } else if name == "fetch" {
             execute_fetch(&inner_args, cfg).await
         } else if name == "web_search" {
@@ -3242,7 +3350,7 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         let mut cfg = cfg;
         cfg.bash_timeout_secs = 1;
-        let o = execute_bash("sleep 30", &cfg, None).await;
+        let o = execute_bash("sleep 30", &cfg, None, SudoAuth::None).await;
         assert!(!o.ok);
         assert!(o.output.contains("timed out"), "{}", o.output);
     }
@@ -3250,7 +3358,7 @@ mod tests {
     #[tokio::test]
     async fn bash_denylist_blocks() {
         let (_root, cfg) = tmp_ws();
-        let o = execute_bash("rm -rf /", &cfg, None).await;
+        let o = execute_bash("rm -rf /", &cfg, None, SudoAuth::None).await;
         assert!(!o.ok);
         assert!(o.output.contains("denylist"), "{}", o.output);
     }
@@ -3258,7 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn bash_runs_in_workspace() {
         let (root, cfg) = tmp_ws();
-        let o = execute_bash("pwd", &cfg, None).await;
+        let o = execute_bash("pwd", &cfg, None, SudoAuth::None).await;
         assert!(o.ok, "{}", o.output);
         // canonicalize both for comparison (tmp may be a symlink)
         assert_eq!(
@@ -3475,7 +3583,7 @@ mod tests {
     async fn bash_denylist_blocks_extra_whitespace_root() {
         let (_root, cfg) = tmp_ws();
         // P1-7: extra spaces can't evade the pattern after whitespace normalization.
-        let o = execute_bash("rm   -rf    /", &cfg, None).await;
+        let o = execute_bash("rm   -rf    /", &cfg, None, SudoAuth::None).await;
         assert!(!o.ok, "{}", o.output);
         assert!(o.output.contains("denylist"), "{}", o.output);
     }
@@ -3485,11 +3593,11 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         // P1-7: `rm -rf /tmp/x` no longer false-positives on `rm -rf /`.
         // Use `echo` so nothing destructive runs; the tripwire must NOT match.
-        let o = execute_bash("echo rm -rf /tmp/x-nope", &cfg, None).await;
+        let o = execute_bash("echo rm -rf /tmp/x-nope", &cfg, None, SudoAuth::None).await;
         assert!(o.ok, "{}", o.output);
         // And a plain workspace-relative rm still runs.
         fs::write(cfg.workspace.join("to_delete"), "x").unwrap();
-        let o2 = execute_bash("rm -f to_delete", &cfg, None).await;
+        let o2 = execute_bash("rm -f to_delete", &cfg, None, SudoAuth::None).await;
         assert!(o2.ok, "{}", o2.output);
     }
 
@@ -3726,5 +3834,37 @@ mod tests {
 
         crate::presence::clear_presence(&cfg.workspace, peer_pid);
         crate::presence::clear_presence(&cfg.workspace, my_pid);
+    }
+
+    #[test]
+    fn test_command_uses_sudo_detection() {
+        // Positive: commands that invoke sudo as a command word.
+        assert!(command_uses_sudo("sudo apt update"));
+        assert!(command_uses_sudo("sudo make install"));
+        assert!(command_uses_sudo("cd /opt && sudo ./install.sh"));
+        assert!(command_uses_sudo("echo hi | sudo tee /etc/hosts"));
+        assert!(command_uses_sudo("sudo -u root whoami"));
+
+        // Negative: sudo as a substring but NOT a standalone word.
+        assert!(!command_uses_sudo("sudoers"));
+        assert!(!command_uses_sudo("pseudo command"));
+        assert!(!command_uses_sudo("ls -la"));
+        assert!(!command_uses_sudo("echo hello"));
+        assert!(!command_uses_sudo(""));
+    }
+
+    #[tokio::test]
+    async fn test_bash_sudo_without_password_returns_error() {
+        let (_root, cfg) = tmp_ws();
+        // A sudo command with no password (un-approved path, e.g. subagent/bulk)
+        // must return a clean error — NOT run sudo (which would grab /dev/tty
+        // and garble the TUI).
+        let o = execute_bash("sudo true", &cfg, None, SudoAuth::None).await;
+        assert!(!o.ok, "sudo without password should not succeed");
+        assert!(
+            o.output.contains("sudo"),
+            "error should mention sudo: {}",
+            o.output
+        );
     }
 }

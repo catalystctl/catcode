@@ -40,6 +40,7 @@ export const initialState: AgentState = {
   retrying: false,
   pendingApproval: null,
   pendingAsk: null,
+  pendingSudo: null,
   metrics: null,
   umansConc: null,
   sessions: [],
@@ -468,6 +469,16 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           `Agent asks: ${ev.questions.length} question${ev.questions.length === 1 ? "" : "s"}`,
         ),
       };
+    case "sudo_request":
+      return {
+        ...state,
+        pendingSudo: { request_id: ev.request_id, command: ev.command },
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          "Sudo command requested — approve or decline",
+        ),
+      };
     case "compacting":
       return {
         ...state,
@@ -577,6 +588,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         streaming: false,
         pendingApproval: null,
         pendingAsk: null,
+        pendingSudo: null,
       };
     case "reset":
       return {
@@ -586,6 +598,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         streaming: false,
         pendingApproval: null,
         pendingAsk: null,
+        pendingSudo: null,
         // A reset aborts the current turn (and any in-flight subagent), so a
         // pending intercom ask is now stale — drop the banner so it can't hang.
         pendingIntercom: null,
@@ -775,6 +788,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         streaming: false,
         pendingApproval: null,
         pendingAsk: null,
+        pendingSudo: null,
         sessions: [],
         currentSessionFile: null,
         stats: null,

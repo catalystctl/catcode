@@ -66,6 +66,8 @@ export interface AgentApi {
   intercomReply: (reply: string) => Promise<void>;
   // ── Ask tool ──
   askReply: (answers: Record<string, string> | null) => Promise<void>;
+  // ── Sudo passthrough ──
+  sudoReply: (approved: boolean, password?: string) => Promise<void>;
   // ── OAuth ──
   submitOauthCode: (code: string) => Promise<void>;
   dismissOauth: () => void;
@@ -450,6 +452,22 @@ export function useAgent(): AgentApi {
     [send],
   );
 
+  const sudoReply = useCallback(
+    (approved: boolean, password?: string) => {
+      const s = stateRef.current;
+      const req = s.pendingSudo;
+      if (!req) return Promise.resolve();
+      setState((st) => ({ ...st, pendingSudo: null }));
+      return send({
+        type: "sudo_reply",
+        request_id: req.request_id,
+        approved,
+        ...(password ? { password } : {}),
+      });
+    },
+    [send],
+  );
+
   // ── OAuth ──
   // Complete a no-browser (manual-code) OAuth login by pasting the code or
   // final callback URL the provider returned. Mirrors the TUI's /oauth-code.
@@ -714,6 +732,7 @@ export function useAgent(): AgentApi {
       dismissToast,
       intercomReply,
       askReply,
+      sudoReply,
       submitOauthCode,
       dismissOauth,
       undo,

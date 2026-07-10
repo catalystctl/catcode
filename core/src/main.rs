@@ -347,6 +347,21 @@ pub struct PendingAsk {
     answers: Mutex<Option<Value>>,
 }
 
+/// A pending sudo approval: the agent wants to run a bash command that invokes
+/// `sudo`. The user must approve (supplying a password) or decline (Esc). The
+/// password is used once to feed `sudo -S` on stdin and is never stored.
+#[allow(dead_code)]
+pub struct PendingSudo {
+    request_id: String,
+    /// The full command string, shown to the user so they know what they're
+    /// approving.
+    command: String,
+    notify: Arc<Notify>,
+    /// None = awaiting. Some(Some(pw)) = approved with password.
+    /// Some(None) = declined (Esc). The outer Option is the "resolved" flag.
+    result: Mutex<Option<Option<String>>>,
+}
+
 pub struct State {
     pub cfg: RwLock<Config>,
     /// The shared HTTP client. Held on State so per-turn resolution can do
@@ -370,6 +385,10 @@ pub struct State {
     pub pending: Mutex<std::collections::HashMap<String, Arc<PendingApproval>>>,
     /// Pending `ask` tool calls keyed by their unique ask id (see ASK_SEQ).
     pub pending_asks: Mutex<std::collections::HashMap<String, Arc<PendingAsk>>>,
+    /// Pending sudo approval requests keyed by their unique sudo id (see
+    /// SUDO_SEQ). A bash command that invokes `sudo` blocks here until the user
+    /// approves (with password) or declines (Esc).
+    pub pending_sudos: Mutex<std::collections::HashMap<String, Arc<PendingSudo>>>,
     pub logger: Logger,
     /// Token counts accumulated across the session (for the status bar).
     pub tokens_in: Mutex<u64>,
@@ -1422,6 +1441,7 @@ async fn main() {
         handle: Mutex::new(None),
         pending: Mutex::new(std::collections::HashMap::new()),
         pending_asks: Mutex::new(std::collections::HashMap::new()),
+        pending_sudos: Mutex::new(std::collections::HashMap::new()),
         logger,
         tokens_in: Mutex::new(init_stats.tokens_in),
         tokens_out: Mutex::new(init_stats.tokens_out),
@@ -3047,6 +3067,27 @@ async fn main() {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!("no pending ask for id {request_id}")),
+                    ));
+                }
+            }
+            Command::SudoReply {
+                request_id,
+                approved,
+                password,
+            } => {
+                // The user approved (with password) or declined (Esc) a pending
+                // sudo_request. Resolves the awaiting request_sudo() so the
+                // blocked bash call either runs with `sudo -S` or returns a
+                // "declined" outcome to the agent.
+                let p = state.pending_sudos.lock().await.get(&request_id).cloned();
+                if let Some(p) = p {
+                    *p.result.lock().await =
+                        Some(if approved { password } else { None });
+                    p.notify.notify_one();
+                } else {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!("no pending sudo request for id {request_id}")),
                     ));
                 }
             }
@@ -4841,9 +4882,57 @@ async fn run_turn(
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let timeout_override = exec_args.get("timeout").and_then(|v| v.as_u64());
-                        tokio::select! {
-                            o = tools::execute_bash(cmd, &cfg, timeout_override) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
+                        // Sudo passthrough: if the command invokes `sudo`, we
+                        // must NOT let it run directly — sudo opens /dev/tty to
+                        // read the password, which garbles the TUI. Instead we
+                        // surface a `sudo_request` to the user. On approve the
+                        // password is fed via `sudo -S` on stdin; on decline
+                        // (Esc) the agent is told the user declined.
+                        //
+                        // Approval::Never optimization: when approval is Never
+                        // and the user has NOPASSWD sudo (or cached creds), we
+                        // skip the prompt entirely and run with `sudo -n`. Only
+                        // if a password is actually needed do we prompt — so
+                        // users with NOPASSWD never see a sudo flyout.
+                        if tools::command_uses_sudo(cmd) {
+                            let needs_prompt = match cfg.approval {
+                                crate::config::Approval::Never => {
+                                    tools::sudo_needs_password(&cfg).await
+                                }
+                                _ => true,
+                            };
+                            if needs_prompt {
+                                match request_sudo(st, cmd, &cancel).await {
+                                    SudoResult::Approved { password } => {
+                                        tokio::select! {
+                                            o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::Password(password)) => o,
+                                            _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
+                                        }
+                                    }
+                                    SudoResult::Declined => tools::Outcome::ok(
+                                        "The user declined the sudo request — the \
+                                         command was NOT run. Ask the user to run it \
+                                         manually, or re-attempt without sudo."
+                                    ),
+                                    SudoResult::Aborted => {
+                                        emit(&Event::new("aborted"));
+                                        emit(&Event::new("done"));
+                                        return;
+                                    }
+                                }
+                            } else {
+                                // NOPASSWD / cached — run with `sudo -n`
+                                // (non-interactive, never opens /dev/tty).
+                                tokio::select! {
+                                    o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::NonInteractive) => o,
+                                    _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
+                                }
+                            }
+                        } else {
+                            tokio::select! {
+                                o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::None) => o,
+                                _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
+                            }
                         }
                     } else if name == "bulk" {
                         tokio::select! {
@@ -5447,6 +5536,65 @@ pub(crate) async fn request_ask(
         },
         // Some(Null) or Some(non-object) = user skipped the prompt.
         _ => AskResult::Skipped,
+    }
+}
+
+/// Outcome of a pending sudo approval.
+pub(crate) enum SudoResult {
+    /// The user approved and supplied a password to feed `sudo -S` on stdin.
+    Approved { password: String },
+    /// The user declined (Esc) — the command was NOT run.
+    Declined,
+    /// The turn was aborted (/abort) while the sudo prompt was pending.
+    Aborted,
+}
+
+/// Monotonic generator for globally-unique sudo-request ids.
+static SUDO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Ask the user to approve a bash command that invokes `sudo`. Blocks until the
+/// user approves (with a password) or declines (Esc). Mirrors `request_ask`
+/// but carries a single password string back instead of structured answers.
+/// The password is used once to feed `sudo -S` on stdin and is never persisted.
+pub(crate) async fn request_sudo(
+    st: &Arc<State>,
+    command: &str,
+    cancel: &CancellationToken,
+) -> SudoResult {
+    let request_id = format!(
+        "sudo-{}",
+        SUDO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let notify = Arc::new(Notify::new());
+    let pending = Arc::new(PendingSudo {
+        request_id: request_id.clone(),
+        command: command.to_string(),
+        notify: notify.clone(),
+        result: Mutex::new(None),
+    });
+    st.pending_sudos
+        .lock()
+        .await
+        .insert(request_id.clone(), pending.clone());
+    emit(
+        &Event::new("sudo_request")
+            .with("request_id", json!(request_id))
+            .with("command", json!(command)),
+    );
+
+    // Wait for the sudo_reply command or abort.
+    let result = tokio::select! {
+        _ = notify.notified() => pending.result.lock().await.take(),
+        _ = cancel.cancelled() => {
+            st.pending_sudos.lock().await.remove(&request_id);
+            return SudoResult::Aborted;
+        }
+    };
+    st.pending_sudos.lock().await.remove(&request_id);
+    match result {
+        Some(Some(pw)) => SudoResult::Approved { password: pw },
+        // Some(None) = declined (Esc). None should not happen (notify implies resolved).
+        _ => SudoResult::Declined,
     }
 }
 

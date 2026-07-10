@@ -56,6 +56,7 @@ type session struct {
 	pendingIntercom     *intercomPrompt
 	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
 	pendingAsk          *askPrompt
+	pendingSudo         *sudoPrompt
 	updateInfo          *updateInfo // non-nil when a newer release is available (drives the top banner)
 	lastMetrics         json.RawMessage
 	approvalModeStr     string
@@ -528,6 +529,15 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.logError("core did not start within 30s — check UMANS_CORE path / config (Ctrl+C to quit)")
 		return s, nil
 
+	case sudoTimeoutMsg:
+		// The 30s auto-close timer fired. If the sudo flyout is still open for
+		// the same request, auto-decline so the agent isn't blocked forever.
+		if s.pendingSudo != nil && s.pendingSudo.requestID == msg.requestID {
+			s.sendSudoReply(s.pendingSudo, false)
+			s.logWarn("⊘ sudo request auto-declined (30s timeout)")
+		}
+		return s, nil
+
 	case sigtermMsg:
 		// SIGHUP/SIGTERM: restore the terminal via the normal quit path (the
 		// signal goroutine already killed the core; the reader reaps it).
@@ -565,7 +575,7 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.queued = nil
 		s.todos = nil
 		s.pendingAsk = nil
-		s.contextTokens = 0
+		s.pendingSudo = nil
 		s.lastMetrics = nil
 		s.lastCachePct = 0
 		s.tokensSaved = 0

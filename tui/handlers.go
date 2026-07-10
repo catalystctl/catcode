@@ -504,6 +504,21 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				len(a.questions), pluralS(len(a.questions))))
 			s.layout()
 		}
+	case "sudo_request":
+		// The agent wants to run a bash command that invokes `sudo`. sudo would
+		// open /dev/tty to read the password, garbling the TUI — so the core
+		// blocks here and surfaces it to the user. On Enter the password is fed
+		// via `sudo -S` on stdin; on Esc the agent is told the request was
+		// declined (command NOT run). The flyout auto-closes after 30s.
+		var cmd tea.Cmd
+		if rid := ev.get("request_id"); rid != "" {
+			s.pendingSudo = newSudoPrompt(rid, ev.get("command"))
+			s.input.Blur()
+			s.logInfo("🔐 sudo command requested — approve or decline")
+			s.layout()
+			cmd = sudoTimeoutCmd(rid)
+		}
+		return tea.Batch(cmd, waitForEvent(s.coreEvents))
 	case "intercom_message":
 		// A subagent is prompting the orchestrator for a decision (or a progress
 		// update). need_decision blocks until we reply; progress_update is a log line.
@@ -1237,6 +1252,12 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// never receives keystrokes even after ask_request set s.pendingAsk.
 	if s.pendingAsk != nil {
 		return s.handleAskKey(msg)
+	}
+	// sudo flyout: a bash command invokes `sudo` and the core is blocking on
+	// approval. Same precedence as the ask flyout — owns all keys (password
+	// entry, Enter approve, Esc decline) until resolved.
+	if s.pendingSudo != nil {
+		return s.handleSudoKey(msg)
 	}
 	// transcript scrolling works in every state (idle/busy/approval) so the
 	// user can read history while a turn runs or a decision is pending.

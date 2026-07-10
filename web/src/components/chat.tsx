@@ -16,6 +16,7 @@ import { Toasts } from "./toasts";
 import { Approval } from "./approval";
 import { IntercomPrompt } from "./intercom";
 import { AskFlyout } from "./ask";
+import { SudoPrompt } from "./sudo-prompt";
 import { OauthPromptBanner } from "./oauth-prompt";
 import { WorkStatePanel } from "./work-state";
 import { SubagentsPanel } from "./subagents";
@@ -420,6 +421,15 @@ export function Chat() {
                     prompt={state.pendingAsk}
                     onSubmit={(answers) => agent.askReply(answers)}
                     onSkip={() => agent.askReply(null)}
+                  />
+                </div>
+              )}
+              {state.pendingSudo && (
+                <div className="mx-4 mb-2 sm:mx-6">
+                  <SudoPrompt
+                    prompt={state.pendingSudo}
+                    onApprove={(password) => agent.sudoReply(true, password)}
+                    onDecline={() => agent.sudoReply(false)}
                   />
                 </div>
               )}

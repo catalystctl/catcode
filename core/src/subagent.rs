@@ -1751,7 +1751,7 @@ async fn dispatch_subagent_tool(
                 .unwrap_or("");
             let timeout_override = exec_args.get("timeout").and_then(|v| v.as_u64());
             tokio::select! {
-                o = tools::execute_bash(cmd, cfg, timeout_override) => o,
+                o = tools::execute_bash(cmd, cfg, timeout_override, tools::SudoAuth::None) => o,
                 _ = cancel.cancelled() => Outcome::err("bash aborted"),
             }
         }

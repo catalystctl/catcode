@@ -505,6 +505,9 @@ func (s *session) renderInputBox() string {
 		lines = append(lines, chipLine)
 	}
 	lines = append(lines, strings.Split(content, "\n")...)
+	if s.busy {
+		return s.renderInputBoxAnimated(w, innerW, lines)
+	}
 	top := "╭" + strings.Repeat("─", w-2) + "╮"
 	bot := "╰" + strings.Repeat("─", w-2) + "╯"
 	var b strings.Builder
@@ -518,6 +521,137 @@ func (s *session) renderInputBox() string {
 	}
 	b.WriteString("\n" + bot)
 	return b.String()
+}
+
+// renderInputBoxAnimated draws the input box with a "comet": a soft accent
+// light that sweeps the box perimeter while a turn is in flight — the TUI
+// analog of the web's composer-inflight flowing-gradient ring.
+//
+// Anti-jank design (see the tui-animation-infrastructure memory):
+//   - geometry is identical to the idle border (same ╭─╮│╰╯ chars + counts);
+//     only each cell's foreground color changes → zero layout shift;
+//   - 24-bit truecolor per cell via lipgloss (auto-downscaled on 256-color
+//     terminals), blended between the theme's dim (faded) and accent (bright
+//     head) so the sweep is a smooth gradient, not an ANSI stair-step;
+//   - the head position is derived from wall-clock time, not a frame count,
+//     so dropped frames skip the comet ahead at constant speed instead of
+//     slowing/stuttering — the single biggest smoothness lever;
+//   - re-renders piggyback on the existing spinner tick (10 FPS, already
+//     running while busy) — no new timer, no new re-render storm, and idle
+//     (s.busy == false) is a pure no-op that falls through to the plain border.
+func (s *session) renderInputBoxAnimated(w, innerW int, lines []string) string {
+	H := len(lines)
+	P := 2 * (w + H) // perimeter length in cells
+
+	// One full lap per inflightCycle; phase ∈ [0,1) is wall-clock driven.
+	phase := float64(time.Now().UnixNano()%int64(inflightCycle)) / float64(int64(inflightCycle))
+	head := phase * float64(P)
+
+	// Precompute a smooth brightness ramp of lipgloss styles from dim→accent.
+	// Quantizing to a modest number of levels is visually indistinguishable for
+	// a soft gaussian glow but avoids building one style object per cell.
+	base := hexRGB(c.dim)
+	accent := hexRGB(c.accent)
+	sigma := float64(P) / inflightSigmaDiv
+	ramp := make([]lipgloss.Style, inflightLevels)
+	for i := 0; i < inflightLevels; i++ {
+		t := float64(i) / float64(inflightLevels-1)
+		rgb := blendRGB(base, accent, t)
+		ramp[i] = lipgloss.NewStyle().Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", rgb[0], rgb[1], rgb[2])))
+	}
+
+	// styleAt returns the ramp style for a perimeter cell at index idx, given a
+	// head that has swept to `head`. Distance wraps around the ring symmetrically.
+	styleAt := func(idx int) lipgloss.Style {
+		d := float64(idx) - head
+		if d < -float64(P)/2 {
+			d += float64(P)
+		} else if d > float64(P)/2 {
+			d -= float64(P)
+		}
+		if d < 0 {
+			d = -d
+		}
+		t := math.Exp(-(d * d) / (2 * sigma * sigma))
+		li := int(t*float64(inflightLevels-1) + 0.5)
+		if li < 0 {
+			li = 0
+		} else if li >= inflightLevels {
+			li = inflightLevels - 1
+		}
+		return ramp[li]
+	}
+	render := func(idx int, ch string) string { return styleAt(idx).Render(ch) }
+
+	var b strings.Builder
+	// Top edge (clockwise): ╭ at 0, ─ at 1..w-2, ╮ at w-1.
+	b.WriteString(render(0, "╭"))
+	for i := 1; i < w-1; i++ {
+		b.WriteString(render(i, "─"))
+	}
+	b.WriteString(render(w-1, "╮"))
+	// Middle rows: left │ (left edge) + content + right │ (right edge).
+	for r, ln := range lines {
+		pad := innerW - lipgloss.Width(ln)
+		if pad < 0 {
+			pad = 0
+		}
+		rightIdx := w + r     // right edge, traversed top→bottom
+		leftIdx := P - (r+1) // left edge, wraps to meet ╭ at index 0
+		b.WriteString("\n")
+		b.WriteString(render(leftIdx, "│"))
+		b.WriteString(" " + ln + strings.Repeat(" ", pad) + " ")
+		b.WriteString(render(rightIdx, "│"))
+	}
+	// Bottom edge. The perimeter runs clockwise (right→left along the bottom
+	// for index continuity with the right edge), but the string is written
+	// left→right for display — so ╰ is leftmost and ╯ rightmost.
+	b.WriteString("\n")
+	for j := 0; j < w; j++ {
+		idx := w + H + (w - 1 - j)
+		var ch string
+		switch {
+		case j == w-1:
+			ch = "╯"
+		case j == 0:
+			ch = "╰"
+		default:
+			ch = "─"
+		}
+		b.WriteString(render(idx, ch))
+	}
+	return b.String()
+}
+
+// inflight animation tuning. The cycle matches the web's 3s gradient sweep;
+// the glow half-width scales with the box perimeter so it reads as a single
+// moving light rather than the whole border pulsing.
+const (
+	inflightCycle    = 3 * time.Second // one comet lap
+	inflightSigmaDiv = 12.0            // glow = perimeter / sigmaDiv
+	inflightLevels   = 32              // brightness ramp steps (smooth on truecolor)
+)
+
+// hexRGB parses a #RRGGBB string into its RGB components.
+func hexRGB(hex string) [3]int {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return [3]int{}
+	}
+	n, err := strconv.ParseUint(hex, 16, 32)
+	if err != nil {
+		return [3]int{}
+	}
+	return [3]int{int(n >> 16 & 255), int(n >> 8 & 255), int(n & 255)}
+}
+
+// blendRGB linearly interpolates between base and target by t∈[0,1].
+func blendRGB(base, target [3]int, t float64) [3]int {
+	return [3]int{
+		int(math.Round(float64(base[0]) + float64(target[0]-base[0])*t)),
+		int(math.Round(float64(base[1]) + float64(target[1]-base[1])*t)),
+		int(math.Round(float64(base[2]) + float64(target[2]-base[2])*t)),
+	}
 }
 
 // maxInputLines caps the input box height: a very long message shows a
@@ -942,6 +1076,9 @@ func (s *session) View() tea.View {
 		// top of the full view (like the modal above). renderAskOverlay is a
 		// no-op (returns base unchanged) when s.pendingAsk is nil.
 		content = s.renderAskOverlay(view)
+		// sudo flyout: a blocking sudo_request (bash command invokes sudo) renders
+		// as a centered overlay with a password field. No-op when nil.
+		content = s.renderSudoOverlay(content)
 	}
 	v := tea.NewView(content)
 	// v2 is declarative: alt-screen + mouse mode are View fields, not program

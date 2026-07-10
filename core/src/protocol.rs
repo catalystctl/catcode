@@ -231,6 +231,19 @@ pub enum Command {
     /// resumes and the formatted answers are returned to the model.
     #[serde(rename = "ask_reply")]
     AskReply { request_id: String, answers: Value },
+    /// Reply to a pending `sudo_request` (a bash command that invokes `sudo`).
+    /// `approved: false` declines the request (the command is NOT run and the
+    /// agent is told). `approved: true` with a `password` runs the command with
+    /// `sudo -S` and feeds the password on stdin (so sudo never touches /dev/tty
+    /// and garbles the TUI). The password is used once and not stored.
+    #[serde(rename = "sudo_reply")]
+    SudoReply {
+        request_id: String,
+        #[serde(default)]
+        approved: bool,
+        #[serde(default)]
+        password: Option<String>,
+    },
     /// Get the current vision-handoff configuration (curated vision-capable
     /// models + preferred target). Emits a `vision_config` event.
     #[serde(rename = "get_vision_config")]
