@@ -34,6 +34,11 @@ function getSecret(): string {
 }
 
 // ── database (SQLite via better-sqlite3 + Kysely) ───────────
+// better-sqlite3 requires the parent directory to already exist (it does not
+// mkdir). Create it before open so Next.js "collect page data" / first boot
+// on a fresh machine (and CI release builds) don't fail with
+// "Cannot open database because the directory does not exist".
+mkdirSync(CONFIG_DIR, { recursive: true });
 const dialect = new SqliteDialect({ database: new Database(DB_PATH) });
 const db = new Kysely<any>({ dialect });
 
