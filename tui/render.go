@@ -596,8 +596,8 @@ func (s *session) renderInputBoxAnimated(w, innerW int, lines []string) string {
 		if pad < 0 {
 			pad = 0
 		}
-		rightIdx := w + r     // right edge, traversed top→bottom
-		leftIdx := P - (r+1) // left edge, wraps to meet ╭ at index 0
+		rightIdx := w + r      // right edge, traversed top→bottom
+		leftIdx := P - (r + 1) // left edge, wraps to meet ╭ at index 0
 		b.WriteString("\n")
 		b.WriteString(render(leftIdx, "│"))
 		b.WriteString(" " + ln + strings.Repeat(" ", pad) + " ")

@@ -116,19 +116,37 @@ export interface Stats {
   session_file: string;
 }
 
-/** A saved memory note (persisted per-workspace, injected into the system prompt). */
+/** A saved memory note (persisted per-workspace, injected into the system prompt).
+ *  The core emits the full memory text under `content`, a one-line `description`,
+ *  a `name` (slug/title), and `scope` ("workspace" | "global"). `text` is an
+ *  alias for `name` kept for TUI parity; `tags` surfaces the memory type. */
 export interface MemoryEntry {
   id: string;
+  /** Memory slug/title (the core generates one on save). */
+  name?: string;
+  /** One-line description shown as a subtitle. */
+  description?: string;
+  /** Full memory text — the actual content the agent remembers. */
+  content?: string;
+  /** "workspace" or "global". */
+  scope?: string;
+  /** Memory type label (e.g. "note", "convention", "decision"). */
+  type?: string;
+  /** Alias for `name` (TUI parity). Kept for backward compat. */
   text: string;
   tags?: string[];
 }
 
-/** A loaded plugin. */
+/** A loaded plugin. The core emits `name`, `version`, `enabled`, `description`,
+ *  and `hooks` (the list of hook-point names the plugin registers). */
 export interface PluginEntry {
   name: string;
   enabled: boolean;
+  version?: string;
   path?: string;
   description?: string;
+  /** Hook-point names this plugin registers (e.g. ["pre_write","post_bash"]). */
+  hooks?: string[];
   error?: string;
 }
 

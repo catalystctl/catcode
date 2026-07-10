@@ -1,15 +1,17 @@
 "use client";
 
 // SettingsModal — runtime configuration: default model, thinking level,
-// approval mode, and bash timeout. Click-outside / Escape to close. The
-// preferences themselves are persisted by the parent (localStorage); this
-// modal just calls the supplied callbacks.
+// approval mode, and bash timeout. Takes up 80% of the viewport so the model
+// picker (with search + provider filters) has room to breathe. Click-outside
+// / Escape to close. Preferences are persisted by the parent (localStorage);
+// this modal just calls the supplied callbacks.
 
 import { useState, type ReactNode } from "react";
 import type { ModelInfo, ReadyPayload } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { CheckIcon, XIcon, ModelIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
+import { CheckIcon, XIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
+import { ModelPicker } from "./model-picker";
 import { AccountSecurity } from "./account-security";
 
 interface Props {
@@ -33,12 +35,17 @@ const APPROVAL_HELP: Record<string, string> = {
   always: "ask for everything",
 };
 
-function Section({ label, children }: { label: string; children: ReactNode }) {
+function ColumnLabel({ children }: { children: ReactNode }) {
   return (
-    <div className="mb-5">
-      <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">{label}</div>
+    <div className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-ink-500">
       {children}
     </div>
+  );
+}
+
+function Panel({ children }: { children: ReactNode }) {
+  return (
+    <div className="rounded-xl border border-ink-800 bg-ink-925/30 p-3.5">{children}</div>
   );
 }
 
@@ -57,149 +64,141 @@ export function SettingsModal(props: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[85vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="flex max-h-[88vh] w-[80vw] max-w-5xl flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+        <div className="flex items-center justify-between border-b border-ink-800/80 px-6 py-4">
           <div className="flex items-center gap-2">
-            <BoltIcon width={16} height={16} className="text-accent-soft" />
-            <h2 className="text-[15px] font-semibold text-ink-100">Settings</h2>
+            <BoltIcon width={18} height={18} className="text-accent-soft" />
+            <h2 className="text-[16px] font-semibold text-ink-100">Settings</h2>
           </div>
           <button
             onClick={props.onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
           >
-            <XIcon width={16} height={16} />
+            <XIcon width={18} height={18} />
           </button>
         </div>
 
-        <div className="overflow-y-auto px-5 py-4">
-          {/* Account & security */}
-          <Section label="Account & security">
-            <AccountSecurity />
-          </Section>
+        {/* Two-column body */}
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto p-6 lg:grid-cols-2">
+          {/* Left column: account + approval + timeout */}
+          <div className="flex flex-col gap-5">
+            <div>
+              <ColumnLabel>Account &amp; security</ColumnLabel>
+              <Panel>
+                <AccountSecurity />
+              </Panel>
+            </div>
 
-          {/* Model */}
-          <Section label="Model">
-            <div className="overflow-hidden rounded-xl border border-ink-800">
-              {props.models.length === 0 && (
-                <div className="px-3 py-2.5 text-[12px] text-ink-500">No models — set an API key.</div>
-              )}
-              {props.models.map((mo, i) => {
-                const active = props.selectedModel === mo.id;
-                return (
+            <div>
+              <ColumnLabel>Approval mode</ColumnLabel>
+              <div className="space-y-2">
+                {APPROVAL_MODES.map((mode) => {
+                  const active = props.approvalMode === mode;
+                  return (
+                    <button
+                      key={mode}
+                      onClick={() => props.onSetApproval(mode)}
+                      className={`flex w-full items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-colors ${
+                        active
+                          ? mode === "always"
+                            ? "border-success/40 bg-success/10 text-success"
+                            : mode === "never"
+                              ? "border-ink-700 bg-ink-850 text-ink-100"
+                              : "border-warning/40 bg-warning/10 text-warning"
+                          : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
+                      }`}
+                    >
+                      <ShieldIcon width={14} height={14} className="shrink-0" />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-medium capitalize">{mode}</div>
+                        <div className="text-[11px] text-ink-500">{APPROVAL_HELP[mode]}</div>
+                      </div>
+                      {active && <CheckIcon width={14} height={14} className="shrink-0" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
+              <ColumnLabel>Bash timeout</ColumnLabel>
+              <Panel>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    value={timeoutInput}
+                    onChange={(e) => setTimeoutInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const n = Number(timeoutInput);
+                        if (Number.isFinite(n) && n > 0) props.onSetBashTimeout(n);
+                      }
+                    }}
+                    className="w-24 rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 focus:border-accent/50 focus:outline-none"
+                  />
+                  <span className="text-[12px] text-ink-500">seconds</span>
                   <button
-                    key={mo.id}
-                    onClick={() => props.onSelectModel(mo.id)}
-                    className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors ${
-                      active ? "bg-accent/10" : "hover:bg-ink-850"
-                    } ${i > 0 ? "border-t border-ink-800" : ""}`}
+                    onClick={() => {
+                      const n = Number(timeoutInput);
+                      if (Number.isFinite(n) && n > 0) props.onSetBashTimeout(n);
+                    }}
+                    className="ml-auto rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft"
                   >
-                    <ModelIcon width={13} height={13} className={active ? "text-accent-soft" : "text-ink-500"} />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-[12px] font-medium text-ink-100">{mo.name || mo.id}</div>
-                      <div className="truncate font-mono text-[10px] text-ink-500">{mo.id}</div>
-                    </div>
-                    {mo.reasoning && (
-                      <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-accent-soft">
-                        reasoning
-                      </span>
-                    )}
-                    {active && <CheckIcon width={13} height={13} className="shrink-0 text-accent-soft" />}
+                    Apply
                   </button>
-                );
-              })}
+                </div>
+              </Panel>
             </div>
-          </Section>
+          </div>
 
-          {/* Thinking */}
-          <Section label="Thinking">
-            <div className="flex flex-wrap gap-1.5">
-              {effLevels.map((lv) => {
-                const active = props.thinkingLevel === lv;
-                return (
-                  <button
-                    key={lv}
-                    onClick={() => props.onSelectThinking(lv)}
-                    className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-medium capitalize transition-colors ${
-                      active
-                        ? "border-accent/50 bg-accent/15 text-accent-soft"
-                        : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
-                    }`}
-                  >
-                    <BrainIcon width={12} height={12} />
-                    {lv}
-                  </button>
-                );
-              })}
+          {/* Right column: model picker + thinking */}
+          <div className="flex min-h-0 flex-col gap-5">
+            <div className="flex min-h-0 flex-1 flex-col">
+              <ColumnLabel>Model</ColumnLabel>
+              <div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-ink-800 bg-ink-900">
+                <ModelPicker
+                  models={props.models}
+                  selectedModel={props.selectedModel}
+                  onSelect={props.onSelectModel}
+                  variant="inline"
+                />
+              </div>
             </div>
-          </Section>
 
-          {/* Approval */}
-          <Section label="Approval">
-            <div className="space-y-1.5">
-              {APPROVAL_MODES.map((mode) => {
-                const active = props.approvalMode === mode;
-                return (
-                  <button
-                    key={mode}
-                    onClick={() => props.onSetApproval(mode)}
-                    className={`flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
-                      active
-                        ? mode === "always"
-                          ? "border-success/40 bg-success/10 text-success"
-                          : mode === "never"
-                            ? "border-ink-700 bg-ink-850 text-ink-100"
-                            : "border-warning/40 bg-warning/10 text-warning"
-                        : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
-                    }`}
-                  >
-                    <ShieldIcon width={13} height={13} className="shrink-0" />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[12px] font-medium capitalize">{mode}</div>
-                      <div className="text-[10px] text-ink-500">{APPROVAL_HELP[mode]}</div>
-                    </div>
-                    {active && <CheckIcon width={13} height={13} className="shrink-0" />}
-                  </button>
-                );
-              })}
+            <div>
+              <ColumnLabel>Thinking level</ColumnLabel>
+              <Panel>
+                <div className="flex flex-wrap gap-1.5">
+                  {effLevels.map((lv) => {
+                    const active = props.thinkingLevel === lv;
+                    return (
+                      <button
+                        key={lv}
+                        onClick={() => props.onSelectThinking(lv)}
+                        className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-medium capitalize transition-colors ${
+                          active
+                            ? "border-accent/50 bg-accent/15 text-accent-soft"
+                            : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
+                        }`}
+                      >
+                        <BrainIcon width={12} height={12} />
+                        {lv}
+                      </button>
+                    );
+                  })}
+                </div>
+              </Panel>
             </div>
-          </Section>
-
-          {/* Bash timeout */}
-          <Section label="Bash timeout">
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                value={timeoutInput}
-                onChange={(e) => setTimeoutInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    const n = Number(timeoutInput);
-                    if (Number.isFinite(n) && n > 0) props.onSetBashTimeout(n);
-                  }
-                }}
-                className="w-24 rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[13px] text-ink-100 focus:border-accent/50 focus:outline-none"
-              />
-              <span className="text-[12px] text-ink-500">seconds</span>
-              <button
-                onClick={() => {
-                  const n = Number(timeoutInput);
-                  if (Number.isFinite(n) && n > 0) props.onSetBashTimeout(n);
-                }}
-                className="ml-auto rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft"
-              >
-                Apply
-              </button>
-            </div>
-          </Section>
+          </div>
         </div>
 
-        <div className="border-t border-ink-800/80 px-5 py-2.5">
+        <div className="border-t border-ink-800/80 px-6 py-3">
           <p className="text-[11px] text-ink-500">Preferences are saved to this browser.</p>
         </div>
       </div>

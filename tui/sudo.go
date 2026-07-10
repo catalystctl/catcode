@@ -54,7 +54,7 @@ func newSudoPrompt(requestID, command string) *sudoPrompt {
 	return &sudoPrompt{
 		requestID: requestID,
 		command:   command,
-		openedAt: time.Now(),
+		openedAt:  time.Now(),
 		input:     ti,
 	}
 }

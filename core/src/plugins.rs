@@ -5,9 +5,10 @@
 use crate::config::{ProviderConfig, ProviderKind, ResolvedProvider};
 use crate::oauth::{LoginOutcome, OAuthPrompt, PendingOauth};
 use crate::tools::{Outcome, ToolKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
@@ -34,6 +35,38 @@ session lifecycle events to inspect, approve, modify, or log operations.
 5. The core loads new plugins on next restart, or you can call the `plugin` tool
    (if loaded by the TUI) to `install`, `remove`, `enable`, or `disable` plugins
    at runtime.
+
+### Installing a plugin
+
+Install from a **local directory** or a **GitHub Release**:
+
+- Local: `/plugin-install /path/to/plugin-dir`
+- GitHub (latest release): `/plugin-install https://github.com/owner/repo`
+- GitHub (pinned release): `/plugin-install https://github.com/owner/repo@v1.2.0`
+- Shorthand: `/plugin-install owner/repo@v1.2.0`
+
+**Prefer GitHub Releases for distribution.** Tag a release so the install
+downloads that release's source `.zip` (via the GitHub API `zipball_url`).
+Release tags are the version pin — they enable reproducible installs and a
+future auto-updater that re-fetches the latest (or newer) release zip. A
+repo with no Releases cannot be installed via URL; publish one first.
+
+Optional subdir for monorepos: `owner/repo@v1.2.0:path/to/plugin` (the
+plugin.json lives under that path inside the release zip).
+
+### Publishing / discovery (plugin listing)
+
+To show up on a site that scrapes GitHub (e.g. code.catalystctl.com):
+
+1. Publish **GitHub Releases** (versioned source zips).
+2. Add the repository topic **`catcode-plugin`** (canonical). Optional alias:
+   `catalyst-code-plugin`.
+3. Keep `plugin.json` at the repo root (or document a `:subdir`).
+
+Listing scrapers search:
+`https://api.github.com/search/repositories?q=topic:catcode-plugin`
+then read each repo's latest Release + `plugin.json`. An optional root
+`catalog.json` (`schema: catcode-plugin/v1`) can carry extra listing metadata.
 
 ### plugin.json format
 
@@ -1072,6 +1105,51 @@ impl PluginManager {
             system_prompt: manifest.system_prompt,
             oauth: oauth_config,
         })
+    }
+
+    /// Install a plugin from a local directory path OR a GitHub Release URL.
+    ///
+    /// GitHub sources download the release source `.zip` (latest, or a pinned
+    /// tag) so installs are versioned and can later be auto-updated by
+    /// re-fetching a newer release. Local paths keep the existing copy-into-
+    /// managed-dir behavior.
+    ///
+    /// An existing local directory with `plugin.json` always wins over
+    /// `owner/repo` shorthand, so relative paths like `./plugins/foo` stay
+    /// unambiguous.
+    pub async fn install_source(&self, source: &str) -> Result<Plugin, String> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err("plugin source is empty".into());
+        }
+
+        let local = Path::new(source);
+        let local_resolved = if local.is_absolute() {
+            local.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(local)
+        };
+        if local_resolved.is_dir() && local_resolved.join("plugin.json").is_file() {
+            return self.install(local);
+        }
+
+        if let Some(gh) = parse_github_plugin_source(source) {
+            let (plugin_dir, meta, tmp_root) = fetch_github_release_plugin(&gh).await?;
+            let result = self.install(&plugin_dir);
+            // Always clean the temp extract tree (install copies into managed dir).
+            let _ = std::fs::remove_dir_all(&tmp_root);
+            let installed = result?;
+            if let Err(e) = write_plugin_source_meta(&installed.source_path, &meta) {
+                eprintln!(
+                    "[plugins] warning: installed '{}' but could not write {}: {e}",
+                    installed.name, PLUGIN_SOURCE_META_FILE
+                );
+            }
+            return Ok(installed);
+        }
+        self.install(local)
     }
 
     /// Install a plugin from `source_path` (a directory containing plugin.json).
@@ -2276,6 +2354,521 @@ fn hook_command(script: &Path) -> Command {
     c
 }
 
+/// Sidecar written next to an installed plugin so a future auto-updater can
+/// re-fetch the same GitHub Release source zip (or a newer tag).
+const PLUGIN_SOURCE_META_FILE: &str = ".catalyst-plugin-source.json";
+
+/// A parsed GitHub plugin install source. Installs always go through a
+/// **Release** source zip so the tag is a real version pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubPluginSource {
+    owner: String,
+    repo: String,
+    /// Specific release tag (`v1.2.0`). `None` → GitHub's `/releases/latest`.
+    tag: Option<String>,
+    /// Optional path inside the release zip where `plugin.json` lives
+    /// (monorepo layout).
+    subdir: Option<String>,
+}
+
+/// Persisted install provenance for GitHub Release installs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PluginSourceMeta {
+    kind: String,
+    owner: String,
+    repo: String,
+    /// Release tag that was installed (e.g. `v1.2.0`).
+    tag: String,
+    /// Canonical repo URL (`https://github.com/owner/repo`).
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subdir: Option<String>,
+    /// Unix seconds when this install/update wrote the sidecar.
+    installed_at: u64,
+}
+
+/// True when `source` looks like a GitHub repo URL or `owner/repo` shorthand
+/// (as opposed to a local filesystem path).
+fn looks_like_github_source(source: &str) -> bool {
+    let s = source.trim();
+    if s.contains("github.com") || s.starts_with("git@github.com:") {
+        return true;
+    }
+    // owner/repo or owner/repo@tag — but not an absolute/relative path.
+    if s.starts_with('/') || s.starts_with('.') || s.starts_with('~') {
+        return false;
+    }
+    if s.contains('\\') {
+        return false;
+    }
+    let base = s.split(['@', '#', ':']).next().unwrap_or(s);
+    let mut parts = base.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty()
+            && o.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    )
+}
+
+/// Parse a GitHub plugin source string into owner/repo/tag/subdir.
+///
+/// Accepted forms:
+/// - `https://github.com/owner/repo`
+/// - `https://github.com/owner/repo.git`
+/// - `https://github.com/owner/repo@v1.2.0`
+/// - `https://github.com/owner/repo#v1.2.0`
+/// - `https://github.com/owner/repo/releases/tag/v1.2.0`
+/// - `https://github.com/owner/repo/tree/v1.2.0/path/to/plugin`
+/// - `git@github.com:owner/repo.git`
+/// - `owner/repo` / `owner/repo@v1.2.0` / `owner/repo@v1.2.0:subdir`
+/// - `owner/repo:subdir` (latest release, monorepo subdir)
+fn parse_github_plugin_source(source: &str) -> Option<GithubPluginSource> {
+    if !looks_like_github_source(source) {
+        return None;
+    }
+    let s = source.trim();
+
+    // Normalize git@ and strip trailing .git early where possible.
+    let s = if let Some(rest) = s.strip_prefix("git@github.com:") {
+        format!("https://github.com/{}", rest.trim_end_matches(".git"))
+    } else {
+        s.to_string()
+    };
+    let s = s.replace("https://www.github.com/", "https://github.com/");
+    let s = if s.starts_with("http://github.com/") {
+        format!("https://{}", s.trim_start_matches("http://"))
+    } else {
+        s
+    };
+
+    // Split off @tag or #tag, and optional :subdir after the tag.
+    let (main, tag_and_subdir) = if let Some(i) = s.rfind(['@', '#']) {
+        let (a, b) = s.split_at(i);
+        (a.to_string(), Some(b[1..].to_string()))
+    } else {
+        (s.clone(), None)
+    };
+
+    let (tag_from_suffix, subdir_from_suffix) = match tag_and_subdir {
+        Some(rest) => {
+            if let Some((tag, sub)) = rest.split_once(':') {
+                (
+                    Some(tag.trim().to_string()).filter(|t| !t.is_empty()),
+                    Some(sub.trim().trim_matches('/').to_string()).filter(|p| !p.is_empty()),
+                )
+            } else {
+                (
+                    Some(rest.trim().to_string()).filter(|t| !t.is_empty()),
+                    None,
+                )
+            }
+        }
+        None => (None, None),
+    };
+
+    // Shorthand monorepo form without a tag: owner/repo:subdir
+    let (main, subdir_from_shorthand) = if tag_from_suffix.is_none()
+        && subdir_from_suffix.is_none()
+        && !main.starts_with("https://")
+    {
+        if let Some((repo_part, sub)) = main.split_once(':') {
+            (
+                repo_part.to_string(),
+                Some(sub.trim().trim_matches('/').to_string()).filter(|p| !p.is_empty()),
+            )
+        } else {
+            (main, None)
+        }
+    } else {
+        (main, None)
+    };
+
+    let path = if let Some(rest) = main.strip_prefix("https://github.com/") {
+        rest.trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_string()
+    } else if !main.contains("://") && !main.starts_with("git@") {
+        main.trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_string()
+    } else {
+        return None;
+    };
+
+    let segments: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let owner = segments[0].to_string();
+    let repo = segments[1].to_string();
+
+    // Path forms: /releases/tag/TAG or /tree/REF[/subdir...]
+    let (tag_from_path, subdir_from_path) =
+        if segments.len() >= 4 && segments[2] == "releases" && segments[3] == "tag" {
+            (
+                Some(segments[4..].join("/")).filter(|t| !t.is_empty()),
+                None,
+            )
+        } else if segments.len() >= 4 && segments[2] == "tree" {
+            let tag = segments[3].to_string();
+            let sub = if segments.len() > 4 {
+                Some(segments[4..].join("/"))
+            } else {
+                None
+            };
+            (Some(tag), sub)
+        } else if segments.len() > 2 {
+            // Unknown extra path — not a supported GitHub plugin URL.
+            return None;
+        } else {
+            (None, None)
+        };
+
+    let tag = tag_from_suffix.or(tag_from_path);
+    let subdir = subdir_from_suffix
+        .or(subdir_from_shorthand)
+        .or(subdir_from_path);
+
+    Some(GithubPluginSource {
+        owner,
+        repo,
+        tag,
+        subdir,
+    })
+}
+
+/// Fetch a GitHub Release source zip, extract it, and locate the plugin root.
+/// Returns `(plugin_dir, source_meta, tmp_root_to_cleanup)`.
+async fn fetch_github_release_plugin(
+    src: &GithubPluginSource,
+) -> Result<(PathBuf, PluginSourceMeta, PathBuf), String> {
+    let release = resolve_github_release(src).await?;
+    let bytes = download_url_bytes(&release.zipball_url, "release source zip").await?;
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "catalyst-plugin-{}-{}-{}",
+        src.owner,
+        src.repo,
+        std::process::id()
+    ));
+    if tmp_root.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+    std::fs::create_dir_all(&tmp_root)
+        .map_err(|e| format!("cannot create temp dir {}: {e}", tmp_root.display()))?;
+
+    let extract_dir = tmp_root.join("extract");
+    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("cannot create extract dir: {e}"))?;
+    extract_zip_bytes(&bytes, &extract_dir)?;
+
+    let repo_root = find_single_top_level_dir(&extract_dir)?;
+    let plugin_dir = resolve_plugin_dir(&repo_root, src.subdir.as_deref())?;
+    // Release zips sometimes drop the executable bit; ensure hook/tool scripts
+    // are runnable before validation.
+    ensure_plugin_scripts_executable(&plugin_dir);
+
+    let meta = PluginSourceMeta {
+        kind: "github_release".into(),
+        owner: src.owner.clone(),
+        repo: src.repo.clone(),
+        tag: release.tag,
+        url: format!("https://github.com/{}/{}", src.owner, src.repo),
+        subdir: src.subdir.clone(),
+        installed_at: now_secs(),
+    };
+    Ok((plugin_dir, meta, tmp_root))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseResponse {
+    tag_name: String,
+    zipball_url: String,
+}
+
+struct ResolvedRelease {
+    tag: String,
+    zipball_url: String,
+}
+
+async fn resolve_github_release(src: &GithubPluginSource) -> Result<ResolvedRelease, String> {
+    let api = match &src.tag {
+        Some(tag) => format!(
+            "https://api.github.com/repos/{}/{}/releases/tags/{}",
+            src.owner,
+            src.repo,
+            tag.trim_start_matches('/')
+        ),
+        None => format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            src.owner, src.repo
+        ),
+    };
+
+    let client = github_http_client()?;
+    let mut req = client
+        .get(&api)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = github_token() {
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GitHub API read failed: {e}"))?;
+
+    if status.as_u16() == 404 {
+        return Err(match &src.tag {
+            Some(tag) => format!(
+                "no GitHub Release '{tag}' for {}/{}; publish a Release (recommended for versioning and updates) or check the tag",
+                src.owner, src.repo
+            ),
+            None => format!(
+                "no GitHub Releases found for {}/{}; publish a Release so the install can download a versioned source .zip (required for URL installs and future auto-updates)",
+                src.owner, src.repo
+            ),
+        });
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub API {} for {}/{}: {}",
+            status,
+            src.owner,
+            src.repo,
+            truncate_err(&body, 200)
+        ));
+    }
+
+    let release: GithubReleaseResponse = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "GitHub release JSON parse error: {e} ({})",
+            truncate_err(&body, 120)
+        )
+    })?;
+    if release.zipball_url.is_empty() {
+        return Err(format!(
+            "GitHub release '{}' for {}/{} has no zipball_url",
+            release.tag_name, src.owner, src.repo
+        ));
+    }
+    Ok(ResolvedRelease {
+        tag: release.tag_name,
+        zipball_url: release.zipball_url,
+    })
+}
+
+fn github_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent("catalyst-code-plugin-install/0.2")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))
+}
+
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+async fn download_url_bytes(url: &str, label: &str) -> Result<Vec<u8>, String> {
+    let client = github_http_client()?;
+    let mut req = client.get(url);
+    if let Some(token) = github_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("download {label} failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download {label} failed: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("download {label} read failed: {e}"))?;
+    // Guard against accidental huge downloads (plugin source zips should be small).
+    const MAX_ZIP_BYTES: usize = 64 * 1024 * 1024;
+    if bytes.len() > MAX_ZIP_BYTES {
+        return Err(format!(
+            "{label} is too large ({} bytes; max {} bytes)",
+            bytes.len(),
+            MAX_ZIP_BYTES
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn extract_zip_bytes(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    let reader = Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("invalid zip archive: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("zip entry {i}: {e}"))?;
+        let name = file
+            .enclosed_name()
+            .ok_or_else(|| format!("zip entry '{}' has an unsafe path", file.name()))?
+            .to_path_buf();
+        let out = dest.join(&name);
+
+        if file.is_dir() || file.name().ends_with('/') {
+            std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        let mut outfile =
+            std::fs::File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+        std::io::copy(&mut file, &mut outfile)
+            .map_err(|e| format!("extract {}: {e}", out.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = file.unix_mode() {
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// GitHub zipballs contain a single top-level directory (`owner-repo-<sha>/`).
+fn find_single_top_level_dir(extract_dir: &Path) -> Result<PathBuf, String> {
+    let mut dirs = Vec::new();
+    let rd = std::fs::read_dir(extract_dir)
+        .map_err(|e| format!("read extract dir {}: {e}", extract_dir.display()))?;
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("extract dir entry: {e}"))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("extract dir file_type: {e}"))?;
+        if ft.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    match dirs.len() {
+        1 => Ok(dirs.remove(0)),
+        0 => Err("release zip is empty".into()),
+        _ => {
+            // Unusual, but treat extract_dir itself as the root.
+            Ok(extract_dir.to_path_buf())
+        }
+    }
+}
+
+/// Locate the directory that contains `plugin.json` inside an extracted release.
+fn resolve_plugin_dir(repo_root: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(sub) = subdir {
+        let rel = Path::new(sub);
+        for comp in rel.components() {
+            if matches!(comp, std::path::Component::ParentDir) {
+                return Err(format!("plugin subdir '{sub}' must not contain '..'"));
+            }
+        }
+        let dir = repo_root.join(rel);
+        if !dir.join("plugin.json").is_file() {
+            return Err(format!(
+                "no plugin.json at subdir '{}' inside the release (looked in {})",
+                sub,
+                dir.display()
+            ));
+        }
+        return Ok(dir);
+    }
+
+    if repo_root.join("plugin.json").is_file() {
+        return Ok(repo_root.to_path_buf());
+    }
+
+    // Convenience: if exactly one immediate child has plugin.json, use it.
+    let mut matches = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(repo_root) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join("plugin.json").is_file() {
+                matches.push(p);
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(format!(
+            "no plugin.json found in the release root {}; pass owner/repo@tag:subdir for monorepos",
+            repo_root.display()
+        )),
+        n => Err(format!(
+            "found {n} plugin.json directories in the release; pass owner/repo@tag:subdir to pick one"
+        )),
+    }
+}
+
+fn write_plugin_source_meta(plugin_dir: &Path, meta: &PluginSourceMeta) -> Result<(), String> {
+    let path = plugin_dir.join(PLUGIN_SOURCE_META_FILE);
+    let raw = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("serialize plugin source meta: {e}"))?;
+    std::fs::write(&path, raw + "\n").map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Best-effort: mark scripts under `hooks/`, `tools/`, and `oauth/` executable
+/// after a zip extract (GitHub zipballs usually preserve mode, but not always).
+fn ensure_plugin_scripts_executable(plugin_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for sub in ["hooks", "tools", "oauth"] {
+            let dir = plugin_dir.join(sub);
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                let mut perms = meta.permissions();
+                let mode = perms.mode();
+                if mode & 0o111 == 0 {
+                    perms.set_mode(mode | 0o755);
+                    let _ = std::fs::set_permissions(&path, perms);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = plugin_dir;
+    }
+}
+
+fn truncate_err(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.len() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", &t[..max])
+    }
+}
+
 /// Recursively copy a directory from `src` to `dst`.
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {:?}: {e}", dst))?;
@@ -2665,6 +3258,162 @@ mod tests {
         let result = mgr.install(&src.path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already installed"));
+    }
+
+    #[test]
+    fn parse_github_plugin_source_forms() {
+        let cases = [
+            (
+                "https://github.com/acme/cool-plugin",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: None,
+                    subdir: None,
+                },
+            ),
+            (
+                "https://github.com/acme/cool-plugin.git",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: None,
+                    subdir: None,
+                },
+            ),
+            (
+                "https://github.com/acme/cool-plugin@v1.2.0",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: Some("v1.2.0".into()),
+                    subdir: None,
+                },
+            ),
+            (
+                "acme/cool-plugin@v1.2.0:plugins/foo",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: Some("v1.2.0".into()),
+                    subdir: Some("plugins/foo".into()),
+                },
+            ),
+            (
+                "acme/cool-plugin:plugins/foo",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: None,
+                    subdir: Some("plugins/foo".into()),
+                },
+            ),
+            (
+                "https://github.com/acme/cool-plugin/releases/tag/v2.0.0",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: Some("v2.0.0".into()),
+                    subdir: None,
+                },
+            ),
+            (
+                "https://github.com/acme/cool-plugin/tree/v2.0.0/plugins/foo",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: Some("v2.0.0".into()),
+                    subdir: Some("plugins/foo".into()),
+                },
+            ),
+            (
+                "git@github.com:acme/cool-plugin.git",
+                GithubPluginSource {
+                    owner: "acme".into(),
+                    repo: "cool-plugin".into(),
+                    tag: None,
+                    subdir: None,
+                },
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_github_plugin_source(input).as_ref(),
+                Some(&expected),
+                "input={input}"
+            );
+        }
+        assert!(parse_github_plugin_source("/abs/path/to/plugin").is_none());
+        assert!(parse_github_plugin_source("./relative/plugin").is_none());
+        assert!(parse_github_plugin_source("https://gitlab.com/acme/cool").is_none());
+    }
+
+    #[test]
+    fn resolve_plugin_dir_root_and_subdir() {
+        let tmp = TmpDir::new("resolve_plugin_dir");
+        write_plugin(&tmp.path, "root-plug", "1.0.0", "{}");
+        assert_eq!(
+            resolve_plugin_dir(&tmp.path, None).unwrap(),
+            tmp.path.clone()
+        );
+
+        let mono = TmpDir::new("resolve_mono");
+        let nested = mono.path.join("plugins/foo");
+        fs::create_dir_all(&nested).unwrap();
+        write_plugin(&nested, "foo", "1.0.0", "{}");
+        assert_eq!(
+            resolve_plugin_dir(&mono.path, Some("plugins/foo")).unwrap(),
+            nested
+        );
+        let err = resolve_plugin_dir(&mono.path, None).unwrap_err();
+        assert!(err.contains("no plugin.json") || err.contains("pass owner/repo"));
+    }
+
+    #[test]
+    fn extract_zip_and_find_top_level() {
+        let tmp = TmpDir::new("zip_extract");
+        // Build a minimal zip shaped like a GitHub zipball.
+        let zip_path = tmp.path.join("src.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.add_directory("acme-cool-abc123/", opts).unwrap();
+            zip.start_file("acme-cool-abc123/plugin.json", opts)
+                .unwrap();
+            let manifest = r#"{"name":"cool","version":"1.0.0"}"#;
+            use std::io::Write;
+            zip.write_all(manifest.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = fs::read(&zip_path).unwrap();
+        let extract = tmp.path.join("out");
+        fs::create_dir_all(&extract).unwrap();
+        extract_zip_bytes(&bytes, &extract).unwrap();
+        let root = find_single_top_level_dir(&extract).unwrap();
+        assert!(root.join("plugin.json").is_file());
+        let plugin_dir = resolve_plugin_dir(&root, None).unwrap();
+        assert_eq!(plugin_dir, root);
+    }
+
+    #[test]
+    fn write_plugin_source_meta_roundtrip() {
+        let tmp = TmpDir::new("source_meta");
+        write_plugin(&tmp.path, "meta-plug", "1.0.0", "{}");
+        let meta = PluginSourceMeta {
+            kind: "github_release".into(),
+            owner: "acme".into(),
+            repo: "cool".into(),
+            tag: "v1.2.0".into(),
+            url: "https://github.com/acme/cool".into(),
+            subdir: None,
+            installed_at: 1_700_000_000,
+        };
+        write_plugin_source_meta(&tmp.path, &meta).unwrap();
+        let raw = fs::read_to_string(tmp.path.join(PLUGIN_SOURCE_META_FILE)).unwrap();
+        let parsed: PluginSourceMeta = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, meta);
     }
 
     #[test]

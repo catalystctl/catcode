@@ -18,9 +18,10 @@ use tokio_util::sync::CancellationToken;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPhase {
+    #[default]
     Idle,
     Planning,
     PlanReady,
@@ -43,12 +44,6 @@ impl GoalPhase {
             GoalPhase::Done => "done",
             GoalPhase::Failed => "failed",
         }
-    }
-}
-
-impl Default for GoalPhase {
-    fn default() -> Self {
-        GoalPhase::Idle
     }
 }
 

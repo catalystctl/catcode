@@ -1,19 +1,119 @@
 "use client";
 
-// MemoryPanel — list/create/forget persisted workspace memories.
-// Memories are injected into the agent's system prompt across sessions.
+// MemoryPanel — list/create/forget persisted workspace + global memories.
+// Each memory shows its name (title), description (subtitle), the full content
+// (expandable), a scope badge (workspace/global), and its type tag. Memories
+// are injected into the agent's system prompt across sessions.
 
 import { useState } from "react";
 import type { MemoryEntry } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { BrainIcon, PlusIcon, TrashIcon, XIcon } from "./icons";
+import {
+  BrainIcon,
+  PlusIcon,
+  TrashIcon,
+  XIcon,
+  ChevronDown,
+  GlobeIcon,
+  FolderIcon,
+} from "./icons";
 
 interface Props {
   memories: MemoryEntry[];
   onSave: (text: string, tags?: string[]) => void;
   onForget: (id: string) => void;
   onClose: () => void;
+}
+
+function scopeBadge(scope?: string) {
+  if (scope === "global") {
+    return { label: "global", Icon: GlobeIcon, cls: "bg-accent/10 text-accent-soft" };
+  }
+  return { label: "workspace", Icon: FolderIcon, cls: "bg-ink-800 text-ink-400" };
+}
+
+function MemoryCard({ m, onForget }: { m: MemoryEntry; onForget: (id: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const title = m.name || m.text;
+  const content = m.content ?? m.text ?? "";
+  const desc = m.description;
+  const { label, Icon, cls } = scopeBadge(m.scope);
+  const hasLongContent = content.length > 160;
+
+  return (
+    <div className="group rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2.5">
+      {/* Title row */}
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-[13px] font-semibold text-ink-100">{title}</span>
+            {m.type && (
+              <span className="rounded bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
+                {m.type}
+              </span>
+            )}
+          </div>
+          {desc && (
+            <p className="mt-0.5 truncate text-[11px] text-ink-500">{desc}</p>
+          )}
+        </div>
+        <button
+          onClick={() => {
+            if (window.confirm(`Forget "${title}"?`)) onForget(m.id);
+          }}
+          className="shrink-0 rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100"
+          title="Forget"
+        >
+          <TrashIcon width={13} height={13} />
+        </button>
+      </div>
+
+      {/* Content */}
+      {content && (
+        <div className="mt-1.5">
+          <pre
+            className={`whitespace-pre-wrap break-words rounded-md border border-ink-800/60 bg-ink-950/50 p-2 font-mono text-[11.5px] leading-relaxed text-ink-300 ${
+              expanded || !hasLongContent ? "" : "max-h-20 overflow-hidden"
+            }`}
+          >
+            <code>{content}</code>
+          </pre>
+          {hasLongContent && (
+            <button
+              onClick={() => setExpanded((e) => !e)}
+              className="mt-1 flex items-center gap-1 text-[11px] text-accent-soft hover:text-accent"
+            >
+              <ChevronDown
+                width={12}
+                height={12}
+                className={`transition-transform ${expanded ? "rotate-180" : ""}`}
+              />
+              {expanded ? "Show less" : "Show more"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Footer: scope + tags */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1">
+        <span
+          className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium ${cls}`}
+        >
+          <Icon width={9} height={9} />
+          {label}
+        </span>
+        {m.tags &&
+          m.tags
+            .filter((t) => t !== m.type)
+            .map((t) => (
+              <span key={t} className="rounded bg-ink-800 px-1.5 py-0.5 text-[9px] text-ink-400">
+                {t}
+              </span>
+            ))}
+      </div>
+    </div>
+  );
 }
 
 export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
@@ -38,7 +138,7 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="flex max-h-[85vh] w-full max-w-xl flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
         role="dialog"
         aria-modal="true"
         aria-label="Memories"
@@ -47,6 +147,11 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
           <div className="flex items-center gap-2">
             <BrainIcon width={15} height={15} className="text-accent-soft" />
             <span className="text-[13px] font-semibold text-ink-100">Memories</span>
+            {memories.length > 0 && (
+              <span className="rounded-full bg-ink-800 px-2 py-0.5 text-[10px] text-ink-400">
+                {memories.length}
+              </span>
+            )}
           </div>
           <button
             onClick={onClose}
@@ -56,11 +161,11 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
           {/* New memory */}
           <div className="mb-3 rounded-xl border border-ink-800 bg-ink-925/40 p-3">
             <textarea
-              rows={2}
+              rows={3}
               value={text}
               onChange={(e) => setText(e.target.value)}
               placeholder="Save a note the agent will remember across sessions…"
@@ -85,43 +190,13 @@ export function MemoryPanel({ memories, onSave, onForget, onClose }: Props) {
 
           {/* List */}
           {memories.length === 0 ? (
-            <div className="px-3 py-6 text-center text-[12px] text-ink-600">
+            <div className="px-3 py-8 text-center text-[12px] text-ink-600">
               No memories yet. Save one above.
             </div>
           ) : (
             <div className="space-y-2">
               {memories.map((m) => (
-                <div
-                  key={m.id}
-                  className="group rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2"
-                >
-                  <div className="flex items-start gap-2">
-                    <p className="flex-1 whitespace-pre-wrap break-words text-[13px] text-ink-200">
-                      {m.text}
-                    </p>
-                    <button
-                      onClick={() => {
-                        if (window.confirm("Forget this memory?")) onForget(m.id);
-                      }}
-                      className="shrink-0 rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100"
-                      title="Forget"
-                    >
-                      <TrashIcon width={13} height={13} />
-                    </button>
-                  </div>
-                  {m.tags && m.tags.length > 0 && (
-                    <div className="mt-1.5 flex flex-wrap gap-1">
-                      {m.tags.map((t) => (
-                        <span
-                          key={t}
-                          className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-400"
-                        >
-                          {t}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
+                <MemoryCard key={m.id} m={m} onForget={onForget} />
               ))}
             </div>
           )}

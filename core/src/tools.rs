@@ -24,6 +24,7 @@ pub fn classify(name: &str) -> ToolKind {
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
         "workspace_activity" => ToolKind::ReadOnly,
+        // delete/rename/mkdir mutate the tree — always gated under Destructive.
         _ => ToolKind::Destructive,
     }
 }
@@ -120,13 +121,14 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file's plain content. Call this before editing so you see the exact text to copy verbatim into edit's search/replace. Paths are relative to the workspace root; absolute paths and \"..\" escapes are rejected. Refuses files larger than the configured byte/line limits; pass `offset` (1-indexed line) and `limit` (line count) to page large files.",
+                "description": "Read a file. Default: plain content for edit's exact search/replace. Large files auto-window (first N lines) — pass offset/limit to page. Set line_numbers:true for navigation/citations (do NOT copy numbered lines into edit search). Paths are workspace-relative.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "offset": { "type": "integer", "description": "1-indexed line to start reading from (for pagination)" },
-                        "limit": { "type": "integer", "description": "max lines to return (for pagination)" }
+                        "offset": { "type": "integer", "description": "1-indexed start line (pagination)" },
+                        "limit": { "type": "integer", "description": "max lines to return" },
+                        "line_numbers": { "type": "boolean", "description": "prefix each line with N| for navigation; omit when preparing edit search/replace" }
                     },
                     "required": ["path"]
                 }
@@ -177,6 +179,49 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "delete",
+                "description": "Delete a file or empty directory (workspace-relative). Refuses non-empty directories — remove contents first. Prefer this over bash rm.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rename",
+                "description": "Rename or move a file/directory within the workspace (creates parent dirs of the destination). Prefer this over bash mv.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "existing path" },
+                        "to": { "type": "string", "description": "new path" }
+                    },
+                    "required": ["from", "to"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mkdir",
+                "description": "Create a directory (and parents) at a workspace-relative path. Prefer this over bash mkdir.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "list_dir",
                 "description": "List entries in a directory (relative path). Returns one entry per line, directories suffixed with /.",
                 "parameters": {
@@ -190,13 +235,23 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents for a pattern (regex) under the workspace. Returns matching lines as path:line:content, capped at 50 matches. Pass `context` (int) to include N lines before+after each match (like grep -C): matched lines keep the ':' separator, context lines use '-' so you can tell them apart. Overlapping windows merge; distinct groups are separated by '...'. Use context to grab a snippet + its surroundings without reading the whole file.",
+                "description": "Search file contents (regex). Default output: path:line:content. Use glob/type to scope, case_insensitive for -i, output_mode files_with_matches|count|content, head_limit/offset to page, context for -C windows.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "Rust regex" },
-                        "path": { "type": "string", "description": "directory to search (relative); defaults to workspace root" },
-                        "context": { "type": "integer", "description": "lines of context to show before and after each match (like grep -C n). 0 = matched line only (default)." }
+                        "path": { "type": "string", "description": "directory or file to search (relative); default workspace root" },
+                        "glob": { "type": "string", "description": "only files matching this glob (e.g. **/*.rs)" },
+                        "type": { "type": "string", "description": "language/file-type shortcut (rs, go, py, js, ts, …) — filters by extension" },
+                        "case_insensitive": { "type": "boolean", "description": "case-insensitive match (default false)" },
+                        "output_mode": {
+                            "type": "string",
+                            "enum": ["content", "files_with_matches", "count"],
+                            "description": "content (default) = matching lines; files_with_matches = paths only; count = path:N per file"
+                        },
+                        "head_limit": { "type": "integer", "description": "max matches (content) or files (other modes); default 50" },
+                        "offset": { "type": "integer", "description": "skip first N matches/files (pagination)" },
+                        "context": { "type": "integer", "description": "lines before+after each match (content mode, like grep -C). 0 = match line only." }
                     },
                     "required": ["pattern"]
                 }
@@ -242,7 +297,7 @@ pub fn definitions() -> Vec<Value> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash","fetch","web_search"] },
+                                    "name": { "type": "string", "enum": ["read_file","write_file","edit","list_dir","grep","glob","bash","fetch","web_search","delete","rename","mkdir"] },
                                     "args": { "type": "object" }
                                 },
                                 "required": ["name","args"]
@@ -446,7 +501,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web via DuckDuckGo Lite (no API key, no JS). Returns the top results as a numbered list (title, url, snippet) plus a compact JSON array. Honors the same egress rules as fetch (--no-network / fetch_allowlist). Use for ad-hoc web research; pair with the fetch tool to read a result's full page. Read-only.",
+                "description": "Search the web with no API key (HTML scrape). Tries DuckDuckGo Lite, then DuckDuckGo HTML, then Mojeek if a backend is rate-limited/blocked. Returns the top results as a numbered list (title, url, snippet) plus a compact JSON array. Honors the same egress rules as fetch (--no-network / fetch_allowlist). Use for ad-hoc web research; pair with the fetch tool to read a result's full page. Read-only.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -648,11 +703,11 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
             }
         }
         "write_file" => write_file(s("path"), s("content"), cfg),
+        "delete" => delete_path(s("path"), cfg),
+        "rename" => rename_path(s("from"), s("to"), cfg),
+        "mkdir" => mkdir_path(s("path"), cfg),
         "list_dir" => list_dir(s("path"), cfg),
-        "grep" => {
-            let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            grep(s("pattern"), s("path"), context, cfg)
-        }
+        "grep" => grep(s("pattern"), args, cfg),
         "glob" => glob(s("pattern"), cfg),
         "bulk_read" => bulk_read(args, cfg),
         "bulk_write" => bulk_write(args, cfg),
@@ -729,6 +784,10 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
         Err(e) => return Outcome::err(format!("read_file {input:?} failed: {e}")),
     };
     let (lines, _trailing) = split_lines(&content);
+    let line_numbers = args
+        .get("line_numbers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Optional pagination: offset (1-indexed) + limit slice a window so
     // files >max_read_lines still load page-by-page instead of being refused.
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -736,24 +795,50 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    if offset > 0 || limit.is_some() {
-        let start = offset.saturating_sub(1).min(lines.len());
-        let end = match limit {
-            Some(n) => (start + n).min(lines.len()),
-            None => lines.len(),
+
+    // Auto-window large files when the model didn't ask for a page — dumping
+    // thousands of lines into context is the #1 token waste. Explicit
+    // offset/limit still honors max_read_lines.
+    const AUTO_WINDOW: usize = 500;
+    let auto_window = offset == 0 && limit.is_none() && lines.len() > AUTO_WINDOW;
+
+    if offset > 0 || limit.is_some() || auto_window {
+        let start = if auto_window {
+            0
+        } else {
+            offset.saturating_sub(1).min(lines.len())
         };
+        let end = if auto_window {
+            AUTO_WINDOW.min(lines.len())
+        } else {
+            match limit {
+                Some(n) => (start + n).min(lines.len()),
+                None => lines.len(),
+            }
+        };
+        if !auto_window && end - start > cfg.max_read_lines {
+            return Outcome::err(format!(
+                "read_file {input:?} window is {} lines (max {}); pass a smaller limit",
+                end - start,
+                cfg.max_read_lines
+            ));
+        }
         let window = &lines[start..end];
         let mut out = String::new();
-        out.push_str(&format!(
-            "# {input} lines {}-{} of {}\n",
-            start + 1,
-            end,
-            lines.len()
-        ));
-        for l in window {
-            out.push_str(l);
-            out.push('\n');
+        if auto_window {
+            out.push_str(&format!(
+                "# {input} lines 1-{end} of {} (auto-windowed; pass offset/limit to page)\n",
+                lines.len()
+            ));
+        } else {
+            out.push_str(&format!(
+                "# {input} lines {}-{} of {}\n",
+                start + 1,
+                end,
+                lines.len()
+            ));
         }
+        format_read_lines(&mut out, window, start, line_numbers);
         return Outcome::ok(out);
     }
     if lines.len() > cfg.max_read_lines {
@@ -763,8 +848,28 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
             cfg.max_read_lines
         ));
     }
+    if line_numbers {
+        let mut out = String::new();
+        format_read_lines(&mut out, &lines, 0, true);
+        return Outcome::ok(out);
+    }
     // Plain content: the model copies substrings verbatim for edit's search/replace.
     Outcome::ok(content)
+}
+
+fn format_read_lines(out: &mut String, lines: &[String], start_idx: usize, line_numbers: bool) {
+    if line_numbers {
+        let width = ((start_idx + lines.len()).max(1).ilog10() as usize) + 1;
+        for (i, l) in lines.iter().enumerate() {
+            let n = start_idx + i + 1;
+            out.push_str(&format!("{n:>width$}|{l}\n"));
+        }
+    } else {
+        for l in lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
 }
 
 /// Atomically write `content` to `path`: write to a sibling temp file,
@@ -821,6 +926,75 @@ fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
     }
 }
 
+fn delete_path(input: &str, cfg: &Config) -> Outcome {
+    if input.is_empty() {
+        return Outcome::err("delete requires a non-empty 'path'");
+    }
+    let path = match resolve_ws(cfg, input) {
+        Ok(p) => p,
+        Err(e) => return Outcome::err(e),
+    };
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return Outcome::err(format!("delete {input:?} failed: {e}")),
+    };
+    if meta.is_dir() {
+        match std::fs::remove_dir(&path) {
+            Ok(()) => Outcome::ok(format!("deleted directory {input}")),
+            Err(e) => Outcome::err(format!(
+                "delete {input:?} failed: {e} (directories must be empty — remove contents first)"
+            )),
+        }
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Outcome::ok(format!("deleted {input}")),
+            Err(e) => Outcome::err(format!("delete {input:?} failed: {e}")),
+        }
+    }
+}
+
+fn rename_path(from: &str, to: &str, cfg: &Config) -> Outcome {
+    if from.is_empty() || to.is_empty() {
+        return Outcome::err("rename requires non-empty 'from' and 'to'");
+    }
+    let src = match resolve_ws(cfg, from) {
+        Ok(p) => p,
+        Err(e) => return Outcome::err(e),
+    };
+    let dst = match resolve_ws(cfg, to) {
+        Ok(p) => p,
+        Err(e) => return Outcome::err(e),
+    };
+    if !src.exists() {
+        return Outcome::err(format!("rename {from:?} failed: source does not exist"));
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Outcome::err(format!("rename mkdir failed: {e}"));
+            }
+        }
+    }
+    match std::fs::rename(&src, &dst) {
+        Ok(()) => Outcome::ok(format!("renamed {from} → {to}")),
+        Err(e) => Outcome::err(format!("rename {from:?} → {to:?} failed: {e}")),
+    }
+}
+
+fn mkdir_path(input: &str, cfg: &Config) -> Outcome {
+    if input.is_empty() {
+        return Outcome::err("mkdir requires a non-empty 'path'");
+    }
+    let path = match resolve_ws(cfg, input) {
+        Ok(p) => p,
+        Err(e) => return Outcome::err(e),
+    };
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => Outcome::ok(format!("created directory {input}")),
+        Err(e) => Outcome::err(format!("mkdir {input:?} failed: {e}")),
+    }
+}
+
 fn list_dir(input: &str, cfg: &Config) -> Outcome {
     let path = match resolve_ws(cfg, input) {
         Ok(p) => p,
@@ -846,12 +1020,92 @@ fn list_dir(input: &str, cfg: &Config) -> Outcome {
     }
 }
 
+/// Map a language/type shortcut to filename extensions.
+fn type_extensions(t: &str) -> Option<&'static [&'static str]> {
+    Some(match t.trim().to_ascii_lowercase().as_str() {
+        "rs" | "rust" => &["rs"],
+        "go" => &["go"],
+        "py" | "python" => &["py", "pyi"],
+        "js" | "javascript" => &["js", "jsx", "mjs", "cjs"],
+        "ts" | "typescript" => &["ts", "tsx", "mts", "cts"],
+        "java" => &["java"],
+        "kt" | "kotlin" => &["kt", "kts"],
+        "c" => &["c", "h"],
+        "cpp" | "cc" | "cxx" => &["cpp", "cc", "cxx", "hpp", "hxx", "h"],
+        "cs" | "csharp" => &["cs"],
+        "rb" | "ruby" => &["rb"],
+        "php" => &["php"],
+        "swift" => &["swift"],
+        "md" | "markdown" => &["md", "mdx"],
+        "json" => &["json", "jsonc"],
+        "yaml" | "yml" => &["yaml", "yml"],
+        "toml" => &["toml"],
+        "html" => &["html", "htm"],
+        "css" => &["css", "scss", "sass"],
+        "sh" | "bash" | "shell" => &["sh", "bash", "zsh"],
+        "sql" => &["sql"],
+        "xml" => &["xml"],
+        "txt" | "text" => &["txt"],
+        _ => return None,
+    })
+}
+
+fn path_matches_type(path: &std::path::Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::needless_range_loop)]
-fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
-    let re = match regex::Regex::new(pattern) {
-        Ok(r) => r,
-        Err(e) => return Outcome::err(format!("grep bad pattern: {e}")),
+fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
+    let case_insensitive = args
+        .get("case_insensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let re = {
+        let mut b = regex::RegexBuilder::new(pattern);
+        b.case_insensitive(case_insensitive);
+        match b.build() {
+            Ok(r) => r,
+            Err(e) => return Outcome::err(format!("grep bad pattern: {e}")),
+        }
     };
+    let input = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let glob_pat = args
+        .get("glob")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let type_exts = match args
+        .get("type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => match type_extensions(t) {
+            Some(e) => Some(e),
+            None => {
+                return Outcome::err(format!(
+                    "grep unknown type {t:?}; try rs, go, py, js, ts, java, md, json, …"
+                ))
+            }
+        },
+        None => None,
+    };
+    let output_mode = args
+        .get("output_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("content");
+    if !matches!(output_mode, "content" | "files_with_matches" | "count") {
+        return Outcome::err("grep output_mode must be content, files_with_matches, or count");
+    }
+    let head_limit = args
+        .get("head_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let skip = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
     let root = if input.is_empty() {
         cfg.workspace.clone()
     } else {
@@ -860,131 +1114,234 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
             Err(e) => return Outcome::err(e),
         }
     };
-    const MAX_MATCHES: usize = 50;
+
+    // Single-file path: search just that file.
+    let single_file = root.is_file();
+
     // Records of every match: (rel_path, line_index_0based, matched_line).
-    // Context windows are built in a second per-file pass so we don't hold
-    // every scanned file's full content in memory — only matched files are
-    // re-read, and only when context > 0.
     let mut records: Vec<(String, usize, String)> = Vec::new();
     let mut file_order: Vec<String> = Vec::new();
     let mut per_file: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
-    let mut dirs: Vec<std::path::PathBuf> = vec![root.clone()];
+    let mut file_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut dirs: Vec<std::path::PathBuf> = if single_file {
+        Vec::new()
+    } else {
+        vec![root.clone()]
+    };
     let mut seen = 0u32;
     let mut capped = false;
-    while let Some(dir) = dirs.pop() {
-        if seen > 5000 {
-            break;
+    // How many *emitted* units we've collected (matches or files, depending on mode).
+    let collect_cap = skip + head_limit;
+
+    let mut scan_file = |p: &std::path::Path| -> bool {
+        // Returns true when the collect cap is hit.
+        if let Some(exts) = type_exts {
+            if !path_matches_type(p, exts) {
+                return false;
+            }
         }
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for e in rd.flatten() {
-            seen += 1;
-            let p = e.path();
-            let ft = match e.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                // ponytail: skip VCS/build dirs — noise.
-                let name = e.file_name().to_string_lossy().to_string();
-                if !matches!(
-                    name.as_str(),
-                    ".git" | "node_modules" | "target" | "dist" | "build" | ".venv"
-                ) {
-                    dirs.push(p);
+        let rel = p
+            .strip_prefix(&cfg.workspace)
+            .unwrap_or(p)
+            .display()
+            .to_string();
+        if let Some(g) = glob_pat {
+            if !glob_match(g, &rel) {
+                let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !glob_match(g, base) {
+                    return false;
                 }
-                continue;
             }
-            if !ft.is_file() {
-                continue;
-            }
-            if p.extension()
-                .and_then(|x| x.to_str())
-                .map(|x| x.len())
-                .unwrap_or(0)
-                > 40
-            {
-                continue; // skip binary-ish extensions
-            }
-            // ponytail: size guard + content sniff so we don't slurp a 2GB log.
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.len() > 5_000_000 {
-                continue;
-            } // 5MB cap per file
-            let Ok(content) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            // binary sniff: NUL bytes mean binary — skip.
-            if content.contains('\0') {
-                continue;
-            }
-            let rel = p
-                .strip_prefix(&cfg.workspace)
-                .unwrap_or(&p)
-                .display()
-                .to_string();
-            for (i, line) in content.lines().enumerate() {
-                if re.is_match(line) {
+        }
+        if p.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.len())
+            .unwrap_or(0)
+            > 40
+        {
+            return false;
+        }
+        let Ok(meta) = std::fs::metadata(p) else {
+            return false;
+        };
+        if meta.len() > 5_000_000 {
+            return false;
+        }
+        let Ok(content) = std::fs::read_to_string(p) else {
+            return false;
+        };
+        if content.contains('\0') {
+            return false;
+        }
+        let mut file_hit = false;
+        let mut n_in_file = 0usize;
+        for (i, line) in content.lines().enumerate() {
+            if re.is_match(line) {
+                file_hit = true;
+                n_in_file += 1;
+                if output_mode == "content" {
                     records.push((rel.clone(), i, line.to_string()));
                     let entry = per_file.entry(rel.clone()).or_default();
                     if entry.is_empty() {
                         file_order.push(rel.clone());
                     }
                     entry.push(i);
-                    if records.len() >= MAX_MATCHES {
-                        capped = true;
-                        break;
+                    if records.len() >= collect_cap {
+                        return true;
                     }
                 }
             }
-            if capped {
-                break;
+        }
+        if file_hit && output_mode != "content" {
+            if !file_order.iter().any(|f| f == &rel) {
+                file_order.push(rel.clone());
+            }
+            file_counts.insert(rel, n_in_file);
+            if file_order.len() >= collect_cap {
+                return true;
             }
         }
-        if capped {
-            break;
+        false
+    };
+
+    if single_file {
+        capped = scan_file(&root);
+    } else {
+        while let Some(dir) = dirs.pop() {
+            if seen > 5000 || capped {
+                break;
+            }
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for e in rd.flatten() {
+                seen += 1;
+                let p = e.path();
+                let ft = match e.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !matches!(
+                        name.as_str(),
+                        ".git" | "node_modules" | "target" | "dist" | "build" | ".venv"
+                    ) {
+                        dirs.push(p);
+                    }
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                if scan_file(&p) {
+                    capped = true;
+                    break;
+                }
+            }
         }
     }
 
+    // Apply offset + head_limit to the collected units.
+    let page = |total: usize| -> (usize, usize, bool) {
+        let start = skip.min(total);
+        let end = (start + head_limit).min(total);
+        let more = end < total || capped;
+        (start, end, more)
+    };
+
+    match output_mode {
+        "files_with_matches" => {
+            let (start, end, more) = page(file_order.len());
+            let mut s = file_order[start..end].join("\n");
+            if more {
+                s.push_str(&format!(
+                    "\n...[{} file cap reached; pass offset={} to continue]",
+                    head_limit,
+                    skip + (end - start)
+                ));
+            }
+            return Outcome::ok(s);
+        }
+        "count" => {
+            let (start, end, more) = page(file_order.len());
+            let mut lines: Vec<String> = Vec::with_capacity(end - start);
+            let mut total = 0usize;
+            for rel in &file_order[start..end] {
+                let n = *file_counts.get(rel).unwrap_or(&0);
+                total += n;
+                lines.push(format!("{rel}:{n}"));
+            }
+            let mut s = lines.join("\n");
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!("# total: {total}"));
+            if more {
+                s.push_str(&format!(
+                    "\n...[{} file cap reached; pass offset={} to continue]",
+                    head_limit,
+                    skip + (end - start)
+                ));
+            }
+            return Outcome::ok(s);
+        }
+        _ => {} // content — fall through
+    }
+
+    // Slice records for content mode pagination.
+    let (start, end, more_matches) = page(records.len());
+    let records: Vec<(String, usize, String)> = records[start..end].to_vec();
+    // Rebuild file_order / per_file for the page only (context mode).
+    let mut page_order: Vec<String> = Vec::new();
+    let mut page_per_file: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (rel, i, _) in &records {
+        let entry = page_per_file.entry(rel.clone()).or_default();
+        if entry.is_empty() {
+            page_order.push(rel.clone());
+        }
+        entry.push(*i);
+    }
+
     if context == 0 {
-        // Original behaviour: one line per match.
         let mut out: Vec<String> = Vec::with_capacity(records.len());
         for (rel, i, line) in &records {
             out.push(format!("{rel}:{}:{}", i + 1, line));
         }
         let mut s = out.join("\n");
-        if capped {
-            s.push_str("\n...[50 match cap reached]");
+        if more_matches {
+            s.push_str(&format!(
+                "\n...[{} match cap reached; pass offset={} to continue]",
+                head_limit,
+                skip + records.len()
+            ));
         }
         return Outcome::ok(s);
     }
 
-    // Context mode (like grep -C n): re-read only the files that had matches and
-    // emit merged [i-context, i+context] windows. Matched lines use ':' as the
-    // separator; context lines use '-' (GNU grep convention) so the model can
-    // distinguish them. Overlapping/adjacent windows merge; distinct windows are
-    // separated by '...'. Total output is capped so a huge file can't flood context.
+    // Context mode (like grep -C n).
     const MAX_CTX_LINES: usize = 400;
     let mut out: Vec<String> = Vec::new();
     let mut total = 0usize;
-    for rel in &file_order {
+    let mut ctx_capped = false;
+    for rel in &page_order {
         let path = cfg.workspace.join(rel);
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
         let lines: Vec<&str> = content.lines().collect();
-        let idxs = per_file.get(rel).cloned().unwrap_or_default();
-        // Merge overlapping/adjacent [start, end] windows (0-based, inclusive).
+        let idxs = page_per_file.get(rel).cloned().unwrap_or_default();
         let mut windows: Vec<(usize, usize)> = Vec::new();
         for &i in &idxs {
-            let start = i.saturating_sub(context);
-            let end = (i + context).min(lines.len().saturating_sub(1));
+            let wstart = i.saturating_sub(context);
+            let wend = (i + context).min(lines.len().saturating_sub(1));
             match windows.last_mut() {
-                Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
-                _ => windows.push((start, end)),
+                Some(last) if wstart <= last.1 + 1 => last.1 = last.1.max(wend),
+                _ => windows.push((wstart, wend)),
             }
         }
         for (wi, (ws, we)) in windows.iter().enumerate() {
@@ -993,26 +1350,28 @@ fn grep(pattern: &str, input: &str, context: usize, cfg: &Config) -> Outcome {
             }
             for ln in *ws..=*we {
                 if total >= MAX_CTX_LINES {
-                    capped = true;
+                    ctx_capped = true;
                     break;
                 }
-                // idxs is naturally ascending (line scan order) so binary_search works.
                 let matched = idxs.binary_search(&ln).is_ok();
                 let sep = if matched { ':' } else { '-' };
                 out.push(format!("{rel}{sep}{}{sep}{}", ln + 1, lines[ln]));
                 total += 1;
             }
-            if capped {
+            if ctx_capped {
                 break;
             }
         }
-        if capped {
+        if ctx_capped {
             break;
         }
     }
     let mut s = out.join("\n");
-    if capped {
-        s.push_str("\n...[output cap reached]");
+    if more_matches || ctx_capped {
+        s.push_str(&format!(
+            "\n...[output cap reached; pass offset={} to continue]",
+            skip + records.len()
+        ));
     }
     Outcome::ok(s)
 }
@@ -1849,7 +2208,7 @@ error: path must be a string"
             ));
             continue;
         };
-        let r = read_file(path, p, cfg);
+        let r = read_file(path, &json!({ "path": path }), cfg);
         if !r.ok {
             ok = false;
         }
@@ -3343,6 +3702,128 @@ mod tests {
         let o = execute("grep", &json!({"pattern":"beta"}), &cfg);
         assert!(o.ok, "{}", o.output);
         assert_eq!(o.output, "a.txt:2:beta");
+    }
+
+    #[test]
+    fn grep_case_insensitive_and_glob_and_type() {
+        let (root, cfg) = tmp_ws();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "Hello\n").unwrap();
+        fs::write(root.join("src/b.txt"), "hello\n").unwrap();
+        let o = execute(
+            "grep",
+            &json!({
+                "pattern": "hello",
+                "case_insensitive": true,
+                "glob": "**/*.rs",
+            }),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.rs"));
+        assert!(!o.output.contains("b.txt"));
+
+        let o2 = execute("grep", &json!({ "pattern": "Hello", "type": "rs" }), &cfg);
+        assert!(o2.ok, "{}", o2.output);
+        assert!(o2.output.contains("a.rs"));
+        assert!(!o2.output.contains("b.txt"));
+    }
+
+    #[test]
+    fn grep_output_modes_files_and_count() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "x\nx\n").unwrap();
+        fs::write(root.join("b.txt"), "x\n").unwrap();
+        let files = execute(
+            "grep",
+            &json!({ "pattern": "x", "output_mode": "files_with_matches" }),
+            &cfg,
+        );
+        assert!(files.ok, "{}", files.output);
+        assert!(files.output.contains("a.txt"));
+        assert!(files.output.contains("b.txt"));
+        assert!(!files.output.contains(":1:"));
+
+        let count = execute(
+            "grep",
+            &json!({ "pattern": "x", "output_mode": "count" }),
+            &cfg,
+        );
+        assert!(count.ok, "{}", count.output);
+        assert!(count.output.contains("a.txt:2"));
+        assert!(count.output.contains("b.txt:1"));
+        assert!(count.output.contains("# total: 3"));
+    }
+
+    #[test]
+    fn grep_head_limit_and_offset() {
+        let (root, cfg) = tmp_ws();
+        let body: String = (1..=20).map(|n| format!("match{n}\n")).collect();
+        fs::write(root.join("a.txt"), &body).unwrap();
+        let o = execute(
+            "grep",
+            &json!({ "pattern": "match", "head_limit": 3, "offset": 2 }),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("match3"));
+        assert!(o.output.contains("match5"));
+        assert!(!o.output.contains("match2\n") && !o.output.contains(":2:match2"));
+        assert!(o.output.contains("offset=5") || o.output.contains("cap reached"));
+    }
+
+    #[test]
+    fn read_file_auto_windows_large_files() {
+        let (_root, cfg) = tmp_ws();
+        let body: String = (1..=600).map(|n| format!("line {n}\n")).collect();
+        fs::write(cfg.workspace.join("big.txt"), &body).unwrap();
+        let o = execute("read_file", &json!({ "path": "big.txt" }), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("auto-windowed"), "{}", o.output);
+        assert!(o.output.contains("line 1"));
+        assert!(o.output.contains("line 500"));
+        assert!(!o.output.contains("line 501"));
+    }
+
+    #[test]
+    fn read_file_line_numbers() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let o = execute(
+            "read_file",
+            &json!({ "path": "a.txt", "line_numbers": true }),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("1|alpha"), "{}", o.output);
+        assert!(o.output.contains("2|beta"), "{}", o.output);
+    }
+
+    #[test]
+    fn delete_rename_mkdir_roundtrip() {
+        let (root, cfg) = tmp_ws();
+        let o = execute("mkdir", &json!({ "path": "sub/dir" }), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(root.join("sub/dir").is_dir());
+
+        fs::write(root.join("sub/dir/f.txt"), "hi").unwrap();
+        let o = execute(
+            "rename",
+            &json!({ "from": "sub/dir/f.txt", "to": "sub/dir/g.txt" }),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(root.join("sub/dir/g.txt").is_file());
+        assert!(!root.join("sub/dir/f.txt").exists());
+
+        let o = execute("delete", &json!({ "path": "sub/dir/g.txt" }), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(!root.join("sub/dir/g.txt").exists());
+
+        // non-empty dir refused
+        fs::write(root.join("sub/dir/keep.txt"), "x").unwrap();
+        let o = execute("delete", &json!({ "path": "sub/dir" }), &cfg);
+        assert!(!o.ok, "{}", o.output);
     }
 
     #[tokio::test]

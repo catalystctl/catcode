@@ -124,6 +124,13 @@ export const FolderIcon = (p: P) => (
   </svg>
 );
 
+export const GlobeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+  </svg>
+);
+
 export const CompactIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M21 12a9 9 0 1 1-3-6.7" />

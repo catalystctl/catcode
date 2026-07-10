@@ -27,11 +27,11 @@
 //!      fail to load — that's fine). Paste the `code` query param (or full
 //!      redirect URL) via `/oauth-code`. Optional: SSH `-L 51121:127.0.0.1:51121`
 //!      + `CATALYST_CODE_NO_BROWSER=0` for automatic loopback capture.
-//!      Tokens are written to `~/.gemini/oauth_creds.json` in the
-//!      `google-auth-library` `Credentials` shape (same path Antigravity / gemini-cli
-//!      use). Works for **regular Google accounts** (personal Gmail /
-//!      Google One AI) **and Google Cloud / Workspace identities** alike — the
-//!      Google consent screen lets the user pick the account.
+//!        Tokens are written to `~/.gemini/oauth_creds.json` in the
+//!        `google-auth-library` `Credentials` shape (same path Antigravity / gemini-cli
+//!        use). Works for **regular Google accounts** (personal Gmail /
+//!        Google One AI) **and Google Cloud / Workspace identities** alike — the
+//!        Google consent screen lets the user pick the account.
 //!  - Google *Cloud* accounts that prefer ADC: `gcloud auth
 //!    application-default login` (`~/.config/gcloud/application_default_
 //!    credentials.json`) and a service-account key file pointed at by
@@ -2755,7 +2755,7 @@ pub async fn xai_login(
                 tokio::time::sleep(remaining.min(Duration::from_secs(current_interval))).await;
                 continue;
             }
-            other if other.is_empty() => {
+            "" => {
                 // Non-JSON or unexpected body — don't hang forever; surface it.
                 return Err(format!(
                     "xAI device-code token polling failed (HTTP {status}): {body}"
@@ -2945,7 +2945,7 @@ pub async fn qwen_login(
                 tokio::time::sleep(remaining.min(Duration::from_secs(current_interval))).await;
                 continue;
             }
-            other if other.is_empty() => {
+            "" => {
                 return Err(format!(
                     "Qwen device-code token polling failed (HTTP {status}): {body}"
                 ));

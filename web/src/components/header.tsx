@@ -5,9 +5,10 @@
 // the secondary controls on small screens.
 
 import { useState } from "react";
-import type { Metrics, UmansConc } from "@/lib/types";
+import type { Metrics, UmansConc, ModelInfo } from "@/lib/types";
 import { formatTokens, formatTps, formatMs, basename } from "@/lib/format";
 import { useOutsideClose } from "@/lib/use-outside-close";
+import { ModelPicker } from "./model-picker";
 import {
   ChevronDown,
   CheckIcon,
@@ -24,7 +25,7 @@ interface Props {
   connected: boolean;
   workspace: string;
   provider: string;
-  models: { id: string; name: string; reasoning: boolean; thinking_levels: string[]; provider?: string }[];
+  models: ModelInfo[];
   selectedModel: string | null;
   thinkingLevel: string;
   approvalMode: string;
@@ -102,30 +103,14 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {modelOpen && (
-          <div role="menu" className="absolute right-0 z-30 mt-1 max-h-72 w-64 overflow-auto rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
-            {props.models.length === 0 && (
-              <div className="px-3 py-2 text-[12px] text-ink-500">No models — set an API key.</div>
-            )}
-            {props.models.map((mo) => (
-              <button
-                key={mo.id}
-                role="menuitem"
-                onClick={() => {
-                  props.onSelectModel(mo.id);
-                  setModelOpen(false);
-                }}
-                className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors hover:bg-ink-800"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[12px] font-medium text-ink-100">{mo.name || mo.id}</div>
-                  <div className="truncate font-mono text-[10px] text-ink-500">
-                    {mo.id}
-                    {mo.reasoning && " · reasoning"}
-                  </div>
-                </div>
-                {props.selectedModel === mo.id && <CheckIcon width={13} height={13} className="text-accent-soft" />}
-              </button>
-            ))}
+          <div role="menu" className="absolute right-0 z-30 mt-1 w-80 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-0 shadow-2xl shadow-black/40 animate-fade-in">
+            <ModelPicker
+              models={props.models}
+              selectedModel={props.selectedModel}
+              onSelect={props.onSelectModel}
+              variant="popover"
+              onClose={() => setModelOpen(false)}
+            />
           </div>
         )}
       </div>

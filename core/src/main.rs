@@ -16,6 +16,7 @@ mod intercom;
 mod logging;
 mod memory;
 mod message;
+mod models_dev;
 mod oauth;
 mod pattern_log;
 mod plugins;
@@ -26,6 +27,7 @@ mod search_tool;
 mod session;
 mod staging;
 mod subagent;
+mod tool_cache;
 mod tools;
 mod vision;
 mod workspace;
@@ -66,9 +68,9 @@ const SYSTEM_PROMPT_BASE: &str = r#"You are a coding agent operating inside a Ru
 You can read, edit, write, and list files, search with grep/glob, and run bash commands — all confined to the current workspace directory.
 
 File editing uses search-and-replace, not line numbers or hashes:
-- read_file returns a file's plain content. Call it before editing so you see the exact text.
+- read_file returns plain content by default (auto-windows large files). Call it before editing so you see the exact text. Use line_numbers:true only for navigation/citations — never copy numbered lines into edit search.
 - To change a file, call edit with one or more {search, replace} pairs. `search` must match the file content EXACTLY (copy it verbatim, including whitespace) and be unique in the file; `replace` is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in `replace`. All edits in one call apply atomically — if any `search` is not found or is ambiguous (matches multiple places) nothing is written; re-read and correct the search text.
-- Use write_file only for new files or complete rewrites; prefer edit for targeted changes. Use grep to search and glob to find files by pattern.
+- Use write_file only for new files or complete rewrites; prefer edit for targeted changes. Use delete/rename/mkdir instead of bash for those filesystem ops. Use grep (glob/type/output_mode) to search and glob to find files by pattern.
 
 Tool-call hygiene — keep tool arguments small and valid JSON:
 - Call the dedicated tool directly (bash, read_file, edit). Use `bulk` only to batch several genuinely independent calls — never wrap a single bash command in `bulk`.
@@ -465,6 +467,10 @@ pub struct State {
     /// Last time the concurrency anomaly note was emitted, for per-session
     /// rate-limiting so a pathological tool-call loop can't nag every result.
     pub last_concurrency_note: Mutex<Option<std::time::Instant>>,
+    /// Digested / ingress-capped tool outputs, keyed by tool+args hash, so an
+    /// identical re-call of a read-only tool can restore full content without
+    /// re-executing (bash is never restored). Cleared on workspace mutations.
+    pub tool_output_cache: Mutex<tool_cache::ToolOutputCache>,
 }
 
 /// Shared tail of `login_oauth` (web flow) and `oauth_code` (manual flow):
@@ -1069,11 +1075,10 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
     *st.goal_deploy_cancel.lock().await = Some(tok.clone());
     tokio::spawn(async move {
         goal::deploy_goal(st.clone(), client, tok.clone()).await;
-        // Clear cancel slot if we still own it.
-        let mut slot = st.goal_deploy_cancel.lock().await;
-        if slot.as_ref().is_some_and(|t| t.is_cancelled() || true) {
-            // Always clear when the deploy task exits.
-            *slot = None;
+        // Clear cancel slot only if we still own it. A newer spawn cancels
+        // this token first, so a cancelled token means the slot was replaced.
+        if !tok.is_cancelled() {
+            *st.goal_deploy_cancel.lock().await = None;
         }
     });
 }
@@ -1143,7 +1148,16 @@ async fn sync_work_state_from_todos(st: &State, args: &Value) {
 /// summary aware of what the session has actually changed.
 async fn record_file_touch(st: &State, tool: &str, args: &Value) {
     let paths: Vec<String> = match tool {
-        "bulk_write" | "bulk_edit" => args
+        "bulk_write" => args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("path").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "bulk_edit" => args
             .get("edits")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -1152,6 +1166,16 @@ async fn record_file_touch(st: &State, tool: &str, args: &Value) {
                     .collect()
             })
             .unwrap_or_default(),
+        "rename" => {
+            let mut v = Vec::new();
+            if let Some(p) = args.get("from").and_then(|v| v.as_str()) {
+                v.push(p.to_string());
+            }
+            if let Some(p) = args.get("to").and_then(|v| v.as_str()) {
+                v.push(p.to_string());
+            }
+            v
+        }
         _ => args
             .get("path")
             .and_then(|v| v.as_str())
@@ -1469,6 +1493,7 @@ async fn main() {
         pending_oauth: Mutex::new(None),
         peers: Mutex::new(Vec::new()),
         last_concurrency_note: Mutex::new(None),
+        tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
     });
 
     // Apply disabled plugin list from config.
@@ -2599,8 +2624,7 @@ async fn main() {
                 );
             }
             Command::InstallPlugin { path } => {
-                let dir = std::path::PathBuf::from(&path);
-                match state.plugin_manager.install(&dir) {
+                match state.plugin_manager.install_source(&path).await {
                     Ok(plugin) => {
                         let hooks_list: Vec<String> = plugin.hooks.keys().cloned().collect();
                         emit(
@@ -3081,8 +3105,7 @@ async fn main() {
                 // "declined" outcome to the agent.
                 let p = state.pending_sudos.lock().await.get(&request_id).cloned();
                 if let Some(p) = p {
-                    *p.result.lock().await =
-                        Some(if approved { password } else { None });
+                    *p.result.lock().await = Some(if approved { password } else { None });
                     p.notify.notify_one();
                 } else {
                     emit(&Event::new("error").with(
@@ -3218,7 +3241,10 @@ pub(crate) fn tool_matches_rule(tool_name: &str, args: &Value, rule: &Permission
     let candidate = match tool_name {
         "bash" => args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
         "write_file" | "edit" | "patch" | "read_file" | "bulk_read" | "bulk_write"
-        | "bulk_edit" => args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+        | "bulk_edit" | "delete" | "mkdir" => {
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
+        }
+        "rename" => args.get("from").and_then(|v| v.as_str()).unwrap_or(""),
         "grep" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         "glob" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
@@ -3301,8 +3327,20 @@ pub(crate) fn restricted_path_for_tool(
         workspace::check_dangerous_path(&rel_str)
     }
     match name {
-        "read_file" | "write_file" | "edit" | "patch" => {
+        "read_file" | "write_file" | "edit" | "patch" | "delete" | "mkdir" => {
             path_of(args).and_then(|raw| check(raw, root))
+        }
+        "rename" => {
+            let from = args
+                .get("from")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let to = args
+                .get("to")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            from.and_then(|raw| check(raw, root))
+                .or_else(|| to.and_then(|raw| check(raw, root)))
         }
         "bulk_read" => args
             .get("paths")
@@ -3806,11 +3844,21 @@ fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     let paths: Vec<String> = match tool {
-        "write_file" | "edit" | "patch" => args
+        "write_file" | "edit" | "patch" | "delete" | "mkdir" => args
             .get("path")
             .and_then(|v| v.as_str())
             .map(|s| vec![s.to_string()])
             .unwrap_or_default(),
+        "rename" => {
+            let mut v = Vec::new();
+            if let Some(p) = args.get("from").and_then(|v| v.as_str()) {
+                v.push(p.to_string());
+            }
+            if let Some(p) = args.get("to").and_then(|v| v.as_str()) {
+                v.push(p.to_string());
+            }
+            v
+        }
         "bulk_write" => args
             .get("files")
             .and_then(|v| v.as_array())
@@ -4871,7 +4919,14 @@ async fn run_turn(
                     // The async ones are wrapped in a `select!` on the turn cancel
                     // so /abort can interrupt them mid-flight — kill_on_drop frees
                     // the spawned child when the future is dropped.
-                    let mut outcome = if let Some(tc) = st
+                    let mut outcome = if let Some(restored) = {
+                        // Identical re-call of a read-only tool after a digest /
+                        // ingress-cap: restore full output without re-executing.
+                        let cache = st.tool_output_cache.lock().await;
+                        cache.get(&name, &args_str).map(|s| s.to_string())
+                    } {
+                        tools::Outcome::ok(format!("[restored from digest cache]\n{restored}"))
+                    } else if let Some(tc) = st
                         .plugin_manager
                         .tool_config(&name)
                         .filter(|tc| tc.override_builtin || !tools::is_builtin(&name))
@@ -4932,7 +4987,7 @@ async fn run_turn(
                                     SudoResult::Declined => tools::Outcome::ok(
                                         "The user declined the sudo request — the \
                                          command was NOT run. Ask the user to run it \
-                                         manually, or re-attempt without sudo."
+                                         manually, or re-attempt without sudo.",
                                     ),
                                     SudoResult::Aborted => {
                                         emit(&Event::new("aborted"));
@@ -5048,7 +5103,8 @@ async fn run_turn(
                     if outcome.ok {
                         match name.as_str() {
                             "todo_write" => sync_work_state_from_todos(st, &exec_args).await,
-                            "write_file" | "edit" | "patch" | "bulk_write" | "bulk_edit" => {
+                            "write_file" | "edit" | "patch" | "bulk_write" | "bulk_edit"
+                            | "delete" | "rename" | "mkdir" => {
                                 record_file_touch(st, &name, &exec_args).await
                             }
                             _ => {}
@@ -5170,6 +5226,29 @@ async fn run_turn(
                     {
                         outcome.output.push_str("\n\n");
                         outcome.output.push_str(&note);
+                    }
+                    // Cache + ingress: store full output for restorable tools so
+                    // digests / caps can shrink context; identical re-calls restore.
+                    // Destructive tools wipe the cache (tree may have changed).
+                    if outcome.ok {
+                        if tool_cache::invalidates_cache(&name) {
+                            st.tool_output_cache.lock().await.invalidate_all();
+                        } else if tool_cache::ToolOutputCache::is_restorable(&name)
+                            && !outcome.output.starts_with("[restored from digest cache]")
+                        {
+                            st.tool_output_cache.lock().await.store(
+                                &name,
+                                &args_str,
+                                &outcome.output,
+                            );
+                        }
+                    }
+                    // Hard ingress cap: never let a single tool result dominate
+                    // the context window. Full bytes stay in the cache above.
+                    // Skip when we just restored — the whole point is to give
+                    // the model the full output back.
+                    if outcome.ok && !outcome.output.starts_with("[restored from digest cache]") {
+                        outcome.output = apply_ingress_cap(&name, &args_str, outcome.output);
                     }
                     // Debug log: records full tool args (file contents, commands) which may
                     // include secrets the model handles. Opt-in (cfg.debug_log), user-owned.
@@ -5954,10 +6033,25 @@ fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String 
     };
     let how = if tool == "bash" {
         "re-run if needed"
+    } else if tool_cache::ToolOutputCache::is_restorable(tool) {
+        "re-run identical call to restore (cached)"
     } else {
         "re-run to recover full output"
     };
     format!("[digested: {what} — {how}]")
+}
+
+/// Cap a freshly produced tool result before it enters the conversation.
+/// Oversized outputs are replaced with a one-line digest; the full bytes must
+/// already be in `tool_output_cache` so an identical re-call can restore them.
+const INGRESS_MAX_BYTES: usize = 48 * 1024;
+
+fn apply_ingress_cap(tool: &str, args_json: &str, output: String) -> String {
+    if output.len() <= INGRESS_MAX_BYTES || output.starts_with("[digested:") {
+        return output;
+    }
+    let lines = output.lines().count();
+    make_digest(tool, args_json, output.len(), lines)
 }
 
 /// Truncate a string to `n` chars at a char boundary, appending an ellipsis.
@@ -6395,7 +6489,11 @@ mod digest_tests {
         assert!(d.contains("read_file"), "{}", d);
         assert!(d.contains("src/big.rs"), "{}", d);
         assert!(d.contains("lines"), "should report line count: {}", d);
-        assert!(d.contains("re-run to recover full output"), "{}", d);
+        assert!(
+            d.contains("re-run identical call to restore (cached)"),
+            "{}",
+            d
+        );
         // tool_call_id preserved so the assistant/tool pairing stays valid
         assert_eq!(m[2].tool_call_id(), Some("call_1"));
         // recent large result (inside the keep tail) is untouched
@@ -6640,6 +6738,20 @@ mod compact_tests {
         );
         // Both tool messages survive (pairing intact); the older one is digested.
         assert_eq!(m.iter().filter(|x| x.is_tool()).count(), 2);
+    }
+
+    #[test]
+    fn apply_ingress_cap_digests_oversized() {
+        let huge = "x".repeat(60_000);
+        let out = apply_ingress_cap("read_file", r#"{"path":"a.txt"}"#, huge);
+        assert!(out.starts_with("[digested:"), "{out}");
+        assert!(out.contains("cached") || out.contains("re-run"), "{out}");
+    }
+
+    #[test]
+    fn apply_ingress_cap_passthrough_small() {
+        let out = apply_ingress_cap("grep", r#"{"pattern":"x"}"#, "a:1:x".into());
+        assert_eq!(out, "a:1:x");
     }
 }
 

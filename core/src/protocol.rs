@@ -180,7 +180,9 @@ pub enum Command {
     /// Values are coerced from the JSON type (string or number).
     #[serde(rename = "set_config")]
     SetConfig { key: String, value: Value },
-    /// Plugin lifecycle commands.
+    /// Plugin lifecycle commands. `install_plugin.path` accepts a local
+    /// directory **or** a GitHub Release source (`owner/repo[@tag]`, full
+    /// github.com URL). Release installs download the source `.zip`.
     #[serde(rename = "install_plugin")]
     InstallPlugin { path: String },
     #[serde(rename = "remove_plugin")]

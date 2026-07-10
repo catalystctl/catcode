@@ -191,7 +191,7 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
 function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }) {
   const title = run.agent ?? run.mode;
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-2 border-b border-ink-800/80 px-4 py-3">
         <button
           onClick={onBack}
@@ -219,7 +219,7 @@ function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }
           <p className="mt-1.5 line-clamp-2 text-[12px] leading-relaxed text-ink-300">{run.task}</p>
         )}
       </div>
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
         {run.items.length === 0 ? (
           <div className="px-3 py-10 text-center text-[12px] text-ink-600">
             {run.mode === "parallel" || run.mode === "chain" ? (

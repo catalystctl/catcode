@@ -1209,15 +1209,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// global: the quit key (default Ctrl+C) quits unless a modal is open
 	// (where esc / ctrl+c closes the modal instead).
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
-		// Mark teardown so the core's stdout EOF doesn't trigger an auto-restart,
-		// then kill the core. The stdout-reader goroutine reaps it via cmd.Wait()
-		// on EOF — do NOT Wait() here, that would race the reader's Wait on the
-		// same Cmd (double-reap).
-		quitting.Store(true)
-		if s.coreCmd != nil && s.coreCmd.Process != nil {
-			_ = s.coreCmd.Process.Kill()
-		}
-		return s, tea.Quit
+		return s, s.quit()
 	}
 	// modal intercept: when a modal is active it owns all keys.
 	if s.modal.kind != modalNone {
@@ -1531,6 +1523,19 @@ func (s *session) handleScrollKey(msg tea.KeyPressMsg) bool {
 // User line / slash commands
 // ---------------------------------------------------------------------------
 
+// quit performs a clean app teardown: it marks quitting so the core's stdout
+// EOF doesn't trigger an auto-restart, kills the core process (the
+// stdout-reader goroutine reaps it via cmd.Wait() on EOF — we never Wait()
+// here, which would race the reader's Wait on the same Cmd), and returns the
+// tea.Quit command. Shared by the quit key and the /exit · /quit commands.
+func (s *session) quit() tea.Cmd {
+	quitting.Store(true)
+	if s.coreCmd != nil && s.coreCmd.Process != nil {
+		_ = s.coreCmd.Process.Kill()
+	}
+	return tea.Quit
+}
+
 func (s *session) handleUserLine(text string) tea.Cmd {
 	if strings.HasPrefix(text, "/") {
 		parts := strings.Fields(text)
@@ -1640,6 +1645,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.queued = nil
 			s.sendCore(map[string]any{"type": "abort"})
 			return nil
+		case "/exit", "/quit":
+			// Quit the app (alias: /quit). Same clean teardown as the quit key.
+			return s.quit()
 		case "/steer":
 			// Steer via command: works on every terminal (Ctrl+Enter is only detected
 			// on terminals that send a distinct CSI for it). Bare /steer opens a

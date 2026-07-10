@@ -59,7 +59,7 @@ type goalDraft struct {
 	reviewBeforeDeploy bool            // auto_deploy = !reviewBeforeDeploy
 	// Advanced section
 	advanced         bool
-	plannerModel     string         // empty = default (orchestrator)
+	plannerModel     string // empty = default (orchestrator)
 	workerModel      string
 	reviewerModel    string
 	modelConcurrency map[string]int // model id → max concurrent (capped by concurrency)
@@ -126,20 +126,20 @@ func goalNextField(fields []int, field, delta int) int {
 
 // goalStateSnap is a lightweight view of the core's goal_state event.
 type goalStateSnap struct {
-	ID        string
-	Goal      string
-	Phase     string
-	Error     string
+	ID         string
+	Goal       string
+	Phase      string
+	Error      string
 	AutoDeploy bool
-	Prompts   []goalPromptSnap
-	Version   uint64
+	Prompts    []goalPromptSnap
+	Version    uint64
 }
 
 type goalPromptSnap struct {
-	StepID string
-	Agent  string
-	Title  string
-	Status string
+	StepID  string
+	Agent   string
+	Title   string
+	Status  string
 	Summary string
 }
 
@@ -350,9 +350,9 @@ func (s *session) openAttachModal() {
 	s.openValueEditModal(editTargetAttach, "Attach Image", "/path/to/image.png", "")
 }
 
-// openPluginInstallModal collects a filesystem path to a plugin directory.
+// openPluginInstallModal collects a local path or GitHub Release URL.
 func (s *session) openPluginInstallModal() {
-	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "/path/to/plugin-dir", "")
+	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "path or github.com/owner/repo[@tag]", "")
 }
 
 // openSteerModal collects a mid-turn steer message.
@@ -783,6 +783,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
 		{label: "/abort", desc: "stop running turn (or Esc)"},
+		{label: "/exit", desc: "quit the app (alias: /quit)"},
 		{label: "/steer", desc: "steer an in-flight turn (modal)"},
 		{label: "/settings", desc: "settings hub (dedicated modals per option)"},
 		{label: "/keybinds", desc: "view & customize keybindings"},
@@ -790,7 +791,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/copy", desc: "copy last assistant reply"},
 		{label: "/attach", desc: "attach an image (vision) — path modal"},
 		{label: "/vision", desc: "configure vision models & handoff target"},
-		{label: "/plugin-install", desc: "install a plugin from directory (path modal)"},
+		{label: "/plugin-install", desc: "install from path or GitHub Release URL"},
 		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
 		{label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
@@ -2249,7 +2250,7 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		return s, s.sendAttach(val, "")
 	case editTargetPluginInstall:
 		if val == "" {
-			s.logError("no plugin path entered")
+			s.logError("no plugin path or GitHub URL entered")
 			return s, nil
 		}
 		s.sendCore(map[string]any{"type": "install_plugin", "path": val})
@@ -2416,6 +2417,7 @@ func (s *session) helpText() string {
 		"  /context          token-usage breakdown (top consumers)",
 		"  /usage            provider plan limits (5h · weekly · …)",
 		"  /abort            stop running turn",
+		"  /exit · /quit     quit the app",
 		"  /steer            steer an in-flight turn",
 		"  /settings         settings hub (opens dedicated modals)",
 		"  /keybinds         view & customize keybindings",
@@ -2424,7 +2426,7 @@ func (s *session) helpText() string {
 		"  /vision           configure vision models & handoff target",
 		"  /remember         save a memory note",
 		"  /memory · /forget list / forget memories",
-		"  /plugin-install   install a plugin from a directory",
+		"  /plugin-install   install from a directory or GitHub Release URL",
 		"  /plugin-config    enable / disable plugins",
 		"  /plugin-remove    uninstall a plugin",
 		"  /goal             goal mode — plan & deploy subagents (modal)",

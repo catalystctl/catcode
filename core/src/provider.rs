@@ -1507,6 +1507,12 @@ async fn discover_models_openai(
                     } else {
                         parse_openai_models_list(&v)
                     };
+                    // Enrich with models.dev caps (context/output/reasoning/vision)
+                    // for models the curated table left at generic defaults.
+                    let mut listed = listed;
+                    if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
+                        crate::models_dev::enrich_models(&mut listed, &dev, &provider.base_url);
+                    }
                     if !listed.is_empty() {
                         write_models_cache(cache_key, &listed);
                         return listed;
@@ -1539,7 +1545,7 @@ const MODELS_CACHE_TTL: u64 = 28800;
 // v7: xAI models parse live `context_length` / vision from `/models` +
 // `/language-models` (previously hardcoded wrong windows for Grok).
 // v8: Antigravity Gemini 3 + Claude-via-Antigravity catalog.
-const MODELS_CACHE_VERSION: u64 = 8;
+const MODELS_CACHE_VERSION: u64 = 9;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -4161,7 +4167,11 @@ fn hmac_sha256_hex(key: &[u8], payload: &[u8]) -> String {
     let mut outer = Sha256::new();
     outer.update(opad);
     outer.update(inner.finalize());
-    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// iFlow chat requests require per-request HMAC headers (session-id,
@@ -5173,12 +5183,17 @@ async fn discover_models_anthropic(
     for (k, v) in &provider.headers {
         req = req.header(k, v);
     }
-    let live = match req.send().await {
+    let mut live = match req.send().await {
         Ok(r) if r.status().is_success() => {
             parse_anthropic_models(&r.json::<Value>().await.unwrap_or_else(|_| json!({})))
         }
         _ => read_models_cache_stale(cache_key).unwrap_or_else(anthropic_fallback_models),
     };
+    // Enrich with models.dev caps for models the curated table left at
+    // generic defaults (relevant for Anthropic-compatible gateways).
+    if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
+        crate::models_dev::enrich_models(&mut live, &dev, &provider.base_url);
+    }
     write_models_cache(cache_key, &live);
     live
 }

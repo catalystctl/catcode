@@ -1,35 +1,64 @@
-// web_search tool: scrape DuckDuckGo Lite (https://lite.duckduckgo.com/lite/).
+// web_search tool: scrape HTML search backends with no API key and no JS.
 //
-// NO API KEY, NO JavaScript, NO new crate deps. DDG Lite returns a tiny,
-// JS-free HTML page whose results are simple <a class="result-link"> links
-// plus <td class="result-snippet"> snippets. We parse those with the `regex`
-// crate the core already depends on, decode DDG's `uddg=` redirect URLs by
-// hand (no percent-encoding crate), and reuse fetch_tool's HTML-to-text +
-// egress helpers so the security model stays identical to the fetch tool
-// (honors --no-network and fetch_allowlist).
+// Primary → fallback chain (same security model as fetch — honors
+// --no-network / fetch_allowlist, reuses html_to_text + egress helpers):
+//   1. DuckDuckGo Lite  (https://lite.duckduckgo.com/lite/)
+//   2. DuckDuckGo HTML  (https://html.duckduckgo.com/html/)
+//   3. Mojeek           (https://www.mojeek.com/search)
 //
-// This is best-effort scraping, not an SLA: DDG may rate-limit / serve a
-// captcha page under burst traffic, and the markup may drift. The extractor is
-// defensive — if the structured parse finds nothing it falls back to scraping
-// any result-looking <a> hrefs, and an empty/captcha page is surfaced as a
-// clear error rather than a silent "no results".
+// NO API KEY, NO JavaScript, NO new crate deps. Each backend returns a
+// JS-free HTML page we parse with the `regex` crate the core already
+// depends on. DDG wraps destinations in `uddg=` redirects which we decode
+// by hand (no percent-encoding crate).
+//
+// This is best-effort scraping, not an SLA: backends may rate-limit / serve
+// a captcha under burst traffic, and markup may drift. On block/HTTP failure
+// / empty parse we try the next backend. Only if every backend fails do we
+// surface an aggregated error; a successful empty SERP reports "no results".
 use crate::config::Config;
 use crate::fetch_tool::{egress_check, html_to_text};
 use crate::tools::{smart_truncate, Outcome};
 use regex::Regex;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::sync::LazyLock;
 
-/// Hoisted (compiled once at first use) instead of recompiled on every
-/// web_search call. DDG Lite markup is stable enough that these don't change
-/// at runtime, and web_search may run several times in a session.
-static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+// ---- shared regexes (compiled once) ----
+
+/// DDG Lite: `<a class="result-link" href="...">title</a>`
+static DDG_LITE_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<a\s+class="result-link"\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
 });
-static SNIP_RE: LazyLock<Regex> =
+/// DDG Lite: `<td class="result-snippet">...</td>`
+static DDG_LITE_SNIP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"class="result-snippet"[^>]*>([\s\S]*?)</td>"#).unwrap());
+/// Loose fallback for any `<a href>` when structured classes drift.
 static ANY_LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap());
+
+/// DDG HTML: `<a class="result__a" href="...">title</a>` (class order may vary).
+static DDG_HTML_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)
+        .unwrap()
+});
+/// Alternate attribute order: href before class.
+static DDG_HTML_LINK_RE_ALT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>([\s\S]*?)</a>"#)
+        .unwrap()
+});
+/// DDG HTML snippets.
+static DDG_HTML_SNIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)</(?:a|td|span|div)>"#).unwrap()
+});
+
+/// Mojeek: `<a class="title" title="url" href="url">Title</a>`
+static MOJEEK_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a\s+class="title"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
+});
+/// Mojeek snippet: `<p class="s">...</p>` (paired by index with titles).
+static MOJEEK_SNIP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<p\s+class="s">([\s\S]*?)</p>"#).unwrap());
 
 /// Percent-decode a query-string value (no `percent-encoding` crate dep).
 /// Handles `%XX` hex escapes and `+`→space. Malformed `%` sequences are passed
@@ -65,12 +94,11 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// DDG Lite wraps each result's destination in a redirect like
+/// DDG wraps each result's destination in a redirect like
 /// `//duckduckgo.com/l/?uddg=<encoded>&rut=...`. Extract and decode the real
 /// URL. For direct hrefs (no `uddg=`), return the href unchanged (protocol-less
 /// `//host/...` is upgraded to `https://`).
 fn unwrap_ddg_url(href: &str) -> String {
-    // protocol-relative -> https
     let href = if let Some(rest) = href.strip_prefix("//") {
         format!("https://{rest}")
     } else {
@@ -93,10 +121,51 @@ fn cell_text(s: &str) -> String {
 }
 
 /// A single search hit.
+#[derive(Clone, Debug)]
 struct Hit {
     title: String,
     url: String,
     snippet: String,
+}
+
+/// Which backend produced the hits (shown in the tool output header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    DdgLite,
+    DdgHtml,
+    Mojeek,
+}
+
+impl Backend {
+    fn label(self) -> &'static str {
+        match self {
+            Backend::DdgLite => "DuckDuckGo Lite",
+            Backend::DdgHtml => "DuckDuckGo HTML",
+            Backend::Mojeek => "Mojeek",
+        }
+    }
+}
+
+/// Outcome of one backend attempt.
+enum Attempt {
+    /// Parsed ≥1 hit — stop the chain.
+    Hits(Vec<Hit>),
+    /// Page looked like a real SERP but had zero results — stop the chain
+    /// (don't keep searching; the query genuinely has nothing).
+    Empty,
+    /// Blocked / HTTP error / markup drift — try the next backend.
+    Fail(String),
+}
+
+/// Shared captcha / anomaly heuristics used by both DDG backends.
+fn looks_blocked(html: &str) -> bool {
+    let low = html.to_ascii_lowercase();
+    low.contains("captcha")
+        || low.contains("unusual traffic")
+        || low.contains("are you a robot")
+        || low.contains("bots use duckduckgo")
+        || low.contains("anomaly-modal")
+        || low.contains("please complete the following challenge")
 }
 
 /// Parse DDG Lite HTML into ordered hits. Returns up to `limit` results.
@@ -104,7 +173,7 @@ struct Hit {
 /// nothing (markup drift / captcha), falls back to scraping any `<a href>`
 /// whose href looks like a real external result.
 fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
-    let titles_urls: Vec<(String, String)> = LINK_RE
+    let titles_urls: Vec<(String, String)> = DDG_LITE_LINK_RE
         .captures_iter(html)
         .map(|c| {
             let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -113,7 +182,7 @@ fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
         })
         .filter(|(t, u)| !t.is_empty() && !u.is_empty())
         .collect();
-    let snippets: Vec<String> = SNIP_RE
+    let snippets: Vec<String> = DDG_LITE_SNIP_RE
         .captures_iter(html)
         .map(|c| cell_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
         .collect();
@@ -156,6 +225,191 @@ fn parse_ddg_lite(html: &str, limit: usize) -> Vec<Hit> {
     hits
 }
 
+/// Parse DDG HTML (`html.duckduckgo.com/html/`) results: `result__a` +
+/// `result__snippet`. Same `uddg=` unwrap as Lite.
+fn parse_ddg_html(html: &str, limit: usize) -> Vec<Hit> {
+    let mut titles_urls: Vec<(String, String)> = DDG_HTML_LINK_RE
+        .captures_iter(html)
+        .map(|c| {
+            let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = c.get(2).map(|m| m.as_str()).unwrap_or("");
+            (cell_text(title), unwrap_ddg_url(href))
+        })
+        .filter(|(t, u)| !t.is_empty() && !u.is_empty())
+        .collect();
+    if titles_urls.is_empty() {
+        titles_urls = DDG_HTML_LINK_RE_ALT
+            .captures_iter(html)
+            .map(|c| {
+                let href = c.get(1).map(|m| m.as_str()).unwrap_or("");
+                let title = c.get(2).map(|m| m.as_str()).unwrap_or("");
+                (cell_text(title), unwrap_ddg_url(href))
+            })
+            .filter(|(t, u)| !t.is_empty() && !u.is_empty())
+            .collect();
+    }
+    let snippets: Vec<String> = DDG_HTML_SNIP_RE
+        .captures_iter(html)
+        .map(|c| cell_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
+        .collect();
+
+    titles_urls
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, (t, u))| Hit {
+            title: t.clone(),
+            url: u.clone(),
+            snippet: snippets.get(i).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Parse Mojeek SERP: `a.title` + paired `p.s` snippets. Hrefs are direct
+/// (no redirect wrapper).
+fn parse_mojeek(html: &str, limit: usize) -> Vec<Hit> {
+    let titles_urls: Vec<(String, String)> = MOJEEK_TITLE_RE
+        .captures_iter(html)
+        .map(|c| {
+            let href = c.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let title = cell_text(c.get(2).map(|m| m.as_str()).unwrap_or(""));
+            (title, href)
+        })
+        .filter(|(t, u)| !t.is_empty() && u.starts_with("http"))
+        .collect();
+    let snippets: Vec<String> = MOJEEK_SNIP_RE
+        .captures_iter(html)
+        .map(|c| cell_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
+        .collect();
+
+    titles_urls
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, (t, u))| Hit {
+            title: t.clone(),
+            url: u.clone(),
+            snippet: snippets.get(i).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Classify a fetched body for a given backend into Hits / Empty / Fail.
+fn classify_response(
+    backend: Backend,
+    status: reqwest::StatusCode,
+    html: &str,
+    body_len: usize,
+    truncated: bool,
+    limit: usize,
+) -> Attempt {
+    let trunc = if truncated { " [body truncated]" } else { "" };
+    if !status.is_success() {
+        return Attempt::Fail(format!("{} returned HTTP {status}{trunc}", backend.label()));
+    }
+
+    if looks_blocked(html) {
+        return Attempt::Fail(format!(
+            "{} served a captcha/anomaly page (likely rate-limited){trunc}",
+            backend.label()
+        ));
+    }
+
+    let low = html.to_ascii_lowercase();
+    let has_markers = match backend {
+        Backend::DdgLite => low.contains("result-link") || low.contains("result-snippet"),
+        Backend::DdgHtml => {
+            low.contains("result__a")
+                || low.contains("result__snippet")
+                || low.contains("web-result")
+        }
+        Backend::Mojeek => low.contains("class=\"title\"") || low.contains("class=\"s\""),
+    };
+
+    // Small page with no result markers → block / markup drift, not "no hits".
+    if !has_markers && body_len < 8 * 1024 {
+        return Attempt::Fail(format!(
+            "{} returned an unexpected page with no result markers (markup drift or a block){trunc}",
+            backend.label()
+        ));
+    }
+
+    let hits = match backend {
+        Backend::DdgLite => parse_ddg_lite(html, limit),
+        Backend::DdgHtml => parse_ddg_html(html, limit),
+        Backend::Mojeek => parse_mojeek(html, limit),
+    };
+
+    if hits.is_empty() {
+        // Markers present (or large page) but nothing parsed: treat as empty
+        // SERP when markers exist; otherwise as a soft fail so the chain continues.
+        if has_markers {
+            Attempt::Empty
+        } else {
+            Attempt::Fail(format!(
+                "{} returned a page that parsed to zero results{trunc}",
+                backend.label()
+            ))
+        }
+    } else {
+        Attempt::Hits(hits)
+    }
+}
+
+/// GET `url`, stream up to `byte_limit` bytes, return (status, body, truncated).
+async fn fetch_html(
+    client: &reqwest::Client,
+    url: &str,
+    byte_limit: usize,
+) -> Result<(reqwest::StatusCode, String, bool), String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    use futures_util::StreamExt;
+    let mut collected: Vec<u8> = Vec::with_capacity(byte_limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("failed to read body: {e}"))?;
+        let room = byte_limit - collected.len();
+        if chunk.len() <= room {
+            collected.extend_from_slice(&chunk);
+        } else {
+            collected.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+    }
+    let html = String::from_utf8_lossy(&collected).into_owned();
+    Ok((status, html, truncated))
+}
+
+fn render_hits(query: &str, backend: Backend, hits: &[Hit]) -> Outcome {
+    let mut text = format!(
+        "Search: {query}  ({}, {} hit(s))\n\n",
+        backend.label(),
+        hits.len()
+    );
+    for (i, h) in hits.iter().enumerate() {
+        text.push_str(&format!(
+            "{}. {}\n   {}\n   {}\n\n",
+            i + 1,
+            h.title,
+            h.url,
+            h.snippet
+        ));
+    }
+
+    const OUT_CAP: usize = 65_536;
+    if text.len() > OUT_CAP {
+        text = smart_truncate(&text, OUT_CAP);
+    }
+    Outcome::ok(text)
+}
+
 pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     if query.trim().is_empty() {
@@ -172,12 +426,27 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("us-en");
 
-    // DDG Lite accepts GET ?q=&kl= and returns a minimal HTML page.
     let q = form_urlencode(query);
-    let url = format!("https://lite.duckduckgo.com/lite/?q={q}&kl={region}");
+    // Ordered fallback chain. Region (`kl=`) only applies to DDG backends.
+    let backends: [(Backend, String); 3] = [
+        (
+            Backend::DdgLite,
+            format!("https://lite.duckduckgo.com/lite/?q={q}&kl={region}"),
+        ),
+        (
+            Backend::DdgHtml,
+            format!("https://html.duckduckgo.com/html/?q={q}&kl={region}"),
+        ),
+        (
+            Backend::Mojeek,
+            format!("https://www.mojeek.com/search?q={q}"),
+        ),
+    ];
 
-    // Honor the same egress rules as fetch (no_network / fetch_allowlist).
-    if let Some(err) = egress_check("web_search", &url, cfg) {
+    // Pre-check egress on the first URL so --no-network fails fast with the
+    // same message as before. Per-backend checks still run below so a narrow
+    // allowlist can permit DDG but deny Mojeek (or vice versa).
+    if let Some(err) = egress_check("web_search", &backends[0].1, cfg) {
         return Outcome::err(err);
     }
 
@@ -189,7 +458,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         .redirect(crate::fetch_tool::allowlist_redirect_policy(
             cfg.fetch_allowlist.clone(),
         ))
-        // DDG blocks obvious bot user-agents; use a plain browser UA.
+        // Search engines block obvious bot UAs; use a plain browser UA.
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
         .build()
     {
@@ -197,103 +466,46 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         Err(e) => return Outcome::err(format!("web_search: failed to build HTTP client: {e}")),
     };
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => return Outcome::err(format!("web_search: request failed: {e}")),
-    };
-    let status = resp.status();
-    // Stream the body, bounded so a runaway response can't OOM the agent.
-    let limit = cfg.fetch_max_bytes.max(64 * 1024);
-    use futures_util::StreamExt;
-    let mut collected: Vec<u8> = Vec::with_capacity(limit.min(64 * 1024));
-    let mut truncated = false;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => return Outcome::err(format!("web_search: failed to read body: {e}")),
+    let byte_limit = cfg.fetch_max_bytes.max(64 * 1024);
+    let mut failures: Vec<String> = Vec::new();
+
+    for (backend, url) in &backends {
+        if let Some(err) = egress_check("web_search", url, cfg) {
+            failures.push(format!("{}: skipped ({err})", backend.label()));
+            continue;
+        }
+
+        let (status, html, truncated) = match fetch_html(&client, url, byte_limit).await {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("{}: {e}", backend.label()));
+                continue;
+            }
         };
-        let room = limit - collected.len();
-        if chunk.len() <= room {
-            collected.extend_from_slice(&chunk);
-        } else {
-            collected.extend_from_slice(&chunk[..room]);
-            truncated = true;
-            break;
+
+        match classify_response(*backend, status, &html, html.len(), truncated, count) {
+            Attempt::Hits(hits) => return render_hits(query, *backend, &hits),
+            Attempt::Empty => {
+                return Outcome::ok(format!(
+                    "No results found for {query:?} on {}.{}",
+                    backend.label(),
+                    if truncated {
+                        " [page body was truncated; refine the query]"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            Attempt::Fail(reason) => {
+                failures.push(reason);
+            }
         }
     }
 
-    let html = String::from_utf8_lossy(&collected);
-    if !status.is_success() {
-        return Outcome::err(format!(
-            "web_search: DuckDuckGo returned HTTP {status}; query was {query:?}"
-        ));
-    }
-
-    // Detect a captcha / anomaly page. DDG Lite's real results page always
-    // contains at least one `result-link` or `result-snippet` class. If neither
-    // appears AND the body is small, treat it as a block rather than "no hits".
-    let low = html.to_ascii_lowercase();
-    let looks_captcha = low.contains("captcha")
-        || low.contains("unusual traffic")
-        || low.contains("are you a robot");
-    let has_result_classes = low.contains("result-link") || low.contains("result-snippet");
-    if looks_captcha || (!has_result_classes && collected.len() < 8 * 1024) {
-        let reason = if looks_captcha {
-            "DuckDuckGo served a captcha/anomaly page (likely rate-limited)"
-        } else {
-            "DuckDuckGo returned an unexpected page with no result markers (markup drift or a block)"
-        };
-        return Outcome::err(format!(
-            "web_search: {reason}; retry later or use the `fetch` tool against a specific URL. query was {query:?}{}",
-            if truncated { " [body truncated]" } else { "" }
-        ));
-    }
-
-    let hits = parse_ddg_lite(&html, count);
-    if hits.is_empty() {
-        return Outcome::ok(format!(
-            "No results found for {query:?} on DuckDuckGo Lite.{}",
-            if truncated {
-                " [page body was truncated; refine the query]"
-            } else {
-                ""
-            }
-        ));
-    }
-
-    // Render as a numbered list for the model; include a compact JSON array too
-    // so callers that want structured data can parse it.
-    let mut text = format!(
-        "Search: {query}  (DuckDuckGo Lite, {} hit(s))\n\n",
-        hits.len()
-    );
-    let mut arr: Vec<Value> = Vec::new();
-    for (i, h) in hits.iter().enumerate() {
-        text.push_str(&format!(
-            "{}. {}\n   {}\n   {}\n\n",
-            i + 1,
-            h.title,
-            h.url,
-            h.snippet
-        ));
-        arr.push(json!({
-            "title": h.title,
-            "url": h.url,
-            "snippet": h.snippet,
-        }));
-    }
-    text.push_str("---\njson: ");
-    let json_compact = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
-    text.push_str(&json_compact);
-    text.push('\n');
-
-    // Cap the final text so a big result page can't blow context.
-    const OUT_CAP: usize = 65_536;
-    if text.len() > OUT_CAP {
-        text = smart_truncate(&text, OUT_CAP);
-    }
-    Outcome::ok(text)
+    Outcome::err(format!(
+        "web_search: all backends failed; retry later or use the `fetch` tool against a specific URL. query was {query:?}. attempts: {}",
+        failures.join(" | ")
+    ))
 }
 
 /// Minimal application/x-www-form-urlencoded encoder for the query string
@@ -362,6 +574,24 @@ mod tests {
 </table>
 </body></html>"#;
 
+    const SAMPLE_DDG_HTML: &str = r#"<html><body>
+<div id="links">
+<div class="result results_links web-result">
+  <h2 class="result__title"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F&rut=abc">The Rust Programming Language</a></h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F">A language empowering everyone to build reliable &amp; efficient software.</a>
+</div>
+<div class="result results_links web-result">
+  <h2 class="result__title"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&rut=def">std - Rust</a></h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F">API documentation for the Rust standard library.</a>
+</div>
+</div>
+</body></html>"#;
+
+    const SAMPLE_MOJEEK: &str = r#"<html><body><ul>
+<!--rs--><li class="r1"><a title="https://rust-lang.org/" href="https://rust-lang.org/" class="ob"><p class="i"><span class="url">https://rust-lang.org/</span></p></a><h2><a class="title" title="https://rust-lang.org/" href="https://rust-lang.org/">Rust Programming Language</a></h2><p class="s"><strong>Rust</strong> is blazingly fast and memory-efficient.</p></li><!--re-->
+<!--rs--><li class="r2"><a title="https://doc.rust-lang.org/book/" href="https://doc.rust-lang.org/book/" class="ob"></a><h2><a class="title" title="https://doc.rust-lang.org/book/" href="https://doc.rust-lang.org/book/">The Rust Programming Language</a></h2><p class="s">The HTML format is available online.</p></li><!--re-->
+</ul></body></html>"#;
+
     #[test]
     fn parse_ddg_lite_structured() {
         let hits = parse_ddg_lite(SAMPLE_DDG_LITE, 10);
@@ -390,6 +620,99 @@ mod tests {
         assert_eq!(hits[0].title, "First");
         // snippet empty in fallback
         assert!(hits[0].snippet.is_empty());
+    }
+
+    #[test]
+    fn parse_ddg_html_structured() {
+        let hits = parse_ddg_html(SAMPLE_DDG_HTML, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "The Rust Programming Language");
+        assert_eq!(hits[0].url, "https://www.rust-lang.org/");
+        assert!(hits[0].snippet.contains("reliable & efficient"));
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/std/");
+    }
+
+    #[test]
+    fn parse_ddg_html_href_before_class() {
+        let html = r##"<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=x" class="result__a">Example</a>
+<a class="result__snippet" href="#">An example site.</a>"##;
+        let hits = parse_ddg_html(html, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/");
+        assert_eq!(hits[0].title, "Example");
+    }
+
+    #[test]
+    fn parse_mojeek_structured() {
+        let hits = parse_mojeek(SAMPLE_MOJEEK, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust Programming Language");
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        assert!(hits[0].snippet.contains("blazingly fast"));
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/book/");
+    }
+
+    #[test]
+    fn classify_captcha_is_fail() {
+        let html = "<html><body>please solve the captcha to continue</body></html>";
+        match classify_response(
+            Backend::DdgLite,
+            reqwest::StatusCode::OK,
+            html,
+            html.len(),
+            false,
+            8,
+        ) {
+            Attempt::Fail(r) => assert!(r.contains("captcha") || r.contains("anomaly")),
+            _ => panic!("expected Fail"),
+        }
+    }
+
+    #[test]
+    fn classify_ddg_html_hits() {
+        match classify_response(
+            Backend::DdgHtml,
+            reqwest::StatusCode::OK,
+            SAMPLE_DDG_HTML,
+            SAMPLE_DDG_HTML.len(),
+            false,
+            8,
+        ) {
+            Attempt::Hits(h) => assert_eq!(h.len(), 2),
+            _ => panic!("expected Hits"),
+        }
+    }
+
+    #[test]
+    fn classify_mojeek_hits() {
+        match classify_response(
+            Backend::Mojeek,
+            reqwest::StatusCode::OK,
+            SAMPLE_MOJEEK,
+            SAMPLE_MOJEEK.len(),
+            false,
+            8,
+        ) {
+            Attempt::Hits(h) => assert_eq!(h.len(), 2),
+            _ => panic!("expected Hits"),
+        }
+    }
+
+    #[test]
+    fn classify_anomaly_modal_is_fail() {
+        let html =
+            r#"<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>"#;
+        match classify_response(
+            Backend::DdgHtml,
+            reqwest::StatusCode::OK,
+            html,
+            html.len(),
+            false,
+            8,
+        ) {
+            Attempt::Fail(r) => assert!(r.contains("captcha") || r.contains("anomaly")),
+            _ => panic!("expected Fail"),
+        }
     }
 
     // ---- HTTP integration against a one-shot mock server ----
@@ -445,6 +768,7 @@ mod tests {
         assert!(low.contains("captcha"));
         let has_result_classes = low.contains("result-link") || low.contains("result-snippet");
         assert!(!has_result_classes);
+        assert!(looks_blocked(html));
     }
 
     #[test]
@@ -468,5 +792,18 @@ mod tests {
         let out = rt.block_on(execute_web_search(&json!({ "query": "rust lang" }), &cfg));
         assert!(!out.ok);
         assert!(out.output.contains("--no-network"));
+    }
+
+    #[test]
+    fn render_hits_names_backend() {
+        let hits = vec![Hit {
+            title: "T".into(),
+            url: "https://example.com/".into(),
+            snippet: "S".into(),
+        }];
+        let out = render_hits("q", Backend::Mojeek, &hits);
+        assert!(out.ok);
+        assert!(out.output.contains("Mojeek"));
+        assert!(out.output.contains("https://example.com/"));
     }
 }

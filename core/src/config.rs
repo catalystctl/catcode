@@ -2080,6 +2080,10 @@ mod tests {
 
     #[test]
     fn resolve_provider_legacy_default_when_none_configured() {
+        // Isolate from the developer's shell: legacy_default reads UMANS_API_KEY.
+        let saved = std::env::var("UMANS_API_KEY").ok();
+        std::env::remove_var("UMANS_API_KEY");
+
         let c = Config {
             base_url: "https://example.test/v1".into(),
             ..Default::default()
@@ -2090,6 +2094,11 @@ mod tests {
         assert!(r.kind.is_openai());
         assert_eq!(r.base_url, "https://example.test/v1");
         assert!(r.api_key.is_none());
+
+        match saved {
+            Some(v) => std::env::set_var("UMANS_API_KEY", v),
+            None => std::env::remove_var("UMANS_API_KEY"),
+        }
     }
 
     #[test]
