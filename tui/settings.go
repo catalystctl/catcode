@@ -19,9 +19,9 @@ import (
 // ---------------------------------------------------------------------------
 
 type settingsStore struct {
-	path            string
-	APIKey          string `json:"api_key,omitempty"`
-	SelectedModel   string `json:"model,omitempty"`
+	path          string
+	APIKey        string `json:"api_key,omitempty"`
+	SelectedModel string `json:"model,omitempty"`
 	// Approval is intentionally NOT omitempty — an empty value must not drop the
 	// key on save (that looked like a "settings reset" after restart).
 	Approval        string `json:"approval"`

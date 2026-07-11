@@ -101,9 +101,7 @@ pub fn build_system_prompt(
         prompt.push_str(&git_context_injection(&git));
     }
     let mem = match memory_provider {
-        Some(cfg) => {
-            plugins::memory_provider_inject(cfg, &workspace.display().to_string(), "")
-        }
+        Some(cfg) => plugins::memory_provider_inject(cfg, &workspace.display().to_string(), ""),
         None => memory_injection(workspace, ""),
     };
     if !mem.is_empty() {
@@ -3055,12 +3053,13 @@ async fn main() {
                             Err(r.output)
                         }
                     } else {
-                        memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "")
-                            .map(|p| {
+                        memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "").map(
+                            |p| {
                                 p.file_stem()
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_default()
-                            })
+                            },
+                        )
                     };
                     match save_result {
                         Ok(id) => {
@@ -3097,10 +3096,10 @@ async fn main() {
                     } else if r.ok {
                         Vec::new()
                     } else {
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!(format!("list_memory failed: {}", r.output))),
-                        );
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!("list_memory failed: {}", r.output)),
+                        ));
                         Vec::new()
                     }
                 } else {
@@ -5859,9 +5858,7 @@ async fn flush_pending_bash(st: &Arc<State>) {
 async fn handle_user_bash(st: &Arc<State>, command: String, exclude_from_context: bool) {
     let command = command.trim().to_string();
     if command.is_empty() {
-        emit(
-            &Event::new("error").with("message", json!("empty bash command")),
-        );
+        emit(&Event::new("error").with("message", json!("empty bash command")));
         return;
     }
 
@@ -5877,13 +5874,8 @@ async fn handle_user_bash(st: &Arc<State>, command: String, exclude_from_context
         if needs_prompt {
             match request_sudo(st, &command, &cancel).await {
                 SudoResult::Approved { password } => {
-                    tools::execute_bash(
-                        &command,
-                        &cfg,
-                        None,
-                        tools::SudoAuth::Password(password),
-                    )
-                    .await
+                    tools::execute_bash(&command, &cfg, None, tools::SudoAuth::Password(password))
+                        .await
                 }
                 SudoResult::Declined => {
                     emit(
@@ -6380,9 +6372,7 @@ async fn refresh_memory_injection(state: &State) -> String {
     };
     let mp = state.plugin_manager.memory_provider();
     let mem = match mp.as_ref() {
-        Some(cfg) => {
-            plugins::memory_provider_inject(cfg, &ws.display().to_string(), "")
-        }
+        Some(cfg) => plugins::memory_provider_inject(cfg, &ws.display().to_string(), ""),
         None => memory_injection(&ws, ""),
     };
     let new_system = build_main_system_prompt(&ws, &state.plugin_manager, auto_reflect);

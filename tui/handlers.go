@@ -1589,9 +1589,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	if cmd, exclude, ok := parseBangCommand(text); ok {
 		s.pushHistory(text)
 		s.sendCore(map[string]any{
-			"type":                  "user_bash",
-			"command":               cmd,
-			"exclude_from_context":  exclude,
+			"type":                 "user_bash",
+			"command":              cmd,
+			"exclude_from_context": exclude,
 		})
 		return nil
 	}
@@ -2271,8 +2271,10 @@ func isBangCommand(text string) bool {
 }
 
 // parseBangCommand extracts a PI-compatible bang bash command.
-//   !cmd  → command, excludeFromContext=false
-//   !!cmd → command, excludeFromContext=true
+//
+//	!cmd  → command, excludeFromContext=false
+//	!!cmd → command, excludeFromContext=true
+//
 // Returns ok=false when the text is not a bang command or the command is empty
 // (so bare `!` falls through as a normal prompt, matching PI).
 func parseBangCommand(text string) (command string, excludeFromContext bool, ok bool) {

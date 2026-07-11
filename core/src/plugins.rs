@@ -1255,12 +1255,9 @@ impl PluginManager {
     /// Resolve the on-disk directory for a given install scope.
     pub fn install_dir_for(&self, scope: PluginInstallScope) -> Result<PathBuf, String> {
         match scope {
-            PluginInstallScope::Global => self
-                .user_plugins_dir
-                .clone()
-                .ok_or_else(|| {
-                    "global plugin install unavailable (no ~/.catalyst-code/plugins)".into()
-                }),
+            PluginInstallScope::Global => self.user_plugins_dir.clone().ok_or_else(|| {
+                "global plugin install unavailable (no ~/.catalyst-code/plugins)".into()
+            }),
             // `plugins_dir` is absolute (resolved against workspace at construct).
             PluginInstallScope::Workspace => Ok(self.plugins_dir.clone()),
         }
@@ -3415,10 +3412,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
                     #[cfg(unix)]
                     {
                         if let Err(e) = std::os::unix::fs::symlink(&target, &dst_path) {
-                            eprintln!(
-                                "[plugins] skip symlink {:?} -> {:?}: {e}",
-                                src_path, target
-                            );
+                            eprintln!("[plugins] skip symlink {:?} -> {:?}: {e}", src_path, target);
                         }
                     }
                     #[cfg(not(unix))]
@@ -3428,10 +3422,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
                         if resolved.is_file() {
                             let _ = std::fs::copy(&resolved, &dst_path);
                         } else {
-                            eprintln!(
-                                "[plugins] skip symlink {:?} (non-unix)",
-                                src_path
-                            );
+                            eprintln!("[plugins] skip symlink {:?} (non-unix)", src_path);
                         }
                     }
                 }
@@ -3779,7 +3770,9 @@ mod tests {
             r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
         );
 
-        let installed = mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        let installed = mgr
+            .install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
         assert_eq!(installed.name, "fresh");
         assert_eq!(installed.version, "2.0.0");
 
@@ -3820,9 +3813,7 @@ mod tests {
             r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
         );
 
-        let global = mgr
-            .install(&src.path, PluginInstallScope::Global)
-            .unwrap();
+        let global = mgr.install(&src.path, PluginInstallScope::Global).unwrap();
         assert_eq!(global.name, "scoped");
         assert!(global_plugins.join("scoped/plugin.json").exists());
         assert!(!project_plugins.join("scoped").exists());
@@ -3868,11 +3859,7 @@ mod tests {
         fs::create_dir_all(ws.join(".catalyst-code/plugins")).unwrap();
 
         // Relative plugins_dir must not depend on process cwd.
-        let mgr = PluginManager::new(
-            PathBuf::from(".catalyst-code/plugins"),
-            ws.clone(),
-            false,
-        );
+        let mgr = PluginManager::new(PathBuf::from(".catalyst-code/plugins"), ws.clone(), false);
 
         let src = TmpDir::new("rel_src");
         fs::create_dir_all(src.path.join("hooks")).unwrap();
@@ -3884,7 +3871,8 @@ mod tests {
             r#"{"post_write": {"script": "hooks/hook.sh"}}"#,
         );
 
-        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        mgr.install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
         assert!(ws
             .join(".catalyst-code/plugins/relplug/plugin.json")
             .exists());
@@ -3894,11 +3882,7 @@ mod tests {
             .exists());
 
         // Simulate restart: new manager, trust still off.
-        let mgr2 = PluginManager::new(
-            PathBuf::from(".catalyst-code/plugins"),
-            ws,
-            false,
-        );
+        let mgr2 = PluginManager::new(PathBuf::from(".catalyst-code/plugins"), ws, false);
         assert!(
             mgr2.list().contains_key("relplug"),
             "workspace user-install must survive restart without trust"
@@ -3944,7 +3928,9 @@ mod tests {
         fs::create_dir_all(src.path.join(".git")).unwrap();
         fs::write(src.path.join(".git/config"), "x").unwrap();
 
-        let installed = mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        let installed = mgr
+            .install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
         assert_eq!(installed.name, "clean");
         let dest = tmp.path.join("managed/clean");
         assert!(dest.join("plugin.json").exists());
@@ -3952,7 +3938,10 @@ mod tests {
             !dest.join(".venv").exists(),
             ".venv must be skipped on install"
         );
-        assert!(!dest.join(".git").exists(), ".git must be skipped on install");
+        assert!(
+            !dest.join(".git").exists(),
+            ".git must be skipped on install"
+        );
     }
 
     #[test]
@@ -3974,7 +3963,8 @@ mod tests {
             r#"{"pre_read": {"script": "hooks/h.sh"}}"#,
         );
 
-        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        mgr.install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
         let result = mgr.install(&src.path, PluginInstallScope::Workspace);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already installed"));
@@ -4155,7 +4145,8 @@ mod tests {
             r#"{"pre_write": {"script": "hooks/h.sh"}}"#,
         );
 
-        mgr.install(&src.path, PluginInstallScope::Workspace).unwrap();
+        mgr.install(&src.path, PluginInstallScope::Workspace)
+            .unwrap();
 
         // Initially enabled.
         assert!(mgr.get_plugin("toggle-me").unwrap().enabled);
