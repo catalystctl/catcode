@@ -97,17 +97,30 @@ function Detect-Runtime {
 }
 
 # --- resolve release version + base URL ------------------------------------
+# Strip a leading "v" from a tag for the version string used in asset names.
+# Unlike Substring(1), this leaves commit-SHA tags (e.g. "1c08256") intact.
+function Get-VerFromTag {
+    param([string]$Tag)
+    if ($Tag.StartsWith('v') -or $Tag.StartsWith('V')) { return $Tag.Substring(1) }
+    return $Tag
+}
+
 function Resolve-Release {
     if ($Version) {
+        # Accept "0.2.0" (-> v0.2.0 semver tag), "v0.2.0" (as-is), or a commit
+        # SHA like "1c08256" (as-is — SHA tags have no leading v). Only prepend v
+        # for bare semver (digits.digits), never for hex SHAs.
         $script:Tag = $Version
-        if (-not $script:Tag.StartsWith('v')) { $script:Tag = "v$($script:Tag)" }
-        $script:Ver = $script:Tag.Substring(1)
+        if ($script:Tag -match '^[0-9]+\.[0-9]+' -and -not $script:Tag.StartsWith('v')) {
+            $script:Tag = "v$($script:Tag)"
+        }
+        $script:Ver = Get-VerFromTag $script:Tag
     } else {
         $api = "https://api.github.com/repos/$Repo/releases/latest"
         try {
             $rel = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'catcode-installer' } -ErrorAction Stop
             $script:Tag = $rel.tag_name
-            $script:Ver = $script:Tag.Substring(1)
+            $script:Ver = Get-VerFromTag $script:Tag
         } catch {
             Die "could not resolve the latest release from $api. The repo may be private or rate-limited. Pass -Version <v> or -BaseUrl <url>."
         }
