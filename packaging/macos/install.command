@@ -31,6 +31,6 @@ echo
 echo "Done. Open a NEW terminal window (so PATH reloads) and run:"
 echo "    catcode"
 echo
-echo "First run inside catcode:  /key sk-...   then /model, then type a prompt."
+echo "First run inside catcode:  /login   then /model, then type a prompt."
 echo "The workspace is the directory you launch catcode from."
 echo "Tip: the agent's bash tool needs bash on PATH (present by default on macOS)."

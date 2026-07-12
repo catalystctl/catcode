@@ -35,6 +35,7 @@ export interface ProviderPreset {
   hasKey: boolean;
   configured: boolean;
   loggedIn: boolean;
+  supportsOauth?: boolean;
 }
 
 export interface ReadyPayload {
@@ -441,6 +442,7 @@ export type CoreCommand =
   | { type: "set_provider"; name: string }
   | { type: "list_provider_presets" }
   | { type: "login"; preset: string; api_key?: string }
+  | { type: "login_oauth"; preset: string }
   | { type: "logout"; provider: string }
   | { type: "oauth_code"; code: string }
   | { type: "list_sessions" }

@@ -59,5 +59,5 @@ Write-Host ""
 Write-Host "Done. Open a NEW PowerShell window (so PATH reloads) and run:" -ForegroundColor Green
 Write-Host "    catcode" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "First run inside catcode:  /key sk-...   then pick a model with /model"
+Write-Host "First run inside catcode:  /login   then pick a model with /model"
 Write-Host "Tip: the agent's bash tool needs bash on PATH (Git Bash or WSL)."

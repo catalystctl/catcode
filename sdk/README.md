@@ -89,9 +89,11 @@ await runtime.dispose();
 2. Dev build at `core/target/release/catcode-core` / `…/core` (repo-relative).
 3. `catcode-core` on `PATH` (installed layout).
 
-API keys are read by the core from `UMANS_API_KEY` / provider config by default;
-push a runtime key via `authStorage.setRuntimeApiKey(provider, key)` (forwarded
-as the `set_key` command).
+API keys are not auto-injected by the SDK. Paste a key via `/login` or complete
+this app's OAuth flow; you can also push a runtime key via
+`authStorage.setRuntimeApiKey(provider, key)` (forwarded as the `set_key`
+command). For a provider explicitly configured with `api_key_env`, the core
+reads the named env var at request time.
 
 ## Protocol mapping
 

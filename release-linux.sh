@@ -145,6 +145,6 @@ if [[ -n "$APPIMG" ]]; then
 fi
 echo "Run the standalone:"
 echo "  chmod +x ${STANDALONE##*/}  &&  ./${STANDALONE##*/}"
-echo "First run inside either:  /key sk-...   then /model, then type a prompt."
+echo "First run inside either:  /login   then /model, then type a prompt."
 echo "Note: the agent's bash tool needs bash on PATH (present by default)."
 echo "      Sandboxing (--sandbox firejail / --no-network) is Linux-only."

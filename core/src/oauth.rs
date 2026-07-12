@@ -27,23 +27,23 @@
 //!      fail to load — that's fine). Paste the `code` query param (or full
 //!      redirect URL) via `/oauth-code`. Optional: SSH `-L 51121:127.0.0.1:51121`
 //!      + `CATALYST_CODE_NO_BROWSER=0` for automatic loopback capture.
-//!        Tokens are written to `~/.gemini/oauth_creds.json` in the
-//!        `google-auth-library` `Credentials` shape (same path Antigravity / gemini-cli
-//!        use). Works for **regular Google accounts** (personal Gmail /
-//!        Google One AI) **and Google Cloud / Workspace identities** alike — the
-//!        Google consent screen lets the user pick the account.
-//!  - Google *Cloud* accounts that prefer ADC: `gcloud auth
-//!    application-default login` (`~/.config/gcloud/application_default_
-//!    credentials.json`) and a service-account key file pointed at by
-//!    `GOOGLE_APPLICATION_CREDENTIALS` are read and refreshed here too, so a
-//!    headless Cloud workload needs no `/login`.
+//!    fail to load — that's fine). Paste the `code` query param (or full
+//!      redirect URL) via `/oauth-code`. Optional: SSH `-L 51121:127.0.0.1:51121`
+//!      + `CATALYST_CODE_NO_BROWSER=0` for automatic loopback capture.
+//!        Tokens are written to `~/.config/catalyst-code/oauth/gemini.json`
+//!        (this app's store only — we do not read gemini-cli / gcloud ADC /
+//!        `GOOGLE_APPLICATION_CREDENTIALS`).
 //!  - Claude: Anthropic **authorization-code + PKCE** matching Claude Code's
 //!    subscription OAuth flow — local machines use `http://localhost:<port>/callback`
 //!    loopback; SSH/headless sessions use Anthropic's hosted manual callback
 //!    page and `/oauth-code`, so no port forwarding is required. Uses Claude
 //!    Code's public client_id, authorize/token endpoints, scopes, JSON token
-//!    exchange, and `oauth-2025-04-20` API beta header.
-//!  - xAI Grok: **dual auth** — `XAI_API_KEY` (console.x.ai) OR **OAuth 2.0
+//!    exchange, and the `claude-code-20250219,oauth-2025-04-20` identity beta
+//!    header (plus `claude-cli` User-Agent / `x-app: cli`) that Anthropic's
+//!    gateway requires to accept a subscription token. Tokens are stored only
+//!    under `~/.config/catalyst-code/oauth/anthropic.json` (Claude CLI's
+//!    `~/.claude/.credentials.json` is not read).
+//!  - xAI Grok: **dual auth** — paste `XAI_API_KEY` via `/login` OR **OAuth 2.0
 //!    device-code** against `auth.x.ai` (same public client + scopes Hermes /
 //!    Grok CLI use for SuperGrok / X Premium+). Works on local machines and
 //!    over SSH/headless (prints verification URL + user code; polls until
@@ -54,19 +54,16 @@
 //!    SSH/headless. Tokens refresh automatically; chat goes to
 //!    `portal.qwen.ai/v1`.
 //!
-//! Tokens from `/login` are stored at `~/.gemini/oauth_creds.json` (Google,
-//! 0600) or `~/.config/catalyst-code/oauth/<id>.json` (OpenAI/Claude/xAI, 0600)
-//! and refreshed in place. OpenAI/Codex deliberately does NOT reuse the
-//! official Codex CLI's `~/.codex/auth.json`; use this app's OAuth flow so the
-//! selected account/subscription is explicit.
+//! Tokens from `/login` are stored at `~/.config/catalyst-code/oauth/<id>.json`
+//! (0600) and refreshed in place. Third-party CLI credential stores (gemini-cli,
+//! Claude CLI, gcloud ADC, Codex CLI `~/.codex/auth.json`) are intentionally
+//! **not** scanned — a fresh download stays signed out until the user pastes
+//! an API key or completes this app's OAuth flow.
 //!
-//! Note on endpoints: `gemini` CLI routes its OAuth/subscription turns through
-//! the Code Assist backend (`cloudcode-pa.googleapis.com`, a different request
-//! shape). This harness speaks the OpenAI-compatible Gemini shim
-//! (`generativelanguage.googleapis.com/v1beta/openai`), which accepts the same
-//! OAuth access token (cloud-platform scope) as `Authorization: Bearer`. The
-//! OAuth *identity* matches gemini-cli exactly; the transport stays OpenAI-
-//! compatible. To use a Gemini API key instead, export `GEMINI_API_KEY`.
+//! Note on endpoints: Gemini OAuth turns go through the Antigravity Code Assist
+//! backend (`cloudcode-pa.googleapis.com` / daily sandbox). The harness keeps
+//! an OpenAI-compatible internal shape; OAuth identity matches Antigravity.
+//! To use a Gemini API key instead, paste `GEMINI_API_KEY` via `/login`.
 
 use crate::config::{home_dir, ProviderKind, ResolvedProvider};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -75,7 +72,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // --- Google (Gemini / Antigravity) constants ----------------------------------
@@ -107,8 +103,21 @@ const CODE_ASSIST_AUTOPUSH_BASE_URL: &str =
 /// Fallback project id when loadCodeAssist returns none (business/workspace
 /// accounts). Matches Antigravity / CLIProxy.
 const ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "rising-fact-p41fc";
-/// Antigravity client version baked into User-Agent / Client-Metadata.
-const ANTIGRAVITY_VERSION: &str = "1.18.3";
+/// Antigravity client version baked into the inference `User-Agent`. This MUST
+/// stay current: Google's Code Assist gateway rejects stale `antigravity/<ver>`
+/// User-Agents, breaking Gemini model access. `1.107.0` matches pi-mono's last
+/// working Antigravity build (before upstream removed the provider). Overridable
+/// at runtime via the `PI_AI_ANTIGRAVITY_VERSION` env var (pi-mono compat).
+const ANTIGRAVITY_VERSION: &str = "1.107.0";
+
+/// Resolve the Antigravity client version, honoring the `PI_AI_ANTIGRAVITY_VERSION`
+/// env override (pi-mono compatibility) and falling back to the baked constant.
+fn antigravity_version() -> String {
+    std::env::var("PI_AI_ANTIGRAVITY_VERSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| ANTIGRAVITY_VERSION.to_string())
+}
 // Antigravity scopes (cloud-platform + identity + cclog + experiments). The
 // two extra scopes beyond gemini-cli are what unlock Antigravity-only models.
 const GOOGLE_SCOPES: &[&str] = &[
@@ -171,6 +180,40 @@ const CLAUDE_SCOPES: &[&str] = &[
 ];
 fn claude_scope_string() -> String {
     CLAUDE_SCOPES.join(" ")
+}
+
+/// Anthropic's gateway rejects a Claude Pro/Max subscription bearer token
+/// unless the request also carries Claude Code's client fingerprint — the public
+/// OAuth client (`CLAUDE_CLIENT_ID`) is the *only* one Anthropic registers for
+/// subscription access, so the gateway identifies the caller by these headers,
+/// not just the token. These are the **minimal** identity values the gateway
+/// validates; we deliberately do NOT adopt Claude Code's persona system prompt
+/// ("You are Claude Code…") or its optional feature betas
+/// (`fine-grained-tool-streaming-2025-05-14`, `interleaved-thinking-2025-05-14`)
+/// that other ports copy verbatim — catcode keeps its own identity and sends
+/// only what the subscription gateway requires to accept the token.
+pub const CLAUDE_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+pub const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.1.160";
+pub const CLAUDE_OAUTH_X_APP: &str = "cli";
+
+/// Push the Anthropic subscription-OAuth identity headers (User-Agent + x-app)
+/// onto a resolved provider's header list, skipping any name already present so
+/// a user/config override always wins. (`anthropic-beta` is set at the request
+/// sites via `CLAUDE_OAUTH_BETA` so the standalone usage call can set it too.)
+fn header_present(headers: &[(String, String)], name: &str) -> bool {
+    headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+}
+
+fn inject_anthropic_oauth_identity(headers: &mut Vec<(String, String)>) {
+    if !header_present(headers, "user-agent") {
+        headers.push((
+            "User-Agent".to_string(),
+            CLAUDE_OAUTH_USER_AGENT.to_string(),
+        ));
+    }
+    if !header_present(headers, "x-app") {
+        headers.push(("x-app".to_string(), CLAUDE_OAUTH_X_APP.to_string()));
+    }
 }
 
 // --- xAI (Grok SuperGrok / X Premium+) constants ------------------------------
@@ -264,9 +307,8 @@ pub struct OAuthPrompt {
     pub message: String,
 }
 
-/// An in-memory OAuth token. For Google we persist the `google-auth-library`
-/// `Credentials` shape (see `GeminiCreds`); this struct is the working
-/// representation used by refresh. For Claude we persist this struct directly.
+/// An in-memory OAuth token. Persisted under
+/// `~/.config/catalyst-code/oauth/<id>.json` and used by refresh.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct OAuthToken {
     pub access_token: String,
@@ -294,26 +336,6 @@ pub struct OAuthToken {
     pub extra: Option<Value>,
 }
 
-/// On-disk shape Google's `google-auth-library` (and the `gemini` CLI) writes
-/// to `~/.gemini/oauth_creds.json`. `expiry_date` is in MILLISECONDS. We match
-/// this exactly so our token file is interchangeable with gemini-cli's.
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct GeminiCreds {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    access_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    token_type: Option<String>,
-    /// MILLISECONDS since epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expiry_date: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    id_token: Option<String>,
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -323,14 +345,6 @@ fn now_secs() -> u64 {
 
 // --- credential file locations ------------------------------------------------
 
-fn gcloud_adc_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".config/gcloud/application_default_credentials.json"))
-}
-
-fn claude_creds_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".claude/.credentials.json"))
-}
-
 fn codex_auth_path() -> Option<PathBuf> {
     // Use our own OAuth store. Do NOT auto-detect/reuse the official Codex
     // CLI's ~/.codex/auth.json; users should sign in here via this app's OAuth
@@ -338,18 +352,14 @@ fn codex_auth_path() -> Option<PathBuf> {
     Some(home_dir()?.join(".config/catalyst-code/oauth/openai.json"))
 }
 
-/// Where the `gemini` CLI (and now we) store Google OAuth tokens.
+/// Legacy path where older builds stored Google OAuth tokens
+/// (`~/.gemini/oauth_creds.json`, google-auth-library shape). Read once on
+/// startup to migrate to the new store; `/logout` still removes it.
 fn gemini_creds_path() -> Option<PathBuf> {
     Some(home_dir()?.join(".gemini/oauth_creds.json"))
 }
 
-/// Our legacy pre-match token path (kept as a read-only fallback so an existing
-/// login is not silently lost). New logins always write `~/.gemini/oauth_creds.json`.
-fn legacy_gemini_token_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".config/catalyst-code/oauth/gemini.json"))
-}
-
-/// Where WE store Anthropic OAuth tokens obtained via `/login`.
+/// Where WE store OAuth tokens obtained via `/login`.
 fn stored_token_path(provider: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(format!(".config/catalyst-code/oauth/{provider}.json")))
 }
@@ -358,27 +368,81 @@ fn stored_token_dir() -> Option<PathBuf> {
     Some(home_dir()?.join(".config/catalyst-code/oauth"))
 }
 
-/// True when Gemini auth is available: our/gemini-cli token OR gcloud ADC OR a
-/// `GOOGLE_APPLICATION_CREDENTIALS` file exists.
-pub fn has_google_creds() -> bool {
-    gemini_creds_path().map(|p| p.exists()).unwrap_or(false)
-        || legacy_gemini_token_path()
-            .map(|p| p.exists())
-            .unwrap_or(false)
-        || gcloud_adc_path().map(|p| p.exists()).unwrap_or(false)
-        || std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|p| std::path::Path::new(&p).exists())
-            .unwrap_or(false)
+/// One-time migration: if a Gemini OAuth token from an older build exists at
+/// the legacy `~/.gemini/oauth_creds.json` (google-auth-library shape) and the
+/// new `~/.config/catalyst-code/oauth/gemini.json` does not, convert and write
+/// it so an existing login is not silently lost on upgrade. Idempotent — a no-op
+/// once the new-path file exists.
+fn migrate_legacy_gemini_token() {
+    let new_path = match stored_token_path("gemini") {
+        Some(p) => p,
+        None => return,
+    };
+    if new_path.exists() {
+        return;
+    }
+    let old_path = match gemini_creds_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let data = match std::fs::read_to_string(&old_path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let old: Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let access_token = old
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if access_token.is_empty() {
+        return;
+    }
+    // expiry_date is in MILLISECONDS (google-auth-library); OAuthToken uses SECONDS.
+    let expires_at = old
+        .get("expiry_date")
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms / 1000)
+        .unwrap_or(0);
+    let tok = OAuthToken {
+        access_token: access_token.to_string(),
+        refresh_token: old
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        expires_at,
+        client_id: None,
+        client_secret: None,
+        kind: "google".to_string(),
+        id_token: old
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        extra: None,
+    };
+    // merge_google_oauth_token fills in client_id/client_secret defaults.
+    let merged = merge_google_oauth_token(&tok, None);
+    let _ = store_token("gemini", &merged);
 }
 
-/// True when Claude auth is available: our stored token OR the CLI's creds exist.
+/// True when Gemini auth from **this app's** `/login` is on disk (after a
+/// one-time migration from the legacy `~/.gemini/oauth_creds.json` if needed).
+/// Does not scan gcloud ADC or `GOOGLE_APPLICATION_CREDENTIALS`.
+pub fn has_google_creds() -> bool {
+    migrate_legacy_gemini_token();
+    stored_token_path("gemini")
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// True when Claude auth from **this app's** `/login` is on disk.
+/// Does not read `~/.claude/.credentials.json`.
 pub fn has_claude_creds() -> bool {
     stored_token_path("anthropic")
         .map(|p| p.exists())
         .unwrap_or(false)
-        || claude_creds_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 pub fn has_codex_creds() -> bool {
@@ -438,9 +502,9 @@ pub fn has_iflow_creds() -> bool {
 /// after logout and the provider re-appears as "logged in" on the next
 /// session — the stale token would even be used for model discovery + turns.
 ///
-/// Only deletes credentials OUR login created. System-managed credentials
-/// (gcloud ADC, `GOOGLE_APPLICATION_CREDENTIALS` service-account files) are
-/// left alone — the user set those up independently and may still need them.
+/// Only deletes credentials OUR login created. Third-party CLI stores are not
+/// used for auth anymore; Gemini logout still removes a leftover
+/// `~/.gemini/oauth_creds.json` from older builds that shared that path.
 pub fn clear_oauth_creds(preset_id: &str) {
     let try_remove = |p: Option<std::path::PathBuf>| {
         if let Some(p) = p {
@@ -449,23 +513,12 @@ pub fn clear_oauth_creds(preset_id: &str) {
     };
     match preset_id {
         "gemini" => {
-            // Our login writes ~/.gemini/oauth_creds.json (google-auth-library shape;
-            // same path Antigravity / gemini-cli use).
+            try_remove(stored_token_path("gemini"));
+            // Older builds wrote the shared gemini-cli path; clear it on logout
+            // so a reinstall does not look signed-in from leftover files.
             try_remove(gemini_creds_path());
-            try_remove(legacy_gemini_token_path());
-            // Clear the in-memory service-account cache so a stale SA token
-            // isn't used after the personal token is gone.
-            if let Ok(mut c) = sa_cache().lock() {
-                *c = None;
-            }
-            // Do NOT delete gcloud ADC or GOOGLE_APPLICATION_CREDENTIALS —
-            // those are system-managed credentials the user set up outside
-            // this app.
         }
         "anthropic" => {
-            // Our store only. Leave ~/.claude/.credentials.json (the Claude
-            // CLI's own login) — if the user has the CLI set up, they're still
-            // authenticated via it, which is correct.
             try_remove(stored_token_path("anthropic"));
         }
         "openai" => {
@@ -485,88 +538,43 @@ pub fn clear_oauth_creds(preset_id: &str) {
     }
 }
 
-// --- Google token storage (gemini-cli shape) ----------------------------------
+// --- Google token storage (harness-owned) -------------------------------------
 
 fn read_gemini_token() -> Option<OAuthToken> {
-    // Prefer the canonical gemini-cli path; fall back to our legacy file.
-    let (path, legacy) = match gemini_creds_path() {
-        Some(p) if p.exists() => (Some(p), false),
-        _ => match legacy_gemini_token_path() {
-            Some(p) if p.exists() => (Some(p), true),
-            _ => (None, false),
-        },
-    };
-    let path = path?;
-    let data = std::fs::read_to_string(&path).ok()?;
-    if legacy {
-        // Legacy file is our own OAuthToken JSON.
-        let tok: OAuthToken = serde_json::from_str(&data).ok()?;
-        return if tok.access_token.is_empty() {
-            None
-        } else {
-            Some(tok)
-        };
+    let tok = read_stored_token("gemini")?;
+    if tok.access_token.is_empty() {
+        None
+    } else {
+        Some(tok)
     }
-    let creds: GeminiCreds = serde_json::from_str(&data).ok()?;
-    let access = creds.access_token?;
-    Some(OAuthToken {
-        access_token: access,
-        refresh_token: creds.refresh_token,
-        // gemini-cli stores MILLISECONDS; we work in seconds.
-        expires_at: creds.expiry_date.map(|ms| ms / 1000).unwrap_or(0),
-        client_id: Some(GOOGLE_CLIENT_ID.to_string()),
-        client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
-        kind: "google".to_string(),
-        id_token: creds.id_token,
-        extra: None,
-    })
 }
 
 fn write_gemini_token(tok: &OAuthToken) -> Option<()> {
-    let path = gemini_creds_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    // Preserve the existing refresh_token + id_token when the new token doesn't
-    // carry them. Google only returns a refresh_token on the FIRST authorization
-    // for a given client+user; re-logins (same user, same client) return NO
-    // refresh_token. Without this merge, a re-login would clobber the stored
-    // refresh_token with None, making future refreshes impossible — the access
-    // token expires in ~1h and the user is silently logged out. This mirrors
-    // google-auth-library's `OAuth2Client.setCredentials` merge (Object.assign
-    // over the existing credentials) that gemini-cli relies on.
-    let existing = gemini_creds_path()
-        .and_then(|p| std::fs::read_to_string(&p).ok())
-        .and_then(|s| serde_json::from_str::<GeminiCreds>(&s).ok());
-    let creds = merged_gemini_creds(tok, existing.as_ref());
-    let data = serde_json::to_string_pretty(&creds).ok()?;
-    // Unique-temp atomic write + 0600 (fsutil): two processes refreshing the
-    // same token concurrently never collide on a shared temp file.
-    crate::fsutil::atomic_write_secure(&path, data.as_bytes()).ok()?;
-    Some(())
+    let existing = read_stored_token("gemini");
+    let merged = merge_google_oauth_token(tok, existing.as_ref());
+    store_token("gemini", &merged)
 }
 
-/// Build the on-disk `GeminiCreds` from a freshly obtained `OAuthToken`,
-/// merging with any existing credentials so fields Google omits on re-login
-/// (refresh_token, id_token) are preserved rather than clobbered with None.
-/// Google only returns a refresh_token on the FIRST authorization for a given
-/// client+user; subsequent logins return NO refresh_token, so without this
-/// merge a re-login would destroy the stored refresh_token and the access
-/// token would become unrefreshable after its ~1h expiry. This mirrors
-/// google-auth-library's `OAuth2Client.setCredentials` merge (Object.assign
-/// over the existing credentials) that gemini-cli relies on.
-fn merged_gemini_creds(tok: &OAuthToken, existing: Option<&GeminiCreds>) -> GeminiCreds {
-    let prev_refresh = existing.and_then(|c| c.refresh_token.clone());
-    let prev_id = existing.and_then(|c| c.id_token.clone());
-    GeminiCreds {
-        access_token: Some(tok.access_token.clone()),
-        refresh_token: tok.refresh_token.clone().or(prev_refresh),
-        token_type: Some("Bearer".to_string()),
-        // seconds → milliseconds (match google-auth-library).
-        expiry_date: Some(tok.expires_at.saturating_mul(1000)),
-        scope: Some(google_scope_string()),
-        id_token: tok.id_token.clone().or(prev_id),
+/// Preserve refresh_token / id_token when Google omits them on re-login.
+fn merge_google_oauth_token(tok: &OAuthToken, existing: Option<&OAuthToken>) -> OAuthToken {
+    let mut merged = tok.clone();
+    if merged.refresh_token.is_none() {
+        merged.refresh_token = existing.and_then(|t| t.refresh_token.clone());
     }
+    if merged.id_token.is_none() {
+        merged.id_token = existing.and_then(|t| t.id_token.clone());
+    }
+    if merged.client_id.is_none() {
+        merged.client_id = existing
+            .and_then(|t| t.client_id.clone())
+            .or_else(|| Some(GOOGLE_CLIENT_ID.to_string()));
+    }
+    if merged.client_secret.is_none() {
+        merged.client_secret = existing
+            .and_then(|t| t.client_secret.clone())
+            .or_else(|| Some(GOOGLE_CLIENT_SECRET.to_string()));
+    }
+    merged
 }
 
 // --- Claude token storage (our own shape) -------------------------------------
@@ -677,11 +685,11 @@ fn jwt_account_id(jwt: &str) -> Option<String> {
 
 // --- token refresh ------------------------------------------------------------
 
-/// Refresh a Google OAuth token via gemini-cli's exact refresh request:
-/// `refresh_token` + `client_id` + `client_secret` + `grant_type=refresh_token`
-/// (client_secret in the BODY, not Basic; NO `x-goog-user-project` header).
-/// Google does not always return a new refresh_token, so the old one is
-/// preserved. Result is written back to `~/.gemini/oauth_creds.json`.
+/// Refresh a Google OAuth token via the Antigravity installed-app refresh
+/// request: `refresh_token` + `client_id` + `client_secret` +
+/// `grant_type=refresh_token` (client_secret in the BODY, not Basic). Google
+/// does not always return a new refresh_token, so the old one is preserved.
+/// Result is written back to `~/.config/catalyst-code/oauth/gemini.json`.
 async fn refresh_google_token(client: &reqwest::Client, tok: &OAuthToken) -> Option<String> {
     let refresh_token = tok.refresh_token.clone()?;
     let client_id = tok
@@ -880,14 +888,10 @@ async fn refresh_qwen_token(client: &reqwest::Client, tok: &OAuthToken) -> Optio
 
 // --- token resolution (used at turn/discovery time by enrich_oauth) -----------
 
-/// Resolve a Google OAuth access token. Resolution order matches "support
-/// Google Cloud AND regular accounts":
-///   1. `~/.gemini/oauth_creds.json` (our Antigravity `/login`) —
-///      refreshed if expired. Works for personal + Workspace + Cloud identities.
-///   2. `GOOGLE_APPLICATION_CREDENTIALS` (service-account JSON or an
-///      `authorized_user` ADC file) — the canonical Google Cloud path.
-///   3. gcloud ADC (`~/.config/gcloud/application_default_credentials.json`,
-///      `authorized_user` type) — `gcloud auth application-default login`.
+/// Resolve a Google OAuth access token from **this app's** `/login` store
+/// (`~/.config/catalyst-code/oauth/gemini.json`), refreshing if expired.
+/// Does not fall back to gemini-cli, gcloud ADC, or
+/// `GOOGLE_APPLICATION_CREDENTIALS`.
 pub async fn google_token(client: &reqwest::Client) -> Option<String> {
     if let Some(tok) = read_gemini_token() {
         if !tok.access_token.is_empty() {
@@ -900,68 +904,56 @@ pub async fn google_token(client: &reqwest::Client) -> Option<String> {
             }
         }
     }
-    if let Some(t) = google_token_from_gac(client).await {
-        return Some(t);
-    }
-    google_token_from_adc(client).await
+    None
 }
 
 /// Cache for the Code Assist project ID (obtained via loadCodeAssist onboarding).
 /// The project ID is stable per-user, so we fetch it once and reuse it.
 static CODE_ASSIST_PROJECT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-/// Antigravity Code Assist metadata (ideType/platform/pluginType). The daily
-/// sandbox + Claude-via-Antigravity models require `ideType: ANTIGRAVITY`
-/// (gemini-cli's `IDE_UNSPECIFIED` is rejected / limited to older models).
+/// Code Assist discovery metadata (ideType/platform/pluginType) sent on the
+/// `loadCodeAssist` / `onboardUser` calls. Matches pi-mono's Antigravity
+/// `discoverProject`: `IDE_UNSPECIFIED` + `PLATFORM_UNSPECIFIED` + `GEMINI`.
+/// Model-tier access (Gemini 3 / Claude-via-Antigravity / GPT-OSS) comes from
+/// the Antigravity OAuth client (its client id), NOT this metadata — so the
+/// generic identity is correct and universally accepted.
 fn antigravity_metadata() -> Value {
-    let platform = if cfg!(target_os = "windows") {
-        "WINDOWS"
-    } else if cfg!(target_os = "macos") {
-        "MACOS"
-    } else {
-        // Antigravity only ships Windows/macOS clients; Linux hosts still
-        // identify as MACOS (matches CLIProxy / opencode-antigravity-auth).
-        "MACOS"
-    };
     json!({
-        "ideType": "ANTIGRAVITY",
-        "platform": platform,
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
         "pluginType": "GEMINI",
     })
 }
 
-/// Headers Antigravity / CLIProxy send on every Code Assist request. Without
-/// `Client-Metadata: ideType=ANTIGRAVITY` the gateway may refuse Gemini 3 /
-/// Claude-via-Antigravity models even with a valid OAuth token.
+/// Inference headers for Antigravity Code Assist requests — sent on every
+/// `streamGenerateContent` call. Matches pi-mono's `getAntigravityHeaders()`:
+/// a single `User-Agent: antigravity/<version> darwin/arm64`. The gateway keys
+/// model-tier access off this UA + the request body's `userAgent: "antigravity"`
+/// field, NOT off a `Client-Metadata` header. The version MUST be current or
+/// the gateway rejects the request (a stale `antigravity/1.18.3` is rejected).
 pub fn antigravity_headers() -> Vec<(String, String)> {
-    let platform = if cfg!(target_os = "windows") {
-        "WINDOWS"
-    } else {
-        "MACOS"
-    };
-    let ua = format!(
-        "antigravity/{ANTIGRAVITY_VERSION} {}",
-        if cfg!(target_os = "windows") {
-            "windows/amd64"
-        } else if cfg!(target_os = "macos") {
-            if cfg!(target_arch = "aarch64") {
-                "darwin/arm64"
-            } else {
-                "darwin/amd64"
-            }
-        } else {
-            "darwin/amd64"
-        }
-    );
-    let meta =
-        format!(r#"{{"ideType":"ANTIGRAVITY","platform":"{platform}","pluginType":"GEMINI"}}"#);
+    vec![(
+        "User-Agent".to_string(),
+        format!("antigravity/{} darwin/arm64", antigravity_version()),
+    )]
+}
+
+/// Discovery headers for the `loadCodeAssist` / `onboardUser` calls. Matches
+/// pi-mono's `discoverProject`: a generic `google-api-nodejs-client` User-Agent
+/// + `X-Goog-Api-Client` + a `Client-Metadata` identifying as
+/// `IDE_UNSPECIFIED`/`GEMINI` (the discovery endpoint accepts this universally).
+fn code_assist_discovery_headers() -> Vec<(String, String)> {
     vec![
-        ("User-Agent".to_string(), ua),
+        ("User-Agent".to_string(), "google-api-nodejs-client/9.15.1".to_string()),
         (
             "X-Goog-Api-Client".to_string(),
             "google-cloud-sdk vscode_cloudshelleditor/0.1".to_string(),
         ),
-        ("Client-Metadata".to_string(), meta),
+        (
+            "Client-Metadata".to_string(),
+            r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#
+                .to_string(),
+        ),
     ]
 }
 
@@ -1004,7 +996,7 @@ async fn fetch_code_assist_project(client: &reqwest::Client, token: &str) -> Opt
             .bearer_auth(token)
             .json(&body)
             .timeout(std::time::Duration::from_secs(10));
-        for (k, v) in antigravity_headers() {
+        for (k, v) in code_assist_discovery_headers() {
             req = req.header(k, v);
         }
         let Ok(resp) = req.send().await else {
@@ -1051,7 +1043,7 @@ async fn onboard_code_assist_user(
         .bearer_auth(token)
         .json(&body)
         .timeout(std::time::Duration::from_secs(10));
-    for (k, v) in antigravity_headers() {
+    for (k, v) in code_assist_discovery_headers() {
         req = req.header(k, v);
     }
     let resp = req.send().await.ok()?;
@@ -1079,162 +1071,8 @@ async fn onboard_code_assist_user(
     None
 }
 
-#[derive(Deserialize)]
-struct GcloudAdc {
-    #[serde(rename = "type", default)]
-    typ: Option<String>,
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    client_secret: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
-}
-
-async fn google_token_from_adc(client: &reqwest::Client) -> Option<String> {
-    let path = gcloud_adc_path()?;
-    let data = std::fs::read_to_string(&path).ok()?;
-    let adc: GcloudAdc = serde_json::from_str(&data).ok()?;
-    if let Some(t) = adc.access_token.filter(|s| !s.is_empty()) {
-        return Some(t);
-    }
-    if adc.typ.as_deref() != Some("authorized_user") {
-        return None;
-    }
-    let client_id = adc.client_id?;
-    let client_secret = adc.client_secret?;
-    let refresh_token = adc.refresh_token?;
-    let resp = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    v.get("access_token")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Read `GOOGLE_APPLICATION_CREDENTIALS` (a Google Cloud key file). Dispatches
-/// by `type`: `service_account` → JWT-bearer exchange (RS256-signed assertion);
-/// `authorized_user` → refresh_token grant. This is the standard Google Cloud
-/// auth path — it lets a service account (headless Cloud workload) authenticate
-/// with no interactive `/login`.
-async fn google_token_from_gac(client: &reqwest::Client) -> Option<String> {
-    let p = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let data = std::fs::read_to_string(&p).ok()?;
-    let v: Value = serde_json::from_str(&data).ok()?;
-    match v.get("type").and_then(|t| t.as_str()) {
-        Some("service_account") => google_token_from_service_account(client, &v).await,
-        Some("authorized_user") => google_token_from_authorized_user(client, &v).await,
-        _ => None,
-    }
-}
-
-async fn google_token_from_authorized_user(client: &reqwest::Client, v: &Value) -> Option<String> {
-    let client_id = v.get("client_id").and_then(|t| t.as_str())?.to_string();
-    let client_secret = v.get("client_secret").and_then(|t| t.as_str())?.to_string();
-    let refresh_token = v.get("refresh_token").and_then(|t| t.as_str())?.to_string();
-    let resp = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let r: Value = resp.json().await.ok()?;
-    r.get("access_token")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-}
-
-// In-memory cache for service-account access tokens (short-lived; avoids
-// re-signing + re-exchanging on every turn). (token, expiry_secs).
-static SA_CACHE: OnceLock<std::sync::Mutex<Option<(String, u64)>>> = OnceLock::new();
-fn sa_cache() -> &'static std::sync::Mutex<Option<(String, u64)>> {
-    SA_CACHE.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Exchange a service-account key for an OAuth access token via the JWT-bearer
-/// grant (RFC 7523): sign a RS256 JWT `{iss, scope, aud, iat, exp}` with the
-/// service account's private key, POST it as `assertion` with
-/// `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`. This is exactly
-/// what `google-auth-library`'s `GoogleAuth.fromJSON(service_account)` does.
-async fn google_token_from_service_account(client: &reqwest::Client, v: &Value) -> Option<String> {
-    // Return a cached token if still valid (60s skew).
-    {
-        let cache = sa_cache().lock().ok()?;
-        if let Some((tok, exp)) = cache.as_ref() {
-            if *exp > now_secs() + 60 {
-                return Some(tok.clone());
-            }
-        }
-    }
-
-    let iss = v.get("client_email").and_then(|t| t.as_str())?;
-    let private_key_pem = v.get("private_key").and_then(|t| t.as_str())?;
-    let token_uri = v
-        .get("token_uri")
-        .and_then(|t| t.as_str())
-        .unwrap_or(GOOGLE_TOKEN_URL);
-
-    let now = now_secs();
-    let claims = json!({
-        "iss": iss,
-        "scope": google_scope_string(),
-        "aud": token_uri,
-        "iat": now,
-        "exp": now + 3600,
-    });
-    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    header.typ = Some("JWT".to_string());
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).ok()?;
-    let assertion = jsonwebtoken::encode(&header, &claims, &key).ok()?;
-
-    let resp = client
-        .post(token_uri)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", assertion.as_str()),
-        ])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let r: Value = resp.json().await.ok()?;
-    let access = r.get("access_token").and_then(|t| t.as_str())?.to_string();
-    let expires_in = r.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
-    let exp = now_secs() + expires_in;
-    if let Ok(mut cache) = sa_cache().lock() {
-        *cache = Some((access.clone(), exp));
-    }
-    Some(access)
-}
-
-/// Resolve an Anthropic (Claude.ai) OAuth access token. Prefers our stored
-/// token (refreshing), then the CLI's `~/.claude/.credentials.json`.
+/// Resolve an Anthropic (Claude.ai) OAuth access token from **this app's**
+/// store, refreshing when expired. Does not read Claude CLI credentials.
 pub async fn claude_token(client: &reqwest::Client) -> Option<String> {
     if let Some(tok) = read_stored_token("anthropic") {
         if !tok.access_token.is_empty() {
@@ -1247,47 +1085,6 @@ pub async fn claude_token(client: &reqwest::Client) -> Option<String> {
             }
         }
     }
-    claude_token_from_cli(client).await
-}
-
-#[derive(Deserialize)]
-struct ClaudeCreds {
-    #[serde(rename = "claudeAiOauth", default)]
-    oauth: Option<ClaudeOauth>,
-}
-#[derive(Deserialize)]
-struct ClaudeOauth {
-    #[serde(default, rename = "accessToken")]
-    access_token: Option<String>,
-    #[serde(default, rename = "refreshToken")]
-    #[allow(dead_code)]
-    refresh_token: Option<String>,
-    #[serde(default, rename = "expiresAt")]
-    expires_at: Option<u64>,
-}
-
-async fn claude_token_from_cli(client: &reqwest::Client) -> Option<String> {
-    let path = claude_creds_path()?;
-    let data = std::fs::read_to_string(&path).ok()?;
-    let creds: ClaudeCreds = serde_json::from_str(&data).ok()?;
-    let oauth = creds.oauth?;
-    let now = now_secs();
-    let expired = oauth
-        .expires_at
-        .map(|exp| {
-            (if exp > 1_000_000_000_000 {
-                exp / 1000
-            } else {
-                exp
-            }) <= now + 60
-        })
-        .unwrap_or(false);
-    if !expired {
-        if let Some(t) = oauth.access_token.filter(|s| !s.is_empty()) {
-            return Some(t);
-        }
-    }
-    let _ = client; // CLI-token refresh not attempted (client_id not stored by the CLI).
     None
 }
 
@@ -1396,6 +1193,9 @@ pub async fn enrich_oauth(
             if let Some(t) = claude_token(client).await {
                 rp.api_key = Some(t);
                 rp.oauth = true;
+                // Stamp the Claude Code client fingerprint the gateway requires
+                // to accept a subscription bearer token (see CLAUDE_OAUTH_BETA).
+                inject_anthropic_oauth_identity(&mut rp.headers);
             }
         }
         _ if crate::provider::is_codex_endpoint(&rp.base_url) => {
@@ -1518,10 +1318,9 @@ pub async fn enrich_oauth(
     rp
 }
 
-/// The default headers the official `codex` CLI attaches to every request
-/// Attach Antigravity Client-Metadata / User-Agent so the Code Assist gateway
-/// routes the request to Gemini 3 / Claude-via-Antigravity (without these the
-/// gateway may treat the call as gemini-cli and refuse newer models).
+/// Attach the Antigravity `User-Agent` the Code Assist gateway keys model-tier
+/// access off of. Idempotent — skips a header already present so repeated
+/// `enrich_oauth` calls on the same provider don't duplicate.
 fn inject_antigravity_headers(headers: &mut Vec<(String, String)>) {
     for (k, v) in antigravity_headers() {
         if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
@@ -1530,6 +1329,7 @@ fn inject_antigravity_headers(headers: &mut Vec<(String, String)>) {
     }
 }
 
+/// The default headers the official `codex` CLI attaches to every request
 /// against the ChatGPT Codex backend. `originator` identifies the client to
 /// OpenAI's gateway (routing/entitlement); `User-Agent` avoids looking like a
 /// bare bot to Cloudflare. Idempotent — skips a header already present so
@@ -1926,9 +1726,6 @@ pub async fn complete_google_login(
         extra: None,
     };
     write_gemini_token(&tok);
-    if let Ok(mut c) = sa_cache().lock() {
-        *c = None;
-    }
     Ok(tok)
 }
 
@@ -2083,11 +1880,6 @@ async fn google_login_web(
         extra: None,
     };
     write_gemini_token(&tok);
-    // Best-effort: clear any stale service-account cache so the new personal
-    // token is used immediately.
-    if let Ok(mut c) = sa_cache().lock() {
-        *c = None;
-    }
     Ok(tok)
 }
 
@@ -4221,17 +4013,28 @@ mod tests {
         // Daily sandbox is the primary Code Assist endpoint (Antigravity).
         assert!(CODE_ASSIST_BASE_URL.contains("daily-cloudcode-pa.sandbox.googleapis.com"));
         assert!(CODE_ASSIST_PROD_BASE_URL.contains("cloudcode-pa.googleapis.com"));
-        // Metadata identifies as ANTIGRAVITY (not IDE_UNSPECIFIED).
+        // Discovery metadata identifies as IDE_UNSPECIFIED/GEMINI (pi-mono
+        // discoverProject) — model-tier access comes from the OAuth client.
         let meta = antigravity_metadata();
-        assert_eq!(meta["ideType"], "ANTIGRAVITY");
+        assert_eq!(meta["ideType"], "IDE_UNSPECIFIED");
+        assert_eq!(meta["platform"], "PLATFORM_UNSPECIFIED");
         assert_eq!(meta["pluginType"], "GEMINI");
+        // Inference headers are just the antigravity User-Agent (pi-mono
+        // getAntigravityHeaders): version current (1.107.0+), no Client-Metadata.
         let headers = antigravity_headers();
-        assert!(headers
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].0.eq_ignore_ascii_case("user-agent"));
+        assert!(headers[0].1.starts_with("antigravity/"));
+        assert!(headers[0].1.ends_with("darwin/arm64"));
+        // Discovery headers use the generic google-api-nodejs-client identity.
+        let disc = code_assist_discovery_headers();
+        assert!(disc
             .iter()
-            .any(|(k, v)| k == "User-Agent" && v.starts_with("antigravity/")));
-        assert!(headers
+            .any(|(k, v)| k == "User-Agent" && v == "google-api-nodejs-client/9.15.1"));
+        assert!(disc.iter().any(|(k, _v)| k == "X-Goog-Api-Client"));
+        assert!(disc
             .iter()
-            .any(|(k, v)| k == "Client-Metadata" && v.contains("ANTIGRAVITY")));
+            .any(|(k, v)| k == "Client-Metadata" && v.contains("IDE_UNSPECIFIED")));
     }
 
     #[test]
@@ -4329,6 +4132,38 @@ mod tests {
     }
 
     #[test]
+    fn claude_oauth_identity_includes_gateway_fingerprint() {
+        // Anthropic's gateway rejects a Claude Pro/Max subscription bearer token
+        // unless the request carries Claude Code's client fingerprint. The beta
+        // MUST include claude-code-20250219 (oauth-2025-04-20 alone is rejected).
+        assert!(CLAUDE_OAUTH_BETA.contains("claude-code-20250219"));
+        assert!(CLAUDE_OAUTH_BETA.contains("oauth-2025-04-20"));
+        // We deliberately do NOT impersonate Claude Code's optional feature betas
+        // or persona — only the auth-required identity pair.
+        assert!(!CLAUDE_OAUTH_BETA.contains("fine-grained-tool-streaming"));
+        assert!(!CLAUDE_OAUTH_BETA.contains("interleaved-thinking"));
+
+        let mut headers: Vec<(String, String)> = vec![];
+        inject_anthropic_oauth_identity(&mut headers);
+        let ua = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+        assert_eq!(ua.map(|(_, v)| v.as_str()), Some(CLAUDE_OAUTH_USER_AGENT));
+        assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-app")));
+
+        // A user/config-set header always wins — we must not duplicate it.
+        let mut with_custom = vec![("User-Agent".to_string(), "my-proxy/1.0".to_string())];
+        inject_anthropic_oauth_identity(&mut with_custom);
+        assert_eq!(
+            with_custom
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn claude_authorize_url_has_correct_params() {
         // Local loopback mode
         let local = claude_authorize_url("challenge", "state", "http://localhost:54321/callback");
@@ -4372,51 +4207,20 @@ mod tests {
     }
 
     #[test]
-    fn gemini_creds_roundtrip_ms_expiry() {
-        // expiry_date is stored in MILLISECONDS; ensure the s<->ms mapping
-        // survives a write→read round-trip.
-        let tmp = OAuthToken {
-            access_token: "ya29.test".into(),
-            refresh_token: Some("1//refresh".into()),
-            expires_at: 1719000000, // seconds
+    fn merge_google_oauth_preserves_refresh_token_on_relogin() {
+        // Google only returns a refresh_token on the FIRST authorization for a
+        // client+user. A re-login returns NO refresh_token. Without the merge,
+        // write_gemini_token would clobber the stored refresh_token with None.
+        let existing = OAuthToken {
+            access_token: "ya29.old".into(),
+            refresh_token: Some("1//old-refresh".into()),
+            expires_at: 1_719_000_000,
             client_id: Some(GOOGLE_CLIENT_ID.into()),
             client_secret: Some(GOOGLE_CLIENT_SECRET.into()),
             kind: "google".into(),
-            id_token: None,
+            id_token: Some("old.jwt".into()),
             extra: None,
         };
-        let creds = GeminiCreds {
-            access_token: Some(tmp.access_token.clone()),
-            refresh_token: tmp.refresh_token.clone(),
-            token_type: Some("Bearer".into()),
-            expiry_date: Some(tmp.expires_at * 1000),
-            scope: Some(google_scope_string()),
-            id_token: None,
-        };
-        let json = serde_json::to_string(&creds).unwrap();
-        let parsed: GeminiCreds = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.expiry_date, Some(1719000000000u64));
-        // ms → s on read:
-        assert_eq!(parsed.expiry_date.unwrap() / 1000, tmp.expires_at);
-    }
-
-    #[test]
-    fn merged_gemini_creds_preserves_refresh_token_on_relogin() {
-        // Google only returns a refresh_token on the FIRST authorization for a
-        // client+user. A re-login returns NO refresh_token. Without the merge,
-        // write_gemini_token would clobber the stored refresh_token with None,
-        // making future refreshes impossible (access token expires in ~1h →
-        // silently logged out). The merge must preserve the existing one.
-        let existing = GeminiCreds {
-            access_token: Some("ya29.old".into()),
-            refresh_token: Some("1//old-refresh".into()),
-            token_type: Some("Bearer".into()),
-            expiry_date: Some(1_719_000_000_000),
-            scope: None,
-            id_token: Some("old.jwt".into()),
-        };
-        // New login: fresh access token, but NO refresh_token / id_token (the
-        // re-authorization case Google hits us with).
         let new_tok = OAuthToken {
             access_token: "ya29.new".into(),
             refresh_token: None,
@@ -4427,26 +4231,24 @@ mod tests {
             id_token: None,
             extra: None,
         };
-        let merged = merged_gemini_creds(&new_tok, Some(&existing));
-        assert_eq!(merged.access_token, Some("ya29.new".into()));
-        // CRITICAL: the old refresh_token survives the re-login.
-        assert_eq!(merged.refresh_token, Some("1//old-refresh".into()));
-        // The old id_token is also preserved (interchangeability with gemini-cli).
-        assert_eq!(merged.id_token, Some("old.jwt".into()));
-        assert_eq!(merged.expiry_date, Some(1_719_003_600_000)); // ms
+        let merged = merge_google_oauth_token(&new_tok, Some(&existing));
+        assert_eq!(merged.access_token, "ya29.new");
+        assert_eq!(merged.refresh_token.as_deref(), Some("1//old-refresh"));
+        assert_eq!(merged.id_token.as_deref(), Some("old.jwt"));
+        assert_eq!(merged.expires_at, 1_719_003_600);
     }
 
     #[test]
-    fn merged_gemini_creds_uses_new_refresh_when_google_returns_one() {
-        // When Google DOES return a new refresh_token (first-ever login, or a
-        // forced re-consent), the new one wins.
-        let existing = GeminiCreds {
-            access_token: Some("ya29.old".into()),
+    fn merge_google_oauth_uses_new_refresh_when_google_returns_one() {
+        let existing = OAuthToken {
+            access_token: "ya29.old".into(),
             refresh_token: Some("1//old-refresh".into()),
-            token_type: Some("Bearer".into()),
-            expiry_date: Some(1_719_000_000_000),
-            scope: None,
+            expires_at: 1_719_000_000,
+            client_id: Some(GOOGLE_CLIENT_ID.into()),
+            client_secret: Some(GOOGLE_CLIENT_SECRET.into()),
+            kind: "google".into(),
             id_token: None,
+            extra: None,
         };
         let new_tok = OAuthToken {
             access_token: "ya29.new".into(),
@@ -4458,9 +4260,9 @@ mod tests {
             id_token: Some("new.jwt".into()),
             extra: None,
         };
-        let merged = merged_gemini_creds(&new_tok, Some(&existing));
-        assert_eq!(merged.refresh_token, Some("1//new-refresh".into()));
-        assert_eq!(merged.id_token, Some("new.jwt".into()));
+        let merged = merge_google_oauth_token(&new_tok, Some(&existing));
+        assert_eq!(merged.refresh_token.as_deref(), Some("1//new-refresh"));
+        assert_eq!(merged.id_token.as_deref(), Some("new.jwt"));
     }
 
     #[test]

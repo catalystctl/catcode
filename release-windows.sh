@@ -101,5 +101,5 @@ echo
 echo "Install the MSI:   msiexec /i $(basename "$MSI")            (or double-click; no admin needed)"
 echo "Silent:            msiexec /i $(basename "$MSI") /quiet"
 echo "Run the standalone: .\\$(basename "$STANDALONE")            (no install; any CWD)"
-echo "First run inside catcode:  /key sk-...   then pick a model with /model"
+echo "First run inside catcode:  /login   then pick a model with /model"
 echo "Tip: the agent's bash tool needs bash on PATH (Git Bash or WSL)."

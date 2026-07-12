@@ -152,7 +152,6 @@ type goalPlanSnap struct {
 
 // Value-edit targets for modalValueEdit (stored in modal.editTarget).
 const (
-	editTargetAPIKey           = "api_key"
 	editTargetBashTimeout      = "bash_timeout"
 	editTargetIdleTimeout      = "idle_timeout"
 	editTargetMaxSessionTokens = "max_session_tokens"
@@ -317,10 +316,6 @@ func (s *session) openValueEditModal(target, title, placeholder, initial string)
 	ti.CursorEnd()
 	ti.Focus()
 	s.modal.editBuf = ti
-}
-
-func (s *session) openAPIKeyModal() {
-	s.openValueEditModal(editTargetAPIKey, "API Key", "sk-... (active provider)", "")
 }
 
 func (s *session) openBashTimeoutModal() {
@@ -535,17 +530,19 @@ func (s *session) providerItems() []listItem {
 			label = "▸ " + p.Label
 			if p.SupportsOauth && p.EnvVar == "" {
 				desc = "OAuth credentials on disk · enter to re-login · " + desc
+			} else if p.SupportsOauth {
+				desc = "stored credentials · enter to log in · " + desc
 			} else {
-				desc = "ready (key in " + p.EnvVar + ") · enter to log in · " + desc
+				desc = "stored API key · enter to log in · " + desc
 			}
 		default:
 			label = "▸ " + p.Label
 			if p.SupportsOauth && p.EnvVar == "" {
 				desc = "enter to log in via OAuth (SuperGrok / X Premium+) · " + desc
 			} else if p.SupportsOauth {
-				desc = "enter to log in via OAuth (browser) · or set " + p.EnvVar + " · " + desc
+				desc = "enter to log in via OAuth · or paste an API key · " + desc
 			} else {
-				desc = "enter key to log in · needs " + p.EnvVar + " · " + desc
+				desc = "enter to paste API key · " + desc
 			}
 		}
 		items = append(items, listItem{label: label, desc: desc, meta: p.ID, meta2: "preset"})
@@ -762,7 +759,6 @@ func (s *session) commandItems() []listItem {
 		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
 		{label: "/logout", desc: "log out of a provider"},
 		{label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
-		{label: "/key", desc: "set API key for active provider"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
 		{label: "/reasoning", desc: "set reasoning effort (per model)"},
@@ -872,7 +868,6 @@ func (s *session) reasoningItems() []listItem {
 func (s *session) settingsHubItems() []listItem {
 	return []listItem{
 		{label: "/login", desc: "provider · " + s.providerFieldLabel()},
-		{label: "/key", desc: "API key for active provider"},
 		{label: "/approval", desc: "safety gate · " + s.approvalMode()},
 		{label: "/reasoning", desc: "effort · " + s.settings.ReasoningEffort},
 		{label: "/theme", desc: "colour · " + activeTheme.name},
@@ -1811,8 +1806,6 @@ func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
 	switch label {
 	case "/login":
 		s.openLoginPicker()
-	case "/key":
-		s.openAPIKeyModal()
 	case "/approval", "/approvals":
 		s.openApprovalPicker()
 	case "/reasoning":
@@ -1877,11 +1870,10 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 			s.closeModal()
 			return s, nil
 		}
-		// Already logged in: let the user OVERRIDE the key (e.g. fix a bad env
-		// var that caused a 401). Opens the inline key-entry box; an empty submit
+		// Already logged in: let the user OVERRIDE the key (e.g. fix a bad
+		// key that caused a 401). Opens the inline key-entry box; an empty submit
 		// just switches to it instead of overriding. A pasted key replaces the
-		// provider's config with a literal key that takes precedence over the
-		// env var and is persisted, so the override survives restarts.
+		// provider's config with a literal key and is persisted.
 		if preset.LoggedIn {
 			s.pendingLogin = name
 			s.modal.editing = true
@@ -1891,7 +1883,9 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 			s.modal.editBuf.CursorEnd()
 			return s, nil
 		}
-		// A key is available from the env var: log in immediately, no prompt.
+		// Stored credentials from a prior login in this app (OAuth token or
+		// config key marker): re-bind without prompting. Env vars alone never
+		// count — the user must paste a key or complete OAuth.
 		if preset.HasKey {
 			s.sendCore(map[string]any{"type": "login", "preset": name})
 			s.logInfo("logging in to " + preset.Label)
@@ -1911,7 +1905,7 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 		s.pendingLogin = name
 		s.modal.editing = true
 		s.modal.editBuf.SetValue("")
-		s.modal.editBuf.Placeholder = "paste " + preset.EnvVar + " value"
+		s.modal.editBuf.Placeholder = "paste API key"
 		s.modal.editBuf.Focus()
 		s.modal.editBuf.CursorEnd()
 		return s, nil
@@ -2021,9 +2015,6 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 		return nil
 	case "/logout":
 		s.openLogoutPicker()
-		return nil
-	case "/key":
-		s.openAPIKeyModal()
 		return nil
 	case "/model":
 		s.openModelPicker()
@@ -2185,7 +2176,7 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 		s.closeModal()
 		return s, nil
 	}
-	// Dedicated value-edit modals (/key, /bash-timeout, /idle-timeout, …).
+	// Dedicated value-edit modals (/bash-timeout, /idle-timeout, …).
 	if s.modal.kind == modalValueEdit {
 		return s.commitValueEdit()
 	}
@@ -2200,23 +2191,6 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 	s.modal.editing = false
 	s.closeModal()
 	switch target {
-	case editTargetAPIKey:
-		if val == "" {
-			s.logError("no key entered")
-			return s, nil
-		}
-		name := s.activeProvider
-		if name == "" {
-			name = "default"
-		}
-		if s.settings.ProviderKeys == nil {
-			s.settings.ProviderKeys = map[string]string{}
-		}
-		s.settings.ProviderKeys[name] = val
-		s.settings.APIKey = val
-		_ = s.settings.save()
-		s.sendCore(map[string]any{"type": "set_key", "provider": name, "api_key": val})
-		s.logInfo(fmt.Sprintf("sending key for provider '%s'…", name))
 	case editTargetBashTimeout:
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
@@ -2412,7 +2386,6 @@ func (s *session) helpText() string {
 		"  /login           log in / switch provider (OpenAI · Gemini · Claude · xAI · Qwen · OpenRouter · …)",
 		"  /logout          log out of a provider",
 		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
-		"  /key             set API key for active provider",
 		"  /model           switch model",
 		"  /approval        never | destructive | always",
 		"  /reasoning       set reasoning effort (per model)",
@@ -2462,7 +2435,7 @@ func (s *session) helpText() string {
 		"    { \"name\": \"local\", \"kind\": \"openai\", \"base_url\": \"http://localhost:11434/v1\" }",
 		"  Select one at startup with `--provider <name>` or UMANS_ACTIVE_PROVIDER.",
 		"  Switch at runtime: /login (or /settings → /login).",
-		"  Each provider keeps its own key (/key stores per-provider).",
+		"  Each provider keeps its own key (set via /login).",
 	)
 	return strings.Join(lines, "\n")
 }
@@ -3182,7 +3155,7 @@ func (s *session) renderContextModal() string {
 }
 
 // renderValueEditModal renders a free-form edit box for a single setting
-// (API key, bash timeout, idle timeout, max session tokens). Built by hand
+// (bash timeout, idle timeout, max session tokens, …). Built by hand
 // (not via renderListModal) so the title is never treated as a list filter.
 func (s *session) renderValueEditModal() string {
 	w := s.modalWidth(72)
@@ -3191,11 +3164,7 @@ func (s *session) renderValueEditModal() string {
 		title = "Edit value"
 	}
 	val := s.modal.editBuf.Value()
-	// Mask API keys while typing.
 	display := val
-	if s.modal.editTarget == editTargetAPIKey && val != "" {
-		display = strings.Repeat("•", len(val))
-	}
 	if display == "" && s.modal.editBuf.Placeholder != "" {
 		display = s.modal.editBuf.Placeholder
 	}

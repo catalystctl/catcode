@@ -51,17 +51,17 @@ pub enum Command {
     SetProvider { name: String },
     /// List the built-in first-party provider presets (OpenAI/Codex, Gemini,
     /// Anthropic). Emits a `provider_presets` event so the TUI/web can render a
-    /// one-click "login" picker. Each entry carries whether a key is already
-    /// available (env var set) and whether the provider is logged in.
+    /// one-click "login" picker. Each entry carries whether a key or OAuth
+    /// token is already stored from a prior explicit `/login`.
     #[serde(rename = "list_provider_presets")]
     ListProviderPresets,
     /// Log in to a first-party provider (`openai` | `gemini` | `anthropic` | `xai` | …):
     /// create the provider config, set its API key, persist, and re-aggregate
     /// models so the provider's models appear in `/models` alongside any others
-    /// already logged in. An optional `api_key` overrides the preset's standard
-    /// env var; when omitted the key is read from the env var. Multiple
-    /// providers can be logged in at once; each turn routes to the selected
-    /// model's provider.
+    /// already logged in. Requires an explicit `api_key` paste (env vars are not
+    /// scanned). For OAuth subscription login use `login_oauth` instead.
+    /// Multiple providers can be logged in at once; each turn routes to the
+    /// selected model's provider.
     #[serde(rename = "login")]
     Login {
         preset: String,

@@ -998,7 +998,7 @@ func (s *session) reauthActiveProvider() {
 	if s.sendProviderKey(s.activeProvider) {
 		s.logInfo("sending key…")
 	} else {
-		s.logWarn("set your key: /key sk-...  (or /login)")
+		s.logWarn("not authenticated — run /login")
 	}
 }
 
@@ -1032,7 +1032,7 @@ func (s *session) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 // to the user as the originating slash command.
 func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
@@ -1173,7 +1173,7 @@ func splitChain(s string) string {
 
 func (s *session) sendSteer(prompt string) tea.Cmd {
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
@@ -1218,7 +1218,7 @@ func (s *session) steerFromInput() tea.Cmd {
 // busy across the hand-off instead of flashing "ready".
 func (s *session) queueFollowUp(text string) tea.Cmd {
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
@@ -1621,30 +1621,6 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				return nil
 			}
 			s.openLogoutPicker()
-			return nil
-		case "/key":
-			// /key <value> sets the API key for the active provider. Kept as a
-			// convenience because the app's "not authenticated" errors direct the
-			// user here ("run /key sk-... first"); the full multi-provider flow is
-			// /login. With no argument, /key opens a dedicated API-key modal.
-			if len(parts) < 2 {
-				s.openAPIKeyModal()
-				return nil
-			}
-			key := parts[1]
-			// Scope the key to the active provider (per-provider keys). Also keep the
-			// legacy single APIKey field in sync for the default/active provider.
-			if s.activeProvider == "" {
-				s.activeProvider = "default"
-			}
-			if s.settings.ProviderKeys == nil {
-				s.settings.ProviderKeys = map[string]string{}
-			}
-			s.settings.ProviderKeys[s.activeProvider] = key
-			s.settings.APIKey = key
-			_ = s.settings.save()
-			s.sendCore(map[string]any{"type": "set_key", "provider": s.activeProvider, "api_key": key})
-			s.logInfo(fmt.Sprintf("sending key for provider '%s'…", s.activeProvider))
 			return nil
 		case "/oauth-code":
 			// /oauth-code [code] completes a pending no-browser OAuth login (the
@@ -2069,7 +2045,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	}
 
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
@@ -2113,7 +2089,7 @@ func (s *session) sendAttach(imgPath, promptText string) tea.Cmd {
 		promptText = "Describe this image."
 	}
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
@@ -2163,7 +2139,7 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 		return nil
 	}
 	if !s.authed {
-		s.logError("not authenticated — run /key sk-... first")
+		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {

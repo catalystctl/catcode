@@ -178,7 +178,7 @@ pub struct Config {
     /// Per-provider API keys persisted by the TUI (settings.json `provider_keys`
     /// + the legacy `api_key` under "default"). Seeded into `State::api_keys` at
     ///   startup so they override config/env keys (runtime keys win in provider
-    ///   resolution) and survive restarts — this is what makes `/key` sticky.
+    ///   resolution) and survive restarts — this is what makes persisted keys sticky.
     pub persisted_keys: std::collections::HashMap<String, String>,
 }
 
@@ -322,18 +322,21 @@ pub struct ResolvedProvider {
     pub api_key: Option<String>,
     pub headers: Vec<(String, String)>,
     /// When true (Anthropic OAuth), the streaming/discovery path uses
-    /// `Authorization: Bearer <api_key>` + the `anthropic-beta: oauth-2025-04-20`
-    /// header instead of `x-api-key`. Set by `oauth::enrich_oauth` when a Claude
-    /// subscription token is used. (Gemini OAuth needs no flag: it reuses the
-    /// OpenAI Bearer path unchanged.)
+    /// `Authorization: Bearer <api_key>` + the `anthropic-beta:
+    /// claude-code-20250219,oauth-2025-04-20` identity header (and a `claude-cli`
+    /// User-Agent / `x-app: cli`, injected by `oauth::enrich_oauth`) instead of
+    /// `x-api-key` — Anthropic's gateway rejects subscription tokens without
+    /// the Claude Code fingerprint. Set when a Claude subscription token is used.
+    /// (Gemini OAuth needs no flag: it reuses the OpenAI Bearer path unchanged.)
     pub oauth: bool,
 }
 
 impl ResolvedProvider {
     /// The legacy/default provider when none are configured: OpenAI-shaped,
-    /// `cfg.base_url` for the URL, key resolved from `runtime_keys["default"]`
-    /// then the `UMANS_API_KEY` env var (backward-compatible with the pre-provider
-    /// single-endpoint setup).
+    /// `cfg.base_url` for the URL, key resolved only from `runtime_keys["default"]`
+    /// (set via explicit `/login` / `set_key`). Does **not** scan `UMANS_API_KEY`
+    /// or other env vars — a fresh install stays signed out until the user
+    /// provides a key or completes OAuth.
     pub fn legacy_default(
         cfg: &Config,
         runtime_keys: &std::collections::HashMap<String, String>,
@@ -341,7 +344,6 @@ impl ResolvedProvider {
         let api_key = runtime_keys
             .get("default")
             .cloned()
-            .or_else(|| std::env::var("UMANS_API_KEY").ok())
             .filter(|s| !s.is_empty());
         ResolvedProvider {
             name: "default".to_string(),
@@ -388,7 +390,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.code.umans.ai/v1",
         api_key_env: "UMANS_API_KEY",
         alt_envs: &[],
-        description: "Umans — GLM-5.2, the default provider. Uses your UMANS_API_KEY (https://app.umans.ai/billing → API Keys).",
+        description: "Umans — GLM-5.2, the default provider. Paste your API key via /login (https://app.umans.ai/billing → API Keys).",
     },
     ProviderPreset {
         id: "openai",
@@ -837,6 +839,10 @@ impl ProviderPreset {
     /// Resolve an API key for this preset from its env vars (primary first,
     /// then alternates). None when none are set. Empty `api_key_env` means
     /// OAuth-only (e.g. xAI SuperGrok) — always returns None.
+    ///
+    /// Not used for auto-login (auth is explicit via `/login` paste or OAuth).
+    /// Kept for diagnostics and for callers that intentionally opt into env lookup.
+    #[allow(dead_code)]
     pub fn env_key(&self) -> Option<String> {
         if self.api_key_env.is_empty() {
             return None;
@@ -1078,59 +1084,20 @@ pub fn save_providers_config(
     Ok(())
 }
 
-/// Auto-log-in to every first-party preset whose API key is already available
-/// in the environment (`UMANS_API_KEY`, `OPENAI_API_KEY`, ...). Gemini/Claude
-/// may also reuse their CLI OAuth stores; OpenAI/Codex deliberately does not —
-/// use this app's OAuth login so account selection is explicit. For each such
-/// preset that isn't already explicitly configured, add a provider entry. API-key
-/// providers store the env-var NAME only (the secret stays in the environment);
-/// OAuth providers store no key at all (the token is resolved + refreshed at
-/// turn time by `oauth::enrich_oauth`). Already-configured providers are left
-/// untouched. Returns the names added. NOT persisted — presence (env var / cred
-/// file) drives it every launch.
-pub fn auto_login_env_presets(cfg: &mut Config) -> Vec<String> {
-    let mut added = Vec::new();
-    for p in PROVIDER_PRESETS {
-        if cfg.find_provider(p.id).is_some() {
-            continue; // already configured (explicit login or prior session) — leave it.
-        }
-        // Auth available without a manual step?
-        let has_env_key = p.env_key().is_some();
-        let has_oauth = preset_has_oauth_creds(p);
-        if has_env_key || has_oauth {
-            // Most presets → one config; OpenCode Go → two (OpenAI-kind +
-            // Anthropic-kind) sharing the base URL + key.
-            let configs = preset_provider_configs(p, None);
-            for mut pc in configs {
-                // For Umans, honor a custom cfg.base_url (e.g. UMANS_BASE_URL)
-                // instead of the preset's default URL, so a custom proxy isn't
-                // silently overwritten.
-                if p.id == "umans" && !cfg.base_url.is_empty() {
-                    pc.base_url = cfg.base_url.clone();
-                }
-                if cfg.find_provider(&pc.name).is_none() {
-                    cfg.providers.push(pc);
-                }
-            }
-            added.push(p.id.to_string());
-        }
-    }
-    // If no active provider is set, prefer Umans (the default), else the first.
-    if cfg.active_provider.is_none() && !cfg.providers.is_empty() {
-        if cfg.find_provider("umans").is_some() {
-            cfg.active_provider = Some("umans".to_string());
-        } else {
-            cfg.active_provider = Some(cfg.providers[0].name.clone());
-        }
-    }
-    added
+/// Previously auto-added every preset whose env API key or third-party OAuth
+/// file was already present. That silently signed users in on first launch.
+/// Auth is now explicit only: paste an API key via `/login` or complete this
+/// app's OAuth flow. Kept as a no-op so call sites stay stable.
+pub fn auto_login_env_presets(_cfg: &mut Config) -> Vec<String> {
+    Vec::new()
 }
 
-/// True when a preset's reusable OAuth credentials exist (cheap sync file
-/// check). OpenAI/Codex is intentionally excluded: no Codex CLI auto-detect.
-/// xAI is included so a prior SuperGrok OAuth login reappears on restart.
-fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
+/// True when a preset's reusable OAuth credentials exist in **this app's**
+/// store (cheap sync file check). Does not scan env vars or third-party CLIs
+/// (Claude CLI, gemini-cli, gcloud ADC).
+pub fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
     match p.id {
+        "openai" => crate::oauth::has_codex_creds(),
         "gemini" => crate::oauth::has_google_creds(),
         "anthropic" => crate::oauth::has_claude_creds(),
         "xai" => crate::oauth::has_xai_creds(),
@@ -1166,8 +1133,9 @@ impl Config {
     ///   3. the legacy default (OpenAI, `cfg.base_url`) when none are configured
     ///
     /// API key for the resolved provider:
-    ///   runtime_keys[name] -> provider.api_key -> provider.api_key_env (env) ->
-    ///   (legacy default only) `UMANS_API_KEY` env. Empty values are dropped.
+    ///   runtime_keys[name] -> provider.api_key -> provider.api_key_env (env).
+    /// Empty values are dropped. The legacy default (no providers configured)
+    /// only uses runtime_keys["default"] — it does not scan env vars.
     pub fn resolve_provider(
         &self,
         runtime_keys: &std::collections::HashMap<String, String>,
@@ -1903,7 +1871,7 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     // Per-provider API keys persisted by the TUI (settings.json `provider_keys`)
     // and the legacy single `api_key`. These seed the runtime key map at
-    // startup (see main.rs) so a key set via `/key` or the settings modal
+    // startup (see main.rs) so a key set via `/login` or the settings modal
     // survives a restart and overrides config/env keys (runtime keys win).
     if let Some(obj) = v.get("provider_keys").and_then(|x| x.as_object()) {
         for (name, key) in obj {
@@ -2133,10 +2101,8 @@ mod tests {
 
     #[test]
     fn resolve_provider_legacy_default_when_none_configured() {
-        // Isolate from the developer's shell: legacy_default reads UMANS_API_KEY.
-        let saved = std::env::var("UMANS_API_KEY").ok();
-        std::env::remove_var("UMANS_API_KEY");
-
+        // Fresh install: no providers configured and no runtime key → unsigned.
+        // Env vars like UMANS_API_KEY must NOT auto-authenticate.
         let c = Config {
             base_url: "https://example.test/v1".into(),
             ..Default::default()
@@ -2148,10 +2114,11 @@ mod tests {
         assert_eq!(r.base_url, "https://example.test/v1");
         assert!(r.api_key.is_none());
 
-        match saved {
-            Some(v) => std::env::set_var("UMANS_API_KEY", v),
-            None => std::env::remove_var("UMANS_API_KEY"),
-        }
+        // Explicit runtime key still works.
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("default".to_string(), "sk-runtime".to_string());
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.api_key.as_deref(), Some("sk-runtime"));
     }
 
     #[test]
@@ -2288,7 +2255,7 @@ mod tests {
     // The TUI persists API keys to settings.json as `provider_keys` (a
     // name->key map) + the legacy `api_key`, and the active provider as
     // snake_case `active_provider`. The core must read these so a key set via
-    // /key survives a restart and overrides config/env (it seeds runtime
+    // A persisted key survives a restart and overrides config/env (it seeds runtime
     // keys, which win in resolution).
     #[test]
     fn apply_json_loads_tui_persisted_keys() {

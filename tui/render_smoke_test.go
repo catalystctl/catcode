@@ -59,7 +59,7 @@ func TestRenderSmoke(t *testing.T) {
 	tb.dur = 1400000000
 	s.invalidateAll()
 
-	s.push(blkError).text.WriteString("not authenticated — run /key sk-... first")
+	s.push(blkError).text.WriteString("not authenticated — run /login first")
 	s.invalidateAll()
 
 	// flat layout: role glyphs + content, tool output in a │ panel

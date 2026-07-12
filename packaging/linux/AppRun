@@ -7,7 +7,7 @@
 #
 # Run ./catcode-<ver>-x86_64.AppImage from a terminal to launch the TUI in that
 # terminal, in the current directory (the workspace is your CWD). First run:
-# /key sk-... then /model, then type a prompt.
+# /login then /model, then type a prompt.
 set -e
 # APPDIR is set by the AppImage runtime to the mount point; fall back to this
 # script's dir for extracted/unpacked runs.

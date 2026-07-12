@@ -44,11 +44,11 @@ found automatically when running from `web/`. To point at a different build, set
 
 ## API key & workspace
 
-- **API key**: read from the TUI's `~/.config/catalyst-code/settings.json` (`api_key`)
-  on startup and forwarded to the core via `UMANS_API_KEY`, so the web app
-  authenticates with the same key the TUI uses — no re-entry. If none is found, a
-  key-entry overlay is shown; submit it there (sends the `set_key` command).
-  You can also set `UMANS_API_KEY` in the environment.
+- **API key**: the web layer does not inject keys. Use `/login` in the UI to
+  paste a key or complete OAuth. Keys previously saved via `/login`
+  (`~/.config/catalyst-code/settings.json` `provider_keys`) are loaded by the
+  core for returning users. A key-entry overlay appears when nothing is
+  configured.
 - **Workspace**: defaults to the repo root (the directory containing the located
   `core/` binary). Override with `CATALYST_CODE_WORKSPACE=/path/to/project`. The
   workspace constrains all file/bash operations the agent performs.

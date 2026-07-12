@@ -51,6 +51,7 @@ export interface AgentApi {
   setKey: (key: string) => Promise<void>;
   setProvider: (name: string) => Promise<void>;
   login: (preset: string, key?: string) => Promise<void>;
+  loginOauth: (preset: string) => Promise<void>;
   logout: (provider: string) => Promise<void>;
   listProviderPresets: () => Promise<void>;
   setModel: (id: string) => void;
@@ -369,13 +370,19 @@ export function useAgent(): AgentApi {
     [send, post],
   );
 
-  // Log in to a first-party provider (OpenAI/Codex, Gemini, Anthropic). When
-  // no key is passed the core reads it from the preset's standard env var.
-  // Multiple providers can be logged in at once; the core re-aggregates models
-  // so the provider's models appear in /models alongside any others.
+  // Log in to a first-party provider. Requires an explicitly pasted API key
+  // (or stored OAuth creds from a prior login in this app). Does not scan env.
   const login = useCallback(
     async (preset: string, key?: string) => {
       await send({ type: "login", preset, api_key: key });
+    },
+    [send],
+  );
+
+  // Start this app's OAuth subscription login (browser / device-code).
+  const loginOauth = useCallback(
+    async (preset: string) => {
+      await send({ type: "login_oauth", preset });
     },
     [send],
   );
@@ -731,6 +738,7 @@ export function useAgent(): AgentApi {
       setKey,
       setProvider,
       login,
+      loginOauth,
       logout,
       listProviderPresets,
       setModel,

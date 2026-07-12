@@ -2541,7 +2541,7 @@ fn parse_memory_provider_stdout(stdout: &str) -> MemoryProviderResult {
                 .cloned()
                 .unwrap_or_default();
             let output = if output.is_empty() && !ok {
-                format!("memory_provider failed (action response had ok=false)")
+                "memory_provider failed (action response had ok=false)".to_string()
             } else {
                 output
             };

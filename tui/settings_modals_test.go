@@ -106,7 +106,6 @@ func TestDedicatedSettingCommandsOpenModals(t *testing.T) {
 		cmd  string
 		kind modalKind
 	}{
-		{"/key", modalValueEdit},
 		{"/reasoning", modalReasoning},
 		{"/theme", modalTheme},
 		{"/bash-timeout", modalValueEdit},
@@ -176,27 +175,6 @@ func TestApprovalPickerSelectAppliesMode(t *testing.T) {
 	}
 	if s.settings.Approval != "always" {
 		t.Errorf("settings.Approval = %q, want always", s.settings.Approval)
-	}
-}
-
-// TestValueEditAPIKeyCommit: typing a key in the /key modal and pressing Enter
-// scopes it to the active provider.
-func TestValueEditAPIKeyCommit(t *testing.T) {
-	s := initialSession()
-	s.ready = true
-	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
-	s.activeProvider = "umans"
-	s.openAPIKeyModal()
-	if s.modal.kind != modalValueEdit || s.modal.editTarget != editTargetAPIKey {
-		t.Fatalf("expected API key value-edit modal, got kind=%v target=%q", s.modal.kind, s.modal.editTarget)
-	}
-	s.modal.editBuf.SetValue("sk-test-from-modal")
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if s.modal.kind != modalNone {
-		t.Fatalf("modal should close, kind=%v", s.modal.kind)
-	}
-	if got := s.settings.ProviderKeys["umans"]; got != "sk-test-from-modal" {
-		t.Errorf("ProviderKeys[umans]=%q, want sk-test-from-modal", got)
 	}
 }
 

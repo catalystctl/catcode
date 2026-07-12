@@ -34,9 +34,11 @@ interface HarnessSettings {
   provider?: string;
 }
 
-/** Read the TUI's settings.json (~/.config/catalyst-code/settings.json) so the web
- *  app auto-authenticates with the same key the TUI uses — no re-entry needed.
- *  The core itself does not read settings.json (the TUI forwards the key via env). */
+/** Read the TUI's settings.json (~/.config/catalyst-code/settings.json) for
+ *  model/baseUrl/provider prefs. API keys are not auto-injected from the
+ *  environment — users paste a key or complete OAuth via `/login`. Keys already
+ *  saved in settings (`api_key` / `provider_keys`) are still loaded by the core
+ *  from that file for returning users. */
 function loadSettings(): HarnessSettings {
   const path = join(homedir() || ".", ".config", "catalyst-code", "settings.json");
   try {
@@ -44,7 +46,7 @@ function loadSettings(): HarnessSettings {
     const raw = readFileSync(path, "utf8");
     const s = JSON.parse(raw) as Record<string, unknown>;
     const out: HarnessSettings = {};
-    if (typeof s.api_key === "string" && s.api_key) out.apiKey = s.api_key;
+    // Do not forward api_key via UMANS_API_KEY — that was silent env auth.
     if (typeof s.model === "string" && s.model) out.model = s.model;
     if (typeof s.base_url === "string" && s.base_url) out.baseUrl = s.base_url;
     if (typeof s.provider === "string" && s.provider) out.provider = s.provider;

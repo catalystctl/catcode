@@ -160,7 +160,7 @@ impl ProviderUsage {
 }
 
 /// Dispatch usage fetch for the resolved provider. Detects Umans / Codex /
-/// Anthropic OAuth (subscription) endpoints; everything else returns a clear
+/// Anthropic OAuth / xAI endpoints; everything else returns a clear
 /// "not available" message so `/usage` never hard-errors.
 pub async fn fetch_provider_usage(
     client: &reqwest::Client,
@@ -785,7 +785,9 @@ async fn fetch_anthropic_oauth_usage(
     let resp = client
         .get(url)
         .bearer_auth(access_token)
-        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA)
+        .header("user-agent", crate::oauth::CLAUDE_OAUTH_USER_AGENT)
+        .header("x-app", crate::oauth::CLAUDE_OAUTH_X_APP)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(10))
@@ -4740,12 +4742,14 @@ async fn send_anthropic_request(
             .header("content-type", "application/json")
             .json(body);
         if provider.oauth {
-            // Claude.ai subscription (OAuth): Bearer token + the oauth beta header
-            // instead of x-api-key, reusing the same Messages endpoint.
+            // Claude.ai subscription (OAuth): Bearer token + the claude-code
+            // identity beta (Anthropic's gateway requires it for subscription
+            // tokens). UA/x-app come from provider.headers (injected by
+            // enrich_oauth). Reuses the same Messages endpoint as the API-key path.
             if let Some(k) = provider.api_key.as_deref() {
                 req = req.header("authorization", format!("Bearer {k}"));
             }
-            req = req.header("anthropic-beta", "oauth-2025-04-20");
+            req = req.header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA);
         } else if let Some(k) = provider.api_key.as_deref() {
             req = req.header("x-api-key", k);
         }
@@ -5175,7 +5179,7 @@ async fn discover_models_anthropic(
         if let Some(k) = provider.api_key.as_deref() {
             req = req.header("authorization", format!("Bearer {k}"));
         }
-        req = req.header("anthropic-beta", "oauth-2025-04-20");
+        req = req.header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA);
     } else if let Some(k) = provider.api_key.as_deref() {
         req = req.header("x-api-key", k);
     }

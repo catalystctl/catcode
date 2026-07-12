@@ -1,9 +1,12 @@
 // AuthStorage — the symbols pi-web imports from `pi-coding-agent`'s auth layer.
 //
-// The catalyst-code core resolves API keys from (1) `--provider`/config
-// provider `api_key_env`/`api_key`, (2) `UMANS_API_KEY` env, (3) a runtime key
-// pushed via the `set_key` command. This class is the bridge: keys set here are
-// forwarded to a spawned core via `set_key` (handled by `AgentSession`).
+// The catalyst-code core resolves API keys from (1) an explicit `/login` paste
+// or `set_key`, (2) this app's OAuth store under `~/.config/catalyst-code/oauth/`.
+// A fresh install with no configured provider does not scan env vars; a
+// provider explicitly configured with `api_key_env` reads the env var at
+// request time. Third-party CLI credential files are not used for auth.
+// This class is the bridge: keys set here are forwarded to a spawned core via
+// `set_key` (handled by `AgentSession`).
 
 import type { AuthCredential } from "./auth-types.js";
 

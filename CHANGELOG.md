@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Removed — `/key` slash command
+- `/login` already covers API-key paste, key override, and OAuth; `/logout`
+  clears credentials. The redundant `/key` convenience command is gone.
+- Auth error / first-run copy now points at `/login`. The `set_key` protocol
+  remains for SDK/web/reauth.
+
 ### Added — PI-compatible bang bash (`!` / `!!`)
 - Type `!command` in the TUI or web composer to run bash in the workspace and
   add the output to model context (next turn sees it). Use `!!command` to run

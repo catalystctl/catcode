@@ -254,39 +254,23 @@ fn emit_skills_event(workspace: &std::path::Path) {
 }
 
 /// Build the JSON array of first-party provider presets for the `ready` and
-/// `provider_presets` events. Each entry tells the client whether a key is
-/// already available (env var set, or a literal key in the provider config)
-/// and whether the provider is already logged in — so a picker can show
-/// "log in" vs "log out" and warn when a key is missing.
+/// `provider_presets` events. Each entry tells the client whether a key or
+/// OAuth token is already stored from a prior explicit `/login` in this app
+/// — so a picker can show "log in" vs "log out". Env vars and third-party
+/// CLI credentials are never treated as signed-in.
 fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> Vec<Value> {
     let mut out: Vec<Value> = config::PROVIDER_PRESETS
         .iter()
         .map(|p| {
             let configured = cfg.find_provider(p.id).is_some();
-            // Auth available = API key (env/config literal) OR reusable OAuth
-            // creds. OpenAI/Codex uses only this app's OAuth store; no
-            // ~/.codex/auth.json auto-detect.
-            let has_oauth = match p.id {
-                "openai" => oauth::has_codex_creds(),
-                "gemini" => oauth::has_google_creds(),
-                "anthropic" => oauth::has_claude_creds(),
-                "xai" => oauth::has_xai_creds(),
-                "qwen" => oauth::has_qwen_creds(),
-                "github" => oauth::has_github_creds(),
-                "kimi-coding" => oauth::has_kimi_coding_creds(),
-                "kilocode" => oauth::has_kilocode_creds(),
-                "cline" => oauth::has_cline_creds(),
-                "clinepass" => oauth::has_clinepass_creds(),
-                "kimchi" => oauth::has_kimchi_creds(),
-                "codebuddy-cn" => oauth::has_codebuddy_creds(),
-                "iflow" => oauth::has_iflow_creds(),
-                _ => false,
-            };
-            let has_key = p.env_key().is_some()
-                || cfg
-                    .find_provider(p.id)
-                    .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
-                    .is_some()
+            // Auth available = literal key already in config OR this app's
+            // OAuth store. Do not treat env vars or third-party CLI creds as
+            // signed-in — the user must paste a key or complete /login OAuth.
+            let has_oauth = config::preset_has_oauth_creds(p);
+            let has_key = cfg
+                .find_provider(p.id)
+                .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
+                .is_some()
                 || has_oauth;
             let logged_in = configured && has_key;
             json!({
@@ -1391,13 +1375,9 @@ async fn main() {
         );
     }
     let mut cfg = config::load();
-    // Auto-log-in to every first-party preset whose key is already in the
-    // environment (UMANS_API_KEY, OPENAI_API_KEY, ...), so providers show as
-    // logged in and their models appear in /models without a manual /login.
-    let auto_logged = config::auto_login_env_presets(&mut cfg);
-    if !auto_logged.is_empty() {
-        eprintln!("[umans] auto-logged in: {}", auto_logged.join(", "));
-    }
+    // Explicit auth only — do not scan env vars or third-party OAuth stores.
+    // Users must `/login` with an API key or complete this app's OAuth flow.
+    let _ = config::auto_login_env_presets(&mut cfg);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1521,7 +1501,7 @@ async fn main() {
     }
 
     // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
-    // (read from settings.json by Config::load). A key set via `/key` or the
+    // (read from settings.json by Config::load). A key set via `/login` or the
     // settings modal is saved by the TUI into settings.json; loading it here
     // makes it survive a restart and take precedence over provider config/env
     // keys (runtime keys are checked first in provider resolution).
@@ -1850,10 +1830,23 @@ async fn main() {
                     ));
                     return;
                 };
-                // API-key path: accept an explicit key or env key. OAuth-capable
-                // presets (xAI, Qwen, OpenAI/Gemini/Claude) also work with no
-                // key via /login's OAuth branch when supports_login is true.
-                let key = api_key.or_else(|| p.env_key());
+                // API-key path: require an explicitly pasted key. Do not scan
+                // the environment. OAuth-capable presets use `login_oauth`
+                // instead; a keyless `login` is only allowed when this app
+                // already has OAuth creds on disk (re-bind after logout of
+                // config) or the preset is OAuth-only (empty env var name).
+                let key = api_key.filter(|s| !s.is_empty());
+                if key.is_none() && !config::preset_has_oauth_creds(p) && !p.api_key_env.is_empty()
+                {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "no API key provided for '{}' — paste a key via /login, or use OAuth login when supported",
+                            p.label
+                        )),
+                    ));
+                    return;
+                }
                 let configs = config::preset_provider_configs(p, key.clone());
                 let name = configs[0].name.clone();
                 // Insert or replace each provider config (e.g. opencode-go +
@@ -1902,9 +1895,9 @@ async fn main() {
                 emit(&Event::new("info").with(
                     "message",
                     json!(if key.is_some() {
-                        format!("logged into {} (key from {}).", p.label, p.resolved_env())
+                        format!("logged into {}.", p.label)
                     } else {
-                        format!("logged into {}, but no API key found — export {} or /login again with a key.", p.label, p.resolved_env())
+                        format!("logged into {} (using stored OAuth credentials).", p.label)
                     }),
                 ));
                 emit(
@@ -3703,6 +3696,15 @@ async fn start_turn(
     *state.handle.lock().await = Some(handle);
 }
 
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .map(str::to_string)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(non-string panic payload)".into())
+}
+
 /// Run one assistant turn, then drain a queued prompt (one-deep) into another
 /// turn. Shared by `send` (idle start) and `steer` (idle fallback) so the
 /// queue-drain logic and the `current` token hand-off live in one place. A
@@ -3738,10 +3740,15 @@ fn run_turn_and_drain(
         // freed bytes in its arenas, so RSS creeps up and never falls — trim the
         // heap back to the OS once per turn to bound long-session growth.
         trim_heap();
-        if let Err(_panic) = result {
+        if let Err(panic) = result {
+            let detail = panic_payload_message(&panic);
+            st.logger
+                .log("turn_error", json!({ "error": format!("panic: {detail}") }));
             emit(&Event::new("error").with(
                 "message",
-                json!("turn terminated unexpectedly (panic); please retry"),
+                json!(format!(
+                    "turn terminated unexpectedly (panic): {detail}; please retry"
+                )),
             ));
             emit(&Event::new("done"));
             return;

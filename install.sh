@@ -1195,7 +1195,7 @@ summary_install() {
     else
       log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
     fi
-    log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
+    log_warn "Auth: on first launch use /login to paste an API key or complete OAuth — nothing is auto-detected."
     if [[ "$HOST" != "127.0.0.1" ]]; then
       log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
     fi
@@ -1239,7 +1239,7 @@ summary_add_web() {
   else
     log_info "Web service logs:  journalctl -u $UNIT_NAME -f"
   fi
-  log_warn "Auth: ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY."
+  log_warn "Auth: on first launch use /login to paste an API key or complete OAuth — nothing is auto-detected."
 }
 
 # ── interactive menu (no args + a terminal) ──────────────────

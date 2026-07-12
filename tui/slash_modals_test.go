@@ -24,7 +24,6 @@ func TestBareArgCommandsOpenModals(t *testing.T) {
 		{"/parallel", modalValueEdit, editTargetParallel},
 		{"/chain", modalValueEdit, editTargetChain},
 		{"/compact", modalValueEdit, editTargetCompact},
-		{"/key", modalValueEdit, editTargetAPIKey},
 		{"/oauth-code", modalOauthCode, ""},
 		{"/approval", modalApproval, ""},
 		{"/reasoning", modalReasoning, ""},

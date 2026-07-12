@@ -26,7 +26,7 @@ Or run it directly from anywhere without installing:
 
 First run inside catcode
 --------------------
-    /key sk-...        set your Umans API key (https://app.umans.ai/billing)
+    /login             log in (API key or OAuth) — https://app.umans.ai/billing
     /model             list models / pick one (e.g. /model glm-5.2)
     <type a prompt>    chat with the agent
 

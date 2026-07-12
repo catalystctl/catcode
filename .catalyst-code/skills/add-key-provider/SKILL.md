@@ -108,8 +108,9 @@ Fields (`parse_provider`, `config.rs:1278`):
   **name** (preferred; secret stays in env). One or the other; `api_key` wins.
 - `headers` — extra HTTP headers, `[[key,val],…]`.
 
-Then: `export MY_PROVIDER_API_KEY=sk-...` and restart the core (or use
-`/login` → the picker lists presets + any configured providers).
+Then: use `/login` to paste the API key, add the provider via config with a
+literal `api_key`, or set `api_key_env` and export the named env var (read at
+request time). A fresh install with no configured provider stays signed out.
 
 **What you CANNOT do via config today** (these are the gaps — see the review's
 proposed schema): override the model-discovery *endpoint path*, declare a custom

@@ -64,7 +64,7 @@ func TestLoginKeyEntryEnterCommits(t *testing.T) {
 }
 
 // TestLoginKeyEntryEnterUnboundSelect: the app's error messages tell users to
-// "run /key sk-... first", and /keybinds can clear the select binding — so
+// "run /login first", and /keybinds can clear the select binding — so
 // committing a pasted key with Enter must keep working even with select unbound
 // (the guaranteed-escape pattern every other select handler already follows).
 func TestLoginKeyEntryEnterUnboundSelect(t *testing.T) {
@@ -93,33 +93,5 @@ func TestLoginKeyEntryEnterUnboundSelect(t *testing.T) {
 	}
 	if s.settings.ProviderKeys["umans"] != "sk-x" {
 		t.Errorf("key not committed; ProviderKeys=%v", s.settings.ProviderKeys)
-	}
-}
-
-// TestKeyCommandSetsActiveProviderKey: /key <value> (deleted then restored) must
-// set the API key for the active provider, since the app's "not authenticated"
-// errors direct users to "run /key sk-... first".
-func TestKeyCommandSetsActiveProviderKey(t *testing.T) {
-	s := initialSession()
-	s.keybinds = defaultKeybinds()
-	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
-	s.ready = true
-	s.width, s.height = 80, 24
-	s.activeProvider = "umans"
-
-	// Simulate the user typing "/key sk-abc" and pressing Enter.
-	cmd := s.handleUserLine("/key sk-abc")
-	_ = cmd
-
-	if s.settings.ProviderKeys["umans"] != "sk-abc" {
-		t.Errorf("ProviderKeys[umans] = %q, want sk-abc", s.settings.ProviderKeys["umans"])
-	}
-	if s.settings.APIKey != "sk-abc" {
-		t.Errorf("APIKey = %q, want sk-abc", s.settings.APIKey)
-	}
-	// sendCore is a no-op without a running core; assert it didn't crash and
-	// state is consistent. Re-auth path should now report a key is present.
-	if !s.sendProviderKey("umans") {
-		t.Error("sendProviderKey(umans) should report a key is available after /key")
 	}
 }

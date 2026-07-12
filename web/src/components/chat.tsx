@@ -192,10 +192,9 @@ export function Chat() {
         return;
       }
       case "login": {
-        // Pick a preset to log in to. After choosing, prompt for the key only
-        // when none is available from the environment (the core resolves env
-        // keys automatically when no key is passed). A logged-in provider can
-        // be re-keyed here to override a bad env var (e.g. fix a 401).
+        // Pick a preset to log in to. After choosing, either start the OAuth
+        // flow or paste an API key. A logged-in provider can be re-keyed here
+        // (e.g. to override a bad key that caused a 401).
         a.listProviderPresets();
         const presets = a.state?.providerPresets ?? [];
         const opts = presets
@@ -204,6 +203,7 @@ export function Chat() {
         const idx = window.prompt(
           `Log in / switch provider. Pick by number:\n\n${opts}`,
         );
+        if (idx === null || idx.trim() === "") return; // cancelled or blank
         const n = Number(idx);
         if (Number.isNaN(n) || n < 0 || n >= presets.length) return;
         const p = presets[n];
@@ -211,7 +211,7 @@ export function Chat() {
           // Already logged in — offer to override the key (empty = just switch).
           const key = window.prompt(
             `${p.label} is logged in. Paste a new key to OVERRIDE it\n` +
-              `(e.g. to fix a bad ${p.envVar} that caused a 401).\n` +
+              `(e.g. to fix a bad key that caused a 401).\n` +
               `Leave blank to just switch to it.`,
           );
           if (key === null) return; // cancelled
@@ -222,9 +222,29 @@ export function Chat() {
           }
           return;
         }
-        const key = p.hasKey ? undefined : window.prompt(`Paste ${p.envVar}:`);
-        if (!p.hasKey && !key?.trim()) return;
-        void a.login(p.id, key?.trim() || undefined);
+        // Stored credentials from a prior login in this app — re-bind.
+        if (p.hasKey) {
+          void a.login(p.id);
+          return;
+        }
+        // OAuth-capable: offer OAuth (Enter) or an API key (paste). Otherwise
+        // only an API key makes sense.
+        if (p.supportsOauth) {
+          const key = window.prompt(
+            `${p.label} supports OAuth.\n` +
+              `Press Enter to start the browser/device flow, or paste an API key:`,
+          );
+          if (key === null) return; // cancelled
+          if (key.trim()) {
+            void a.login(p.id, key.trim());
+          } else {
+            void a.loginOauth(p.id);
+          }
+          return;
+        }
+        const key = window.prompt(`Paste API key for ${p.label}:`);
+        if (!key?.trim()) return;
+        void a.login(p.id, key.trim());
         return;
       }
       case "logout": {
@@ -236,6 +256,7 @@ export function Chat() {
         }
         const opts = loggedIn.map((p) => `  ${p.label}`).join("\n");
         const idx = window.prompt(`Log out of which provider? Pick by number:\n\n${opts}`);
+        if (idx === null || idx.trim() === "") return; // cancelled or blank
         const n = Number(idx);
         if (Number.isNaN(n) || n < 0 || n >= loggedIn.length) return;
         void a.logout(loggedIn[n].id);
@@ -676,7 +697,7 @@ function KeyOverlay({
           {busy ? "Connecting…" : "Connect"}
         </button>
         <p className="mt-3 text-center text-[11px] text-ink-500">
-          Or set <code className="font-mono text-ink-400">UMANS_API_KEY</code> before launching the server.
+          Paste a key here, or use <code className="font-mono text-ink-400">/login</code> for OAuth.
         </p>
       </div>
     </div>
