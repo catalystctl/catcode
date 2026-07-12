@@ -20,13 +20,64 @@ pub fn classify(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
         | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
-        | "memory" | "goal_write_plan" => ToolKind::ReadOnly,
+        | "memory" | "goal_write_plan" | "load_tools" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
         "workspace_activity" => ToolKind::ReadOnly,
         // delete/rename/mkdir mutate the tree — always gated under Destructive.
         _ => ToolKind::Destructive,
     }
+}
+
+/// Tools always included in the main agent's request schema (cheap, high-use).
+pub fn is_core_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "edit"
+            | "write_file"
+            | "delete"
+            | "rename"
+            | "mkdir"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "bash"
+            | "todo_write"
+            | "todo_read"
+            | "finish"
+            | "memory"
+            | "ask"
+            | "load_tools"
+            | "subagent"
+            | "patch"
+    )
+}
+
+/// Deferred tools — enabled via `load_tools` (or goal planning for goal_write_plan).
+pub fn is_deferred_tool(name: &str) -> bool {
+    deferred_tool_names().contains(&name)
+}
+
+/// Names of built-in tools that are not in the core set.
+pub fn deferred_tool_names() -> &'static [&'static str] {
+    &[
+        "bulk",
+        "bulk_read",
+        "bulk_write",
+        "bulk_edit",
+        "goal_write_plan",
+        "diagnostics",
+        "fetch",
+        "web_search",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "workspace_activity",
+        "git_add",
+        "git_commit",
+        "spawn",
+    ]
 }
 
 /// Whether `name` is a built-in tool (one returned by [`definitions`]).
@@ -61,22 +112,22 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "subagent",
-                "description": "Delegate work to a focused child agent (scout, reviewer, worker, oracle, planner, researcher, context-builder, delegate, or a custom agent). Supports single, parallel, chain, and dynamic workflows, plus agent/chain management and async status/control. A subagent can prompt the orchestrator for decisions via contact_supervisor and talk to peer subagents via intercom when the setup allows it.",
+                "description": "Delegate to a child agent (scout/reviewer/worker/oracle/planner/researcher/context-builder/delegate/custom). Modes: single, parallel (tasks), chain, plus management actions (list/status/interrupt/resume/peek/steer/doctor).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["list","get","models","create","update","delete","status","interrupt","resume","peek","steer","doctor"], "description": "management/control action. peek: inspect a running subagent's conversation state (messages, tokens, last turns). steer: inject a directional message into a running subagent's conversation to bump its course or unstick it." },
+                        "action": { "type": "string", "enum": ["list","get","models","create","update","delete","status","interrupt","resume","peek","steer","doctor"], "description": "management/control action" },
                         "agent": { "type": "string", "description": "agent name for single mode or target for management" },
                         "task": { "type": "string", "description": "task string for single mode" },
                         "model": { "type": "string", "description": "override model for this run" },
-                        "tasks": { "type": "array", "description": "top-level parallel tasks: each {agent, task, model?, count?}" },
-                        "chain": { "type": "array", "description": "sequential chain steps; a step is {agent, task, as?, parallel?:[...], concurrency?}" },
+                        "tasks": { "type": "array", "description": "parallel tasks: each {agent, task, model?, count?}" },
+                        "chain": { "type": "array", "description": "sequential steps: {agent, task, as?, parallel?, concurrency?}" },
                         "concurrency": { "type": "integer", "description": "parallel concurrency (default from config)" },
                         "worktree": { "type": "boolean" },
-                        "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent conversation" },
+                        "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent" },
                         "async": { "type": "boolean", "description": "background execution" },
                         "id": { "type": "string", "description": "run id for status/interrupt/resume/peek/steer" },
-                        "message": { "type": "string", "description": "follow-up message for resume, or steering text for steer" },
+                        "message": { "type": "string", "description": "follow-up for resume, or steering text for steer" },
                         "config": { "type": "object", "description": "agent/chain config for create/update" },
                         "agentScope": { "type": "string", "enum": ["user","project","both"] }
                     }
@@ -121,7 +172,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file. Default: plain content for edit's exact search/replace. Large files auto-window (first N lines) — pass offset/limit to page. Set line_numbers:true for navigation/citations (do NOT copy numbered lines into edit search). Paths are workspace-relative.",
+                "description": "Read a file (workspace-relative). Large files auto-window; pass offset/limit to page. Prefer grep to locate first. line_numbers:true for citations only — never copy numbered lines into edit search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -138,7 +189,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Apply search-and-replace edits to a file. Read it first with read_file to see the exact content, then call edit with search/replace pairs. Each 'search' string must match the file content EXACTLY (copy it verbatim, including whitespace) and must be unique in the file; 'replace' is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in 'replace'. Set 'replace_all': true to replace every occurrence instead of requiring a unique match. Set 'normalize_whitespace': true to match on whitespace-collapsed text (runs of whitespace become a single space) so indentation/spacing drift still lands — the replacement edits the real text region. All edits in one call apply atomically — if any 'search' is not found or is ambiguous (matches more than once without replace_all) the file is left unchanged; re-read and correct the search text. Use write_file only for new files or full rewrites.",
+                "description": "Search/replace edits on a file. Read first; each search must match exactly and be unique (or set replace_all). Empty replace deletes. normalize_whitespace tolerates indent drift. All edits apply atomically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -148,10 +199,10 @@ pub fn definitions() -> Vec<Value> {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "search": { "type": "string", "description": "exact text to find in the file (must be unique; copy it verbatim from read_file output)" },
-                                    "replace": { "type": "string", "description": "replacement text (empty string = delete the search text)" },
-                                    "replace_all": { "type": "boolean", "description": "replace every occurrence instead of requiring a unique match" },
-                                    "normalize_whitespace": { "type": "boolean", "description": "match on whitespace-collapsed text so indentation/spacing drift still lands" }
+                                    "search": { "type": "string", "description": "exact text to find (unique unless replace_all)" },
+                                    "replace": { "type": "string", "description": "replacement (empty = delete)" },
+                                    "replace_all": { "type": "boolean", "description": "replace every occurrence" },
+                                    "normalize_whitespace": { "type": "boolean", "description": "match whitespace-collapsed text" }
                                 },
                                 "required": ["search", "replace"]
                             }
@@ -273,7 +324,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a bash command in the workspace root. Returns combined stdout+stderr (truncated to 32KB). Commands run with a 30s timeout (configurable). A small denylist blocks catastrophic commands. Pass `timeout` (seconds) to give a slow build/test up to the configured ceiling more time for this one command — useful for `cargo build --release`, `npm install`, or test suites that exceed the default. Keep the command short and simple: for loops, nested quotes, long && chains, or multi-line logic, write a script to a file with write_file and run `bash script.sh` instead of inlining one long command string (long inline commands are prone to JSON-encoding errors when wrapped in bulk).",
+                "description": "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -288,7 +339,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk",
-                "description": "Run several tool calls in one round-trip. Each entry has a tool name and its args object. Dispatches any built-in tool (read_file, write_file, edit, list_dir, grep, glob, bash). Returns one result block per call, in order. Use this to batch independent operations and cut round-trips; the whole batch shares one approval gate. Use bulk only to batch several genuinely independent calls — do not wrap a single bash command in bulk (call bash directly instead). Avoid putting long, quote-heavy commands inside bulk: their nested JSON escaping is a common source of malformed tool calls; write such commands to a script file with write_file and run `bash script.sh` instead.",
+                "description": "Batch several independent tool calls in one round-trip (shared approval). Do not wrap a single call. Avoid long quote-heavy commands inside bulk JSON — write a script instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -350,7 +401,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bulk_edit",
-                "description": "Apply search-and-replace edits to many files in one call. Each entry is {path, edits} where edits is the same search/replace array as the edit tool (each {search, replace, replace_all?, normalize_whitespace?}). Read each file first with read_file/bulk_read to see exact content. All edits on a file apply atomically — a failed search (not found or not unique) fails only that file's block.",
+                "description": "Apply search/replace edits to many files. Each entry: {path, edits} (same shape as edit). Per-file atomic; failed search fails only that file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -419,7 +470,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "goal_write_plan",
-                "description": "GOAL MODE ONLY. Submit a structured multi-subagent deployment plan for the active /goal. Call exactly once during the planning turn. Each step becomes a subagent prompt that the harness deploys under the goal's concurrency and model/provider caps.",
+                "description": "GOAL MODE ONLY. Submit the structured multi-subagent plan exactly once. Each step becomes a subagent prompt under the goal's concurrency/model caps.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -501,7 +552,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web with no API key (HTML scrape). Tries DuckDuckGo Lite, then DuckDuckGo HTML, then Mojeek if a backend is rate-limited/blocked. Returns the top results as a numbered list (title, url, snippet) plus a compact JSON array. Honors the same egress rules as fetch (--no-network / fetch_allowlist). Use for ad-hoc web research; pair with the fetch tool to read a result's full page. Read-only.",
+                "description": "Web search (no API key; scrapes DDG/Mojeek). Returns top hits as text + JSON. Honors --no-network / fetch_allowlist. Pair with fetch to read a page.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -598,7 +649,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Persist, list, or forget durable memories. Memories survive across sessions and are injected into the system prompt so prior learnings carry forward. By default memories are scoped to the current workspace (per-codebase). Use scope 'global' for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Use `save` to record conventions, structure, decisions, or gotchas worth remembering; use `append` to add facts to an existing memory (accumulates, oldest trimmed when it exceeds a rolling cap) instead of overwriting it. Read-only (no workspace side effects).",
+                "description": "Persist/list/forget durable memories (workspace-scoped by default; scope:global for cross-project). Use save for new notes, append to accumulate. Injected into future system prompts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -633,34 +684,52 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ask",
-                "description": "Ask the user one or more questions and block until they answer. Use this at the start of a task to gather requirements, clarify scope, or let the user choose between options (framework, approach, trade-offs) before you commit to a plan. Each question is either a multiple-choice selection or a free-text box. The user's answers are returned as the tool result. The user may skip optional questions or dismiss the whole prompt — handle a skip gracefully (fall back to your best judgment and say so).",
+                "description": "Ask the user structured questions and wait for answers. Use to clarify requirements or choose among options before committing. User may skip optional questions or dismiss the prompt.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "questions": {
                             "type": "array",
                             "minItems": 1,
-                            "description": "One or more questions to ask the user, in order. Each appears as its own field in the flyout.",
+                            "description": "Questions in order; each is a flyout field.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "id": { "type": "string", "description": "Stable identifier for this question. The answers come back keyed by this id." },
-                                    "prompt": { "type": "string", "description": "The question text shown to the user." },
-                                    "type": { "type": "string", "enum": ["select", "text"], "description": "'select' = choose from options; 'text' = free-text input box." },
+                                    "id": { "type": "string", "description": "stable id; answers keyed by this" },
+                                    "prompt": { "type": "string", "description": "question text" },
+                                    "type": { "type": "string", "enum": ["select", "text"], "description": "select = options; text = free input" },
                                     "options": {
                                         "type": "array",
                                         "items": { "type": "string" },
-                                        "description": "Required for type 'select': the choices the user picks from."
+                                        "description": "required for select"
                                     },
-                                    "allowCustom": { "type": "boolean", "description": "(select only) when true, the user may type a custom answer instead of picking from options." },
-                                    "placeholder": { "type": "string", "description": "(text only) placeholder shown in the input box." },
-                                    "required": { "type": "boolean", "description": "If false, the user may skip this question. Default true." }
+                                    "allowCustom": { "type": "boolean", "description": "select: allow typed custom answer" },
+                                    "placeholder": { "type": "string", "description": "text: input placeholder" },
+                                    "required": { "type": "boolean", "description": "if false, may skip (default true)" }
                                 },
                                 "required": ["id", "prompt", "type"]
                             }
                         }
                     },
                     "required": ["questions"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "load_tools",
+                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, goal_write_plan.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "tool names or groups (all|git|web|bulk)"
+                        },
+                        "tool": { "type": "string", "description": "single tool name or group" }
+                    }
                 }
             }
         }),
@@ -695,6 +764,9 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
         "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
         "ask" => Outcome::err("ask must be dispatched through request_ask (async, orchestrator loop only)"),
+        "load_tools" => Outcome::err(
+            "load_tools must be dispatched through handle_load_tools (orchestrator loop only)",
+        ),
         "edit" => {
             let path = s("path");
             match args.get("edits").and_then(|v| v.as_array()) {
@@ -799,7 +871,7 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
     // Auto-window large files when the model didn't ask for a page — dumping
     // thousands of lines into context is the #1 token waste. Explicit
     // offset/limit still honors max_read_lines.
-    const AUTO_WINDOW: usize = 500;
+    const AUTO_WINDOW: usize = 200;
     let auto_window = offset == 0 && limit.is_none() && lines.len() > AUTO_WINDOW;
 
     if offset > 0 || limit.is_some() || auto_window {
@@ -2190,6 +2262,8 @@ pub fn preview_diff_write(input: &str, content: &str, cfg: &Config) -> Result<St
 // gets its own result block so per-file errors don't abort the whole batch.
 
 /// Read many files. Each file becomes a headed block; per-file errors inline.
+/// Total output is capped so a large batch cannot dump tens of thousands of
+/// tokens in one result — callers should page with fewer paths or use grep.
 fn bulk_read(args: &Value, cfg: &Config) -> Outcome {
     let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
         return Outcome::err("bulk_read requires a 'paths' array");
@@ -2197,14 +2271,29 @@ fn bulk_read(args: &Value, cfg: &Config) -> Outcome {
     if paths.is_empty() {
         return Outcome::err("bulk_read requires a non-empty 'paths' array");
     }
+    const MAX_PATHS: usize = 20;
+    const MAX_TOTAL_BYTES: usize = 48 * 1024;
+    if paths.len() > MAX_PATHS {
+        return Outcome::err(format!(
+            "bulk_read accepts at most {MAX_PATHS} paths (got {}); split the batch or use grep",
+            paths.len()
+        ));
+    }
     let mut blocks: Vec<String> = Vec::with_capacity(paths.len());
     let mut ok = true;
+    let mut total = 0usize;
     for (i, p) in paths.iter().enumerate() {
+        if total >= MAX_TOTAL_BYTES {
+            ok = false;
+            blocks.push(format!(
+                "### [{i}..] <budget exhausted>\nerror: bulk_read total output capped at {MAX_TOTAL_BYTES} bytes; request fewer paths or page with read_file offset/limit"
+            ));
+            break;
+        }
         let Some(path) = p.as_str() else {
             ok = false;
             blocks.push(format!(
-                "### [{i}] <invalid path>
-error: path must be a string"
+                "### [{i}] <invalid path>\nerror: path must be a string"
             ));
             continue;
         };
@@ -2212,7 +2301,19 @@ error: path must be a string"
         if !r.ok {
             ok = false;
         }
-        blocks.push(format!("### [{i}] {path}\n{}", r.output));
+        let mut block = format!("### [{i}] {path}\n{}", r.output);
+        if total + block.len() > MAX_TOTAL_BYTES {
+            let room = MAX_TOTAL_BYTES.saturating_sub(total);
+            block = smart_truncate(&block, room.max(256));
+            blocks.push(block);
+            ok = false;
+            blocks.push(format!(
+                "### [remaining] <budget exhausted>\nerror: bulk_read total output capped at {MAX_TOTAL_BYTES} bytes"
+            ));
+            break;
+        }
+        total += block.len();
+        blocks.push(block);
     }
     Outcome {
         ok,
@@ -3781,8 +3882,8 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("auto-windowed"), "{}", o.output);
         assert!(o.output.contains("line 1"));
-        assert!(o.output.contains("line 500"));
-        assert!(!o.output.contains("line 501"));
+        assert!(o.output.contains("line 200"));
+        assert!(!o.output.contains("line 201"));
     }
 
     #[test]
@@ -3987,6 +4088,38 @@ mod tests {
         assert!(o.output.contains("line 10"));
         assert!(o.output.contains("line 12"));
         assert!(!o.output.contains("line 13"));
+    }
+
+    #[test]
+    fn core_vs_deferred_tool_partition() {
+        assert!(is_core_tool("read_file"));
+        assert!(is_core_tool("bash"));
+        assert!(is_core_tool("load_tools"));
+        assert!(is_core_tool("subagent"));
+        assert!(!is_core_tool("fetch"));
+        assert!(is_deferred_tool("fetch"));
+        assert!(is_deferred_tool("git_status"));
+        assert!(is_deferred_tool("bulk_read"));
+        assert!(!is_deferred_tool("read_file"));
+        assert!(is_builtin("load_tools"));
+        let defs = definitions();
+        let names: Vec<_> = defs
+            .iter()
+            .filter_map(|d| {
+                d.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+        assert!(names.contains(&"load_tools"));
+        assert!(names.contains(&"fetch"));
+        // Every deferred tool must appear in definitions (so load_tools can
+        // re-add its schema) and must NOT be core.
+        for d in deferred_tool_names() {
+            assert!(is_deferred_tool(d), "{d}");
+            assert!(!is_core_tool(d), "{d} must not be core");
+            assert!(names.contains(d), "{d} missing from definitions");
+        }
     }
 
     #[test]

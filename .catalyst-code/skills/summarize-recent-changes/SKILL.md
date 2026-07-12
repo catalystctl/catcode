@@ -9,6 +9,7 @@ Use when asked "summarize the most recent changes", "what's new", "what did you 
 
 ## Steps
 
+0. **Enable git tools** — call `load_tools` with `tools:["git"]` once if not already enabled (git_* tools are deferred).
 1. **Working tree state** — `git_status`. Determines whether the "recent changes" are committed (→ inspect commits) or uncommitted (→ inspect the diff), or both.
 2. **Recent commits** — `git_log` (limit ~15–20) for the commit history line. The HEAD commit is almost always what "most recent changes" refers to when the tree is clean.
 3. **Uncommitted changes** — `git_diff` (unstaged) and/or `git_diff` with `staged:true`. Only meaningful if `git_status` shows changes; skip if clean.

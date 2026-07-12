@@ -358,7 +358,7 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
     out.push_str(&text);
 
     // Cap the final text the model sees so a big doc doesn't blow context.
-    const OUT_CAP: usize = 65_536;
+    const OUT_CAP: usize = 24_576;
     if out.len() > OUT_CAP {
         out = smart_truncate(&out, OUT_CAP);
     }

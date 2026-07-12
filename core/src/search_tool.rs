@@ -403,7 +403,7 @@ fn render_hits(query: &str, backend: Backend, hits: &[Hit]) -> Outcome {
         ));
     }
 
-    const OUT_CAP: usize = 65_536;
+    const OUT_CAP: usize = 24_576;
     if text.len() > OUT_CAP {
         text = smart_truncate(&text, OUT_CAP);
     }

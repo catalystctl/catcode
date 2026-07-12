@@ -2,7 +2,25 @@
 
 ## Unreleased
 
-### Removed — `/key` slash command
+### Improved — compaction reliability and tool-call token efficiency
+- Summarize compaction pre-digests the middle, truncates oversized tool payloads,
+  map-reduces chunks over 100k chars, and merges summary + durable facts into
+  **one** model call (max 3072 tokens out).
+- Soft digest uses a **token-budgeted** keep window (20% of context), digests
+  oversized `write_file`/`edit` tool-call arguments, then budget-reclaims anything
+  still over 50% of the window (including few-huge-message chats). Restorable
+  outputs are cached **before** digest so restore hints are truthful. Subagents
+  get the same soft-digest path **plus** ingress capping, digest-cache restore,
+  schema-only tool gate, and no deferred tools by default.
+- Post-compact target lowered to **35%** of the window.
+- Tool schemas are staged: core tools always; deferred tools (`git_*`, `fetch`,
+  `web_search`, `bulk_*`, `diagnostics`, `spawn`, …) load via **`load_tools`**.
+- Ingress prefers smart-truncation (24KB) over opaque digests; cache restores
+  are capped (16KB); identical re-reads dedupe; `read_file` auto-window 200;
+  `bulk_read` aggregate budget; fetch/search output caps aligned.
+- Deferred tools that are not currently offered in the tool list are refused
+  with a `load_tools` hint (so schema staging cannot be bypassed by a
+  hallucinated call).
 - `/login` already covers API-key paste, key override, and OAuth; `/logout`
   clears credentials. The redundant `/key` convenience command is gone.
 - Auth error / first-run copy now points at `/login`. The `set_key` protocol

@@ -80,6 +80,12 @@ All paths are relative to the workspace root; absolute paths and ".." are reject
 Work step by step: read/search before changing, make the smallest correct change, then verify with a command.
 Be concise. Prefer standard tools. When done, summarize what you did in two lines.
 
+Token hygiene — keep context lean:
+- Prefer grep/glob (scoped, head_limit) before full read_file; page with offset/limit instead of re-reading whole files.
+- Prefer edit over write_file for targeted changes so large file contents are not re-sent in tool-call arguments.
+- Use load_tools to enable deferred tools (git_*, fetch, web_search, bulk_*, diagnostics, spawn, …) only when needed.
+- After a digested tool result, re-call with the same args only if you need the bytes again; prefer a narrower offset/limit.
+
 Self-learning — you compound knowledge across sessions, so future you starts smarter:
 - The `memory` tool (actions: save/append/list/forget) persists durable facts. By default memories are scoped to this workspace (per-codebase); pass `scope: "global"` for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
 - Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation BEFORE you write your completion summary — you reflect (save memories, no prose), then write your summary as the final message — and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `CATALYST_CODE_AUTO_REFLECT=0`).
@@ -470,6 +476,10 @@ pub struct State {
     /// identical re-call of a read-only tool can restore full content without
     /// re-executing (bash is never restored). Cleared on workspace mutations.
     pub tool_output_cache: Mutex<tool_cache::ToolOutputCache>,
+    /// Deferred tool names enabled for this session via `load_tools`. Core tools
+    /// are always available; rare/heavy schemas (git_*, fetch, bulk_*, …) stay
+    /// out of every request until the model opts in (or goal mode needs them).
+    pub enabled_deferred_tools: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Shared tail of `login_oauth` (web flow) and `oauth_code` (manual flow):
@@ -1490,6 +1500,7 @@ async fn main() {
         peers: Mutex::new(Vec::new()),
         last_concurrency_note: Mutex::new(None),
         tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
+        enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
     });
 
     // Apply disabled plugin list from config.
@@ -2216,6 +2227,8 @@ async fn main() {
             Command::Reset => {
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
+                state.enabled_deferred_tools.lock().await.clear();
+                state.tool_output_cache.lock().await.invalidate_all();
                 let cfg = state.cfg.read().await;
                 if let Some(p) = cfg.session_file.as_ref() {
                     session::rewrite(p, &[]);
@@ -2229,6 +2242,8 @@ async fn main() {
                 // In-memory only: keep the session file so a restart can still resume.
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
+                state.enabled_deferred_tools.lock().await.clear();
+                state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
                 reset_stats(&state).await;
@@ -2416,6 +2431,8 @@ async fn main() {
                 };
                 *state.conversation.lock().await = loaded.clone();
                 state.pending_bash.lock().await.clear();
+                state.enabled_deferred_tools.lock().await.clear();
+                state.tool_output_cache.lock().await.invalidate_all();
                 // Restore the loaded session's cumulative stats so `/stats` shows
                 // its real totals, not the prior session's.
                 restore_stats(&state, &p).await;
@@ -2480,6 +2497,8 @@ async fn main() {
                 session::ensure(&new_path);
                 *state.conversation.lock().await = Vec::new();
                 state.pending_bash.lock().await.clear();
+                state.enabled_deferred_tools.lock().await.clear();
+                state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
                 state.cfg.write().await.session_file = Some(new_path.clone());
@@ -4307,11 +4326,11 @@ async fn run_turn(
         }
     }
 
-    // Main agent tool list: built-in tools (minus the subagent-only intercom
-    // coordination tools contact_supervisor/intercom, registered only inside
-    // child runs) MERGED with tools declared by enabled plugins, then filtered
-    // by every plugin's `disable_tools`. Three plugin capabilities converge
-    // here, mirroring what a direct core edit can do to the tool list:
+    // Main agent tool list: core built-ins (always) + session-enabled deferred
+    // tools (via load_tools) + goal_write_plan when planning, MERGED with tools
+    // declared by enabled plugins, then filtered by every plugin's
+    // `disable_tools`. Subagent-only tools (contact_supervisor/intercom) stay
+    // hidden on the main agent. Three plugin capabilities converge here:
     //   • ADD       — a plugin `tools` entry adds a new capability.
     //   • OVERRIDE  — a plugin tool with `override:true` whose name matches a
     //                  built-in REPLACES that built-in: the plugin's declared
@@ -4324,6 +4343,11 @@ async fn run_turn(
     // is still skipped — the built-in wins, unchanged.
     let overridden = st.plugin_manager.overridden_tool_names();
     let disabled = st.plugin_manager.disabled_tools();
+    let enabled_deferred = st.enabled_deferred_tools.lock().await.clone();
+    let goal_planning = {
+        let g = st.goal.lock().await;
+        g.phase == goal::GoalPhase::Planning
+    };
     let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
     reserved.insert("contact_supervisor".into());
     reserved.insert("intercom".into());
@@ -4338,7 +4362,18 @@ async fn run_turn(
             reserved.insert(n.to_string());
             // Hide the reserved subagent-only tools, AND any built-in a plugin
             // is overriding (its plugin version is added below instead).
-            n != "contact_supervisor" && n != "intercom" && !overridden.contains(n)
+            if n == "contact_supervisor" || n == "intercom" || overridden.contains(n) {
+                return false;
+            }
+            // Core tools always; deferred only when session-enabled (or goal
+            // planning needs goal_write_plan).
+            if tools::is_core_tool(n) {
+                return true;
+            }
+            if n == "goal_write_plan" && goal_planning {
+                return true;
+            }
+            enabled_deferred.contains(n)
         })
         .collect();
     for d in st.plugin_manager.tool_definitions() {
@@ -4524,18 +4559,19 @@ async fn run_turn(
         *st.estimated_tokens.lock().await = est;
         let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
         let hard_cap = (model_ctx as f32 * 0.95) as u64;
-        // Soft digest: collapse stale, large tool results into one-line digests
-        // well before the compaction threshold so they stop being re-sent verbatim
-        // on every turn. Conservative — only tool messages older than the
-        // compaction tail (DIGEST_KEEP_LAST) and larger than DIGEST_MIN_BYTES are
-        // touched; idempotent; tool_call_id + role preserved so the model's
-        // tool-call/result pairing stays intact. This never removes information
-        // compaction would keep (compaction drops these entirely), so it is
-        // strictly safer than waiting for compaction to fire.
+        // Soft digest: collapse stale, large tool results AND oversized tool-call
+        // arguments into one-line digests well before the compaction threshold so
+        // they stop being re-sent verbatim on every turn. Keep-window is sized by
+        // token budget (20% of the context window), not a fixed message count —
+        // a few huge recent results no longer block reclaim of everything older.
+        // Idempotent; tool_call_id + role preserved so pairing stays intact.
         let soft = (model_ctx as f32 * cfg.context_digest_at) as u64;
-        if est > soft && messages.len() > DIGEST_KEEP_LAST {
+        if cfg.context_digest_at > 0.0 && est > soft {
             let before_est = est;
-            let changed = digest_stale_tool_results(&mut messages, DIGEST_KEEP_LAST);
+            let changed = {
+                let mut cache = st.tool_output_cache.lock().await;
+                soft_digest_conversation(&mut messages, model_ctx, Some(&mut cache))
+            };
             if changed > 0 {
                 *st.conversation.lock().await = messages.clone();
                 if let Some(p) = cfg.session_file.as_ref() {
@@ -4808,6 +4844,46 @@ async fn run_turn(
                         }
                     };
 
+                    // Tool-schema gate: only tools currently offered in `tool_defs`
+                    // may run. Deferred tools (git_*, fetch, bulk_*, …) stay out of
+                    // the schema until `load_tools` enables them — without this
+                    // gate a model that invents the name (e.g. after reading a
+                    // skill) would still execute and defeat staging.
+                    let offered = tool_defs.iter().any(|d| {
+                        d.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            == Some(name.as_str())
+                    });
+                    if !offered {
+                        let msg = if tools::is_deferred_tool(&name) {
+                            format!(
+                                "tool '{name}' is deferred and not enabled this session. \
+                                 Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, all), \
+                                 then retry the call."
+                            )
+                        } else {
+                            format!(
+                                "tool '{name}' is not available on this agent (not in the current tool list)."
+                            )
+                        };
+                        emit(
+                            &Event::new("tool_result")
+                                .with("id", json!(id))
+                                .with("ok", json!(false))
+                                .with("output", json!(msg)),
+                        );
+                        let tool_result = Message::tool(id.clone(), msg);
+                        let est = estimate_message_tokens(&tool_result);
+                        let mut conv = st.conversation.lock().await;
+                        conv.push(tool_result);
+                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                            session::append(p, conv.last().unwrap());
+                        }
+                        *st.estimated_tokens.lock().await += est;
+                        continue;
+                    }
+
                     // Approval gate for destructive tools. A plugin tool that
                     // dispatches (a custom name, OR an `override:true` tool that
                     // replaces a built-in) carries its own kind; everything else
@@ -5002,15 +5078,36 @@ async fn run_turn(
                                 let iargs = c.get("args").cloned().unwrap_or(json!({}));
                                 let mut modified = iargs.clone();
                                 let mut dmsg: Option<String> = None;
-                                // permission deny-rules (ALLOW skips, DENY blocks)
-                                let mut force_allow = false;
-                                for rule in &cfg.allow_rules {
-                                    if tool_matches_rule(&iname, &iargs, rule) {
-                                        force_allow = true;
-                                        break;
+                                // Deferred-tool staging: bulk must not smuggle
+                                // fetch/git_*/web_search/… that aren't enabled.
+                                if tools::is_deferred_tool(&iname)
+                                    && !matches!(
+                                        iname.as_str(),
+                                        "bulk" | "bulk_read" | "bulk_write" | "bulk_edit"
+                                    )
+                                {
+                                    let enabled = st.enabled_deferred_tools.lock().await.clone();
+                                    let planning =
+                                        st.goal.lock().await.phase == goal::GoalPhase::Planning;
+                                    if !(enabled.contains(&iname)
+                                        || (iname == "goal_write_plan" && planning))
+                                    {
+                                        dmsg = Some(format!(
+                                            "deferred tool '{iname}' is not enabled — call load_tools first, then retry"
+                                        ));
                                     }
                                 }
-                                if !force_allow {
+                                // permission deny-rules (ALLOW skips, DENY blocks)
+                                let mut force_allow = false;
+                                if dmsg.is_none() {
+                                    for rule in &cfg.allow_rules {
+                                        if tool_matches_rule(&iname, &iargs, rule) {
+                                            force_allow = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if dmsg.is_none() && !force_allow {
                                     for rule in &cfg.deny_rules {
                                         if tool_matches_rule(&iname, &iargs, rule) {
                                             dmsg = Some("denied by permission rule".into());
@@ -5073,11 +5170,21 @@ async fn run_turn(
                     // the spawned child when the future is dropped.
                     let mut outcome = if let Some(restored) = {
                         // Identical re-call of a read-only tool after a digest /
-                        // ingress-cap: restore full output without re-executing.
+                        // ingress-cap: restore content without re-executing.
+                        // Restore is capped so a re-call cannot re-bloat context.
                         let cache = st.tool_output_cache.lock().await;
                         cache.get(&name, &args_str).map(|s| s.to_string())
                     } {
-                        tools::Outcome::ok(format!("[restored from digest cache]\n{restored}"))
+                        tools::Outcome::ok(apply_restore_cap(&restored))
+                    } else if let Some((prior_id, preview)) = {
+                        let conv = st.conversation.lock().await;
+                        find_duplicate_tool_result(&conv, &name, &args_str)
+                    } {
+                        // Same tool+args already in history undigested — point at
+                        // it instead of duplicating tens of KB in the transcript.
+                        tools::Outcome::ok(format!(
+                            "[duplicate of tool_call_id {prior_id}; content unchanged]\n{preview}"
+                        ))
                     } else if let Some(tc) = st
                         .plugin_manager
                         .tool_config(&name)
@@ -5210,6 +5317,8 @@ async fn run_turn(
                         .await
                     } else if name == "goal_write_plan" {
                         goal::handle_goal_write_plan(st, &exec_args).await
+                    } else if name == "load_tools" {
+                        handle_load_tools(st, &exec_args, &mut tool_defs).await
                     } else if name == "ask" {
                         // Blocking user-interaction tool: surface a flyout and
                         // wait for the answer (or skip/abort). Validation errors
@@ -5408,6 +5517,7 @@ async fn run_turn(
                             st.tool_output_cache.lock().await.invalidate_all();
                         } else if tool_cache::ToolOutputCache::is_restorable(&name)
                             && !outcome.output.starts_with("[restored from digest cache]")
+                            && !outcome.output.starts_with("[duplicate of tool_call_id")
                         {
                             st.tool_output_cache.lock().await.store(
                                 &name,
@@ -5417,10 +5527,13 @@ async fn run_turn(
                         }
                     }
                     // Hard ingress cap: never let a single tool result dominate
-                    // the context window. Full bytes stay in the cache above.
-                    // Skip when we just restored — the whole point is to give
-                    // the model the full output back.
-                    if outcome.ok && !outcome.output.starts_with("[restored from digest cache]") {
+                    // the context window. Prefer smart-truncation over an opaque
+                    // digest on first ingress; soft digest collapses further later.
+                    // Skip restore/duplicate pointers (already compact).
+                    if outcome.ok
+                        && !outcome.output.starts_with("[restored from digest cache]")
+                        && !outcome.output.starts_with("[duplicate of tool_call_id")
+                    {
                         outcome.output = apply_ingress_cap(&name, &args_str, outcome.output);
                     }
                     // Debug log: records full tool args (file contents, commands) which may
@@ -6077,15 +6190,117 @@ async fn resume_pending_ask(st: &Arc<State>, cancel: &CancellationToken) {
     );
 }
 
-/// Number of trailing messages whose tool results are always kept verbatim.
-/// Chosen >= the compaction tail (8 summarize / 10 naive) so digesting never
-/// touches anything compaction would keep — it only reclaims tokens from
-/// results that compaction would otherwise drop entirely.
-const DIGEST_KEEP_LAST: usize = 10;
+/// Soft-digest keep-window floor (messages). Mirrors compaction's MIN_TAIL so
+/// soft digest never touches anything a subsequent compact would keep by count.
+const SOFT_DIGEST_MIN_KEEP: usize = 6;
+/// Soft-digest keep-window as a fraction of the context window (token budget).
+const SOFT_DIGEST_KEEP_FRACTION: f32 = 0.20;
 /// Minimum tool-result size (bytes) worth digesting. Small results (ok/err
 /// one-liners, denial messages) stay full — they're cheap and the model may
 /// need them verbatim.
 const DIGEST_MIN_BYTES: usize = 256;
+/// Post-compaction target: reclaim until the conversation fits under this
+/// fraction of the context window (was 0.50 — left too little runway).
+const POST_COMPACT_BUDGET_FRACTION: f32 = 0.35;
+
+/// Index where the soft-digest keep-window begins: walk backward accumulating
+/// tokens until `keep_budget` (20% of context, floored at 4k) is exceeded,
+/// always keeping at least `SOFT_DIGEST_MIN_KEEP` messages.
+fn soft_digest_keep_start(messages: &[Message], context_window: u64) -> usize {
+    let n = messages.len();
+    if n <= SOFT_DIGEST_MIN_KEEP {
+        return 0;
+    }
+    let budget = ((context_window as f32 * SOFT_DIGEST_KEEP_FRACTION) as u64).max(4_000);
+    let mut acc: u64 = 0;
+    let mut start = n;
+    for i in (0..n).rev() {
+        let t = estimate_message_tokens(&messages[i]);
+        if i < n.saturating_sub(SOFT_DIGEST_MIN_KEEP) && acc + t > budget {
+            break;
+        }
+        acc += t;
+        start = i;
+    }
+    start
+}
+
+/// Soft-digest path used by the main loop and subagents: collapse stale large
+/// tool results AND oversized tool-call arguments outside the token-budgeted
+/// keep window, then budget-reclaim any remaining oversized call args / results
+/// that still push the conversation over half the window (aligned under the
+/// soft trigger so a few-huge-message chat at 40–50% still reclaims).
+/// When `cache` is provided, restorable tool outputs are stored before they are
+/// replaced so "re-run identical call to restore" is truthful.
+/// Returns total items changed.
+pub fn soft_digest_conversation(
+    messages: &mut Vec<Message>,
+    context_window: u64,
+    cache: Option<&mut tool_cache::ToolOutputCache>,
+) -> usize {
+    // Prefill cache from oversized tool results we're about to digest so a
+    // later identical re-call can restore without re-executing.
+    if let Some(cache) = cache {
+        cache_tool_results_before_digest(messages, cache);
+    }
+    let keep_start = soft_digest_keep_start(messages, context_window);
+    let mut changed = 0usize;
+    let n = messages.len();
+    if n <= SOFT_DIGEST_MIN_KEEP {
+        // Few-but-huge: digest ALL oversized tool results (keep=0) so a 3–6
+        // message chat dominated by large reads still reclaims at the soft
+        // threshold instead of waiting for 90% compact.
+        changed += digest_stale_tool_results(messages, 0);
+        changed += digest_stale_call_args(messages, n);
+    } else if keep_start > 0 {
+        let keep = n.saturating_sub(keep_start);
+        changed += digest_stale_tool_results(messages, keep);
+        changed += digest_stale_call_args(messages, keep_start);
+    }
+    // else: keep_start==0 but n > MIN_KEEP means the whole history still fits
+    // in the keep budget — don't collapse recent results; leave reclaim to
+    // digest_to_budget below.
+    // Soft budget reclaim: target half the window (between digest-at ~40% and
+    // compact-at ~90%) so reclaim actually fires when soft digest triggers.
+    let soft_budget = ((context_window as f32) * 0.50) as u64;
+    changed += digest_to_budget(messages, soft_budget);
+    changed
+}
+
+/// Store restorable tool outputs into the digest cache before they are
+/// collapsed, so identical re-calls can restore after soft digest / compact.
+fn cache_tool_results_before_digest(messages: &[Message], cache: &mut tool_cache::ToolOutputCache) {
+    let mut call_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for m in messages {
+        if let Some(calls) = m.tool_calls() {
+            for tc in calls {
+                if !tc.id.is_empty() {
+                    call_map.insert(
+                        tc.id.clone(),
+                        (tc.function.name.clone(), tc.function.arguments.clone()),
+                    );
+                }
+            }
+        }
+    }
+    for m in messages {
+        if !m.is_tool() {
+            continue;
+        }
+        let content = match m.content_text() {
+            Some(c) if !c.starts_with("[digested:") && c.len() > DIGEST_MIN_BYTES => c,
+            _ => continue,
+        };
+        let id = m.tool_call_id().unwrap_or("");
+        let Some((name, args)) = call_map.get(id) else {
+            continue;
+        };
+        if tool_cache::ToolOutputCache::is_restorable(name) {
+            cache.store(name, args, content);
+        }
+    }
+}
 
 /// Collapse stale, large `role: "tool"` results into a one-line digest so they
 /// stop being re-sent verbatim on every turn. Only tool messages older than the
@@ -6146,7 +6361,36 @@ pub fn digest_stale_tool_results(messages: &mut Vec<Message>, keep: usize) -> us
     changed
 }
 
-/// Build a one-line digest for a tool result, preserving enough to navigate
+/// Soft-path reclaim for oversized assistant `tool_call.arguments` (write_file
+/// content, edit payloads, …). Unlike `digest_oversized_call_args` (budget-driven
+/// at compact time), this digests every eligible call at or before `until_idx`
+/// so large write/edit args stop riding every turn well before the 90% compact.
+fn digest_stale_call_args(messages: &mut [Message], until_idx: usize) -> usize {
+    let end = until_idx.min(messages.len());
+    let mut changed = 0usize;
+    for m in messages.iter_mut().take(end) {
+        if let Message::Assistant {
+            ref mut tool_calls, ..
+        } = m
+        {
+            if let Some(calls) = tool_calls.as_mut() {
+                for tc in calls.iter_mut() {
+                    if tc.function.arguments.len() <= 2048 {
+                        continue;
+                    }
+                    if let Some(digested) =
+                        digest_call_args_field(&tc.function.name, &tc.function.arguments)
+                    {
+                        tc.function.arguments = digested;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// Reclaim oversized assistant `tool_call.arguments` (H3): the tool-result
 /// digest (`digest_to_budget`'s main loop) only collapses `role:"tool"`
 /// messages, so a huge NON-tool message — an assistant tool_call whose
@@ -6333,7 +6577,7 @@ fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String 
     let how = if tool == "bash" {
         "re-run if needed"
     } else if tool_cache::ToolOutputCache::is_restorable(tool) {
-        "re-run identical call to restore (cached)"
+        "re-run identical call to restore (cached if available)"
     } else {
         "re-run to recover full output"
     };
@@ -6341,16 +6585,80 @@ fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String 
 }
 
 /// Cap a freshly produced tool result before it enters the conversation.
-/// Oversized outputs are replaced with a one-line digest; the full bytes must
-/// already be in `tool_output_cache` so an identical re-call can restore them.
-const INGRESS_MAX_BYTES: usize = 48 * 1024;
+/// Oversized outputs are smart-truncated (head-error salvage + tail) rather than
+/// immediately digested to a one-liner — the model still sees useful content on
+/// first ingress. Soft digest later collapses stale results further. Full bytes
+/// remain in `tool_output_cache` for identical re-calls (themselves restore-capped).
+pub(crate) const INGRESS_MAX_BYTES: usize = 24 * 1024;
+/// Cap applied when restoring a cached tool output so a re-call after digest
+/// cannot re-bloat the conversation with the full payload.
+pub(crate) const RESTORE_MAX_BYTES: usize = 16 * 1024;
 
-fn apply_ingress_cap(tool: &str, args_json: &str, output: String) -> String {
+pub(crate) fn apply_ingress_cap(tool: &str, args_json: &str, output: String) -> String {
+    let _ = (tool, args_json); // kept for call-site symmetry / future per-tool caps
     if output.len() <= INGRESS_MAX_BYTES || output.starts_with("[digested:") {
         return output;
     }
-    let lines = output.lines().count();
-    make_digest(tool, args_json, output.len(), lines)
+    tools::smart_truncate(&output, INGRESS_MAX_BYTES)
+}
+
+pub(crate) fn apply_restore_cap(output: &str) -> String {
+    if output.len() <= RESTORE_MAX_BYTES {
+        return format!("[restored from digest cache]\n{output}");
+    }
+    let truncated = tools::smart_truncate(output, RESTORE_MAX_BYTES);
+    format!(
+        "[restored from digest cache — truncated to {RESTORE_MAX_BYTES} bytes; \
+         re-call with a narrower offset/limit if you need another slice]\n{truncated}"
+    )
+}
+
+/// Find an earlier undigested tool result for the same tool name + args JSON.
+/// Used to avoid duplicating large read/grep output when the model re-issues
+/// an identical call while the prior result is still verbatim in history.
+pub(crate) fn find_duplicate_tool_result(
+    messages: &[Message],
+    tool: &str,
+    args_json: &str,
+) -> Option<(String, String)> {
+    if !tool_cache::ToolOutputCache::is_restorable(tool) {
+        return None;
+    }
+    let mut call_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for m in messages {
+        if let Some(calls) = m.tool_calls() {
+            for tc in calls {
+                call_map.insert(
+                    tc.id.clone(),
+                    (tc.function.name.clone(), tc.function.arguments.clone()),
+                );
+            }
+        }
+    }
+    for m in messages.iter().rev() {
+        if !m.is_tool() {
+            continue;
+        }
+        let id = m.tool_call_id()?.to_string();
+        let (name, args) = call_map.get(&id)?;
+        if name != tool || args != args_json {
+            continue;
+        }
+        let content = m.content_text()?;
+        if content.starts_with("[digested:")
+            || content.starts_with("[duplicate of tool_call_id")
+            || content.starts_with("[restored from digest cache]")
+        {
+            continue;
+        }
+        if content.len() <= DIGEST_MIN_BYTES {
+            continue;
+        }
+        let preview = trunc_chars(content, 400);
+        return Some((id, preview));
+    }
+    None
 }
 
 /// Truncate a string to `n` chars at a char boundary, appending an ellipsis.
@@ -6361,6 +6669,127 @@ fn truncate_str(s: &str, n: usize) -> String {
     let mut out: String = s.chars().take(n).collect();
     out.push('…');
     out
+}
+
+fn trunc_chars(s: &str, n: usize) -> String {
+    truncate_str(s, n)
+}
+
+/// Enable deferred tool schemas for the rest of this session (and this turn's
+/// subsequent model rounds). Core tools are always available; `load_tools` is
+/// how the model opts into git/fetch/bulk/diagnostics/spawn/etc.
+async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>) -> tools::Outcome {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(arr) = args.get("tools").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                let t = s.trim();
+                if !t.is_empty() {
+                    names.push(t.to_string());
+                }
+            }
+        }
+    }
+    if let Some(s) = args.get("tool").and_then(|v| v.as_str()) {
+        let t = s.trim();
+        if !t.is_empty() {
+            names.push(t.to_string());
+        }
+    }
+    // Expand group aliases.
+    let mut expanded: Vec<String> = Vec::new();
+    for n in &names {
+        match n.as_str() {
+            "all" => {
+                expanded.extend(
+                    tools::deferred_tool_names()
+                        .iter()
+                        .filter(|n| **n != "goal_write_plan")
+                        .map(|s| (*s).to_string()),
+                );
+            }
+            "git" => {
+                for g in ["git_status", "git_diff", "git_log", "git_add", "git_commit"] {
+                    expanded.push(g.into());
+                }
+            }
+            "web" => {
+                expanded.push("fetch".into());
+                expanded.push("web_search".into());
+            }
+            "bulk" => {
+                for g in ["bulk", "bulk_read", "bulk_write", "bulk_edit"] {
+                    expanded.push(g.into());
+                }
+            }
+            other => expanded.push(other.to_string()),
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    if expanded.is_empty() {
+        return tools::Outcome::ok(format!(
+            "No tools requested. Deferred tools: {}. Groups: all, git, web, bulk. Core tools are already available.",
+            tools::deferred_tool_names().join(", ")
+        ));
+    }
+    let all_defs = tools::definitions();
+    let mut enabled = st.enabled_deferred_tools.lock().await;
+    let mut added: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let existing: std::collections::HashSet<String> = tool_defs
+        .iter()
+        .filter_map(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    for name in expanded {
+        if tools::is_core_tool(&name) {
+            continue; // already available
+        }
+        // goal_write_plan is planning-phase only — never session-enable via load_tools.
+        if name == "goal_write_plan" {
+            unknown.push(format!(
+                "{name} (only available during /goal planning — not loadable)"
+            ));
+            continue;
+        }
+        if !tools::is_deferred_tool(&name) {
+            unknown.push(name);
+            continue;
+        }
+        enabled.insert(name.clone());
+        if existing.contains(&name) {
+            added.push(format!("{name} (already enabled)"));
+            continue;
+        }
+        if let Some(def) = all_defs.iter().find(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                == Some(name.as_str())
+        }) {
+            tool_defs.push(def.clone());
+            added.push(name);
+        } else {
+            unknown.push(name);
+        }
+    }
+    let mut out = String::new();
+    if !added.is_empty() {
+        out.push_str(&format!("Enabled: {}\n", added.join(", ")));
+    }
+    if !unknown.is_empty() {
+        out.push_str(&format!("Unknown (skipped): {}\n", unknown.join(", ")));
+    }
+    if out.is_empty() {
+        out.push_str("Nothing to enable.");
+    }
+    out.push_str("These tools are available on subsequent model rounds this session.");
+    tools::Outcome::ok(out)
 }
 
 /// Compact the conversation when it nears the context window.
@@ -6481,7 +6910,7 @@ pub fn compact_conversation(messages: &mut Vec<Message>, context_window: u64) {
     // results are huge (large file reads, verbose command output). Dropping old
     // turns reclaims nothing there; collapse those oversized results into
     // one-line digests until the conversation fits under half the window.
-    let budget = ((context_window as f32) * 0.5) as u64;
+    let budget = ((context_window as f32) * POST_COMPACT_BUDGET_FRACTION) as u64;
     digest_to_budget(&mut compacted, budget);
     *messages = compacted;
 }
@@ -6523,58 +6952,67 @@ pub async fn compact_with_summary(
     }
     let to_summarize: Vec<Message> = messages[1..tail_start].to_vec();
     let kept: Vec<Message> = messages[tail_start..].to_vec();
-    let summary =
-        provider::summarize(client, provider, model, &to_summarize, cancel, instructions).await;
+    // Pre-digest the middle so the summarize HTTP call itself stays small, then
+    // one combined summarize+facts call (avoids a second full pass).
+    let mut for_summary = to_summarize.clone();
+    let _ = soft_digest_conversation(&mut for_summary, context_window, None);
+    let combined = provider::summarize_and_extract(
+        client,
+        provider,
+        model,
+        &for_summary,
+        cancel,
+        instructions,
+    )
+    .await;
     let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
-    if let Some(s) = summary {
+    if let Some((s, facts)) = combined {
         let content = format!("[Summary of earlier turns]\n{s}");
         summary_chars = content.chars().count();
         compacted.push(Message::system(content));
-    } else {
-        compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]"));
-    }
-    // Session memory extraction: persist durable facts so future sessions inherit
-    // project knowledge. Best-effort; never blocks compaction. Facts ACCUMULATE
-    // across compactions (append, not overwrite) so early-session facts survive,
-    // with a rolling byte cap so the file stays bounded.
-    if cfg.summarize_on_compact {
-        if let Some(facts) =
-            provider::extract_facts(client, provider, model, &to_summarize, cancel).await
-        {
-            if let Some(mp) = memory_provider {
-                let args = json!({
-                    "name": "session-extract",
-                    "content": facts,
-                    "type": "session",
-                    "description": "auto-extracted durable facts (accumulated on compaction)",
-                    "cap_bytes": 16384,
-                });
-                let _ = plugins::execute_memory_provider(
-                    mp,
-                    "compact_append",
-                    &args,
-                    &cfg.workspace.display().to_string(),
-                    "",
-                )
-                .await;
-            } else {
-                let _ = memory::append_memory(
-                    &cfg.workspace,
-                    "session-extract",
-                    &facts,
-                    "session",
-                    "auto-extracted durable facts (accumulated on compaction)",
-                    16_384,
-                );
+        // Session memory extraction: persist durable facts so future sessions inherit
+        // project knowledge. Best-effort; never blocks compaction. Facts ACCUMULATE
+        // across compactions (append, not overwrite) so early-session facts survive,
+        // with a rolling byte cap so the file stays bounded.
+        if cfg.summarize_on_compact {
+            if let Some(facts) = facts {
+                if let Some(mp) = memory_provider {
+                    let args = json!({
+                        "name": "session-extract",
+                        "content": facts,
+                        "type": "session",
+                        "description": "auto-extracted durable facts (accumulated on compaction)",
+                        "cap_bytes": 16384,
+                    });
+                    let _ = plugins::execute_memory_provider(
+                        mp,
+                        "compact_append",
+                        &args,
+                        &cfg.workspace.display().to_string(),
+                        "",
+                    )
+                    .await;
+                } else {
+                    let _ = memory::append_memory(
+                        &cfg.workspace,
+                        "session-extract",
+                        &facts,
+                        "session",
+                        "auto-extracted durable facts (accumulated on compaction)",
+                        16_384,
+                    );
+                }
             }
         }
+    } else {
+        compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]"));
     }
     // The kept tail can still hold the bulk of the tokens when a few recent
     // tool results are huge. Collapse them so the compacted conversation
     // actually fits the window instead of no-op'ing back to its original size.
     compacted.extend(kept);
-    let budget = ((context_window as f32) * 0.5) as u64;
+    let budget = ((context_window as f32) * POST_COMPACT_BUDGET_FRACTION) as u64;
     digest_to_budget(&mut compacted, budget);
     *messages = compacted;
     summary_chars
@@ -6812,7 +7250,7 @@ mod digest_tests {
         assert!(d.contains("src/big.rs"), "{}", d);
         assert!(d.contains("lines"), "should report line count: {}", d);
         assert!(
-            d.contains("re-run identical call to restore (cached)"),
+            d.contains("re-run identical call to restore (cached"),
             "{}",
             d
         );
@@ -7055,25 +7493,87 @@ mod compact_tests {
             "compaction must reduce tokens (was a no-op): {before} -> {after}"
         );
         assert!(
-            after < 100_000,
-            "should be well under half the window: {after}"
+            after < 70_000,
+            "should be well under 35% of the window: {after}"
         );
         // Both tool messages survive (pairing intact); the older one is digested.
         assert_eq!(m.iter().filter(|x| x.is_tool()).count(), 2);
     }
 
     #[test]
-    fn apply_ingress_cap_digests_oversized() {
+    fn apply_ingress_cap_truncates_oversized() {
         let huge = "x".repeat(60_000);
         let out = apply_ingress_cap("read_file", r#"{"path":"a.txt"}"#, huge);
-        assert!(out.starts_with("[digested:"), "{out}");
-        assert!(out.contains("cached") || out.contains("re-run"), "{out}");
+        assert!(out.len() <= INGRESS_MAX_BYTES + 256, "len={}", out.len());
+        assert!(
+            out.contains("truncated") || out.len() <= INGRESS_MAX_BYTES,
+            "{out}"
+        );
+        assert!(
+            !out.starts_with("[digested:"),
+            "prefer truncate over digest on ingress"
+        );
     }
 
     #[test]
     fn apply_ingress_cap_passthrough_small() {
         let out = apply_ingress_cap("grep", r#"{"pattern":"x"}"#, "a:1:x".into());
         assert_eq!(out, "a:1:x");
+    }
+
+    #[test]
+    fn soft_digest_reclaims_stale_call_args() {
+        let huge = "x".repeat(40_000);
+        let args = format!(
+            "{{\"path\":\"big.rs\",\"content\":{}}}",
+            serde_json::to_string(&huge).unwrap()
+        );
+        let mut m = vec![
+            Message::system("sys"),
+            asst_tool_call("c1", "write_file", &args),
+            tool_result("c1", "ok"),
+        ];
+        for i in 0..12 {
+            m.push(Message::assistant(format!("pad{i}")));
+        }
+        // Small window so soft budget (50%) is under the write_file args size
+        // and digest_to_budget must reclaim even if keep_start is 0.
+        let n = soft_digest_conversation(&mut m, 8_000, None);
+        assert!(n >= 1, "should digest oversized write_file args: {n}");
+        let call_args = match &m[1] {
+            Message::Assistant { tool_calls, .. } => {
+                tool_calls.as_ref().unwrap()[0].function.arguments.clone()
+            }
+            _ => panic!("expected assistant"),
+        };
+        assert!(call_args.contains("digested"), "{call_args}");
+        assert!(!call_args.contains(&huge));
+    }
+
+    #[test]
+    fn soft_digest_few_huge_messages_reclaims_tool_results() {
+        // ≤ MIN_KEEP messages but huge tool results — must digest results, not
+        // only call args (the case keep_start==0 used to under-reclaim).
+        let huge = "x\n".repeat(20_000);
+        let mut m = vec![
+            Message::system("sys"),
+            asst_tool_call("c1", "read_file", r#"{"path":"a.rs"}"#),
+            tool_result("c1", &huge),
+            asst_tool_call("c2", "read_file", r#"{"path":"b.rs"}"#),
+            tool_result("c2", &huge),
+            Message::user("continue"),
+        ];
+        assert!(m.len() <= SOFT_DIGEST_MIN_KEEP);
+        let before = estimate_messages_tokens(&m);
+        let n = soft_digest_conversation(&mut m, 200_000, None);
+        assert!(n >= 1, "few-but-huge must digest: {n}");
+        let after = estimate_messages_tokens(&m);
+        assert!(after < before, "{before} -> {after}");
+        assert!(
+            m[2].content_text().unwrap().starts_with("[digested:"),
+            "{}",
+            m[2].content_text().unwrap()
+        );
     }
 }
 

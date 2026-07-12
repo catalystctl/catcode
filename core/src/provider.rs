@@ -1142,10 +1142,32 @@ pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
     levels[0].clone()
 }
 
+/// Hard cap on a single summarize request's user payload. Larger middles are
+/// map-reduced in chunks so the summarize call itself never blows the model
+/// context (which used to make compaction fall back to an empty drop marker).
+const MAX_SUMMARY_INPUT_CHARS: usize = 100_000;
+/// Per-tool-result char budget inside the summarize payload (after digesting
+/// oversized results). Keeps path/command signal without re-sending 48KB dumps.
+const SUMMARY_TOOL_RESULT_CHARS: usize = 1_500;
+/// Max tokens for the combined summary+facts reply.
+const SUMMARY_MAX_TOKENS: u32 = 3072;
+
+/// Truncate `s` at a char boundary, appending an ellipsis when cut.
+fn trunc_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n).collect();
+    out.push('…');
+    out
+}
+
 /// Build a compact, image-stripped string of a message for the summarization
 /// prompt. Re-serializing a multimodal message verbatim would POST megabytes
 /// of base64 image data to the model (costly, and it can blow the summary
 /// request's own context); image parts are replaced with a short placeholder.
+/// Oversized tool results and write/edit payloads are truncated so a tool-heavy
+/// middle can still be summarized instead of failing the HTTP call.
 fn message_for_summary(m: &Message) -> String {
     let v: Value = m.into();
     let mut clean = v;
@@ -1156,7 +1178,137 @@ fn message_for_summary(m: &Message) -> String {
             }
         }
     }
+    // Truncate large tool-result content strings.
+    if clean.get("role").and_then(|r| r.as_str()) == Some("tool") {
+        if let Some(c) = clean.get("content").and_then(|c| c.as_str()) {
+            if c.len() > SUMMARY_TOOL_RESULT_CHARS {
+                let head = trunc_chars(c, SUMMARY_TOOL_RESULT_CHARS / 2);
+                let tail = {
+                    let chars: Vec<char> = c.chars().collect();
+                    let n = SUMMARY_TOOL_RESULT_CHARS / 2;
+                    if chars.len() > n {
+                        chars[chars.len() - n..].iter().collect::<String>()
+                    } else {
+                        String::new()
+                    }
+                };
+                clean["content"] = json!(format!(
+                    "{head}\n…[truncated {} chars for summary]…\n{tail}",
+                    c.len()
+                ));
+            }
+        }
+    }
+    // Truncate huge tool-call argument payloads (write_file content, etc.).
+    if let Some(calls) = clean.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+        for tc in calls.iter_mut() {
+            if let Some(args) = tc
+                .pointer_mut("/function/arguments")
+                .and_then(|a| a.as_str().map(|s| s.to_string()))
+            {
+                if args.len() > SUMMARY_TOOL_RESULT_CHARS {
+                    *tc.pointer_mut("/function/arguments").unwrap() =
+                        json!(trunc_chars(&args, SUMMARY_TOOL_RESULT_CHARS));
+                }
+            }
+        }
+    }
     serde_json::to_string(&clean).unwrap_or_default()
+}
+
+/// Serialize messages for a summarize call, then split into char-budgeted chunks
+/// so each HTTP request stays under `MAX_SUMMARY_INPUT_CHARS`.
+fn summary_payload_chunks(messages: &[Message]) -> Vec<String> {
+    let parts: Vec<String> = messages.iter().map(message_for_summary).collect();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for p in parts {
+        if !cur.is_empty() && cur.len() + 1 + p.len() > MAX_SUMMARY_INPUT_CHARS {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if p.len() > MAX_SUMMARY_INPUT_CHARS {
+            // A single message still oversized after truncation — hard-slice it.
+            let mut offset = 0;
+            let bytes = p.as_bytes();
+            while offset < bytes.len() {
+                let mut end = (offset + MAX_SUMMARY_INPUT_CHARS).min(bytes.len());
+                while end > offset && !p.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == offset {
+                    break;
+                }
+                chunks.push(p[offset..end].to_string());
+                offset = end;
+            }
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(&p);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+fn summary_system_prompt(instructions: Option<&str>) -> String {
+    const BASE_SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nAlso extract durable project facts worth remembering across future sessions (conventions, structure, key decisions, gotchas). If none, put the single word none under <facts>.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>\n<facts>\n- fact one\n- fact two\n</facts>";
+    match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!(
+            "{BASE_SYS}\n\nThe user provided the following guidance for what to preserve in this summary — honor it above the default priorities:\n{extra}"
+        ),
+        None => BASE_SYS.to_string(),
+    }
+}
+
+/// Parse a combined summarize+facts reply into `(summary, optional_facts)`.
+fn parse_summary_and_facts(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    let facts = {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(start) = lower.find("<facts>") {
+            let after = start + "<facts>".len();
+            let end = lower[after..]
+                .find("</facts>")
+                .map(|i| after + i)
+                .unwrap_or(trimmed.len());
+            let body = trimmed[after..end].trim();
+            if body.is_empty() || body.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(body.to_string())
+            }
+        } else {
+            None
+        }
+    };
+    let summary = {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(start) = lower.find("<summary>") {
+            let after = start + "<summary>".len();
+            let end = lower[after..]
+                .find("</summary>")
+                .map(|i| after + i)
+                .unwrap_or_else(|| {
+                    lower[after..]
+                        .find("<facts>")
+                        .map(|i| after + i)
+                        .unwrap_or(trimmed.len())
+                });
+            trimmed[after..end].trim().to_string()
+        } else if let Some(facts_at) = lower.find("<facts>") {
+            trimmed[..facts_at].trim().to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    (summary, facts)
 }
 
 /// Summarize a slice of messages into one system message. Used by context
@@ -1164,6 +1316,11 @@ fn message_for_summary(m: &Message) -> String {
 /// Non-streaming, cheap; returns None on any failure (caller keeps the
 /// naive drop-oldest fallback). Protocol-agnostic: branches on the provider's
 /// `kind` (OpenAI chat-completions vs Anthropic Messages).
+///
+/// Oversized middles are truncated per-message and map-reduced in chunks so the
+/// summarize HTTP call itself rarely fails from context overflow.
+#[allow(dead_code)] // convenience wrapper: production uses summarize_and_extract;
+                    // retained as API + exercised by the mock tests below
 pub async fn summarize(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
@@ -1172,25 +1329,104 @@ pub async fn summarize(
     cancel: &CancellationToken,
     instructions: Option<&str>,
 ) -> Option<String> {
-    const BASE_SYS: &str = "Summarize the following conversation turns in structured format. Preserve: decisions made, file paths touched, the user's goal, and any unresolved errors.\n\nUse this exact format:\n<summary>\n 1. Primary Request and Intent\n 2. Key Technical Concepts\n 3. Files and Code Sections\n 4. Errors and Fixes\n 5. Problem Solving\n 6. All User Messages\n 7. Pending Tasks\n 8. Current Work\n 9. Optional Next Step\n</summary>";
-    let sys = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(extra) => format!(
-            "{BASE_SYS}\n\nThe user provided the following guidance for what to preserve in this summary — honor it above the default priorities:\n{extra}"
-        ),
-        None => BASE_SYS.to_string(),
+    summarize_and_extract(client, provider, model, messages, cancel, instructions)
+        .await
+        .map(|(s, _)| s)
+}
+
+/// One-shot summarize + durable-fact extraction (single model call). Returns
+/// `(summary, facts)` where facts is `None` when the model reported nothing
+/// durable. Prefer this over separate `summarize` + `extract_facts` calls.
+pub async fn summarize_and_extract(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    model: &str,
+    messages: &[Message],
+    cancel: &CancellationToken,
+    instructions: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let sys = summary_system_prompt(instructions);
+    let chunks = summary_payload_chunks(messages);
+    if chunks.len() == 1 {
+        let raw = complete_text(
+            client,
+            provider,
+            model,
+            &sys,
+            &chunks[0],
+            SUMMARY_MAX_TOKENS,
+            cancel,
+        )
+        .await?;
+        return Some(parse_summary_and_facts(&raw));
+    }
+    // Map-reduce: summarize each chunk, then merge.
+    let mut partials: Vec<String> = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_sys = format!(
+            "{sys}\n\nThis is partial chunk {} of {}. Summarize only this chunk; a later merge will combine them.",
+            i + 1,
+            chunks.len()
+        );
+        let part = complete_text(
+            client,
+            provider,
+            model,
+            &chunk_sys,
+            chunk,
+            SUMMARY_MAX_TOKENS,
+            cancel,
+        )
+        .await?;
+        partials.push(part);
+    }
+    let merge_user = {
+        let joined = partials.join("\n\n---\n\n");
+        if joined.len() <= MAX_SUMMARY_INPUT_CHARS {
+            joined
+        } else {
+            // Hierarchical reduce would be nicer; hard-cap keeps the merge call
+            // from itself blowing the model context (which used to make compact
+            // fall back to an empty drop marker).
+            let mut out = String::new();
+            for p in &partials {
+                if out.len() + p.len() + 8 > MAX_SUMMARY_INPUT_CHARS {
+                    break;
+                }
+                if !out.is_empty() {
+                    out.push_str("\n\n---\n\n");
+                }
+                out.push_str(p);
+            }
+            if out.is_empty() {
+                trunc_chars(&joined, MAX_SUMMARY_INPUT_CHARS)
+            } else {
+                out
+            }
+        }
     };
-    let user = messages
-        .iter()
-        .map(message_for_summary)
-        .collect::<Vec<_>>()
-        .join("\n");
-    complete_text(client, provider, model, &sys, &user, 1024, cancel).await
+    let merge_sys = format!(
+        "{sys}\n\nBelow are partial summaries of earlier conversation chunks. Merge them into one final <summary> and one <facts> block. Deduplicate; prefer later info when they conflict."
+    );
+    let raw = complete_text(
+        client,
+        provider,
+        model,
+        &merge_sys,
+        &merge_user,
+        SUMMARY_MAX_TOKENS,
+        cancel,
+    )
+    .await?;
+    Some(parse_summary_and_facts(&raw))
 }
 
 /// Extract durable facts worth remembering across future sessions from a slice of
 /// the conversation. Best-effort (returns None on any failure, or if there is
 /// nothing durable). Used by the session memory extraction hook on compaction.
+/// Prefer [`summarize_and_extract`] when a summary is also needed (one call).
 /// Protocol-agnostic: branches on the provider's `kind`.
+#[allow(dead_code)] // convenience wrapper over summarize_and_extract; kept for API + tests
 pub async fn extract_facts(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
@@ -1198,18 +1434,9 @@ pub async fn extract_facts(
     messages: &[Message],
     cancel: &CancellationToken,
 ) -> Option<String> {
-    const SYS: &str = "Extract durable facts about this project worth remembering across future sessions: conventions, structure, key decisions, gotchas, and how things work. Be concise and specific (paths, names). If there is nothing durable, reply with the single word: none\n\nOutput a short bulleted list, one fact per line, no preamble.";
-    let user = messages
-        .iter()
-        .map(message_for_summary)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let s = complete_text(client, provider, model, SYS, &user, 512, cancel).await?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    Some(s)
+    summarize_and_extract(client, provider, model, messages, cancel, None)
+        .await
+        .and_then(|(_, facts)| facts)
 }
 
 /// One-shot text completion (no tools, no streaming). Returns the model's text
@@ -1227,7 +1454,7 @@ async fn complete_text(
 ) -> Option<String> {
     match provider.kind {
         ProviderKind::OpenAI => {
-            openai_complete(client, provider, model, system, user, cancel).await
+            openai_complete(client, provider, model, system, user, max_tokens, cancel).await
         }
         ProviderKind::Anthropic => {
             anthropic_complete(client, provider, model, system, user, max_tokens, cancel).await
@@ -1241,11 +1468,13 @@ async fn openai_complete(
     model: &str,
     system: &str,
     user: &str,
+    max_tokens: u32,
     cancel: &CancellationToken,
 ) -> Option<String> {
     let body = json!({
         "model": model,
         "stream": false,
+        "max_tokens": max_tokens.max(256),
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
@@ -6600,7 +6829,7 @@ mod tests {
             Message::assistant("on it"),
         ];
         let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
-        assert_eq!(out.as_deref(), Some("<summary>mocked</summary>"));
+        assert_eq!(out.as_deref(), Some("mocked"));
     }
 
     #[tokio::test]

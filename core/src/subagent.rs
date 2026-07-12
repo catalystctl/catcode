@@ -648,6 +648,67 @@ fn all_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Resolve the tool-name allowlist for a subagent (same set offered in the
+/// schema). Empty `agent.tools` → core read-only defaults (not "all tools").
+fn subagent_allowed_names(
+    agent: &AgentConfig,
+    bridge: bool,
+    depth: u32,
+    max_depth: u32,
+) -> Vec<String> {
+    let allow_subagent = agent.tools.iter().any(|t| t == "subagent") && depth + 1 < max_depth;
+    let mut names: Vec<String> = if agent.tools.is_empty() {
+        all_tool_names()
+            .iter()
+            .copied()
+            .filter(|n| {
+                tools::is_core_tool(n)
+                    && !matches!(
+                        *n,
+                        "bash"
+                            | "write_file"
+                            | "edit"
+                            | "patch"
+                            | "delete"
+                            | "rename"
+                            | "mkdir"
+                            | "subagent"
+                            | "spawn"
+                            | "load_tools"
+                    )
+            })
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        agent
+            .tools
+            .iter()
+            .filter_map(|t| {
+                let n = AgentConfig::normalize_tool(t);
+                if n == "subagent" && !allow_subagent {
+                    None
+                } else {
+                    Some(n.to_string())
+                }
+            })
+            .collect()
+    };
+    if bridge {
+        for t in ["contact_supervisor", "intercom"] {
+            if !names.iter().any(|n| n == t) {
+                names.push(t.to_string());
+            }
+        }
+    }
+    if allow_subagent && !names.iter().any(|n| n == "subagent") {
+        names.push("subagent".into());
+    }
+    if !names.iter().any(|n| n == "finish") {
+        names.push("finish".into());
+    }
+    names
+}
+
 /// Build the tool-definition list a subagent may call, applying the agent's
 /// allowlist and the intercom bridge. `depth`/`max_depth` gate the `subagent`
 /// tool (nested fanout only when allowed and below the depth cap).
@@ -658,7 +719,6 @@ pub fn subagent_tool_defs(
     max_depth: u32,
 ) -> Vec<Value> {
     let all = tools::definitions();
-    // name → def
     let by_name: HashMap<&str, &Value> = all
         .iter()
         .map(|d| {
@@ -671,66 +731,10 @@ pub fn subagent_tool_defs(
             )
         })
         .collect();
-
-    // Resolve allowed tool names.
-    let allow_subagent = agent.tools.iter().any(|t| t == "subagent") && depth + 1 < max_depth;
-    let mut names: Vec<&str> = if agent.tools.is_empty() {
-        // Omitting `tools:` defaults to READ-ONLY tools (all tools minus the
-        // destructive ones) — an agent whose frontmatter forgot to declare tools
-        // must not silently get bash/write/edit/subagent. Declare them explicitly.
-        all_tool_names()
-            .iter()
-            .copied()
-            .filter(|n| {
-                !matches!(
-                    *n,
-                    "bash"
-                        | "write_file"
-                        | "edit"
-                        | "patch"
-                        | "bulk"
-                        | "bulk_write"
-                        | "bulk_edit"
-                        | "subagent"
-                        | "spawn"
-                )
-            })
-            .collect()
-    } else {
-        agent
-            .tools
-            .iter()
-            .filter_map(|t| {
-                let n = AgentConfig::normalize_tool(t);
-                // filter out subagent unless explicitly allowed + below depth
-                if n == "subagent" && !allow_subagent {
-                    None
-                } else {
-                    Some(n)
-                }
-            })
-            .collect()
-    };
-    // bridge tools
-    if bridge {
-        for t in ["contact_supervisor", "intercom"] {
-            if !names.contains(&t) {
-                names.push(t);
-            }
-        }
-    }
-    // subagent only via explicit allowlist + depth
-    if allow_subagent && !names.contains(&"subagent") {
-        names.push("subagent");
-    }
-    // always allow finish so the subagent can end
-    if !names.contains(&"finish") {
-        names.push("finish");
-    }
-
+    let names = subagent_allowed_names(agent, bridge, depth, max_depth);
     names
         .iter()
-        .filter_map(|n| by_name.get(n).map(|v| (*v).clone()))
+        .filter_map(|n| by_name.get(n.as_str()).map(|v| (*v).clone()))
         .collect()
 }
 
@@ -1291,6 +1295,24 @@ async fn run_agent_inner(
             *messages.lock().unwrap() = sub.clone();
             continue; // re-enter loop with new context
         }
+        let est = grounded_estimate(&sub, last_real, len_at_real);
+        let soft = (model_ctx as f32 * cfg.context_digest_at) as u64;
+        if cfg.context_digest_at > 0.0 && est > soft {
+            let changed = {
+                let mut cache = st.tool_output_cache.lock().await;
+                crate::soft_digest_conversation(&mut sub, model_ctx, Some(&mut cache))
+            };
+            if changed > 0 {
+                last_real = None;
+                len_at_real = 0;
+                emit(
+                    &Event::new("digested")
+                        .with("scope", json!("subagent"))
+                        .with("results", json!(changed))
+                        .with("after_tokens", json!(estimate_messages_tokens(&sub))),
+                );
+            }
+        }
         // compaction gate — anchor on the endpoint's real prompt_tokens when
         // available so compaction fires at the right context level, not a
         // whole-history char/4 guess that drifts late.
@@ -1478,23 +1500,34 @@ async fn run_agent_inner(
 
             emit_subagent_tool_call(run_id, &id, &name, &argsv, tool_count);
 
-            let outcome = dispatch_subagent_tool(
-                &name,
-                &argsv,
-                &id,
-                &args_str,
-                st,
-                client,
-                provider,
-                parent_model,
-                my_target,
-                agent,
-                depth,
-                max_depth,
-                &cfg,
-                cancel,
-            )
-            .await;
+            // Duplicate short-circuit (parity with main): identical undigested
+            // result already in this subagent's history.
+            let outcome = if let Some((prior_id, preview)) =
+                crate::find_duplicate_tool_result(&sub, &name, &args_str)
+            {
+                tools::Outcome::ok(format!(
+                    "[duplicate of tool_call_id {prior_id}; content unchanged]\n{preview}"
+                ))
+            } else {
+                dispatch_subagent_tool(
+                    &name,
+                    &argsv,
+                    &id,
+                    &args_str,
+                    st,
+                    client,
+                    provider,
+                    parent_model,
+                    my_target,
+                    agent,
+                    depth,
+                    max_depth,
+                    bridge,
+                    &cfg,
+                    cancel,
+                )
+                .await
+            };
 
             emit_subagent_progress(
                 run_id,
@@ -1514,12 +1547,42 @@ async fn run_agent_inner(
                 &truncate(&outcome.output, 8000),
                 outcome.ok,
             );
-            sub.push(Message::tool(&id, &outcome.output));
+            // Mirror main-loop cache + ingress so subagent contexts stay lean
+            // (previously they pushed full tool output and only soft-compacted
+            // at 90%). Key by the original call args (same as main loop).
+            let finish = name == "finish" && outcome.ok && outcome.output == "__finish__";
+            let mut model_output = outcome.output;
+            if outcome.ok && !finish {
+                // Invalidate the shared cache on tree-mutating tools, matching the
+                // main loop's `invalidates_cache`. bash is included because a
+                // shell redirect / `sed -i` / `jq >` can change files a prior
+                // read cached — excluding it would let a subsequent re-read
+                // restore stale content. The re-execution cost on read-only
+                // bash is the price of correctness (the main loop pays it too).
+                let wipe = crate::tool_cache::invalidates_cache(&name);
+                if wipe {
+                    st.tool_output_cache.lock().await.invalidate_all();
+                } else if crate::tool_cache::ToolOutputCache::is_restorable(&name)
+                    && !model_output.starts_with("[restored from digest cache]")
+                    && !model_output.starts_with("[duplicate of tool_call_id")
+                {
+                    st.tool_output_cache
+                        .lock()
+                        .await
+                        .store(&name, &args_str, &model_output);
+                }
+                if !model_output.starts_with("[restored from digest cache]")
+                    && !model_output.starts_with("[duplicate of tool_call_id")
+                {
+                    model_output = crate::apply_ingress_cap(&name, &args_str, model_output);
+                }
+            }
+            sub.push(Message::tool(&id, &model_output));
             // Snapshot after tool result (for peek)
             *messages.lock().unwrap() = sub.clone();
 
             // finish sentinel
-            if name == "finish" && outcome.ok && outcome.output == "__finish__" {
+            if finish {
                 let text = assistant.content_text().unwrap_or("").to_string();
                 if let Some(out_path) = &agent.output {
                     let p = workspace.join(out_path);
@@ -1555,17 +1618,18 @@ async fn dispatch_subagent_tool(
     agent: &AgentConfig,
     depth: u32,
     max_depth: u32,
+    bridge: bool,
     cfg: &Config,
     cancel: &CancellationToken,
 ) -> Outcome {
-    // Honor the agent's declared tool allowlist (agent.tools). If non-empty,
-    // only those tools may be dispatched here; anything else is refused so a
-    // subagent can't exceed its declared capabilities (and this gives the
-    // previously-vestigial `agent` param a real job). Empty == all tools.
-    if !agent.tools.is_empty() && !agent.tools.iter().any(|t| t == name) {
+    // Enforce the same tool set offered in the schema. Empty `agent.tools`
+    // means the core read-only default — NOT "execute anything the model invents".
+    let _ = my_target; // retained for intercom dispatch below
+    let offered = subagent_allowed_names(agent, bridge, depth, max_depth);
+    if !offered.iter().any(|n| n == name) {
         return Outcome::err(format!(
-            "tool '{}' is not in agent '{}' declared tool list {:?}",
-            name, agent.name, agent.tools
+            "tool '{}' is not available to agent '{}' (not in its tool schema). Declare it in the agent's tools: frontmatter if needed.",
+            name, agent.name
         ));
     }
 
@@ -1691,14 +1755,23 @@ async fn dispatch_subagent_tool(
                 let iargs = c.get("args").cloned().unwrap_or(json!({}));
                 let mut modified = iargs.clone();
                 let mut dmsg: Option<String> = None;
+                // Inner calls must also be in this subagent's offered schema —
+                // bulk must not smuggle tools the agent wasn't given.
+                if !offered.iter().any(|n| n == &iname) {
+                    dmsg = Some(format!(
+                        "tool '{iname}' is not in this subagent's tool schema"
+                    ));
+                }
                 let mut force_allow = false;
-                for rule in &cfg.allow_rules {
-                    if crate::tool_matches_rule(&iname, &iargs, rule) {
-                        force_allow = true;
-                        break;
+                if dmsg.is_none() {
+                    for rule in &cfg.allow_rules {
+                        if crate::tool_matches_rule(&iname, &iargs, rule) {
+                            force_allow = true;
+                            break;
+                        }
                     }
                 }
-                if !force_allow {
+                if dmsg.is_none() && !force_allow {
                     for rule in &cfg.deny_rules {
                         if crate::tool_matches_rule(&iname, &iargs, rule) {
                             dmsg = Some("denied by permission rule".into());
@@ -1750,6 +1823,21 @@ async fn dispatch_subagent_tool(
                 }
             }
         }
+    }
+
+    // Cache restore: identical re-call of a read-only tool after digest/ingress
+    // (mirrors the main loop). Keyed by the original call args (`args_str`),
+    // matching the outer-loop store site.
+    if let Some(restored) = {
+        let cache = st.tool_output_cache.lock().await;
+        cache.get(name, args_str).map(|s| s.to_string())
+    } {
+        let mut o = Outcome::ok(crate::apply_restore_cap(&restored));
+        if !hook_notes.is_empty() {
+            o.output.push_str("\n\n[hooks]\n");
+            o.output.push_str(&hook_notes.join("\n"));
+        }
+        return o;
     }
 
     // Execute. bash/bulk/diagnostics/subagent are async; others sync. Hooks that
@@ -3117,6 +3205,12 @@ mod tests {
         assert!(
             !names.contains(&"write_file"),
             "default agent must not get write_file: {names:?}"
+        );
+        assert!(
+            !names.contains(&"fetch")
+                && !names.contains(&"web_search")
+                && !names.contains(&"bulk_read"),
+            "default agent must not get deferred tools: {names:?}"
         );
     }
 
