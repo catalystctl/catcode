@@ -60,6 +60,8 @@ export class LiveSession {
   private starting: Promise<void> | null = null;
   private disposed = false;
   private crashCheck: ReturnType<typeof setInterval> | null = null;
+  /** Latches so a dead core only notifies once until the next successful start. */
+  private deadNotified = false;
   private titleMap: Record<string, string>;
   private readonly cb: SessionCallbacks;
   private readonly env: SessionEnv;
@@ -108,7 +110,11 @@ export class LiveSession {
   }
 
   private async start(): Promise<void> {
-    const env: Record<string, string> = {};
+    // Web UIs cannot open a browser on the server — force the pasteable
+    // oauth_prompt /oauth-code flow even when the host has a DISPLAY.
+    const env: Record<string, string> = {
+      CATALYST_CODE_NO_BROWSER: "1",
+    };
     if (this.env.apiKey) env.UMANS_API_KEY = this.env.apiKey;
     const core = new CoreProcess({
       cwd: this.workspace,
@@ -137,6 +143,7 @@ export class LiveSession {
       this.fanout({ type: "error", message: `Failed to start session: ${msg}` });
       throw err;
     }
+    this.deadNotified = false;
     this.onCoreEvent(ready as unknown as CoreEvent);
 
     // Populate the UI immediately (per-session models/plugins/memories/vision +
@@ -155,8 +162,17 @@ export class LiveSession {
 
   private checkAlive(): void {
     if (this.disposed) return;
-    if (this.core?.isRunning) return;
-    // The core exited unexpectedly. Surface it; the next command/ensure respawns.
+    if (this.core?.isRunning) {
+      this.deadNotified = false;
+      return;
+    }
+    // Already surfaced this death — wait for ensure()/start() to respawn.
+    if (this.deadNotified || !this.core) return;
+    this.deadNotified = true;
+    // End the in-flight turn for live clients (clears streaming + HITL gates)
+    // before wiping server state — otherwise Approve/Stop wedges forever.
+    this.state = reduce(this.state, { type: "aborted" });
+    this.fanout({ type: "aborted" });
     this.core = null;
     this.starting = null;
     this.state = {
@@ -168,6 +184,7 @@ export class LiveSession {
       type: "error",
       message: "This session's core exited. Sending a message will restart it.",
     });
+    this.cb.onDead(this.sessionFile);
   }
 
   /** Overlay web-layer custom session titles onto a `sessions` event. */
@@ -219,9 +236,10 @@ export class LiveSession {
     }
   }
 
-  /** Atomically capture this session's snapshot and register a live sink. */
+  /** Capture a snapshot, then register the live sink so no event can arrive
+   *  at the client before `_snapshot` (callers should send snapshot first). */
   subscribe(fn: Sink): { snapshot: AgentState; unsubscribe: () => void } {
-    const snapshot: AgentState = this.state;
+    const snapshot: AgentState = structuredClone(this.state);
     this.sinks.add(fn);
     return { snapshot, unsubscribe: () => this.sinks.delete(fn) };
   }
@@ -229,7 +247,7 @@ export class LiveSession {
   /** Reduce + fanout an event the bridge synthesized (projects, titles, …). */
   inject(ev: AgentEvent): void {
     this.state = reduce(this.state, ev);
-    this.fanout(ev as CoreEvent);
+    this.fanout(ev as unknown as CoreEvent);
   }
 
   /** Reload the title overlay (after a rename) and refresh the list. */
@@ -253,11 +271,33 @@ export class LiveSession {
   send(cmd: CoreCommand): void {
     this.lastActivity = Date.now();
     if (cmd.type === "send" || cmd.type === "steer") {
+      // Record for reconnect snapshots only — do NOT fanout (the originating
+      // client already applied an optimistic `_user`; fanning would duplicate).
       this.state = reduce(this.state, {
         type: "_user",
         text: cmd.prompt,
         model: cmd.model,
         steer: cmd.type === "steer",
+      });
+    } else if (cmd.type === "undo") {
+      // Mirror client `_undo_local` so the following core `reset` keeps the
+      // trimmed transcript in the server snapshot (reconnect-safe). Fan out so
+      // multi-viewer peers soft-trim instead of hard-wiping on `reset`.
+      this.inject({ type: "_undo_local" });
+    } else if (cmd.type === "apply_skill") {
+      const task = cmd.task?.trim();
+      this.state = reduce(this.state, {
+        type: "_user",
+        text: task ? `/skill:${cmd.name} ${task}` : `/skill:${cmd.name}`,
+        model: cmd.model,
+        steer: false,
+      });
+    } else if (cmd.type === "start_goal") {
+      this.state = reduce(this.state, {
+        type: "_user",
+        text: `🎯 Goal: ${cmd.goal}`,
+        model: cmd.model,
+        steer: false,
       });
     }
     if (!this.core) throw new Error("session core not started");

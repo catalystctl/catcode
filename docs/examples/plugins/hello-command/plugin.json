@@ -1,0 +1,13 @@
+{
+  "name": "hello-command",
+  "version": "0.1.0",
+  "description": "Demo plugin slash command + notify/status side effects.",
+  "commands": [
+    {
+      "name": "hello",
+      "description": "Greet from a plugin (/hello [name])",
+      "script": "commands/hello.py",
+      "timeout_ms": 5000
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "sqlite-memory",
+  "version": "0.1.0",
+  "description": "SQLite-backed memory provider (replaces markdown memory store). Requires Python stdlib only.",
+  "memory_provider": {
+    "script": "memory/provider.py",
+    "timeout_ms": 30000
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "path-guard",
+  "version": "0.1.0",
+  "description": "Block writes to sensitive paths (.env, credentials, private keys) before they happen.",
+  "hooks": {
+    "pre_write": {
+      "script": "hooks/pre_write.py",
+      "timeout_ms": 3000,
+      "pass_args": true
+    }
+  }
+}

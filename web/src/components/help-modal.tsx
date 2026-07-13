@@ -1,7 +1,8 @@
 "use client";
 
 // HelpModal — keybindings + slash-command reference. Opened via /help or the
-// sidebar. Uses the shared command catalog so it stays in sync with the flyout.
+// sidebar Help action. Uses the shared command catalog so it stays in sync with
+// the flyout.
 
 import { COMMANDS } from "@/lib/commands";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
@@ -9,14 +10,15 @@ import { useFocusTrap } from "@/lib/use-focus-trap";
 import { XIcon } from "./icons";
 
 const KEYBINDS: Array<[string, string]> = [
-  ["Enter", "Send message"],
+  ["Enter", "Send (or queue follow-up while streaming)"],
+  ["Ctrl + Enter", "Steer the in-flight turn"],
   ["Shift + Enter", "Newline"],
+  ["Esc", "Clear queued follow-up, else stop turn / close flyout"],
   ["/", "Open command menu"],
   ["!", "Run bash (!cmd · !!cmd no context)"],
   ["@", "Mention a file"],
   ["↑ / ↓", "Navigate flyout"],
   ["Tab / ↵", "Confirm flyout selection"],
-  ["Esc", "Close flyout / modal"],
   ["Double-click session", "Rename session"],
 ];
 

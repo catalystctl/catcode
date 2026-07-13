@@ -62,16 +62,24 @@ export async function GET(req: Request) {
       const send = (obj: ServerToClient) =>
         safeEnqueue(`data: ${JSON.stringify(obj)}\n\n`);
 
-      // 1) Atomically subscribe + snapshot (no event can slip between them).
-      const { snapshot, unsubscribe: unsub } = live.subscribe((ev: CoreEvent) =>
-        send(ev as unknown as ServerToClient),
-      );
+      // Buffer live events until the snapshot is flushed so the client never
+      // applies a post-snapshot event and then overwrites it with a stale snapshot.
+      const pending: CoreEvent[] = [];
+      let hydrated = false;
+      const { snapshot, unsubscribe: unsub } = live.subscribe((ev: CoreEvent) => {
+        if (!hydrated) {
+          pending.push(ev);
+          return;
+        }
+        send(ev as unknown as ServerToClient);
+      });
       unsubscribe = unsub;
 
-      // 2) Hydrate the full current state of THIS session, then live events flow.
       send({ type: "_snapshot", state: snapshot });
+      hydrated = true;
+      for (const ev of pending) send(ev as unknown as ServerToClient);
 
-      // 3) Keepalive so intermediaries don't time the idle connection out.
+      // Keepalive so intermediaries don't time the idle connection out.
       keepalive = setInterval(() => safeEnqueue(": keepalive\n\n"), 15000);
     },
     cancel() {

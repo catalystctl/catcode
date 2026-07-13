@@ -15,8 +15,8 @@
 // The blocking `need_decision` ask still uses the inline IntercomPrompt banner
 // (intercom.tsx); this panel is for observation, not reply.
 
-import { useState } from "react";
-import type { SubagentChatItem, SubagentRunView } from "@/lib/types";
+import { useEffect, useState } from "react";
+import type { AgentInfo, SubagentChatItem, SubagentRunView } from "@/lib/types";
 import {
   formatMs,
   formatTokens,
@@ -32,9 +32,25 @@ import {
   DotIcon,
   CheckIcon,
   WarningIcon,
+  RefreshIcon,
 } from "./icons";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+
+/** Fallback builtins if the core hasn't emitted an `agents` event yet. */
+const FALLBACK_AGENTS: AgentInfo[] = [
+  { name: "scout", description: "Fast code exploration", source: "builtin" },
+  { name: "reviewer", description: "Evidence-backed review", source: "builtin" },
+  { name: "worker", description: "Implementation writer", source: "builtin" },
+  { name: "oracle", description: "Decision consistency", source: "builtin" },
+  { name: "planner", description: "Implementation planning", source: "builtin" },
+  { name: "researcher", description: "Deep research", source: "builtin" },
+  { name: "context-builder", description: "Gather handoff context", source: "builtin" },
+  { name: "delegate", description: "General delegated work", source: "builtin" },
+];
+
+/** @deprecated Prefer live `availableAgents` from core. Kept for external imports. */
+export const AVAILABLE_AGENTS = FALLBACK_AGENTS.map((a) => a.name);
 
 const STATE_STYLE: Record<string, { dot: string; text: string; label: string }> = {
   running: { dot: "bg-warning", text: "text-warning", label: "running" },
@@ -256,13 +272,21 @@ function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }
 
 interface PanelProps {
   runs: Record<string, SubagentRunView>;
+  /** Discoverable agents from core `agents` events (builtin + user + project). */
+  agents?: AgentInfo[];
+  onRefreshAgents?: () => void;
   onClose: () => void;
 }
 
-export function SubagentsPanel({ runs, onClose }: PanelProps) {
+export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: PanelProps) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    onRefreshAgents?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const list = Object.values(runs).sort((a, b) => {
     const ar = a.state === "running" ? 1 : 0;
@@ -272,6 +296,7 @@ export function SubagentsPanel({ runs, onClose }: PanelProps) {
   });
   const runningCount = list.filter((r) => r.state === "running").length;
   const selected = selectedId ? runs[selectedId] : null;
+  const agentList = agents && agents.length > 0 ? agents : FALLBACK_AGENTS;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
@@ -291,24 +316,57 @@ export function SubagentsPanel({ runs, onClose }: PanelProps) {
               </span>
             )}
           </div>
-          <button
-            onClick={onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
-            aria-label="Close"
-          >
-            <XIcon width={16} height={16} />
-          </button>
+          <div className="flex items-center gap-1">
+            {onRefreshAgents && (
+              <button
+                onClick={onRefreshAgents}
+                className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                aria-label="Refresh agents"
+                title="Refresh available agents"
+              >
+                <RefreshIcon width={15} height={15} />
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+              aria-label="Close"
+            >
+              <XIcon width={16} height={16} />
+            </button>
+          </div>
         </div>
 
         {selected ? (
           <RunDetail run={selected} onBack={() => setSelectedId(null)} />
         ) : (
           <div className="flex-1 overflow-y-auto p-3">
+            <div className="mb-3 rounded-xl border border-ink-800 bg-ink-950/50 px-3 py-2.5">
+              <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-ink-500">
+                Available agents
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {agentList.map((a) => (
+                  <code
+                    key={a.name}
+                    title={a.description || a.source}
+                    className="rounded-md bg-ink-850 px-1.5 py-0.5 font-mono text-[11px] text-accent-soft"
+                  >
+                    {a.name}
+                  </code>
+                ))}
+              </div>
+
+              <p className="mt-2 text-[11px] text-ink-600">
+                Use <code className="font-mono text-ink-500">/run</code>,{" "}
+                <code className="font-mono text-ink-500">/parallel</code>, or{" "}
+                <code className="font-mono text-ink-500">/chain</code> — or the{" "}
+                <code className="font-mono text-ink-500">subagent</code> tool.
+              </p>
+            </div>
             {list.length === 0 ? (
-              <div className="px-3 py-12 text-center text-[12px] text-ink-600">
-                No subagent runs yet. Delegate work with the{" "}
-                <code className="font-mono text-ink-500">subagent</code> tool and runs will
-                appear here live.
+              <div className="px-3 py-8 text-center text-[12px] text-ink-600">
+                No runs yet. Delegated work will appear here live.
               </div>
             ) : (
               <div className="space-y-2">

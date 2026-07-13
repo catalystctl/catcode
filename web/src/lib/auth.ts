@@ -16,8 +16,21 @@ const SECRET_PATH = path.join(CONFIG_DIR, "auth-secret");
 
 // ── origin / rpID (passkey WebAuthn) ────────────────────────
 // CATCODE_WEB_ORIGIN lets a user override when accessing via a tunnel/domain.
+// Single-user default stays localhost; tunnels/domains must set the env var.
 const ORIGIN = process.env.CATCODE_WEB_ORIGIN || "http://localhost:49283";
 const RPID = new URL(ORIGIN).hostname;
+if (
+  process.env.NODE_ENV === "production" &&
+  !process.env.CATCODE_WEB_ORIGIN &&
+  process.env.NEXT_PHASE !== "phase-production-build" &&
+  !(globalThis as { __catcodeOriginWarned?: boolean }).__catcodeOriginWarned
+) {
+  (globalThis as { __catcodeOriginWarned?: boolean }).__catcodeOriginWarned = true;
+  console.warn(
+    "[auth] CATCODE_WEB_ORIGIN is unset; defaulting to http://localhost:49283. " +
+      "Set CATCODE_WEB_ORIGIN when accessing via a tunnel or custom domain (passkeys / cookies).",
+  );
+}
 
 // ── secret (auto-generate + persist on first run) ──────────
 function getSecret(): string {

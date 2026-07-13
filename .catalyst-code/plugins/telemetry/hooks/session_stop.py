@@ -129,6 +129,14 @@ def _new_summary(workspace, ws_hash):
         "elapsed_sum_ms": 0,
         "avg_elapsed_ms": 0.0,
         "per_model": {},
+        # Memory recall aggregates (optional; from args.memory_recall).
+        "memory_relevant_offers": 0,
+        "memory_relevant_gets": 0,
+        "memory_relevant_misses": 0,
+        "memory_synonym_miss_offers": 0,
+        "memory_synonym_miss_gets": 0,
+        "undo_count": 0,
+        "skill_md_reads": 0,
     }
 
 
@@ -185,6 +193,29 @@ def _render_md(s):
     lines.append(f"Throughput:      avg {_fmt_float(s.get('avg_tps'))} tok/s  (n={tps_n})")
     lines.append(f"Elapsed/turn:    avg {_fmt_float(s.get('avg_elapsed_ms'))} ms")
     lines.append("")
+    offers = s.get("memory_relevant_offers", 0) or 0
+    if offers or (s.get("memory_synonym_miss_offers", 0) or 0):
+        gets = s.get("memory_relevant_gets", 0) or 0
+        misses = s.get("memory_relevant_misses", 0) or 0
+        syn_o = s.get("memory_synonym_miss_offers", 0) or 0
+        syn_g = s.get("memory_synonym_miss_gets", 0) or 0
+        hit = (gets / offers) if offers else 0.0
+        lines.append("## Memory recall")
+        lines.append(
+            f"Relevant offers/gets/misses: {offers}/{gets}/{misses}  "
+            f"(hit {hit*100:.1f}%)"
+        )
+        lines.append(
+            f"Synonym-miss offers/recovered: {syn_o}/{syn_g}"
+        )
+        lines.append("")
+    undos = s.get("undo_count", 0) or 0
+    skill_reads = s.get("skill_md_reads", 0) or 0
+    if undos or skill_reads:
+        lines.append("## Learning loop")
+        lines.append(f"Human corrections (/undo): {undos}")
+        lines.append(f"Skill utilization (SKILL.md reads): {skill_reads}")
+        lines.append("")
     per_model = s.get("per_model", {}) or {}
     if per_model:
         lines.append("## Per model")
@@ -292,6 +323,28 @@ def main():
         m["tokens_in"] = int(m.get("tokens_in", 0)) + t_in
         m["tokens_out"] = int(m.get("tokens_out", 0)) + t_out
         m["cached_tokens"] = int(m.get("cached_tokens", 0)) + t_cache
+
+        # Fold cumulative memory-recall summary when the core attaches it.
+        mr = args.get("memory_recall") or {}
+        if isinstance(mr, dict) and mr:
+            # Prefer cumulative totals from the core summary when present.
+            for src, dst in (
+                ("relevant_offers", "memory_relevant_offers"),
+                ("relevant_gets", "memory_relevant_gets"),
+                ("relevant_misses", "memory_relevant_misses"),
+                ("synonym_miss_offers", "memory_synonym_miss_offers"),
+                ("synonym_miss_gets", "memory_synonym_miss_gets"),
+            ):
+                if mr.get(src) is not None:
+                    s[dst] = _as_int(mr.get(src)) or 0
+
+        # Human corrections + skill utilization (core session counters).
+        hc = args.get("human_corrections") or {}
+        if isinstance(hc, dict) and hc.get("undo_count") is not None:
+            s["undo_count"] = _as_int(hc.get("undo_count")) or 0
+        su = args.get("skill_utilization") or {}
+        if isinstance(su, dict) and su.get("skill_md_reads") is not None:
+            s["skill_md_reads"] = _as_int(su.get("skill_md_reads")) or 0
 
         _atomic_write(summary_path, json.dumps(s, indent=2) + "\n")
         _atomic_write(md_path, _render_md(s))

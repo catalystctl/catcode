@@ -23,6 +23,53 @@ use std::sync::Mutex as StdMutex;
 /// correct for one core process — the only writer to a memory dir.
 static WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
+/// Optional override for the memory store root (tests only). Avoids mutating
+/// process-global `HOME`, which races with parallel tests that also touch
+/// the memory store.
+static ROOT_OVERRIDE: StdMutex<Option<PathBuf>> = StdMutex::new(None);
+
+/// Serializes tests that touch the default memory store or install a root
+/// override — without this, parallel `tools` memory tests race with hygiene
+/// tests that temporarily redirect the store root.
+#[cfg(test)]
+pub fn memory_test_serial() -> &'static StdMutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+/// RAII guard that installs a temporary memory root and restores the previous
+/// override on drop. Tests that need an isolated store should hold this guard
+/// for the duration of the test body.
+pub struct MemoryRootGuard {
+    prev: Option<PathBuf>,
+}
+
+impl Drop for MemoryRootGuard {
+    fn drop(&mut self) {
+        let mut g = ROOT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+        *g = self.prev.take();
+    }
+}
+
+/// Install `root` as the memory store root until the returned guard is dropped.
+#[cfg(test)]
+pub fn override_memory_root(root: PathBuf) -> MemoryRootGuard {
+    let mut g = ROOT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = g.replace(root);
+    MemoryRootGuard { prev }
+}
+
+fn memory_store_root() -> PathBuf {
+    if let Ok(g) = ROOT_OVERRIDE.lock() {
+        if let Some(ref p) = *g {
+            return p.clone();
+        }
+    }
+    let home = crate::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config/catalyst-code/memory")
+}
+
 /// Memory scope: workspace-local (per-codebase) or global (cross-codebase).
 /// Global memories carry user-level facts — the user's name, preferred tech
 /// stacks, harness conventions — that apply regardless of which project is
@@ -51,6 +98,33 @@ impl Scope {
     }
 }
 
+/// Relative durability hint for catalog preference + write policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Importance {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
+impl Importance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Importance::High => "high",
+            Importance::Normal => "normal",
+            Importance::Low => "low",
+        }
+    }
+
+    pub fn parse(s: &str) -> Importance {
+        match s.trim().to_lowercase().as_str() {
+            "high" | "critical" | "durable" => Importance::High,
+            "low" | "ephemeral" | "temp" => Importance::Low,
+            _ => Importance::Normal,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryEntry {
     pub name: String,
@@ -59,7 +133,28 @@ pub struct MemoryEntry {
     pub content: String,
     pub path: PathBuf,
     pub scope: Scope,
+    /// When true (frontmatter `pin: true`), this memory is preferred in the
+    /// standing catalog over unpinned notes when the entry budget is tight.
+    pub pinned: bool,
+    /// Frontmatter `importance:` (high|normal|low). High ranks with pins in
+    /// the catalog; low is discouraged by the write policy unless forced.
+    pub importance: Importance,
 }
+
+/// Standing-prompt catalog caps. Bodies are NOT injected — only name/type/scope
+/// + one-line description — so a large store stays cheap in the prefix cache.
+/// Full text is loaded on demand via `memory` action=get (or list).
+pub const CATALOG_MAX_ENTRIES: usize = 48;
+/// ~2.5k tokens at the chars/4 heuristic used elsewhere in the harness.
+pub const CATALOG_MAX_CHARS: usize = 10_000;
+const CATALOG_DESC_MAX_CHARS: usize = 100;
+
+/// Per-turn relevant-memory tail (transient, not prefix-cached).
+pub const RELEVANT_MAX_ENTRIES: usize = 8;
+const RELEVANT_PREVIEW_LINES: usize = 5;
+
+/// Soft warning threshold for the `memory` tool after save/append.
+pub const SAVE_COUNT_WARN_THRESHOLD: usize = 60;
 
 // ---- hash ----
 
@@ -95,8 +190,7 @@ struct Store {
 
 impl Store {
     fn default_root() -> PathBuf {
-        let home = crate::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/catalyst-code/memory")
+        memory_store_root()
     }
 
     fn new(root: PathBuf) -> Self {
@@ -155,6 +249,27 @@ impl Store {
         mem_type: &str,
         description: &str,
     ) -> Result<PathBuf, String> {
+        self.save_scoped_with_importance(
+            workspace,
+            scope,
+            name,
+            content,
+            mem_type,
+            description,
+            Importance::Normal,
+        )
+    }
+
+    fn save_scoped_with_importance(
+        &self,
+        workspace: &Path,
+        scope: Scope,
+        name: &str,
+        content: &str,
+        mem_type: &str,
+        description: &str,
+        importance: Importance,
+    ) -> Result<PathBuf, String> {
         let dir = self.dir_scoped(workspace, scope);
         std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create memory dir: {e}"))?;
 
@@ -165,8 +280,18 @@ impl Store {
         let filename = format!("{}.md", slug);
         let path = dir.join(&filename);
 
+        let pin_line = if is_pinned_type(mem_type) || importance == Importance::High {
+            "pin: true\n"
+        } else {
+            ""
+        };
+        let importance_line = if importance != Importance::Normal {
+            format!("importance: {}\n", importance.as_str())
+        } else {
+            String::new()
+        };
         let body = format!(
-            "---\nname: {}\ndescription: {}\ntype: {}\n---\n{}",
+            "---\nname: {}\ndescription: {}\ntype: {}\n{pin_line}{importance_line}---\n{}",
             name, description, mem_type, content
         );
 
@@ -237,14 +362,36 @@ pub fn save_memory_scoped(
     mem_type: &str,
     description: &str,
 ) -> Result<PathBuf, String> {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    Store::new(Store::default_root()).save_scoped(
+    save_memory_scoped_with_importance(
         workspace,
         scope,
         name,
         content,
         mem_type,
         description,
+        Importance::Normal,
+    )
+}
+
+/// Like `save_memory_scoped` but records an importance hint in frontmatter.
+pub fn save_memory_scoped_with_importance(
+    workspace: &Path,
+    scope: Scope,
+    name: &str,
+    content: &str,
+    mem_type: &str,
+    description: &str,
+    importance: Importance,
+) -> Result<PathBuf, String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Store::new(Store::default_root()).save_scoped_with_importance(
+        workspace,
+        scope,
+        name,
+        content,
+        mem_type,
+        description,
+        importance,
     )
 }
 
@@ -370,15 +517,25 @@ fn append_memory_into(
             &combined[start..]
         );
     }
-    // Appending preserves the existing memory's type/description; the caller's
-    // values only apply when creating a NEW memory, so `append` can never
-    // silently wipe a memory's metadata (the tool defaults description="",
-    // type="note").
-    let (final_type, final_desc) = match &existing {
-        Some(m) if !m.content.is_empty() => (m.mem_type.as_str(), m.description.as_str()),
-        _ => (mem_type, description),
+    // Appending preserves the existing memory's type/description/importance;
+    // the caller's values only apply when creating a NEW memory, so `append`
+    // can never silently wipe a memory's metadata (the tool defaults
+    // description="", type="note").
+    let (final_type, final_desc, final_importance) = match &existing {
+        Some(m) if !m.content.is_empty() => {
+            (m.mem_type.as_str(), m.description.as_str(), m.importance)
+        }
+        _ => (mem_type, description, Importance::Normal),
     };
-    store.save_scoped(workspace, scope, name, &combined, final_type, final_desc)
+    store.save_scoped_with_importance(
+        workspace,
+        scope,
+        name,
+        &combined,
+        final_type,
+        final_desc,
+        final_importance,
+    )
 }
 
 /// Delete a memory by its slug/id (the filename stem) and rebuild the index.
@@ -421,49 +578,294 @@ pub fn forget_memory_any(workspace: &Path, id: &str) -> Result<(), String> {
         .or_else(|_| forget_memory_scoped(workspace, Scope::Global, id))
 }
 
+/// Look up a memory by id (slug) or name in both scopes (workspace first).
+pub fn get_memory(workspace: &Path, id: &str) -> Result<MemoryEntry, String> {
+    get_memory_scoped(workspace, Scope::Workspace, id)
+        .or_else(|_| get_memory_scoped(workspace, Scope::Global, id))
+}
+
+/// Look up a memory by id/name in a specific scope.
+pub fn get_memory_scoped(workspace: &Path, scope: Scope, id: &str) -> Result<MemoryEntry, String> {
+    let store = Store::new(Store::default_root());
+    let dir = store.dir_scoped(workspace, scope);
+    let slug = slugify(id);
+    if slug.is_empty() {
+        return Err("memory id/name must contain at least one alphanumeric character".into());
+    }
+    let path = dir.join(format!("{slug}.md"));
+    if !path.exists() {
+        // Fall back to scanning by display name (slug may differ from id input).
+        if let Some(entry) = store
+            .scan_scoped(workspace, scope)
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(id.trim()) || slugify(&e.name) == slug)
+        {
+            return Ok(entry);
+        }
+        return Err(format!(
+            "no {} memory found with id/name '{id}'",
+            scope.as_str()
+        ));
+    }
+    match parse_memory_file(&path) {
+        Some(mut entry) => {
+            entry.scope = scope;
+            Ok(entry)
+        }
+        None => Err(format!("memory file at {} is unreadable", path.display())),
+    }
+}
+
+/// True when a memory with this name/id already exists in the given scope.
+pub fn memory_exists_scoped(workspace: &Path, scope: Scope, name: &str) -> bool {
+    get_memory_scoped(workspace, scope, name).is_ok()
+}
+
+/// Count of memories across both scopes (for save-path soft warnings).
+pub fn memory_count(workspace: &Path) -> usize {
+    scan_all_memories(workspace).len()
+}
+
+/// One-line description for catalog display: prefer frontmatter description,
+/// else the first non-empty content line. Truncated for standing-prompt budget.
+fn catalog_blurb(entry: &MemoryEntry) -> String {
+    let raw = if !entry.description.trim().is_empty() {
+        entry.description.trim().to_string()
+    } else {
+        entry
+            .content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    truncate_chars(&raw, CATALOG_DESC_MAX_CHARS)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}…")
+}
+
 /// Build a string to inject into the system prompt with memories relevant to
-/// the user's current prompt. Returns an empty string if no memories match.
+/// the user's current prompt.
+///
+/// - Empty `prompt` (standing system prompt): a **catalog** of name/type/scope
+///   + one-line description only — no body previews. Capped by entry count and
+///   char budget; pinned memories are preferred when truncating.
+/// - Non-empty `prompt` (per-turn relevance): matching memories with short body
+///   previews, capped at [`RELEVANT_MAX_ENTRIES`]. Prefer
+///   [`relevant_memories_tail`] for the transient turn-tail path.
 pub fn memory_injection(workspace: &Path, prompt: &str) -> String {
     let memories = scan_all_memories(workspace);
     build_injection(&memories, prompt)
+}
+
+/// Transient per-turn relevant-memory block for the request tail (not persisted,
+/// not spliced into the standing system prompt — keeps the prefix cache stable).
+pub fn relevant_memories_tail(workspace: &Path, prompt: &str) -> String {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return String::new();
+    }
+    let memories = scan_all_memories(workspace);
+    crate::memory_recall::begin_turn(workspace, prompt, &memories);
+    build_relevant_tail(&memories, prompt)
+}
+
+/// When the memory store grows past this, switch ranking from boolean keyword
+/// match to bag-of-words cosine similarity — a local retrieval foundation that
+/// needs no external embedding model (SELF_LEARNING Milestone 4 trigger).
+pub const RETRIEVAL_SCALE_THRESHOLD: usize = 500;
+
+fn importance_rank(i: Importance) -> u8 {
+    match i {
+        Importance::High => 2,
+        Importance::Normal => 1,
+        Importance::Low => 0,
+    }
 }
 
 fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
     if memories.is_empty() {
         return String::new();
     }
-    // An empty prompt means we're building the standing system prompt (no
-    // specific query to filter by): include ALL memories so the model always
-    // carries forward what it learned in prior sessions. A non-empty prompt
-    // (per-turn relevance, reserved for future use) filters to keyword matches.
-    let relevant: Vec<&MemoryEntry> = if prompt.is_empty() {
-        memories.iter().collect()
+    if prompt.is_empty() {
+        return build_catalog(memories);
+    }
+    // Keyword-filtered with short previews (also used by relevant_memories_tail).
+    build_relevant_tail(memories, prompt)
+}
+
+fn build_catalog(memories: &[MemoryEntry]) -> String {
+    // Pinned/high-importance first (stable within group by name), then the rest.
+    let mut order: Vec<&MemoryEntry> = memories.iter().collect();
+    order.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| importance_rank(b.importance).cmp(&importance_rank(a.importance)))
+            .then_with(|| a.scope.as_str().cmp(b.scope.as_str())) // global before workspace
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut out = String::from(
+        "[MEMORY CATALOG] — name/type/scope + one-line summary only. \
+         Full text: memory action=get with id/name. Prefer append over new saves. \
+         Use consolidate to merge near-duplicates; skip trivia.\n",
+    );
+    let mut listed = 0usize;
+    let mut omitted = 0usize;
+    for m in order {
+        let blurb = catalog_blurb(m);
+        let line = format!(
+            "- **{}** ({}, {}){}\n",
+            m.name,
+            if m.mem_type.is_empty() {
+                "note"
+            } else {
+                m.mem_type.as_str()
+            },
+            m.scope.as_str(),
+            if blurb.is_empty() {
+                String::new()
+            } else {
+                format!(": {blurb}")
+            }
+        );
+        if listed >= CATALOG_MAX_ENTRIES || out.len() + line.len() > CATALOG_MAX_CHARS {
+            omitted += 1;
+            continue;
+        }
+        out.push_str(&line);
+        listed += 1;
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "- …and {omitted} more (memory action=list, then get by id)\n"
+        ));
+    }
+    out
+}
+
+fn build_relevant_tail(memories: &[MemoryEntry], prompt: &str) -> String {
+    let use_vector = memories.len() >= RETRIEVAL_SCALE_THRESHOLD;
+    let mut scored: Vec<(&MemoryEntry, f64)> = if use_vector {
+        let q = bag_vector(prompt);
+        memories
+            .iter()
+            .filter_map(|m| {
+                let text = format!("{} {} {}", m.name, m.description, m.content);
+                let score = cosine_sim(&q, &bag_vector(&text));
+                // Soft floor so sparse queries still surface a few candidates.
+                if score > 0.02 {
+                    Some((m, score))
+                } else {
+                    None
+                }
+            })
+            .collect()
     } else {
-        memories.iter().filter(|m| is_relevant(m, prompt)).collect()
+        memories
+            .iter()
+            .filter(|m| is_relevant(m, prompt))
+            .map(|m| (m, 1.0))
+            .collect()
     };
-    if relevant.is_empty() {
+    if scored.is_empty() {
         return String::new();
     }
-    let mut out = String::from("[PERSISTENT MEMORIES]\n");
-    for m in &relevant {
-        let desc_part = if m.description.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", m.description)
-        };
+    // Prefer higher retrieval score, then pinned/high-importance, then name.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.0.pinned.cmp(&a.0.pinned))
+            .then_with(|| importance_rank(b.0.importance).cmp(&importance_rank(a.0.importance)))
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    let total = scored.len();
+    scored.truncate(RELEVANT_MAX_ENTRIES);
+
+    let header = if use_vector {
+        "[RELEVANT MEMORIES] — vector-ranked matches for this turn (transient; \
+         bag-of-words cosine over the memory store). Use memory action=get for full text.\n"
+    } else {
+        "[RELEVANT MEMORIES] — keyword matches for this turn (transient). \
+         Use memory action=get for full text.\n"
+    };
+    let mut out = String::from(header);
+    for (m, _score) in &scored {
+        let blurb = catalog_blurb(m);
         out.push_str(&format!(
             "- **{}** ({}, {}){}\n",
             m.name,
-            m.mem_type,
+            if m.mem_type.is_empty() {
+                "note"
+            } else {
+                m.mem_type.as_str()
+            },
             m.scope.as_str(),
-            desc_part
+            if blurb.is_empty() {
+                String::new()
+            } else {
+                format!(": {blurb}")
+            }
         ));
         if !m.content.is_empty() {
-            let preview: String = m.content.lines().take(5).collect::<Vec<_>>().join("\n");
-            out.push_str(&format!("  {}\n", preview));
+            let preview: String = m
+                .content
+                .lines()
+                .take(RELEVANT_PREVIEW_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&format!("  {preview}\n"));
         }
     }
+    if total > scored.len() {
+        out.push_str(&format!(
+            "- …and {} more matches (memory action=list)\n",
+            total - scored.len()
+        ));
+    }
     out
+}
+
+/// Sparse bag-of-words vector over significant tokens (local embedding stand-in).
+fn bag_vector(text: &str) -> std::collections::HashMap<String, f64> {
+    let mut v = std::collections::HashMap::new();
+    for t in significant_tokens(text) {
+        *v.entry(t).or_insert(0.0) += 1.0;
+    }
+    v
+}
+
+fn cosine_sim(
+    a: &std::collections::HashMap<String, f64>,
+    b: &std::collections::HashMap<String, f64>,
+) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for (k, va) in a {
+        na += va * va;
+        if let Some(vb) = b.get(k) {
+            dot += va * vb;
+        }
+    }
+    for vb in b.values() {
+        nb += vb * vb;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 // ---- scan internals ----
@@ -522,6 +924,8 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     let mut name = String::new();
     let mut description = String::new();
     let mut mem_type = String::new();
+    let mut pinned = false;
+    let mut importance = Importance::Normal;
 
     for line in fm_block.lines() {
         let line = line.trim();
@@ -536,12 +940,21 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
             "name" => name = val,
             "description" => description = val,
             "type" => mem_type = val,
+            "importance" => importance = Importance::parse(&val),
+            "pin" | "pinned" => {
+                pinned = matches!(val.to_lowercase().as_str(), "true" | "yes" | "1");
+            }
             _ => {}
         }
     }
 
     if name.is_empty() {
         return None;
+    }
+
+    // Types that are almost always worth keeping in the standing catalog.
+    if !pinned {
+        pinned = is_pinned_type(&mem_type) || importance == Importance::High;
     }
 
     Some(MemoryEntry {
@@ -554,7 +967,17 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         // file content. scan_dir() overrides this with the correct value; the
         // default here covers direct parse_memory_file callers (e.g. append).
         scope: Scope::Workspace,
+        pinned,
+        importance,
     })
+}
+
+/// Built-in pin heuristic for memory types that should survive catalog truncation.
+fn is_pinned_type(mem_type: &str) -> bool {
+    matches!(
+        mem_type.trim().to_lowercase().as_str(),
+        "convention" | "decision" | "user" | "identity" | "preference"
+    )
 }
 
 /// Find the closing `---` line in a frontmatter block. Returns the byte offset
@@ -597,16 +1020,26 @@ fn rebuild_index(dir: &Path, scope: Scope) -> Result<(), String> {
 /// from the memory's name or description appears in the prompt (case-insensitive),
 /// the memory is considered relevant.
 fn is_relevant(entry: &MemoryEntry, prompt: &str) -> bool {
+    is_name_relevant(entry, prompt)
+}
+
+/// Public for recall telemetry: name+description keyword overlap with prompt.
+pub fn is_name_relevant(entry: &MemoryEntry, prompt: &str) -> bool {
     let prompt_lower = prompt.to_lowercase();
     let text = format!("{} {}", entry.name, entry.description);
-    let keywords: Vec<&str> = text
-        .split_whitespace()
+    significant_tokens(&text)
+        .into_iter()
+        .any(|kw| prompt_lower.contains(&kw))
+}
+
+/// Significant lowercase tokens (>2 chars, not stopwords) from `text`.
+pub fn significant_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(|w| w.trim_matches(|c: char| c == '_' || c == '-'))
         .filter(|w| w.len() > 2)
         .filter(|w| !is_stopword(w))
-        .collect();
-    keywords
-        .iter()
-        .any(|kw| prompt_lower.contains(&kw.to_lowercase()))
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
 fn is_stopword(w: &str) -> bool {
@@ -641,6 +1074,16 @@ fn slugify(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// Public wrapper so hygiene/recall can share the (possibly overridden) root.
+pub fn memory_store_root_public() -> PathBuf {
+    memory_store_root()
+}
+
+/// Public slug helper for recall/hygiene modules (same rules as internal slugify).
+pub fn slugify_public(name: &str) -> String {
+    slugify(name)
 }
 
 /// Atomic + fsync'd file write via a UNIQUE temp file (fsutil), so two
@@ -787,6 +1230,8 @@ mod tests {
             content: String::new(),
             path: PathBuf::from("/fake/ts.md"),
             scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::Normal,
         };
         assert!(is_relevant(&e, "write a strict TypeScript component"));
         assert!(is_relevant(&e, "use enums in this file"));
@@ -804,6 +1249,8 @@ mod tests {
             content: String::new(),
             path: PathBuf::from("/fake/fmt.md"),
             scope: Scope::Workspace,
+            pinned: false,
+            importance: Importance::Normal,
         };
         assert!(!is_relevant(&e, "the quick brown fox"));
         assert!(!is_relevant(&e, "this and that"));
@@ -832,10 +1279,12 @@ mod tests {
 
         let memories = store.scan(&ws);
         let injection = build_injection(&memories, "please add jest tests for the component");
-        assert!(injection.contains("[PERSISTENT MEMORIES]"));
+        assert!(injection.contains("[RELEVANT MEMORIES]"));
         assert!(injection.contains("test rules"));
         assert!(injection.contains("Jest is the test framework"));
         assert!(!injection.contains("indent"));
+        // Relevant tail may include a short body preview.
+        assert!(injection.contains("run tests with jest"));
     }
 
     #[test]
@@ -853,27 +1302,75 @@ mod tests {
     }
 
     #[test]
-    fn memory_injection_empty_prompt_injects_all() {
-        // The standing system prompt is built with an empty prompt: ALL memories
-        // must be injected so prior-session learnings carry forward, not filtered
-        // by keyword relevance (which would match nothing on an empty prompt).
+    fn memory_injection_empty_prompt_builds_catalog() {
+        // Standing system prompt: catalog of all memories (name + one-line),
+        // no multi-line body previews.
         let root = tmp_root();
         let ws = fake_workspace("empty");
         let store = test_store(&root);
 
         store
-            .save(&ws, "rust rules", "no unsafe", "project", "safe Rust only")
+            .save(
+                &ws,
+                "rust rules",
+                "no unsafe\nnever panic",
+                "project",
+                "safe Rust only",
+            )
             .unwrap();
         store
             .save(&ws, "indent", "always use tabs", "user", "tab width 4")
             .unwrap();
         let memories = store.scan(&ws);
         let injection = build_injection(&memories, "");
-        assert!(injection.contains("[PERSISTENT MEMORIES]"));
+        assert!(injection.contains("[MEMORY CATALOG]"));
         assert!(injection.contains("rust rules"));
         assert!(injection.contains("safe Rust only"));
-        // an unrelated memory must still appear under the empty-prompt standing prompt
         assert!(injection.contains("indent"));
+        // Body lines beyond the one-line blurb must not appear.
+        assert!(
+            !injection.contains("never panic"),
+            "catalog must not embed multi-line bodies: {injection}"
+        );
+    }
+
+    #[test]
+    fn memory_catalog_caps_entries_and_prefers_pinned() {
+        let mut memories = Vec::new();
+        for i in 0..(CATALOG_MAX_ENTRIES + 5) {
+            memories.push(MemoryEntry {
+                name: format!("note-{i:03}"),
+                description: format!("desc {i}"),
+                mem_type: "note".into(),
+                content: "body".into(),
+                path: PathBuf::from(format!("/fake/note-{i}.md")),
+                scope: Scope::Workspace,
+                pinned: false,
+                importance: Importance::Normal,
+            });
+        }
+        memories.push(MemoryEntry {
+            name: "zzz-pinned".into(),
+            description: "must survive truncation".into(),
+            mem_type: "convention".into(),
+            content: "important".into(),
+            path: PathBuf::from("/fake/pinned.md"),
+            scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::High,
+        });
+        let injection = build_catalog(&memories);
+        assert!(injection.contains("[MEMORY CATALOG]"));
+        assert!(
+            injection.contains("zzz-pinned"),
+            "pinned memory must be kept under budget: {injection}"
+        );
+        assert!(
+            injection.contains("…and "),
+            "overflow marker required: {injection}"
+        );
+        let listed = injection.lines().filter(|l| l.starts_with("- **")).count();
+        assert_eq!(listed, CATALOG_MAX_ENTRIES);
     }
 
     #[test]
@@ -1274,13 +1771,19 @@ mod tests {
 
         let memories = scan_all_memories_with_store(&store, &ws);
         let injection = build_injection(&memories, "");
-        assert!(injection.contains("[PERSISTENT MEMORIES]"));
+        assert!(injection.contains("[MEMORY CATALOG]"));
         assert!(injection.contains("user-identity"));
-        assert!(injection.contains("Alice"));
+        // Description empty → catalog blurb falls back to first content line.
+        assert!(injection.contains("User is Alice"));
         assert!(injection.contains("project-rule"));
         // scope tags present
         assert!(injection.contains("global"));
         assert!(injection.contains("workspace"));
+        // Catalog must not embed multi-line body blocks (single-line blurb only).
+        assert!(
+            !injection.contains("\n  User is Alice"),
+            "catalog should not indent body previews: {injection}"
+        );
     }
 
     // Helper: scan_all_memories against a test store (not the default root).

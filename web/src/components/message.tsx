@@ -70,9 +70,11 @@ function UserMessage({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.text);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const cancelledRef = useRef(false);
   useEffect(() => {
     if (editing) {
       setDraft(m.text);
+      cancelledRef.current = false;
       requestAnimationFrame(() => {
         const el = inputRef.current;
         if (el) {
@@ -104,10 +106,17 @@ function UserMessage({
                   commit();
                 } else if (e.key === "Escape") {
                   e.preventDefault();
+                  cancelledRef.current = true;
                   setEditing(false);
                 }
               }}
-              onBlur={commit}
+              onBlur={() => {
+                if (cancelledRef.current) {
+                  cancelledRef.current = false;
+                  return;
+                }
+                commit();
+              }}
               rows={Math.min(8, draft.split("\n").length + 1)}
               className="w-full resize-none bg-transparent px-2 py-1 text-[14px] leading-relaxed text-ink-100 focus:outline-none"
             />

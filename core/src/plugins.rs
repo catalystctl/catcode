@@ -17,558 +17,18 @@ use tokio::process::Command;
 
 // ---- constants ----
 
-/// Injected into the system prompt so agents can self-bootstrap plugins.
-/// Explains the plugin directory layout, manifest format, hook contract,
-/// and available hook points. Designed for an LLM to read and act on.
-pub const PLUGIN_DOCS: &str = r#"## Plugin System
-
-You can extend the harness with plugins. Plugins are self-contained directories
-under `.catalyst-code/plugins/`. Each plugin hooks into tool execution and
-session lifecycle events to inspect, approve, modify, or log operations.
-
-### Creating a plugin
-
-1. Create a directory: `.catalyst-code/plugins/<plugin-name>/`
-2. Write a `plugin.json` manifest (see format below)
-3. Write executable hook scripts (bash, python, or any language)
-4. Make hook scripts executable (`chmod +x hooks/*.sh`)
-5. The core loads new plugins on next restart, or you can call the `plugin` tool
-   (if loaded by the TUI) to `install`, `remove`, `enable`, or `disable` plugins
-   at runtime.
-
-### Installing a plugin
-
-Install from a **local directory** or a **GitHub Release**:
-
-- Local: `/plugin-install /path/to/plugin-dir`
-- Local (this repo only): `/plugin-install /path/to/plugin-dir workspace`
-- GitHub (latest release): `/plugin-install https://github.com/owner/repo`
-- GitHub (pinned release): `/plugin-install https://github.com/owner/repo@v1.2.0`
-- Shorthand: `/plugin-install owner/repo@v1.2.0`
-- Scope flags: append `global` (default) or `workspace`, or use `--global` / `--workspace`
-
-**Install scope**
-
-| Scope | Destination | Loads when |
-|-------|-------------|------------|
-| `global` (default) | `~/.catalyst-code/plugins/<name>/` | Every workspace, always |
-| `workspace` | `<repo>/.catalyst-code/plugins/<name>/` | This repo only (user installs load without `--trust-project-plugins`) |
-
-Prefer **global** for personal plugins (memory backends, OAuth, vision handoff).
-Use **workspace** when the plugin should stay repo-local. Repo-shipped plugins
-(without the user-install marker) still need `--trust-project-plugins` to load.
-
-**Prefer GitHub Releases for distribution.** Tag a release so the install
-downloads that release's source `.zip` (via the GitHub API `zipball_url`).
-Release tags are the version pin — they enable reproducible installs and a
-future auto-updater that re-fetches the latest (or newer) release zip. A
-repo with no Releases cannot be installed via URL; publish one first.
-
-Optional subdir for monorepos: `owner/repo@v1.2.0:path/to/plugin` (the
-plugin.json lives under that path inside the release zip).
-
-### Publishing / discovery (plugin listing)
-
-To show up on a site that scrapes GitHub (e.g. code.catalystctl.com):
-
-1. Publish **GitHub Releases** (versioned source zips).
-2. Add the repository topic **`catcode-plugin`** (canonical). Optional alias:
-   `catalyst-code-plugin`.
-3. Keep `plugin.json` at the repo root (or document a `:subdir`).
-
-Listing scrapers search:
-`https://api.github.com/search/repositories?q=topic:catcode-plugin`
-then read each repo's latest Release + `plugin.json`. An optional root
-`catalog.json` (`schema: catcode-plugin/v1`) can carry extra listing metadata.
-
-### plugin.json format
-
-```
-{
-  "name": "my-plugin",
-  "version": "0.1.0",
-  "description": "What this plugin does",
-  "hooks": {
-    "pre_write": {
-      "script": "hooks/pre_write.sh",
-      "timeout_ms": 5000,
-      "pass_args": true
-    },
-    "post_bash": {
-      "script": "hooks/post_bash.py",
-      "timeout_ms": 30000,
-      "pass_args": false
-    }
-  }
-}
-```
-
-Fields:
-- `name` (required): unique plugin identifier (directory name must match)
-- `version` (required): semver string
-- `description` (optional): human-readable summary
-- `hooks` (optional): map of hook-point name to config
-  - `script` (required): path to executable, relative to the plugin directory
-  - `timeout_ms` (optional): override the default hook timeout (default: 5s for pre_*, 30s for post_*)
-  - `pass_args` (optional): if true, the hook context JSON includes the tool's `args` object (default: false)
-
-### Hook contract
-
-Each hook script receives a single JSON object on stdin and MUST write a single
-JSON object to stdout before exiting. Stderr is captured for error reporting.
-
-**Context (stdin → script):**
-```
-{
-  "hook": "pre_write",
-  "tool": "write_file",
-  "workspace": "/path/to/workspace",
-  "args": { "path": "src/file.rs", "content": "..." },
-  "session_id": "abc123.jsonl",
-  "timestamp": 1719000000
-}
-```
-
-**Response (script → stdout):**
-```
-{
-  "allow": true,
-  "reason": "File passes lint check",
-  "modify": { "content": "reformatted code" }
-}
-```
-
-- `allow` (required, bool): true to proceed, false to block (pre hooks) or skip result (post hooks)
-- `reason` (optional, string): human-readable explanation. For pre hooks it
-  is shown to the model — appended to the tool result as a note on `allow`, and
-  used as the deny message on `allow:false`. Also logged. For post hooks it is
-  appended to the tool result as a note.
-- `modify` (optional, object): for pre hooks, a JSON object whose keys are
-  **merged over** the original tool args (shallow, per-key override). Return only
-  the fields you want to change; everything else is preserved. Examples:
-  pre_write `{ "content": "reformatted" }` overrides content but keeps `path`/
-  `edits`; pre_bash `{ "command": "fixed command" }` overrides the command;
-  pre_read `{ "path": "new/path" }` redirects the read. For **post hooks**,
-  `modify` transforms the tool's RESULT: `{ "output": "...", "ok": false,
-  "diff": "..." }` replaces the result text, flips success, or replaces/clears
-  the diff — e.g. redact a secret, append context, or reformat. (The post
-  context includes the current result under the `result` key so the hook can
-  read it.)
-
-  Note: pre-hook `modify` runs AFTER the approval gate + diff preview (which use
-  the original args), so a rewritten `path`/`command` is NOT re-prompted. File
-  tools still re-confine the path internally and `bash` re-checks its denylist,
-  so the security boundaries hold — but a plugin that redirects a safe path to a
-  sensitive one bypasses the user-facing prompt. Pre-hooks are trusted,
-  user-installed code (project hooks gated by `--trust-project-plugins`).
-
-Safety rules enforced by the core:
-- pre_* hooks: non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks the tool)
-- post_* hooks: non-zero exit, timeout, or JSON parse failure → silently skipped (tool already ran)
-- Disabled plugins are never invoked
-- Every hook has a hard timeout (5s default for pre_*, 30s default for post_*)
-- Hook failures never crash the core
-
-### Available hook points
-
-| Hook point    | Fires when                              | Type |
-|---------------|-----------------------------------------|------|
-| pre_bash      | Before a bash command executes          | pre  |
-| pre_write     | Before a file write/edit                | pre  |
-| pre_read      | Before a file is read                   | pre  |
-| post_bash     | After a bash command completes          | post |
-| post_write    | After a file write/edit completes       | post |
-| post_read     | After a file is read                    | post |
-| pre_tool      | Before ANY tool executes (catch-all)    | pre  |
-| post_tool     | After ANY tool executes (catch-all)     | post |
-| session_start | When a session begins (prompt received) | lifecycle |
-| session_stop  | When a session ends (done/abort)        | lifecycle |
-| pre_compact   | Before conversation compaction         | pre  |
-| pre_turn      | Before a model request (advisory)      | pre  |
-
-### pre_turn hook (model handoff)
-
-`pre_turn` fires once per assistant turn, after the user message (including any
-attached images) is built and before the first model request. It is advisory:
-it can remap the model for the turn but can never block it (a missing/broken
-hook or `allow:false` is ignored — the turn proceeds with the original model).
-
-Context `args` (set `pass_args: true` in the manifest):
-```
-{
-  "model": "umans-glm-5.2",
-  "has_images": true,
-  "image_count": 2,
-  "models": [ {"id":"...", "vision":true}, ... ]
-}
-```
-Response: return `modify: { "model": "<new-model-id>" }` to swap the turn's
-model. The core validates the id against discovered models and emits an `info`
-event on handoff. Use this to route image-bearing turns to a vision-capable
-model when the active one lacks vision (see the bundled `vision-handoff` plugin).
-
-### Declaring tools (custom capabilities, no MCP)
-
-A plugin can ALSO declare tools — first-class capabilities the model can call,
-defined without MCP and without recompiling. A tool is a JSON Schema (sent to
-the model like any built-in tool) plus a handler script the core spawns per
-call. This is the no-MCP way to give the agent a new capability (a domain tool,
-a CLI wrapper, an internal-API client, …) by dropping files in
-`.catalyst-code/plugins/`. (Plugin tools are available to the main agent;
-subagents use the built-in tool set.)
-
-Add a `tools` array to `plugin.json` (a plugin may declare only tools, only
-hooks, or both):
-
-```
-{
-  "name": "my-tools",
-  "version": "0.1.0",
-  "description": "Custom domain tools",
-  "tools": [
-    {
-      "name": "lookup_order",
-      "description": "Look up an order by id from the internal API.",
-      "parameters": {
-        "type": "object",
-        "properties": { "order_id": { "type": "string" } },
-        "required": ["order_id"]
-      },
-      "script": "tools/lookup_order.sh",
-      "kind": "readonly",
-      "timeout_ms": 15000
-    }
-  ]
-}
-```
-
-Fields:
-- `name` (required): tool name. By default it must not collide with a built-in
-  tool (bash, read_file, edit, subagent, …) — a colliding plugin tool is skipped
-  and the built-in wins. Set `override: true` (below) to instead REPLACE the
-  built-in's implementation with this plugin's handler.
-- `description` (optional): shown to the model.
-- `parameters` (optional): a JSON Schema for the tool's arguments. Defaults
-  to an empty object.
-- `script` (required): path to the executable handler, relative to the plugin
-  directory (path-confined; `..` escapes are rejected).
-- `kind` (optional): `"readonly"` (skips the approval gate) or `"destructive"`
-  (prompts under Approval::Destructive — the default). Arbitrary external code
-  runs on every call, so default to `destructive`.
-- `override` (optional, bool): when `true` AND `name` matches a built-in tool,
-  this plugin's handler REPLACES that built-in — the model still sees a tool of
-  that name (this plugin's declared `description`/`parameters`), but calls route
-  to the plugin script instead of the core handler. This is the no-recompile way
-  to fully override a core tool (a sandboxed `bash`, a redacting `read_file`, a
-  rate-limited `git_commit`, …). Default `false`: a name collision stays built-in.
-- `timeout_ms` (optional): hard per-call timeout (default 30s).
-
-Tool handler contract (one JSON object on stdin, one on stdout):
-
-```
-# stdin (→ handler)
-{ "args": { "order_id": "12345" }, "workspace": "/abs/path", "session_id": "x.jsonl", "timestamp": 1719000000 }
-
-# stdout (→ core)
-{ "ok": true,  "output": "Order #12345: shipped" }
-{ "ok": false, "output": "order not found" }   # ok omitted defaults to true
-```
-
-- `output` is the text shown to the model as the tool result. `ok:false` (or
-  an `error` field) marks the call failed — the conversation continues; the
-  model sees the error and can react.
-- A bare non-JSON stdout is accepted as `output` with `ok=true`, so a trivial
-  `echo` handler works. Prefer the structured form.
-- Non-zero exit, timeout, or spawn failure produce an error result (the model
-  is told the tool failed); they never crash the core or the turn.
-
-Safety (identical to hooks): tool scripts are path-confined to the plugin
-directory, must be executable, and run with the same `trust_project_plugins`
-gate — a repo's project-scoped tools load only after you opt in with
-`--trust-project-plugins` (built-in + `~/.catalyst-code/plugins` tools load
-always). Tool calls honor the approval gate and your allow/deny permission
-rules like any tool.
-
-`.catalyst-code/plugins/my-tools/tools/lookup_order.sh`:
-```bash
-#!/bin/bash
-input=$(cat)
-id=$(echo "$input" | jq -r '.args.order_id')
-# …call your internal API…
-jq -n --arg o "Order #$id: shipped" '{ "ok": true, "output": $o }'
-```
-
-Remember: `chmod +x` the handler.
-
-### Add, override, and remove core behavior
-
-A plugin can do everything a direct core edit can — add, override, and remove
-behavior — without recompiling. Five mechanisms cover the full surface:
-
-| Operation | Mechanism | Notes |
-|-----------|-----------|-------|
-| **ADD a tool** | `tools` array | A new capability the model can call. |
-| **OVERRIDE a tool** | a tool with `override: true` | Replaces a built-in's implementation (the model still sees that tool name; calls route to the plugin script). |
-| **REMOVE a tool** | `disable_tools` | Drops the named tool from the model's toolset entirely (built-in or override). The strongest lever — wins over `override`. |
-| **MODIFY tool input** | `pre_bash`/`pre_write`/`pre_read`/`pre_tool` `modify` | Override specific args before execution. |
-| **MODIFY tool output** | `post_*`/`post_tool` `modify` | Replace the result text / flip success / change the diff after execution. |
-| **MODIFY the model** | `pre_turn` `modify.model` | Remap the turn's model (advisory). |
-| **ADD to the system prompt** | `system_prompt` field | Static text appended to the system prompt. |
-| **REPLACE the memory store** | `memory_provider` block | Replaces standing-prompt injection, slash `/remember`/`/memory`/`/forget`, compaction extract, and (unless a tool `override`s `memory`) the built-in `memory` tool. Only one enabled provider should be active. |
-
-#### `memory_provider` — replace the memory backend
-
-A plugin can replace the built-in markdown memory store with an external
-engine (vector DB, Engraphis, remote API, …). Declare a single script that
-handles all memory actions, same pattern as `oauth`:
-
-```json
-{
-  "name": "engraphis-memory",
-  "version": "1.0.0",
-  "memory_provider": {
-    "script": "memory/provider.py",
-    "timeout_ms": 30000
-  }
-}
-```
-
-Fields:
-- `script` (required): path relative to the plugin directory
-- `timeout_ms` (optional, default 30000): hard timeout per action
-
-**Action contract** — stdin is one JSON object; stdout is one JSON object.
-
-Base context always includes `action`, `workspace`, `session_id`, `timestamp`.
-Action-specific fields live under `args`.
-
-| action | args | success response |
-|--------|------|------------------|
-| `inject` | optional `query` | `{ "ok": true, "injection": "…" }` (empty string = no memories) |
-| `save` | `name`, `content`, optional `type`, `description`, `scope` | `{ "ok": true, "output": "…", "id": "…" }` |
-| `append` | same as save | same |
-| `list` | optional `scope` | `{ "ok": true, "output": "…", "entries": […] }` |
-| `forget` | `id`, optional `scope` | `{ "ok": true, "output": "…" }` |
-| `compact_append` | `content`, optional `name`, `cap_bytes` | `{ "ok": true, "output": "…" }` |
-
-On failure return `{ "ok": false, "output": "reason" }` (or `{ "error": "…" }`).
-`inject` failures are soft — the core uses an empty injection and continues.
-Write failures surface to the model / slash-command caller.
-
-When a `memory_provider` is loaded, the core skips the markdown store for
-injection, slash memory commands, and compaction extracts. The self-learning
-auto-reflect loop still calls the `memory` tool — those writes go to the
-provider (or to a plugin `memory` tool with `override: true` if declared).
-
-#### `disable_tools` — remove a capability
-
-```json
-{
-  "name": "no-bash",
-  "version": "1.0.0",
-  "disable_tools": ["bash", "git_commit"]
-}
-```
-
-The listed tool names vanish from the model's toolset — it can never call them
-(this is stronger than a per-call `pre_bash` deny). Composes across plugins (the
-union is removed). Applied as a final filter, so it also removes a tool another
-plugin `override`s.
-
-#### `system_prompt` — inject context
-
-```json
-{
-  "name": "domain-rules",
-  "version": "1.0.0",
-  "system_prompt": "All database access must go through the `db_query` tool. Never construct raw SQL in bash."
-}
-```
-
-The text is appended to the system prompt (after the plugin docs), framed with
-the plugin name + version — the same surface a core edit of the system prompt
-touches. Empty by default, so the prompt + its prefix cache are untouched when no
-plugin declares one. (Main agent only; subagents use the built-in tool set.)
-
-#### `override: true` — replace a core tool
-
-```json
-{
-  "name": "sandboxed-bash",
-  "version": "1.0.0",
-  "tools": [
-    {
-      "name": "bash",
-      "override": true,
-      "description": "Run a command in the project sandbox.",
-      "parameters": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]},
-      "script": "tools/bash.sh",
-      "kind": "destructive"
-    }
-  ]
-}
-```
-
-The model calls `bash` as usual, but the call routes to `tools/bash.sh` instead
-of the core handler — and the plugin controls the description/schema. The tool's
-`kind` (approval gate) is the plugin's. The specific `pre_bash`/`post_bash`
-hooks still fire (keyed on the tool name), and `pre_tool`/`post_tool` fire too.
-
-### Declaring an OAuth provider (subscription auth)
-
-A plugin can add a subscription-OAuth provider — the same mechanism the
-built-in OpenAI (ChatGPT), Google (Gemini), and Anthropic (Claude) providers
-use, but for any vendor — with no recompile. The plugin supplies ONE script
-that handles four actions (`login`, `complete`, `token`, `clear`); the
-harness owns the loopback redirect server (web flow) and the `/oauth-code`
-paste path (manual/device flow), exactly like the built-in flows.
-
-Add an `oauth` block to `plugin.json`:
-
-```json
-{
-  "name": "grok-oauth",
-  "version": "0.1.0",
-  "oauth": {
-    "provider_id": "grok",
-    "label": "Grok (xAI)",
-    "kind": "openai",
-    "base_url": "https://api.x.ai/v1",
-    "description": "Grok via xAI device-code OAuth.",
-    "headers": [["X-Source", "catalyst-code"]],
-    "token_path": "grok.json",
-    "script": "oauth/oauth.sh",
-    "login_timeout_ms": 180000,
-    "token_timeout_ms": 30000
-  }
-}
-```
-
-Fields:
-- `provider_id` (required): the provider identity. The harness creates the
-  provider config with this `name` on a successful `/login`, and `/oauth-code`
-  + `/logout` dispatch on it.
-- `label` (optional): shown in the `/login` picker (defaults to provider_id).
-- `kind` (optional, default `"openai"`): `"openai"` (OpenAI-compatible
-  `/chat/completions`) or `"anthropic"` (`/v1/messages`). Decides the wire
-  protocol + auth header.
-- `base_url` (required): the endpoint, including `/v1`. Paths are appended
-  directly.
-- `description` (optional): shown in the picker.
-- `headers` (optional): extra HTTP headers on every request, `[[key,val],…]`.
-  These are persisted into the provider config.
-- `token_path` (optional, default `<provider_id>.json`): the token-file name,
-  relative to `~/.config/catalyst-code/oauth/`. The plugin owns the token's
-  on-disk format; the harness only checks existence (for the "logged in"
-  status) and passes the absolute path to the script.
-- `script` (required unless every action has an explicit override): the script
-  handling ALL actions, dispatched by the `action` field in stdin.
-- `login_script` / `complete_script` / `token_script` (optional): per-action
-  overrides. When absent, the action falls back to `script`.
-- `login_timeout_ms` (optional, default 120000): timeout for `login` +
-  `complete`.
-- `token_timeout_ms` (optional, default 30000): timeout for `token` + `clear`.
-
-#### Script action contract
-
-Every invocation receives ONE JSON object on stdin (with `action` + the base
-context) and MUST write ONE JSON object to stdout. The base context always
-includes `action`, `provider_id`, `token_path` (absolute), `workspace`, and
-`timestamp`; each action adds its own fields.
-
-**`login`** — build the authorize/verify URL. Input adds `headless` (bool) and,
-for the web flow, `redirect_uri` (a `http://localhost:<port>/callback` the
-harness already bound — embed it verbatim in your authorize URL). Output:
-```json
-{ "url": "https://auth.example.com/device?...", "code": "ABCD-EFGH",
-  "message": "Open the URL and enter the code",
-  "flow": "web" | "manual",
-  "state": "<csrf>", "pending": { "verifier": "...", "device_id": "..." } }
-```
-- `flow`: `"web"` = the harness waits for the loopback redirect (local
-  machine); `"manual"` = the user pastes a code back via `/oauth-code`
-  (SSH/headless, or device-code flows). Honor `headless`: return `"manual"`
-  when there is no usable browser.
-- `state` (web flow): the CSRF state you put in the authorize URL, so the
-  harness can verify the redirect.
-- `pending` (both flows): an opaque JSON blob you need to carry to `complete`
-  (e.g. a PKCE verifier, a device-auth id). The harness stashes it and passes
-  it back verbatim.
-- `code` (optional, manual/device flow): a user-code to display.
-
-**`complete`** — exchange the code for a token and WRITE it to `token_path`.
-Input adds `code` (the pasted/redirected code) and `redirect_uri` (web flow) or
-`pending` (manual flow). Output:
-```json
-{ "ok": true }
-{ "ok": false, "error": "expired code" }
-```
-
-**`token`** — resolve/refresh the access token. Read `token_path`; if expired,
-refresh (make your own HTTP call) and write the updated token back. Output:
-```json
-{ "access_token": "<bearer>", "expires_at": 1719003600 }
-{ "access_token": null }
-{ "ok": false, "error": "refresh failed" }
-```
-`expires_at` is unix seconds (optional; if 0/absent the harness caches for ~5
-min). This runs on the per-turn hot path, so it is cached until near expiry.
-
-**`clear`** — delete any credentials + extra state you manage. The harness
-ALSO deletes `token_path`, so this is optional (use it for sidecar files).
-Output: `{ "ok": true }`.
-
-#### How it fits together
-
-- `/login <provider_id>`: the harness runs `login`, emits the URL as an
-  `oauth_prompt`, and either waits for the redirect (web) or stashes `pending`
-  and waits for `/oauth-code` (manual). On success it creates the provider
-  config (name = provider_id, your base_url/kind/headers, no api_key) and
-  refreshes `/models`.
-- At turn + discovery time: the harness runs `token` (cached), injects the
-  access token as `Authorization: Bearer`, and routes the turn to your
-  `base_url` over your declared `kind`.
-- `/logout <provider_id>`: deletes `token_path` + runs `clear` + drops the
-  provider config.
-
-The plugin's token format is entirely its own — the harness never parses it.
-
-### Example: a pre_write linter plugin
-
-`.catalyst-code/plugins/lint-check/plugin.json`:
-```
-{
-  "name": "lint-check",
-  "version": "0.1.0",
-  "description": "Run cargo fmt on Rust files before writing",
-  "hooks": {
-    "pre_write": {
-      "script": "hooks/pre_write.sh",
-      "timeout_ms": 10000,
-      "pass_args": true
-    }
-  }
-}
-```
-
-`.catalyst-code/plugins/lint-check/hooks/pre_write.sh`:
-```bash
-#!/bin/bash
-input=$(cat)
-path=$(echo "$input" | jq -r '.args.path // ""')
-content=$(echo "$input" | jq -r '.args.content // ""')
-
-if [[ "$path" == *.rs ]] && command -v rustfmt &>/dev/null; then
-  formatted=$(echo "$content" | rustfmt --edition 2021 2>/dev/null)
-  if [ $? -eq 0 ] && [ -n "$formatted" ]; then
-    jq -n --arg c "$formatted" '{ "allow": true, "reason": "rustfmt applied", "modify": { "content": $c } }'
-    exit 0
-  fi
-fi
-echo '{"allow": true}'
-```
-
-Remember: `chmod +x .catalyst-code/plugins/lint-check/hooks/pre_write.sh`
+/// Short plugins pointer injected into the standing system prompt. The full
+/// authoring contract lives in the opt-in `plugin-authoring` skill so everyday
+/// coding turns do not pay for a ~6k-token manual.
+pub const PLUGIN_DOCS: &str = r#"## Plugins
+
+Extend the harness via `.catalyst-code/plugins/` (hooks, custom tools, OAuth,
+memory backends, system-prompt injection). Manage with the `plugin` tool or
+`/plugin-install` / `/plugin-enable` / `/plugin-disable`.
+
+When authoring or debugging a plugin, apply the `plugin-authoring` skill
+(`/skill:plugin-authoring`) — do not invent schema from memory. Full contract:
+hooks, tools, overrides, OAuth, and memory providers.
 "#;
 
 /// Valid hook point names. Plugins can register for any of these.
@@ -599,6 +59,45 @@ pub const DEFAULT_PRE_TIMEOUT_MS: u64 = 5_000;
 /// Default timeout in milliseconds for post_* and lifecycle hooks.
 pub const DEFAULT_POST_TIMEOUT_MS: u64 = 30_000;
 
+/// Slash-command names reserved by the harness. Plugin commands may not reuse
+/// these (with or without a leading `/`).
+const RESERVED_COMMAND_NAMES: &[&str] = &[
+    "help",
+    "new",
+    "abort",
+    "login",
+    "logout",
+    "models",
+    "plugin-install",
+    "plugin-list",
+    "plugin-enable",
+    "plugin-disable",
+    "plugin-remove",
+    "plugin-reload",
+    "plugin-config",
+    "stats",
+    "sessions",
+    "clear",
+    "reset",
+    "undo",
+    "compact",
+    "memory",
+    "remember",
+    "forget",
+    "reflect",
+    "index",
+    "goal",
+    "cancel-goal",
+    "run",
+    "parallel",
+    "chain",
+    "subagents",
+    "vision",
+    "context",
+    "usage",
+    "skill",
+];
+
 // ---- manifest deserialization (plugin.json) ----
 
 #[derive(Deserialize, Debug, Clone)]
@@ -627,6 +126,20 @@ struct PluginManifest {
     /// and (when no tool overrides `memory`) the built-in `memory` tool.
     #[serde(default)]
     memory_provider: Option<MemoryProviderManifestEntry>,
+    /// Optional slash commands declared by the plugin (`/name` → script).
+    #[serde(default)]
+    commands: Vec<CommandManifestEntry>,
+}
+
+/// A slash-command declared in a plugin manifest (the `commands` array).
+#[derive(Deserialize, Debug, Clone)]
+struct CommandManifestEntry {
+    name: String,
+    #[serde(default)]
+    description: String,
+    script: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 /// A memory-provider declaration in `plugin.json` (`memory_provider` block).
@@ -677,8 +190,8 @@ struct ToolManifestEntry {
 /// the same way the built-in OpenAI/Claude/Gemini providers work — no
 /// recompile. The plugin supplies ONE script that handles four actions
 /// (`login`, `complete`, `token`, `clear`) dispatched by an `action` field in
-/// the stdin context; per-action script overrides are optional. See
-/// PLUGIN_DOCS for the full contract.
+/// the stdin context; per-action script overrides are optional. See the `plugin-authoring` skill
+/// (`.catalyst-code/skills/plugin-authoring/SKILL.md`) for the full contract.
 #[derive(Deserialize, Debug, Clone)]
 struct OauthManifestEntry {
     /// The provider identity. Must match the provider-config `name` created on
@@ -736,6 +249,8 @@ pub struct Plugin {
     pub hooks: HashMap<String, HookConfig>,
     /// Tools this plugin declares (custom capabilities; no MCP needed).
     pub tools: Vec<ToolConfig>,
+    /// Slash commands this plugin declares (`/name` handlers).
+    pub commands: Vec<CommandConfig>,
     /// Built-in/plugin tool names to REMOVE from the model's toolset.
     pub disable_tools: Vec<String>,
     /// Static text injected into the system prompt (empty = none).
@@ -784,6 +299,21 @@ pub struct ToolConfig {
     pub kind: ToolKind,
     /// True → this tool's handler replaces the built-in of the same name.
     pub override_builtin: bool,
+    /// Plugin that owns this tool (for UI side-effect framing).
+    pub plugin_name: String,
+}
+
+/// Configuration for one plugin-declared slash command.
+#[derive(Clone, Debug)]
+pub struct CommandConfig {
+    pub name: String,
+    pub description: String,
+    /// Absolute path to the executable handler script.
+    pub script: PathBuf,
+    /// Hard timeout in milliseconds for a single command invocation.
+    pub timeout_ms: u64,
+    /// Plugin that owns this command.
+    pub plugin_name: String,
 }
 
 /// A loaded OAuth-provider declaration (manifest `oauth` block with script
@@ -835,6 +365,10 @@ pub struct HookResult {
     pub reason: String,
     /// Optional modified arguments (pre hooks only; ignored for post hooks).
     pub modify: Option<Value>,
+    /// Optional UI notification text from the hook response.
+    pub notify: Option<String>,
+    /// Optional status-bar text (`Some("")` means clear).
+    pub status: Option<String>,
 }
 
 // ---- PluginManager ----
@@ -999,20 +533,27 @@ impl PluginManager {
     /// Invalid plugins are skipped with a log message to stderr but never
     /// crash. Project-scoped plugins (dir inside the workspace) are skipped
     /// unless `trust_project` is true; their names are recorded in
-    /// `skipped_project`.
-    fn scan_and_load(&self) {
+    /// `skipped_project`. Returns load-error messages for callers (e.g. reload).
+    fn scan_and_load(&self) -> Vec<String> {
         let canon_ws =
             std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
         let mut plugins = self.plugins.write().unwrap();
         plugins.clear();
         let mut skipped_local: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
 
         // 1) Global, user-owned plugins (~/.catalyst-code/plugins) when this
         //    manager was constructed to scan them (production). Outside the
         //    workspace, so `is_project` is false and they load unconditionally.
         //    Skipped entirely for the isolated `new()` constructor (tests).
         if let Some(ref user_dir) = self.user_plugins_dir {
-            self.scan_dir(user_dir, &canon_ws, &mut plugins, &mut skipped_local);
+            self.scan_dir(
+                user_dir,
+                &canon_ws,
+                &mut plugins,
+                &mut skipped_local,
+                &mut errors,
+            );
         }
 
         // 2) Project plugins. Scanned last so a same-named project plugin
@@ -1024,9 +565,11 @@ impl PluginManager {
             &canon_ws,
             &mut plugins,
             &mut skipped_local,
+            &mut errors,
         );
 
         *self.skipped_project.lock().unwrap() = skipped_local;
+        errors
     }
 
     /// Scan one plugin directory and load every valid plugin in it into
@@ -1039,6 +582,7 @@ impl PluginManager {
         canon_ws: &std::path::Path,
         plugins: &mut HashMap<String, Plugin>,
         skipped: &mut Vec<String>,
+        errors: &mut Vec<String>,
     ) {
         let rd = match std::fs::read_dir(dir) {
             Ok(r) => r,
@@ -1086,10 +630,12 @@ impl PluginManager {
                     plugins.insert(plugin.name.clone(), plugin);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[plugins] failed to load plugin in {:?}: {e}",
+                    let msg = format!(
+                        "failed to load plugin in {:?}: {e}",
                         path.file_name().unwrap_or_default()
                     );
+                    eprintln!("[plugins] {msg}");
+                    errors.push(msg);
                 }
             }
         }
@@ -1212,6 +758,33 @@ impl PluginManager {
                 timeout_ms,
                 kind,
                 override_builtin: t.override_builtin,
+                plugin_name: manifest.name.clone(),
+            });
+        }
+
+        // --- plugin-declared slash commands ---
+        let mut commands_vec: Vec<CommandConfig> = Vec::new();
+        for c in &manifest.commands {
+            let name = c.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let name = name.strip_prefix('/').unwrap_or(name);
+            if name.is_empty() {
+                continue;
+            }
+            if RESERVED_COMMAND_NAMES.contains(&name) {
+                return Err(format!(
+                    "command '{name}' collides with a reserved builtin slash command"
+                ));
+            }
+            let canon_script = validate_plugin_script(&canon_dir, &c.script)?;
+            commands_vec.push(CommandConfig {
+                name: name.to_string(),
+                description: c.description.clone(),
+                script: canon_script,
+                timeout_ms: c.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS),
+                plugin_name: manifest.name.clone(),
             });
         }
 
@@ -1245,6 +818,7 @@ impl PluginManager {
             source_path: canon_dir,
             hooks,
             tools: tools_vec,
+            commands: commands_vec,
             disable_tools: manifest.disable_tools,
             system_prompt: manifest.system_prompt,
             oauth: oauth_config,
@@ -1493,6 +1067,88 @@ impl PluginManager {
             .values()
             .filter(|p| p.enabled)
             .find_map(|p| p.tools.iter().find(|t| t.name == name).cloned())
+    }
+
+    /// Slash-command definitions for every command declared by ENABLED plugins.
+    /// Each entry is `{name, description, plugin}`.
+    pub fn command_definitions(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+            for c in &p.commands {
+                out.push(json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "plugin": p.name,
+                }));
+            }
+        }
+        out
+    }
+
+    /// Look up a plugin-declared slash command by name (enabled plugins only).
+    /// Accepts names with or without a leading `/`.
+    pub fn command_config(&self, name: &str) -> Option<CommandConfig> {
+        let name = name.strip_prefix('/').unwrap_or(name);
+        self.plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .find_map(|p| p.commands.iter().find(|c| c.name == name).cloned())
+    }
+
+    /// Re-scan plugin directories, preserving per-plugin `enabled` flags for
+    /// plugins that are still present. Prunes OAuth token cache entries for
+    /// providers that disappeared. Returns a JSON summary:
+    /// `{loaded, skipped, errors?}`.
+    pub fn reload(&self) -> Value {
+        let enabled_map: HashMap<String, bool> = self
+            .plugins
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.enabled))
+            .collect();
+
+        let errors = self.scan_and_load();
+
+        // Re-apply previously-disabled flags for plugins that still exist.
+        {
+            let mut plugins = self.plugins.write().unwrap();
+            for (name, enabled) in &enabled_map {
+                if !*enabled {
+                    if let Some(p) = plugins.get_mut(name) {
+                        p.enabled = false;
+                    }
+                }
+            }
+        }
+
+        // Prune token_cache for OAuth providers that are no longer loaded.
+        {
+            let active: std::collections::HashSet<String> = self
+                .plugins
+                .read()
+                .unwrap()
+                .values()
+                .filter_map(|p| p.oauth.as_ref().map(|o| o.provider_id.clone()))
+                .collect();
+            let mut cache = self.token_cache.lock().unwrap();
+            cache.retain(|k, _| active.contains(k));
+        }
+
+        let loaded = self.plugins.read().unwrap().len();
+        let skipped = self.skipped_project.lock().unwrap().clone();
+        let mut out = json!({
+            "loaded": loaded,
+            "skipped": skipped,
+        });
+        if !errors.is_empty() {
+            out.as_object_mut()
+                .unwrap()
+                .insert("errors".into(), json!(errors));
+        }
+        out
     }
 
     /// Approval classification for a plugin-declared tool, if it exists.
@@ -1969,7 +1625,7 @@ impl PluginManager {
 /// Execute a single hook script and return its result.
 ///
 /// The hook receives `context` JSON on stdin. It must write a JSON response
-/// (see PLUGIN_DOCS for schema) to stdout. The function handles timeouts,
+/// (see the `plugin-authoring` skill for schema) to stdout. The function handles timeouts,
 /// non-zero exits, and parse failures according to the safety rules:
 ///
 /// - **pre_* hooks**: non-zero exit, timeout, or parse failure → deny
@@ -1989,12 +1645,16 @@ pub async fn execute_hook(
         allow: false,
         reason,
         modify: None,
+        notify: None,
+        status: None,
     };
 
     let skip = |reason: String| HookResult {
         allow: true,
         reason: format!("[{plugin_name}] {reason}"),
         modify: None,
+        notify: None,
+        status: None,
     };
 
     // Spawn the hook script.
@@ -2079,22 +1739,48 @@ pub async fn execute_hook(
                 .unwrap_or("")
                 .to_string();
             let modify = response.get("modify").cloned();
+            let notify = response
+                .get("notify")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            // Present key (including empty string = clear) → Some; absent → None.
+            let status = if response.get("status").is_some() {
+                Some(
+                    response
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            } else {
+                None
+            };
 
             // For post hooks, we never block — "allow: false" just means
             // the hook observed an issue, it doesn't roll back the operation.
-            if !is_pre && !allow {
-                return HookResult {
+            let result = if !is_pre && !allow {
+                HookResult {
                     allow: true,
                     reason: format!("[{plugin_name}] {reason}"),
                     modify: None,
-                };
-            }
-
-            HookResult {
-                allow,
-                reason,
-                modify,
-            }
+                    notify,
+                    status,
+                }
+            } else {
+                HookResult {
+                    allow,
+                    reason,
+                    modify,
+                    notify,
+                    status,
+                }
+            };
+            emit_plugin_ui_side_effects(
+                plugin_name,
+                result.notify.as_deref(),
+                result.status.as_deref(),
+            );
+            result
         }
         Ok(Err(e)) => {
             let msg = format!("hook '{}' wait error: {e}", hook_name);
@@ -2115,6 +1801,22 @@ pub async fn execute_hook(
                 skip(msg)
             }
         }
+    }
+}
+
+/// Emit optional UI side effects (`notify` → info event, `status` → plugin_status).
+/// `status: Some("")` clears the status text; absent status is a no-op.
+pub fn emit_plugin_ui_side_effects(plugin_name: &str, notify: Option<&str>, status: Option<&str>) {
+    use crate::protocol::{emit, Event};
+    if let Some(msg) = notify.filter(|s| !s.is_empty()) {
+        emit(&Event::new("info").with("message", json!(format!("[{plugin_name}] {msg}"))));
+    }
+    if let Some(text) = status {
+        emit(
+            &Event::new("plugin_status")
+                .with("plugin", json!(plugin_name))
+                .with("text", json!(text)),
+        );
     }
 }
 
@@ -2267,6 +1969,14 @@ pub async fn execute_plugin_tool(
             // Structured {ok, output} | {error} | {result}; else accept raw text.
             match serde_json::from_str::<Value>(&stdout) {
                 Ok(v) if v.is_object() => {
+                    let notify = v.get("notify").and_then(|n| n.as_str());
+                    let status = if v.get("status").is_some() {
+                        Some(v.get("status").and_then(|s| s.as_str()).unwrap_or(""))
+                    } else {
+                        None
+                    };
+                    emit_plugin_ui_side_effects(&config.plugin_name, notify, status);
+
                     if let Some(err) = v
                         .get("error")
                         .and_then(|e| e.as_str())
@@ -2299,6 +2009,134 @@ pub async fn execute_plugin_tool(
         Err(_) => Outcome::err(format!(
             "plugin tool '{}' handler timed out after {}ms",
             tool_name, config.timeout_ms
+        )),
+    }
+}
+
+/// Execute a plugin-declared slash command by spawning its handler script.
+///
+/// Stdin JSON:
+/// `{ "command", "args", "workspace", "session_id", "timestamp", "plugin" }`
+///
+/// Stdout JSON:
+/// `{ "ok": true|false, "output": "...", "notify"?: "...", "status"?: "..." }`
+/// Non-JSON stdout is accepted as output text with `ok=true`.
+pub async fn execute_plugin_command(
+    config: &CommandConfig,
+    args: &str,
+    workspace: &str,
+    session_id: &str,
+) -> Outcome {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ctx = json!({
+        "command": config.name,
+        "args": args,
+        "workspace": workspace,
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "plugin": config.plugin_name,
+    });
+    let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+
+    let mut child = match hook_command(&config.script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Outcome::err(format!(
+                "plugin command '{}' failed to spawn handler: {e}",
+                config.name
+            ))
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
+        let write_fut = async {
+            let _ = stdin.write_all(&ctx_bytes).await;
+            let _ = stdin.shutdown().await;
+        };
+        if tokio::time::timeout(stdin_timeout, write_fut)
+            .await
+            .is_err()
+        {
+            let _ = child.start_kill();
+            return Outcome::err(format!(
+                "plugin command '{}' handler did not consume stdin within {}ms",
+                config.name,
+                stdin_timeout.as_millis()
+            ));
+        }
+    }
+
+    let timeout_dur = Duration::from_millis(config.timeout_ms);
+    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Outcome::err(format!(
+                    "plugin command '{}' handler exited with {}: {}",
+                    config.name,
+                    output.status,
+                    stderr.trim()
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                return Outcome::err(format!(
+                    "plugin command '{}' handler returned empty stdout",
+                    config.name
+                ));
+            }
+            match serde_json::from_str::<Value>(&stdout) {
+                Ok(v) if v.is_object() => {
+                    let notify = v.get("notify").and_then(|n| n.as_str());
+                    let status = if v.get("status").is_some() {
+                        Some(v.get("status").and_then(|s| s.as_str()).unwrap_or(""))
+                    } else {
+                        None
+                    };
+                    emit_plugin_ui_side_effects(&config.plugin_name, notify, status);
+
+                    if let Some(err) = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        Outcome::err(format!("plugin command '{}': {}", config.name, err))
+                    } else {
+                        let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+                        let output_text = v
+                            .get("output")
+                            .or_else(|| v.get("result"))
+                            .and_then(|o| o.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| stdout.clone());
+                        if ok {
+                            Outcome::ok(output_text)
+                        } else {
+                            Outcome::err(output_text)
+                        }
+                    }
+                }
+                Ok(_) => Outcome::ok(stdout),
+                Err(_) => Outcome::ok(stdout),
+            }
+        }
+        Ok(Err(e)) => Outcome::err(format!(
+            "plugin command '{}' handler wait error: {e}",
+            config.name
+        )),
+        Err(_) => Outcome::err(format!(
+            "plugin command '{}' handler timed out after {}ms",
+            config.name, config.timeout_ms
         )),
     }
 }
@@ -3518,7 +3356,56 @@ mod tests {
         assert_eq!(plugin.name, "minimal");
         assert_eq!(plugin.version, "1.0.0");
         assert_eq!(plugin.hooks.len(), 0);
+        assert!(plugin.commands.is_empty());
         assert!(plugin.enabled);
+    }
+
+    #[test]
+    fn load_plugin_with_commands() {
+        let tmp = TmpDir::new("load_with_commands");
+        let scripts = tmp.path.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let script = write_hook_script(&scripts, "greet.sh", r#"{"ok":true,"output":"hi"}"#, 0);
+
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "cmd-plugin",
+  "version": "1.0.0",
+  "commands": [
+    { "name": "greet", "description": "Say hello", "script": "scripts/greet.sh", "timeout_ms": 12000 },
+    { "name": "", "script": "scripts/greet.sh" },
+    { "name": "/ping", "description": "Ping", "script": "scripts/greet.sh" }
+  ]
+}"#,
+        );
+
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        assert_eq!(plugin.commands.len(), 2);
+
+        let greet = plugin.commands.iter().find(|c| c.name == "greet").unwrap();
+        assert_eq!(greet.description, "Say hello");
+        assert_eq!(greet.timeout_ms, 12_000);
+        assert_eq!(greet.plugin_name, "cmd-plugin");
+        assert_eq!(greet.script, std::fs::canonicalize(&script).unwrap());
+
+        let ping = plugin.commands.iter().find(|c| c.name == "ping").unwrap();
+        assert_eq!(ping.timeout_ms, DEFAULT_POST_TIMEOUT_MS);
+        assert_eq!(ping.plugin_name, "cmd-plugin");
+    }
+
+    #[test]
+    fn load_rejects_reserved_command_name() {
+        let tmp = TmpDir::new("load_reserved_cmd");
+        let scripts = tmp.path.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        write_hook_script(&scripts, "x.sh", r#"{"ok":true}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"bad-cmd","version":"1.0.0","commands":[{"name":"help","script":"scripts/x.sh"}]}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("reserved"), "err={err}");
     }
 
     #[test]
@@ -5020,6 +4907,7 @@ mod tests {
             timeout_ms,
             kind,
             override_builtin: false,
+            plugin_name: "test-plugin".into(),
         }
     }
 

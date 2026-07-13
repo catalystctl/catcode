@@ -1,8 +1,8 @@
 //! First-run global staging.
 //!
 //! The harness ships a set of *default* subagent files — the built-in agent
-//! definitions (`agents/*.md`), the orchestrator delegation skill
-//! (`skills/pi-subagents/SKILL.md`), and the vision-handoff plugin. These are
+//! definitions (`agents/*.md`), orchestrator skills (`skills/pi-subagents`,
+//! `skills/plugin-authoring`), and the vision-handoff plugin. These are
 //! the things every project needs for the agent system to work, and they
 //! should NOT be copied into each project's `.catalyst-code/`. Instead they are
 //! materialized once, at a single **global, user-owned** location —
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// Bump when the bundled default set changes meaningfully. The marker file
 /// stores this; on a version mismatch we re-scan for *missing* files (existing
 /// user files are still never overwritten) and then re-stamp the marker.
-pub const STAGING_VERSION: u32 = 2;
+pub const STAGING_VERSION: u32 = 4;
 
 /// `~/.catalyst-code` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
@@ -189,6 +189,12 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
             "skills/pi-subagents/SKILL.md",
             include_str!("../../.catalyst-code/skills/pi-subagents/SKILL.md"),
         ),
+        // --- Plugin authoring skill (opt-in; kept out of the standing system
+        // prompt — apply with /skill:plugin-authoring when needed). ---
+        (
+            "skills/plugin-authoring/SKILL.md",
+            include_str!("../../.catalyst-code/skills/plugin-authoring/SKILL.md"),
+        ),
         // --- vision-handoff plugin (required for image-bearing turns to route
         // to a vision-capable model). ---
         (
@@ -316,7 +322,8 @@ project.
     ~/.catalyst-code/
     ├── agents/            # built-in subagent definitions (*.md)
     ├── skills/
-    │   └── pi-subagents/  # orchestrator delegation skill (parent-only)
+    │   ├── pi-subagents/      # orchestrator delegation playbook (opt-in via /skill)
+    │   └── plugin-authoring/  # full plugin contract (opt-in via /skill)
     ├── plugins/
     │   └── vision-handoff/# routes image turns to a vision-capable model
     ├── README.md          # this file
@@ -361,6 +368,10 @@ mod tests {
         assert!(!r1.written.is_empty(), "first run should write defaults");
         assert!(home.join("agents/scout.md").exists());
         assert!(home.join("skills/pi-subagents/SKILL.md").exists());
+        assert!(
+            home.join("skills/plugin-authoring/SKILL.md").exists(),
+            "plugin-authoring skill should be staged on first run"
+        );
         assert!(home.join("plugins/vision-handoff/plugin.json").exists());
         assert!(home
             .join("plugins/vision-handoff/hooks/pre_turn.py")

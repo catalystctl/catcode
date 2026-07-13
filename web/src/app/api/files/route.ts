@@ -32,7 +32,38 @@ const SKIP = new Set([
   "venv",
   ".idea",
   ".vscode",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker",
 ]);
+
+/** Secret-ish filenames / extensions that must never appear in @-mention results. */
+const SKIP_FILES = /\.(env|pem|key|p12|pfx|crt|cer)$/i;
+const SKIP_FILE_NAMES = new Set([
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.production",
+  ".env.test",
+  "credentials.json",
+  "credentials",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "id_dsa",
+  "id_rsa.pub",
+  "known_hosts",
+  "authorized_keys",
+]);
+
+function shouldSkipFile(name: string): boolean {
+  if (SKIP_FILE_NAMES.has(name)) return true;
+  if (name.startsWith(".env")) return true;
+  if (SKIP_FILES.test(name)) return true;
+  return false;
+}
 
 const MAX_DEPTH = 8;
 const MAX_RESULTS = 50;
@@ -78,6 +109,7 @@ export async function GET(req: Request) {
         if (SKIP.has(name)) continue;
         walk(full, depth + 1);
       } else {
+        if (shouldSkipFile(name)) continue;
         const filePath = relative(workspace, full).replace(/\\/g, "/");
         if (seen.has(filePath)) continue;
         seen.add(filePath);

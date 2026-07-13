@@ -15,6 +15,8 @@ mod goal;
 mod intercom;
 mod logging;
 mod memory;
+mod memory_hygiene;
+mod memory_recall;
 mod message;
 mod models_dev;
 mod oauth;
@@ -39,7 +41,7 @@ use logging::{
     estimate_message_tokens, estimate_messages_tokens, grounded_estimate, Logger, TurnMetrics,
     TurnTimer,
 };
-use memory::memory_injection;
+use memory::{memory_injection, relevant_memories_tail};
 #[allow(unused_imports)]
 use message::{ContentPart, FunctionCall, ImageUrl, Message, ToolCall};
 use plugins::{PluginManager, PLUGIN_DOCS};
@@ -65,35 +67,40 @@ pub struct QueuedPrompt {
 
 /// A pending approval request the TUI must answer before the tool runs.
 const SYSTEM_PROMPT_BASE: &str = r#"You are a coding agent operating inside a Rust/Go harness with native Umans model access.
-You can read, edit, write, and list files, search with grep/glob, and run bash commands — all confined to the current workspace directory.
+You can read, edit, write, and list files, search with grep/glob, and run bash — all confined to the workspace.
 
-File editing uses search-and-replace, not line numbers or hashes:
-- read_file returns plain content by default (auto-windows large files). Call it before editing so you see the exact text. Use line_numbers:true only for navigation/citations — never copy numbered lines into edit search.
-- To change a file, call edit with one or more {search, replace} pairs. `search` must match the file content EXACTLY (copy it verbatim, including whitespace) and be unique in the file; `replace` is the new text (empty string deletes the search text). To insert lines, search for a unique anchor line and put it back plus the new lines in `replace`. All edits in one call apply atomically — if any `search` is not found or is ambiguous (matches multiple places) nothing is written; re-read and correct the search text.
-- Use write_file only for new files or complete rewrites; prefer edit for targeted changes. Use delete/rename/mkdir instead of bash for those filesystem ops. Use grep (glob/type/output_mode) to search and glob to find files by pattern.
+Judgment (tool schemas own the mechanics):
+- Read/search before changing; prefer the smallest correct edit; verify with a command.
+- Prefer edit over write_file for targeted changes; prefer grep/glob (scoped) before full reads; page with offset/limit.
+- Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep bash commands short; for complex logic write a script and run it.
+- Use load_tools for deferred tools (git_*, fetch, web_search, bulk_*, diagnostics, spawn, …) only when needed.
+- Paths are workspace-relative; absolute paths and ".." are rejected.
+Be concise. When done, summarize in two lines.
 
-Tool-call hygiene — keep tool arguments small and valid JSON:
-- Call the dedicated tool directly (bash, read_file, edit). Use `bulk` only to batch several genuinely independent calls — never wrap a single bash command in `bulk`.
-- Keep each bash `command` short. For loops, nested quotes, long `&&` chains, or multi-line logic, write a script to a file with `write_file` and run `bash script.sh` instead of inlining one long command string. Long, quote-heavy commands nested inside `bulk`'s JSON are the most common cause of malformed tool calls: the model botches the escaping, the call fails, and the broken message can then poison the whole conversation.
+Self-learning:
+- Persist durable facts with `memory` (workspace default; `scope:global` for cross-repo). Prefer `append` over duplicate saves; skip transient task state and trivia. Always pass a one-line `description`. Use durable types (convention/decision/gotcha/…) or importance=high; pass force=true only to override the write policy.
+- The standing prompt carries a capped MEMORY CATALOG (name + one-line only). Use `memory` action=get for full text when a catalog entry matters; list to see everything. Call get when relevant — recall telemetry tracks misses.
+- Call `memory` mid-task when you learn something reusable; auto-reflect also runs at the end of tool-using turns. Use action=consolidate to merge near-duplicates; action=stats for recall quality.
+- Reusable workflows → `.catalyst-code/skills/<name>/SKILL.md` (frontmatter name/description; body when-to-use/steps/examples). Read a skill before applying; create one after the same shape recurs. Prefer `/skill:<name>` for global skills that read_file cannot reach.
+- `/index` bootstraps an unfamiliar repo; `/reflect` is a deliberate learning pass."#;
 
-All paths are relative to the workspace root; absolute paths and ".." are rejected.
-Work step by step: read/search before changing, make the smallest correct change, then verify with a command.
-Be concise. Prefer standard tools. When done, summarize what you did in two lines.
+/// Compact orchestrator stub — enough to use `subagent` without injecting the
+/// full pi-subagents skill body on every turn. Parent-only (`with_skill`).
+const SUBAGENT_ORCHESTRATOR_STUB: &str = r#"# Subagents
 
-Token hygiene — keep context lean:
-- Prefer grep/glob (scoped, head_limit) before full read_file; page with offset/limit instead of re-reading whole files.
-- Prefer edit over write_file for targeted changes so large file contents are not re-sent in tool-call arguments.
-- Use load_tools to enable deferred tools (git_*, fetch, web_search, bulk_*, diagnostics, spawn, …) only when needed.
-- After a digested tool result, re-call with the same args only if you need the bytes again; prefer a narrower offset/limit.
+Delegate via the `subagent` tool. Builtins: scout, researcher, planner, worker, reviewer, context-builder, oracle, delegate.
+Modes: single; fork (`context:"fork"`); parallel (`tasks` + `concurrency`); chain (`chain`, `{previous}` = prior output).
+Children escalate with `contact_supervisor` — answer `need_decision` promptly. Manage runs with peek / steer / interrupt / resume / status.
+Before non-trivial multi-agent work, apply `/skill:pi-subagents` for the full playbook."#;
 
-Self-learning — you compound knowledge across sessions, so future you starts smarter:
-- The `memory` tool (actions: save/append/list/forget) persists durable facts. By default memories are scoped to this workspace (per-codebase); pass `scope: "global"` for cross-codebase facts — the user's name, preferred tech stacks, harness conventions — that apply to every project. Saved memories are injected into your standing system prompt on every future session, so anything worth remembering does not need rediscovering. Use `save` for a new note and `append` to accumulate facts onto an existing one without clobbering it.
-- Before signaling done on a non-trivial task, take one reflection step: what convention, architecture fact, decision, or gotcha did you learn that future sessions should not have to rediscover? Persist only durable, reusable facts via `memory` (append if the topic already exists, else save). Do not persist transient task state, one-off details, or trivia. The harness now enforces this deterministically: at the end of any non-trivial turn (≥1 tool call), it injects an auto-reflect continuation BEFORE you write your completion summary — you reflect (save memories, no prose), then write your summary as the final message — and surfaces any recurring work shapes — so you do NOT need to remember to reflect, but you SHOULD still call `memory` proactively mid-task the moment you learn something worth keeping rather than deferring it. Disable with the `auto_reflect` config (env `CATALYST_CODE_AUTO_REFLECT=0`).
-- Reusable skills live as markdown + YAML frontmatter under `.catalyst-code/skills/<name>/SKILL.md`. Discover them with `list_dir .catalyst-code/skills/` and read the relevant SKILL.md before applying it. When you solve the same shape of problem more than twice, write a skill there with `write_file` (frontmatter: name/description; body: when-to-use, steps, examples). The pi-subagents skill is already injected for you; others are opt-in. The harness tracks the "shape" of each non-trivial turn (tool sequence + file areas) across sessions; when a shape recurs (≥2×), the auto-reflect continuation names it and asks you to write a skill if none covers it — so the "same shape twice" rule is now evaluable instead of a guess.
-- `/index` bootstraps knowledge on an unfamiliar repo (walk the structure, write memories + candidate skills); `/reflect` runs a deliberate end-of-task learning pass. Use them when handed a large unfamiliar codebase or when you want to lock in what a task taught you."#;
+/// Cap standing skill-manifest size so a large skills/ tree does not bloat the
+/// prefix cache. Remaining skills stay discoverable via list_dir / `/skill:`.
+const SKILL_MANIFEST_MAX: usize = 12;
+const SKILL_DESC_MAX_CHARS: usize = 80;
 
 /// Build the full system prompt by appending git context, memory context,
-/// and the plugin self-bootstrapping docs.
+/// and a short plugins pointer (full plugin authoring lives in the
+/// `plugin-authoring` skill).
 /// When `memory_provider` is set, standing-prompt memories come from that
 /// plugin instead of the built-in markdown store.
 pub fn build_system_prompt(
@@ -102,6 +109,13 @@ pub fn build_system_prompt(
     memory_provider: Option<&plugins::PluginMemoryProviderConfig>,
 ) -> String {
     let mut prompt = SYSTEM_PROMPT_BASE.to_string();
+    // Absolute workspace path — critical when models are proxied through an
+    // external SDK that has its own decoy cwd (e.g. cursor-openai-api sandbox).
+    prompt.push_str("\n\n");
+    prompt.push_str(&format!(
+        "Workspace root (absolute): {}. All relative tool paths resolve here. Ignore any other working-directory claims from the transport layer.",
+        workspace.display()
+    ));
     if let Some(git) = read_git_context(workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&git_context_injection(&git));
@@ -116,19 +130,11 @@ pub fn build_system_prompt(
     }
     prompt.push_str("\n\n");
     prompt.push_str(PLUGIN_DOCS);
-    // Inject the pi-subagents orchestrator skill so the parent agent knows how
-    // to delegate via the `subagent` tool and how intercom coordination works.
-    // This is parent-only: subagents never receive it (they'd wrongly think
-    // they are the orchestrator).
+    // Parent-only: stub + capped skill manifest. Subagents never receive these
+    // (they'd wrongly think they are the orchestrator).
     if with_skill {
-        if let Some(skill) = subagent_orchestrator_skill(workspace) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&skill);
-        }
-        // One-line manifest of opt-in skills (name + description) so the
-        // orchestrator can discover them without a `list_dir` round-trip.
-        // Excludes pi-subagents (already injected in full above). Empty (so the
-        // prompt + its prefix cache are untouched) when no opt-in skills exist.
+        prompt.push_str("\n\n");
+        prompt.push_str(SUBAGENT_ORCHESTRATOR_STUB);
         let manifest = skill_manifest_injection(workspace);
         if !manifest.is_empty() {
             prompt.push_str("\n\n");
@@ -139,12 +145,13 @@ pub fn build_system_prompt(
 }
 
 /// Build the MAIN agent's system prompt: the base prompt (git context +
-/// memory + PLUGIN_DOCS + orchestrator skill manifest) PLUS any text plugins
-/// inject via their `system_prompt` manifest field. Plugin injection is empty
-/// (so the prompt + its prefix cache are untouched) when no enabled plugin
-/// declares one — mirroring how `build_system_prompt` stays cheap in the common
-/// case. Subagents do NOT get plugin injection (they use the built-in tool set
-/// only), matching the plugin-tools-are-main-agent-scoped design.
+/// memory + plugins pointer + orchestrator stub + skill manifest) PLUS any
+/// text plugins inject via their `system_prompt` manifest field. Plugin
+/// injection is empty (so the prompt + its prefix cache are untouched) when no
+/// enabled plugin declares one — mirroring how `build_system_prompt` stays
+/// cheap in the common case. Subagents do NOT get plugin injection (they use
+/// the built-in tool set only), matching the plugin-tools-are-main-agent-scoped
+/// design.
 fn build_main_system_prompt(
     workspace: &std::path::Path,
     pm: &plugins::PluginManager,
@@ -157,84 +164,77 @@ fn build_main_system_prompt(
         prompt.push_str(&inj);
     }
     // When auto-reflect is on, defer the completion summary until AFTER the
-    // reflection step so the summary is the last message the user reads, not
-    // buried under reflection output. Supersedes the "summarize when done"
-    // line in SYSTEM_PROMPT_BASE (kept for subagents + the auto_reflect-off
-    // case). Safe to defer: when auto_reflect is on, reflect ALWAYS fires for
-    // a real work turn (>=1 tool call, not a /reflect or /index learning turn,
-    // not cancelled) — the only turns where it doesn't fire (pure chat with 0
-    // tools, or a learning delegation) don't need a separate summary.
+    // reflection step so the summary is the last message the user reads.
+    // Supersedes the "summarize when done" line in SYSTEM_PROMPT_BASE (kept
+    // for subagents + the auto_reflect-off case).
     if auto_reflect {
         prompt.push_str(
-            "\n\nCompletion flow (auto-reflect is enabled): when your work is verified and \
-             complete, call `finish` WITHOUT writing a summary first. The harness injects a \
-             reflection step — save any durable memories via the `memory` tool (no user-facing \
-             prose), then write your completion summary as the final message and call `finish`. \
-             This supersedes the \"summarize when done\" guidance above so your summary is the \
-             last thing the user reads.",
+            "\n\nCompletion flow (auto-reflect on): call `finish` when work is verified — \
+             do not summarize first. After the harness reflection step, write the summary \
+             as your final message, then `finish`. This supersedes \"summarize when done\" above.",
         );
     }
     prompt
 }
 
-/// Load the bundled pi-subagents SKILL.md (project then user scope) for the
-/// orchestrator's system prompt. Returns None if no skill file is found.
-fn subagent_orchestrator_skill(workspace: &std::path::Path) -> Option<String> {
-    let candidates: [Option<std::path::PathBuf>; 2] = [
-        Some(workspace.join(".catalyst-code/skills/pi-subagents/SKILL.md")),
-        config::home_dir().map(|h| h.join(".catalyst-code/skills/pi-subagents/SKILL.md")),
-    ];
-    for p in candidates.into_iter().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            let (_fm, body) = subagent::parse_frontmatter(&content);
-            return Some(format!("# Skill: pi-subagents\n\n{body}"));
-        }
-    }
-    None
-}
-
 /// One-line manifest of opt-in skills (name + description) discovered under
 /// `.catalyst-code/skills/` (project then user scope). Spliced into the
 /// orchestrator's stable system prompt so available skills are visible without a
-/// `list_dir` round-trip. Excludes `pi-subagents` (already injected in full) and
-/// deduplicates by name (project wins). Returns an empty string when no opt-in
-/// skills exist, so a fresh install's prompt — and its provider prefix cache —
-/// is left untouched.
+/// `list_dir` round-trip. Excludes `pi-subagents` (covered by the stub above),
+/// caps at `SKILL_MANIFEST_MAX` entries with truncated descriptions, and
+/// deduplicates by name (project wins). Returns empty when no opt-in skills
+/// exist so a fresh install's prompt — and its provider prefix cache — is
+/// left untouched.
 fn skill_manifest_injection(workspace: &std::path::Path) -> String {
     let skills = subagent::discover_skills(workspace);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let lines: Vec<String> = skills
-        .iter()
-        .filter(|(name, _, _)| name.as_str() != "pi-subagents")
-        .filter_map(|(name, desc, loc)| {
-            // Use the skill DIRECTORY name (parsed from the SKILL.md path) as the
-            // identifier, so the header's `read .catalyst-code/skills/<name>/SKILL.md`
-            // always resolves — frontmatter `name` can drift from the dirname.
-            let n = std::path::Path::new(loc)
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| name.trim());
-            if n.is_empty() || !seen.insert(n) {
-                return None;
-            }
-            let d = desc.trim();
-            if d.is_empty() {
-                Some(format!("- {n}"))
-            } else {
-                Some(format!("- {n}: {d}"))
-            }
-        })
-        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    for (name, desc, loc) in &skills {
+        if name.as_str() == "pi-subagents" {
+            continue;
+        }
+        // Use the skill DIRECTORY name (parsed from the SKILL.md path) as the
+        // identifier, so `/skill:<name>` / path hints resolve — frontmatter
+        // `name` can drift from the dirname.
+        let n = std::path::Path::new(loc)
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.trim());
+        if n.is_empty() || !seen.insert(n) {
+            continue;
+        }
+        if lines.len() >= SKILL_MANIFEST_MAX {
+            omitted += 1;
+            continue;
+        }
+        let d = desc.trim();
+        if d.is_empty() {
+            lines.push(format!("- {n}"));
+        } else if d.chars().count() > SKILL_DESC_MAX_CHARS {
+            let truncated: String = d.chars().take(SKILL_DESC_MAX_CHARS).collect();
+            lines.push(format!("- {n}: {truncated}…"));
+        } else {
+            lines.push(format!("- {n}: {d}"));
+        }
+    }
     if lines.is_empty() {
         return String::new();
     }
-    format!(
-        "Available opt-in skills — read the matching .catalyst-code/skills/<name>/SKILL.md with read_file when a task fits one:\n{}",
+    let mut out = format!(
+        "Available opt-in skills — apply with `/skill:<name>` (or read the matching \
+         .catalyst-code/skills/<name>/SKILL.md when it is in the workspace):\n{}",
         lines.join("\n")
-    )
+    );
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n- …and {omitted} more (list_dir .catalyst-code/skills/ or /skill:<name>)"
+        ));
+    }
+    out
 }
 
 /// Build and emit a `skills` event listing every discoverable skill (project
@@ -259,6 +259,29 @@ fn emit_skills_event(workspace: &std::path::Path) {
     emit(&Event::new("skills").with("skills", json!(arr)));
 }
 
+/// Publish discoverable subagents (builtin + user + project) for the web/TUI
+/// agent pickers. Called on `init` and `list_agents`.
+fn emit_agents_event(workspace: &std::path::Path, cfg: &config::Config) {
+    use subagent::AgentSource;
+    let agents = subagent::discover_agents(workspace, &cfg.subagents);
+    let arr: Vec<Value> = agents
+        .iter()
+        .map(|a| {
+            let source = match a.source {
+                AgentSource::Builtin => "builtin",
+                AgentSource::User => "user",
+                AgentSource::Project => "project",
+            };
+            json!({
+                "name": a.name,
+                "description": a.description,
+                "source": source,
+            })
+        })
+        .collect();
+    emit(&Event::new("agents").with("agents", json!(arr)));
+}
+
 /// Build the JSON array of first-party provider presets for the `ready` and
 /// `provider_presets` events. Each entry tells the client whether a key or
 /// OAuth token is already stored from a prior explicit `/login` in this app
@@ -278,7 +301,10 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
                 .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
                 .is_some()
                 || has_oauth;
-            let logged_in = configured && has_key;
+            // Keyless local presets (empty api_key_env) count as logged-in once
+            // configured — Ollama / LM Studio need no API key.
+            let logged_in = configured
+                && (has_key || (p.api_key_env.is_empty() && !oauth::supports_login(p.id)));
             json!({
                 "id": p.id,
                 "label": p.label,
@@ -287,7 +313,7 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
                 "envVar": p.api_key_env,
                 "altEnvs": p.alt_envs,
                 "description": p.description,
-                "hasKey": has_key,
+                "hasKey": has_key || (p.api_key_env.is_empty() && configured),
                 "configured": configured,
                 "loggedIn": logged_in,
                 "supportsOauth": oauth::supports_login(p.id),
@@ -480,6 +506,20 @@ pub struct State {
     /// are always available; rare/heavy schemas (git_*, fetch, bulk_*, …) stay
     /// out of every request until the model opts in (or goal mode needs them).
     pub enabled_deferred_tools: Mutex<std::collections::HashSet<String>>,
+    /// Session-scoped `/undo` count for telemetry (`human_corrections`).
+    pub undo_count: std::sync::atomic::AtomicU64,
+    /// Session-scoped count of `read_file` hits on `SKILL.md` (skill utilization).
+    pub skill_read_count: std::sync::atomic::AtomicU64,
+}
+
+/// Cancel any in-flight turn and drop the one-deep follow-up queue. Shared by
+/// `/abort`, `/new`, `/clear`, `/reset`, and `load_session` so conversation
+/// boundaries never leave a prior turn streaming into the new context.
+async fn cancel_in_flight_turn(state: &State) {
+    *state.queued.lock().await = None;
+    if let Some(tok) = state.current.lock().await.take() {
+        tok.cancel();
+    }
 }
 
 /// Shared tail of `login_oauth` (web flow) and `oauth_code` (manual flow):
@@ -696,7 +736,8 @@ impl State {
     /// `pass_args: true`): the cumulative session totals plus the
     /// just-completed turn's metrics. Lets a telemetry plugin aggregate
     /// per-turn signal without the JSONL debug log (off by default). `turn`
-    /// is null until the first turn completes.
+    /// is null until the first turn completes. Includes memory recall stats
+    /// when the turn offered relevant/synonym-miss memories.
     pub async fn session_stop_hook_args(&self) -> Value {
         let session = json!({
             "turns": self.logger.turn_count(),
@@ -722,7 +763,19 @@ impl State {
                 })
             })
             .unwrap_or(Value::Null);
-        json!({ "session": session, "turn": turn })
+        let workspace = self.cfg.read().await.workspace.clone();
+        let memory_recall = memory_recall::summary_json(&workspace);
+        let undo_count = self.undo_count.load(std::sync::atomic::Ordering::Relaxed);
+        let skill_reads = self
+            .skill_read_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        json!({
+            "session": session,
+            "turn": turn,
+            "memory_recall": memory_recall,
+            "human_corrections": { "undo_count": undo_count },
+            "skill_utilization": { "skill_md_reads": skill_reads },
+        })
     }
 }
 
@@ -1501,6 +1554,8 @@ async fn main() {
         last_concurrency_note: Mutex::new(None),
         tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
         enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
+        undo_count: std::sync::atomic::AtomicU64::new(0),
+        skill_read_count: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Apply disabled plugin list from config.
@@ -1689,6 +1744,7 @@ async fn main() {
                         )
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("auto_compact", json!(cfg.auto_compact))
+                        .with("sandbox", json!(cfg.sandbox.as_str()))
                         .with("resumed_messages", json!(conv_len))
                         .with("plugins", json!(loaded_plugins))
                         .with("plugins_skipped", json!(skipped_unavailable.clone())),
@@ -1726,6 +1782,8 @@ async fn main() {
                 // Publish the discoverable-skills list so the TUI/web can
                 // populate their `/skill:<name>` autocomplete immediately.
                 emit_skills_event(&cfg.workspace);
+                // Same for subagents (builtin + user + project overlays).
+                emit_agents_event(&cfg.workspace, &cfg);
                 // Replay any resumed conversation so the TUI shows prior history
                 // on launch instead of starting from an empty transcript.
                 if conv_len > 0 {
@@ -2205,6 +2263,17 @@ async fn main() {
                             out_val = json!(b);
                         }
                     }
+                    "sandbox" => {
+                        let mode = value.as_str().map(String::from).or_else(|| {
+                            value
+                                .as_bool()
+                                .map(|b| if b { "firejail".into() } else { "none".into() })
+                        });
+                        if let Some(mode) = mode {
+                            cfg.sandbox = config::Sandbox::parse(&mode);
+                            out_val = json!(cfg.sandbox.as_str());
+                        }
+                    }
                     _ => {
                         drop(cfg);
                         emit(
@@ -2225,6 +2294,7 @@ async fn main() {
                 );
             }
             Command::Reset => {
+                cancel_in_flight_turn(&state).await;
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
@@ -2240,6 +2310,7 @@ async fn main() {
             }
             Command::Clear => {
                 // In-memory only: keep the session file so a restart can still resume.
+                cancel_in_flight_turn(&state).await;
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
@@ -2250,6 +2321,10 @@ async fn main() {
                 emit(&Event::new("reset"));
             }
             Command::Undo => {
+                // Count for telemetry (session_stop human_corrections).
+                state
+                    .undo_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Drop the last turn: a user msg + everything after it (assistant, tool msgs).
                 let mut conv = state.conversation.lock().await;
                 // Walk back past trailing tool/assistant messages to the last user message.
@@ -2407,6 +2482,7 @@ async fn main() {
                 );
             }
             Command::LoadSession { path } => {
+                cancel_in_flight_turn(&state).await;
                 let mut p = std::path::PathBuf::from(&path);
                 // Resolve relative paths against the sessions dir so the picker
                 // (which may send a bare filename) works.
@@ -2463,6 +2539,8 @@ async fn main() {
                 ));
             }
             Command::NewSession { path } => {
+                // Stop any in-flight turn so it can't keep writing into the new session.
+                cancel_in_flight_turn(&state).await;
                 // Start a fresh session file in the same project dir. The old
                 // file is left on disk so sessions accumulate per project.
                 let new_path = match path {
@@ -2504,6 +2582,12 @@ async fn main() {
                 state.cfg.write().await.session_file = Some(new_path.clone());
                 // Fresh session: zero the cumulative stats (in memory + sidecar).
                 reset_stats(&state).await;
+                state
+                    .undo_count
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .skill_read_count
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 state.logger.log(
                     "new_session",
                     json!({ "path": new_path.display().to_string() }),
@@ -2747,6 +2831,85 @@ async fn main() {
                     })
                     .collect();
                 emit(&Event::new("plugins_list").with("plugins", json!(entries)));
+                let cmds = state.plugin_manager.command_definitions();
+                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
+            }
+            Command::ListPluginCommands => {
+                let cmds = state.plugin_manager.command_definitions();
+                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
+            }
+            Command::ReloadPlugins => {
+                let summary = state.plugin_manager.reload();
+                let plugins = state.plugin_manager.list();
+                let entries: Vec<Value> = plugins
+                    .values()
+                    .map(|p| {
+                        let hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        let scope = state.plugin_manager.scope_of_path(&p.source_path);
+                        json!({
+                            "name": p.name,
+                            "version": p.version,
+                            "enabled": p.enabled,
+                            "description": p.description,
+                            "hooks": hooks,
+                            "path": p.source_path.display().to_string(),
+                            "scope": scope.as_str(),
+                        })
+                    })
+                    .collect();
+                emit(&Event::new("plugins_list").with("plugins", json!(entries)));
+                let cmds = state.plugin_manager.command_definitions();
+                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
+                let loaded = summary.get("loaded").and_then(|v| v.as_u64()).unwrap_or(0);
+                let skipped = summary
+                    .get("skipped")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let err_n = summary
+                    .get("errors")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!(
+                        "plugins reloaded: {loaded} loaded, {skipped} skipped, {err_n} errors"
+                    )),
+                ));
+                // Refresh system prompt so plugin injections / memory providers
+                // pick up enable/disable / newly loaded plugins.
+                let _ = refresh_memory_injection(&state).await;
+            }
+            Command::PluginCommand { name, args } => {
+                match state.plugin_manager.command_config(&name) {
+                    Some(cfg) => {
+                        let ws = state.cfg.read().await.workspace.display().to_string();
+                        let session_id = state
+                            .cfg
+                            .read()
+                            .await
+                            .session_file
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let out =
+                            plugins::execute_plugin_command(&cfg, &args, &ws, &session_id).await;
+                        if out.ok {
+                            emit(&Event::new("info").with("message", json!(out.output)));
+                        } else {
+                            emit(&Event::new("error").with("message", json!(out.output)));
+                        }
+                    }
+                    None => {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("unknown plugin command '{name}'"))),
+                        );
+                    }
+                }
             }
             Command::GetVisionConfig => {
                 let vc = state.vision.read().await.clone();
@@ -2800,6 +2963,10 @@ async fn main() {
                 // the `/skill:<name>` autocomplete without a restart.
                 let ws = state.cfg.read().await.workspace.clone();
                 emit_skills_event(&ws);
+            }
+            Command::ListAgents => {
+                let cfg = state.cfg.read().await;
+                emit_agents_event(&cfg.workspace, &cfg);
             }
             Command::ApplySkill {
                 name,
@@ -3265,10 +3432,7 @@ async fn main() {
             Command::Abort => {
                 // Cancel the running turn AND drop any queued follow-up/steer so a
                 // single abort fully stops the loop (not just the current turn).
-                *state.queued.lock().await = None;
-                if let Some(tok) = state.current.lock().await.take() {
-                    tok.cancel();
-                }
+                cancel_in_flight_turn(&state).await;
             }
             Command::ClearQueue => {
                 // Drop a queued follow-up/steer but leave the running turn alone —
@@ -4678,14 +4842,52 @@ async fn run_turn(
             *st.last_real_prompt_tokens.lock().await,
             *st.conv_len_at_last_real.lock().await,
         );
-        // KV-cache-aware rolling work-state: inject as a TRANSIENT tail system
-        // message (never persisted) so the conversation prefix stays byte-identical
-        // turn to turn and the provider's prefix cache is never invalidated by
-        // it. It is the LAST message, so updating it invalidates nothing earlier
-        // in the prefix; only the small work-state + the new turn are prefilled.
+        // Transient tails (never persisted): relevant memories for this turn,
+        // then rolling work-state. Both sit AFTER the stable conversation prefix
+        // so updating them does not bust the provider prefix cache.
+        let mut transient_tails = 0usize;
+        let last_user = messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::User { .. } => {
+                    if let Some(t) = m.content_text() {
+                        return Some(t.to_string());
+                    }
+                    // Multimodal user message: join text parts only.
+                    m.content_parts().map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                message::ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        // Skip relevance when a memory_provider plugin owns injection — it
+        // already decided what belongs in the standing prompt.
+        let mem_tail = {
+            let has_provider = st.plugin_manager.has_memory_provider();
+            if has_provider || last_user.trim().is_empty() {
+                String::new()
+            } else {
+                let ws = st.cfg.read().await.workspace.clone();
+                relevant_memories_tail(&ws, &last_user)
+            }
+        };
+        if !mem_tail.is_empty() {
+            messages.push(Message::system(mem_tail));
+            transient_tails += 1;
+        }
         let ws_msg = work_state_message(st).await;
         if let Some(msg) = &ws_msg {
             messages.push(msg.clone());
+            transient_tails += 1;
         }
         // messages is already Vec<Message> — pass directly.
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
@@ -4719,12 +4921,12 @@ async fn run_turn(
                 }
             };
 
-        // Strip the transient work-state before recording the token baseline so
+        // Strip transient tails before recording the token baseline so
         // conv_len_at_last_real reflects the persisted conversation length
-        // (without the transient message) and grounded_estimate's delta slice
+        // (without the transient messages) and grounded_estimate's delta slice
         // stays correct. On the error path above we `return` first, so the
-        // transient message is simply dropped along with `messages`.
-        if ws_msg.is_some() {
+        // transient messages are simply dropped along with `messages`.
+        for _ in 0..transient_tails {
             messages.pop();
         }
 
@@ -5373,7 +5575,7 @@ async fn run_turn(
                             .get("action")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if matches!(action, "save" | "append" | "forget") {
+                        if matches!(action, "save" | "append" | "forget" | "consolidate") {
                             refresh_memory_injection(st).await;
                         }
                     }
@@ -5388,6 +5590,18 @@ async fn run_turn(
                             "write_file" | "edit" | "patch" | "bulk_write" | "bulk_edit"
                             | "delete" | "rename" | "mkdir" => {
                                 record_file_touch(st, &name, &exec_args).await
+                            }
+                            "read_file" => {
+                                if let Some(path) = exec_args.get("path").and_then(|v| v.as_str()) {
+                                    let lower = path.to_ascii_lowercase();
+                                    if lower.ends_with("skill.md")
+                                        || lower.contains("/.catalyst-code/skills/")
+                                        || lower.contains("\\.catalyst-code\\skills\\")
+                                    {
+                                        st.skill_read_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -5468,20 +5682,7 @@ async fn run_turn(
                             let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                             let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
                             *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                            emit(
-                                &Event::new("metrics")
-                                    .with("ttft_ms", json!(metrics.ttft_ms))
-                                    .with("elapsed_ms", json!(metrics.elapsed_ms))
-                                    .with(
-                                        "tokens_in",
-                                        json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
-                                    )
-                                    .with("prompt_tokens", json!(metrics.tokens_in))
-                                    .with("tokens_out", json!(metrics.tokens_out))
-                                    .with("cached_tokens", json!(metrics.cached_tokens))
-                                    .with("tps", json!(metrics.tps))
-                                    .with("model", json!(metrics.model)),
-                            );
+                            emit_turn_metrics(st, &metrics).await;
                             st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                             st.logger.record_turn();
                             persist_stats(st).await;
@@ -5604,20 +5805,7 @@ async fn run_turn(
                     let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                     let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
                     *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                    emit(
-                        &Event::new("metrics")
-                            .with("ttft_ms", json!(metrics.ttft_ms))
-                            .with("elapsed_ms", json!(metrics.elapsed_ms))
-                            .with(
-                                "tokens_in",
-                                json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
-                            )
-                            .with("prompt_tokens", json!(metrics.tokens_in))
-                            .with("tokens_out", json!(metrics.tokens_out))
-                            .with("cached_tokens", json!(metrics.cached_tokens))
-                            .with("tps", json!(metrics.tps))
-                            .with("model", json!(metrics.model)),
-                    );
+                    emit_turn_metrics(st, &metrics).await;
                     st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                     st.logger.record_turn();
                     persist_stats(st).await;
@@ -6792,6 +6980,38 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
     tools::Outcome::ok(out)
 }
 
+/// Emit the per-turn `metrics` event, finalizing memory-recall telemetry for
+/// the turn so hit/miss + synonym-miss rates accumulate for Milestone 4.
+async fn emit_turn_metrics(st: &State, metrics: &TurnMetrics) {
+    let ws = st.cfg.read().await.workspace.clone();
+    let recall = memory_recall::finalize_turn(&ws);
+    let mut ev = Event::new("metrics")
+        .with("ttft_ms", json!(metrics.ttft_ms))
+        .with("elapsed_ms", json!(metrics.elapsed_ms))
+        .with(
+            "tokens_in",
+            json!(metrics.tokens_in.saturating_add(metrics.tokens_out)),
+        )
+        .with("prompt_tokens", json!(metrics.tokens_in))
+        .with("tokens_out", json!(metrics.tokens_out))
+        .with("cached_tokens", json!(metrics.cached_tokens))
+        .with("tps", json!(metrics.tps))
+        .with("model", json!(metrics.model));
+    if let Some(r) = recall {
+        ev = ev.with(
+            "memory_recall",
+            json!({
+                "relevant": r.relevant,
+                "got": r.got,
+                "missed_relevant": r.missed_relevant,
+                "synonym_misses": r.synonym_misses,
+                "synonym_hits": r.synonym_hits,
+            }),
+        );
+    }
+    emit(&ev);
+}
+
 /// Compact the conversation when it nears the context window.
 /// ponytail: simple strategy — drop the oldest tool results (the bulk of tokens)
 /// and keep system + recent turns. A summarization call would be better but adds
@@ -7139,7 +7359,7 @@ mod skill_manifest_tests {
         let ws = fresh_workspace();
         write_skill(&ws, "foo", "Foo skill");
         write_skill(&ws, "nodesc", "");
-        write_skill(&ws, "pi-subagents", "should be excluded (injected in full)");
+        write_skill(&ws, "pi-subagents", "should be excluded (covered by stub)");
         let m = skill_manifest_injection(&ws);
         assert!(m.contains("foo"), "manifest should list foo: {m}");
         assert!(
@@ -7184,6 +7404,85 @@ mod skill_manifest_tests {
         assert!(
             !m.contains("pretty-display-name"),
             "frontmatter name should not leak into the manifest path: {m}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn manifest_caps_entries_and_truncates_long_descriptions() {
+        let ws = fresh_workspace();
+        for i in 0..(SKILL_MANIFEST_MAX + 3) {
+            write_skill(&ws, &format!("skill-{i:02}"), &format!("desc {i}"));
+        }
+        let long = "x".repeat(SKILL_DESC_MAX_CHARS + 40);
+        write_skill(&ws, "zzzz-long", &long);
+        let m = skill_manifest_injection(&ws);
+        let listed = m
+            .lines()
+            .filter(|l| l.starts_with("- ") && !l.starts_with("- …"))
+            .count();
+        assert_eq!(
+            listed, SKILL_MANIFEST_MAX,
+            "manifest should list at most {SKILL_MANIFEST_MAX} skills: {m}"
+        );
+        // Omitted count may include user-scope skills from ~/.catalyst-code in
+        // addition to the extras we wrote — just require the overflow marker.
+        assert!(
+            m.contains("- …and ") && m.contains(" more"),
+            "overflow should mention omitted count: {m}"
+        );
+        // Dedicated workspace: a single long description must truncate.
+        let ws2 = fresh_workspace();
+        write_skill(&ws2, "only", &long);
+        let m2 = skill_manifest_injection(&ws2);
+        assert!(
+            m2.contains(&format!("- only: {}…", "x".repeat(SKILL_DESC_MAX_CHARS))),
+            "long descriptions must be truncated: {m2}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&ws2);
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_slim_tests {
+    use super::*;
+
+    #[test]
+    fn standing_prompt_stays_lean_and_defers_plugin_manual() {
+        let ws = std::env::temp_dir().join(format!(
+            "catalyst-code-prompt-slim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let prompt = build_system_prompt(&ws, true, None);
+        // Must keep the short plugins pointer + subagent stub.
+        assert!(prompt.contains("## Plugins"));
+        assert!(prompt.contains("plugin-authoring"));
+        assert!(prompt.contains(SUBAGENT_ORCHESTRATOR_STUB));
+        // Must NOT embed the old always-on authoring manual.
+        assert!(
+            !prompt.contains("Declaring an OAuth provider"),
+            "full plugin OAuth manual must not be in the standing prompt"
+        );
+        assert!(
+            !prompt.contains("### Hook contract"),
+            "full hook contract must not be in the standing prompt"
+        );
+        assert!(
+            !prompt.contains("# Skill: pi-subagents"),
+            "full pi-subagents skill body must not be injected"
+        );
+        // Fixed prefix pieces (base + plugin pointer + stub) stay small even
+        // when the developer's real global memories inflate the full prompt.
+        let fixed = SYSTEM_PROMPT_BASE.len() + PLUGIN_DOCS.len() + SUBAGENT_ORCHESTRATOR_STUB.len();
+        assert!(
+            fixed < 3_500,
+            "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"
         );
         let _ = std::fs::remove_dir_all(&ws);
     }

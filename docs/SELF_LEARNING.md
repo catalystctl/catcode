@@ -25,7 +25,8 @@ Before designing, audit what exists. The harness shipped with:
   `forget`) reusing `memory.rs`. Classified `ReadOnly` (no approval gate).
   Reaches the main orchestrator.
 - **`.catalyst-code/skills/`** — skills as markdown + YAML frontmatter. The
-  `pi-subagents` skill is injected into the orchestrator's system prompt.
+  `pi-subagents` skill is available via `/skill:pi-subagents` (a short stub is
+  kept in the orchestrator system prompt; the full playbook is opt-in).
 - **`.catalyst-code/agents/`** — 8 built-in subagents (scout, researcher,
   planner, worker, reviewer, context-builder, oracle, delegate) + an in-process
   intercom bus for orchestrator↔child and child↔child coordination.
@@ -185,9 +186,10 @@ You are adding a new HTTP route/handler.
 | Testing        | Skills are prompts; "testing" = applying them to a benchmark task and   |
 |                | checking the result. No unit-test harness for prompts in v1.            |
 | Documentation  | The skill file IS the documentation (frontmatter + body).                |
-| Discovery      | `list_dir .catalyst-code/skills/` + read `SKILL.md`. The orchestrator   |
-|                | skill (`pi-subagents`) is auto-injected; others are opt-in.              |
-|                | **Deferred:** a one-line skill manifest in the system prompt (note §15).|
+| Discovery      | `list_dir .catalyst-code/skills/` + read `SKILL.md`, or `/skill:<name>`. |
+|                | A short `pi-subagents` stub is auto-injected; full skills are opt-in.    |
+|                | A capped skill manifest (name + short description) is in the system     |
+|                | prompt; overflow falls back to list_dir / `/skill:`.                    |
 
 ### When to create a skill vs solve ad hoc
 
@@ -249,10 +251,30 @@ no unwrap in prod
 
 ### Retrieval quality
 
-Standing-prompt injection includes every memory (empty-prompt ⇒ all), so
-retrieval recall is 100% by construction — the model always sees all memories.
-**Ceiling:** at high memory count this bloats the prompt. The per-memory preview
-is capped at 5 lines and `append_memory` has a rolling byte cap, bounding cost.
+Standing-prompt injection is a **capped catalog** (name / type / scope + one-line
+summary; bodies omitted). Full text is loaded on demand via `memory` action=get.
+A transient per-turn `[RELEVANT MEMORIES]` tail (keyword match, short previews)
+is pushed only for the model request and never persisted — so the prefix cache
+stays stable.
+
+**Recall telemetry** (`memory_recall.rs`, `memory action=stats`): each turn
+records which memories were keyword-offered, which were fetched via `get`, and
+**synonym misses** (body tokens overlap the prompt but name/description did
+not). Aggregates land in the metrics event + `session_stop` hook args
+(`memory_recall`) for the telemetry plugin. Synonym-miss rate is the measured
+trigger for Milestone 4 embeddings.
+
+**Write policy** (`memory_hygiene.rs`): save/append reject trivia and ephemeral
+task-state, skip duplicate appends, and block simple polarity conflicts
+(always/never, prefer/avoid) unless `force=true`. Optional `importance`
+(high|normal|low) is stored in frontmatter; high ranks with pins in the catalog.
+
+**Consolidate** (`memory action=consolidate`, auto after soft-warn count +
+cooldown): Jaccard near-duplicate merge within a scope, plus in-file appended
+line dedupe. Survivor prefers pinned → importance → longer body.
+
+**Ceiling:** keyword match misses synonyms. **Upgrade path:** embedding
+retrieval into the same transient tail when synonym misses are observed.
 
 ### Long-term memory, confidence, aging, conflicts
 
@@ -260,16 +282,12 @@ is capped at 5 lines and `append_memory` has a rolling byte cap, bounding cost.
 |----------------|--------------------------------------------------------------------------|
 | Long-term      | Memories persist as files across sessions. `append_memory` runs at       |
 |                | compaction so durable facts survive context truncation.                  |
-| Confidence     | No numeric confidence in v1. The model's reflection decides what is       |
-|                | "durable." Confidence scoring is speculative until we measure what       |
-|                | the model over/under-saves. **Upgrade:** add a `confidence` frontmatter  |
-|                | field once a telemetry plugin (§11) records save→correction rates.       |
-| Aging           | The rolling cap on `append_memory` ages out the oldest facts when a       |
-|                | memory grows past 8 KB. Explicit `forget` removes stale entries.          |
-| Conflict        | Last-write-wins per memory name (a `save` overwrites; an `append`        |
-|                | accumulates). The model is told to `append` to existing topics, which    |
-|                | avoids clobbering. No automated conflict resolution — the model resolves |
-|                | by reading the existing memory before writing.                           |
+| Confidence     | Frontmatter `importance` (high/normal/low) + durable types.   |
+|                | Numeric confidence still deferred; write policy rejects        |
+|                | trivia/ephemeral content unless `force=true`.                  |
+| Aging           | Rolling append cap + explicit `forget` + `consolidate` merge. |
+| Conflict        | Heuristic polarity conflict on save/append; `force=true` to    |
+|                | override. Consolidate merges near-duplicates.                  |
 
 ---
 
@@ -435,7 +453,8 @@ costs one tool call but keeps the prompt lean (skill bodies can be long).
 
 | Retrieval target        | Mechanism                              | When          |
 |-------------------------|----------------------------------------|---------------|
-| Memories (facts)        | Standing prompt injection              | Always (free) |
+| Memories (facts)        | Capped catalog in standing prompt +     | Catalog always; |
+|                         | on-demand `get` + transient relevance   | bodies on demand |
 | Skills (workflows)      | `list_dir` + `read_file`               | On-demand     |
 | Previous implementations| `grep` / `read_file` in the workspace  | On-demand     |
 | Architecture decisions  | A memory of type `decision`/`architecture` | Always (free) |
@@ -760,14 +779,14 @@ All core tests (206) and TUI tests pass; both build clean.
 ### ✅ Milestone 2 — Skill discovery (done)
 
 - **Skill manifest in the system prompt** (`main.rs::skill_manifest_injection`):
-  a one-line-per-skill list (name + description) discovered under
+  a capped list (name + short description) discovered under
   `.catalyst-code/skills/*/SKILL.md` (project then user scope) is spliced into
   the orchestrator's standing prompt, so available opt-in skills are visible
-  without a `list_dir` round-trip. It excludes `pi-subagents` (already injected
-  in full) and dedups by name (project wins). It returns `""` when no opt-in
-  skills exist, so a fresh install's prompt — and its prefix cache — is left
-  untouched. It is gated to the orchestrator (`with_skill`) so subagent prompts
-  stay lean. (`+test`)
+  without a `list_dir` round-trip. It excludes `pi-subagents` (covered by the
+  standing stub), truncates long descriptions, and notes overflow. It returns
+  `""` when no opt-in skills exist, so a fresh install's prompt — and its
+  prefix cache — is left untouched. It is gated to the orchestrator (`with_skill`) so
+  subagent prompts stay lean. (`+test`)
 
 ### ✅ Milestone 3 — Measurement (done)
 
@@ -804,7 +823,17 @@ All core tests (206) and TUI tests pass; both build clean.
 All core tests (221) and TUI tests pass; core is `cargo fmt`/`clippy` clean
 (only pre-existing `config.rs` lints remain); both build clean.
 
-### Milestone 4 — Retrieval at scale (only if triggered)
+### Milestone 3.5 — Memory hygiene + recall measurement (done)
+
+- **Recall telemetry** (`memory_recall.rs`): per-turn relevant offers vs `get`
+  hits, plus synonym-miss detection (body match without name/desc match).
+  Surfaced on the `metrics` event, `memory action=stats`, and `session_stop`
+  `memory_recall` args for the telemetry plugin.
+- **Write policy** (`memory_hygiene.rs`): rejects trivia/ephemeral task-state,
+  duplicate appends, and simple polarity conflicts unless `force=true`.
+  Frontmatter `importance` (high|normal|low).
+- **Consolidate** (`memory action=consolidate` + auto past soft-warn count with
+  cooldown): Jaccard near-duplicate merge + in-file line dedupe.
 
 - Per-turn embedding retrieval into a separate system message when memory
   count exceeds ~500 or synonym misses are observed. Keeps the stable prefix

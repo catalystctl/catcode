@@ -29,7 +29,7 @@ type settingsStore struct {
 	Theme           string `json:"theme,omitempty"`
 	ThinkExpanded   bool   `json:"think_expanded,omitempty"`
 	// Production knobs (item 3/7): passed to the core on launch.
-	Sandbox          string `json:"sandbox,omitempty"` // none | firejail
+	Sandbox          string `json:"sandbox,omitempty"` // none | firejail | seatbelt
 	NoNetwork        bool   `json:"no_network,omitempty"`
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited

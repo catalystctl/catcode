@@ -47,6 +47,8 @@ export interface AgentApi {
   /** PI-compatible bang bash (`!cmd` / `!!cmd`). */
   userBash: (command: string, excludeFromContext?: boolean) => Promise<void>;
   abort: () => Promise<void>;
+  /** Drop a queued follow-up/steer without aborting the running turn. */
+  clearQueue: () => Promise<void>;
   approve: (decision: "yes" | "no" | "always") => Promise<void>;
   setKey: (key: string) => Promise<void>;
   setProvider: (name: string) => Promise<void>;
@@ -75,18 +77,21 @@ export interface AgentApi {
   submitOauthCode: (code: string) => Promise<void>;
   dismissOauth: () => void;
   // ── Turn / history ──
-  undo: () => Promise<void>;
+  undo: () => Promise<boolean>;
   clear: () => Promise<void>;
   // ── Memory ──
-  saveMemory: (text: string, tags?: string[]) => Promise<void>;
+  saveMemory: (text: string, tags?: string[], scope?: "workspace" | "global") => Promise<void>;
   listMemory: () => Promise<void>;
   forgetMemory: (id: string) => Promise<void>;
   // ── Plugins ──
-  installPlugin: (path: string) => Promise<void>;
+  installPlugin: (path: string, scope?: "workspace" | "global") => Promise<void>;
   removePlugin: (name: string) => Promise<void>;
   enablePlugin: (name: string) => Promise<void>;
   disablePlugin: (name: string) => Promise<void>;
   listPlugins: () => Promise<void>;
+  listAgents: () => Promise<void>;
+  // ── Usage ──
+  usage: (model?: string) => Promise<void>;
   // ── Skills ──
   listSkills: () => Promise<void>;
   applySkill: (name: string, task?: string) => Promise<void>;
@@ -106,11 +111,14 @@ export interface AgentApi {
   cancelGoal: () => Promise<void>;
   approveGoalPlan: () => Promise<void>;
   reviseGoal: (feedback: string) => Promise<void>;
+  goalStatus: () => Promise<void>;
   // ── Vision ──
   getVisionConfig: () => Promise<void>;
   setVisionConfig: (vision_model: string | null, vision_models?: string[]) => Promise<void>;
   // ── Config ──
-  setConfig: (key: string, value: string | number) => Promise<void>;
+  setConfig: (key: string, value: string | number | boolean) => Promise<void>;
+  // ── Memory extras ──
+  refreshMemory: () => Promise<void>;
   // ── Projects / workspace ──
   switchWorkspace: (path: string) => Promise<void>;
   renameSession: (name: string, title: string) => Promise<void>;
@@ -143,6 +151,12 @@ export function useAgent(): AgentApi {
   const [streamSessionId, setStreamSessionId] = useState<string | null>(null);
   const activeRef = useRef<string | null>(null);
   const workspaceRef = useRef<string>("");
+  /** Bumps on each stream effect so stale EventSource handlers are ignored. */
+  const streamGenRef = useRef(0);
+  /** Serializes undo so rapid double-/undo can't soft+hard wipe. */
+  const undoBusyRef = useRef(false);
+  /** Suppress repeated 502 toasts while EventSource hammers reconnect. */
+  const lastStreamErrToastRef = useRef(0);
   useEffect(() => {
     if (state.workspace) workspaceRef.current = state.workspace;
     if (state.currentSessionFile) activeRef.current = state.currentSessionFile;
@@ -159,10 +173,57 @@ export function useAgent(): AgentApi {
       if (workspaceRef.current) params.set("workspace", workspaceRef.current);
       url = `/api/stream?${params.toString()}`;
     }
+    const gen = ++streamGenRef.current;
     const es = new EventSource(url);
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
+    es.onopen = () => {
+      if (streamGenRef.current !== gen) return;
+      setConnected(true);
+    };
+    es.onerror = () => {
+      if (streamGenRef.current !== gen) return;
+      setConnected(false);
+      setState((s) => (s.switching ? { ...s, switching: false } : s));
+      void fetch(url, { method: "GET", headers: { Accept: "text/event-stream" }, cache: "no-store" })
+        .then(async (res) => {
+          if (streamGenRef.current !== gen) {
+            void res.body?.cancel();
+            return;
+          }
+          if (res.status === 401 && typeof window !== "undefined") {
+            void res.body?.cancel();
+            es.close();
+            window.location.href = "/login";
+            return;
+          }
+          const ct = res.headers.get("content-type") || "";
+          // A live SSE body means EventSource already has a healthy stream —
+          // cancel this probe immediately so we don't leak a second subscriber.
+          if (ct.includes("text/event-stream")) {
+            void res.body?.cancel();
+            return;
+          }
+          if (res.status >= 400) {
+            const now = Date.now();
+            if (now - lastStreamErrToastRef.current < 8000) return;
+            lastStreamErrToastRef.current = now;
+            let msg = `Connection failed (${res.status})`;
+            try {
+              const body = (await res.json()) as { error?: string };
+              if (body.error) msg = body.error;
+            } catch {
+              /* keep status message */
+            }
+            setState((s) => reduce(s, { type: "error", message: msg }));
+          } else {
+            void res.body?.cancel();
+          }
+        })
+        .catch(() => {
+          /* transient — EventSource retries */
+        });
+    };
     es.onmessage = (e) => {
+      if (streamGenRef.current !== gen) return;
       let ev: CoreEvent | { type: "_snapshot"; state: AgentState };
       try {
         ev = JSON.parse(e.data);
@@ -171,22 +232,33 @@ export function useAgent(): AgentApi {
       }
       if (ev.type === "_snapshot") {
         const snap = (ev as { state: AgentState }).state;
-        // Preserve the user's UI prefs (model/thinking) across session switches:
-        // each session's core reports its own (default) values, but the choice
-        // is global (localStorage).
         const t = lsGet("umans:thinking");
         const m = lsGet("umans:model");
-        setState({
-          ...snap,
-          thinkingLevel: t ?? snap.thinkingLevel,
-          selectedModel:
-            m && snap.models.some((x) => x.id === m) ? m : snap.selectedModel,
+        // Functional merge: preserve in-flight client undo (and its trimmed
+        // transcript) so a reconnect mid-undo can't lose pendingUndo and then
+        // wipe messages on the following reset.
+        setState((s) => {
+          // Keep client trim only while undo is still in flight on the server
+          // (snapshot still has the longer pre-undo transcript). Once the server
+          // has applied undo, trust snap.pendingUndo so Reset isn't soft-stuck.
+          const undoInFlight =
+            s.pendingUndo && snap.messages.length > s.messages.length;
+          return {
+            ...snap,
+            pendingUndo: undoInFlight || snap.pendingUndo,
+            messages: undoInFlight ? s.messages : snap.messages,
+            thinkingLevel: t ?? snap.thinkingLevel,
+            selectedModel:
+              m && snap.models.some((x) => x.id === m) ? m : snap.selectedModel,
+          };
         });
       } else {
         setState((s) => reduce(s, ev as CoreEvent));
       }
     };
-    return () => es.close();
+    return () => {
+      es.close();
+    };
   }, [streamSessionId, reconnectKey]);
 
   // Auto-select a model once they arrive and none is chosen. Prefer a saved
@@ -201,20 +273,10 @@ export function useAgent(): AgentApi {
     if (id) setState((s) => reduce(s, { type: "_select_model", id }));
   }, [state.models]);
 
-  // Restore saved UI preferences (thinking level, approval mode) on first mount.
+  // Restore thinking preference on mount.
   useEffect(() => {
     const t = lsGet("umans:thinking");
     if (t) setState((s) => reduce(s, { type: "_set_thinking", level: t }));
-    const a = lsGet("umans:approval");
-    if (a === "never" || a === "destructive" || a === "always") {
-      fetch("/api/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: "set_approval", mode: a }),
-      }).catch(() => {
-        /* surfaced via the stream */
-      });
-    }
   }, []);
 
   const post = useCallback(
@@ -231,43 +293,83 @@ export function useAgent(): AgentApi {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        return (await res.json().catch(() => ({}))) as {
+        const data = (await res.json().catch(() => ({}))) as {
           ok?: boolean;
           session?: string;
           workspace?: string;
           error?: string;
         };
-      } catch {
-        /* surfaced via the stream's error events */
-        return {};
+        if (!res.ok) {
+          return {
+            ...data,
+            ok: false,
+            error: data.error || `Request failed (${res.status})`,
+          };
+        }
+        if (data.ok === false || data.error) {
+          return { ...data, ok: false, error: data.error || "Command failed" };
+        }
+        return { ...data, ok: true };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : "Network error",
+        };
       }
     },
     [],
   );
+
+  // Apply saved approval once the viewed session is known — applying
+  // set_approval before the stream resolves a session file can spawn an orphan
+  // core when the sessions dir is empty (freshSessionFile races).
+  useEffect(() => {
+    if (!state.currentSessionFile) return;
+    const a = lsGet("umans:approval");
+    if (a !== "never" && a !== "destructive" && a !== "always") return;
+    void post({ type: "set_approval", mode: a });
+  }, [state.currentSessionFile, post]);
 
   // Switch the viewed session: reopen the SSE stream for it (the bridge starts
   // its core if it isn't already live) and re-apply the user's global approval
   // preference to the new session's core. Other live sessions keep running.
   const switchToSession = useCallback(
     (sessionFile: string, workspace?: string) => {
+      // Clicking the already-active session must no-op — otherwise we set
+      // switching:true without reopening the SSE stream (same streamSessionId)
+      // and the UI wedges on "Loading session…".
+      if (
+        sessionFile === activeRef.current &&
+        (!workspace || workspace === workspaceRef.current) &&
+        !stateRef.current.switching
+      ) {
+        return;
+      }
       activeRef.current = sessionFile;
       if (workspace) workspaceRef.current = workspace;
-      // Optimistically blank the view while the new session's snapshot loads.
       setState((s) => ({
         ...s,
         messages: [],
         currentAssistantId: null,
         streaming: false,
         retrying: false,
+        followUpQueued: false,
+        pendingUndo: false,
         pendingApproval: null,
         pendingIntercom: null,
         pendingAsk: null,
+        pendingSudo: null,
+        pendingOauth: null,
+        workState: null,
+        goalMode: null,
+        goalPlan: null,
+        subagentRuns: {},
+        metrics: null,
         currentSessionFile: sessionFile,
         switching: true,
         workspace: workspace ?? s.workspace,
       }));
       setStreamSessionId(sessionFile);
-      // Re-apply the user's approval preference to this session's core.
       const a = lsGet("umans:approval");
       if (a === "never" || a === "destructive" || a === "always") {
         void post({ type: "set_approval", mode: a });
@@ -278,7 +380,8 @@ export function useAgent(): AgentApi {
 
   const send = useCallback(
     async (cmd: CoreCommand) => {
-      if (cmd.type === "send" || cmd.type === "steer") {
+      const optimistic = cmd.type === "send" || cmd.type === "steer";
+      if (optimistic) {
         setState((s) =>
           reduce(s, {
             type: "_user",
@@ -288,7 +391,29 @@ export function useAgent(): AgentApi {
           }),
         );
       }
-      await post(cmd);
+      const r = await post(cmd);
+      if (r.ok === false || r.error) {
+        setState((s) => {
+          let messages = s.messages;
+          if (optimistic) {
+            // Roll back the optimistic bubble (last matching user line).
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const m = messages[i];
+              if (m.role === "user" && m.text === cmd.prompt) {
+                messages = [...messages.slice(0, i), ...messages.slice(i + 1)];
+                break;
+              }
+            }
+          }
+          return reduce(
+            { ...s, messages },
+            {
+              type: "error",
+              message: optimistic ? "Failed to send command" : r.error || "Command failed",
+            },
+          );
+        });
+      }
     },
     [post],
   );
@@ -345,17 +470,30 @@ export function useAgent(): AgentApi {
   );
 
   const abort = useCallback(() => send({ type: "abort" }), [send]);
+  const clearQueue = useCallback(() => send({ type: "clear_queue" }), [send]);
 
   const approve = useCallback(
-    (decision: "yes" | "no" | "always") => {
+    async (decision: "yes" | "no" | "always") => {
       const s = stateRef.current;
       const req = s.pendingApproval;
-      if (!req) return Promise.resolve();
-      // Optimistically clear the banner so double-clicks don't re-fire.
+      if (!req) return;
+      const sessionAtClick = s.currentSessionFile;
       setState((st) => ({ ...st, pendingApproval: null }));
-      return send({ type: "approve", request_id: req.request_id, decision });
+      const r = await post({ type: "approve", request_id: req.request_id, decision });
+      if (r.ok === false || r.error) {
+        // Restore only if still on the same session (don't poison a switch).
+        setState((st) => {
+          if (st.currentSessionFile !== sessionAtClick) {
+            return reduce(st, { type: "error", message: r.error || "Failed to send approval" });
+          }
+          return reduce(
+            { ...st, pendingApproval: st.pendingApproval ?? req },
+            { type: "error", message: r.error || "Failed to send approval" },
+          );
+        });
+      }
     },
-    [send],
+    [post],
   );
 
   const setKey = useCallback(
@@ -423,6 +561,10 @@ export function useAgent(): AgentApi {
 
   const newSession = useCallback(async () => {
     const r = await post({ type: "new_session" });
+    if (r.ok === false || r.error) {
+      setState((s) => reduce(s, { type: "error", message: r.error || "Failed to create session" }));
+      return;
+    }
     if (r.session) switchToSession(r.session, r.workspace);
   }, [post, switchToSession]);
   const loadSession = useCallback(
@@ -438,7 +580,55 @@ export function useAgent(): AgentApi {
       send({ type: "compact", ...(instructions ? { instructions } : {}) }),
     [send],
   );
-  const reset = useCallback(() => send({ type: "reset" }), [send]);
+  const wipeLocalTranscript = useCallback(() => {
+    setState((s) => ({
+      ...s,
+      pendingUndo: false,
+      messages: [],
+      currentAssistantId: null,
+      streaming: false,
+      followUpQueued: false,
+      pendingApproval: null,
+      pendingAsk: null,
+      pendingSudo: null,
+      pendingIntercom: null,
+      pendingOauth: null,
+      workState: null,
+      goalMode: null,
+      goalPlan: null,
+      subagentRuns: {},
+      metrics: null,
+    }));
+  }, []);
+
+  const reset = useCallback(async () => {
+    if (undoBusyRef.current) {
+      setState((st) =>
+        reduce(st, { type: "error", message: "Wait for undo to finish before resetting" }),
+      );
+      return;
+    }
+    const s0 = stateRef.current;
+    if (
+      s0.streaming ||
+      s0.pendingApproval ||
+      s0.pendingAsk ||
+      s0.pendingSudo ||
+      s0.pendingIntercom
+    ) {
+      setState((st) =>
+        reduce(st, {
+          type: "error",
+          message: "Stop or resolve the pending turn before resetting",
+        }),
+      );
+      return;
+    }
+    // Drop pendingUndo so the following core `reset` hard-clears (undo soft-path
+    // must not swallow an intentional wipe).
+    wipeLocalTranscript();
+    await send({ type: "reset" });
+  }, [send, wipeLocalTranscript]);
   const stats = useCallback(() => send({ type: "stats" }), [send]);
   const context = useCallback(() => send({ type: "context" }), [send]);
 
@@ -448,44 +638,86 @@ export function useAgent(): AgentApi {
 
   // ── Subagent / intercom ──
   const intercomReply = useCallback(
-    (reply: string) => {
+    async (reply: string) => {
       const s = stateRef.current;
       const req = s.pendingIntercom;
-      if (!req) return Promise.resolve();
+      if (!req) return;
+      const sessionAtClick = s.currentSessionFile;
       setState((st) => ({ ...st, pendingIntercom: null }));
-      return send({ type: "intercom_reply", request_id: req.request_id, reply });
+      const r = await post({ type: "intercom_reply", request_id: req.request_id, reply });
+      if (r.ok === false || r.error) {
+        setState((st) =>
+          reduce(
+            {
+              ...st,
+              pendingIntercom:
+                st.currentSessionFile === sessionAtClick
+                  ? st.pendingIntercom ?? req
+                  : st.pendingIntercom,
+            },
+            { type: "error", message: r.error || "Failed to send reply" },
+          ),
+        );
+      }
     },
-    [send],
+    [post],
   );
 
-  // ── Ask tool ──
-  // Submit the user's answers to a pending `ask` tool call (object keyed by
-  // question id), or pass null to skip the prompt.
   const askReply = useCallback(
-    (answers: Record<string, string> | null) => {
+    async (answers: Record<string, string> | null) => {
       const s = stateRef.current;
       const req = s.pendingAsk;
-      if (!req) return Promise.resolve();
+      if (!req) return;
+      const sessionAtClick = s.currentSessionFile;
       setState((st) => ({ ...st, pendingAsk: null }));
-      return send({ type: "ask_reply", request_id: req.request_id, answers });
+      const r = await post({ type: "ask_reply", request_id: req.request_id, answers });
+      if (r.ok === false || r.error) {
+        setState((st) =>
+          reduce(
+            {
+              ...st,
+              pendingAsk:
+                st.currentSessionFile === sessionAtClick
+                  ? st.pendingAsk ?? req
+                  : st.pendingAsk,
+            },
+            { type: "error", message: r.error || "Failed to send answers" },
+          ),
+        );
+      }
     },
-    [send],
+    [post],
   );
 
   const sudoReply = useCallback(
-    (approved: boolean, password?: string) => {
+    async (approved: boolean, password?: string) => {
       const s = stateRef.current;
       const req = s.pendingSudo;
-      if (!req) return Promise.resolve();
+      if (!req) return;
+      const sessionAtClick = s.currentSessionFile;
       setState((st) => ({ ...st, pendingSudo: null }));
-      return send({
+      const r = await post({
         type: "sudo_reply",
         request_id: req.request_id,
         approved,
         ...(password ? { password } : {}),
       });
+      if (r.ok === false || r.error) {
+        setState((st) =>
+          reduce(
+            {
+              ...st,
+              pendingSudo:
+                st.currentSessionFile === sessionAtClick
+                  ? st.pendingSudo ?? req
+                  : st.pendingSudo,
+            },
+            { type: "error", message: r.error || "Failed to send sudo reply" },
+          ),
+        );
+      }
     },
-    [send],
+    [post],
   );
 
   // ── OAuth ──
@@ -495,24 +727,110 @@ export function useAgent(): AgentApi {
     async (code: string) => {
       const v = code.trim();
       if (!v) return;
-      await post({ type: "oauth_code", code: v });
+      const r = await post({ type: "oauth_code", code: v });
+      if (r.ok === false || r.error) {
+        setState((s) =>
+          reduce(s, { type: "error", message: r.error || "Failed to submit OAuth code" }),
+        );
+      }
     },
     [post],
   );
   const dismissOauth = useCallback(() => {
     // Hide the banner only — the core keeps its pending login until oauth_code
-    // or a fresh /login, so dismissing does not cancel an in-flight login.
-    setState((s) => ({ ...s, pendingOauth: null }));
+    // or a fresh /login. Surface a hint so the user can finish via /oauth-code.
+    setState((s) =>
+      reduce(
+        { ...s, pendingOauth: null },
+        {
+          type: "info",
+          message: "OAuth still pending in the core — paste the code with /oauth-code when ready",
+        },
+      ),
+    );
   }, []);
 
   // ── Turn / history ──
-  const undo = useCallback(() => send({ type: "undo" }), [send]);
-  const clear = useCallback(() => send({ type: "clear" }), [send]);
+  const undo = useCallback(async () => {
+    if (undoBusyRef.current) return false;
+    const s0 = stateRef.current;
+    // Core stays blocked on HITL / mid-turn until approve…/abort —
+    // undoing would clear Stop/banners and wedge or corrupt the live turn.
+    if (
+      s0.streaming ||
+      s0.pendingApproval ||
+      s0.pendingAsk ||
+      s0.pendingSudo ||
+      s0.pendingIntercom
+    ) {
+      setState((st) =>
+        reduce(st, {
+          type: "error",
+          message: s0.streaming
+            ? "Stop the running turn before undoing"
+            : "Resolve or abort the pending prompt before undoing",
+        }),
+      );
+      return false;
+    }
+    undoBusyRef.current = true;
+    const before = s0.messages;
+    const sessionAtClick = s0.currentSessionFile;
+    setState((s) => reduce(s, { type: "_undo_local" }));
+    try {
+      const r = await post({ type: "undo" });
+      // Session switched mid-flight — don't claim success (edit/regen would
+      // re-prompt the wrong session) and don't restore A's transcript into B.
+      if (stateRef.current.currentSessionFile !== sessionAtClick) {
+        setState((s) => ({ ...s, pendingUndo: false }));
+        return false;
+      }
+      if (r.ok === false || r.error) {
+        setState((s) =>
+          reduce(
+            { ...s, messages: before, pendingUndo: false },
+            { type: "error", message: r.error || "Undo failed" },
+          ),
+        );
+        return false;
+      }
+      return true;
+    } finally {
+      undoBusyRef.current = false;
+    }
+  }, [post]);
+
+  const clear = useCallback(async () => {
+    if (undoBusyRef.current) {
+      setState((st) =>
+        reduce(st, { type: "error", message: "Wait for undo to finish before clearing" }),
+      );
+      return;
+    }
+    const s0 = stateRef.current;
+    if (
+      s0.streaming ||
+      s0.pendingApproval ||
+      s0.pendingAsk ||
+      s0.pendingSudo ||
+      s0.pendingIntercom
+    ) {
+      setState((st) =>
+        reduce(st, {
+          type: "error",
+          message: "Stop or resolve the pending turn before clearing",
+        }),
+      );
+      return;
+    }
+    wipeLocalTranscript();
+    await send({ type: "clear" });
+  }, [send, wipeLocalTranscript]);
 
   // ── Memory ──
   const saveMemory = useCallback(
-    async (text: string, tags?: string[]) => {
-      await send({ type: "save_memory", text, tags });
+    async (text: string, tags?: string[], scope?: "workspace" | "global") => {
+      await send({ type: "save_memory", text, tags, ...(scope ? { scope } : {}) });
       await post({ type: "list_memory" });
     },
     [send, post],
@@ -528,8 +846,8 @@ export function useAgent(): AgentApi {
 
   // ── Plugins ──
   const installPlugin = useCallback(
-    async (path: string) => {
-      await send({ type: "install_plugin", path });
+    async (path: string, scope?: "workspace" | "global") => {
+      await send({ type: "install_plugin", path, ...(scope ? { scope } : {}) });
       await post({ type: "list_plugins" });
     },
     [send, post],
@@ -556,6 +874,8 @@ export function useAgent(): AgentApi {
     [send, post],
   );
   const listPlugins = useCallback(() => send({ type: "list_plugins" }), [send]);
+  const listAgents = useCallback(() => send({ type: "list_agents" }), [send]);
+  const refreshMemory = useCallback(() => send({ type: "refresh_memory" }), [send]);
 
   // ── Skills ──
   const listSkills = useCallback(() => send({ type: "list_skills" }), [send]);
@@ -571,7 +891,20 @@ export function useAgent(): AgentApi {
       // invoked (the core inlines the full skill body into the actual prompt).
       const display = task && task.trim() ? `/skill:${name} ${task.trim()}` : `/skill:${name}`;
       setState((st) => reduce(st, { type: "_user", text: display, model, steer: false }));
-      await post(cmd);
+      const r = await post(cmd);
+      if (r.ok === false || r.error) {
+        setState((st) => {
+          let messages = st.messages;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (m.role === "user" && m.text === display) {
+              messages = [...messages.slice(0, i), ...messages.slice(i + 1)];
+              break;
+            }
+          }
+          return reduce({ ...st, messages }, { type: "error", message: r.error || "Failed to apply skill" });
+        });
+      }
     },
     [post, effortFor],
   );
@@ -608,20 +941,35 @@ export function useAgent(): AgentApi {
       };
       const eff = effortFor(s.thinkingLevel);
       if (eff) cmd.reasoning_effort = eff;
+      const display = `🎯 Goal: ${opts.goal}`;
       setState((st) =>
         reduce(st, {
           type: "_user",
-          text: `🎯 Goal: ${opts.goal}`,
+          text: display,
           model,
           steer: false,
         }),
       );
-      await post(cmd);
+      const r = await post(cmd);
+      if (r.ok === false || r.error) {
+        setState((st) => {
+          let messages = st.messages;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (m.role === "user" && m.text === display) {
+              messages = [...messages.slice(0, i), ...messages.slice(i + 1)];
+              break;
+            }
+          }
+          return reduce({ ...st, messages }, { type: "error", message: r.error || "Failed to start goal" });
+        });
+      }
     },
     [post, effortFor],
   );
   const cancelGoal = useCallback(() => send({ type: "cancel_goal" }), [send]);
   const approveGoalPlan = useCallback(() => send({ type: "approve_goal_plan" }), [send]);
+  const goalStatus = useCallback(() => send({ type: "goal_status" }), [send]);
   const reviseGoal = useCallback(
     async (feedback: string) => {
       const s = stateRef.current;
@@ -629,7 +977,12 @@ export function useAgent(): AgentApi {
       const cmd: CoreCommand = { type: "revise_goal", feedback, model };
       const eff = effortFor(s.thinkingLevel);
       if (eff) cmd.reasoning_effort = eff;
-      await post(cmd);
+      const r = await post(cmd);
+      if (r.ok === false || r.error) {
+        setState((st) =>
+          reduce(st, { type: "error", message: r.error || "Failed to revise goal" }),
+        );
+      }
     },
     [post, effortFor],
   );
@@ -642,9 +995,15 @@ export function useAgent(): AgentApi {
     [send],
   );
 
+  // ── Usage ──
+  const usage = useCallback(
+    (model?: string) => send({ type: "usage", ...(model ? { model } : {}) }),
+    [send],
+  );
+
   // ── Config ──
   const setConfig = useCallback(
-    (key: string, value: string | number) => send({ type: "set_config", key, value }),
+    (key: string, value: string | number | boolean) => send({ type: "set_config", key, value }),
     [send],
   );
 
@@ -652,6 +1011,10 @@ export function useAgent(): AgentApi {
   const switchWorkspace = useCallback(
     async (path: string) => {
       const r = await post({ type: "switch_workspace", path });
+      if (r.ok === false || r.error) {
+        setState((s) => reduce(s, { type: "error", message: r.error || "Failed to switch workspace" }));
+        return;
+      }
       if (r.session) switchToSession(r.session, r.workspace ?? path);
     },
     [post, switchToSession],
@@ -671,8 +1034,10 @@ export function useAgent(): AgentApi {
   const deleteSession = useCallback(
     async (path: string) => {
       const r = await post({ type: "delete_session", path });
-      // If we deleted the session currently being viewed, switch to the
-      // next most-recent one (returned by the bridge) so the view stays live.
+      if (r.ok === false || r.error) {
+        setState((s) => reduce(s, { type: "error", message: r.error || "Failed to delete session" }));
+        return;
+      }
       if (activeRef.current && activeRef.current === path && r.session) {
         switchToSession(r.session, r.workspace);
       }
@@ -689,13 +1054,30 @@ export function useAgent(): AgentApi {
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i];
       if (m.role === "assistant" && m.text.trim()) {
-        navigator.clipboard?.writeText(m.text).then(
-          () => {},
-          () => {},
+        if (!navigator.clipboard?.writeText) {
+          setState((s) =>
+            reduce(s, { type: "error", message: "Clipboard unavailable in this browser" }),
+          );
+          return;
+        }
+        void navigator.clipboard.writeText(m.text).then(
+          () => {
+            setState((s) =>
+              reduce(s, { type: "info", message: "Copied last reply to clipboard" }),
+            );
+          },
+          () => {
+            setState((s) =>
+              reduce(s, { type: "error", message: "Failed to copy — clipboard permission denied" }),
+            );
+          },
         );
         return;
       }
     }
+    setState((s) =>
+      reduce(s, { type: "info", message: "No assistant reply to copy yet" }),
+    );
   }, []);
 
   const exportTranscript = useCallback((): string => {
@@ -734,6 +1116,7 @@ export function useAgent(): AgentApi {
       steer,
       userBash,
       abort,
+      clearQueue,
       approve,
       setKey,
       setProvider,
@@ -767,14 +1150,18 @@ export function useAgent(): AgentApi {
       enablePlugin,
       disablePlugin,
       listPlugins,
+      listAgents,
+      refreshMemory,
       listSkills,
       applySkill,
       startGoal,
       cancelGoal,
       approveGoalPlan,
       reviseGoal,
+      goalStatus,
       getVisionConfig,
       setVisionConfig,
+      usage,
       setConfig,
       switchWorkspace,
       renameSession,

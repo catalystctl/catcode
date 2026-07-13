@@ -8,6 +8,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AskPrompt, AskQuestion } from "@/lib/types";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, SendIcon, XIcon, PencilIcon } from "./icons";
 
 interface Props {
@@ -34,6 +35,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
   // Per select-question: whether the user switched to custom free-text entry.
   const [custom, setCustom] = useState<Record<string, boolean>>({});
   const firstTextRef = useRef<HTMLInputElement | null>(null);
+  const trapRef = useFocusTrap<HTMLDivElement>();
 
   useEffect(() => {
     // Focus the first text-capable field so typing works immediately.
@@ -103,6 +105,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
 
   return (
     <div
+      ref={trapRef}
       className="my-3 overflow-hidden rounded-xl border border-accent/25 bg-accent/[0.03]"
       role="dialog"
       aria-modal="true"

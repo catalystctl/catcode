@@ -15,6 +15,7 @@ import {
   PlusIcon, HistoryIcon, TrashIcon, CompactIcon, DotIcon, XIcon,
   BrainIcon, TerminalIcon, BoltIcon, SparkIcon, FolderIcon,
   ChevronDown, CheckIcon, FolderPlusIcon, SearchIcon, PencilIcon, RefreshIcon,
+  HelpIcon,
 } from "./icons";
 
 interface Props {
@@ -36,6 +37,8 @@ interface Props {
   onRemoveProject: (path: string) => void;
   onDeleteSession: (path: string) => void;
   onRenameSession: (name: string, title: string) => void;
+  /** Optional confirm dialog (avoids window.confirm). */
+  onConfirmDelete?: (title: string) => Promise<boolean>;
 }
 
 export function Sidebar(props: Props) {
@@ -46,9 +49,13 @@ export function Sidebar(props: Props) {
   const [renameValue, setRenameValue] = useState("");
   const projectRef = useOutsideClose(() => setProjectOpen(false));
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const renameCancelledRef = useRef(false);
 
   useEffect(() => {
-    if (renaming) renameInputRef.current?.focus();
+    if (renaming) {
+      renameCancelledRef.current = false;
+      renameInputRef.current?.focus();
+    }
   }, [renaming]);
 
   const filtered = query.trim()
@@ -226,9 +233,13 @@ export function Sidebar(props: Props) {
           ) : (
             <ul className="space-y-0.5">
               {filtered.map((s) => {
-                const active = props.currentSessionFile
-                  ? props.currentSessionFile.endsWith(s.name)
-                  : false;
+                const cur = props.currentSessionFile;
+                const active = !!cur && (
+                  cur === s.path ||
+                  cur === s.name ||
+                  cur.endsWith("/" + s.name) ||
+                  cur.endsWith("\\" + s.name)
+                );
                 const displayTitle = s.title || basename(s.name) || s.name;
                 const isRenaming = renaming === s.name;
                 return (
@@ -253,10 +264,17 @@ export function Sidebar(props: Props) {
                                 commitRename();
                               } else if (e.key === "Escape") {
                                 e.preventDefault();
+                                renameCancelledRef.current = true;
                                 setRenaming(null);
                               }
                             }}
-                            onBlur={commitRename}
+                            onBlur={() => {
+                              if (renameCancelledRef.current) {
+                                renameCancelledRef.current = false;
+                                return;
+                              }
+                              commitRename();
+                            }}
                             className="w-full rounded border border-accent/40 bg-ink-950 px-1.5 py-0.5 text-[11px] text-ink-100 focus:outline-none"
                           />
                         ) : (
@@ -277,31 +295,33 @@ export function Sidebar(props: Props) {
                         )}
                       </div>
                     </button>
-                    {/* Rename + delete buttons (hover) */}
+                    {/* Rename + delete — always visible on touch; hover-reveal on pointer devices */}
                     {!isRenaming && (
-                      <div className="absolute right-1.5 top-1.5 hidden items-center gap-0.5 group-hover:flex">
+                      <div className="absolute right-1.5 top-1.5 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
                             startRename(s);
                           }}
-                          className="rounded p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-100"
+                          className="rounded p-1 text-ink-600 hover:bg-ink-800 hover:text-ink-100"
                           title="Rename session"
+                          aria-label={`Rename ${displayTitle}`}
                         >
                           <PencilIcon width={11} height={11} />
                         </button>
                         <button
-                          onClick={(e) => {
+                          onClick={async (e) => {
                             e.stopPropagation();
-                            if (
-                              window.confirm(
-                                `Delete session "${displayTitle}"? The .jsonl file will be permanently removed.`,
-                              )
-                            )
-                              props.onDeleteSession(s.path ?? s.name);
+                            const ok = props.onConfirmDelete
+                              ? await props.onConfirmDelete(displayTitle)
+                              : window.confirm(
+                                  `Delete session "${displayTitle}"? The .jsonl file will be permanently removed.`,
+                                );
+                            if (ok) props.onDeleteSession(s.path ?? s.name);
                           }}
-                          className="rounded p-0.5 text-ink-600 hover:bg-danger/10 hover:text-danger"
+                          className="rounded p-1 text-ink-600 hover:bg-danger/10 hover:text-danger"
                           title="Delete session"
+                          aria-label={`Delete ${displayTitle}`}
                         >
                           <TrashIcon width={11} height={11} />
                         </button>
@@ -316,11 +336,12 @@ export function Sidebar(props: Props) {
 
         {/* ── Footer: quick actions + stats ── */}
         <div className="border-t border-ink-800/80 p-2">
-          <div className="mb-1.5 grid grid-cols-4 gap-1.5">
+          <div className="mb-1.5 grid grid-cols-5 gap-1.5">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
             <ActionBtn icon={<SparkIcon width={13} height={13} />} label="Agents" onClick={() => props.onOpenPanel("subagents")} />
             <ActionBtn icon={<BoltIcon width={13} height={13} />} label="Settings" onClick={() => props.onOpenPanel("settings")} />
+            <ActionBtn icon={<HelpIcon width={13} height={13} />} label="Help" onClick={() => props.onOpenPanel("help")} />
           </div>
           <div className="grid grid-cols-3 gap-1.5">
             <ActionBtn icon={<TrashIcon width={13} height={13} />} label="Reset" onClick={props.onReset} />

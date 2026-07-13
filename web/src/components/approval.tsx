@@ -2,11 +2,13 @@
 
 // Approval — the human-in-the-loop gate banner. Destructive tools are styled
 // amber/rose; read-only tools are neutral. Yes / No / Always (escalate this
-// tool kind for the rest of the session).
+// tool kind for the rest of the session). Esc denies (TUI parity); outside
+// click does NOT deny — the user may be reading a diff / using the sidebar.
 
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import type { ApprovalRequest } from "@/lib/types";
 import { isDangerousTool, toolIcon } from "@/lib/format";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, ShieldIcon } from "./icons";
 import { Diff } from "./diff";
 
@@ -25,8 +27,26 @@ export function Approval({ approval, onApprove }: Props) {
     }
   }, [approval.args]);
 
+  const onDeny = useCallback(() => onApprove("no"), [onApprove]);
+  const trapRef = useFocusTrap<HTMLDivElement>();
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      onDeny();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onDeny]);
+
   return (
     <div
+      ref={trapRef}
+      role="alertdialog"
+      aria-modal="true"
+      aria-label={`Approve ${approval.tool}`}
       className={`my-3 overflow-hidden rounded-xl border ${
         danger ? "border-warning/30 bg-warning/[0.04]" : "border-accent/20 bg-accent/[0.03]"
       }`}
@@ -64,7 +84,7 @@ export function Approval({ approval, onApprove }: Props) {
             <ShieldIcon width={13} height={13} /> Always allow {approval.tool}
           </button>
           <button
-            onClick={() => onApprove("no")}
+            onClick={onDeny}
             className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
           >
             <XIcon width={14} height={14} /> Deny

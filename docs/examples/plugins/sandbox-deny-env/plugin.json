@@ -1,0 +1,22 @@
+{
+  "name": "sandbox-deny-env",
+  "version": "0.1.0",
+  "description": "Override bash to reject commands that touch .env / secret files (demo of tools[].override).",
+  "tools": [
+    {
+      "name": "bash",
+      "override": true,
+      "description": "Run a shell command in the workspace (blocks obvious secret-file access).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "bash command to run" }
+        },
+        "required": ["command"]
+      },
+      "script": "hooks/bash.sh",
+      "kind": "destructive",
+      "timeout_ms": 120000
+    }
+  ]
+}

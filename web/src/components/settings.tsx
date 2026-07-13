@@ -1,13 +1,13 @@
 "use client";
 
 // SettingsModal — runtime configuration: default model, thinking level,
-// approval mode, and bash timeout. Takes up 80% of the viewport so the model
-// picker (with search + provider filters) has room to breathe. Click-outside
-// / Escape to close. Preferences are persisted by the parent (localStorage);
-// this modal just calls the supplied callbacks.
+// approval mode, bash timeout, auto-compact, and vision handoff. Takes up 80%
+// of the viewport so the model picker (with search + provider filters) has room
+// to breathe. Click-outside / Escape to close. Preferences are persisted by the
+// parent (localStorage); this modal just calls the supplied callbacks.
 
-import { useState, type ReactNode } from "react";
-import type { ModelInfo, ReadyPayload } from "@/lib/types";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import type { ModelInfo, ReadyPayload, VisionConfig } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
@@ -20,10 +20,17 @@ interface Props {
   selectedModel: string | null;
   thinkingLevel: string;
   approvalMode: string;
+  autoCompact: boolean;
+  sandbox: string;
   onSelectModel: (id: string) => void;
   onSelectThinking: (level: string) => void;
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
   onSetBashTimeout: (secs: number) => void;
+  onSetAutoCompact: (on: boolean) => void;
+  onSetSandbox: (mode: "none" | "firejail" | "seatbelt") => void;
+  visionConfig: VisionConfig | null;
+  onSetVisionConfig: (vision_model: string | null, vision_models: string[]) => void;
+  onRefreshVision?: () => void;
   onClose: () => void;
 }
 
@@ -33,6 +40,12 @@ const APPROVAL_HELP: Record<string, string> = {
   never: "auto-run all",
   destructive: "ask before bash/edits",
   always: "ask for everything",
+};
+const SANDBOX_MODES: Array<"none" | "firejail" | "seatbelt"> = ["none", "firejail", "seatbelt"];
+const SANDBOX_HELP: Record<string, string> = {
+  none: "denylist tripwire only",
+  firejail: "wrap bash in firejail (Linux)",
+  seatbelt: "sandbox-exec seatbelt (macOS)",
 };
 
 function ColumnLabel({ children }: { children: ReactNode }) {
@@ -60,6 +73,58 @@ export function SettingsModal(props: Props) {
     String(props.ready?.bash_timeout_secs ?? 30),
   );
 
+  const curatedIds = useMemo(
+    () => props.visionConfig?.vision_models ?? [],
+    [props.visionConfig?.vision_models],
+  );
+  const preferredId = props.visionConfig?.vision_model ?? null;
+
+  const [draftCurated, setDraftCurated] = useState<string[]>(() => curatedIds);
+  const [draftPreferred, setDraftPreferred] = useState<string | null>(() => preferredId);
+
+  useEffect(() => {
+    setDraftCurated(curatedIds);
+    setDraftPreferred(preferredId);
+  }, [curatedIds, preferredId]);
+
+  useEffect(() => {
+    props.onRefreshVision?.();
+    // Only refresh once when the modal mounts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const visionCandidates = useMemo(() => {
+    const byId = new Map(props.models.map((m) => [m.id, m]));
+    const ids = new Set<string>();
+    for (const m of props.models) {
+      if (m.vision) ids.add(m.id);
+    }
+    for (const id of curatedIds) ids.add(id);
+    for (const id of draftCurated) ids.add(id);
+    return Array.from(ids)
+      .map((id) => byId.get(id) ?? ({ id, name: id, vision: true } as ModelInfo))
+      .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  }, [props.models, curatedIds, draftCurated]);
+
+  const toggleCurated = (id: string) => {
+    setDraftCurated((prev) => {
+      if (prev.includes(id)) {
+        const next = prev.filter((x) => x !== id);
+        if (draftPreferred === id) setDraftPreferred(next[0] ?? null);
+        return next;
+      }
+      return [...prev, id];
+    });
+  };
+
+  const saveVision = () => {
+    const preferred =
+      draftPreferred && draftCurated.includes(draftPreferred)
+        ? draftPreferred
+        : draftCurated[0] ?? null;
+    props.onSetVisionConfig(preferred, draftCurated);
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
@@ -85,7 +150,7 @@ export function SettingsModal(props: Props) {
 
         {/* Two-column body */}
         <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto p-6 lg:grid-cols-2">
-          {/* Left column: account + approval + timeout */}
+          {/* Left column: account + approval + timeout + auto-compact */}
           <div className="flex flex-col gap-5">
             <div>
               <ColumnLabel>Account &amp; security</ColumnLabel>
@@ -126,6 +191,67 @@ export function SettingsModal(props: Props) {
             </div>
 
             <div>
+              <ColumnLabel>Bash sandbox</ColumnLabel>
+              <div className="space-y-2">
+                {SANDBOX_MODES.map((mode) => {
+                  const active = (props.sandbox || "none") === mode;
+                  return (
+                    <button
+                      key={mode}
+                      onClick={() => props.onSetSandbox(mode)}
+                      className={`flex w-full items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-colors ${
+                        active
+                          ? mode === "none"
+                            ? "border-ink-700 bg-ink-850 text-ink-100"
+                            : "border-success/40 bg-success/10 text-success"
+                          : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
+                      }`}
+                    >
+                      <ShieldIcon width={14} height={14} className="shrink-0" />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-medium capitalize">{mode}</div>
+                        <div className="text-[11px] text-ink-500">{SANDBOX_HELP[mode]}</div>
+                      </div>
+                      {active && <CheckIcon width={14} height={14} className="shrink-0" />}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-[11px] text-ink-500">
+                Hard isolation for agent bash. Requires firejail (Linux) or seatbelt (macOS) when enabled.
+              </p>
+            </div>
+
+            <div>
+              <ColumnLabel>Auto-compact</ColumnLabel>
+              <div className="flex gap-2">
+                {([true, false] as const).map((on) => {
+                  const active = props.autoCompact === on;
+                  return (
+                    <button
+                      key={on ? "on" : "off"}
+                      onClick={() => props.onSetAutoCompact(on)}
+                      className={`flex flex-1 items-center justify-center gap-2 rounded-xl border px-3.5 py-2.5 text-[13px] font-medium transition-colors ${
+                        active
+                          ? on
+                            ? "border-success/40 bg-success/10 text-success"
+                            : "border-ink-700 bg-ink-850 text-ink-100"
+                          : "border-ink-700/70 bg-ink-900/70 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
+                      }`}
+                    >
+                      {on ? "On" : "Off"}
+                      {active && <CheckIcon width={14} height={14} />}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-[11px] text-ink-500">
+                Automatically compact context near limits or after idle. Manual /compact always
+                works.
+              </p>
+            </div>
+
+            <div>
               <ColumnLabel>Bash timeout</ColumnLabel>
               <Panel>
                 <div className="flex items-center gap-2">
@@ -157,7 +283,7 @@ export function SettingsModal(props: Props) {
             </div>
           </div>
 
-          {/* Right column: model picker + thinking */}
+          {/* Right column: model picker + thinking + vision */}
           <div className="flex min-h-0 flex-col gap-5">
             <div className="flex min-h-0 flex-1 flex-col">
               <ColumnLabel>Model</ColumnLabel>
@@ -193,6 +319,67 @@ export function SettingsModal(props: Props) {
                     );
                   })}
                 </div>
+              </Panel>
+            </div>
+
+            <div>
+              <ColumnLabel>Vision handoff</ColumnLabel>
+              <Panel>
+                {visionCandidates.length === 0 ? (
+                  <p className="text-[12px] text-ink-500">
+                    No vision-capable models discovered yet.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {visionCandidates.map((m) => {
+                      const included = draftCurated.includes(m.id);
+                      const preferred = draftPreferred === m.id;
+                      return (
+                        <div
+                          key={m.id}
+                          className="flex items-center gap-2 rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-2"
+                        >
+                          <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={included}
+                              onChange={() => toggleCurated(m.id)}
+                              className="accent-[var(--accent)]"
+                            />
+                            <span className="truncate text-[12px] text-ink-200">
+                              {m.name || m.id}
+                            </span>
+                            {m.vision && (
+                              <span className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
+                                vision
+                              </span>
+                            )}
+                          </label>
+                          <button
+                            type="button"
+                            title="Preferred handoff target"
+                            disabled={!included}
+                            onClick={() => setDraftPreferred(m.id)}
+                            className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                              preferred
+                                ? "bg-accent/15 text-accent-soft"
+                                : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"
+                            }`}
+                          >
+                            {preferred ? "★ preferred" : "☆ prefer"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={saveVision}
+                  className="mt-3 w-full rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft"
+                >
+                  Save vision config
+                </button>
               </Panel>
             </div>
           </div>

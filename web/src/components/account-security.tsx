@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { QRCodeSVG } from "qrcode.react";
 import { authClient } from "@/lib/auth-client";
+import { AppDialogHost, useAppDialog } from "./app-dialog";
 
 // Loosely typed — Better Auth infers the exact shapes at runtime.
 interface Passkey {
@@ -17,12 +18,14 @@ export function AccountSecurity() {
   const { data: session } = authClient.useSession();
   const router = useRouter();
   const user = session?.user as any;
+  const { confirm, prompt, dialog } = useAppDialog();
 
   return (
     <div className="space-y-5">
+      <AppDialogHost dialog={dialog} />
       <AccountInfo email={user?.email} name={user?.name} />
-      <PasskeyManager />
-      <TotpManager enabled={Boolean(user?.twoFactorEnabled)} />
+      <PasskeyManager confirm={confirm} prompt={prompt} />
+      <TotpManager enabled={Boolean(user?.twoFactorEnabled)} prompt={prompt} />
       <ChangePassword />
       <SignOut onDone={() => router.replace("/login")} />
     </div>
@@ -46,7 +49,18 @@ function AccountInfo({ email, name }: { email?: string | null; name?: string | n
 }
 
 // ── Passkeys ──────────────────────────────────────────────────
-function PasskeyManager() {
+function PasskeyManager({
+  confirm,
+  prompt,
+}: {
+  confirm: (opts: { title: string; message: string; confirmLabel?: string; danger?: boolean }) => Promise<boolean>;
+  prompt: (opts: {
+    title: string;
+    message?: string;
+    placeholder?: string;
+    defaultValue?: string;
+  }) => Promise<string | null>;
+}) {
   const [passkeys, setPasskeys] = useState<Passkey[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +77,11 @@ function PasskeyManager() {
 
   async function addPasskey() {
     setError(null);
-    const name = window.prompt("Name this passkey (e.g. MacBook, YubiKey):", "");
+    const name = await prompt({
+      title: "Name this passkey",
+      message: "Optional label (e.g. MacBook, YubiKey).",
+      placeholder: "MacBook",
+    });
     if (name === null) return;
     setLoading(true);
     const { error } = await authClient.passkey.addPasskey({ name: name || undefined });
@@ -76,7 +94,13 @@ function PasskeyManager() {
   }
 
   async function deletePasskey(id: string) {
-    if (!window.confirm("Remove this passkey? You won't be able to sign in with it.")) return;
+    const ok = await confirm({
+      title: "Remove passkey",
+      message: "Remove this passkey? You won't be able to sign in with it.",
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
     setError(null);
     const { error } = await authClient.passkey.deletePasskey({ id });
     if (error) {
@@ -127,7 +151,19 @@ function PasskeyManager() {
 }
 
 // ── TOTP (authenticator app) ──────────────────────────────────
-function TotpManager({ enabled: initialEnabled }: { enabled: boolean }) {
+function TotpManager({
+  enabled: initialEnabled,
+  prompt,
+}: {
+  enabled: boolean;
+  prompt: (opts: {
+    title: string;
+    message?: string;
+    placeholder?: string;
+    password?: boolean;
+    required?: boolean;
+  }) => Promise<string | null>;
+}) {
   const [enabled, setEnabled] = useState(initialEnabled);
   const [setupUri, setSetupUri] = useState<string | null>(null);
   const [pendingBackupCodes, setPendingBackupCodes] = useState<string[] | null>(null);
@@ -144,7 +180,12 @@ function TotpManager({ enabled: initialEnabled }: { enabled: boolean }) {
   // Enable flow: enable({ password }) → { totpURI, backupCodes } → show QR →
   // verifyTotp({ code }) → 2FA active → show backup codes.
   async function startEnable() {
-    const password = window.prompt("Enter your password to start TOTP setup:", "");
+    const password = await prompt({
+      title: "Confirm password",
+      message: "Enter your password to start TOTP setup.",
+      password: true,
+      required: true,
+    });
     if (password === null) return;
     setError(null);
     setLoading(true);
@@ -182,7 +223,12 @@ function TotpManager({ enabled: initialEnabled }: { enabled: boolean }) {
   }
 
   async function disable() {
-    const password = window.prompt("Enter your password to disable 2FA:", "");
+    const password = await prompt({
+      title: "Disable 2FA",
+      message: "Enter your password to disable two-factor authentication.",
+      password: true,
+      required: true,
+    });
     if (password === null) return;
     setError(null);
     setLoading(true);
@@ -197,7 +243,12 @@ function TotpManager({ enabled: initialEnabled }: { enabled: boolean }) {
   }
 
   async function regenerateBackupCodes() {
-    const password = window.prompt("Enter your password to regenerate backup codes:", "");
+    const password = await prompt({
+      title: "Regenerate backup codes",
+      message: "Enter your password to regenerate backup codes. Old codes stop working.",
+      password: true,
+      required: true,
+    });
     if (password === null) return;
     setError(null);
     setLoading(true);

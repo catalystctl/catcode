@@ -236,6 +236,10 @@ func (s *session) renderFooter() string {
 	if s.settings.MouseWheel {
 		left.WriteString(dimStyle.Render(" · mouse:on"))
 	}
+	if s.pluginStatus != "" {
+		left.WriteString(dimStyle.Render(" · "))
+		left.WriteString(mutedStyle.Render(s.pluginStatus))
+	}
 	statusLine := left.String()
 
 	// Line 2 — metrics (left) + context budget (right). Both can be empty

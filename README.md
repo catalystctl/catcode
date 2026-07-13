@@ -391,9 +391,11 @@ peers over an in-process intercom bus.
 - [x] Subagents + intercom bus
 - [x] Plugin system (hooks + custom tools, no MCP)
 - [x] xAI Grok SuperGrok / X Premium+ OAuth (device-code, no API key)
-- [ ] More provider presets (local gateways, additional OAuth flows)
-- [ ] macOS/Windows sandboxing options
-- [ ] Broader plugin / skill ecosystem
+- [x] Plugin slash commands, notify/status, and `/plugin-reload`
+- [x] Local provider presets (Ollama, LM Studio)
+- [x] macOS seatbelt sandbox mode (Windows remains denylist-only)
+- [ ] Broader plugin / skill ecosystem (catalog + more reference plugins)
+- [ ] Additional OAuth / gateway presets as demand appears
 
 See the [open issues](https://github.com/catalystctl/catcode/issues) for a full
 list of proposed features (and known issues).

@@ -26,18 +26,21 @@ export function SetupForm() {
       return;
     }
     setLoading(true);
-    const { error } = await authClient.signUp.email({
-      email,
-      password,
-      name: name || email.split("@")[0],
-    });
-    setLoading(false);
-    if (error) {
-      setError(error.message ?? "Failed to create account.");
-      return;
+    try {
+      const { error } = await authClient.signUp.email({
+        email,
+        password,
+        name: name || email.split("@")[0],
+      });
+      if (error) {
+        setError(error.message ?? "Failed to create account.");
+        return;
+      }
+      router.replace("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
     }
-    router.replace("/");
-    router.refresh();
   }
 
   return (

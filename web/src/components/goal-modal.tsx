@@ -98,7 +98,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
       if (reviewerModel) opts.reviewer_model = reviewerModel;
       const mc: Record<string, number> = {};
       for (const [k, v] of Object.entries(modelConcurrency)) {
-        if (v > 0 && v < Math.min(c, mt)) mc[k] = v;
+        if (v >= 1 && v <= Math.min(c, mt)) mc[k] = v;
       }
       if (Object.keys(mc).length) opts.model_concurrency = mc;
     }

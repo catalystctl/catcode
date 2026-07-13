@@ -27,12 +27,16 @@ export const COMMANDS: CommandDef[] = [
   { label: "/compact", desc: "force compaction (opt: instructions)", category: "session", action: "compact" },
   { label: "/stats", desc: "token + turn totals", category: "session", action: "stats" },
   { label: "/context", desc: "token-usage breakdown (top consumers)", category: "session", action: "context" },
+  { label: "/usage", desc: "provider plan / rate-limit usage", category: "session", action: "usage" },
   { label: "/abort", desc: "stop running turn", category: "session", action: "abort", streaming: true },
 
   // ── Config ──
   { label: "/model", desc: "switch model", category: "config", action: "model" },
   { label: "/reasoning", desc: "set reasoning effort", category: "config", action: "reasoning" },
   { label: "/approval", desc: "never · destructive · always", category: "config", action: "approval" },
+  { label: "/sandbox", desc: "none · firejail · seatbelt (bash hard sandbox)", category: "config", action: "sandbox" },
+  { label: "/auto-compact", desc: "toggle auto context compaction", category: "config", action: "auto-compact" },
+  { label: "/bash-timeout", desc: "set bash tool timeout (seconds)", category: "config", action: "bash-timeout" },
   { label: "/settings", desc: "open settings modal", category: "config", action: "settings" },
   { label: "/theme", desc: "switch colour theme", category: "config", action: "theme" },
   { label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)", category: "config", action: "login" },
@@ -46,7 +50,9 @@ export const COMMANDS: CommandDef[] = [
   { label: "/run", desc: "delegate to a subagent", category: "agent", action: "run" },
   { label: "/parallel", desc: "run subagents in parallel", category: "agent", action: "parallel" },
   { label: "/chain", desc: "run a subagent chain", category: "agent", action: "chain" },
-  { label: "/subagents", desc: "list available subagents", category: "agent", action: "subagents" },
+  { label: "/subagents", desc: "subagent runs + available agents", category: "agent", action: "subagents" },
+  { label: "/index", desc: "bootstrap repo knowledge → memories + skills", category: "agent", action: "index" },
+  { label: "/reflect", desc: "reflect on this session, persist learnings", category: "agent", action: "reflect" },
 
   // ── Tools ──
   { label: "/memory", desc: "list saved memories", category: "tools", action: "memory" },

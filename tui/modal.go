@@ -255,12 +255,12 @@ func (s *session) openApprovalPicker() {
 	}
 }
 
-// openSandboxPicker lists sandbox modes (none | firejail).
+// openSandboxPicker lists sandbox modes (none | firejail | seatbelt).
 func (s *session) openSandboxPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalSandbox
 	s.modal.cursor = 0
-	modes := []string{"none", "firejail"}
+	modes := []string{"none", "firejail", "seatbelt"}
 	for i, m := range modes {
 		if m == s.settings.Sandbox {
 			s.modal.cursor = i
@@ -765,7 +765,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/theme", desc: "switch colour theme"},
 		{label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
 		{label: "/auto-compact", desc: "auto context compaction on/off"},
-		{label: "/sandbox", desc: "sandbox mode (none · firejail)"},
+		{label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
 		{label: "/no-network", desc: "block network in sandbox on/off"},
 		{label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
 		{label: "/idle-timeout", desc: "idle timeout (seconds)"},
@@ -791,6 +791,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/plugin-install", desc: "install path/URL · optional global|workspace"},
 		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
+		{label: "/plugin-reload", desc: "re-scan plugin directories"},
 		{label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
 		{label: "/run", desc: "delegate to a subagent (single) — modal"},
 		{label: "/parallel", desc: "run subagents in parallel — modal"},
@@ -814,6 +815,17 @@ func (s *session) commandItems() []listItem {
 			desc = "apply skill"
 		}
 		items = append(items, listItem{label: "/skill:" + sk.Name, desc: desc})
+	}
+	// Plugin-declared slash commands (/{name}).
+	for _, pc := range s.pluginCommands {
+		desc := pc.Description
+		if desc == "" {
+			desc = "plugin command"
+		}
+		if pc.Plugin != "" {
+			desc = desc + " · " + pc.Plugin
+		}
+		items = append(items, listItem{label: "/" + pc.Name, desc: desc})
 	}
 	return items
 }
@@ -907,7 +919,8 @@ func (s *session) sandboxItems() []listItem {
 		mode, desc string
 	}{
 		{"none", "no sandbox (applies on next launch)"},
-		{"firejail", "firejail sandbox (applies on next launch)"},
+		{"firejail", "firejail sandbox (Linux; applies on next launch)"},
+		{"seatbelt", "seatbelt / sandbox-exec (macOS; applies on next launch)"},
 	}
 	items := make([]listItem, len(modes))
 	for i, m := range modes {
@@ -2392,7 +2405,7 @@ func (s *session) helpText() string {
 		"  /theme           switch colour theme",
 		"  /bash-timeout    bash tool timeout (seconds)",
 		"  /auto-compact    auto context compaction on/off",
-		"  /sandbox         sandbox mode (none · firejail)",
+		"  /sandbox         sandbox mode (none · firejail · seatbelt)",
 		"  /no-network      block network in sandbox on/off",
 		"  /mouse-wheel     mouse-wheel scrolling on/off",
 		"  /idle-timeout    idle timeout (seconds)",
@@ -2419,10 +2432,12 @@ func (s *session) helpText() string {
 		"  /plugin-install   install from path/URL [global|workspace]",
 		"  /plugin-config    enable / disable plugins",
 		"  /plugin-remove    uninstall a plugin",
+		"  /plugin-reload    re-scan plugin directories",
 		"  /goal             goal mode — plan & deploy subagents (modal)",
 		"  /cancel-goal      cancel active goal mode",
 		"  /run · /parallel · /chain  subagent delegation",
 		"  /skill:<name> [task]  apply a skill (task optional)",
+		"  /{plugin-cmd}     plugin-declared slash command",
 		"",
 		"Settings persist to ~/.config/catalyst-code/settings.json",
 		"Config (core) persists to ~/.config/catalyst-code/config.json",

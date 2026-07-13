@@ -115,16 +115,17 @@ export function Header(props: Props) {
         )}
       </div>
 
-      {/* Thinking selector */}
-      <div className="relative hidden sm:block" ref={thinkRef}>
+      {/* Thinking selector — icon-only on xs, full on sm+ */}
+      <div className="relative" ref={thinkRef}>
         <button
           onClick={() => setThinkOpen((o) => !o)}
           aria-haspopup="menu"
           aria-expanded={thinkOpen}
           className="flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/70 px-2.5 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850"
+          title={`Thinking: ${props.thinkingLevel}`}
         >
           <BrainIcon width={13} height={13} className="text-accent-soft" />
-          <span className="capitalize">{props.thinkingLevel}</span>
+          <span className="hidden capitalize sm:inline">{props.thinkingLevel}</span>
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {thinkOpen && (
@@ -245,7 +246,7 @@ export function Header(props: Props) {
           </span>
         </span>
         {/* Reconnect button when disconnected */}
-        {!props.connected && props.onReconnect && !props.switching && (
+        {!props.connected && props.onReconnect && (
           <button
             onClick={props.onReconnect}
             className="flex items-center gap-1 rounded-md border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"

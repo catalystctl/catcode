@@ -89,3 +89,30 @@ jobs:
         run: |
           mkdir -p embed && touch embed/catcode-core
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -tags embed_core .
+
+  web:
+    name: web (next)
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: install
+        working-directory: web
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        working-directory: web
+        run: bun run typecheck
+      - name: lint
+        working-directory: web
+        run: bun run lint
+      - name: test
+        working-directory: web
+        run: bun test
+      - name: build
+        working-directory: web
+        run: bun run build
+        env:
+          # Single-user localhost default; build must not require a public origin.
+          CATCODE_WEB_ORIGIN: http://localhost:49283

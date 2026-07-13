@@ -9,6 +9,7 @@ import { useState } from "react";
 import type { PluginEntry } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { AppDialogHost, useAppDialog } from "./app-dialog";
 import {
   TerminalIcon,
   PlusIcon,
@@ -21,7 +22,7 @@ import {
 
 interface Props {
   plugins: PluginEntry[];
-  onInstall: (path: string) => void;
+  onInstall: (path: string, scope?: "workspace" | "global") => void;
   onRemove: (name: string) => void;
   onEnable: (name: string) => void;
   onDisable: (name: string) => void;
@@ -114,11 +115,10 @@ function PluginCard({
             </button>
           )}
           <button
-            onClick={() => {
-              if (window.confirm(`Remove plugin "${p.name}"?`)) onRemove(p.name);
-            }}
-            className="rounded-md p-1 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100"
+            onClick={() => void onRemove(p.name)}
+            className="rounded-md p-1 text-ink-600 opacity-100 transition-opacity hover:bg-danger/10 hover:text-danger sm:opacity-0 sm:group-hover:opacity-100"
             title="Remove"
+            aria-label={`Remove ${p.name}`}
           >
             <TrashIcon width={13} height={13} />
           </button>
@@ -194,20 +194,34 @@ export function PluginsPanel({
   onClose,
 }: Props) {
   const [path, setPath] = useState("");
+  const [scope, setScope] = useState<"workspace" | "global">("workspace");
+  const { confirm, dialog } = useAppDialog();
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
 
   const install = () => {
     const p = path.trim();
     if (!p) return;
-    onInstall(p);
+    onInstall(p, scope);
     setPath("");
+  };
+
+  const remove = async (name: string) => {
+    const ok = await confirm({
+      title: "Remove plugin",
+      message: `Remove plugin "${name}"?`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (ok) onRemove(name);
   };
 
   const enabledCount = plugins.filter((p) => p.enabled).length;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <>
+      <AppDialogHost dialog={dialog} />
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <div
         ref={mergeRefs(closeRef, trapRef)}
         className="flex max-h-[85vh] w-full max-w-xl flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
@@ -235,23 +249,41 @@ export function PluginsPanel({
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
           {/* Install */}
-          <div className="mb-3 flex items-center gap-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3">
-            <input
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") install();
-              }}
-              placeholder="/path/to/plugin or owner/repo@v1.2.0"
-              className="flex-1 rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none"
-            />
-            <button
-              onClick={install}
-              disabled={!path.trim()}
-              className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
-            >
-              <PlusIcon width={13} height={13} /> Install
-            </button>
+          <div className="mb-3 space-y-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3">
+            <div className="flex items-center gap-2">
+              <input
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") install();
+                }}
+                placeholder="/path/to/plugin or owner/repo@v1.2.0"
+                className="flex-1 rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none"
+              />
+              <button
+                onClick={install}
+                disabled={!path.trim()}
+                className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+              >
+                <PlusIcon width={13} height={13} /> Install
+              </button>
+            </div>
+            <div className="flex rounded-lg border border-ink-700 bg-ink-950 p-0.5 w-fit">
+              {(["workspace", "global"] as const).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setScope(s)}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-medium capitalize transition-colors ${
+                    scope === s
+                      ? "bg-ink-800 text-ink-100"
+                      : "text-ink-500 hover:text-ink-300"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* List */}
@@ -269,7 +301,7 @@ export function PluginsPanel({
                 <PluginCard
                   key={p.name}
                   p={p}
-                  onRemove={onRemove}
+                  onRemove={remove}
                   onEnable={onEnable}
                   onDisable={onDisable}
                 />
@@ -279,5 +311,6 @@ export function PluginsPanel({
         </div>
       </div>
     </div>
+    </>
   );
 }

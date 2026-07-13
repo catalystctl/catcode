@@ -15,6 +15,7 @@ import type {
   BashMsg,
   CoreEvent,
   IntercomEntry,
+  ReadyPayload,
   SubagentChatItem,
   SubagentRunView,
   Toast,
@@ -51,15 +52,20 @@ export const initialState: AgentState = {
   memories: [],
   plugins: [],
   skills: [],
+  availableAgents: [],
   pendingIntercom: null,
   pendingOauth: null,
   intercomLog: [],
   subagentRuns: {},
   visionConfig: null,
+  contextBreakdown: null,
+  usageSnapshot: null,
   workState: null,
   goalMode: null,
   goalPlan: null,
   switching: false,
+  followUpQueued: false,
+  pendingUndo: false,
 };
 
 let counter = 0;
@@ -178,7 +184,57 @@ function finishTurn(state: AgentState): AgentState {
     ...finalizeCurrentAssistant(state),
     streaming: false,
     retrying: false,
+    followUpQueued: false,
+    // Abort/done must drop blocking gates — otherwise a cancelled turn leaves a
+    // dead approval/ask/sudo/intercom banner that can no longer be answered.
+    pendingApproval: null,
+    pendingAsk: null,
+    pendingSudo: null,
+    pendingIntercom: null,
   };
+}
+
+/** Drop the last user message and everything after it (assistant/tool/bash). */
+function dropLastTurn(messages: UIMessage[]): UIMessage[] {
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) return messages;
+  return messages.slice(0, lastUser);
+}
+
+/** True when the current turn has produced assistant/tool/bash activity (or a
+ *  blocking gate). Used so a pre-turn `error` (bad skill/model) can clear the
+ *  optimistic `streaming` flag without killing a live mid-turn stream. */
+function turnHasStarted(state: AgentState): boolean {
+  if (state.currentAssistantId) return true;
+  if (state.pendingApproval || state.pendingAsk || state.pendingSudo) return true;
+  if (state.followUpQueued) return true;
+  let lastUser = -1;
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    if (state.messages[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  for (let i = lastUser + 1; i < state.messages.length; i++) {
+    const role = state.messages[i].role;
+    if (role === "assistant" || role === "bash") return true;
+  }
+  // Queued follow-up user line while a prior turn is still streaming: the last
+  // message is the new user, but the turn is live (assistant exists earlier).
+  if (state.streaming && lastUser > 0) {
+    for (let i = lastUser - 1; i >= 0; i--) {
+      const role = state.messages[i].role;
+      if (role === "assistant" || role === "bash") return true;
+      if (role === "user") break;
+    }
+  }
+  return false;
 }
 
 function parseArgs(raw: string): { args: Record<string, unknown>; argString: string } {
@@ -365,6 +421,18 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, toasts: state.toasts.filter((t) => t.id !== ev.id) };
     case "_set_switching":
       return { ...state, switching: ev.switching };
+    case "_undo_local": {
+      // Optimistic undo: trim the last turn; the core `reset` that follows must
+      // NOT wipe the remaining transcript (see `pendingUndo` on `reset`).
+      // Idempotent: originating client + server fanout both emit this — apply once.
+      if (state.pendingUndo) return state;
+      return {
+        ...finishTurn(state),
+        messages: dropLastTurn(state.messages),
+        pendingUndo: true,
+        workState: null,
+      };
+    }
     case "_session_title": {
       const sessions = state.sessions.map((s) =>
         s.name === ev.name ? { ...s, title: ev.title || undefined } : s,
@@ -373,7 +441,16 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
 
     // ── Core events ──
-    case "ready":
+    case "ready": {
+      const skipped = ev.plugins_skipped;
+      let toasts = state.toasts;
+      if (skipped && skipped.length > 0) {
+        toasts = pushToast(
+          toasts,
+          "info",
+          `Skipped project plugin(s): ${skipped.join(", ")} (need --trust-project-plugins or reinstall)`,
+        );
+      }
       return {
         ...state,
         ready: ev,
@@ -384,15 +461,31 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         approvalMode: ev.approval,
         workspace: ev.workspace,
         providerPresets: ev.providerPresets ?? state.providerPresets,
+        toasts,
       };
-    case "models":
-      return { ...state, models: ev.models ?? [] };
+    }
+    case "models": {
+      const models = ev.models ?? [];
+      const stillValid =
+        state.selectedModel && models.some((m) => m.id === state.selectedModel);
+      return {
+        ...state,
+        models,
+        selectedModel: stillValid ? state.selectedModel : models[0]?.id ?? null,
+      };
+    }
     case "provider_presets":
       return { ...state, providerPresets: ev.presets ?? [] };
     case "authed":
       return { ...state, authed: ev.ok, pendingOauth: null };
     case "provider_changed":
-      return { ...state, provider: ev.provider, providerKind: ev.kind, authed: ev.has_key, pendingOauth: null };
+      return {
+        ...state,
+        provider: ev.provider,
+        providerKind: ev.kind,
+        authed: ev.has_key,
+        pendingOauth: null,
+      };
     case "approval_changed": {
       if (ev.mode.includes(":")) {
         const kind = ev.mode.split(":")[0];
@@ -406,11 +499,11 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, approvalMode: ev.mode };
     }
     case "delta": {
-      const s = beginAssistant(state);
+      const s = beginAssistant({ ...state, retrying: false });
       return updateCurrentAssistant(s, (m) => ({ ...m, text: m.text + ev.text }));
     }
     case "thinking": {
-      const s = beginAssistant(state);
+      const s = beginAssistant({ ...state, retrying: false });
       return updateCurrentAssistant(s, (m) => ({ ...m, thinking: m.thinking + ev.text }));
     }
     case "tool_call_start":
@@ -446,8 +539,13 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, umansConc: { used: used ?? null, limit: limit ?? null, provider: provider ?? "" } };
     }
     case "metrics": {
-      const { type: _t, ...rest } = ev;
-      const metrics = { ...state.metrics, ...rest };
+      const { type: _t, tps_est, tps, ...rest } = ev as typeof ev & { tps_est?: number };
+      // Mid-stream core emits `tps_est`; final metrics emit `tps`. Prefer final.
+      const metrics = {
+        ...state.metrics,
+        ...rest,
+        tps: tps ?? tps_est ?? state.metrics?.tps,
+      };
       // Final metrics (carry elapsed_ms / prompt_tokens): attach usage to the last
       // assistant message for per-message display.
       const isFinal = ev.elapsed_ms != null || ev.prompt_tokens != null;
@@ -460,7 +558,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           );
         }
       }
-      return { ...state, metrics, messages };
+      return { ...state, metrics, messages, retrying: false };
     }
     case "approval_request":
       return {
@@ -525,7 +623,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return {
         ...state,
         sessions: sorted,
-        currentSessionFile: state.currentSessionFile ?? sorted[0]?.name ?? null,
+        currentSessionFile:
+          state.currentSessionFile ?? sorted[0]?.path ?? sorted[0]?.name ?? null,
       };
     }
     case "stats":
@@ -535,17 +634,27 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentSessionFile: ev.session_file || state.currentSessionFile,
       };
     case "usage": {
-      // Provider plan/rate-limit snapshot for the selected model. Surface a
-      // toast summary; full window list is available on the event for UI that
-      // wants a dedicated panel later.
+      // Provider plan/rate-limit snapshot for the selected model. Keep the full
+      // payload for the Diagnostics panel (toasts stay short).
       const avail = ev.available;
       const plan = ev.plan;
       const provider = ev.provider || "provider";
       const windows = ev.windows ?? [];
       const msg = ev.message;
+      const snapshot = {
+        provider: ev.provider,
+        provider_kind: ev.provider_kind,
+        model: ev.model,
+        base_url: ev.base_url,
+        available: ev.available,
+        plan: ev.plan,
+        message: ev.message,
+        windows,
+      };
       if (!avail) {
         return {
           ...state,
+          usageSnapshot: snapshot,
           toasts: pushToast(state.toasts, "info", msg || `${provider}: usage not available`),
         };
       }
@@ -553,7 +662,6 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         .slice(0, 3)
         .map((w) => {
           const label = w.label || "limit";
-          // Percentage only when a positive limit is known (or unit is already %).
           if (w.unit === "percent" && typeof w.used === "number") {
             return `${label} ${Math.round(w.used)}%`;
           }
@@ -572,6 +680,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       const head = plan ? `${provider} (${plan})` : provider;
       return {
         ...state,
+        usageSnapshot: snapshot,
         toasts: pushToast(
           state.toasts,
           "info",
@@ -580,58 +689,125 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     }
     case "context_breakdown": {
-      const top = (ev.top_consumers ?? [])
-        .slice(0, 3)
-        .map((c) => `${c.role} #${c.index}: ${c.tokens.toLocaleString()}`)
-        .join(" · ");
+      const breakdown = {
+        total_tokens: ev.total_tokens,
+        context_window: ev.context_window,
+        pct: ev.pct,
+        messages: ev.messages,
+        system_tokens: ev.system_tokens,
+        by_role: ev.by_role ?? {},
+        top_consumers: ev.top_consumers ?? [],
+      };
       return {
         ...state,
-        toasts: pushToast(
-          state.toasts,
-          "info",
-          `Context: ${ev.total_tokens.toLocaleString()} / ${ev.context_window.toLocaleString()} tokens (${ev.pct}%)${top ? ` — top: ${top}` : ""}`,
-        ),
+        contextBreakdown: breakdown,
       };
     }
-    case "history":
+    case "agents":
+      return {
+        ...state,
+        availableAgents: ev.agents ?? [],
+      };
+    case "history": {
+      const tokensIn = (ev as { tokens_in?: number }).tokens_in;
       return {
         ...state,
         messages: historyToMessages(ev.messages ?? []),
         currentAssistantId: null,
         streaming: false,
+        followUpQueued: false,
         pendingApproval: null,
         pendingAsk: null,
         pendingSudo: null,
+        pendingIntercom: null,
+        stats:
+          tokensIn != null
+            ? {
+                type: "stats",
+                tokens_in: tokensIn,
+                tokens_out: state.stats?.tokens_out ?? 0,
+                tokens_total: tokensIn + (state.stats?.tokens_out ?? 0),
+                cached_tokens: state.stats?.cached_tokens ?? 0,
+                turns: state.stats?.turns ?? 0,
+                messages: (ev.messages ?? []).length,
+                session_file: state.stats?.session_file ?? state.currentSessionFile ?? "",
+              }
+            : state.stats,
       };
+    }
     case "reset":
+      // After client `_undo_local`, keep the trimmed messages — core already
+      // dropped the last turn and this reset is only a UI sync signal.
+      if (state.pendingUndo) {
+        return {
+          ...finishTurn(state),
+          pendingUndo: false,
+          workState: null,
+          goalMode: null,
+          goalPlan: null,
+        };
+      }
       return {
         ...state,
         messages: [],
         currentAssistantId: null,
         streaming: false,
+        followUpQueued: false,
+        pendingUndo: false,
         pendingApproval: null,
         pendingAsk: null,
         pendingSudo: null,
-        // A reset aborts the current turn (and any in-flight subagent), so a
-        // pending intercom ask is now stale — drop the banner so it can't hang.
         pendingIntercom: null,
+        pendingOauth: null,
         workState: null,
         goalMode: null,
         goalPlan: null,
+        subagentRuns: {},
+        metrics: null,
       };
     case "done":
       return finishTurn(state);
     case "aborted":
       return finishTurn(state);
-    case "error":
+    case "error": {
+      // Do NOT always clear streaming — core often emits non-fatal errors mid-turn.
+      // Pre-turn failures (bad skill/model): drop the optimistic user bubble + working flag.
+      // Core-death toasts after `aborted` must NOT strip the last user line.
+      const msg = ev.message ?? "";
+      const coreDead = /core exited/i.test(msg);
+      const started = turnHasStarted(state);
+      let messages = state.messages;
+      if (
+        !coreDead &&
+        !started &&
+        messages.length > 0 &&
+        messages[messages.length - 1].role === "user"
+      ) {
+        messages = messages.slice(0, -1);
+      }
       return {
         ...state,
-        streaming: false,
+        messages,
+        streaming: started || coreDead ? state.streaming : false,
         retrying: false,
-        toasts: pushToast(state.toasts, "error", ev.message),
+        goalMode: coreDead ? null : state.goalMode,
+        goalPlan: coreDead ? null : state.goalPlan,
+        toasts: pushToast(state.toasts, "error", msg),
       };
-    case "info":
-      return { ...state, toasts: pushToast(state.toasts, "info", ev.message) };
+    }
+    case "info": {
+      const msg = ev.message.toLowerCase();
+      let followUpQueued = state.followUpQueued;
+      if (msg.includes("prompt queued")) followUpQueued = true;
+      if (msg.includes("queue cleared") || msg.includes("queue already empty")) {
+        followUpQueued = false;
+      }
+      return {
+        ...state,
+        followUpQueued,
+        toasts: pushToast(state.toasts, "info", ev.message),
+      };
+    }
     case "steer":
       return state;
 
@@ -640,14 +816,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       const msg = ev.message.length > 80 ? ev.message.slice(0, 79) + "…" : ev.message;
       const entry: IntercomEntry = {
         id: newId("ic"),
-        kind: ev.reason === "need_decision" || !ev.reason ? "ask" : "reply",
+        kind: ev.reason === "need_decision" ? "ask" : "reply",
         from: ev.from,
         to: ev.to,
         message: ev.message,
         ts: Date.now(),
       };
       const log = [entry, ...state.intercomLog].slice(0, 50);
-      const needsDecision = !ev.reason || ev.reason === "need_decision";
+      const needsDecision = ev.reason === "need_decision";
       return {
         ...state,
         intercomLog: log,
@@ -802,12 +978,18 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         pendingApproval: null,
         pendingAsk: null,
         pendingSudo: null,
+        pendingIntercom: null,
+        pendingOauth: null,
+        pendingUndo: false,
+        followUpQueued: false,
         sessions: [],
         currentSessionFile: null,
         stats: null,
         workState: null,
         goalMode: null,
         goalPlan: null,
+        subagentRuns: {},
+        metrics: null,
       };
     case "session_renamed": {
       const sessions = state.sessions.map((s) =>
@@ -819,19 +1001,51 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     // ── Compaction / config ──
     case "digested": {
       const n = ev.results;
+      const before = ev.before_tokens;
+      const after = ev.after_tokens;
+      const range =
+        before != null && after != null
+          ? ` — ${before.toLocaleString()} → ${after.toLocaleString()} tokens`
+          : after != null
+            ? ` — now ${after.toLocaleString()} tokens`
+            : "";
       return {
         ...state,
         toasts: pushToast(
           state.toasts,
           "info",
           n > 1
-            ? `Compacted ${n} large result(s) — ${ev.before_tokens.toLocaleString()} → ${ev.after_tokens.toLocaleString()} tokens`
-            : `Compacted a large result — ${ev.before_tokens.toLocaleString()} → ${ev.after_tokens.toLocaleString()} tokens`,
+            ? `Compacted ${n} large result(s)${range}`
+            : `Compacted a large result${range}`,
         ),
       };
     }
-    case "config_changed":
-      return { ...state, toasts: pushToast(state.toasts, "info", `${ev.key} → ${ev.value}`) };
+    case "config_changed": {
+      // Patch ready so Settings / header reflect the live value immediately.
+      const ready = state.ready
+        ? {
+            ...state.ready,
+            ...(ev.key === "bash_timeout_secs"
+              ? { bash_timeout_secs: Number(ev.value) || state.ready.bash_timeout_secs }
+              : {}),
+            ...(ev.key === "auto_compact"
+              ? {
+                  auto_compact:
+                    ev.value === true ||
+                    ev.value === "true" ||
+                    ev.value === 1 ||
+                    ev.value === "1",
+                }
+              : {}),
+            ...(ev.key === "sandbox" ? { sandbox: String(ev.value) } : {}),
+          }
+        : state.ready;
+      return {
+        ...state,
+        ready,
+        toasts: pushToast(state.toasts, "info", `${ev.key} → ${ev.value}`),
+      };
+    }
 
     // ── OAuth / lifecycle status ──
     case "oauth_prompt":
@@ -873,7 +1087,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     case "goal_state": {
       if (!ev.id || ev.phase === "idle") {
-        return { ...state, goalMode: null };
+        return { ...state, goalMode: null, goalPlan: null };
       }
       return {
         ...state,

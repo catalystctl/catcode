@@ -50,7 +50,55 @@ export interface ReadyPayload {
   providers: string[];
   providerPresets?: ProviderPreset[];
   bash_timeout_secs: number;
+  /** When true, the core auto-compacts context on thresholds / idle. */
+  auto_compact?: boolean;
+  /** Bash hard sandbox: `"none"` | `"firejail"` | `"seatbelt"`. */
+  sandbox?: string;
+  plugins_skipped?: string[];
   resumed_messages: number;
+}
+
+/** A discoverable subagent (builtin / user / project) from `agents` events. */
+export interface AgentInfo {
+  name: string;
+  description: string;
+  source: "builtin" | "user" | "project" | string;
+}
+
+/** Latest `/context` payload kept for the Diagnostics panel. */
+export interface ContextBreakdown {
+  total_tokens: number;
+  context_window: number;
+  pct: number;
+  messages: number;
+  system_tokens: number;
+  by_role: Record<string, number>;
+  top_consumers: {
+    index: number;
+    role: string;
+    tokens: number;
+    preview: string;
+  }[];
+}
+
+/** Latest `/usage` payload kept for the Diagnostics panel. */
+export interface UsageSnapshot {
+  provider: string;
+  provider_kind?: string;
+  model?: string;
+  base_url?: string;
+  available: boolean;
+  plan?: string;
+  message?: string;
+  windows: Array<{
+    id: string;
+    label: string;
+    used?: number;
+    limit?: number;
+    unit: string;
+    resets_at?: number;
+    detail?: string;
+  }>;
 }
 
 export interface ApprovalRequest {
@@ -68,6 +116,8 @@ export interface Metrics {
   tokens_out?: number;
   cached_tokens?: number;
   tps?: number;
+  /** Mid-stream estimate from the core (`tps_est`); mapped to `tps` in the reducer. */
+  tps_est?: number;
   model?: string;
 }
 
@@ -357,26 +407,9 @@ export type CoreEvent =
   | { type: "umans_conc"; used: number | null; limit: number | null; provider: string }
   | { type: "compacted"; before_tokens: number; after_tokens: number; summary_chars?: number }
   | { type: "compacting"; before_tokens: number; trigger: string }
-  | { type: "context_breakdown"; total_tokens: number; context_window: number; pct: number; messages: number; system_tokens: number; by_role: Record<string, number>; top_consumers: { index: number; role: string; tokens: number; preview: string }[] }
-  | {
-      type: "usage";
-      provider: string;
-      provider_kind?: string;
-      model?: string;
-      base_url?: string;
-      available: boolean;
-      plan?: string;
-      message?: string;
-      windows: Array<{
-        id: string;
-        label: string;
-        used?: number;
-        limit?: number;
-        unit: string;
-        resets_at?: number;
-        detail?: string;
-      }>;
-    }
+  | ({ type: "context_breakdown" } & ContextBreakdown)
+  | ({ type: "usage" } & UsageSnapshot)
+  | { type: "agents"; agents: AgentInfo[] }
   | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
   | Stats
@@ -400,10 +433,10 @@ export type CoreEvent =
   | { type: "memory_list"; entries: MemoryEntry[] }
   // ── Plugins ──
   | { type: "plugins_list"; plugins: PluginEntry[] }
-  | { type: "plugin_installed"; name: string; ok: boolean; message?: string }
-  | { type: "plugin_removed"; name: string; ok: boolean; message?: string }
-  | { type: "plugin_enabled"; name: string; ok: boolean }
-  | { type: "plugin_disabled"; name: string; ok: boolean }
+  | { type: "plugin_installed"; name: string; ok?: boolean; message?: string }
+  | { type: "plugin_removed"; name: string; ok?: boolean; message?: string }
+  | { type: "plugin_enabled"; name: string; ok?: boolean }
+  | { type: "plugin_disabled"; name: string; ok?: boolean }
   | { type: "plugin_error"; name?: string; message: string }
   // ── Vision ──
   | { type: "vision_config"; vision_models: string[]; vision_model: string | null }
@@ -412,8 +445,8 @@ export type CoreEvent =
   | { type: "workspace_changed"; workspace: string; projects: ProjectEntry[] }
   | { type: "session_renamed"; name: string; title: string }
   // ── Compaction / config ──
-  | { type: "digested"; results: number; before_tokens: number; after_tokens: number }
-  | { type: "config_changed"; key: string; value: string | number }
+  | { type: "digested"; results: number; before_tokens?: number; after_tokens?: number }
+  | { type: "config_changed"; key: string; value: string | number | boolean }
   // ── OAuth / lifecycle status ──
   | { type: "oauth_prompt"; url: string; code?: string; message?: string }
   | { type: "reflecting"; recurrence: number | string }
@@ -430,6 +463,7 @@ export type CoreCommand =
   | { type: "send"; prompt: string; model: string; reasoning_effort?: string; images?: string[] }
   | { type: "steer"; prompt: string; model: string; reasoning_effort?: string }
   | { type: "abort" }
+  | { type: "clear_queue" }
   | { type: "user_bash"; command: string; exclude_from_context?: boolean }
   | { type: "reset" }
   | { type: "clear" }
@@ -449,7 +483,7 @@ export type CoreCommand =
   | { type: "load_session"; path: string }
   | { type: "new_session"; path?: string }
   | { type: "stats" }
-  | { type: "set_config"; key: string; value: string | number }
+  | { type: "set_config"; key: string; value: string | number | boolean }
   // ── Turn / history ──
   | { type: "undo" }
   // ── Subagent / intercom ──
@@ -459,16 +493,17 @@ export type CoreCommand =
   // ── Sudo passthrough (bash command invokes sudo) ──
   | { type: "sudo_reply"; request_id: string; approved: boolean; password?: string }
   // ── Memory ──
-  | { type: "save_memory"; text: string; tags?: string[] }
+  | { type: "save_memory"; text: string; tags?: string[]; scope?: "workspace" | "global" }
   | { type: "list_memory" }
   | { type: "forget_memory"; id: string }
   | { type: "refresh_memory" }
   // ── Plugins ──
-  | { type: "install_plugin"; path: string }
+  | { type: "install_plugin"; path: string; scope?: "workspace" | "global" }
   | { type: "remove_plugin"; name: string }
   | { type: "enable_plugin"; name: string }
   | { type: "disable_plugin"; name: string }
   | { type: "list_plugins" }
+  | { type: "list_agents" }
   // ── Vision ──
   | { type: "get_vision_config" }
   | { type: "set_vision_config"; vision_models?: string[]; vision_model?: string | null }
@@ -517,7 +552,9 @@ export type SyntheticEvent =
   // Optimistic: the bridge is (re)spawning the core after a workspace switch.
   | { type: "_set_switching"; switching: boolean }
   // A custom session title was set/removed (web-layer rename overlay).
-  | { type: "_session_title"; name: string; title: string };
+  | { type: "_session_title"; name: string; title: string }
+  /** Client-side undo: drop the last turn locally; next `reset` keeps messages. */
+  | { type: "_undo_local" };
 
 export type AgentEvent = CoreEvent | SyntheticEvent;
 
@@ -652,12 +689,18 @@ export interface AgentState {
   memories: MemoryEntry[];
   plugins: PluginEntry[];
   skills: SkillInfo[];
+  /** Discoverable subagents from core `agents` events. */
+  availableAgents: AgentInfo[];
   pendingIntercom: IntercomPrompt | null;
   pendingOauth: OauthPrompt | null;
   intercomLog: IntercomEntry[];
   /** Live subagent runs keyed by run_id — the SubagentsPanel list + drill-in chat. */
   subagentRuns: Record<string, SubagentRunView>;
   visionConfig: VisionConfig | null;
+  /** Last `/context` breakdown for the Diagnostics panel. */
+  contextBreakdown: ContextBreakdown | null;
+  /** Last `/usage` snapshot for the Diagnostics panel. */
+  usageSnapshot: UsageSnapshot | null;
   /** Rolling work-state summary (goal/done/doing/next/recent files) from
    *  `work_state` events — drives the ambient status panel. */
   workState: WorkState | null;
@@ -667,6 +710,10 @@ export interface AgentState {
   goalPlan: GoalPlan | null;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;
+  /** True when the core has a one-deep follow-up/steer queued behind the live turn. */
+  followUpQueued: boolean;
+  /** After `_undo_local`, the next core `reset` must not wipe the trimmed transcript. */
+  pendingUndo: boolean;
 }
 
 /** Sent to a freshly-connected client to hydrate the full current state. */

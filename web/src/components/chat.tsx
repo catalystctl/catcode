@@ -25,7 +25,12 @@ import { PluginsPanel } from "./plugins";
 import { SettingsModal } from "./settings";
 import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalStatusChip } from "./goal-modal";
+import { ProviderLoginModal } from "./provider-login-modal";
+import { DiagnosticsModal } from "./diagnostics-modal";
 import { ErrorBoundary } from "./error-boundary";
+import { AppDialogHost, useAppDialog } from "./app-dialog";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { SparkIcon, ShieldIcon, SendIcon } from "./icons";
 
 const EXAMPLES = [
@@ -34,6 +39,31 @@ const EXAMPLES = [
   "Write a unit test for the path-confinement logic.",
   "Summarize the most recent changes.",
 ];
+
+/** Parse `agent "task"` / `agent 'task'` / `agent bare-task` pairs from slash args. */
+function parseAgentTasks(args: string): Array<{ agent: string; task: string }> {
+  const out: Array<{ agent: string; task: string }> = [];
+  const re = /(\S+)\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(args))) {
+    out.push({ agent: m[1], task: m[2] ?? m[3] ?? m[4] ?? "" });
+  }
+  return out;
+}
+
+function buildRunPrompt(agent: string, task: string): string {
+  return `Run the subagent tool: agent="${agent}", task="${task}". Return its result.`;
+}
+
+function buildParallelPrompt(tasks: Array<{ agent: string; task: string }>): string {
+  const lines = tasks.map((t) => `- agent="${t.agent}" task="${t.task}"`).join("\n");
+  return `Run the subagent tool in parallel mode with these tasks:\n${lines}`;
+}
+
+function buildChainPrompt(tasks: Array<{ agent: string; task: string }>): string {
+  const lines = tasks.map((t) => `- agent="${t.agent}" task="${t.task}"`).join("\n");
+  return `Run the subagent tool as a chain with these steps (use {previous} to pass the prior step's output):\n${lines}`;
+}
 
 function lsGet(k: string): string | null {
   try {
@@ -53,6 +83,11 @@ function lsSet(k: string, v: string): void {
 export function Chat() {
   const agent = useAgent();
   const { state } = agent;
+  const { confirm, prompt, dialog } = useAppDialog();
+  const dialogApi = useRef({ confirm, prompt });
+  useEffect(() => {
+    dialogApi.current = { confirm, prompt };
+  }, [confirm, prompt]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [keyInput, setKeyInput] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
@@ -61,7 +96,7 @@ export function Chat() {
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<
-    null | "memory" | "plugins" | "settings" | "subagents" | "help" | "goal"
+    null | "memory" | "plugins" | "settings" | "subagents" | "help" | "goal" | "login" | "logout" | "diagnostics"
   >(null);
   const [images, setImages] = useState<string[]>([]);
   const [theme, setTheme] = useState<string>(() => lsGet("umans:theme") ?? "dark");
@@ -88,12 +123,37 @@ export function Chat() {
     lsSet("umans:theme", theme);
   }, [theme]);
 
-  // Auto-scroll to the bottom while streaming, unless the user scrolled up.
+  // Re-fetch goal status once the core is ready (covers reconnect / mid-goal resume).
+  useEffect(() => {
+    if (state.ready) void agent.goalStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.ready != null]);
+
+  const openDiagnostics = useCallback(() => {
+    const a = agentRef.current;
+    void a.stats();
+    void a.context();
+    void a.usage(a.state.selectedModel ?? undefined);
+    setModal("diagnostics");
+  }, []);
+
+  // Auto-scroll to the bottom while streaming / when HITL gates appear,
+  // unless the user scrolled up.
   useEffect(() => {
     if (!autoScroll) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [state.messages, state.pendingApproval, autoScroll]);
+  }, [
+    state.messages,
+    state.pendingApproval,
+    state.pendingAsk,
+    state.pendingSudo,
+    state.pendingIntercom,
+    state.pendingOauth,
+    state.goalMode,
+    state.goalPlan,
+    autoScroll,
+  ]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -118,173 +178,280 @@ export function Chat() {
 
   // ── Slash-command dispatch (single switch; the catalog is the source of truth) ──
   // Uses refs so this callback is stable — the Composer never re-renders from it.
-  const onCommand = useCallback((name: string) => {
-    const a = agentRef.current;
-    switch (name) {
-      case "reset":
-        if (window.confirm("Reset the conversation and session file? This cannot be undone."))
-          return a.reset();
-        return;
-      case "compact": {
-        const instr = window.prompt(
-          "Optional: what should compaction preserve?\n(e.g. “Focus on code samples and API usage”)\nLeave blank for the default summary.",
-        );
-        return a.compact(instr?.trim() || undefined);
-      }
-      case "context":
-        return a.context();
-      case "new":
-        return a.newSession();
-      case "abort":
-        return a.abort();
-      case "stats":
-        return a.stats();
-      case "sessions":
-        return a.listSessions();
-      case "undo":
-        return a.undo();
-      case "clear":
-        if (window.confirm("Clear the conversation view? The session file is kept."))
-          return a.clear();
-        return;
-      case "memory":
-        a.listMemory();
-        return setModal("memory");
-      case "remember": {
-        // Quick inline save, then open the panel so the user can tag/forget.
-        const note = window.prompt("Remember what? A durable note for future sessions.");
-        if (note?.trim()) void a.saveMemory(note.trim());
-        a.listMemory();
-        return setModal("memory");
-      }
-      case "forget":
-        a.listMemory();
-        return setModal("memory");
-      case "plugins":
-        a.listPlugins();
-        return setModal("plugins");
-      case "settings":
-      case "model":
-      case "reasoning":
-      case "approval":
-      case "vision":
-        return setModal("settings");
-      case "subagents":
-        return setModal("subagents");
-      case "help":
-        return setModal("help");
-      case "copy":
-        return a.copyLastReply();
-      case "export":
-        return doExport();
-      case "theme":
-        return setTheme((t) => (t === "dark" ? "light" : "dark"));
-      case "key": {
-        const key = window.prompt("Enter API key:");
-        if (key?.trim()) void a.setKey(key.trim());
-        return;
-      }
-      case "oauth-code": {
-        // Complete a pending no-browser OAuth login (the /login flow printed a
-        // URL; paste its code or final localhost callback URL here).
-        const code = window.prompt("Paste the OAuth code or final callback URL:");
-        if (code?.trim()) void a.submitOauthCode(code.trim());
-        return;
-      }
-      case "login": {
-        // Pick a preset to log in to. After choosing, either start the OAuth
-        // flow or paste an API key. A logged-in provider can be re-keyed here
-        // (e.g. to override a bad key that caused a 401).
-        a.listProviderPresets();
-        const presets = a.state?.providerPresets ?? [];
-        const opts = presets
-          .map((p) => `${p.loggedIn ? "✓ " : "  "}${p.label} — ${p.description}`)
-          .join("\n");
-        const idx = window.prompt(
-          `Log in / switch provider. Pick by number:\n\n${opts}`,
-        );
-        if (idx === null || idx.trim() === "") return; // cancelled or blank
-        const n = Number(idx);
-        if (Number.isNaN(n) || n < 0 || n >= presets.length) return;
-        const p = presets[n];
-        if (p.loggedIn) {
-          // Already logged in — offer to override the key (empty = just switch).
-          const key = window.prompt(
-            `${p.label} is logged in. Paste a new key to OVERRIDE it\n` +
-              `(e.g. to fix a bad key that caused a 401).\n` +
-              `Leave blank to just switch to it.`,
-          );
-          if (key === null) return; // cancelled
-          if (key.trim()) {
-            void a.login(p.id, key.trim());
-          } else {
-            void a.setProvider?.(p.id);
+  // `args` is the remainder after the slash token (e.g. `/run scout "bugs"` →
+  // action "run", args `scout "bugs"`).
+  const onCommand = useCallback((name: string, args?: string) => {
+    void (async () => {
+      const a = agentRef.current;
+      const d = dialogApi.current;
+      switch (name) {
+        case "reset": {
+          const ok = await d.confirm({
+            title: "Reset session",
+            message: "Reset the conversation and session file? This cannot be undone.",
+            confirmLabel: "Reset",
+            danger: true,
+          });
+          if (ok) await a.reset();
+          return;
+        }
+        case "compact": {
+          let instr = args?.trim();
+          if (!instr) {
+            const typed = await d.prompt({
+              title: "Compact context",
+              message:
+                "Optional: what should compaction preserve? Leave blank for the default summary.",
+              placeholder: "e.g. Focus on code samples and API usage",
+              multiline: true,
+              confirmLabel: "Compact",
+            });
+            if (typed === null) return;
+            instr = typed.trim() || undefined;
           }
+          await a.compact(instr || undefined);
           return;
         }
-        // Stored credentials from a prior login in this app — re-bind.
-        if (p.hasKey) {
-          void a.login(p.id);
+        case "context":
+        case "usage":
+        case "stats":
+          openDiagnostics();
+          return;
+        case "new":
+          return void a.newSession();
+        case "abort":
+          return void a.abort();
+        case "sessions":
+          return void a.listSessions();
+        case "undo":
+          return void a.undo();
+        case "clear": {
+          const ok = await d.confirm({
+            title: "Clear view",
+            message: "Clear the conversation view? The session file is kept.",
+            confirmLabel: "Clear",
+          });
+          if (ok) await a.clear();
           return;
         }
-        // OAuth-capable: offer OAuth (Enter) or an API key (paste). Otherwise
-        // only an API key makes sense.
-        if (p.supportsOauth) {
-          const key = window.prompt(
-            `${p.label} supports OAuth.\n` +
-              `Press Enter to start the browser/device flow, or paste an API key:`,
-          );
-          if (key === null) return; // cancelled
-          if (key.trim()) {
-            void a.login(p.id, key.trim());
-          } else {
-            void a.loginOauth(p.id);
+        case "memory":
+          a.listMemory();
+          return setModal("memory");
+        case "remember": {
+          let note = args?.trim();
+          if (!note) {
+            const typed = await d.prompt({
+              title: "Remember",
+              message: "A durable note for future sessions.",
+              placeholder: "Remember what?",
+              multiline: true,
+              required: true,
+              confirmLabel: "Save",
+            });
+            if (!typed?.trim()) return;
+            note = typed.trim();
           }
+          void a.saveMemory(note);
+          a.listMemory();
+          return setModal("memory");
+        }
+        case "forget":
+          a.listMemory();
+          return setModal("memory");
+        case "plugins":
+          a.listPlugins();
+          return setModal("plugins");
+        case "auto-compact": {
+          const on = !(a.state.ready?.auto_compact ?? true);
+          return void a.setConfig("auto_compact", on);
+        }
+        case "sandbox": {
+          const mode = (args ?? "").trim().toLowerCase();
+          if (mode === "none" || mode === "firejail" || mode === "seatbelt") {
+            return void a.setConfig("sandbox", mode);
+          }
+          void a.getVisionConfig();
+          return setModal("settings");
+        }
+        case "settings":
+        case "vision":
+          void a.getVisionConfig();
+          return setModal("settings");
+        case "model": {
+          const id = args?.trim();
+          if (id) {
+            const match =
+              a.state.models.find((m) => m.id === id) ||
+              a.state.models.find((m) => m.id.endsWith(`/${id}`) || m.name === id);
+            if (match) {
+              a.setModel(match.id);
+              return;
+            }
+          }
+          void a.getVisionConfig();
+          return setModal("settings");
+        }
+        case "reasoning": {
+          const level = args?.trim().toLowerCase();
+          if (level && ["off", "low", "medium", "high", "xhigh", "max"].includes(level)) {
+            a.setThinking(level);
+            return;
+          }
+          void a.getVisionConfig();
+          return setModal("settings");
+        }
+        case "approval": {
+          const mode = args?.trim().toLowerCase();
+          if (mode === "never" || mode === "destructive" || mode === "always") {
+            return void a.setApproval(mode);
+          }
+          void a.getVisionConfig();
+          return setModal("settings");
+        }
+        case "subagents":
+          void a.listAgents();
+          return setModal("subagents");
+        case "help":
+          return setModal("help");
+        case "copy":
+          return a.copyLastReply();
+        case "export":
+          return doExport();
+        case "theme":
+          return setTheme((t) => (t === "dark" ? "light" : "dark"));
+        case "key": {
+          const key = await d.prompt({
+            title: "API key",
+            message: "Enter an API key for the current provider.",
+            placeholder: "sk-…",
+            password: true,
+            required: true,
+            confirmLabel: "Save key",
+          });
+          if (key?.trim()) void a.setKey(key.trim());
           return;
         }
-        const key = window.prompt(`Paste API key for ${p.label}:`);
-        if (!key?.trim()) return;
-        void a.login(p.id, key.trim());
-        return;
-      }
-      case "logout": {
-        const presets = a.state?.providerPresets ?? [];
-        const loggedIn = presets.filter((p) => p.loggedIn);
-        if (loggedIn.length === 0) {
-          window.alert("Not logged into any provider.");
+        case "oauth-code": {
+          const code = await d.prompt({
+            title: "OAuth code",
+            message: "Paste the OAuth code or final callback URL.",
+            placeholder: "code or https://…",
+            required: true,
+            confirmLabel: "Submit",
+          });
+          if (code?.trim()) void a.submitOauthCode(code.trim());
           return;
         }
-        const opts = loggedIn.map((p) => `  ${p.label}`).join("\n");
-        const idx = window.prompt(`Log out of which provider? Pick by number:\n\n${opts}`);
-        if (idx === null || idx.trim() === "") return; // cancelled or blank
-        const n = Number(idx);
-        if (Number.isNaN(n) || n < 0 || n >= loggedIn.length) return;
-        void a.logout(loggedIn[n].id);
-        return;
+        case "login":
+          void a.listProviderPresets();
+          return setModal("login");
+        case "logout":
+          void a.listProviderPresets();
+          return setModal("logout");
+        case "steer": {
+          const msg = args?.trim();
+          if (msg) {
+            void a.steer(msg);
+            return;
+          }
+          setSidebarOpen(false);
+          return composerRef.current?.focus();
+        }
+        case "attach":
+          return composerRef.current?.openAttach();
+        case "goal":
+          void a.goalStatus();
+          return setModal("goal");
+        case "cancel-goal":
+          return void a.cancelGoal();
+        case "index": {
+          const incremental =
+            /\b(--incremental|-i)\b/.test(args ?? "") ||
+            (args ?? "").trim() === "incremental";
+          const task = incremental
+            ? "Run an incremental knowledge index of this repository. Use `git status` + `git diff --name-only` to find files changed since the last index; for each changed area, read it and use the `memory` tool (action: append) to UPDATE the relevant existing memories — architecture, conventions, APIs, gotchas — rather than creating duplicates. If a changed file reveals a new subsystem with no memory yet, save a new one. Then list the memories you touched. Be concise: only persist what genuinely changed."
+            : "Run a full knowledge index of this repository to bootstrap learning. Walk the top-level layout, read README/package-manifest/entry points/config/tests, and identify the architecture, major subsystems, conventions, reusable patterns, build/test/deploy steps, and gotchas. Use the `memory` tool (action: save) to persist each as a durable, named memory (types: architecture/convention/api/gotcha/build). Then use `list_dir .catalyst-code/skills/` and, for any reusable workflow you solved 2+ times that has no skill yet, write a candidate SKILL.md under `.catalyst-code/skills/<name>/` with write_file (frontmatter: name/description; body: when-to-use + steps + example). End by listing the memories and any candidate skills you created, and name one area you are least confident about.";
+          return void a.prompt(task);
+        }
+        case "reflect":
+          return void a.prompt(
+            "Reflect on the work done in this session so far. Identify: (1) any convention, architecture fact, decision, or gotcha worth persisting so future sessions don't rediscover it, and (2) any repetitive pattern you performed more than once that should become a reusable skill under `.catalyst-code/skills/`. Use the `memory` tool (action: append if a topic memory exists, else save) to persist durable facts only — skip transient task state. If you wrote a skill, name it. Finish with a two-line summary: what you learned and what you persisted.",
+          );
+        case "bash-timeout": {
+          const n = Number((args ?? "").trim());
+          if (Number.isFinite(n) && n > 0) return void a.setConfig("bash_timeout_secs", n);
+          void a.getVisionConfig();
+          return setModal("settings");
+        }
+        case "run": {
+          let raw = args?.trim();
+          if (!raw) {
+            raw =
+              (await d.prompt({
+                title: "Delegate to a subagent",
+                message: 'Format: agent "task"',
+                placeholder: 'scout "find bugs"',
+                required: true,
+                confirmLabel: "Run",
+              })) ?? "";
+          }
+          const parsed = parseAgentTasks(raw.trim());
+          if (parsed.length === 0) {
+            if (raw.trim()) {
+              const sp = raw.trim().indexOf(" ");
+              if (sp > 0) {
+                void a.prompt(
+                  buildRunPrompt(
+                    raw.trim().slice(0, sp),
+                    raw.trim().slice(sp + 1).replace(/^["']|["']$/g, ""),
+                  ),
+                );
+              }
+            }
+            return;
+          }
+          void a.prompt(buildRunPrompt(parsed[0].agent, parsed[0].task));
+          return;
+        }
+        case "parallel": {
+          let raw = args?.trim();
+          if (!raw) {
+            raw =
+              (await d.prompt({
+                title: "Run subagents in parallel",
+                message: 'Format: a1 "t1" a2 "t2"',
+                placeholder: 'scout "scan" worker "fix"',
+                required: true,
+                confirmLabel: "Run",
+              })) ?? "";
+          }
+          const parsed = parseAgentTasks(raw.trim());
+          if (parsed.length === 0) return;
+          void a.prompt(buildParallelPrompt(parsed));
+          return;
+        }
+        case "chain": {
+          let raw = args?.trim();
+          if (!raw) {
+            raw =
+              (await d.prompt({
+                title: "Run a subagent chain",
+                message: 'Format: a1 "t1" a2 "t2" — use {previous} in later tasks',
+                placeholder: 'scout "map auth" worker "fix using {previous}"',
+                required: true,
+                confirmLabel: "Run",
+              })) ?? "";
+          }
+          const parsed = parseAgentTasks(raw.trim());
+          if (parsed.length === 0) return;
+          void a.prompt(buildChainPrompt(parsed));
+          return;
+        }
+        default:
+          return;
       }
-      case "steer":
-        // Focus the composer so the user can type a steer (Enter steers while streaming).
-        setSidebarOpen(false);
-        return composerRef.current?.focus();
-      case "attach":
-        return composerRef.current?.openAttach();
-      case "goal":
-        return setModal("goal");
-      case "cancel-goal":
-        return void a.cancelGoal();
-      case "run":
-        composerRef.current?.insert("Delegate to a subagent: ");
-        return;
-      case "parallel":
-        composerRef.current?.insert("Run these subagents in parallel: ");
-        return;
-      case "chain":
-        composerRef.current?.insert("Run a subagent chain: ");
-        return;
-      default:
-        return;
-    }
-  }, [doExport]);
+    })();
+  }, [doExport, openDiagnostics]);
 
   const onAddImage = (url: string) => setImages((prev) => [...prev, url]);
   const onRemoveImage = (i: number) => setImages((prev) => prev.filter((_, idx) => idx !== i));
@@ -305,10 +472,11 @@ export function Chat() {
   // Stable (empty deps) via refs so <Message> memo isn't defeated.
   const onEditUser = useCallback((newText: string) => {
     const a = agentRef.current;
-    void a.undo().then(() => a.prompt(newText));
+    void a.undo().then((ok) => {
+      if (ok) void a.prompt(newText);
+    });
   }, []);
 
-  // ── Regenerate: undo the last turn, re-send the same prompt ──
   const onRegenerate = useCallback(() => {
     const a = agentRef.current;
     const msgs = msgsRef.current;
@@ -320,7 +488,9 @@ export function Chat() {
       }
     }
     if (lastUserText) {
-      void a.undo().then(() => a.prompt(lastUserText));
+      void a.undo().then((ok) => {
+        if (ok) void a.prompt(lastUserText);
+      });
     }
   }, []);
 
@@ -359,18 +529,28 @@ export function Chat() {
           agent.loadSession(p);
           setSidebarOpen(false);
         }}
-        onReset={agent.reset}
-        onCompact={agent.compact}
-        onStats={agent.stats}
+        onReset={() => void onCommand("reset")}
+        onCompact={() => void onCommand("compact")}
+        onStats={openDiagnostics}
         onOpenPanel={(p) => {
           if (p === "memory") agent.listMemory();
           if (p === "plugins") agent.listPlugins();
+          if (p === "subagents") void agent.listAgents();
+          if (p === "settings") void agent.getVisionConfig();
           setModal(p as "memory" | "plugins" | "settings" | "subagents" | "help");
         }}
         onSwitchWorkspace={(p) => agent.switchWorkspace(p)}
         onRemoveProject={(p) => agent.removeProject(p)}
         onDeleteSession={(p) => agent.deleteSession(p)}
         onRenameSession={(name, title) => agent.renameSession(name, title)}
+        onConfirmDelete={async (title) =>
+          dialogApi.current.confirm({
+            title: "Delete session",
+            message: `Delete session "${title}"? The .jsonl file will be permanently removed.`,
+            confirmLabel: "Delete",
+            danger: true,
+          })
+        }
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -401,11 +581,111 @@ export function Chat() {
 
         {/* Messages */}
         <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto">
+          {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
+          {!switching && (
+            <div className="mx-auto max-w-3xl">
+              {state.pendingApproval && (
+                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <Approval approval={state.pendingApproval} onApprove={agent.approve} />
+                </div>
+              )}
+              {state.pendingIntercom && (
+                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <IntercomPrompt
+                    prompt={state.pendingIntercom}
+                    onReply={agent.intercomReply}
+                    onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
+                  />
+                </div>
+              )}
+              {state.pendingAsk && (
+                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <AskFlyout
+                    prompt={state.pendingAsk}
+                    onSubmit={(answers) => agent.askReply(answers)}
+                    onSkip={() => agent.askReply(null)}
+                  />
+                </div>
+              )}
+              {state.pendingSudo && (
+                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <SudoPrompt
+                    prompt={state.pendingSudo}
+                    onApprove={(password) => agent.sudoReply(true, password)}
+                    onDecline={() => agent.sudoReply(false)}
+                  />
+                </div>
+              )}
+              {state.pendingOauth && (
+                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <OauthPromptBanner
+                    prompt={state.pendingOauth}
+                    onSubmit={agent.submitOauthCode}
+                    onDismiss={agent.dismissOauth}
+                  />
+                </div>
+              )}
+              {state.goalMode &&
+                state.goalMode.phase === "plan_ready" &&
+                !state.goalMode.auto_deploy && (
+                  <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                    <GoalPlanBanner
+                      goal={state.goalMode.goal}
+                      summary={state.goalPlan?.summary}
+                      steps={
+                        state.goalMode.prompts.map((p) => ({
+                          agent: p.agent,
+                          title: p.title || p.step_id,
+                        })) || []
+                      }
+                      onApprove={() => void agent.approveGoalPlan()}
+                      onRevise={() => {
+                        void dialogApi.current
+                          .prompt({
+                            title: "Revise plan",
+                            message: "What should change in the plan?",
+                            multiline: true,
+                            required: true,
+                            confirmLabel: "Revise",
+                          })
+                          .then((fb) => {
+                            if (fb?.trim()) void agent.reviseGoal(fb.trim());
+                          });
+                      }}
+                      onCancel={() => void agent.cancelGoal()}
+                    />
+                  </div>
+                )}
+              {state.goalMode &&
+                state.goalMode.phase !== "idle" &&
+                state.goalMode.phase !== "plan_ready" && (
+                  <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                    <GoalStatusChip
+                      phase={state.goalMode.phase}
+                      goal={state.goalMode.goal}
+                      onCancel={() => void agent.cancelGoal()}
+                    />
+                  </div>
+                )}
+            </div>
+          )}
+
           {empty || switching ? (
             <EmptyState
               workspace={state.workspace}
               connected={agent.connected}
               switching={switching}
+              canSend={!!currentModel && agent.connected}
+              compact={
+                !!(
+                  state.pendingApproval ||
+                  state.pendingAsk ||
+                  state.pendingSudo ||
+                  state.pendingIntercom ||
+                  state.pendingOauth ||
+                  state.goalMode
+                )
+              }
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
@@ -422,80 +702,6 @@ export function Chat() {
                   />
                 ))}
               </ErrorBoundary>
-              {state.pendingApproval && (
-                <div className="mx-4 mb-2 sm:mx-6">
-                  <Approval approval={state.pendingApproval} onApprove={agent.approve} />
-                </div>
-              )}
-              {state.pendingIntercom && (
-                <div className="mx-4 mb-2 sm:mx-6">
-                  <IntercomPrompt
-                    prompt={state.pendingIntercom}
-                    onReply={agent.intercomReply}
-                    onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
-                  />
-                </div>
-              )}
-              {state.pendingAsk && (
-                <div className="mx-4 mb-2 sm:mx-6">
-                  <AskFlyout
-                    prompt={state.pendingAsk}
-                    onSubmit={(answers) => agent.askReply(answers)}
-                    onSkip={() => agent.askReply(null)}
-                  />
-                </div>
-              )}
-              {state.pendingSudo && (
-                <div className="mx-4 mb-2 sm:mx-6">
-                  <SudoPrompt
-                    prompt={state.pendingSudo}
-                    onApprove={(password) => agent.sudoReply(true, password)}
-                    onDecline={() => agent.sudoReply(false)}
-                  />
-                </div>
-              )}
-              {state.pendingOauth && (
-                <div className="mx-4 mb-2 sm:mx-6">
-                  <OauthPromptBanner
-                    prompt={state.pendingOauth}
-                    onSubmit={agent.submitOauthCode}
-                    onDismiss={agent.dismissOauth}
-                  />
-                </div>
-              )}
-              {state.goalMode &&
-                state.goalMode.phase === "plan_ready" &&
-                !state.goalMode.auto_deploy && (
-                  <div className="mx-4 mb-2 sm:mx-6">
-                    <GoalPlanBanner
-                      goal={state.goalMode.goal}
-                      summary={state.goalPlan?.summary}
-                      steps={
-                        state.goalMode.prompts.map((p) => ({
-                          agent: p.agent,
-                          title: p.title || p.step_id,
-                        })) || []
-                      }
-                      onApprove={() => void agent.approveGoalPlan()}
-                      onRevise={() => {
-                        const fb = window.prompt("What should change in the plan?");
-                        if (fb?.trim()) void agent.reviseGoal(fb.trim());
-                      }}
-                      onCancel={() => void agent.cancelGoal()}
-                    />
-                  </div>
-                )}
-              {state.goalMode &&
-                state.goalMode.phase !== "idle" &&
-                state.goalMode.phase !== "plan_ready" && (
-                  <div className="mx-4 mb-2 sm:mx-6">
-                    <GoalStatusChip
-                      phase={state.goalMode.phase}
-                      goal={state.goalMode.goal}
-                      onCancel={() => void agent.cancelGoal()}
-                    />
-                  </div>
-                )}
               <div className="h-4" />
             </div>
           )}
@@ -517,8 +723,18 @@ export function Chat() {
         <Composer
           ref={composerRef}
           streaming={state.streaming}
-          connected={agent.connected}
-          canSend={!!currentModel}
+          followUpQueued={state.followUpQueued}
+          hitlOpen={
+            !!(
+              state.pendingApproval ||
+              state.pendingAsk ||
+              state.pendingSudo ||
+              state.pendingIntercom ||
+              state.pendingOauth
+            )
+          }
+          connected={agent.connected && !switching}
+          canSend={!!currentModel && !switching}
           thinkingLevel={state.thinkingLevel}
           modelLabel={modelLabel}
           images={images}
@@ -528,6 +744,7 @@ export function Chat() {
           onPrompt={sendPrompt}
           onSteer={(t) => agent.steer(t)}
           onAbort={agent.abort}
+          onClearQueue={agent.clearQueue}
           onCommand={onCommand}
           skills={state.skills}
           onSkill={(name, task) => agent.applySkill(name, task)}
@@ -536,12 +753,14 @@ export function Chat() {
       </div>
 
       <Toasts toasts={state.toasts} onDismiss={agent.dismissToast} />
+      <AppDialogHost dialog={dialog} />
 
       {modal === "memory" && (
         <MemoryPanel
           memories={state.memories}
           onSave={agent.saveMemory}
           onForget={agent.forgetMemory}
+          onRefresh={() => void agent.refreshMemory()}
           onClose={() => setModal(null)}
         />
       )}
@@ -556,7 +775,12 @@ export function Chat() {
         />
       )}
       {modal === "subagents" && (
-        <SubagentsPanel runs={state.subagentRuns} onClose={() => setModal(null)} />
+        <SubagentsPanel
+          runs={state.subagentRuns}
+          agents={state.availableAgents}
+          onRefreshAgents={() => void agent.listAgents()}
+          onClose={() => setModal(null)}
+        />
       )}
       {modal === "settings" && (
         <SettingsModal
@@ -565,10 +789,32 @@ export function Chat() {
           selectedModel={state.selectedModel}
           thinkingLevel={state.thinkingLevel}
           approvalMode={state.approvalMode}
+          autoCompact={state.ready?.auto_compact ?? true}
+          sandbox={state.ready?.sandbox ?? "none"}
           onSelectModel={agent.setModel}
           onSelectThinking={agent.setThinking}
           onSetApproval={agent.setApproval}
           onSetBashTimeout={(secs) => agent.setConfig("bash_timeout_secs", secs)}
+          onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
+          onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
+          visionConfig={state.visionConfig}
+          onSetVisionConfig={(vision_model, vision_models) =>
+            void agent.setVisionConfig(vision_model, vision_models)
+          }
+          onRefreshVision={() => void agent.getVisionConfig()}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "diagnostics" && (
+        <DiagnosticsModal
+          stats={state.stats}
+          context={state.contextBreakdown}
+          usage={state.usageSnapshot}
+          onRefresh={() => {
+            void agent.stats();
+            void agent.context();
+            void agent.usage(agent.state.selectedModel ?? undefined);
+          }}
           onClose={() => setModal(null)}
         />
       )}
@@ -579,6 +825,18 @@ export function Chat() {
           providerPresets={state.providerPresets}
           providers={state.ready?.providers ?? []}
           onStart={(opts) => void agent.startGoal(opts)}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {(modal === "login" || modal === "logout") && (
+        <ProviderLoginModal
+          presets={state.providerPresets}
+          mode={modal}
+          onLoginKey={(id, key) => void agent.login(id, key)}
+          onLoginOauth={(id) => void agent.loginOauth(id)}
+          onLoginSaved={(id) => void agent.login(id)}
+          onSwitchProvider={(id) => void agent.setProvider(id)}
+          onLogout={(id) => void agent.logout(id)}
           onClose={() => setModal(null)}
         />
       )}
@@ -600,17 +858,25 @@ function EmptyState({
   workspace,
   connected,
   switching,
+  canSend,
+  compact,
   onPick,
 }: {
   workspace: string;
   connected: boolean;
   switching: boolean;
+  canSend: boolean;
+  compact?: boolean;
   onPick: (t: string) => void;
 }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center px-6 py-10 text-center">
+    <div
+      className={`flex flex-col items-center justify-center px-6 text-center ${
+        compact ? "min-h-0 py-6" : "h-full py-10"
+      }`}
+    >
       <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-accent to-accent-deep text-3xl font-bold text-white shadow-glow">
-        u
+        c
       </div>
       <h1 className="text-2xl font-semibold tracking-tight text-ink-100">Catalyst Code</h1>
       <p className="mt-2 max-w-md text-[14px] text-ink-400">
@@ -631,8 +897,12 @@ function EmptyState({
           {EXAMPLES.map((ex) => (
             <button
               key={ex}
-              onClick={() => onPick(ex)}
-              className="group flex items-center gap-3 rounded-xl border border-ink-800 bg-ink-900/40 px-4 py-3 text-left text-[13px] text-ink-300 transition-all hover:border-accent/40 hover:bg-ink-850 hover:text-ink-100"
+              disabled={!canSend}
+              onClick={() => {
+                if (!canSend) return;
+                onPick(ex);
+              }}
+              className="group flex items-center gap-3 rounded-xl border border-ink-800 bg-ink-900/40 px-4 py-3 text-left text-[13px] text-ink-300 transition-all hover:border-accent/40 hover:bg-ink-850 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-ink-800 disabled:hover:bg-ink-900/40 disabled:hover:text-ink-300"
             >
               <SparkIcon width={14} height={14} className="shrink-0 text-ink-500 group-hover:text-accent-soft" />
               <span className="flex-1">{ex}</span>
@@ -658,9 +928,17 @@ function KeyOverlay({
   onSubmit: () => void;
   onDismiss: () => void;
 }) {
+  const closeRef = useOutsideClose(onDismiss);
+  const trapRef = useFocusTrap<HTMLDivElement>();
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="relative w-full max-w-md rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl animate-fade-in">
+      <div
+        ref={mergeRefs(closeRef, trapRef)}
+        className="relative w-full max-w-md rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl animate-fade-in"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Connect your provider"
+      >
         <button
           onClick={onDismiss}
           className="absolute right-3 top-3 rounded-md p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"

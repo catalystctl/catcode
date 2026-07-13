@@ -72,7 +72,12 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
   };
 
   return (
-    <div className="my-3 overflow-hidden rounded-xl border border-warning/30 bg-warning/[0.04]">
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="Subagent needs a decision"
+      className="my-3 overflow-hidden rounded-xl border border-warning/30 bg-warning/[0.04]"
+    >
       <div className="flex items-center gap-2 border-b border-warning/20 px-4 py-2.5">
         <QuestionIcon width={15} height={15} className="text-warning" />
         <span className="text-sm font-semibold text-ink-100">Subagent needs a decision</span>

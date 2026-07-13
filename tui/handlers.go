@@ -158,6 +158,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.sendCore(map[string]any{"type": "set_approval", "mode": desired})
 		}
 		s.approvalModeStr = desired
+		// Populate plugin slash commands for the palette (list_plugins also
+		// emits plugin_commands as a companion; this covers cold start).
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 		// Sync a persisted provider selection that differs from the core's
 		// startup choice (e.g. switched in a previous session). The core emits
 		// provider_changed + models, which re-resolves the key below.
@@ -841,12 +844,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			scope = "global"
 		}
 		s.logSuccess(fmt.Sprintf("plugin installed (%s): %s v%s — %s", scope, ev.get("name"), ev.get("version"), ev.get("description")))
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugin_removed":
 		s.logInfo(fmt.Sprintf("plugin removed: %s", ev.get("name")))
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugin_enabled":
 		s.logInfo(fmt.Sprintf("plugin enabled: %s", ev.get("name")))
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugin_disabled":
 		s.logInfo(fmt.Sprintf("plugin disabled: %s", ev.get("name")))
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugin_error":
 		s.logError(fmt.Sprintf("plugin error (%s): %s", ev.get("name"), ev.get("message")))
 	case "plugins_list":
@@ -859,6 +866,26 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
+	case "plugin_commands":
+		var cmds []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Plugin      string `json:"plugin"`
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(ev.Raw, &m); err == nil {
+			if raw, ok := m["commands"]; ok {
+				_ = json.Unmarshal(raw, &cmds)
+			}
+		}
+		s.pluginCommands = cmds
+	case "plugin_status":
+		text := ev.get("text")
+		s.pluginStatus = text
+		if text != "" {
+			s.logInfo(text)
+		}
+		s.refresh()
 	case "vision_config":
 		var m map[string]json.RawMessage
 		if json.Unmarshal(ev.Raw, &m) == nil {
@@ -1761,12 +1788,12 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/sandbox":
 			if len(parts) >= 2 {
 				mode := parts[1]
-				if mode == "none" || mode == "firejail" {
+				if mode == "none" || mode == "firejail" || mode == "seatbelt" {
 					s.settings.Sandbox = mode
 					_ = s.settings.save()
 					s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", mode))
 				} else {
-					s.logError("usage: /sandbox none|firejail")
+					s.logError("usage: /sandbox none|firejail|seatbelt")
 				}
 				return nil
 			}
@@ -2012,6 +2039,10 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.requestPluginPicker(pluginModeRemove)
 			return nil
+		case "/plugin-reload":
+			s.sendCore(map[string]any{"type": "reload_plugins"})
+			s.logInfo("reloading plugins…")
+			return nil
 		case "/goal":
 			prefill := ""
 			if len(parts) >= 2 {
@@ -2039,6 +2070,18 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/subagents-models":
 			return s.sendDelegation(`Run subagent({ action: "models" }) and show the runtime model mapping for the builtin agents.`, "/subagents-models")
 		default:
+			// Plugin-declared slash commands (/{name} [args]).
+			cmdName := strings.TrimPrefix(parts[0], "/")
+			for _, pc := range s.pluginCommands {
+				if strings.EqualFold(pc.Name, cmdName) {
+					args := ""
+					if len(parts) > 1 {
+						args = strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
+					}
+					s.sendCore(map[string]any{"type": "plugin_command", "name": pc.Name, "args": args})
+					return nil
+				}
+			}
 			s.logError("unknown command: " + parts[0])
 			return nil
 		}

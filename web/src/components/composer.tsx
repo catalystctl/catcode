@@ -7,7 +7,8 @@
 //   • @-mention file flyout: typing "@" triggers a debounced workspace file
 //     search; selecting a file inserts its path into the prompt.
 //   • Draft persistence: unsent text + images survive a reload (sessionStorage).
-//   • Steer vs. send: while the agent is streaming, Enter steers (redirects).
+//   • Mid-turn input: while streaming, Enter queues a follow-up (core one-deep
+//     buffer); Ctrl+Enter steers. Esc clears a queued follow-up, else aborts.
 //
 // Exposes an imperative handle ({ focus, insert, openAttach }) so the shell can
 // drive it from slash commands (/steer focuses, /run/parallel/chain insert a
@@ -29,6 +30,9 @@ import type { FileEntry, SkillInfo } from "@/lib/types";
 
 interface Props {
   streaming: boolean;
+  followUpQueued?: boolean;
+  /** When a HITL banner owns Esc (approve/ask/sudo/intercom), composer must not abort. */
+  hitlOpen?: boolean;
   connected: boolean;
   canSend: boolean;
   thinkingLevel: string;
@@ -40,7 +44,8 @@ interface Props {
   onPrompt: (text: string, images?: string[]) => void;
   onSteer: (text: string) => void;
   onAbort: () => void;
-  onCommand: (name: string) => void;
+  onClearQueue?: () => void;
+  onCommand: (name: string, args?: string) => void;
   /** Discoverable skills (drives the /skill:<name> autocomplete entries). */
   skills: SkillInfo[];
   /** Invoke a skill by name with an optional follow-up task. */
@@ -103,6 +108,8 @@ function isCommandSearch(text: string): boolean {
 export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   {
     streaming,
+    followUpQueued = false,
+    hitlOpen = false,
     connected,
     canSend,
     thinkingLevel,
@@ -114,6 +121,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     onPrompt,
     onSteer,
     onAbort,
+    onClearQueue,
     onCommand,
     skills,
     onSkill,
@@ -259,11 +267,17 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       return;
     }
     if (fetchTimer.current) clearTimeout(fetchTimer.current);
+    const ac = new AbortController();
     fetchTimer.current = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/files?q=${encodeURIComponent(mention.query)}&workspace=${encodeURIComponent(workspace)}`);
+        const res = await fetch(
+          `/api/files?q=${encodeURIComponent(mention.query)}&workspace=${encodeURIComponent(workspace)}`,
+          { signal: ac.signal },
+        );
+        if (ac.signal.aborted) return;
         if (!res.ok) return;
         const data = (await res.json()) as { files: FileEntry[] };
+        if (ac.signal.aborted) return;
         // Re-check the caret is still in a mention (user may have moved).
         const el2 = taRef.current;
         const caret2 = el2 ? el2.selectionStart : 0;
@@ -280,11 +294,13 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         setFileIndex(0);
         setFileOpen(data.files.length > 0);
       } catch {
+        if (ac.signal.aborted) return;
         setFileOpen(false);
       }
     }, 180);
     return () => {
       if (fetchTimer.current) clearTimeout(fetchTimer.current);
+      ac.abort();
     };
   }, [text, workspace, caretTick]);
 
@@ -296,14 +312,25 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const submit = useCallback(() => {
     const t = text.trim();
     if (!t && images.length === 0) return;
-    // Exact slash-command match → execute (legacy fast path).
-    const exact = COMMANDS.find((c) => c.label === t);
-    if (exact) {
-      onCommand(exact.action);
-      setText("");
-      closeFlyouts();
-      return;
+    if (!connected) return;
+    // Slash commands (incl. /login) must work without a selected model.
+    if (t.startsWith("/")) {
+      let matched: (typeof COMMANDS)[number] | undefined;
+      for (const c of COMMANDS) {
+        if (t === c.label || t.startsWith(c.label + " ")) {
+          if (!matched || c.label.length > matched.label.length) matched = c;
+        }
+      }
+      if (matched) {
+        const args = t.slice(matched.label.length).trim();
+        onCommand(matched.action, args || undefined);
+        setText("");
+        closeFlyouts();
+        return;
+      }
     }
+    // Match Send button: prompts/skills need a model.
+    if (!canSend) return;
     // "/skill:<name> [task]" — invoke a discoverable skill. Handles both the
     // bare token (selected from the flyout) and a typed invocation with an
     // optional follow-up task appended after the skill name.
@@ -315,11 +342,11 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         const task = sp === -1 ? undefined : rest.slice(sp + 1).trim();
         if (name) {
           onSkill(name, task || undefined);
+          setText("");
+          closeFlyouts();
+          return;
         }
       }
-      setText("");
-      closeFlyouts();
-      return;
     }
     // PI-compatible bang bash: `!cmd` (include in context) / `!!cmd` (exclude).
     if (onBash && t.startsWith("!")) {
@@ -333,14 +360,19 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       }
     }
     const imgs = images.length ? images : undefined;
-    if (streaming) {
-      onSteer(t);
-    } else {
-      onPrompt(t, imgs);
-    }
+    // Mid-turn Enter queues a follow-up via core; Ctrl+Enter steers (submitSteer).
+    onPrompt(t, imgs);
     setText("");
     closeFlyouts();
-  }, [text, images, streaming, onCommand, onSteer, onPrompt, onSkill, onBash, closeFlyouts]);
+  }, [text, images, connected, canSend, onCommand, onPrompt, onSkill, onBash, closeFlyouts]);
+
+  const submitSteer = useCallback(() => {
+    const t = text.trim();
+    if (!t || !streaming) return;
+    onSteer(t);
+    setText("");
+    closeFlyouts();
+  }, [text, streaming, onSteer, closeFlyouts]);
 
   // Run a command from the flyout by action key.
   const runCommand = useCallback(
@@ -462,10 +494,23 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         return;
       }
     }
-    // ── Normal submit ──
+    // ── Normal submit / mid-turn queue vs steer ──
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      submit();
+      if (streaming && (e.ctrlKey || e.metaKey)) {
+        submitSteer();
+      } else {
+        submit();
+      }
+      return;
+    }
+    if (e.key === "Escape" && !cmdOpen && !fileOpen) {
+      e.preventDefault();
+      // HITL banners own Esc (deny/skip); don't also abort/clear-queue.
+      if (hitlOpen) return;
+      if (followUpQueued && onClearQueue) onClearQueue();
+      else if (streaming) onAbort();
+      return;
     }
   };
 
@@ -521,19 +566,41 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               placeholder={
                 connected
                   ? streaming
-                    ? "Redirect the agent… (Enter to steer)"
+                    ? "Queue a follow-up… (Enter) · Ctrl+Enter to steer"
                     : "Message the agent…  (/ for commands, @ for files)"
                   : "Connecting to catcode-core…"
               }
               className="max-h-60 flex-1 resize-none bg-transparent px-2 py-1.5 text-[14px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50"
             />
             {streaming ? (
-              <button
-                onClick={onAbort}
-                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3.5 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
-              >
-                <StopIcon width={14} height={14} /> Stop
-              </button>
+              <>
+                {text.trim() && (
+                  <>
+                    <button
+                      onClick={submit}
+                      disabled={!connected || !canSend}
+                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
+                      title="Queue follow-up (Enter)"
+                    >
+                      <SendIcon width={14} height={14} /> Queue
+                    </button>
+                    <button
+                      onClick={submitSteer}
+                      disabled={!connected || !canSend}
+                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3.5 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
+                      title="Steer in-flight turn (Ctrl+Enter)"
+                    >
+                      Steer
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={onAbort}
+                  className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3.5 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
+                >
+                  <StopIcon width={14} height={14} /> Stop
+                </button>
+              </>
             ) : (
               <button
                 onClick={submit}
@@ -551,6 +618,27 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             <span className="font-mono">{modelLabel}</span>
             <span className="text-ink-600">·</span>
             <span>think: {thinkingLevel}</span>
+            {followUpQueued && (
+              <>
+                <span className="text-ink-600">·</span>
+                <span
+                  className="inline-flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent-soft"
+                  title="A follow-up is queued for after this turn"
+                >
+                  queued
+                  {onClearQueue && (
+                    <button
+                      type="button"
+                      onClick={onClearQueue}
+                      className="ml-0.5 text-ink-400 hover:text-ink-100"
+                      title="Clear queue (Esc)"
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              </>
+            )}
             {flyoutOpen && (
               <>
                 <span className="text-ink-600">·</span>
@@ -562,10 +650,21 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             )}
           </span>
           <span className="hidden sm:inline">
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> send ·{" "}
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Shift+↵</kbd> newline ·{" "}
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">/</kbd>{" "}
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">@</kbd>
+            {streaming ? (
+              <>
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> queue ·{" "}
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd> steer ·{" "}
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
+                {followUpQueued ? "clear queue" : "stop"}
+              </>
+            ) : (
+              <>
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> send ·{" "}
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Shift+↵</kbd> newline ·{" "}
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">/</kbd>{" "}
+                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">@</kbd>
+              </>
+            )}
           </span>
         </div>
       </div>

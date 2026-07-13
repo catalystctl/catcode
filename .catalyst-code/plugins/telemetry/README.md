@@ -44,21 +44,24 @@ correlate. Each workspace gets its own summary.
 - **Latency (TTFT)** — avg / min / max over turns that report it.
 - **Throughput (TPS)** — avg over turns that report it.
 - **Per-model breakdown** — turns + tokens split by model id.
+- **Human corrections** — session `/undo` count from `args.human_corrections`.
+- **Skill utilization** — `SKILL.md` / skills-dir `read_file` hits from
+  `args.skill_utilization`.
 
-## Not captured (deliberately deferred — see docs/SELF_LEARNING.md §12)
+## Not captured (still deferred — see docs/SELF_LEARNING.md §12)
 
-These signals are marked deferred in the design doc and require either the
-JSONL debug log or additional core instrumentation:
-
-- **Skill utilization** (counts of `read_file` on `SKILL.md`).
 - **Test pass rate** (parsing `bash` test output).
-- **`/undo` correction rate** (undo rewrites history; no per-turn trace).
-
-They can be added later by a richer `session_stop` plugin that scans the
-conversation session file incrementally, without touching core.
+- **Bugs introduced** (needs a test-run signal).
 
 ## Configuration
 
 None. The hook runs whenever the plugin is enabled (it is staged globally by
 default). To disable it, use the plugin management command or delete the
 directory under `~/.catalyst-code/plugins/telemetry/`.
+
+To pick up an updated staged copy after a harness upgrade, remove the local
+file and restart (staging is non-clobbering):
+
+```bash
+rm ~/.catalyst-code/plugins/telemetry/hooks/session_stop.py
+```

@@ -337,3 +337,302 @@ describe("subagent run pruning", () => {
     }
   });
 });
+
+describe("metrics tps_est", () => {
+  test("maps mid-stream tps_est onto tps", () => {
+    const s = reduce(initialState, {
+      type: "metrics",
+      tps_est: 42.5,
+    } as AgentEvent);
+    expect(s.metrics?.tps).toBe(42.5);
+    expect(s.retrying).toBe(false);
+  });
+
+  test("prefers final tps over tps_est", () => {
+    let s = reduce(initialState, { type: "metrics", tps_est: 10 } as AgentEvent);
+    s = reduce(s, { type: "metrics", tps: 55, elapsed_ms: 1000 } as AgentEvent);
+    expect(s.metrics?.tps).toBe(55);
+  });
+});
+
+describe("intercom need_decision", () => {
+  test("empty reason is log-only (not a blocking ask)", () => {
+    const s = reduce(initialState, {
+      type: "intercom_message",
+      id: "m1",
+      from: "explorer",
+      to: "orchestrator",
+      reason: "",
+      message: "progress note",
+    } as AgentEvent);
+    expect(s.pendingIntercom).toBeNull();
+    expect(s.intercomLog[0]?.kind).toBe("reply");
+  });
+
+  test("need_decision opens pendingIntercom", () => {
+    const s = reduce(initialState, {
+      type: "intercom_message",
+      id: "m2",
+      from: "explorer",
+      to: "orchestrator",
+      reason: "need_decision",
+      message: "which path?",
+    } as AgentEvent);
+    expect(s.pendingIntercom?.request_id).toBe("m2");
+    expect(s.pendingIntercom?.message).toBe("which path?");
+  });
+});
+
+describe("config_changed", () => {
+  test("patches ready.bash_timeout_secs and auto_compact", () => {
+    let s = reduce(initialState, {
+      type: "ready",
+      models: [],
+      authed: true,
+      workspace: "/tmp",
+      approval: "destructive",
+      base_url: "",
+      provider: "x",
+      providerKind: "openai",
+      providers: ["x"],
+      bash_timeout_secs: 30,
+      auto_compact: true,
+      resumed_messages: 0,
+    } as AgentEvent);
+    s = reduce(s, { type: "config_changed", key: "bash_timeout_secs", value: 90 });
+    expect(s.ready?.bash_timeout_secs).toBe(90);
+    s = reduce(s, { type: "config_changed", key: "auto_compact", value: false });
+    expect(s.ready?.auto_compact).toBe(false);
+  });
+
+  test("patches ready.sandbox", () => {
+    let s = reduce(initialState, {
+      type: "ready",
+      models: [],
+      authed: true,
+      workspace: "/tmp",
+      approval: "destructive",
+      base_url: "",
+      provider: "x",
+      providerKind: "openai",
+      providers: ["x"],
+      bash_timeout_secs: 30,
+      sandbox: "none",
+      resumed_messages: 0,
+    } as AgentEvent);
+    s = reduce(s, { type: "config_changed", key: "sandbox", value: "firejail" });
+    expect(s.ready?.sandbox).toBe("firejail");
+  });
+});
+
+describe("diagnostics + agents", () => {
+  test("stores context breakdown and agents list", () => {
+    let s = reduce(initialState, {
+      type: "context_breakdown",
+      total_tokens: 1000,
+      context_window: 8000,
+      pct: 12,
+      messages: 4,
+      system_tokens: 200,
+      by_role: { user: 300 },
+      top_consumers: [{ index: 1, role: "user", tokens: 300, preview: "hi" }],
+    } as AgentEvent);
+    expect(s.contextBreakdown?.total_tokens).toBe(1000);
+    expect(s.toasts).toHaveLength(0);
+    s = reduce(s, {
+      type: "agents",
+      agents: [{ name: "scout", description: "explore", source: "builtin" }],
+    } as AgentEvent);
+    expect(s.availableAgents).toEqual([
+      { name: "scout", description: "explore", source: "builtin" },
+    ]);
+  });
+});
+
+describe("http_retry clears on delta", () => {
+  test("retrying flag clears when streaming resumes", () => {
+    let s = reduce(initialState, { type: "http_retry", status: 429 } as AgentEvent);
+    expect(s.retrying).toBe(true);
+    s = reduce(s, { type: "delta", text: "hi" });
+    expect(s.retrying).toBe(false);
+  });
+});
+
+describe("finishTurn clears gates", () => {
+  test("aborted drops pending approval/ask/sudo/intercom and follow-up queue", () => {
+    let s = reduce(initialState, {
+      type: "approval_request",
+      request_id: "a1",
+      tool: "bash",
+      args: "{}",
+    } as AgentEvent);
+    s = reduce(s, {
+      type: "info",
+      message: "prompt queued; will run after the current turn",
+    } as AgentEvent);
+    expect(s.followUpQueued).toBe(true);
+    expect(s.pendingApproval).not.toBeNull();
+    s = reduce(s, { type: "aborted" });
+    expect(s.pendingApproval).toBeNull();
+    expect(s.followUpQueued).toBe(false);
+    expect(s.streaming).toBe(false);
+  });
+});
+
+describe("error does not end the turn", () => {
+  // Covered by "pre-turn error clears streaming" — kept as a pointer in history.
+});
+
+describe("pre-turn error clears streaming", () => {
+  test("error after optimistic user with no assistant clears streaming", () => {
+    let s = reduce(initialState, { type: "_user", text: "/skill:missing" });
+    expect(s.streaming).toBe(true);
+    s = reduce(s, { type: "error", message: "unknown skill" });
+    expect(s.streaming).toBe(false);
+  });
+
+  test("error mid-turn keeps streaming", () => {
+    let s = reduce(initialState, { type: "_user", text: "hi" });
+    s = reduce(s, { type: "delta", text: "hello" });
+    expect(s.streaming).toBe(true);
+    s = reduce(s, { type: "error", message: "no pending approval" });
+    expect(s.streaming).toBe(true);
+  });
+});
+
+describe("digested without before_tokens", () => {
+  test("subagent digested does not throw", () => {
+    const s = reduce(initialState, {
+      type: "digested",
+      results: 2,
+      after_tokens: 1000,
+    } as AgentEvent);
+    expect(s.toasts[0].message).toContain("Compacted");
+    expect(s.toasts[0].message).toContain("1,000");
+  });
+});
+
+describe("pre-turn error drops ghost user", () => {
+  test("unknown skill error removes optimistic user line", () => {
+    let s = reduce(initialState, { type: "_user", text: "/skill:missing" });
+    expect(s.messages).toHaveLength(1);
+    s = reduce(s, { type: "error", message: "unknown skill" });
+    expect(s.messages).toHaveLength(0);
+    expect(s.streaming).toBe(false);
+  });
+
+  test("core exited error keeps the last user line", () => {
+    let s = reduce(initialState, { type: "_user", text: "hi" });
+    s = reduce(s, { type: "aborted" });
+    expect(s.messages).toHaveLength(1);
+    s = reduce(s, {
+      type: "error",
+      message: "This session's core exited. Sending a message will restart it.",
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(s.goalMode).toBeNull();
+  });
+});
+
+describe("models rebinds selectedModel", () => {
+  test("clears selection when model disappears from list", () => {
+    let s = reduce(initialState, {
+      type: "models",
+      models: [
+        { id: "a", name: "A", provider: "p" },
+        { id: "b", name: "B", provider: "p" },
+      ],
+    } as never);
+    s = reduce(s, { type: "_select_model", id: "b" });
+    expect(s.selectedModel).toBe("b");
+    s = reduce(s, {
+      type: "models",
+      models: [{ id: "a", name: "A", provider: "p" }],
+    } as never);
+    expect(s.selectedModel).toBe("a");
+  });
+});
+
+describe("history tokens_in", () => {
+  test("history with tokens_in seeds stats", () => {
+    const s = reduce(initialState, {
+      type: "history",
+      messages: [{ role: "user", content: "hi" }],
+      tokens_in: 42,
+    } as never);
+    expect(s.stats?.tokens_in).toBe(42);
+    expect(s.messages).toHaveLength(1);
+  });
+});
+
+describe("goal_state idle clears plan", () => {
+  test("idle clears goalMode and goalPlan", () => {
+    const seeded = {
+      ...initialState,
+      goalMode: {
+        id: "g1",
+        goal: "x",
+        phase: "running",
+        concurrency: 1,
+        max_tasks: 1,
+        allowed_models: [] as string[],
+        allowed_providers: [] as string[],
+        auto_deploy: false,
+        prompts: [],
+        active_run_ids: [],
+        version: 1,
+        error: null,
+        parent_model: "",
+      },
+      goalPlan: {
+        id: "g1",
+        summary: "plan",
+        steps: [],
+        risks: [],
+        validation: [],
+        version: 1,
+      },
+    };
+    const s = reduce(seeded, { type: "goal_state", id: "", phase: "idle" } as never);
+    expect(s.goalMode).toBeNull();
+    expect(s.goalPlan).toBeNull();
+  });
+});
+
+describe("undo local + pendingUndo reset", () => {
+  test("_undo_local trims last turn and sets pendingUndo", () => {
+    let s = reduce(initialState, { type: "_user", text: "one" });
+    s = reduce(s, { type: "delta", text: "a1" });
+    s = reduce(s, { type: "done" });
+    s = reduce(s, { type: "_user", text: "two" });
+    s = reduce(s, { type: "delta", text: "a2" });
+    s = reduce(s, { type: "done" });
+    expect(s.messages.length).toBeGreaterThanOrEqual(4);
+    s = reduce(s, { type: "_undo_local" });
+    expect(s.pendingUndo).toBe(true);
+    expect(s.messages.some((m) => m.role === "user" && (m as { text: string }).text === "two")).toBe(false);
+    expect(s.messages.some((m) => m.role === "user" && (m as { text: string }).text === "one")).toBe(true);
+    s = reduce(s, { type: "reset" });
+    expect(s.pendingUndo).toBe(false);
+    expect(s.messages.some((m) => m.role === "user" && (m as { text: string }).text === "one")).toBe(true);
+  });
+
+  test("plain reset still clears messages", () => {
+    let s = reduce(initialState, { type: "_user", text: "x" });
+    s = reduce(s, { type: "reset" });
+    expect(s.messages).toHaveLength(0);
+  });
+
+  test("_undo_local is idempotent (client + fanout)", () => {
+    let s = reduce(initialState, { type: "_user", text: "one" });
+    s = reduce(s, { type: "delta", text: "a1" });
+    s = reduce(s, { type: "done" });
+    s = reduce(s, { type: "_user", text: "two" });
+    s = reduce(s, { type: "delta", text: "a2" });
+    s = reduce(s, { type: "done" });
+    const afterFirst = reduce(s, { type: "_undo_local" });
+    const afterSecond = reduce(afterFirst, { type: "_undo_local" });
+    expect(afterSecond.messages.length).toBe(afterFirst.messages.length);
+    expect(afterSecond.pendingUndo).toBe(true);
+  });
+});

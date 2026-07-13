@@ -552,7 +552,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Web search (no API key; scrapes DDG/Mojeek). Returns top hits as text + JSON. Honors --no-network / fetch_allowlist. Pair with fetch to read a page.",
+                "description": "Web search (no API key). Uses public SearXNG instances (google+bing engines, ranked from searx.space), then falls back to DDG/Mojeek scrapes. Returns top hits as text. Honors --no-network / fetch_allowlist. Pair with fetch to read a page.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -649,17 +649,19 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Persist/list/forget durable memories (workspace-scoped by default; scope:global for cross-project). Use save for new notes, append to accumulate. Injected into future system prompts.",
+                "description": "Persist/list/get/forget durable memories (workspace default; scope:global for cross-project). Standing prompt carries a capped catalog (name+one-line); use get for full text. Prefer append over new saves; require a short description. Rejects trivia unless force=true. Use consolidate to merge near-duplicates; stats for recall quality.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["save", "append", "list", "forget"], "description": "save a new memory, append facts to an existing one, list memories, or forget one by id" },
-                        "scope": { "type": "string", "enum": ["workspace", "global"], "description": "where the memory lives: 'workspace' (per-codebase, default) or 'global' (cross-codebase, applies to every project). For 'list' and 'forget', omit to search/list both scopes" },
+                        "action": { "type": "string", "enum": ["save", "append", "list", "get", "forget", "consolidate", "stats"], "description": "save/append/list/get/forget; consolidate merges near-duplicates; stats shows recall hit/miss + synonym-miss rates" },
+                        "scope": { "type": "string", "enum": ["workspace", "global"], "description": "where the memory lives: 'workspace' (per-codebase, default) or 'global' (cross-codebase). For list/get/forget, omit to search both scopes" },
                         "name": { "type": "string", "description": "(save/append) short memory name; becomes the file slug and the id. append looks up the same name to accumulate onto" },
                         "content": { "type": "string", "description": "(save/append) the memory body (save) or the facts to append (append)" },
-                        "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision (default note)" },
-                        "description": { "type": "string", "description": "(save/append) one-line description shown in the injection" },
-                        "id": { "type": "string", "description": "(forget) the memory id (slug or name) to remove" }
+                        "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision/user (default note). convention/decision/user/identity/preference are pinned in the catalog" },
+                        "description": { "type": "string", "description": "(save/append) one-line summary shown in the standing catalog (auto-filled from the first content line if omitted)" },
+                        "importance": { "type": "string", "enum": ["high", "normal", "low"], "description": "(save/append) durability hint; high preferred in catalog; low rejected unless force=true" },
+                        "force": { "type": "boolean", "description": "(save/append) override trivia/conflict write policy when intentional" },
+                        "id": { "type": "string", "description": "(get/forget) the memory id (slug or name)" }
                     },
                     "required": ["action"]
                 }
@@ -1500,7 +1502,85 @@ fn walk_glob(
     }
 }
 
+/// Expand bash-style `{a,b,c}` alternatives in a glob (including nested
+/// braces). Cursor/Claude models routinely emit `**/*.{rs,go,md}`; without
+/// expansion those patterns match literally and grep/glob return empty.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let bytes = pattern.as_bytes();
+    let mut start = None;
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let s = start.expect("brace depth paired");
+                    let inner = &pattern[s + 1..i];
+                    // Only treat as alternation when the top-level group has a comma.
+                    if brace_group_has_comma(inner) {
+                        let prefix = &pattern[..s];
+                        let suffix = &pattern[i + 1..];
+                        let mut out = Vec::new();
+                        for alt in split_brace_alts(inner) {
+                            let combined = format!("{prefix}{alt}{suffix}");
+                            out.extend(expand_braces(&combined));
+                        }
+                        return out;
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    vec![pattern.to_string()]
+}
+
+fn brace_group_has_comma(inner: &str) -> bool {
+    let mut depth = 0usize;
+    for b in inner.bytes() {
+        match b {
+            b'{' => depth += 1,
+            b'}' if depth > 0 => depth -= 1,
+            b',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn split_brace_alts(inner: &str) -> Vec<&str> {
+    let mut alts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, b) in inner.bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' if depth > 0 => depth -= 1,
+            b',' if depth == 0 => {
+                alts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    alts.push(&inner[start..]);
+    alts
+}
+
 fn glob_match(pattern: &str, name: &str) -> bool {
+    expand_braces(pattern)
+        .into_iter()
+        .any(|p| glob_match_one(&p, name))
+}
+
+fn glob_match_one(pattern: &str, name: &str) -> bool {
     // ponytail: convert glob to a simple matcher. ** matches any path depth.
     // Handle the common cases; fall back to substring match.
     if pattern.contains("**") {
@@ -1952,6 +2032,47 @@ fn build_bash_command(
                 .arg(command);
             (Some(path), c)
         }
+        // macOS: sandbox-exec with a seatbelt profile. On non-macOS hosts the
+        // binary is usually absent — fall through to plain bash (denylist still
+        // applies). Windows has no equivalent; selecting seatbelt there is a no-op.
+        Sandbox::Seatbelt => {
+            #[cfg(target_os = "macos")]
+            {
+                let ws_key = cfg.workspace.display().to_string();
+                let cache_key = format!("sb:{ws_key}:{}", cfg.no_network);
+                let mut cache = PROFILE_CACHE.lock().unwrap();
+                let path =
+                    if let Some(cached_path) = cache.get(&(cache_key.clone(), cfg.no_network)) {
+                        if cached_path.exists() {
+                            cached_path.clone()
+                        } else {
+                            let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
+                            let path = std::env::temp_dir()
+                                .join(format!("catalyst-code-sb-{:x}.sb", fxhash(&ws_key)));
+                            let _ = std::fs::write(&path, &profile);
+                            cache.insert((cache_key, cfg.no_network), path.clone());
+                            path
+                        }
+                    } else {
+                        let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
+                        let path = std::env::temp_dir()
+                            .join(format!("catalyst-code-sb-{:x}.sb", fxhash(&ws_key)));
+                        let _ = std::fs::write(&path, &profile);
+                        cache.insert((cache_key, cfg.no_network), path.clone());
+                        path
+                    };
+                let mut c = tokio::process::Command::new("sandbox-exec");
+                c.arg("-f").arg(&path).arg("bash").arg("-c").arg(command);
+                return (Some(path), c);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = &PROFILE_CACHE;
+                let mut c = tokio::process::Command::new("bash");
+                c.arg("-c").arg(command);
+                (None, c)
+            }
+        }
     }
 }
 
@@ -1999,6 +2120,30 @@ fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
     s.push_str("seccomp\n");
     s.push_str("noroot\n");
     s.push_str("private-tmp\n");
+    s
+}
+
+/// macOS seatbelt (sandbox-exec) profile: allow bash + workspace R/W; optionally
+/// deny network. Keep permissive enough that coreutils and dylibs still load.
+#[cfg(target_os = "macos")]
+fn seatbelt_profile(workspace: &std::path::Path, no_network: bool) -> String {
+    let ws = workspace.display();
+    let mut s = String::new();
+    s.push_str("(version 1)\n");
+    s.push_str("(deny default)\n");
+    s.push_str("(allow process*)\n");
+    s.push_str("(allow sysctl-read)\n");
+    s.push_str("(allow mach*)\n");
+    s.push_str("(allow file-read*)\n");
+    s.push_str(&format!(
+        "(allow file-write* (subpath \"{ws}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
+    ));
+    s.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
+    if no_network {
+        s.push_str("(deny network*)\n");
+    } else {
+        s.push_str("(allow network*)\n");
+    }
     s
 }
 
@@ -3193,68 +3338,313 @@ fn git_commit(args: &Value, cfg: &Config) -> Outcome {
 // ---- memory tool (agent-callable wrapper over crate::memory) ----
 
 fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
-    use crate::memory::Scope;
+    use crate::memory::{Importance, Scope};
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let scope = Scope::parse(
         args.get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("workspace"),
     );
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let importance = Importance::parse(
+        args.get("importance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("normal"),
+    );
     match action {
         "save" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
-            let description = args
+            let mut description = args
                 .get("description")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             if name.trim().is_empty() {
                 return Outcome::err("memory save requires 'name'");
             }
             if content.trim().is_empty() {
                 return Outcome::err("memory save requires 'content'");
             }
-            match crate::memory::save_memory_scoped(
+            if description.trim().is_empty() {
+                description = content
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect();
+            }
+            // Prefer accumulation: if the name already exists, append instead of
+            // clobbering (auto-reflect often re-saves the same topic).
+            if crate::memory::memory_exists_scoped(&cfg.workspace, scope, name) {
+                return memory_append_inner(
+                    &cfg.workspace,
+                    scope,
+                    name,
+                    content,
+                    mem_type,
+                    &description,
+                    importance,
+                    force,
+                    true,
+                );
+            }
+            match crate::memory_hygiene::gate_write(
                 &cfg.workspace,
                 scope,
                 name,
                 content,
                 mem_type,
-                description,
+                importance,
+                force,
             ) {
-                Ok(p) => {
-                    let id = p
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    Outcome::ok(format!(
-                        "saved {} memory '{name}' (id: {id})",
-                        scope.as_str()
-                    ))
-                }
+                Ok(warnings) => match crate::memory::save_memory_scoped_with_importance(
+                    &cfg.workspace,
+                    scope,
+                    name,
+                    content,
+                    mem_type,
+                    &description,
+                    importance,
+                ) {
+                    Ok(p) => {
+                        let id = p
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let mut msg =
+                            format!("saved {} memory '{name}' (id: {id})", scope.as_str());
+                        for w in warnings {
+                            msg.push_str("\nnote: ");
+                            msg.push_str(&w);
+                        }
+                        Outcome::ok(memory_write_ok(&cfg.workspace, msg))
+                    }
+                    Err(e) => Outcome::err(e),
+                },
                 Err(e) => Outcome::err(e),
             }
         }
         "append" => {
-            // Accumulate facts onto an existing memory (creating it if absent)
-            // instead of overwriting. The store trims the oldest facts when the
-            // rolling cap is exceeded, so accumulated knowledge stays bounded.
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let mem_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("note");
-            let description = args
+            let mut description = args
                 .get("description")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             if name.trim().is_empty() {
                 return Outcome::err("memory append requires 'name'");
             }
             if content.trim().is_empty() {
                 return Outcome::err("memory append requires 'content'");
             }
-            match crate::memory::append_memory_scoped(
+            if description.trim().is_empty() {
+                description = content
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect();
+            }
+            memory_append_inner(
                 &cfg.workspace,
+                scope,
+                name,
+                content,
+                mem_type,
+                &description,
+                importance,
+                force,
+                false,
+            )
+        }
+        "list" => {
+            // Catalog view (name + one-line). Use get for full bodies.
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let entries = if scope_str.is_empty() {
+                crate::memory::scan_all_memories(&cfg.workspace)
+            } else {
+                crate::memory::scan_memories_scoped(&cfg.workspace, scope)
+            };
+            if entries.is_empty() {
+                return Outcome::ok("(no memories)");
+            }
+            let mut out = String::from("Memory catalog (use action=get with id for full text):\n");
+            for m in &entries {
+                let id = m
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let blurb = if !m.description.is_empty() {
+                    m.description.clone()
+                } else {
+                    m.content
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let desc = if blurb.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {blurb}")
+                };
+                out.push_str(&format!(
+                    "- {} [id: {}] ({}, {}, {}){}\n",
+                    m.name,
+                    id,
+                    m.mem_type,
+                    m.scope.as_str(),
+                    m.importance.as_str(),
+                    desc
+                ));
+            }
+            Outcome::ok(out.trim_end().to_string())
+        }
+        "get" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = if id.trim().is_empty() {
+                args.get("name").and_then(|v| v.as_str()).unwrap_or("")
+            } else {
+                id
+            };
+            if id.trim().is_empty() {
+                return Outcome::err("memory get requires 'id' (or 'name')");
+            }
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let result = if scope_str.is_empty() {
+                crate::memory::get_memory(&cfg.workspace, id)
+            } else {
+                crate::memory::get_memory_scoped(&cfg.workspace, scope, id)
+            };
+            match result {
+                Ok(m) => {
+                    let id = m
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    crate::memory_recall::record_get(&cfg.workspace, &id);
+                    Outcome::ok(format!(
+                        "# {} [id: {}] ({}, {}, {})\n{}\n\n{}",
+                        m.name,
+                        id,
+                        m.mem_type,
+                        m.scope.as_str(),
+                        m.importance.as_str(),
+                        if m.description.is_empty() {
+                            "(no description)".to_string()
+                        } else {
+                            m.description
+                        },
+                        m.content.trim_end()
+                    ))
+                }
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "forget" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.trim().is_empty() {
+                return Outcome::err("memory forget requires 'id' (the memory slug/name)");
+            }
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let result = if scope_str.is_empty() {
+                crate::memory::forget_memory_any(&cfg.workspace, id)
+            } else {
+                crate::memory::forget_memory_scoped(&cfg.workspace, scope, id)
+            };
+            match result {
+                Ok(()) => Outcome::ok(format!("forgot memory '{id}'")),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "consolidate" => {
+            let scope_opt = if args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                None
+            } else {
+                Some(scope)
+            };
+            match crate::memory_hygiene::consolidate(&cfg.workspace, scope_opt) {
+                Ok(report) => Outcome::ok(memory_write_ok(&cfg.workspace, report.message)),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "stats" => {
+            let s = crate::memory_recall::summary_json(&cfg.workspace);
+            let hit = s
+                .get("relevant_hit_rate")
+                .and_then(|v| v.as_f64())
+                .map(|f| format!("{:.0}%", f * 100.0))
+                .unwrap_or_else(|| "n/a".into());
+            let syn = s
+                .get("synonym_recovery_rate")
+                .and_then(|v| v.as_f64())
+                .map(|f| format!("{:.0}%", f * 100.0))
+                .unwrap_or_else(|| "n/a".into());
+            Outcome::ok(format!(
+                "Memory recall stats (workspace):\n\
+                 - turns tracked: {}\n\
+                 - relevant offers/gets/misses: {}/{}/{}\n\
+                 - relevant hit rate: {hit}\n\
+                 - synonym-miss offers/recovered: {}/{}\n\
+                 - synonym recovery rate: {syn}\n\
+                 (synonym misses = body matched the prompt but name/description did not — \
+                 Milestone 4 embedding trigger)",
+                s.get("turns").and_then(|v| v.as_u64()).unwrap_or(0),
+                s.get("relevant_offers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                s.get("relevant_gets").and_then(|v| v.as_u64()).unwrap_or(0),
+                s.get("relevant_misses")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                s.get("synonym_miss_offers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                s.get("synonym_miss_gets")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            ))
+        }
+        other => Outcome::err(format!(
+            "memory: unknown action '{other}' (save|append|list|get|forget|consolidate|stats)"
+        )),
+    }
+}
+
+fn memory_append_inner(
+    workspace: &std::path::Path,
+    scope: crate::memory::Scope,
+    name: &str,
+    content: &str,
+    mem_type: &str,
+    description: &str,
+    importance: crate::memory::Importance,
+    force: bool,
+    redirected_from_save: bool,
+) -> Outcome {
+    match crate::memory_hygiene::gate_write(
+        workspace, scope, name, content, mem_type, importance, force,
+    ) {
+        Err(e) => Outcome::err(e),
+        Ok(warnings) => {
+            match crate::memory::append_memory_scoped(
+                workspace,
                 scope,
                 name,
                 content,
@@ -3267,77 +3657,40 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    Outcome::ok(format!(
-                        "appended to {} memory '{name}' (id: {id})",
-                        scope.as_str()
-                    ))
-                }
-                Err(e) => Outcome::err(e),
-            }
-        }
-        "list" => {
-            // When a scope is explicitly specified, list only that scope.
-            // When omitted (the common case), list BOTH scopes so the agent
-            // sees every memory it has — global + workspace.
-            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-            let entries = if scope_str.is_empty() {
-                crate::memory::scan_all_memories(&cfg.workspace)
-            } else {
-                crate::memory::scan_memories_scoped(&cfg.workspace, scope)
-            };
-            if entries.is_empty() {
-                return Outcome::ok("(no memories)");
-            }
-            let mut out = String::new();
-            for m in &entries {
-                let id = m
-                    .path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let desc = if m.description.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", m.description)
-                };
-                out.push_str(&format!(
-                    "- {} [id: {}] ({}, {}){}\n",
-                    m.name,
-                    id,
-                    m.mem_type,
-                    m.scope.as_str(),
-                    desc
-                ));
-                if !m.content.is_empty() {
-                    for l in m.content.lines().take(3) {
-                        out.push_str(&format!("    {l}\n"));
+                    let mut base = if redirected_from_save {
+                        format!(
+                            "name exists — appended to {} memory '{name}' (id: {id}) instead of overwriting",
+                            scope.as_str()
+                        )
+                    } else {
+                        format!("appended to {} memory '{name}' (id: {id})", scope.as_str())
+                    };
+                    for w in warnings {
+                        base.push_str("\nnote: ");
+                        base.push_str(&w);
                     }
+                    Outcome::ok(memory_write_ok(workspace, base))
                 }
-            }
-            Outcome::ok(out.trim_end().to_string())
-        }
-        "forget" => {
-            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if id.trim().is_empty() {
-                return Outcome::err("memory forget requires 'id' (the memory slug/name)");
-            }
-            // When a scope is specified, delete from that scope only.
-            // When omitted, search both scopes (workspace first, then global).
-            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-            let result = if scope_str.is_empty() {
-                crate::memory::forget_memory_any(&cfg.workspace, id)
-            } else {
-                crate::memory::forget_memory_scoped(&cfg.workspace, scope, id)
-            };
-            match result {
-                Ok(()) => Outcome::ok(format!("forgot memory '{id}'")),
                 Err(e) => Outcome::err(e),
             }
         }
-        other => Outcome::err(format!(
-            "memory: unknown action '{other}' (save|append|list|forget)"
-        )),
     }
+}
+
+fn memory_write_ok(workspace: &std::path::Path, msg: String) -> String {
+    let n = crate::memory::memory_count(workspace);
+    let mut out = if n >= crate::memory::SAVE_COUNT_WARN_THRESHOLD {
+        format!(
+            "{msg}\nnote: {n} memories stored — prefer append/merge/forget; standing catalog is capped"
+        )
+    } else {
+        msg
+    };
+    if let Some(cons) = crate::memory_hygiene::maybe_auto_consolidate(workspace) {
+        out.push('\n');
+        out.push_str(&cons);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3713,6 +4066,28 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains("main.rs"));
         assert!(o.output.contains("lib.rs"));
+    }
+
+    #[test]
+    fn glob_matches_brace_alternatives() {
+        let (root, cfg) = tmp_ws();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "x").unwrap();
+        fs::write(root.join("src/lib.go"), "x").unwrap();
+        fs::write(root.join("README.md"), "x").unwrap();
+        fs::write(root.join("notes.txt"), "x").unwrap();
+        let o = execute("glob", &json!({"pattern":"**/*.{rs,go,md}"}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("main.rs"), "{}", o.output);
+        assert!(o.output.contains("lib.go"), "{}", o.output);
+        assert!(o.output.contains("README.md"), "{}", o.output);
+        assert!(!o.output.contains("notes.txt"), "{}", o.output);
+
+        let g = execute("grep", &json!({"pattern":"x", "glob":"**/*.{rs,md}"}), &cfg);
+        assert!(g.ok, "{}", g.output);
+        assert!(g.output.contains("main.rs"), "{}", g.output);
+        assert!(g.output.contains("README.md"), "{}", g.output);
+        assert!(!g.output.contains("lib.go"), "{}", g.output);
     }
 
     #[test]
@@ -4327,6 +4702,18 @@ mod tests {
 
     #[test]
     fn memory_tool_arg_validation() {
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "catalyst_memtool_root_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let _mem_root = crate::memory::override_memory_root(root);
         let (_root, cfg) = tmp_ws();
         // unknown action
         let o = execute("memory", &json!({ "action": "nope" }), &cfg);
@@ -4345,6 +4732,18 @@ mod tests {
     fn memory_tool_append_accumulates() {
         // append must accumulate onto a memory instead of overwriting it, so
         // repeated learnings about the same topic compound rather than clobber.
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "catalyst_memtool_root_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let _mem_root = crate::memory::override_memory_root(root);
         let (_root, cfg) = tmp_ws();
         let save = execute(
             "memory",
@@ -4358,8 +4757,7 @@ mod tests {
             &cfg,
         );
         assert!(ap.ok, "append should succeed: {}", ap.output);
-        // Inspect the stored memory directly: the `list` action truncates to a
-        // 3-line preview, which would hide a 4th-line appended fact.
+        // Inspect the stored memory directly: list is catalog-only now.
         let entries = crate::memory::scan_memories(&cfg.workspace);
         assert_eq!(entries.len(), 1, "should be one accumulated memory");
         let c = &entries[0].content;
@@ -4382,6 +4780,87 @@ mod tests {
             .ok
         );
         assert!(!execute("memory", &json!({ "action": "append", "name": "x" }), &cfg).ok);
+    }
+
+    #[test]
+    fn memory_tool_save_redirects_to_append_when_name_exists() {
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "catalyst_memtool_root_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let _mem_root = crate::memory::override_memory_root(root);
+        let (_root, cfg) = tmp_ws();
+        assert!(execute(
+            "memory",
+            &json!({ "action": "save", "name": "topic", "content": "fact one is durable here", "description": "t" }),
+            &cfg,
+        )
+        .ok);
+        let o = execute(
+            "memory",
+            &json!({ "action": "save", "name": "topic", "content": "fact two is also durable", "description": "t" }),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(
+            o.output.contains("appended") || o.output.contains("name exists"),
+            "second save should append: {}",
+            o.output
+        );
+        let entries = crate::memory::scan_memories(&cfg.workspace);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("fact one"));
+        assert!(entries[0].content.contains("fact two"));
+    }
+
+    #[test]
+    fn memory_tool_get_returns_full_body() {
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "catalyst_memtool_root_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let _mem_root = crate::memory::override_memory_root(root);
+        let (_root, cfg) = tmp_ws();
+        assert!(
+            execute(
+                "memory",
+                &json!({
+                    "action": "save",
+                    "name": "deep",
+                    "content": "line1\nline2\nline3\nline4",
+                    "description": "deep note",
+                    "type": "note"
+                }),
+                &cfg,
+            )
+            .ok
+        );
+        let list = execute("memory", &json!({ "action": "list" }), &cfg);
+        assert!(list.ok, "{}", list.output);
+        assert!(list.output.contains("deep"));
+        assert!(
+            !list.output.contains("line4"),
+            "list must stay catalog-only: {}",
+            list.output
+        );
+        let got = execute("memory", &json!({ "action": "get", "id": "deep" }), &cfg);
+        assert!(got.ok, "{}", got.output);
+        assert!(got.output.contains("line4"), "get must return full body");
+        assert!(!execute("memory", &json!({ "action": "get" }), &cfg).ok);
     }
 
     #[test]

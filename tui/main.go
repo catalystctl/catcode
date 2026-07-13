@@ -44,24 +44,30 @@ type session struct {
 	coreEvents chan *coreEvent
 	stdinCh    chan []byte // P1-15: stdin writes are funneled through a writer goroutine
 
-	authed              bool
-	models              []modelInfo
-	modelIdx            int
-	busy                bool
-	queuedNext          bool                         // a follow-up/steer turn is chained after the current one
-	queued              *queuedMsg                   // the currently-queued follow-up/steer (drives the pinned banner + Esc-dequeue)
-	todos               []map[string]json.RawMessage // latest todo_write state (pinned panel)
-	turnCount           int
-	pendingApproval     *approvalPrompt
-	pendingIntercom     *intercomPrompt
-	intercomNudge       time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
-	pendingAsk          *askPrompt
-	pendingSudo         *sudoPrompt
-	updateInfo          *updateInfo // non-nil when a newer release is available (drives the top banner)
-	lastMetrics         json.RawMessage
-	approvalModeStr     string
-	sessionList         []sessionEntry
-	skillsList          []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
+	authed          bool
+	models          []modelInfo
+	modelIdx        int
+	busy            bool
+	queuedNext      bool                         // a follow-up/steer turn is chained after the current one
+	queued          *queuedMsg                   // the currently-queued follow-up/steer (drives the pinned banner + Esc-dequeue)
+	todos           []map[string]json.RawMessage // latest todo_write state (pinned panel)
+	turnCount       int
+	pendingApproval *approvalPrompt
+	pendingIntercom *intercomPrompt
+	intercomNudge   time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
+	pendingAsk      *askPrompt
+	pendingSudo     *sudoPrompt
+	updateInfo      *updateInfo // non-nil when a newer release is available (drives the top banner)
+	lastMetrics     json.RawMessage
+	approvalModeStr string
+	sessionList     []sessionEntry
+	skillsList      []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
+	pluginCommands  []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Plugin      string `json:"plugin"`
+	} // plugin-declared slash commands (drives /{name} palette + dispatch)
+	pluginStatus        string // last plugin_status text (footer); empty = clear
 	memoryList          []memoryEntry
 	pendingMemoryPicker bool   // open memory picker once list_memory arrives
 	pluginPickerMode    string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)

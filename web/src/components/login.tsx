@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { authClient, setTwoFactorHandler } from "@/lib/auth-client";
 import { AuthScreen } from "@/components/auth-screen";
+import { AppDialogHost, useAppDialog } from "@/components/app-dialog";
 
 type Step = "credentials" | "two-factor";
 
@@ -15,6 +16,7 @@ export function LoginForm() {
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { prompt, dialog } = useAppDialog();
 
   // Register the 2FA handler so signIn.email can flip us to the TOTP step.
   useEffect(() => {
@@ -30,98 +32,120 @@ export function LoginForm() {
     e.preventDefault();
     setError(null);
     setLoading(true);
-    const { error } = await authClient.signIn.email({ email, password });
-    setLoading(false);
-    if (error) {
-      setError(error.message ?? "Sign in failed.");
-      return;
+    try {
+      const { data, error } = await authClient.signIn.email({ email, password });
+      if (error) {
+        setError(error.message ?? "Sign in failed.");
+        return;
+      }
+      // better-auth may return success with twoFactorRedirect while the hook also fires
+      if ((data as { twoFactorRedirect?: boolean } | null)?.twoFactorRedirect) return;
+      router.replace("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
     }
-    // If 2FA is required, the onTwoFactorRedirect handler flips the step.
-    // Otherwise we're signed in.
-    router.replace("/");
-    router.refresh();
   }
 
   async function onPasskey() {
     setError(null);
     setLoading(true);
-    const { error } = await authClient.signIn.passkey();
-    setLoading(false);
-    if (error) {
-      setError(error.message ?? "Passkey sign-in failed.");
-      return;
+    try {
+      const { data, error } = await authClient.signIn.passkey();
+      if (error) {
+        setError(error.message ?? "Passkey sign-in failed.");
+        return;
+      }
+      if ((data as { twoFactorRedirect?: boolean } | null)?.twoFactorRedirect) return;
+      router.replace("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
     }
-    router.replace("/");
-    router.refresh();
   }
 
   async function onVerifyTotp(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setLoading(true);
-    const { error } = await authClient.twoFactor.verifyTotp({ code });
-    setLoading(false);
-    if (error) {
-      setError(error.message ?? "Invalid code.");
-      return;
+    try {
+      const { error } = await authClient.twoFactor.verifyTotp({ code });
+      if (error) {
+        setError(error.message ?? "Invalid code.");
+        return;
+      }
+      router.replace("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
     }
-    router.replace("/");
-    router.refresh();
   }
 
   async function onUseBackupCode() {
-    const bc = window.prompt("Enter a backup code:");
-    if (!bc) return;
+    const bc = await prompt({
+      title: "Backup code",
+      message: "Enter one of your single-use backup codes.",
+      placeholder: "xxxx-xxxx",
+      required: true,
+      confirmLabel: "Verify",
+    });
+    if (!bc?.trim()) return;
     setError(null);
     setLoading(true);
-    const { error } = await authClient.twoFactor.verifyBackupCode({ code: bc });
-    setLoading(false);
-    if (error) {
-      setError(error.message ?? "Invalid backup code.");
-      return;
+    try {
+      const { error } = await authClient.twoFactor.verifyBackupCode({ code: bc.trim() });
+      if (error) {
+        setError(error.message ?? "Invalid backup code.");
+        return;
+      }
+      router.replace("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
     }
-    router.replace("/");
-    router.refresh();
   }
 
   if (step === "two-factor") {
     return (
-      <AuthScreen title="Two-factor verification" subtitle="Enter the code from your authenticator app.">
-        <form onSubmit={onVerifyTotp} className="space-y-4">
-          <input
-            type="text"
-            inputMode="numeric"
-            autoFocus
-            required
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
-            className="auth-input text-center text-lg tracking-[0.4em]"
-            placeholder="000000"
-            autoComplete="one-time-code"
-          />
-          {error && <p className="text-sm text-danger">{error}</p>}
-          <button type="submit" disabled={loading} className="auth-btn-primary">
-            {loading ? "Verifying…" : "Verify"}
-          </button>
-          <button
-            type="button"
-            onClick={onUseBackupCode}
-            className="auth-btn-ghost"
-          >
-            Use a backup code
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setStep("credentials");
-              setError(null);
-            }}
-            className="auth-btn-ghost"
-          >
-            ← Back
-          </button>
-        </form>
-      </AuthScreen>
+      <>
+        <AppDialogHost dialog={dialog} />
+        <AuthScreen title="Two-factor verification" subtitle="Enter the code from your authenticator app.">
+          <form onSubmit={onVerifyTotp} className="space-y-4">
+            <input
+              type="text"
+              inputMode="numeric"
+              autoFocus
+              required
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              className="auth-input text-center text-lg tracking-[0.4em]"
+              placeholder="000000"
+              autoComplete="one-time-code"
+            />
+            {error && <p className="text-sm text-danger">{error}</p>}
+            <button type="submit" disabled={loading} className="auth-btn-primary">
+              {loading ? "Verifying…" : "Verify"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void onUseBackupCode()}
+              className="auth-btn-ghost"
+            >
+              Use a backup code
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setStep("credentials");
+                setError(null);
+              }}
+              className="auth-btn-ghost"
+            >
+              ← Back
+            </button>
+          </form>
+        </AuthScreen>
+      </>
     );
   }
 

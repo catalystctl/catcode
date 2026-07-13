@@ -82,13 +82,15 @@ pub fn parse_permission_rule(s: &str, behavior: PermissionBehavior) -> Option<Pe
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sandbox {
     None,     // no sandboxing (default; denylist tripwire only)
-    Firejail, // wrap bash in `firejail` with a writable-workspace profile
+    Firejail, // wrap bash in `firejail` with a writable-workspace profile (Linux)
+    Seatbelt, // macOS sandbox-exec profile whitelisting the workspace
 }
 
 impl Sandbox {
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "firejail" | "fj" => Sandbox::Firejail,
+            "seatbelt" | "macos" | "sandbox-exec" => Sandbox::Seatbelt,
             _ => Sandbox::None,
         }
     }
@@ -96,6 +98,7 @@ impl Sandbox {
         match self {
             Sandbox::None => "none",
             Sandbox::Firejail => "firejail",
+            Sandbox::Seatbelt => "seatbelt",
         }
     }
 }
@@ -827,6 +830,25 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_env: "IFLOW_API_KEY",
         alt_envs: &[],
         description: "iFlow AI via browser OAuth (/login + /oauth-code) or IFLOW_API_KEY. Chat requests use iFlow HMAC headers.",
+    },
+    // --- Local OpenAI-compatible gateways (no API key required) ---
+    ProviderPreset {
+        id: "ollama",
+        label: "Ollama (local)",
+        kind: ProviderKind::OpenAI,
+        base_url: "http://localhost:11434/v1",
+        api_key_env: "",
+        alt_envs: &[],
+        description: "Local Ollama OpenAI-compatible API (http://localhost:11434/v1). No API key required — /login ollama with an empty key.",
+    },
+    ProviderPreset {
+        id: "lmstudio",
+        label: "LM Studio (local)",
+        kind: ProviderKind::OpenAI,
+        base_url: "http://localhost:1234/v1",
+        api_key_env: "",
+        alt_envs: &[],
+        description: "Local LM Studio OpenAI-compatible server (http://localhost:1234/v1). No API key required — /login lmstudio with an empty key.",
     },
 ];
 
@@ -1983,9 +2005,12 @@ mod tests {
     fn sandbox_parse() {
         assert_eq!(Sandbox::parse("firejail"), Sandbox::Firejail);
         assert_eq!(Sandbox::parse("fj"), Sandbox::Firejail);
+        assert_eq!(Sandbox::parse("seatbelt"), Sandbox::Seatbelt);
+        assert_eq!(Sandbox::parse("macos"), Sandbox::Seatbelt);
         assert_eq!(Sandbox::parse("none"), Sandbox::None);
         assert_eq!(Sandbox::parse(""), Sandbox::None);
         assert_eq!(Sandbox::Firejail.as_str(), "firejail");
+        assert_eq!(Sandbox::Seatbelt.as_str(), "seatbelt");
         assert_eq!(Sandbox::None.as_str(), "none");
     }
 

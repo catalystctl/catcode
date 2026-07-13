@@ -200,6 +200,23 @@ pub enum Command {
     DisablePlugin { name: String },
     #[serde(rename = "list_plugins")]
     ListPlugins,
+    /// Re-scan plugin directories, preserving enabled/disabled flags.
+    #[serde(rename = "reload_plugins")]
+    ReloadPlugins,
+    /// Run a plugin-declared slash command by name.
+    #[serde(rename = "plugin_command")]
+    PluginCommand {
+        name: String,
+        #[serde(default)]
+        args: String,
+    },
+    /// List slash commands declared by enabled plugins.
+    #[serde(rename = "list_plugin_commands")]
+    ListPluginCommands,
+    /// Re-discover available subagents (builtin + user + project) and emit an
+    /// `agents` event. Used by the web/TUI agent pickers.
+    #[serde(rename = "list_agents")]
+    ListAgents,
     /// Ask core to re-inject memories into the system prompt (called after saving a memory).
     #[serde(rename = "refresh_memory")]
     RefreshMemory,

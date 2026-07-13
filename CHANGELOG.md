@@ -1,346 +1,252 @@
 # Changelog
 
-## Unreleased
+All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
-### Improved — compaction reliability and tool-call token efficiency
-- Summarize compaction pre-digests the middle, truncates oversized tool payloads,
-  map-reduces chunks over 100k chars, and merges summary + durable facts into
-  **one** model call (max 3072 tokens out).
-- Soft digest uses a **token-budgeted** keep window (20% of context), digests
-  oversized `write_file`/`edit` tool-call arguments, then budget-reclaims anything
-  still over 50% of the window (including few-huge-message chats). Restorable
-  outputs are cached **before** digest so restore hints are truthful. Subagents
-  get the same soft-digest path **plus** ingress capping, digest-cache restore,
-  schema-only tool gate, and no deferred tools by default.
-- Post-compact target lowered to **35%** of the window.
-- Tool schemas are staged: core tools always; deferred tools (`git_*`, `fetch`,
-  `web_search`, `bulk_*`, `diagnostics`, `spawn`, …) load via **`load_tools`**.
-- Ingress prefers smart-truncation (24KB) over opaque digests; cache restores
-  are capped (16KB); identical re-reads dedupe; `read_file` auto-window 200;
-  `bulk_read` aggregate budget; fetch/search output caps aligned.
-- Deferred tools that are not currently offered in the tool list are refused
-  with a `load_tools` hint (so schema staging cannot be bypassed by a
-  hallucinated call).
-- `/login` already covers API-key paste, key override, and OAuth; `/logout`
-  clears credentials. The redundant `/key` convenience command is gone.
-- Auth error / first-run copy now points at `/login`. The `set_key` protocol
-  remains for SDK/web/reauth.
+## 2026-07-12
 
-### Added — PI-compatible bang bash (`!` / `!!`)
-- Type `!command` in the TUI or web composer to run bash in the workspace and
-  add the output to model context (next turn sees it). Use `!!command` to run
-  without adding output to context.
-- Core `user_bash` command: same sandbox/denylist as the agent `bash` tool,
-  emits `bash_execution`, defers context injection while a turn is in flight.
-- SDK `executeBash` / `recordBashResult` wired for PI parity.
+- **feat(core): compaction reliability + deferred tool-schema staging** [6a48bd4]
+  Complete overhaul of the compaction system: pre-digests the middle of the
+  conversation, truncates oversized tool payloads, map-reduces chunks over
+  100k chars, and merges summary + durable facts into one model call (max 3072
+  tokens out). Soft digest uses a token-budgeted keep window (20% of context),
+  digests oversized `write_file`/`edit` call arguments, and budget-reclaims
+  anything still over 50% of the window. Post-compact target lowered to 35%.
+  Tool schemas are now staged — core tools always present, deferred tools
+  (`git_*`, `fetch`, `web_search`, `bulk_*`, `diagnostics`, `spawn`) load via
+  `load_tools`. Ingress prefers smart-truncation (24KB) over opaque digests;
+  cache restores capped (16KB); identical re-reads dedupe.
+- **skill: document the review-uncommitted-changes workflow** [947aaae]
 
-### Added — `/goal` Advanced: role models + per-model concurrency
-- Checkbox **Advanced** on the TUI and web `/goal` forms:
-  - Pin models for **planner**, **worker**, and **reviewer** agents.
-  - Set **per-model concurrency** (capped by the global concurrency).
-- Core applies role pins when materializing deploy prompts; planning turn uses
-  the planner model when set. Deploy schedules each step with a global semaphore
-  plus a per-model semaphore.
+## 2026-07-11
 
-### Fixed — no auto-reflect during active goal mode
-- Auto-reflect is skipped while a goal is mid-flight (planning, plan_ready,
-  deploying, running, blocked). Planning only produces a plan — reflecting
-  there delayed deploy and had nothing durable to learn from. Reflect still
-  runs on normal turns after the goal is done/failed/idle.
+- **feat: remove /key command, consolidate OAuth to app-owned store, fix review findings** [3e54128]
+  The `/key` convenience command is removed — `/login` already covers API-key
+  paste, key override, and OAuth; `/logout` clears credentials. OAuth tokens
+  moved to the app's own config directory, not per-workspace files. Auth error
+  / first-run copy now points at `/login`. The `set_key` protocol remains for
+  SDK/web/reauth.
 
-### Added — `/goal` mode (plan then deploy subagents)
-- **Core goal protocol** (`start_goal`, `cancel_goal`, `goal_status`,
-  `approve_goal_plan`, `revise_goal`) with a phase machine:
-  planning → plan_ready → deploying → running → done|failed.
-- Planning turns call the new **`goal_write_plan`** tool to submit a structured
-  multi-step plan; the core materializes per-subagent prompts and deploys them
-  under the user's **concurrency** and **model/provider allowlists**.
-- Subagent model resolution now routes each candidate through
-  `resolve_provider_for_model` and filters by active goal allowlists.
-- **TUI**: multi-field `/goal` modal (goal text, concurrency, max tasks,
-  providers, models, review-before-deploy). Plan-ready review with
-  approve / revise / cancel. `/cancel-goal` aborts.
-- **Web**: matching Goal modal, plan-ready banner, and goal status chip.
-- WorkState.goal is set from `/goal` (replace, not one-shot seed).
+## 2026-07-10
 
-### Fixed — TUI modified Enter in SSH/Konsole
-- **Shift+Enter** now inserts a newline reliably in terminals that support
-  enhanced keyboard reporting (including Konsole over SSH). The TUI enables
-  xterm `modifyOtherKeys` level 2 and Kitty progressive keyboard reporting
-  after Bubble Tea enters the alternate screen, so modified Enter keys are
-  reported distinctly instead of arriving as plain Enter or leaking `OM` into
-  the input.
-- **Ctrl+Enter** now steers instead of queueing a follow-up when the terminal
-  reports the modifier. Enhanced Ctrl+letter reports are translated back into
-  Bubble Tea's normal key messages, preserving existing bindings such as
-  Ctrl+C, Ctrl+P, Ctrl+K, Ctrl+T, and Ctrl+O.
-- Added regression coverage for modified-Enter CSI sequences and the legacy
-  SS3 keypad-Enter fallback.
+- **feat: GitHub plugin installs, tool cache, models.dev, and model picker** [8f5d083]
+  Plugins can now be installed directly from GitHub repositories. Tool cache
+  for improved performance, `models.dev` API for model metadata, and a proper
+  model picker in the TUI.
+- **feat: PI-compatible bang bash, plugin memory_provider, install scopes, CLI precedence fix** [1c08256]
+  `!command` / `!!command` support in the TUI and web composer for running
+  bash inline. Core `user_bash` command with the same sandbox/denylist as the
+  agent `bash` tool. Plugins can now provide `memory_provider` hooks (e.g.
+  SQLite-backed memory). Install scopes added. CLI argument precedence fixed.
+- **fix(web): mkdir auth config dir before opening SQLite** [77b9000]
+- **fix(install): preserve commit-SHA release tags on Windows** [e3365a3]
+- **style: rustfmt + gofmt to unblock CI** [e801999]
+- **docs(skill): document hunk-level staging for entangled concurrent edits** [78004d4]
 
-### Added — cross-platform installers & standalone executables
-- All three desktop platforms now ship BOTH a native installer AND a
-  self-contained standalone executable, so `catcode` runs from the terminal with
-  no install on any OS:
-  - **Windows** — `catcode-<ver>-windows.msi` (per-user MSI, adds `catcode` to PATH,
-    no admin) **and** `catcode-<ver>-windows-x86_64.exe` (single file, Rust core
-    embedded via `go:embed` `-tags embed_core`; extracts its core to
-    `%LOCALAPPDATA%\catalyst-code` on first run). `release-windows.sh` now
-    emits both (previously MSI + zip only).
-  - **macOS** — `catcode-<ver>-macos-{arm64,x86_64}.dmg` (disk-image installer:
-    mount + double-click `Install catcode.command` to put `catcode` on `/usr/local/bin`)
-    **and** the existing `catcode-<ver>-macos-{arm64,x86_64}` standalone.
-    `release-macos.sh` now builds the `.dmg` too (`hdiutil` real UDIF on macOS,
-    `xorriso` HFS+ hybrid when cross-built on Linux).
-  - **Linux** — `catcode-<ver>-<arch>.AppImage` (self-contained AppImage wrapping
-    the embedded-core standalone) **and** `catcode-<ver>-linux-<arch>`
-    standalone. New `release-linux.sh` builds the core natively, embeds it into
-    the TUI, generates a terminal-prompt icon, and packages the AppImage with
-    `appimagetool` (fetched on demand; runs without FUSE via
-    `APPIMAGE_EXTRACT_AND_RUN=1`).
-  - New `release-all.sh` runs all three platform scripts and reports
-    per-platform pass/fail, so a partial toolchain still ships what it can.
-  - Packaging assets: `packaging/linux/{AppRun,catcode.desktop,make-icon.py}` and
-    `packaging/macos/{install.command,README.txt}`.
-- `tui/embed_core.go`: the extracted embedded core now gets the platform exe
-  suffix (`coreExeSuffix()`), so on Windows it caches as
-  `catcode-core-<ver>-windows-amd64.exe` (a proper PE name CreateProcess exec's
-  and AV tools recognize); unchanged on macOS/Linux.
-- Fixed a latent `go build -ldflags` bug: `release-windows.sh` and `release.sh`
-  used `-X main/coreVersion` with a slash (`main/coreVersion`), which the Go
-  1.24 linker rejects. Corrected to `-X main.coreVersion` (dot), matching
-  `release-macos.sh`.
+## 2026-07-09
 
-### Added — core tooling, compaction & approval improvements
-- **`fetch` tool** (native HTTP GET): a first-class read-only tool that fetches
-  a URL and returns lightly HTML-stripped text (bounded to `fetch_max_bytes`,
-  default 256 KiB). Unlike `bash curl`, it is NOT subject to the bash sandbox, so
-  it still works under `--no-network` where bash egress is dead — but it honors
-  `--no-network` unless you explicitly populate `fetch_allowlist` (so it can't
-  surprise-bypass an egress block; the allowlist is the opt-in). A non-empty
-  `fetch_allowlist` (host globs like `*.rust-lang.org`, `docs.rs`) restricts
-  egress; empty = any host when network is enabled. Closes the gap where the
-  `researcher` agent couldn't look anything up under the hard-security config.
-  New config: `fetch_allowlist`, `fetch_timeout_secs` (20), `fetch_max_bytes`
-  (262144); CLI `--fetch-timeout`; env `CATALYST_CODE_FETCH_ALLOWLIST`,
-  `CATALYST_CODE_FETCH_TIMEOUT`, `CATALYST_CODE_FETCH_MAX_BYTES`. Also usable
-  via `bulk`.
-- **`edit`: `replace_all` and `normalize_whitespace`** per edit. `replace_all`
-  replaces every occurrence instead of erroring on a non-unique match.
-  `normalize_whitespace` matches on whitespace-collapsed text (runs of
-  whitespace become a single space) so indentation/spacing drift still lands —
-  the replacement edits the real text region, projected back via a char map. On
-  a failed search, a closest-line hint (line number + token overlap) lets the
-  model self-correct in one shot instead of re-reading the whole file. The
-  matching core is refactored into a non-writing `plan_edit` shared by
-  `execute_edit` and the new approval preview.
-- **`bash`: per-call `timeout`** override (clamped to `[1, max_bash_timeout_secs]`,
-  default ceiling 600s) so a slow `cargo build --release`/`npm install`/test
-  suite can get more time for one command without raising the global default.
-  New config: `max_bash_timeout_secs`; CLI `--max-bash-timeout`; env
-  `CATALYST_CODE_MAX_BASH_TIMEOUT`.
-- **`bash`: smarter output truncation.** When over the 32 KiB cap, the tail is
-  kept AND error/warning lines are salvaged from the dropped head — a compile
-  error in the middle of a huge build log no longer vanishes under a pure tail
-  truncation.
-- **Approval diff preview.** For `write_file`/`edit`/`patch`, the
-  `approval_request` event now carries a `diff` field: the unified diff the
-  call *would* produce (computed without writing). The TUI renders it under the
-  approval banner (and in the history block), so the human approves the actual
-  resulting change, not just the raw search/replace blobs. Layout reserves the
-  real banner height so the diff never overlaps the viewport.
-- **Subagent per-agent depth.** An agent's `maxSubagentDepth` frontmatter now
-  actually caps its subtree (it was dead code): `run_single` computes
-  `child_max_depth(global, agent.max_subagent_depth)`, so e.g. a constrained
-  agent can't fan out deeper than its declared ceiling even when the global
-  cap is higher.
-- **Token-budget-aware compaction tail.** The verbatim tail kept on compaction
-  is now sized by a token budget (25% of the context window, floored at 6k)
-  with a 6-message minimum, instead of a fixed 8/10 messages — so a quiet
-  stretch isn't over-kept and a huge tool result doesn't eat the whole tail.
-- **`session-extract` memory accumulates.** Auto-extracted durable facts now
-  APPEND across compactions (with a rolling 16 KiB cap, oldest trimmed) instead
-  of overwriting, so early-session facts survive later compactions.
+- **feat: Add /goal mode for plan-then-deploy subagent orchestration** [2480b53]
+  Core goal protocol with full phase machine: planning → plan_ready →
+  deploying → running → done|failed. Planning turns use `goal_write_plan` to
+  submit structured plans; core materializes per-subagent prompts and deploys
+  under user concurrency and model/provider allowlists. TUI has multi-field
+  `/goal` modal with plan review/approve/revise. Web has matching Goal modal
+  and status chip. Advanced mode pins models for planner/worker/reviewer.
+- **feat: Add multi-provider catalog, Antigravity OAuth, web auth, installer menu** [0e60400]
+  Multi-provider catalog system for defining providers in config.json. New
+  OAuth provider for Antigravity. Web auth support added. Installer menu for
+  cross-platform setup.
+- **feat: Add sudo passthrough — intercept sudo commands as blocking password flyout** [52be092]
+  When the model runs `sudo`, the TUI intercepts it as a blocking password
+  flyout �� the password is forwarded to the command without leaking into the
+  conversation history.
+- **fix(core): close critical/high security + long-chat durability gaps** [ed7c7c0]
+  Security audit fixes: critical and high-severity gaps closed. Long-chat
+  durability improvements for conversations that span many turns.
+- **tui: replace settings field editor with dedicated modals** [6613273]
+  Settings UI overhauled: each setting category now has its own modal instead
+  of a shared field editor.
+- **tui: migrate to Bubble Tea v2 (Go 1.25, declarative View, KeyPressMsg)** [f3e5dc1]
+  Major TUI framework upgrade to Bubble Tea v2, leveraging Go 1.25's
+  declarative View pattern and typed `KeyPressMsg`.
+- **core: plugins can declare OAuth providers; auto-reflect fires before summary** [714cbd4]
+  Plugins can now declare OAuth providers the harness can use for auth flows.
+  Auto-reflect reordered to fire before the model's completion summary, so the
+  summary is the last thing the user reads.
+- **fix(tui): support modified enter in terminals** [ddabd5d]
+  Shift+Enter now inserts a newline reliably in terminals with enhanced
+  keyboard reporting (including Konsole over SSH). Ctrl+Enter steers instead
+  of queueing a follow-up.
+- **skill: note concurrent-session staging isolation** [8480161]
 
-### Fixed - plugin hook dispatch for write/edit/bash/read
-- Pre-execution hooks (`pre_write`/`pre_bash`/`pre_read`) ran **twice** per
-  tool call: a leftover dead loop re-executed every hook, so on denial the model
-  received two "denied" tool-result messages (double token counting and
-  duplicate context pollution) and any side-effectful hook fired twice. The
-  dispatch is now a single pass.
-- A hook's `modify` now **merges** over the original tool args (per-key) instead
-  of replacing them wholesale. Previously a `pre_write` hook returning
-  `{"content": "..."}` (as in the bundled lint-check example) dropped `path`, so
-  the write targeted the wrong/empty path. `path`/`edits`/`command`/etc. are now
-  preserved and hooks compose (each sees earlier amendments). New helper
-  `plugins::apply_modify` (with unit tests) locks the contract.
-- Hook `reason` is now surfaced to the model: on `allow` it is appended to the
-  tool result as a `Plugin hooks:` note, and on deny it is the deny message - so
-  the model knows its write/edit/bash/read was inspected or modified and can
-  react. `PLUGIN_DOCS` updated to match (merge semantics + reason surfacing).
-- Subagent tool dispatch now applies the same dangerous-path guard
-  (`workspace::check_dangerous_path`) to `write_file`/`edit`/`patch` as the main
-  loop, so scoped subagent writes to `.git/**`, `**/.ssh/**`, `**/.env*`, etc.
-  are blocked and the subagent model is told why.
+## 2026-07-08
 
-### Fixed — per-model reasoning levels from /models/info
-- The core's `/models/info` parser looked for reasoning levels under the wrong
-  field (`capabilities.thinking_levels` / `reasoning_levels` / `reasoning_efforts`),
-  but the endpoint nests them under `capabilities.reasoning.levels`. Every
-  live-discovered model therefore got **empty** levels and the TUI fell back to
-  the hardcoded `low/medium/high` trio for all models. The parser now reads the
-  real `capabilities.reasoning.levels` (with `reasoning.supported` for the flag),
-  so each model advertises the efforts it actually accepts — e.g. GLM 5.2
-  `none/high/max`, flash & qwen `none/low/medium/high`, kimi/coder `[]`
-  (keep the low/med/high fallback). Flat capability fields remain as a fallback
-  for other OpenAI-compatible endpoints.
-- Bumped the models cache schema to v3 (with a `version` gate on read) so stale
-  caches written by the older parser — which stored empty `thinking_levels` and
-  wrong `vision` flags — are treated as a miss and refreshed instead of masking
-  the fixes for the 8h TTL.
-- TUI: the `/reasoning` + `ctrl+r` hints no longer hardcode `(low/med/high)`;
-  the picker already renders the selected model's actual advertised levels.
+- **feat(core): plugin feature parity + context management UX** [3c34a1b]
+  Plugin system brought to feature parity: approvals hardened, intercom
+  interactions, diagnostics tool scheduling, plugin lifecycle management.
+- **core: cross-session workspace presence + awareness** [d105507]
+  Core now tracks concurrent sessions in the same workspace, surfacing presence
+  info to avoid conflicts.
+- **fix: production-readiness hardening + lifecycle/SSRF fixes** [3383c6f]
+  Production hardening pass: server-side request forgery (SSRF) protections,
+  lifecycle edge cases addressed, and reliability improvements.
+- **fix(core): cross-process-safe file writes via fsutil module** [cfcc07d]
+  New `fsutil` module implements atomic writes with unique temp names,
+  preventing cross-process file corruption that the old in-process mutex
+  couldn't protect against.
+- **docs: rewrite README + add top-level Windows installer** [b6b19bd]
+- **chore: git-commit-all skill prefers exact CI gates** [5da7ce2]
+- **ci: merge self-hosted Podman runners, fix flaky core test + remove docker CI** [2da1723, 1467d8b]
+  CI migrated from Docker to self-hosted Podman runners. Flaky core test fixed
+  by using unique temp dirs per call. Docker CI removed.
+- **tui: add catcode self-updater (launch-time banner + catcode --update)** [4a0e52a]
+  Built-in self-updater: launch-time update check with 6h cache TTL, and
+  `catcode --update` CLI flag. Cache-backed, non-blocking, silent on failure.
+- **fix(tui): wire up the ask tool flyout (was entirely dead code)** [2c92b9c]
+  The `ask` tool's TUI flyout was never connected — models could call `ask`
+  but the user never saw the question. Now it wires through properly.
+- **docs(skill): add 'watch CI to green' step to git-commit-all** [1a0228e]
 
-### Fixed — vision capability from /models/info
-- The `/models/info` parser read vision from the wrong field
-  (`capabilities.vision`), but the endpoint exposes it as
-  `capabilities.supports_vision`, encoded as `true` / `false` / `"via-handoff"`.
-  Every live model therefore reported `vision=false`, so the vision-handoff
-  plugin always handed image turns off even from natively vision-capable models
-  (kimi/coder/flash/qwen). The parser now reads `capabilities.supports_vision`;
-  only boolean `true` counts as native client-side vision, so `"via-handoff"`
-  (GLM 5.2, whose vision only works on `/v1/messages`, which the harness doesn't
-  use) maps to `false` and the plugin routes its image turns to a native model.
+## 2026-07-07
 
-### Added — macOS standalone executable
-- `release-macos.sh` cross-compiles the harness into a single self-contained
-  macOS executable per arch (arm64 + x86_64): the Rust core is built with
-  `cargo zigbuild` (zig as the macOS linker; pure-Rust `rustls-tls` so no
-  macOS SDK is needed), then embedded into the Go TUI via `go:embed`
-  (`-tags embed_core`). Each output file runs from any CWD — it extracts its
-  bundled core to `~/Library/Caches/catalyst-code` on first run and launches
-  the harness in that directory, with no separate `catcode-core` and no install.
-- TUI: new `embeddedCorePath()` (build-tagged `embed_core`) is wired into
-  `coreBinaryPath()` ahead of the usual `$CATCODE_CORE`/dev/installed search;
-  it's a no-op stub in normal builds, so dev, Linux, and the Windows MSI
-  layout are unchanged.
+- **web: adopt Catalyst (Obsidian) design system + add Linux installer** [67223cd]
+  Major visual overhaul adopting the Catalyst/Obsidian design system. Linux
+  installer added for the TUI binary.
+- **Rename: Umans Harness → Catalyst Code** [8372ba8, 1b4703a]
+  Full tree rename from `umans-harness` to `catalyst-code`. All paths,
+  binaries, env vars, and docs updated. The "Obsidian" design system becomes
+  the default visual identity.
+- **cross-platform install: fix broken install.sh, add macOS launchd + Windows web service** [a7ff434]
+  Cross-platform install script fixed. macOS launchd plist for auto-start.
+  Windows web service for background operation.
+- **core: re-present interrupted ask questions after a core restart** [728a8c4]
+  If the core restarts while an `ask` question is pending, the question is
+  re-presented so the user doesn't lose the prompt.
+- **tui: keep command label visible when a list-row description overflows** [1fe4607]
+- **feat(core): plugins can declare custom tools at runtime (no MCP)** [270b082]
+  Major plugin capability: plugins can add arbitrary custom tools via a `tools`
+  hook at runtime, no MCP server needed. Tools get full schema, dispatch,
+  approval, and result handling.
+- **feat(install): download prebuilt binaries + commit-SHA releases (no compile)** [6fafe02]
+  Installer now downloads prebuilt binaries from GitHub Releases instead of
+  compiling from source. Commit-SHA release tags allow pinning to any commit.
+- **docs: README overhaul** [9e0b700, 98b3311, 7e2e0ef, 9fecd6b, 1be7ae0]
+  Skills published: `publish-to-new-github-repo`, `git-commit-all` with
+  conditional push and workflow reporting. README refactored to lead with
+  recommended install scripts per platform, added logo and structured sections.
+- **ci: Dockerfile fixes + self-hosted Podman runner setup** [2f51b11, 020091f, 4b5f3aa, 3d4a791, 65e8be5, c3da32c]
+  Dockerfile parse errors fixed. `FROM golang:1.24-slim` changed to
+  `golang:1.24-bookworm` (no `-slim` tag). `cargo build --locked` for
+  deterministic builds. AppImage/MSI made optional so releases publish
+  without `wixl`/`appimagetool`. Self-hosted Podman runners deployed.
 
-### Changed
-- Removed the fixed agentic turn cap (`--max-turns` / `max_turns`, default 200)
-  and the `spawn` sub-agent turn cap (`spawn_max_turns`, default 10). Turns are
-  now bounded only by the session token budget (`--max-session-tokens`, 0 =
-  unlimited), the `finish` tool, abort, or the model stopping. Removed: the
-  `--max-turns` flag, `CATALYST_CODE_MAX_TURNS` env var, `max_turns` config
-  key, `ready` event's `max_turns` field, the `set_config max_turns` knob, and
-  the TUI "Max Turns" setting. Stale `max_turns` config values are ignored.
+## 2026-07-06
 
-### Fixed
-- Tokens-per-second (`tps` in the `metrics` event, shown as "tok/s" in the
-  footer) was wrong: it divided the *last* request's output tokens by the
-  whole turn's wall time — including every tool call's execution/wait time
-  and every prefill. It now divides total output tokens across all requests
-  by accumulated *generation time* (each request's first-token → end
-  window), so tool-call waits and prefill (TTFT) are excluded — pure model
-  throughput, not end-to-end wall time. The live mid-stream TPS now times
-  each request from its own first token (not the turn's), and
-  `mark_first_token` fires on the first reasoning chunk as well as content,
-  so reasoning-model (GLM @ high) TPS is accurate.
+- **prep for first GitHub push: complete .gitignore, untrack scratch artifacts, add MIT license** [e1c8c68]
+  Repository prepared for public push: comprehensive `.gitignore` that tracks
+  only source + shipped agent/plugin/skill definitions. MIT license added.
+  All scratch artifacts untracked.
+- **web: OAuth manual-login banner + live work-state panel; add add-key-provider skill** [f897f75]
+  Web UI gets an OAuth manual-login banner for providers that need browser
+  flow. Live work-state panel shows what the model is doing. New
+  `add-key-provider` skill for the harness.
+- **feat(memory): add global cross-codebase memory scope** [de9e0b2]
+  Memory system extended with a `global` scope — facts persist across
+  different workspace boundaries.
+- **Add live Umans concurrency (used/limit) to footer** [844897b]
+  TUI footer now shows live API concurrency usage (used/limit) from the Umans
+  backend.
+- **feat: ask tool, subagent peek/steer, restricted-path approval-gating, intercom empty-enter fix** [565a39d]
+  `ask` tool for interactive model→user questions. Subagent peek/steer for
+  inspecting and redirecting child agents mid-flight. Restricted-path approval
+  gating for `.git/**`, `.ssh/**`, `.env*`, etc. Intercom empty-enter crash
+  fixed.
+- **fix(long-term-usage): plug leaks, races, deadlock, SSRF, corruption paths** [80815f3]
+  Comprehensive reliability audit for long-running sessions: memory leaks,
+  race conditions, deadlocks, SSRF vectors, and file corruption paths all
+  addressed.
+- **web: inflight composer ring, ambient work-state, code-copy fix, run pruning** [bdc640a]
+  Web UI improvements: spinning indicator while composer is in-flight, ambient
+  work-state that stays visible, code-copy button fixed, old runs pruned.
 
-### Added — in-flight steer, follow-up & commands
-- While a turn is running the input now stays live so you can compose a
-  follow-up, steer the model, or run commands without waiting:
-  - **Enter** queues a follow-up message (runs after the current turn); the
-    core's one-deep buffer drains it automatically.
-  - **Ctrl+Enter** steers: interrupts the running turn and redirects it with
-    the typed message (new `steer` command). On terminals where Ctrl+Enter
-    isn't reported as a distinct key, `/steer <msg>` works everywhere.
-  - **Esc** aborts the turn (and drops any queued follow-up/steer).
-    `/abort` still works.
-  - Slash commands and the palette (`ctrl+p`/`ctrl+k`) are usable mid-turn.
-- A `queuedNext` flag keeps the TUI streaming across the steer/follow-up
-  hand-off so the footer never flashes "ready" between chained turns.
-- Core: the run-loop drain (`run_turn_and_drain`) is shared by `send` and
-  `steer`; `abort` now also clears the queued prompt.
+## 2026-07-05
 
-### Added — reasoning level control
-- Models now advertise their supported thinking levels via a new
-  `thinking_levels` field on `ModelInfo` (e.g. `["low","medium","high"]`).
-  Levels are read from `/models/info` (`capabilities.thinking_levels`,
-  `reasoning_levels`, or `reasoning_efforts`) when the endpoint provides them,
-  and fall back to the built-in snapshot otherwise.
-- `reasoning_effort` is validated against the selected model's levels before
-  each request (`resolve_effort`): an unsupported effort is clamped to the
-  closest preferred level (high → medium → low → … → first). This replaces
-  the hardcoded `model.contains("glm")` sniff — GLM now advertises only
-  `["high"]` and is clamped data-driven-ly. The core emits an `info` event
-  when clamping occurs.
-- TUI: the settings "Reasoning" field cycles the *selected model's* levels
-  (not a fixed low/medium/high), and the effort is clamped on model load,
-  model switch, and `/model` so the displayed value always matches the wire
-  field. The model picker now shows `think:low/medium/high`.
+- **feat: multi-provider OAuth, TUI keybinds, auto-reflect, subagent observability, and reviewer agents** [ba39dc8]
+  Multi-provider OAuth support for Anthropic and Google. New TUI keybindings
+  for power users. Auto-reflect system that learns from each conversation turn.
+  Subagent observability: peek into what child agents are doing. Reviewer
+  agents for code review workflows.
+- **Typed Message, Claude OAuth, Gemini Code Assist API, always-run sanitizer, TPS accuracy** [60bd9a1]
+  Typed message protocol for structured communication. Claude OAuth matches
+  the official `claude-code` CLI byte-for-byte. Gemini Code Assist API OAuth
+  matches `gemini-cli` flow. Always-run sanitizer for tool outputs. TPS
+  metric fixed: now divides by generation time (not wall clock), excluding
+  tool-call waits and prefill.
 
-## 0.2.0 — 2026-06-19 (production hardening)
+## 2026-07-02
 
-### Fixed
-- `bulk_edit` called `execute(path, …)` with the *path* as the tool name;
-  every multi-file edit returned "unknown tool: <path>". Now passes `"edit"`.
-- Settings modal sent `set_config` but the core had no such command; bash-timeout
-  and max-turns edits were dead. Added `SetConfig` + `config_changed` event;
-  `ready` now emits `bash_timeout_secs` / `max_turns`.
-- TUI never passed `--session`, so persistent chats were unreachable.
-  The TUI now writes one JSONL per workspace under
-  `~/.config/catalyst-code/sessions/`.
-- Flaky `workspace::tests::relative_inside_ok` under parallel `cargo test`
-  (shared fixed temp dir). Now uses a unique dir per call.
+- **Add KV-cache-aware rolling work-state, persisted session stats, /stats overhaul, and TUI polish** [5cb2947]
+  Work-state now rolling with KV-cache awareness (older states evicted by
+  token budget). Session stats persisted to disk and survive restarts. `/stats`
+  command overhauled with richer data. TUI polish pass.
+- **feat: add web_search tool + multi-provider /login & /logout** [77ec46e]
+  `web_search` tool for looking up current information. Unified `/login` and
+  `/logout` commands that work across all providers (API key and OAuth).
 
-### Added — agentic loops / infinite turns
-- `max_turns` default 25 → 200; real ceiling is the session token budget.
-- `finish` tool lets the model exit the loop cleanly.
-- `spawn` tool: nested agentic turn with a fresh sub-conversation (depth 1),
-  bounded by `--max-turns` for the sub-agent (`spawn_max_turns`, default 10).
-- `todo_write` / `todo_read`: persistent plan that survives context compaction.
-- `patch` tool: unified-diff applier for larger refactors than `edit`.
-- `diagnostics` tool: runs `cargo check` / `tsc --noEmit` / `go build` /
-  `py_compile` so the model can type-check its work.
-- Summarizing compaction: dropped turns are summarized by a model call
-  (`summarize_on_compact`, default on) instead of vanishing. Falls back to the
-  drop-oldest marker if the summarize call fails.
-- `--max-session-tokens` hard session budget; trips before the request.
-- Read-file pagination (`offset`/`limit`); limits raised to 5 MB / 10 000 lines.
-- `bash` output cap 8 KB → 32 KB, truncating the *head* so errors survive.
-- `grep` size guard (5 MB/file) + binary sniff (NUL bytes).
+## 2026-07-01
 
-### Added — persistent chats
-- Session JSONL is now versioned (`_session_version` header) + fsync'd.
-- `/clear` (in-memory only, keep file) vs `/reset` (wipe both).
-- `/undo` drops the last turn. `/compact` forces compaction.
-- `/sessions` lists saved sessions; `/load_session` loads one.
-- `/stats` reports token + turn totals.
+- **Fix CRLF frontmatter parsing and chain run cancel scoping** [95816e1]
+  Chain runs (multi-step subagent sequences) now scope cancellation correctly.
+  Frontmatter parsing handles Windows CRLF line endings.
+- **Add Next.js web frontend (SSE bridge to core)** [b9a5022]
+  First public web frontend: Next.js app that connects to the core via
+  Server-Sent Events. Real-time chat, tool rendering, and session management.
+- **Add self-learning system and web frontend enhancements** [4560c4d]
+  Self-learning system that extracts durable facts from conversations and
+  persists them for future sessions. Web UI enhancements for the learning
+  features.
+- **Redesign TUI tool-call rendering into per-tool dispatchers** [0f6a29c]
+  TUI tool-call blocks completely redesigned: each tool type gets its own
+  dedicated renderer, making the output cleaner and more informative.
+- **Add real-usage token anchoring, skills, telemetry, multi-session web bridge** [1a3bf01]
+  Token anchoring uses real API usage data instead of estimates. Skills system
+  introduces composable capabilities. Telemetry for usage insights.
+  Multi-session web bridge lets the web UI manage multiple sessions.
 
-### Added — security
-- `--sandbox firejail`: wraps bash in a generated firejail profile that
-  whitelists only the workspace + shell paths.
-- `--no-network`: `unshare -n` so bash can't phone home.
-- Per-tool-*kind* approval escalation: "always" now un-gates only the matched
-  kind, not the whole session.
+## 2026-06-30
 
-### Added — reliability
-- `--idle-timeout` (default 120s, was hard-coded 60s); reasoning models that
-  think >60s before the first token no longer abort.
-- `reasoning_effort` + `reasoning_content` replay gated on Umans base URL;
-  other OpenAI-compatible servers no longer 400 on the unknown fields.
-- TUI auto-restarts the core once on unexpected exit (crash recovery), with
-  a persisted-key re-auth.
-- `send` while a turn is running queues (one-deep) instead of dropping the
-  prompt.
+- **Harden approvals, plugins, and intercom; add diagnostics tool** [a3624b4]
+  Approval system hardened with better context and controls. Plugin system
+  strengthened. Intercom (model↔model communication) made more reliable.
+  `diagnostics` tool added for running `cargo check` / `tsc --noEmit` /
+  `go build` / `py_compile` to type-check work.
+- **Add memory/git tools, diff view, per-model reasoning; cross-platform installers** [a34fcbe]
+  `memory` tool for persistent durable facts. `git_*` tool suite for version
+  control operations (status, diff, log, add, commit). Unified diff preview
+  in approval requests. Per-model reasoning levels read from `/models/info`.
+  Cross-platform installer builds (Windows MSI, Linux AppImage, macOS DMG).
+- **Add fetch tool, edit/bash/approval improvements, and TypeScript SDK** [1055559]
+  `fetch` tool: native HTTP GET with HTML stripping. `edit`: `replace_all`
+  and `normalize_whitespace` options. `bash`: per-call timeout override.
+  Approval diff preview shows the exact changes before approval. TypeScript
+  SDK (`@catalyst-code/sdk`) published with full tool set.
 
-### Added — tooling / UX
-- Image/vision input: `--allow-vision`, `/attach <path>` command, multimodal
-  user messages (data URLs, with magic-byte mime sniffing).
-- New slash commands in the palette + help: `/clear`, `/undo`, `/compact`,
-  `/sessions`, `/stats`, `/attach`.
-- Settings modal: Sandbox, No Network, Idle Timeout, Max Session Tokens.
+## 2026-06-29 — Initial commit
 
-### Packaging
-- `Dockerfile` (multi-stage, firejail + ca-certs in the runtime image).
-- `release.sh` builds + tars + checksums a versioned release.
-- This `CHANGELOG.md`.
+- **Initial commit: umans-harness v0.2.0** [7e95016]
+  First public release of the assistant coding harness (named "umans-harness"
+  at the time). Core agent loop with multi-turn conversations, tool execution,
+  and model provider integration.
+- **Add subagents & intercom system; drop fixed max-turns cap** [3e9b8be]
+  Subagent system: agents can spawn child agents with fresh contexts for
+  parallel or sequential work. Intercom system for model↔model communication.
+  Fixed `--max-turns` cap removed — sessions bounded only by token budget.
+- **Add macOS standalone & Windows installer builds, vision handoff, image attachments; fix TPS metric** [9860270]
+  macOS standalone executable (Rust core embedded in Go TUI via `go:embed`).
+  Windows MSI installer. Vision handoff: image-capable models handle vision
+  requests, and a plugin routes to them when the active model isn't
+  vision-capable. TPS metric accuracy fixed.
+- **Fix plugin hook dispatch, add subagents/plugins/skills, and CI workflow** [8083e55]
+  Plugin hook dispatch fixed: pre-execution hooks (`pre_write`/`pre_bash`)
+  no longer run twice per call. Hook `modify` now merges args per-key instead
+  of replacing them. Subagents, plugins, and skills directories established.
+  CI workflow with build + test matrix.
