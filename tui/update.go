@@ -225,7 +225,14 @@ func launchUpdateCheck(prog *tea.Program) {
 	// 1) fresh cache → answer immediately, no network.
 	if latest, ok := readUpdateCache(); ok {
 		if info := compareUpdate(latest); info != nil {
-			prog.Send(updateAvailableMsg{info: *info})
+			// Send from a goroutine: prog.Send blocks on a select until the
+			// event loop (started by prog.Run(), called after this returns)
+			// is draining messages. Calling it synchronously here deadlocks
+			// the main goroutine before Run() ever starts — the runtime then
+			// detects "all goroutines are asleep" and panics. This only
+			// triggers when a fresh cache reports an available update, hence
+			// the intermittent "after updating/installing" reports.
+			go prog.Send(updateAvailableMsg{info: *info})
 		}
 		return
 	}
