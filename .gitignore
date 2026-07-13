@@ -9,6 +9,7 @@ core/target/
 # Go (tui/) compiled binaries
 tui/tui
 tui/catalyst-code-tui
+tui/catalyst-code-tui.exe
 tui/catcode
 tui/catcode.exe
 tui/bin/
