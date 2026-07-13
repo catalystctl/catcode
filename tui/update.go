@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -442,6 +443,47 @@ func selfReplace(tmp, exe string) error {
 	return os.Rename(tmp, exe)
 }
 
+// canWriteDir reports whether the current user can create (and remove) a
+// file in dir. A system-wide install (e.g. /usr/local/bin, root-owned) is
+// not writable by an unprivileged user — detecting this up front lets us
+// escalate or fail with a clear message instead of crashing mid-download.
+func canWriteDir(dir string) bool {
+	f, err := os.CreateTemp(dir, ".catcode-probe.*")
+	if err != nil {
+		return false
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return true
+}
+
+// tryEscalateSudo re-execs the current binary under sudo, passing through the
+// original CLI args so the privileged child performs the real update. Returns
+// (exitCode, true) if escalation was attempted (success or failure), or
+// (0, false) if sudo isn't available on PATH.
+func tryEscalateSudo(exe string) (int, bool) {
+	sudo, err := exec.LookPath("sudo")
+	if err != nil {
+		return 0, false // no sudo (non-Unix, or not installed)
+	}
+	cmd := exec.Command(sudo, append([]string{exe}, os.Args[1:]...)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// Propagate the child's exit code when we can (e.g. user cancelled at
+		// the sudo prompt, or the update itself failed); otherwise generic.
+		if ee, ok := err.(*exec.ExitError); ok {
+			if code := ee.ExitCode(); code >= 0 {
+				return code, true
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  ✗ sudo escalation failed: %v\n", err)
+		return 1, true
+	}
+	return 0, true
+}
+
 // runUpdate performs the full self-update and returns an exit code.
 func runUpdate() int {
 	exe, err := os.Executable()
@@ -453,6 +495,27 @@ func runUpdate() int {
 		exe = rp // replace the real target, not a symlink
 	}
 	dir := filepath.Dir(exe)
+
+	// A system-wide install (e.g. /usr/local/bin, root-owned) can't be written
+	// to by an unprivileged user. Detect this before touching the network: if
+	// we can't write to the install dir, either re-exec under sudo so the
+	// update just works, or print a clear, actionable error — instead of
+	// failing mid-download with a cryptic temp-file permission error.
+	if !canWriteDir(dir) {
+		if os.Geteuid() != 0 {
+			fmt.Printf("catcode is installed system-wide (%s) and needs elevated privileges to update.\n", dir)
+			fmt.Println("Re-running with sudo…")
+			if code, ok := tryEscalateSudo(exe); ok {
+				return code
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  ✗ permission denied: cannot write to %s\n", dir)
+		fmt.Fprintf(os.Stderr, "    catcode is installed system-wide. Re-run with:\n")
+		fmt.Fprintf(os.Stderr, "      sudo catcode --update\n")
+		fmt.Fprintf(os.Stderr, "    or use the installer:\n")
+		fmt.Fprintf(os.Stderr, "      bash install.sh --update\n")
+		return 1
+	}
 
 	fmt.Println("Checking for updates…")
 	rel, err := fetchLatestRelease()
