@@ -2011,8 +2011,11 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				s.logError(err.Error())
 				return nil
 			}
-			s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
-			s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
+			if scope == "" {
+				s.openPluginInstallScopeModal(path)
+				return nil
+			}
+			s.sendPluginInstall(path, scope)
 			return nil
 		case "/plugin-list", "/plugin-config", "/plugin-enable", "/plugin-disable":
 			// Bare enable/disable open the toggle picker (same as /plugin-config);
@@ -2257,9 +2260,9 @@ func writeOSC52Cmd(text string) tea.Cmd {
 
 // parsePluginInstallArgs extracts the plugin source and install scope from
 // `/plugin-install` args (or the install modal value fields).
-// Scope defaults to "global". Recognizes global|workspace and --global/--workspace/-g/-w.
+// Scope is empty when omitted — callers should prompt (global vs workspace).
+// Recognizes global|workspace and --global/--workspace/-g/-w.
 func parsePluginInstallArgs(args []string) (path string, scope string, err error) {
-	scope = "global"
 	var pathParts []string
 	for _, a := range args {
 		switch strings.ToLower(strings.TrimSpace(a)) {

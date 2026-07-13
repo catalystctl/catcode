@@ -67,12 +67,12 @@ pub struct QueuedPrompt {
 
 /// A pending approval request the TUI must answer before the tool runs.
 const SYSTEM_PROMPT_BASE: &str = r#"You are a coding agent operating inside a Rust/Go harness with native Umans model access.
-You can read, edit, write, and list files, search with grep/glob, and run bash — all confined to the workspace.
+You can read, edit, write, and list files, search with grep/glob, and run shell commands — all confined to the workspace.
 
 Judgment (tool schemas own the mechanics):
 - Read/search before changing; prefer the smallest correct edit; verify with a command.
 - Prefer edit over write_file for targeted changes; prefer grep/glob (scoped) before full reads; page with offset/limit.
-- Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep bash commands short; for complex logic write a script and run it.
+- Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; for complex logic write a script and run it.
 - Use load_tools for deferred tools (git_*, fetch, web_search, bulk_*, diagnostics, spawn, …) only when needed.
 - Paths are workspace-relative; absolute paths and ".." are rejected.
 Be concise. When done, summarize in two lines.
@@ -98,6 +98,17 @@ Before non-trivial multi-agent work, apply `/skill:pi-subagents` for the full pl
 const SKILL_MANIFEST_MAX: usize = 12;
 const SKILL_DESC_MAX_CHARS: usize = 80;
 
+/// OS-aware shell guidance injected into every system prompt (main + subagents)
+/// so the model emits the matching command syntax: bash on Linux/macOS,
+/// PowerShell on Windows. The `bash` tool still carries its name (renaming it
+/// would break TUI/web/SDK wire compatibility); on Windows it executes the
+/// command through PowerShell via `shell_argv` (tools.rs). Override the shell
+/// with `CATALYST_CODE_SHELL` (e.g. `bash` under Git-Bash/WSL).
+#[cfg(target_os = "windows")]
+const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in PowerShell (pwsh if installed, else Windows PowerShell). Write PowerShell syntax — e.g. `Get-ChildItem`/`gci`, `Select-String`, `Remove-Item`, `$env:VAR`, `$LASTEXITCODE`. For complex logic write a `.ps1` script with write_file and run `powershell -File script.ps1`. Avoid POSIX-isms (`&&`/`||` chains, `2>/dev/null`, `$(...)`, `export`); use `;`/`if`/`$()`/`$env:` instead.";
+#[cfg(not(target_os = "windows"))]
+const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in bash. For complex logic write a script with write_file and run `bash script.sh`.";
+
 /// Build the full system prompt by appending git context, memory context,
 /// and a short plugins pointer (full plugin authoring lives in the
 /// `plugin-authoring` skill).
@@ -116,6 +127,8 @@ pub fn build_system_prompt(
         "Workspace root (absolute): {}. All relative tool paths resolve here. Ignore any other working-directory claims from the transport layer.",
         workspace.display()
     ));
+    prompt.push_str("\n\n");
+    prompt.push_str(SHELL_GUIDANCE);
     if let Some(git) = read_git_context(workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&git_context_injection(&git));
@@ -283,28 +296,24 @@ fn emit_agents_event(workspace: &std::path::Path, cfg: &config::Config) {
 }
 
 /// Build the JSON array of first-party provider presets for the `ready` and
-/// `provider_presets` events. Each entry tells the client whether a key or
-/// OAuth token is already stored from a prior explicit `/login` in this app
-/// — so a picker can show "log in" vs "log out". Env vars and third-party
-/// CLI credentials are never treated as signed-in.
+/// `provider_presets` events. Each entry tells the client whether a key is
+/// already stored from a prior explicit `/login` in this app — so a picker can
+/// show "log in" vs "log out". Env vars are never treated as signed-in.
+/// Subscription OAuth is plugin-only (appended below from `pm.oauth_configs()`).
 fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> Vec<Value> {
     let mut out: Vec<Value> = config::PROVIDER_PRESETS
         .iter()
         .map(|p| {
             let configured = cfg.find_provider(p.id).is_some();
-            // Auth available = literal key already in config OR this app's
-            // OAuth store. Do not treat env vars or third-party CLI creds as
-            // signed-in — the user must paste a key or complete /login OAuth.
-            let has_oauth = config::preset_has_oauth_creds(p);
+            // Auth available = literal key already in config. Do not treat env
+            // vars as signed-in — the user must paste a key via /login.
             let has_key = cfg
                 .find_provider(p.id)
                 .and_then(|pc| pc.api_key.clone().filter(|s| !s.is_empty()))
-                .is_some()
-                || has_oauth;
+                .is_some();
             // Keyless local presets (empty api_key_env) count as logged-in once
             // configured — Ollama / LM Studio need no API key.
-            let logged_in = configured
-                && (has_key || (p.api_key_env.is_empty() && !oauth::supports_login(p.id)));
+            let logged_in = configured && (has_key || p.api_key_env.is_empty());
             json!({
                 "id": p.id,
                 "label": p.label,
@@ -316,7 +325,7 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
                 "hasKey": has_key || (p.api_key_env.is_empty() && configured),
                 "configured": configured,
                 "loggedIn": logged_in,
-                "supportsOauth": oauth::supports_login(p.id),
+                "supportsOauth": false,
             })
         })
         .collect();
@@ -846,61 +855,18 @@ pub fn logged_in_providers_for(
 }
 
 /// True when a provider's reusable OAuth credentials exist (cheap sync file
-/// check, no refresh). Used by `logged_in_providers_for` to gate OAuth-only
-/// providers into aggregation. The actual token refresh happens at turn/
+/// check, no refresh). Used by `logged_in_providers_for` to gate plugin OAuth
+/// providers into aggregation. The actual token refresh happens at turn /
 /// discovery time via `oauth::enrich_oauth`.
 fn oauth_creds_for_provider(
     p: &config::ProviderConfig,
     pm: Option<&plugins::PluginManager>,
 ) -> bool {
-    // A plugin-declared OAuth provider owns its token check exclusively (so a
-    // plugin anthropic-kind provider isn't wrongly gated on Claude CLI creds).
+    // Subscription OAuth is plugin-only.
     if let Some(pm) = pm {
         if pm.oauth_config(&p.name).is_some() {
             return pm.has_oauth_creds(&p.name);
         }
-    }
-    if p.kind == config::ProviderKind::Anthropic {
-        return oauth::has_claude_creds();
-    }
-    if provider::is_codex_endpoint(&p.base_url) {
-        return oauth::has_codex_creds();
-    }
-    if provider::is_gemini_endpoint(&p.base_url) {
-        return oauth::has_google_creds();
-    }
-    // xAI SuperGrok OAuth (OAuth-only preset — no API key). Without this,
-    // login writes tokens + config but aggregation skips the provider, so
-    // /models never shows Grok and the TUI looks like sign-in failed.
-    if provider::is_xai_endpoint(&p.base_url) || p.name == "xai" {
-        return oauth::has_xai_creds();
-    }
-    if provider::is_qwen_endpoint(&p.base_url) || p.name == "qwen" {
-        return oauth::has_qwen_creds();
-    }
-    if provider::is_github_copilot_endpoint(&p.base_url) || p.name == "github" {
-        return oauth::has_github_creds();
-    }
-    if provider::is_kimi_coding_endpoint(&p.base_url) || p.name == "kimi-coding" {
-        return oauth::has_kimi_coding_creds();
-    }
-    if provider::is_kilocode_endpoint(&p.base_url) || p.name == "kilocode" {
-        return oauth::has_kilocode_creds();
-    }
-    if provider::is_cline_endpoint(&p.base_url) || p.name == "cline" {
-        return oauth::has_cline_creds();
-    }
-    if provider::is_cline_endpoint(&p.base_url) || p.name == "clinepass" {
-        return oauth::has_clinepass_creds();
-    }
-    if provider::is_kimchi_endpoint(&p.base_url) || p.name == "kimchi" {
-        return oauth::has_kimchi_creds();
-    }
-    if provider::is_codebuddy_endpoint(&p.base_url) || p.name == "codebuddy-cn" {
-        return oauth::has_codebuddy_creds();
-    }
-    if provider::is_iflow_endpoint(&p.base_url) || p.name == "iflow" {
-        return oauth::has_iflow_creds();
     }
     false
 }
@@ -1371,10 +1337,12 @@ async fn clear_work_state(st: &State) {
 
 /// Persist cumulative session stats to the `<session>.stats` sidecar so `/stats`
 /// survives a restart. Called at turn completion (after `record_turn`).
+/// Also fsyncs the session JSONL so the turn's appends are durable.
 async fn persist_stats(st: &State) {
     let Some(p) = st.cfg.read().await.session_file.clone() else {
         return;
     };
+    session::sync(&p);
     let stats = session::SessionStats {
         tokens_in: *st.tokens_in.lock().await,
         tokens_out: *st.tokens_out.lock().await,
@@ -1382,6 +1350,15 @@ async fn persist_stats(st: &State) {
         turns: st.logger.turn_count(),
     };
     session::save_stats(&p, &stats);
+}
+
+/// Best-effort fsync of the session file (no-op when no session is configured).
+/// Used on abort paths that may have appended messages without going through
+/// [`persist_stats`].
+async fn sync_session_file(st: &State) {
+    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+        session::sync(p);
+    }
 }
 
 /// Zero the cumulative stats in memory and on the sidecar (reset / clear /
@@ -1900,17 +1877,15 @@ async fn main() {
                     return;
                 };
                 // API-key path: require an explicitly pasted key. Do not scan
-                // the environment. OAuth-capable presets use `login_oauth`
-                // instead; a keyless `login` is only allowed when this app
-                // already has OAuth creds on disk (re-bind after logout of
-                // config) or the preset is OAuth-only (empty env var name).
+                // the environment. Subscription OAuth is plugin-only
+                // (`login_oauth`). Keyless login is only for local presets
+                // with an empty api_key_env (Ollama / LM Studio).
                 let key = api_key.filter(|s| !s.is_empty());
-                if key.is_none() && !config::preset_has_oauth_creds(p) && !p.api_key_env.is_empty()
-                {
+                if key.is_none() && !p.api_key_env.is_empty() {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "no API key provided for '{}' — paste a key via /login, or use OAuth login when supported",
+                            "no API key provided for '{}' — paste a key via /login (subscription OAuth is available via plugins)",
                             p.label
                         )),
                     ));
@@ -1966,7 +1941,7 @@ async fn main() {
                     json!(if key.is_some() {
                         format!("logged into {}.", p.label)
                     } else {
-                        format!("logged into {} (using stored OAuth credentials).", p.label)
+                        format!("logged into {} (no API key required).", p.label)
                     }),
                 ));
                 emit(
@@ -2018,15 +1993,9 @@ async fn main() {
                     );
                     return;
                 }
-                // Delete the OAuth credential files our /login created, so the
-                // provider is FULLY logged out — not just its config/runtime key.
-                // Without this, has_*_creds() still returns true (token file
-                // remains on disk) and the provider re-appears as "logged in" on
-                // the next session, with the stale token silently used for turns.
+                // Delete plugin OAuth credential files so the provider is fully
+                // logged out (not just its config/runtime key).
                 for n in &to_remove {
-                    oauth::clear_oauth_creds(n);
-                    // Plugin-declared OAuth providers: delete their token file +
-                    // run the plugin's clear action + drop the cached token.
                     state.plugin_manager.clear_oauth(n).await;
                 }
                 // If the active provider was one of those logged out, clear the
@@ -2077,31 +2046,23 @@ async fn main() {
                 state.refresh_models(&client).await;
             }
             Command::LoginOauth { preset } => {
-                // Perform the interactive OAuth subscription login (no official
-                // CLI needed). Runs the flow (Google device-code / Claude
-                // authorize+PKCE+loopback / xAI device-code), emitting
-                // `oauth_prompt` events with the URL/code to visit, stores the
-                // token, ensures the provider is configured, and re-aggregates
-                // so its models appear in /models.
-                //
-                // Spawned on a background task so a multi-minute device-code
-                // poll (xAI SuperGrok) does not freeze the stdin command loop
-                // — otherwise the TUI looks hung for 30s+ while waiting for
-                // browser approval.
+                // Plugin-declared subscription OAuth only. Built-in vendor
+                // OAuth was removed from core — install a plugin that declares
+                // an `oauth` block (e.g. catcode-chatgpt-provider).
                 let plugin_login = state.plugin_manager.supports_oauth_login(&preset);
-                if !oauth::supports_login(&preset) && !plugin_login {
+                if !plugin_login {
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!(
-                            "'{}' has no OAuth login flow yet; use /login with an API key instead",
-                            preset
+                            "'{preset}' has no plugin OAuth login — install a plugin that declares oauth.provider_id=\"{preset}\", or paste an API key via /login"
                         )),
                     ));
                     return;
                 }
-                let label = config::find_preset(&preset)
-                    .map(|p| p.label.to_string())
-                    .or_else(|| state.plugin_manager.oauth_config(&preset).map(|c| c.label))
+                let label = state
+                    .plugin_manager
+                    .oauth_config(&preset)
+                    .map(|c| c.label)
                     .unwrap_or_else(|| preset.clone());
                 emit(&Event::new("info").with(
                     "message",
@@ -2124,11 +2085,7 @@ async fn main() {
                                 .with("message", json!(p.message)),
                         );
                     };
-                    let outcome = if plugin_login {
-                        st.plugin_manager.oauth_login(&preset, &prompt_emit).await
-                    } else {
-                        oauth::login(&preset, &cl, &prompt_emit).await
-                    };
+                    let outcome = st.plugin_manager.oauth_login(&preset, &prompt_emit).await;
                     // Stale attempt (user started another login) — drop result.
                     if OAUTH_GEN.load(std::sync::atomic::Ordering::SeqCst) != gen {
                         emit(&Event::new("info").with(
@@ -2142,22 +2099,11 @@ async fn main() {
                             finalize_oauth(&st, &cl, &preset, &label).await;
                         }
                         Ok(oauth::LoginOutcome::AwaitingCode { pending }) => {
-                            // No-browser (SSH/headless) flow: the prompt was already
-                            // emitted; stash the PKCE verifier + redirect_uri and
-                            // wait for the user to paste the code/redirect URL via
-                            // the `oauth_code` command.
-                            let kind = pending.kind.clone();
                             *st.pending_oauth.lock().await = Some(pending);
-                            let msg = match kind.as_str() {
-                                "openai" => "OAuth login awaiting callback URL. Open the URL above locally, approve, then paste the final localhost URL with /oauth-code <url>.",
-                                "anthropic" => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code or final callback URL via /oauth-code <code-or-url>.",
-                                "xai" | "grok" => "OAuth login awaiting approval. Open the URL above on any device and click Approve — it finishes automatically (no /oauth-code needed for xAI device-code).",
-                                "qwen" => "OAuth login awaiting approval. Open the URL above on any device and approve — it finishes automatically (no /oauth-code needed for Qwen device-code).",
-                                "github" | "kimi-coding" | "kilocode" | "codebuddy-cn" => "OAuth login awaiting approval. Open the device URL above, sign in and approve — it finishes automatically (no /oauth-code needed).",
-                                "cline" | "clinepass" | "kimchi" | "iflow" => "OAuth login awaiting a code. Open the URL above, sign in, then paste the redirect URL or token via /oauth-code <value>.",
-                                _ => "OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>.",
-                            };
-                            emit(&Event::new("info").with("message", json!(msg)));
+                            emit(&Event::new("info").with(
+                                "message",
+                                json!("OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>."),
+                            ));
                         }
                         Err(e) => {
                             st.logger.log(
@@ -2173,10 +2119,7 @@ async fn main() {
                 });
             }
             Command::OauthCode { code } => {
-                // Complete a pending no-browser (manual-code) OAuth login — the
-                // SSH/headless path. The PKCE verifier was stashed by the
-                // `login_oauth` AwaitingCode arm; exchange the pasted code,
-                // store the token, then finalize exactly like the web flow.
+                // Complete a pending plugin OAuth login (manual / device paste).
                 let pending = state.pending_oauth.lock().await.take();
                 let pending = match pending {
                     Some(p) => p,
@@ -2189,22 +2132,24 @@ async fn main() {
                     }
                 };
                 let preset = pending.kind.clone();
-                let label = config::find_preset(&preset)
-                    .map(|p| p.label.to_string())
-                    .or_else(|| state.plugin_manager.oauth_config(&preset).map(|c| c.label))
+                let label = state
+                    .plugin_manager
+                    .oauth_config(&preset)
+                    .map(|c| c.label)
                     .unwrap_or_else(|| preset.clone());
-                // A plugin owns the exchange when this pending login is for a
-                // plugin-declared OAuth provider; otherwise the built-in flow.
-                let result = if state.plugin_manager.oauth_config(&preset).is_some() {
-                    state
-                        .plugin_manager
-                        .oauth_complete(&preset, &pending, &code)
-                        .await
-                } else {
-                    oauth::complete_oauth(&preset, &client, &pending, &code)
-                        .await
-                        .map(|_| ())
-                };
+                if state.plugin_manager.oauth_config(&preset).is_none() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "no plugin OAuth provider for '{preset}' — pending login discarded"
+                        )),
+                    ));
+                    return;
+                }
+                let result = state
+                    .plugin_manager
+                    .oauth_complete(&preset, &pending, &code)
+                    .await;
                 match result {
                     Ok(()) => {
                         finalize_oauth(&state, &client, &preset, &label).await;
@@ -3933,6 +3878,7 @@ fn run_turn_and_drain(
                     "turn terminated unexpectedly (panic): {detail}; please retry"
                 )),
             ));
+            sync_session_file(&st).await;
             emit(&Event::new("done"));
             return;
         }
@@ -4261,6 +4207,401 @@ async fn maybe_reflect_prompt(
     let recurring = pattern_log::recurring_patterns(&workspace);
     let text = build_reflect_text(&recurring);
     Some((text, recurring.len()))
+}
+
+enum ParallelWaveResult {
+    Done,
+    Aborted,
+}
+
+/// Gate + concurrently execute a contiguous batch of readonly recon tools.
+/// Falls back to emitting per-call errors when a gate denies a member; aborts
+/// the turn if the user hits /abort during an approval prompt.
+async fn run_parallel_readonly_wave(
+    st: &Arc<State>,
+    calls: &[message::ToolCall],
+    tool_defs: &[Value],
+    cancel: &CancellationToken,
+    turn_tool_calls: &mut u32,
+    shape_tools: &mut Vec<String>,
+    shape_files: &mut Vec<String>,
+) -> ParallelWaveResult {
+    struct Prepared {
+        id: String,
+        name: String,
+        args_str: String,
+        exec_args: Value,
+        hook_notes: Vec<String>,
+        /// Pre-resolved outcome (deny / restore / duplicate) skips execution.
+        early: Option<tools::Outcome>,
+    }
+
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(calls.len());
+
+    for tc in calls {
+        if cancel.is_cancelled() {
+            sync_session_file(st).await;
+            emit(&Event::new("aborted"));
+            return ParallelWaveResult::Aborted;
+        }
+        let id = tc.id.clone();
+        let name = tc.function.name.clone();
+        let args_str = tc.function.arguments.clone();
+        emit(
+            &Event::new("tool_call")
+                .with("id", json!(id))
+                .with("name", json!(name))
+                .with("args", json!(args_str)),
+        );
+        *turn_tool_calls = turn_tool_calls.saturating_add(1);
+        shape_tools.push(name.clone());
+        for cat in extract_file_categories(&name, &args_str) {
+            shape_files.push(cat);
+        }
+
+        let args: Value = match serde_json::from_str(&args_str) {
+            Ok(v) => v,
+            Err(_) => {
+                let msg = format!(
+                    "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON).",
+                    name
+                );
+                emit(
+                    &Event::new("tool_result")
+                        .with("id", json!(id))
+                        .with("ok", json!(false))
+                        .with("output", json!(msg)),
+                );
+                let tool_result = Message::tool(id.clone(), msg);
+                let est = estimate_message_tokens(&tool_result);
+                let mut conv = st.conversation.lock().await;
+                conv.push(tool_result);
+                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                    session::append(p, conv.last().unwrap());
+                }
+                *st.estimated_tokens.lock().await += est;
+                continue;
+            }
+        };
+
+        let offered = tool_defs.iter().any(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                == Some(name.as_str())
+        });
+        if !offered {
+            let msg = if tools::is_deferred_tool(&name) {
+                format!(
+                    "tool '{name}' is deferred and not enabled this session. \
+                     Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, all), \
+                     then retry the call."
+                )
+            } else {
+                format!(
+                    "tool '{name}' is not available on this agent (not in the current tool list)."
+                )
+            };
+            emit(
+                &Event::new("tool_result")
+                    .with("id", json!(id))
+                    .with("ok", json!(false))
+                    .with("output", json!(msg)),
+            );
+            let tool_result = Message::tool(id.clone(), msg);
+            let est = estimate_message_tokens(&tool_result);
+            let mut conv = st.conversation.lock().await;
+            conv.push(tool_result);
+            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                session::append(p, conv.last().unwrap());
+            }
+            *st.estimated_tokens.lock().await += est;
+            continue;
+        }
+
+        let cfg = st.cfg.read().await.clone();
+        let kind = tools::classify(&name);
+        let kind_str: &'static str = match kind {
+            tools::ToolKind::ReadOnly => "readonly",
+            tools::ToolKind::Destructive => "destructive",
+        };
+        let escalated = st.escalated_kinds.lock().await.contains(kind_str);
+
+        let mut force_allow = false;
+        let mut force_deny = false;
+        for rule in &cfg.allow_rules {
+            if tool_matches_rule(&name, &args, rule) {
+                force_allow = true;
+                break;
+            }
+        }
+        if !force_allow {
+            for rule in &cfg.deny_rules {
+                if tool_matches_rule(&name, &args, rule) {
+                    force_deny = true;
+                    break;
+                }
+            }
+        }
+        if force_deny {
+            let msg = format!("tool call '{}' denied by permission rule", name);
+            emit(
+                &Event::new("tool_result")
+                    .with("id", json!(id))
+                    .with("ok", json!(false))
+                    .with("output", json!(msg)),
+            );
+            let tool_result = Message::tool(id.clone(), msg);
+            let est = estimate_message_tokens(&tool_result);
+            let mut conv = st.conversation.lock().await;
+            conv.push(tool_result);
+            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                session::append(p, conv.last().unwrap());
+            }
+            *st.estimated_tokens.lock().await += est;
+            continue;
+        }
+
+        let restricted = if matches!(cfg.approval, Approval::Never) {
+            None
+        } else {
+            restricted_path_for_tool(&name, &args, &cfg.workspace)
+        };
+        let needs_approval = if force_allow || escalated {
+            false
+        } else {
+            match cfg.approval {
+                Approval::Never => false,
+                Approval::Destructive => {
+                    kind == tools::ToolKind::Destructive || restricted.is_some()
+                }
+                Approval::Always => true,
+            }
+        };
+        if needs_approval {
+            match request_approval(st, &id, &name, &args_str, kind_str, cancel).await {
+                ApprovalResult::Granted => {}
+                ApprovalResult::Denied => {
+                    let msg = format!("tool call '{}' was denied by the user", name);
+                    emit(
+                        &Event::new("tool_result")
+                            .with("id", json!(id))
+                            .with("ok", json!(false))
+                            .with("output", json!(msg)),
+                    );
+                    let tool_result = Message::tool(id.clone(), msg);
+                    let est = estimate_message_tokens(&tool_result);
+                    let mut conv = st.conversation.lock().await;
+                    conv.push(tool_result);
+                    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                        session::append(p, conv.last().unwrap());
+                    }
+                    *st.estimated_tokens.lock().await += est;
+                    continue;
+                }
+                ApprovalResult::Aborted => {
+                    sync_session_file(st).await;
+                    emit(&Event::new("aborted"));
+                    emit(&Event::new("done"));
+                    return ParallelWaveResult::Aborted;
+                }
+            }
+        }
+
+        let hook_name = match name.as_str() {
+            "bash" => "pre_bash",
+            "write_file" | "edit" => "pre_write",
+            "read_file" | "grep" | "glob" => "pre_read",
+            _ => "",
+        };
+        let any_pre = (!hook_name.is_empty() && st.plugin_manager.has_hook(hook_name))
+            || st.plugin_manager.has_hook("pre_tool");
+        let mut exec_args = if any_pre { args.clone() } else { args };
+        let mut hook_notes: Vec<String> = Vec::new();
+        let mut denied: Option<String> = None;
+        if !hook_name.is_empty() {
+            denied =
+                run_pre_hooks(st, &cfg, hook_name, &name, &mut exec_args, &mut hook_notes).await;
+        }
+        if denied.is_none() {
+            denied =
+                run_pre_hooks(st, &cfg, "pre_tool", &name, &mut exec_args, &mut hook_notes).await;
+        }
+        if let Some(msg) = denied {
+            emit(
+                &Event::new("tool_result")
+                    .with("id", json!(id))
+                    .with("ok", json!(false))
+                    .with("output", json!(msg)),
+            );
+            let tool_result = Message::tool(id.clone(), msg);
+            let est = estimate_message_tokens(&tool_result);
+            let mut conv = st.conversation.lock().await;
+            conv.push(tool_result);
+            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                session::append(p, conv.last().unwrap());
+            }
+            *st.estimated_tokens.lock().await += est;
+            continue;
+        }
+
+        let early = if let Some(restored) = {
+            let cache = st.tool_output_cache.lock().await;
+            cache.get(&name, &args_str).map(|s| s.to_string())
+        } {
+            Some(tools::Outcome::ok(apply_restore_cap(&restored)))
+        } else if let Some((prior_id, preview)) = {
+            let conv = st.conversation.lock().await;
+            find_duplicate_tool_result(&conv, &name, &args_str)
+        } {
+            Some(tools::Outcome::ok(format!(
+                "[duplicate of tool_call_id {prior_id}; content unchanged]\n{preview}"
+            )))
+        } else {
+            None
+        };
+
+        prepared.push(Prepared {
+            id,
+            name,
+            args_str,
+            exec_args,
+            hook_notes,
+            early,
+        });
+    }
+
+    if prepared.is_empty() {
+        return ParallelWaveResult::Done;
+    }
+
+    let cfg = st.cfg.read().await.clone();
+    let to_run: Vec<(usize, String, Value)> = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.early.is_none())
+        .map(|(i, p)| (i, p.name.clone(), p.exec_args.clone()))
+        .collect();
+
+    let mut outcomes: Vec<tools::Outcome> = prepared
+        .iter()
+        .map(|p| {
+            p.early
+                .clone()
+                .unwrap_or_else(|| tools::Outcome::err("pending"))
+        })
+        .collect();
+
+    if !to_run.is_empty() {
+        let batch: Vec<(String, Value)> = to_run
+            .iter()
+            .map(|(_, n, a)| (n.clone(), a.clone()))
+            .collect();
+        let ran = tokio::select! {
+            r = tools::execute_parallel_wave(&batch, &cfg) => r,
+            _ = cancel.cancelled() => {
+                sync_session_file(st).await;
+                emit(&Event::new("aborted"));
+                return ParallelWaveResult::Aborted;
+            }
+        };
+        for ((idx, _, _), outcome) in to_run.into_iter().zip(ran) {
+            outcomes[idx] = outcome;
+        }
+    }
+
+    for (p, mut outcome) in prepared.into_iter().zip(outcomes) {
+        let post_hook = match p.name.as_str() {
+            "read_file" | "grep" | "glob" => "post_read",
+            _ => "",
+        };
+        let mut hook_notes = p.hook_notes;
+        if !post_hook.is_empty() {
+            run_post_hooks(
+                st,
+                &cfg,
+                post_hook,
+                &p.name,
+                &p.exec_args,
+                &mut outcome,
+                &mut hook_notes,
+            )
+            .await;
+        }
+        run_post_hooks(
+            st,
+            &cfg,
+            "post_tool",
+            &p.name,
+            &p.exec_args,
+            &mut outcome,
+            &mut hook_notes,
+        )
+        .await;
+
+        if outcome.ok && p.name == "read_file" {
+            if let Some(path) = p.exec_args.get("path").and_then(|v| v.as_str()) {
+                let lower = path.to_ascii_lowercase();
+                if lower.ends_with("skill.md")
+                    || lower.contains("/.catalyst-code/skills/")
+                    || lower.contains("\\.catalyst-code\\skills\\")
+                {
+                    st.skill_read_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        if !hook_notes.is_empty() {
+            outcome.output.push_str("\n\nPlugin hooks:\n- ");
+            outcome.output.push_str(&hook_notes.join("\n- "));
+        }
+        if let Some(note) = maybe_concurrency_note(st, &p.name, &p.exec_args, outcome.ok).await {
+            outcome.output.push_str("\n\n");
+            outcome.output.push_str(&note);
+        }
+        if outcome.ok {
+            if tool_cache::invalidates_cache(&p.name) {
+                st.tool_output_cache.lock().await.invalidate_all();
+            } else if tool_cache::ToolOutputCache::is_restorable(&p.name)
+                && !outcome.output.starts_with("[restored from digest cache]")
+                && !outcome.output.starts_with("[duplicate of tool_call_id")
+            {
+                st.tool_output_cache
+                    .lock()
+                    .await
+                    .store(&p.name, &p.args_str, &outcome.output);
+            }
+        }
+        if outcome.ok
+            && !outcome.output.starts_with("[restored from digest cache]")
+            && !outcome.output.starts_with("[duplicate of tool_call_id")
+        {
+            outcome.output = apply_ingress_cap(&p.name, &p.args_str, outcome.output);
+        }
+        st.logger.log(
+            "tool",
+            json!({ "name": p.name, "args": p.args_str, "ok": outcome.ok, "output_len": outcome.output.len(), "parallel_wave": true }),
+        );
+        let mut ev = Event::new("tool_result")
+            .with("id", json!(p.id))
+            .with("ok", json!(outcome.ok))
+            .with("output", json!(outcome.output));
+        if let Some(d) = &outcome.diff {
+            ev = ev.with("diff", json!(d));
+        }
+        emit(&ev);
+        let tool_result = Message::tool(p.id.clone(), &outcome.output);
+        let est = estimate_message_tokens(&tool_result);
+        let mut conv = st.conversation.lock().await;
+        conv.push(tool_result);
+        if let Some(sess) = st.cfg.read().await.session_file.as_ref() {
+            session::append(sess, conv.last().unwrap());
+        }
+        *st.estimated_tokens.lock().await += est;
+    }
+
+    ParallelWaveResult::Done
 }
 
 async fn run_turn(
@@ -4642,6 +4983,7 @@ async fn run_turn(
 
     loop {
         if cancel.is_cancelled() {
+            sync_session_file(st).await;
             emit(&Event::new("aborted"));
             return;
         }
@@ -4679,6 +5021,7 @@ async fn run_turn(
                             rp.name
                         )),
                     ));
+                    sync_session_file(st).await;
                     emit(&Event::new("done"));
                     return;
                 }
@@ -4880,8 +5223,24 @@ async fn run_turn(
                 relevant_memories_tail(&ws, &last_user)
             }
         };
-        if !mem_tail.is_empty() {
-            messages.push(Message::system(mem_tail));
+        // Skill auto-suggestion: append a [RELEVANT SKILL] hint when a skill's
+        // name+description semantically matches the prompt, so the agent can
+        // apply it without remembering /skill:<name>. Sits with the
+        // relevant-memories tail as one transient (non-prefix-cached) message.
+        let mut tail = mem_tail;
+        if !last_user.trim().is_empty() {
+            let ws = st.cfg.read().await.workspace.clone();
+            if let Some(h) = subagent::relevant_skill_hint(&ws, &last_user) {
+                if tail.is_empty() {
+                    tail = h;
+                } else {
+                    tail.push_str("\n\n");
+                    tail.push_str(&h);
+                }
+            }
+        }
+        if !tail.is_empty() {
+            messages.push(Message::system(tail));
             transient_tails += 1;
         }
         let ws_msg = work_state_message(st).await;
@@ -4911,6 +5270,7 @@ async fn run_turn(
                 Ok(v) => v,
                 Err(e) => {
                     st.logger.log("turn_error", json!({ "error": e }));
+                    sync_session_file(st).await;
                     if e == "aborted" {
                         emit(&Event::new("aborted"));
                     } else {
@@ -4982,7 +5342,35 @@ async fn run_turn(
         let tool_calls = assistant_msg.tool_calls().map(|tc| tc.to_vec());
         match tool_calls {
             Some(calls) if !calls.is_empty() => {
-                for tc in &calls {
+                // Leading contiguous readonly recon tools (≥2) run as a parallel
+                // wave after per-call gates. Writes / finish / bash / … stay in
+                // the sequential loop below so HITL and side effects stay ordered.
+                let mut call_offset = 0usize;
+                {
+                    let mut wave_end = 0usize;
+                    while wave_end < calls.len()
+                        && tools::is_parallel_wave_tool(&calls[wave_end].function.name)
+                    {
+                        wave_end += 1;
+                    }
+                    if wave_end >= 2 {
+                        match run_parallel_readonly_wave(
+                            st,
+                            &calls[..wave_end],
+                            &tool_defs,
+                            &cancel,
+                            &mut turn_tool_calls,
+                            &mut shape_tools,
+                            &mut shape_files,
+                        )
+                        .await
+                        {
+                            ParallelWaveResult::Aborted => return,
+                            ParallelWaveResult::Done => call_offset = wave_end,
+                        }
+                    }
+                }
+                for tc in &calls[call_offset..] {
                     // Honor an abort mid-batch: without this, the synchronous
                     // fall-through tools (write_file/edit/patch/read_file/…)
                     // run to completion after the user hit /abort — only
@@ -4992,6 +5380,7 @@ async fn run_turn(
                     // cancelled. (Any orphaned tool_calls this leaves are
                     // repaired by the always-run sanitizer next turn.)
                     if cancel.is_cancelled() {
+                        sync_session_file(st).await;
                         emit(&Event::new("aborted"));
                         return;
                     }
@@ -5186,6 +5575,7 @@ async fn run_turn(
                                 continue;
                             }
                             ApprovalResult::Aborted => {
+                                sync_session_file(st).await;
                                 emit(&Event::new("aborted"));
                                 emit(&Event::new("done"));
                                 return;
@@ -5451,6 +5841,7 @@ async fn run_turn(
                                          manually, or re-attempt without sudo.",
                                     ),
                                     SudoResult::Aborted => {
+                                        sync_session_file(st).await;
                                         emit(&Event::new("aborted"));
                                         emit(&Event::new("done"));
                                         return;
@@ -5534,6 +5925,7 @@ async fn run_turn(
                                 "The user skipped the questions. Proceed with your best judgment and note any assumptions.",
                             ),
                             AskResult::Aborted => {
+                                sync_session_file(st).await;
                                 emit(&Event::new("aborted"));
                                 emit(&Event::new("done"));
                                 return;
@@ -6355,6 +6747,7 @@ async fn resume_pending_ask(st: &Arc<State>, cancel: &CancellationToken) {
                 .to_string()
         }
         AskResult::Aborted => {
+            sync_session_file(st).await;
             emit(&Event::new("aborted"));
             emit(&Event::new("done"));
             return;

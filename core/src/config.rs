@@ -324,13 +324,9 @@ pub struct ResolvedProvider {
     pub base_url: String,
     pub api_key: Option<String>,
     pub headers: Vec<(String, String)>,
-    /// When true (Anthropic OAuth), the streaming/discovery path uses
-    /// `Authorization: Bearer <api_key>` + the `anthropic-beta:
-    /// claude-code-20250219,oauth-2025-04-20` identity header (and a `claude-cli`
-    /// User-Agent / `x-app: cli`, injected by `oauth::enrich_oauth`) instead of
-    /// `x-api-key` — Anthropic's gateway rejects subscription tokens without
-    /// the Claude Code fingerprint. Set when a Claude subscription token is used.
-    /// (Gemini OAuth needs no flag: it reuses the OpenAI Bearer path unchanged.)
+    /// When true, Anthropic streaming/discovery uses `Authorization: Bearer`
+    /// instead of `x-api-key` (plugin subscription OAuth). Set by
+    /// `oauth::enrich_oauth` when a plugin token is injected.
     pub oauth: bool,
 }
 
@@ -402,7 +398,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://chatgpt.com/backend-api/codex",
         api_key_env: "OPENAI_API_KEY",
         alt_envs: &[],
-        description: "OpenAI Codex via ChatGPT subscription OAuth (or OPENAI_API_KEY for API-key mode)."
+        description: "OpenAI Codex via ChatGPT backend (OPENAI_API_KEY). For ChatGPT Plus/Pro subscription login, install a plugin such as catcode-chatgpt-provider.",
     },
     ProviderPreset {
         id: "gemini",
@@ -412,7 +408,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         api_key_env: "GEMINI_API_KEY",
         alt_envs: &["GOOGLE_API_KEY"],
-        description: "Google Gemini via Antigravity OAuth (Gemini 3 Pro/Flash + Claude-via-Antigravity) or GEMINI_API_KEY / GOOGLE_API_KEY for the OpenAI-compatible endpoint. `/login` uses Antigravity's OAuth client (not the older gemini-cli client) and also accepts Google Cloud ADC / service-account credentials.",
+        description: "Google Gemini via GEMINI_API_KEY / GOOGLE_API_KEY (OpenAI-compatible endpoint). Subscription OAuth is available via plugins.",
     },
     ProviderPreset {
         id: "anthropic",
@@ -421,7 +417,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.anthropic.com/v1",
         api_key_env: "ANTHROPIC_API_KEY",
         alt_envs: &[],
-        description: "Anthropic Claude via API key (ANTHROPIC_API_KEY) or Claude subscription OAuth with /login (works locally and over SSH/headless).",
+        description: "Anthropic Claude via API key (ANTHROPIC_API_KEY). Subscription OAuth is available via plugins.",
     },
     ProviderPreset {
         id: "opencode-go",
@@ -442,13 +438,11 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: "xai",
         label: "xAI Grok",
         kind: ProviderKind::OpenAI,
-        // OpenAI-compatible chat completions at api.x.ai/v1. Dual auth:
-        // XAI_API_KEY (console.x.ai) OR SuperGrok / X Premium+ OAuth via /login.
-        // Matches 9router's dual-mode surface (API key + OAuth).
+        // OpenAI-compatible chat completions at api.x.ai/v1 via XAI_API_KEY.
         base_url: "https://api.x.ai/v1",
         api_key_env: "XAI_API_KEY",
         alt_envs: &[],
-        description: "xAI Grok via XAI_API_KEY (console.x.ai) or SuperGrok / X Premium+ OAuth with /login (device-code at accounts.x.ai).",
+        description: "xAI Grok via XAI_API_KEY (console.x.ai). SuperGrok / X Premium+ subscription OAuth is available via plugins.",
     },
     // --- API-key providers aligned with 9router's OpenAI/Anthropic-compatible
     // surface. All speak standard /chat/completions (or /messages) so discovery
@@ -656,18 +650,17 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.openai.com/v1",
         api_key_env: "OPENAI_API_KEY",
         alt_envs: &[],
-        description: "OpenAI public API (api.openai.com) via OPENAI_API_KEY. Prefer the `openai` preset for ChatGPT subscription OAuth.",
+        description: "OpenAI public API (api.openai.com) via OPENAI_API_KEY.",
     },
     ProviderPreset {
         id: "qwen",
-        label: "Qwen Code (OAuth)",
+        label: "Qwen Code",
         kind: ProviderKind::OpenAI,
-        // portal.qwen.ai OpenAI-compatible chat. Auth is Qwen Code device-code
-        // OAuth (matches 9router's qwen provider). API key optional via env.
+        // portal.qwen.ai OpenAI-compatible chat.
         base_url: "https://portal.qwen.ai/v1",
         api_key_env: "QWEN_API_KEY",
         alt_envs: &[],
-        description: "Qwen Code via device-code OAuth (/login) or QWEN_API_KEY. Models: qwen3-coder-plus/flash.",
+        description: "Qwen Code via QWEN_API_KEY (or a subscription-OAuth plugin). Models: qwen3-coder-plus/flash.",
     },
     // Remaining standard OpenAI-compatible coding endpoints in 9router's
     // API-key catalog. Each has a fixed endpoint and normal Bearer auth.
@@ -1106,34 +1099,19 @@ pub fn save_providers_config(
     Ok(())
 }
 
-/// Previously auto-added every preset whose env API key or third-party OAuth
-/// file was already present. That silently signed users in on first launch.
-/// Auth is now explicit only: paste an API key via `/login` or complete this
-/// app's OAuth flow. Kept as a no-op so call sites stay stable.
+/// Previously auto-added every preset whose env API key was already present.
+/// That silently signed users in on first launch. Auth is now explicit only:
+/// paste an API key via `/login` or complete a **plugin** OAuth flow. Kept as a
+/// no-op so call sites stay stable.
 pub fn auto_login_env_presets(_cfg: &mut Config) -> Vec<String> {
     Vec::new()
 }
 
-/// True when a preset's reusable OAuth credentials exist in **this app's**
-/// store (cheap sync file check). Does not scan env vars or third-party CLIs
-/// (Claude CLI, gemini-cli, gcloud ADC).
-pub fn preset_has_oauth_creds(p: &ProviderPreset) -> bool {
-    match p.id {
-        "openai" => crate::oauth::has_codex_creds(),
-        "gemini" => crate::oauth::has_google_creds(),
-        "anthropic" => crate::oauth::has_claude_creds(),
-        "xai" => crate::oauth::has_xai_creds(),
-        "qwen" => crate::oauth::has_qwen_creds(),
-        "github" => crate::oauth::has_github_creds(),
-        "kimi-coding" => crate::oauth::has_kimi_coding_creds(),
-        "kilocode" => crate::oauth::has_kilocode_creds(),
-        "cline" => crate::oauth::has_cline_creds(),
-        "clinepass" => crate::oauth::has_clinepass_creds(),
-        "kimchi" => crate::oauth::has_kimchi_creds(),
-        "codebuddy-cn" => crate::oauth::has_codebuddy_creds(),
-        "iflow" => crate::oauth::has_iflow_creds(),
-        _ => false,
-    }
+/// Built-in presets no longer carry OAuth credentials (subscription login is
+/// plugin-only). Always returns false; kept so call sites compile during the
+/// migration away from vendor OAuth.
+pub fn preset_has_oauth_creds(_p: &ProviderPreset) -> bool {
+    false
 }
 
 impl Config {
@@ -2372,11 +2350,11 @@ mod tests {
     }
 
     #[test]
-    fn xai_preset_supports_api_key_and_oauth() {
+    fn xai_preset_supports_api_key() {
         let p = find_preset("xai").expect("xai preset exists");
         assert_eq!(p.base_url, "https://api.x.ai/v1");
         assert_eq!(p.api_key_env, "XAI_API_KEY");
-        assert!(crate::oauth::supports_login(p.id));
+        assert!(!preset_has_oauth_creds(p));
         let configs = preset_provider_configs(p, None);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "xai");
@@ -2424,11 +2402,11 @@ mod tests {
         }
         let qwen = find_preset("qwen").unwrap();
         assert_eq!(qwen.base_url, "https://portal.qwen.ai/v1");
-        assert!(crate::oauth::supports_login("qwen"));
+        assert!(!preset_has_oauth_creds(qwen));
     }
 
     #[test]
-    fn nine_router_oauth_coding_presets_have_the_required_headers() {
+    fn nine_router_coding_presets_have_the_required_headers() {
         for id in [
             "github",
             "kimi-coding",
@@ -2439,8 +2417,8 @@ mod tests {
             "codebuddy-cn",
             "iflow",
         ] {
-            let p = find_preset(id).expect("OAuth coding preset exists");
-            assert!(crate::oauth::supports_login(p.id));
+            let _p = find_preset(id).expect("coding preset exists");
+            assert!(!preset_has_oauth_creds(_p));
         }
         let cline = preset_provider_configs(find_preset("cline").unwrap(), None);
         assert!(cline[0].headers.iter().any(|(k, _)| k == "HTTP-Referer"));

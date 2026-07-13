@@ -8,6 +8,15 @@ use serde_json::{json, Value};
 pub use crate::fetch_tool::execute_fetch;
 pub use crate::search_tool::execute_web_search;
 
+/// Description shown to the model for the `bash` tool. OS-selected so the
+/// model emits matching syntax: PowerShell on Windows, bash on Unix. The
+/// tool NAME stays `bash` for wire compatibility (TUI/web/SDK); on Windows it
+/// executes the command through PowerShell (`shell_argv` below).
+#[cfg(target_os = "windows")]
+const BASH_TOOL_DESC: &str = "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.";
+#[cfg(not(target_os = "windows"))]
+const BASH_TOOL_DESC: &str = "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.";
+
 /// ToolKind drives the approval gate in main.rs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolKind {
@@ -27,6 +36,62 @@ pub fn classify(name: &str) -> ToolKind {
         // delete/rename/mkdir mutate the tree — always gated under Destructive.
         _ => ToolKind::Destructive,
     }
+}
+
+/// Tools safe to run concurrently in a top-level tool-call wave after gates
+/// have already passed: readonly, no interactive flyouts, no session mutation
+/// beyond the tool result itself. Writes / bash / finish / subagent / ask stay
+/// sequential so HITL and side-effect ordering stay intact.
+pub fn is_parallel_wave_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "bulk_read"
+            | "todo_read"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "workspace_activity"
+            | "fetch"
+            | "web_search"
+            | "diagnostics"
+    )
+}
+
+/// Run already-gated parallel-wave tools concurrently (ordered results).
+/// Used by the orchestrator when a model emits a multi-read/grep batch.
+pub async fn execute_parallel_wave(calls: &[(String, Value)], cfg: &Config) -> Vec<Outcome> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    if calls.len() == 1 {
+        return vec![dispatch_bulk_inner(&calls[0].0, &calls[0].1, cfg).await];
+    }
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
+    let mut handles = Vec::with_capacity(calls.len());
+    for (i, (name, args)) in calls.iter().enumerate() {
+        let sem = sem.clone();
+        let cfg = cfg.clone();
+        let name = name.clone();
+        let args = args.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            let r = dispatch_bulk_inner(&name, &args, &cfg).await;
+            (i, r)
+        }));
+    }
+    let mut out: Vec<(usize, Outcome)> = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(pair) => out.push(pair),
+            Err(_) => out.push((usize::MAX, Outcome::err("parallel wave task panicked"))),
+        }
+    }
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, o)| o).collect()
 }
 
 /// Tools always included in the main agent's request schema (cheap, high-use).
@@ -106,7 +171,16 @@ pub fn is_builtin(name: &str) -> bool {
     set.contains(name)
 }
 
+/// Built-in tool schemas. Cached in a `OnceLock` — the JSON is large and was
+/// previously rebuilt on every turn start. Callers that filter deferred tools
+/// clone from this base.
 pub fn definitions() -> Vec<Value> {
+    use std::sync::OnceLock;
+    static DEFS: OnceLock<Vec<Value>> = OnceLock::new();
+    DEFS.get_or_init(definitions_uncached).clone()
+}
+
+fn definitions_uncached() -> Vec<Value> {
     vec![
         json!({
             "type": "function",
@@ -324,7 +398,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.",
+                "description": BASH_TOOL_DESC,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -653,15 +727,17 @@ pub fn definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["save", "append", "list", "get", "forget", "consolidate", "stats"], "description": "save/append/list/get/forget; consolidate merges near-duplicates; stats shows recall hit/miss + synonym-miss rates" },
+                        "action": { "type": "string", "enum": ["save", "append", "list", "get", "forget", "consolidate", "stats", "deprecate", "migrate"], "description": "save/append/list/get/forget; consolidate merges near-duplicates; stats shows recall hit/miss + synonym-miss rates; deprecate marks a memory superseded (excluded from catalog/relevant surfaces); migrate rewrites stale project-name refs (umans-harness→catalyst-code, idempotent)" },
                         "scope": { "type": "string", "enum": ["workspace", "global"], "description": "where the memory lives: 'workspace' (per-codebase, default) or 'global' (cross-codebase). For list/get/forget, omit to search both scopes" },
                         "name": { "type": "string", "description": "(save/append) short memory name; becomes the file slug and the id. append looks up the same name to accumulate onto" },
                         "content": { "type": "string", "description": "(save/append) the memory body (save) or the facts to append (append)" },
-                        "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision/user (default note). convention/decision/user/identity/preference are pinned in the catalog" },
+                        "type": { "type": "string", "description": "(save/append) memory type, e.g. note/convention/decision/user (default note). user/identity/preference are pinned in the catalog; convention/decision are NOT auto-pinned (pin explicitly via pin:true or importance:high)" },
                         "description": { "type": "string", "description": "(save/append) one-line summary shown in the standing catalog (auto-filled from the first content line if omitted)" },
                         "importance": { "type": "string", "enum": ["high", "normal", "low"], "description": "(save/append) durability hint; high preferred in catalog; low rejected unless force=true" },
                         "force": { "type": "boolean", "description": "(save/append) override trivia/conflict write policy when intentional" },
-                        "id": { "type": "string", "description": "(get/forget) the memory id (slug or name)" }
+                        "id": { "type": "string", "description": "(get/forget/deprecate) the memory id (slug or name)" },
+                        "replaces": { "type": "string", "description": "(save) name/id of a memory this one supersedes — marks it deprecated so it's excluded from the catalog + relevant tail. Use to resolve contradictions: save the corrected memory with replaces=<stale-name>" },
+                        "superseded_by": { "type": "string", "description": "(deprecate) name of the memory that supersedes the one being deprecated (optional)" }
                     },
                     "required": ["action"]
                 }
@@ -741,6 +817,7 @@ pub fn definitions() -> Vec<Value> {
 /// Outcome of a tool call. For bash we need a future with timeout+kill, so
 /// destructive/bash execution is split: execute() handles sync tools;
 /// execute_bash() is async and takes a runtime handle.
+#[derive(Clone)]
 pub struct Outcome {
     pub ok: bool,
     pub output: String,
@@ -1754,6 +1831,13 @@ pub(crate) fn smart_truncate(output: &str, cap: usize) -> String {
 /// strings like `echo sudo` (false positive) — that's acceptable: better to
 /// prompt for approval than to let sudo grab /dev/tty and garble the TUI.
 pub fn command_uses_sudo(command: &str) -> bool {
+    // sudo handling (the `sudo()` wrapper + the password flyout) is a POSIX
+    // concern — Windows has no `sudo`/`/dev/tty` machinery to reroute. On
+    // PowerShell this returns false so the whole sudo prompt path is skipped
+    // and the command runs through the normal approval gate instead.
+    if !shell_is_posix() {
+        return false;
+    }
     static SUDO_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"\bsudo\b").expect("sudo regex"));
     SUDO_RE.is_match(command)
@@ -1765,6 +1849,11 @@ pub fn command_uses_sudo(command: &str) -> bool {
 /// dispatch layer when approval is `Never` to decide whether to show the
 /// sudo prompt: users with NOPASSWD sudo never see it.
 pub async fn sudo_needs_password(cfg: &Config) -> bool {
+    // POSIX-only (never reached on Windows: command_uses_sudo is false there,
+    // so the caller's `if tools::command_uses_sudo(cmd)` branch is skipped).
+    if !shell_is_posix() {
+        return true;
+    }
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg("sudo -n true 2>/dev/null");
     cmd.current_dir(&cfg.workspace);
@@ -1850,11 +1939,17 @@ pub async fn execute_bash(
     //   NonInteractive → redefine sudo to use `-n` (fail if pw needed).
     //   None          → clean error if sudo detected (caller must prompt).
     let uses_sudo = command_uses_sudo(command);
+    // The `sudo() { command sudo -S "$@"; }` redefinition is POSIX-shell
+    // syntax; it is a no-op (and would be a syntax error) under PowerShell.
+    // On Windows/PowerShell we pass the command through verbatim — Windows
+    // sudo (when present) handles its own UAC elevation. `command_uses_sudo`
+    // already returns false on non-POSIX shells, so `uses_sudo` is false there
+    // and this block is inert; the guard is defensive.
     let run_command = match &sudo_auth {
-        SudoAuth::Password(_) if uses_sudo => {
+        SudoAuth::Password(_) if uses_sudo && shell_is_posix() => {
             format!(r#"sudo() {{ command sudo -S "$@"; }}; {command}"#)
         }
-        SudoAuth::NonInteractive if uses_sudo => {
+        SudoAuth::NonInteractive if uses_sudo && shell_is_posix() => {
             format!(r#"sudo() {{ command sudo -n "$@"; }}; {command}"#)
         }
         _ => {
@@ -1889,21 +1984,29 @@ pub async fn execute_bash(
     }
     cmd.kill_on_drop(true);
     // P1-8: don't leak the parent environment (LD_PRELOAD, LD_LIBRARY_PATH,
-    // UMANS_*, arbitrary PATH/HOME overrides) into bash — even inside a sandbox
-    // these could subvert tool execution. Keep only the essentials.
-    cmd.env_clear();
-    cmd.env(
-        "PATH",
-        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-    );
-    if let Ok(home) = std::env::var("HOME") {
-        cmd.env("HOME", home);
-    }
-    if let Ok(tmp) = std::env::var("TMPDIR") {
-        cmd.env("TMPDIR", tmp);
-    }
-    if let Ok(user) = std::env::var("USER") {
-        cmd.env("USER", user);
+    // UMANS_*, arbitrary PATH/HOME overrides) into the shell — even inside a
+    // sandbox these could subvert tool execution. Keep only the essentials.
+    //
+    // PowerShell (Windows) is the exception: it and its .NET cmdlets depend on
+    // SystemRoot, PATHEXT, USERPROFILE, TEMP, APPDATA, … which env_clear would
+    // strip and break (and the ICU/globalization stack hard-fails without
+    // them). LD_PRELOAD-style injection isn't a Windows concern, so PowerShell
+    // inherits the parent env; the denylist + approval gate still apply.
+    if shell_is_posix() {
+        cmd.env_clear();
+        cmd.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            cmd.env("HOME", home);
+        }
+        if let Ok(tmp) = std::env::var("TMPDIR") {
+            cmd.env("TMPDIR", tmp);
+        }
+        if let Ok(user) = std::env::var("USER") {
+            cmd.env("USER", user);
+        }
     }
 
     let mut child: tokio::process::Child = match cmd.spawn() {
@@ -1977,6 +2080,103 @@ pub async fn execute_bash(
     }
 }
 
+/// Resolve the shell program used to run `bash`-tool commands.
+///
+/// Defaults to the platform-native shell so the model emits the matching
+/// syntax: `bash` on Linux/macOS, PowerShell on Windows (`pwsh` if installed,
+/// else Windows PowerShell). Override with `CATALYST_CODE_SHELL` (e.g. `bash`
+/// for Git-Bash/WSL users on Windows, `zsh`, `pwsh`, or a full path) — mirrors
+/// the plugin hook-launcher convention in plugins.rs.
+fn resolve_shell() -> String {
+    if let Ok(s) = std::env::var("CATALYST_CODE_SHELL") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if pwsh_available() {
+            "pwsh".to_string()
+        } else {
+            "powershell".to_string()
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "bash".to_string()
+    }
+}
+
+/// Whether the resolved shell is a POSIX shell (`bash`/`sh`/`zsh`/`dash`/…):
+/// it takes `-c <cmd>` and supports the `sudo()` function-wrapper trick.
+/// False for PowerShell (`powershell`/`pwsh`). Keyed on the resolved shell
+/// (not the host OS) so a WSL `bash` on Windows still behaves as bash and a
+/// `pwsh` override on Linux behaves as PowerShell.
+fn shell_is_posix() -> bool {
+    let stem = std::path::Path::new(&resolve_shell())
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        stem.as_str(),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
+    )
+}
+
+/// Build `(program, args)` for running a single command string in the active
+/// shell. POSIX shells: `<shell> -c <command>`. PowerShell:
+/// `powershell -NoProfile -NonInteractive -Command <command>` (`-NonInteractive`
+/// prevents `Read-Host` from hanging the agent loop; `-NoProfile` skips the
+/// user profile for a clean, fast startup).
+fn shell_argv(command: &str) -> (String, Vec<String>) {
+    let prog = resolve_shell();
+    let stem = std::path::Path::new(&prog)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if stem == "powershell" || stem == "pwsh" {
+        (
+            prog,
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                command.into(),
+            ],
+        )
+    } else {
+        (prog, vec!["-c".into(), command.into()])
+    }
+}
+
+/// Is `prog` on PATH? A minimal `which` used to prefer `pwsh` over
+/// `powershell` on Windows without a hard dependency. Cached at first use
+/// by `pwsh_available`. POSIX hosts never need this — they default to `bash`.
+#[cfg(target_os = "windows")]
+fn which(prog: &str) -> bool {
+    let path = match std::env::var("PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    for dir in path.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(dir).join(format!("{prog}.exe"));
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn pwsh_available() -> bool {
+    static CACHED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| which("pwsh"));
+    *CACHED
+}
+
 /// Build the tokio Command for a bash invocation, applying the configured
 /// sandbox. Returns (optional temp profile path, Command). The profile path
 /// is kept alive for the lifetime of the returned Command via the temp file.
@@ -1984,65 +2184,90 @@ fn build_bash_command(
     command: &str,
     cfg: &Config,
 ) -> (Option<std::path::PathBuf>, tokio::process::Command) {
-    use crate::config::Sandbox;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static PROFILE_CACHE: std::sync::LazyLock<Mutex<HashMap<(String, bool), std::path::PathBuf>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-    match cfg.sandbox {
-        Sandbox::None => {
-            if cfg.no_network {
-                let mut c = tokio::process::Command::new("unshare");
-                c.arg("-n").arg("bash").arg("-c").arg(command);
-                return (None, c);
-            }
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(command);
-            (None, c)
+    // Windows has no firejail / unshare / sandbox-exec — the sandbox config is a
+    // Unix concept and is ignored. Run the native PowerShell (or a
+    // CATALYST_CODE_SHELL override) directly. (Windows users who want bash
+    // should run the Unix build under WSL.)
+    #[cfg(target_os = "windows")]
+    {
+        let _ = cfg;
+        let (prog, args) = shell_argv(command);
+        let mut c = tokio::process::Command::new(prog);
+        for a in args {
+            c.arg(a);
         }
-        Sandbox::Firejail => {
-            // Cache the firejail profile by (workspace_path, no_network) so we
-            // don't generate and write a temp file per bash call.
-            let ws_key = cfg.workspace.display().to_string();
-            let mut cache = PROFILE_CACHE.lock().unwrap();
-            if let Some(cached_path) = cache.get(&(ws_key.clone(), cfg.no_network)) {
-                if cached_path.exists() {
-                    let mut c = tokio::process::Command::new("firejail");
-                    c.arg("--quiet")
-                        .arg("--profile")
-                        .arg(cached_path)
-                        .arg("bash")
-                        .arg("-c")
-                        .arg(command);
-                    return (Some(cached_path.clone()), c);
+        return (None, c);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use crate::config::Sandbox;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        static PROFILE_CACHE: std::sync::LazyLock<
+            Mutex<HashMap<(String, bool), std::path::PathBuf>>,
+        > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        match cfg.sandbox {
+            Sandbox::None => {
+                if cfg.no_network {
+                    let (prog, args) = shell_argv(command);
+                    let mut c = tokio::process::Command::new("unshare");
+                    c.arg("-n").arg(prog);
+                    for a in args {
+                        c.arg(a);
+                    }
+                    return (None, c);
                 }
+                let (prog, args) = shell_argv(command);
+                let mut c = tokio::process::Command::new(prog);
+                for a in args {
+                    c.arg(a);
+                }
+                (None, c)
             }
-            // Not cached or file missing — generate fresh.
-            let profile = firejail_profile(&cfg.workspace, cfg.no_network);
-            let path = std::env::temp_dir()
-                .join(format!("catalyst-code-fj-{:x}.profile", fxhash(&ws_key)));
-            let _ = std::fs::write(&path, &profile);
-            cache.insert((ws_key, cfg.no_network), path.clone());
-            let mut c = tokio::process::Command::new("firejail");
-            c.arg("--quiet")
-                .arg("--profile")
-                .arg(&path)
-                .arg("bash")
-                .arg("-c")
-                .arg(command);
-            (Some(path), c)
-        }
-        // macOS: sandbox-exec with a seatbelt profile. On non-macOS hosts the
-        // binary is usually absent — fall through to plain bash (denylist still
-        // applies). Windows has no equivalent; selecting seatbelt there is a no-op.
-        Sandbox::Seatbelt => {
-            #[cfg(target_os = "macos")]
-            {
+            Sandbox::Firejail => {
+                // Cache the firejail profile by (workspace_path, no_network) so we
+                // don't generate and write a temp file per bash call.
                 let ws_key = cfg.workspace.display().to_string();
-                let cache_key = format!("sb:{ws_key}:{}", cfg.no_network);
                 let mut cache = PROFILE_CACHE.lock().unwrap();
-                let path =
-                    if let Some(cached_path) = cache.get(&(cache_key.clone(), cfg.no_network)) {
+                if let Some(cached_path) = cache.get(&(ws_key.clone(), cfg.no_network)) {
+                    if cached_path.exists() {
+                        let (prog, args) = shell_argv(command);
+                        let mut c = tokio::process::Command::new("firejail");
+                        c.arg("--quiet").arg("--profile").arg(cached_path).arg(prog);
+                        for a in args {
+                            c.arg(a);
+                        }
+                        return (Some(cached_path.clone()), c);
+                    }
+                }
+                // Not cached or file missing — generate fresh.
+                let profile = firejail_profile(&cfg.workspace, cfg.no_network);
+                let path = std::env::temp_dir()
+                    .join(format!("catalyst-code-fj-{:x}.profile", fxhash(&ws_key)));
+                let _ = std::fs::write(&path, &profile);
+                cache.insert((ws_key, cfg.no_network), path.clone());
+                let (prog, args) = shell_argv(command);
+                let mut c = tokio::process::Command::new("firejail");
+                c.arg("--quiet").arg("--profile").arg(&path).arg(prog);
+                for a in args {
+                    c.arg(a);
+                }
+                (Some(path), c)
+            }
+            // macOS: sandbox-exec with a seatbelt profile. On non-macOS hosts the
+            // binary is usually absent — fall through to the plain shell (denylist
+            // still applies). Windows has no equivalent; selecting seatbelt there
+            // is a no-op.
+            Sandbox::Seatbelt => {
+                #[cfg(target_os = "macos")]
+                {
+                    let ws_key = cfg.workspace.display().to_string();
+                    let cache_key = format!("sb:{ws_key}:{}", cfg.no_network);
+                    let mut cache = PROFILE_CACHE.lock().unwrap();
+                    let path = if let Some(cached_path) =
+                        cache.get(&(cache_key.clone(), cfg.no_network))
+                    {
                         if cached_path.exists() {
                             cached_path.clone()
                         } else {
@@ -2061,22 +2286,32 @@ fn build_bash_command(
                         cache.insert((cache_key, cfg.no_network), path.clone());
                         path
                     };
-                let mut c = tokio::process::Command::new("sandbox-exec");
-                c.arg("-f").arg(&path).arg("bash").arg("-c").arg(command);
-                return (Some(path), c);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = &PROFILE_CACHE;
-                let mut c = tokio::process::Command::new("bash");
-                c.arg("-c").arg(command);
-                (None, c)
+                    let (prog, args) = shell_argv(command);
+                    let mut c = tokio::process::Command::new("sandbox-exec");
+                    c.arg("-f").arg(&path).arg(prog);
+                    for a in args {
+                        c.arg(a);
+                    }
+                    return (Some(path), c);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = &PROFILE_CACHE;
+                    let (prog, args) = shell_argv(command);
+                    let mut c = tokio::process::Command::new(prog);
+                    for a in args {
+                        c.arg(a);
+                    }
+                    (None, c)
+                }
             }
         }
     }
 }
 
 /// A simple FNV-1a hash of a string, used for deterministic profile filenames.
+/// Unix-only (firejail/seatbelt profile caching); not referenced on Windows.
+#[cfg(not(target_os = "windows"))]
 fn fxhash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
@@ -2088,6 +2323,7 @@ fn fxhash(s: &str) -> u64 {
 
 /// A firejail profile that whitelists the workspace (read+write), the shell
 /// and its libs, /tmp, and nothing else. With no_network, drops net entirely.
+#[cfg(not(target_os = "windows"))]
 fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
     let ws = workspace.display();
     let mut s = String::new();
@@ -2544,6 +2780,57 @@ fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
 /// Run many tool calls in one round-trip. Dispatches any built-in tool,
 /// including bash (awaited per-call). One result block per call, in order.
 /// ok only if every call succeeded.
+/// Max concurrent inner calls inside `bulk`. Matches the default subagent
+/// parallel fan-out so a single bulk doesn't stampede the host.
+const BULK_CONCURRENCY: usize = 4;
+
+/// Inner bulk calls that mutate workspace / shared state must run serially so
+/// independent-looking batches cannot race two writes. Readonly + bash/fetch/
+/// web_search (and other non-mutating tools) run concurrently.
+fn bulk_must_serialize(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file"
+            | "edit"
+            | "patch"
+            | "delete"
+            | "rename"
+            | "mkdir"
+            | "todo_write"
+            | "git_add"
+            | "git_commit"
+            | "memory"
+            | "bulk_write"
+            | "bulk_edit"
+    )
+}
+
+async fn dispatch_bulk_inner(name: &str, inner_args: &Value, cfg: &Config) -> Outcome {
+    if name == "bash" {
+        let cmd = inner_args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let timeout_override = inner_args.get("timeout").and_then(|v| v.as_u64());
+        execute_bash(cmd, cfg, timeout_override, SudoAuth::None).await
+    } else if name == "fetch" {
+        execute_fetch(inner_args, cfg).await
+    } else if name == "web_search" {
+        execute_web_search(inner_args, cfg).await
+    } else if name == "diagnostics" {
+        execute_diagnostics(inner_args, cfg).await
+    } else {
+        // Sync tools: offload so concurrent bulk inners don't block the runtime.
+        let name = name.to_string();
+        let inner_args = inner_args.clone();
+        let cfg = cfg.clone();
+        match tokio::task::spawn_blocking(move || execute(&name, &inner_args, &cfg)).await {
+            Ok(o) => o,
+            Err(_) => Outcome::err("bulk inner task panicked"),
+        }
+    }
+}
+
 pub async fn execute_bulk(
     args: &Value,
     cfg: &Config,
@@ -2555,8 +2842,13 @@ pub async fn execute_bulk(
     if calls.is_empty() {
         return Outcome::err("bulk requires a non-empty 'calls' array");
     }
-    let mut blocks: Vec<String> = Vec::with_capacity(calls.len());
-    let mut ok = true;
+
+    // Pre-resolve each slot: early errors stay in-order; the rest split into
+    // concurrent vs serial waves so writes never race.
+    let mut early: Vec<(usize, String)> = Vec::new();
+    let mut concurrent: Vec<(usize, String, Value)> = Vec::new();
+    let mut serial: Vec<(usize, String, Value)> = Vec::new();
+
     for (i, c) in calls.iter().enumerate() {
         let name = c
             .get("name")
@@ -2568,42 +2860,71 @@ pub async fn execute_bulk(
         // pre-hooks) may have denied this inner call so destructive ops can't
         // evade the safety floor by hiding inside a bulk call. Render + skip.
         if let Some(msg) = denied.get(&i) {
-            ok = false;
-            blocks.push(format!("### [{i}] {name}\n⚠ denied: {msg}"));
+            early.push((i, format!("### [{i}] {name}\n⚠ denied: {msg}")));
             continue;
         }
         if name.is_empty() {
-            ok = false;
-            blocks.push(format!("### [{i}] <missing name>\nerror: missing 'name'"));
-            continue;
-        }
-        // ponytail: nested bulk/bash would recurse; block it to keep the gate simple.
-        if name == "bulk" || name == "bulk_read" || name == "bulk_write" || name == "bulk_edit" {
-            ok = false;
-            blocks.push(format!(
-                "### [{i}] {name}\nerror: nested bulk calls are not allowed"
+            early.push((
+                i,
+                format!("### [{i}] <missing name>\nerror: missing 'name'"),
             ));
             continue;
         }
-        let r = if name == "bash" {
-            let cmd = inner_args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let timeout_override = inner_args.get("timeout").and_then(|v| v.as_u64());
-            execute_bash(cmd, cfg, timeout_override, SudoAuth::None).await
-        } else if name == "fetch" {
-            execute_fetch(&inner_args, cfg).await
-        } else if name == "web_search" {
-            execute_web_search(&inner_args, cfg).await
-        } else {
-            execute(&name, &inner_args, cfg)
-        };
-        if !r.ok {
-            ok = false;
+        // Nested bulk would recurse; block it to keep the gate simple.
+        if name == "bulk" || name == "bulk_read" || name == "bulk_write" || name == "bulk_edit" {
+            early.push((
+                i,
+                format!("### [{i}] {name}\nerror: nested bulk calls are not allowed"),
+            ));
+            continue;
         }
-        blocks.push(format!("### [{i}] {name}\n{}", r.output));
+        if bulk_must_serialize(&name) {
+            serial.push((i, name, inner_args));
+        } else {
+            concurrent.push((i, name, inner_args));
+        }
     }
+
+    let mut collected: Vec<(usize, String, bool)> = Vec::with_capacity(calls.len());
+    for (i, block) in early {
+        collected.push((i, block, false));
+    }
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
+    let mut handles: Vec<tokio::task::JoinHandle<(usize, String, Outcome)>> =
+        Vec::with_capacity(concurrent.len());
+    for (i, name, inner_args) in concurrent {
+        let sem = sem.clone();
+        let cfg = cfg.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            let r = dispatch_bulk_inner(&name, &inner_args, &cfg).await;
+            (i, name, r)
+        }));
+    }
+    for h in handles {
+        match h.await {
+            Ok((i, name, r)) => {
+                let ok = r.ok;
+                collected.push((i, format!("### [{i}] {name}\n{}", r.output), ok));
+            }
+            Err(_) => collected.push((
+                usize::MAX,
+                "### [?]\nerror: bulk inner task panicked".into(),
+                false,
+            )),
+        }
+    }
+
+    for (i, name, inner_args) in serial {
+        let r = dispatch_bulk_inner(&name, &inner_args, cfg).await;
+        let ok = r.ok;
+        collected.push((i, format!("### [{i}] {name}\n{}", r.output), ok));
+    }
+
+    collected.sort_by_key(|(i, _, _)| *i);
+    let ok = collected.iter().all(|(_, _, o)| *o);
+    let blocks: Vec<String> = collected.into_iter().map(|(_, b, _)| b).collect();
     Outcome {
         ok,
         output: blocks.join("\n\n"),
@@ -2811,32 +3132,54 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
             Err(e) => return Outcome::err(e),
         }
     };
-    // Pick checker by marker files present.
-    let (cmd, label) = if target.join("Cargo.toml").exists() {
+    // Pick checker by marker files present. The cargo/go checkers run a
+    // program directly; the tsc-fallback and py_compile checkers run a small
+    // shell pipeline, so their syntax must match the active shell (bash on
+    // Unix, PowerShell on Windows) and is routed through `shell_argv` like
+    // the `bash` tool so the OS gets matching semantics.
+    let posix = shell_is_posix();
+    let (cmd, label): (Vec<String>, &str) = if target.join("Cargo.toml").exists() {
         (
-            vec!["cargo", "check", "--message-format=short"],
+            vec![
+                "cargo".to_string(),
+                "check".into(),
+                "--message-format=short".into(),
+            ],
             "cargo check",
         )
     } else if target.join("package.json").exists() {
-        // try tsc, fall back to npm run build if no tsc
-        (
-            vec![
-                "sh",
-                "-c",
-                "npx --no-install tsc --noEmit 2>&1 || npm run --silent build 2>&1",
-            ],
-            "tsc/npm build",
-        )
+        // try tsc, fall back to `npm run build` if no tsc.
+        let script = if posix {
+            "npx --no-install tsc --noEmit 2>&1 || npm run --silent build 2>&1".to_string()
+        } else {
+            "npx --no-install tsc --noEmit 2>&1; if ($LASTEXITCODE -ne 0) { npm run --silent build 2>&1 }".to_string()
+        };
+        let (prog, args) = shell_argv(&script);
+        let mut cmd = vec![prog];
+        cmd.extend(args);
+        (cmd, "tsc/npm build")
     } else if target.join("go.mod").exists() {
-        (vec!["go", "build", "./..."], "go build")
+        (
+            vec!["go".to_string(), "build".into(), "./...".into()],
+            "go build",
+        )
     } else if target.join("pyproject.toml").exists() || target.join("setup.py").exists() {
-        (vec!["sh", "-c", "python -m py_compile $(find . -name '*.py' -not -path './.venv/*' | head -50) 2>&1"], "py_compile")
+        let script = if posix {
+            "python -m py_compile $(find . -name '*.py' -not -path './.venv/*' | head -50) 2>&1"
+                .to_string()
+        } else {
+            "Get-ChildItem -Path . -Recurse -Filter *.py | Where-Object { $_.FullName -notlike '*\\.venv*' } | Select-Object -First 50 | ForEach-Object { python -m py_compile $_.FullName } 2>&1".to_string()
+        };
+        let (prog, args) = shell_argv(&script);
+        let mut cmd = vec![prog];
+        cmd.extend(args);
+        (cmd, "py_compile")
     } else {
         return Outcome::err(
             "no recognized project marker (Cargo.toml/package.json/go.mod/pyproject.toml)",
         );
     };
-    let mut c = tokio::process::Command::new(cmd[0]);
+    let mut c = tokio::process::Command::new(&cmd[0]);
     c.args(&cmd[1..]);
     c.current_dir(&target);
     c.stdin(std::process::Stdio::null());
@@ -2847,31 +3190,35 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     // `c.output().await` had neither, so a wedged `cargo check`/`tsc`/`go build`
     // stalled the whole agent and /abort couldn't interrupt it.
     c.kill_on_drop(true);
-    // Mirror bash's env hygiene: drop the parent env (no LD_PRELOAD / proxy
-    // leak) and re-add only what a build/checker needs. Diagnostics runs a
-    // fixed checker (not model-controlled bash), so the bash denylist doesn't
-    // apply; but a checker still shouldn't inherit arbitrary env.
-    c.env_clear();
-    if let Ok(p) = std::env::var("PATH") {
-        c.env("PATH", p);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        c.env("HOME", home);
-    }
-    if let Ok(tmp) = std::env::var("TMPDIR") {
-        c.env("TMPDIR", tmp);
-    }
-    for k in [
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "GOPATH",
-        "GOCACHE",
-        "GOTMPDIR",
-        "NODE_PATH",
-        "npm_config_cache",
-    ] {
-        if let Ok(v) = std::env::var(k) {
-            c.env(k, v);
+    // Mirror the `bash` tool's env hygiene: on POSIX shells drop the parent
+    // env (no LD_PRELOAD / proxy leak) and re-add only what a checker needs;
+    // on PowerShell/Windows INHERIT the parent env — checkers (cargo/node/go)
+    // and .NET depend on SystemRoot/PATHEXT/USERPROFILE/APPDATA which
+    // env_clear would strip and break. Diagnostics runs a fixed checker (not
+    // model-controlled bash), so the bash denylist doesn't apply.
+    if shell_is_posix() {
+        c.env_clear();
+        if let Ok(p) = std::env::var("PATH") {
+            c.env("PATH", p);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            c.env("HOME", home);
+        }
+        if let Ok(tmp) = std::env::var("TMPDIR") {
+            c.env("TMPDIR", tmp);
+        }
+        for k in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "GOPATH",
+            "GOCACHE",
+            "GOTMPDIR",
+            "NODE_PATH",
+            "npm_config_cache",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                c.env(k, v);
+            }
         }
     }
     let child = match c.spawn() {
@@ -3377,10 +3724,16 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     .take(100)
                     .collect();
             }
+            let replaces = args
+                .get("replaces")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             // Prefer accumulation: if the name already exists, append instead of
             // clobbering (auto-reflect often re-saves the same topic).
-            if crate::memory::memory_exists_scoped(&cfg.workspace, scope, name) {
-                return memory_append_inner(
+            let mut out = if crate::memory::memory_exists_scoped(&cfg.workspace, scope, name) {
+                memory_append_inner(
                     &cfg.workspace,
                     scope,
                     name,
@@ -3390,43 +3743,63 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     importance,
                     force,
                     true,
-                );
-            }
-            match crate::memory_hygiene::gate_write(
-                &cfg.workspace,
-                scope,
-                name,
-                content,
-                mem_type,
-                importance,
-                force,
-            ) {
-                Ok(warnings) => match crate::memory::save_memory_scoped_with_importance(
+                )
+            } else {
+                match crate::memory_hygiene::gate_write(
                     &cfg.workspace,
                     scope,
                     name,
                     content,
                     mem_type,
-                    &description,
                     importance,
+                    force,
                 ) {
-                    Ok(p) => {
-                        let id = p
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let mut msg =
-                            format!("saved {} memory '{name}' (id: {id})", scope.as_str());
-                        for w in warnings {
-                            msg.push_str("\nnote: ");
-                            msg.push_str(&w);
+                    Ok(warnings) => match crate::memory::save_memory_scoped_with_importance(
+                        &cfg.workspace,
+                        scope,
+                        name,
+                        content,
+                        mem_type,
+                        &description,
+                        importance,
+                    ) {
+                        Ok(p) => {
+                            let id = p
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let mut msg =
+                                format!("saved {} memory '{name}' (id: {id})", scope.as_str());
+                            for w in warnings {
+                                msg.push_str("\nnote: ");
+                                msg.push_str(&w);
+                            }
+                            Outcome::ok(memory_write_ok(&cfg.workspace, msg))
                         }
-                        Outcome::ok(memory_write_ok(&cfg.workspace, msg))
-                    }
+                        Err(e) => Outcome::err(e),
+                    },
                     Err(e) => Outcome::err(e),
-                },
-                Err(e) => Outcome::err(e),
+                }
+            };
+            // Deprecate the superseded memory (if any) AFTER a successful
+            // save/append, so a failed write doesn't orphan a deprecation.
+            if !replaces.is_empty() {
+                match crate::memory::mark_memory_deprecated_any(
+                    &cfg.workspace,
+                    &replaces,
+                    Some(name),
+                ) {
+                    Ok(()) => out.output.push_str(&format!(
+                        "\nmarked '{}' deprecated (superseded by '{name}') — excluded from catalog/relevant surfaces",
+                        replaces
+                    )),
+                    Err(e) => out.output.push_str(&format!(
+                        "\nnote: could not mark '{}' deprecated: {e}",
+                        replaces
+                    )),
+                }
             }
+            out
         }
         "append" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -3498,14 +3871,17 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                 } else {
                     format!(": {blurb}")
                 };
+                let dep = if m.deprecated { " [DEPRECATED]" } else { "" };
                 out.push_str(&format!(
-                    "- {} [id: {}] ({}, {}, {}){}\n",
+                    "- {} [id: {}] ({}, {}, {}){}{}
+",
                     m.name,
                     id,
                     m.mem_type,
                     m.scope.as_str(),
                     m.importance.as_str(),
-                    desc
+                    desc,
+                    dep
                 ));
             }
             Outcome::ok(out.trim_end().to_string())
@@ -3534,8 +3910,21 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     crate::memory_recall::record_get(&cfg.workspace, &id);
+                    let banner = if m.deprecated {
+                        let sup = m
+                            .superseded_by
+                            .as_deref()
+                            .map(|s| format!(" (superseded by '{s}')"))
+                            .unwrap_or_default();
+                        format!(
+                            "⚠ DEPRECATED{sup} — this memory is superseded/excluded from recall. \
+                             Prefer its successor; forget if obsolete.\n\n"
+                        )
+                    } else {
+                        String::new()
+                    };
                     Outcome::ok(format!(
-                        "# {} [id: {}] ({}, {}, {})\n{}\n\n{}",
+                        "{banner}# {} [id: {}] ({}, {}, {})\n{}\n\n{}",
                         m.name,
                         id,
                         m.mem_type,
@@ -3621,8 +4010,49 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     .unwrap_or(0),
             ))
         }
+        "deprecate" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = if id.trim().is_empty() {
+                args.get("name").and_then(|v| v.as_str()).unwrap_or("")
+            } else {
+                id
+            };
+            if id.trim().is_empty() {
+                return Outcome::err("memory deprecate requires 'id' (or 'name')");
+            }
+            let sup_raw = args
+                .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sup = if sup_raw.trim().is_empty() {
+                None
+            } else {
+                Some(sup_raw)
+            };
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let result = if scope_str.is_empty() {
+                crate::memory::mark_memory_deprecated_any(&cfg.workspace, id, sup)
+            } else {
+                crate::memory::mark_memory_deprecated(&cfg.workspace, scope, id, sup)
+            };
+            match result {
+                Ok(()) => Outcome::ok(format!(
+                    "marked memory '{id}' deprecated (excluded from catalog/relevant surfaces)"
+                )),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "migrate" => {
+            // One-time rewrite of stale project-name refs (umans-harness →
+            // catalyst-code, UMANS_CORE → CATALYST_CODE) across both scopes.
+            // Idempotent; preserves all metadata.
+            match crate::memory::migrate_memories(&cfg.workspace) {
+                Ok(report) => Outcome::ok(memory_write_ok(&cfg.workspace, report.message)),
+                Err(e) => Outcome::err(e),
+            }
+        }
         other => Outcome::err(format!(
-            "memory: unknown action '{other}' (save|append|list|get|forget|consolidate|stats)"
+            "memory: unknown action '{other}' (save|append|list|get|forget|consolidate|stats|deprecate|migrate)"
         )),
     }
 }
@@ -4400,6 +4830,36 @@ mod tests {
         assert!(o.output.contains("nested bulk"), "{}", o.output);
     }
 
+    #[tokio::test]
+    async fn bulk_runs_independent_calls_concurrently() {
+        // Four independent sleeps: sequential ≈ 600ms, concurrent ≈ 150ms.
+        let (_root, cfg) = tmp_ws();
+        let t0 = std::time::Instant::now();
+        let o = execute_bulk(
+            &json!({
+                "calls": [
+                    { "name": "bash", "args": { "command": "sleep 0.15" } },
+                    { "name": "bash", "args": { "command": "sleep 0.15" } },
+                    { "name": "bash", "args": { "command": "sleep 0.15" } },
+                    { "name": "bash", "args": { "command": "sleep 0.15" } }
+                ]
+            }),
+            &cfg,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert!(o.ok, "{}", o.output);
+        assert!(
+            elapsed.as_millis() < 450,
+            "expected concurrent bulk (~150ms), got {elapsed:?}"
+        );
+        // Output blocks stay index-ordered even when futures finish out of order.
+        let pos0 = o.output.find("### [0] bash").expect("slot 0");
+        let pos3 = o.output.find("### [3] bash").expect("slot 3");
+        assert!(pos0 < pos3);
+    }
+
     #[test]
     fn todo_write_then_read_roundtrip() {
         let (_root, cfg) = tmp_ws();
@@ -4944,6 +5404,25 @@ mod tests {
         assert!(!command_uses_sudo("ls -la"));
         assert!(!command_uses_sudo("echo hello"));
         assert!(!command_uses_sudo(""));
+    }
+
+    #[test]
+    fn shell_resolution_default_is_posix_on_unix() {
+        // On a POSIX host with no CATALYST_CODE_SHELL override, the shell is
+        // bash and shell_argv produces the `bash -c <cmd>` form. (This test
+        // does NOT mutate any env var, so it is safe under `cargo test`'s
+        // parallel runner — it only reads the default.) The PowerShell branch
+        // is compile-gated to Windows and covered by the cross-compile check.
+        if cfg!(target_os = "windows") {
+            return; // default is PowerShell here; skip on a Windows host.
+        }
+        assert!(shell_is_posix(), "default Unix shell should be POSIX");
+        let (prog, args) = shell_argv("echo hi");
+        assert_eq!(prog, "bash");
+        assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+        // A bash sudo command is still detected; a fake PowerShell-only host
+        // can't run here, but command_uses_sudo must agree with shell_is_posix.
+        assert!(command_uses_sudo("sudo true"));
     }
 
     #[tokio::test]

@@ -347,13 +347,24 @@ impl PluginOauthConfig {
     }
 }
 
-/// A cached OAuth access token + its absolute-seconds expiry, keyed by
-/// provider_id in the PluginManager. Keeps the per-turn hot path (enrich_oauth)
-/// from spawning the token script on every request.
+/// A cached OAuth access token + optional request headers + absolute-seconds
+/// expiry, keyed by provider_id in the PluginManager. Keeps the per-turn hot
+/// path (enrich_oauth) from spawning the token script on every request.
+/// `headers` come from the plugin `token` action (e.g. `chatgpt-account-id`).
 #[derive(Clone)]
 struct CachedToken {
     token: String,
     expires_at: u64,
+    headers: Vec<(String, String)>,
+}
+
+/// Fresh OAuth credentials resolved from a plugin `token` action (or cache).
+#[derive(Clone, Debug)]
+pub struct ResolvedOauthCreds {
+    pub access_token: String,
+    /// Extra HTTP headers to merge onto the resolved provider for this turn
+    /// (e.g. `chatgpt-account-id`). Empty when the script omits them.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Result returned from executing a hook.
@@ -1330,11 +1341,14 @@ impl PluginManager {
         }
     }
 
-    /// Resolve a fresh (cached) OAuth access token for `provider_id` at turn /
+    /// Resolve fresh (cached) OAuth credentials for `provider_id` at turn /
     /// discovery time. Spawns the plugin's `token` action only when the cached
     /// token is missing or near expiry. Returns None when no creds exist or the
     /// script fails — callers fall back to the API-key path (no regression).
-    pub async fn resolve_oauth_token(&self, provider_id: &str) -> Option<String> {
+    ///
+    /// The script may also return `"headers": [["Name","value"], …]` which are
+    /// cached with the token and merged onto the resolved provider.
+    pub async fn resolve_oauth_creds(&self, provider_id: &str) -> Option<ResolvedOauthCreds> {
         let cfg = self.oauth_config(provider_id)?;
         // Cache hit?
         {
@@ -1342,7 +1356,10 @@ impl PluginManager {
             if let Some(c) = cache.get(provider_id) {
                 let now = now_secs();
                 if c.expires_at == 0 || c.expires_at > now + 60 {
-                    return Some(c.token.clone());
+                    return Some(ResolvedOauthCreds {
+                        access_token: c.token.clone(),
+                        headers: c.headers.clone(),
+                    });
                 }
             }
         }
@@ -1356,25 +1373,35 @@ impl PluginManager {
             .get("access_token")
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
-            .map(String::from);
-        if let Some(t) = &token {
-            let now = now_secs();
-            let exp = resp
-                .get("expires_at")
-                .and_then(|e| e.as_u64())
-                .filter(|e| *e > 0)
-                .unwrap_or(now + 300);
-            if let Ok(mut cache) = self.token_cache.lock() {
-                cache.insert(
-                    provider_id.to_string(),
-                    CachedToken {
-                        token: t.clone(),
-                        expires_at: exp,
-                    },
-                );
-            }
+            .map(String::from)?;
+        let headers = parse_oauth_token_headers(resp.get("headers"));
+        let now = now_secs();
+        let exp = resp
+            .get("expires_at")
+            .and_then(|e| e.as_u64())
+            .filter(|e| *e > 0)
+            .unwrap_or(now + 300);
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.insert(
+                provider_id.to_string(),
+                CachedToken {
+                    token: token.clone(),
+                    expires_at: exp,
+                    headers: headers.clone(),
+                },
+            );
         }
-        token
+        Some(ResolvedOauthCreds {
+            access_token: token,
+            headers,
+        })
+    }
+
+    /// Convenience wrapper: access token only (no headers).
+    pub async fn resolve_oauth_token(&self, provider_id: &str) -> Option<String> {
+        self.resolve_oauth_creds(provider_id)
+            .await
+            .map(|c| c.access_token)
     }
 
     /// Drive the interactive OAuth login for a plugin provider. Picks the flow
@@ -2551,6 +2578,27 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Parse optional `"headers": [["Name","value"], …]` from a plugin `token`
+/// action response. Ignores malformed entries.
+fn parse_oauth_token_headers(v: Option<&Value>) -> Vec<(String, String)> {
+    let Some(arr) = v.and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        if let Some(pair) = item.as_array() {
+            if pair.len() >= 2 {
+                if let (Some(k), Some(val)) = (pair[0].as_str(), pair[1].as_str()) {
+                    if !k.is_empty() && !val.is_empty() {
+                        out.push((k.to_string(), val.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Extract the lowercased host from a URL (best-effort, no `url` crate dep).

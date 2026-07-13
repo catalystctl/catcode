@@ -438,12 +438,14 @@ hooks still fire (keyed on the tool name), and `pre_tool`/`post_tool` fire too.
 
 ### Declaring an OAuth provider (subscription auth)
 
-A plugin can add a subscription-OAuth provider — the same mechanism the
-built-in OpenAI (ChatGPT), Google (Gemini), and Anthropic (Claude) providers
-use, but for any vendor — with no recompile. The plugin supplies ONE script
-that handles four actions (`login`, `complete`, `token`, `clear`); the
-harness owns the loopback redirect server (web flow) and the `/oauth-code`
-paste path (manual/device flow), exactly like the built-in flows.
+Built-in presets are API-key only. A plugin adds a subscription-OAuth provider
+for any vendor with no recompile. The plugin supplies ONE script that handles
+four actions (`login`, `complete`, `token`, `clear`); the harness owns the
+loopback redirect server (web flow) and the `/oauth-code` paste path
+(manual/device flow).
+
+Working example: `~/catcode-chatgpt-provider` (ChatGPT Plus/Pro → Codex).
+Template: `docs/examples/plugins/grok-oauth`.
 
 Add an `oauth` block to `plugin.json`:
 
@@ -529,12 +531,16 @@ Input adds `code` (the pasted/redirected code) and `redirect_uri` (web flow) or
 **`token`** — resolve/refresh the access token. Read `token_path`; if expired,
 refresh (make your own HTTP call) and write the updated token back. Output:
 ```json
-{ "access_token": "<bearer>", "expires_at": 1719003600 }
+{ "access_token": "<bearer>", "expires_at": 1719003600,
+  "headers": [["chatgpt-account-id", "<uuid>"]] }
 { "access_token": null }
 { "ok": false, "error": "refresh failed" }
 ```
 `expires_at` is unix seconds (optional; if 0/absent the harness caches for ~5
-min). This runs on the per-turn hot path, so it is cached until near expiry.
+min). Optional `headers` are merged onto every request for that provider
+(plugin wins on name conflicts) and cached with the token — use this for
+per-user identity headers such as ChatGPT's `chatgpt-account-id`. This runs
+on the per-turn hot path, so it is cached until near expiry.
 
 **`clear`** — delete any credentials + extra state you manage. The harness
 ALSO deletes `token_path`, so this is optional (use it for sidecar files).
@@ -548,8 +554,8 @@ Output: `{ "ok": true }`.
   config (name = provider_id, your base_url/kind/headers, no api_key) and
   refreshes `/models`.
 - At turn + discovery time: the harness runs `token` (cached), injects the
-  access token as `Authorization: Bearer`, and routes the turn to your
-  `base_url` over your declared `kind`.
+  access token as `Authorization: Bearer`, merges any returned `headers`, and
+  routes the turn to your `base_url` over your declared `kind`.
 - `/logout <provider_id>`: deletes `token_path` + runs `clear` + drops the
   provider config.
 

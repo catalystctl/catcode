@@ -308,12 +308,108 @@ pub fn consolidate(workspace: &Path, scope: Option<Scope>) -> Result<Consolidate
             let global = consolidate_scope(workspace, Scope::Global)?;
             report.merged.extend(global.merged);
             report.skipped += global.skipped;
+            // Cross-scope pass: dedupe memories that exist in BOTH global and
+            // workspace (same slug, or high jaccard). scan_all_memories already
+            // injects both scopes into every prompt, so a same-name cross-scope
+            // duplicate is pure redundancy — and a stale-global / current-
+            // workspace pair is actively misleading. Loser's unique content is
+            // appended to the survivor (no information loss); loser is forgotten.
+            let cross = consolidate_cross_scope(workspace)?;
+            report.merged.extend(cross.merged);
+            report.skipped += cross.skipped;
             report.message = format_report(&report);
             // Stamp cooldown after a full pass.
             stamp_consolidate(workspace);
             Ok(report)
         }
     }
+}
+
+/// Merge near-duplicate memories that span the global and workspace scopes
+/// (same slug, or jaccard >= [`CONSOLIDATE_SIMILARITY`]). Same-name cross-scope
+/// duplicates are pure redundancy — `scan_all_memories` already injects both
+/// scopes into every prompt — and a stale-global / current-workspace pair (as
+/// seen with `harness-provider-auth-architecture`) is actively misleading. The
+/// loser's unique content is appended to the survivor (no information loss);
+/// the loser is then forgotten. On an authority tie the GLOBAL copy wins so
+/// every workspace retains the merged knowledge (global injects everywhere);
+/// a genuine contradiction should be resolved with `memory deprecate`, not here.
+fn consolidate_cross_scope(workspace: &Path) -> Result<ConsolidateReport, String> {
+    let mut report = ConsolidateReport::default();
+    let global = scan_memories_scoped(workspace, Scope::Global);
+    if global.is_empty() {
+        return Ok(report);
+    }
+    let ws = scan_memories_scoped(workspace, Scope::Workspace);
+    if ws.is_empty() {
+        return Ok(report);
+    }
+    let mut absorbed: HashSet<String> = HashSet::new();
+    for g in &global {
+        let g_slug = slugify_public(&g.name);
+        if absorbed.contains(&g_slug) {
+            continue;
+        }
+        // Match by same slug (clear duplicate — a workspace save reusing a name
+        // that exists globally) or high jaccard (semantic near-dup).
+        let Some(w) = ws.iter().find(|w| {
+            let w_slug = slugify_public(&w.name);
+            !absorbed.contains(&w_slug)
+                && (w_slug == g_slug || jaccard_similarity(g, w) >= CONSOLIDATE_SIMILARITY)
+        }) else {
+            continue;
+        };
+        let keep_global = cross_authority(g) >= cross_authority(w);
+        let (surv, loser, surv_scope, loser_scope) = if keep_global {
+            (g, w, Scope::Global, Scope::Workspace)
+        } else {
+            (w, g, Scope::Workspace, Scope::Global)
+        };
+        let surv_name = surv.name.clone();
+        let loser_slug = slugify_public(&loser.name);
+        let merge_blob = unique_append_content(&surv.content, &loser.content);
+        let desc = if surv.description.trim().is_empty() {
+            loser.description.clone()
+        } else {
+            surv.description.clone()
+        };
+        let mem_type = if surv.mem_type.trim().is_empty() {
+            loser.mem_type.clone()
+        } else {
+            surv.mem_type.clone()
+        };
+        crate::memory::save_memory_scoped_with_importance(
+            workspace,
+            surv_scope,
+            &surv_name,
+            &merge_blob,
+            &mem_type,
+            &desc,
+            surv.importance,
+        )?;
+        forget_memory_scoped(workspace, loser_scope, &loser_slug)?;
+        absorbed.insert(loser_slug.clone());
+        if surv_scope == Scope::Workspace {
+            absorbed.insert(slugify_public(&surv_name));
+        }
+        report.merged.push((slugify_public(&surv_name), loser_slug));
+    }
+    report.message = format_report(&report);
+    Ok(report)
+}
+
+/// Authority score for cross-scope survivor selection: (pinned, importance,
+/// content length). Higher wins; ties favor the global copy.
+fn cross_authority(e: &MemoryEntry) -> (i32, i32, usize) {
+    (
+        if e.pinned { 1 } else { 0 },
+        match e.importance {
+            Importance::High => 2,
+            Importance::Normal => 1,
+            Importance::Low => 0,
+        },
+        e.content.len(),
+    )
 }
 
 fn consolidate_scope(workspace: &Path, scope: Scope) -> Result<ConsolidateReport, String> {
@@ -683,6 +779,8 @@ mod tests {
             scope: Scope::Workspace,
             pinned: true,
             importance: Importance::High,
+            deprecated: false,
+            superseded_by: None,
         };
         let v = evaluate_write(
             "indent",
@@ -715,6 +813,8 @@ mod tests {
             scope: Scope::Workspace,
             pinned: false,
             importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
         };
         let v = evaluate_write(
             "rules",
@@ -760,6 +860,91 @@ mod tests {
             );
             let left = crate::memory::scan_memories_scoped(ws, Scope::Workspace);
             assert_eq!(left.len(), 1);
+        });
+    }
+
+    #[test]
+    fn consolidate_merges_cross_scope_same_name() {
+        // A memory that exists in BOTH global and workspace (same name) is pure
+        // redundancy — scan_all_memories injects both into every prompt. The
+        // cross-scope pass (consolidate(None)) must merge them into one survivor
+        // retaining both facts (no information loss).
+        with_temp_store("xscope", |ws| {
+            save_memory_scoped(ws, Scope::Global, "dup", "global fact A", "note", "global")
+                .unwrap();
+            save_memory_scoped(
+                ws,
+                Scope::Workspace,
+                "dup",
+                "workspace fact B",
+                "note",
+                "workspace",
+            )
+            .unwrap();
+            let before = crate::memory::scan_all_memories(ws);
+            assert_eq!(
+                before.len(),
+                2,
+                "two same-name memories across scopes before"
+            );
+            let report = consolidate(ws, None).unwrap();
+            assert!(
+                !report.merged.is_empty(),
+                "cross-scope merge expected: {}",
+                report.message
+            );
+            let after = crate::memory::scan_all_memories(ws);
+            assert_eq!(
+                after.len(),
+                1,
+                "one survivor after cross-scope merge: {:?}",
+                after
+            );
+            assert!(
+                after[0].content.contains("fact A") || after[0].content.contains("fact B"),
+                "survivor should retain merged content: {}",
+                after[0].content
+            );
+        });
+    }
+
+    #[test]
+    fn migrate_rewrites_stale_refs_and_is_idempotent() {
+        // One-time rewrite of dead project-name refs left by the umans-harness →
+        // catalyst-code rename. Must be idempotent (second run is a no-op).
+        with_temp_store("migrate", |ws| {
+            save_memory_scoped(
+                ws,
+                Scope::Workspace,
+                "stale-arch",
+                "config at .umans-harness/config.json; set UMANS_CORE to the core dir",
+                "architecture",
+                "old paths",
+            )
+            .unwrap();
+            let r1 = crate::memory::migrate_memories(ws).unwrap();
+            assert!(
+                !r1.migrated.is_empty(),
+                "expected migration: {}",
+                r1.message
+            );
+            let after = crate::memory::scan_memories_scoped(ws, Scope::Workspace);
+            let body = &after
+                .iter()
+                .find(|m| m.name == "stale-arch")
+                .expect("stale-arch survived")
+                .content;
+            assert!(body.contains(".catalyst-code/config.json"), "{body}");
+            assert!(body.contains("CATALYST_CODE"), "{body}");
+            assert!(!body.contains(".umans-harness"), "{body}");
+            assert!(!body.contains("UMANS_CORE"), "{body}");
+            // Idempotent: second run rewrites nothing.
+            let r2 = crate::memory::migrate_memories(ws).unwrap();
+            assert!(
+                r2.migrated.is_empty(),
+                "migrate must be idempotent: {:?}",
+                r2.migrated
+            );
         });
     }
 }

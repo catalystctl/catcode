@@ -81,6 +81,7 @@ type session struct {
 	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)
 	visionModel         string          // preferred handoff target ("" = pick dynamically)
 	pendingVisionPicker bool            // open the vision picker once the config arrives
+	pendingPluginInstallPath string     // path/URL awaiting scope pick (modalPluginInstallScope)
 
 	// Active model provider (openai/anthropic endpoint). activeProvider is the
 	// name the core resolved; providers is the list of configured names for the

@@ -47,6 +47,7 @@ const (
 	modalMemory    // pick a memory to forget
 	modalGoal      // multi-field /goal form (goal, concurrency, models, providers)
 	modalGoalPlan  // plan-ready review (approve / revise / cancel)
+	modalPluginInstallScope // global vs workspace after /plugin-install path
 )
 
 // goalDraft is the multi-field form state for modalGoal.
@@ -345,10 +346,37 @@ func (s *session) openAttachModal() {
 	s.openValueEditModal(editTargetAttach, "Attach Image", "/path/to/image.png", "")
 }
 
-// openPluginInstallModal collects a local path or GitHub Release URL, with an
-// optional trailing scope (global|workspace).
+// openPluginInstallModal collects a local path or GitHub Release URL; scope is
+// chosen in a follow-up picker (global vs workspace).
 func (s *session) openPluginInstallModal() {
-	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "path|url [global|workspace]", "")
+	s.openValueEditModal(editTargetPluginInstall, "Install Plugin", "path or GitHub URL / owner/repo", "")
+}
+
+// openPluginInstallScopeModal asks where to install after a source path is known.
+func (s *session) openPluginInstallScopeModal(path string) {
+	s.pendingPluginInstallPath = path
+	s.modal = newModal()
+	s.modal.kind = modalPluginInstallScope
+	s.modal.cursor = 0 // default highlight: global (first item)
+}
+
+func (s *session) pluginInstallScopeItems() []listItem {
+	return []listItem{
+		{
+			label: "global",
+			desc:  "every workspace (~/.catalyst-code/plugins)",
+		},
+		{
+			label: "workspace",
+			desc:  "this repo only (.catalyst-code/plugins)",
+		},
+	}
+}
+
+// sendPluginInstall dispatches install_plugin to the core and logs progress.
+func (s *session) sendPluginInstall(path, scope string) {
+	s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
+	s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
 }
 
 // openSteerModal collects a mid-turn steer message.
@@ -748,6 +776,7 @@ func (s *session) closeModal() {
 	s.modal.kind = modalNone
 	s.modal.editing = false
 	s.pluginPickerMode = ""
+	s.pendingPluginInstallPath = ""
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +817,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/copy", desc: "copy last assistant reply"},
 		{label: "/attach", desc: "attach an image (vision) — path modal"},
 		{label: "/vision", desc: "configure vision models & handoff target"},
-		{label: "/plugin-install", desc: "install path/URL · optional global|workspace"},
+		{label: "/plugin-install", desc: "install path/URL · prompts global vs workspace"},
 		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
 		{label: "/plugin-reload", desc: "re-scan plugin directories"},
@@ -1123,7 +1152,7 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory:
+		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory, modalPluginInstallScope:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
@@ -1602,6 +1631,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.noNetworkItems()
 	case modalMouseWheel:
 		items = s.mouseWheelItems()
+	case modalPluginInstallScope:
+		items = s.pluginInstallScopeItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -1788,6 +1819,20 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 				s.logInfo("mouse wheel: off (click-drag to select/copy text)")
 			}
 			s.invalidateAll()
+		}
+		s.closeModal()
+		return s, nil
+	case modalPluginInstallScope:
+		items := s.pluginInstallScopeItems()
+		path := strings.TrimSpace(s.pendingPluginInstallPath)
+		s.pendingPluginInstallPath = ""
+		if path == "" {
+			s.closeModal()
+			s.logError("no plugin path pending — run /plugin-install again")
+			return s, nil
+		}
+		if abs >= 0 && abs < len(items) {
+			s.sendPluginInstall(path, items[abs].label)
 		}
 		s.closeModal()
 		return s, nil
@@ -2255,8 +2300,11 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 			s.logError(err.Error())
 			return s, nil
 		}
-		s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
-		s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
+		if scope == "" {
+			s.openPluginInstallScopeModal(path)
+			return s, nil
+		}
+		s.sendPluginInstall(path, scope)
 	case editTargetSteer:
 		if val == "" {
 			s.logError("no steer message entered")
@@ -2429,7 +2477,7 @@ func (s *session) helpText() string {
 		"  /vision           configure vision models & handoff target",
 		"  /remember         save a memory note",
 		"  /memory · /forget list / forget memories",
-		"  /plugin-install   install from path/URL [global|workspace]",
+		"  /plugin-install   install from path/URL (prompts global|workspace)",
 		"  /plugin-config    enable / disable plugins",
 		"  /plugin-remove    uninstall a plugin",
 		"  /plugin-reload    re-scan plugin directories",
@@ -2524,6 +2572,12 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("No Network", s.noNetworkItems(), false)
 	case modalMouseWheel:
 		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
+	case modalPluginInstallScope:
+		title := "Install where?"
+		if p := strings.TrimSpace(s.pendingPluginInstallPath); p != "" {
+			title = "Install where? · " + p
+		}
+		return s.renderListModal(title, s.pluginInstallScopeItems(), false)
 	case modalValueEdit:
 		return s.renderValueEditModal()
 	case modalGoal:

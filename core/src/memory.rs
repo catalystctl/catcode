@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 /// Serializes all memory write operations (save/append/forget) across the
 /// orchestrator and any in-process subagents. `append_memory` is a
@@ -27,6 +28,40 @@ static WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 /// process-global `HOME`, which races with parallel tests that also touch
 /// the memory store.
 static ROOT_OVERRIDE: StdMutex<Option<PathBuf>> = StdMutex::new(None);
+
+/// Process-local scan + relevant-tail cache. `scan_all_memories` reads every
+/// `.md` on each call; without this, every model round (including post-tool
+/// re-streams) re-reads the whole store. Invalidated on any write.
+struct MemoryScanCache {
+    /// Workspace project hash this cache belongs to (empty = unset).
+    ws_hash: String,
+    entries: Vec<MemoryEntry>,
+    /// `(prompt, rendered tail)` for the current user turn.
+    relevant: Option<(String, String)>,
+    /// Wall time of last successful scan (tests / debugging).
+    scanned_at: Option<Instant>,
+}
+
+impl MemoryScanCache {
+    const fn empty() -> Self {
+        Self {
+            ws_hash: String::new(),
+            entries: Vec::new(),
+            relevant: None,
+            scanned_at: None,
+        }
+    }
+}
+
+static SCAN_CACHE: StdMutex<MemoryScanCache> = StdMutex::new(MemoryScanCache::empty());
+
+/// Drop cached scans / relevant tails. Called after every successful memory
+/// mutation so the next request re-reads from disk.
+pub fn invalidate_scan_cache() {
+    if let Ok(mut c) = SCAN_CACHE.lock() {
+        *c = MemoryScanCache::empty();
+    }
+}
 
 /// Serializes tests that touch the default memory store or install a root
 /// override — without this, parallel `tools` memory tests race with hygiene
@@ -139,6 +174,14 @@ pub struct MemoryEntry {
     /// Frontmatter `importance:` (high|normal|low). High ranks with pins in
     /// the catalog; low is discouraged by the write policy unless forced.
     pub importance: Importance,
+    /// When true, this memory is superseded/invalidated and excluded from the
+    /// standing catalog + per-turn relevant tail (the successor carries the
+    /// knowledge). Set via `memory save ... replaces=` / `memory deprecate`;
+    /// still visible via `list`/`get`/`forget` so it can be audited.
+    pub deprecated: bool,
+    /// Name/id of the memory that supersedes this one (frontmatter
+    /// `superseded_by`), set when a new memory `replaces` this one.
+    pub superseded_by: Option<String>,
 }
 
 /// Standing-prompt catalog caps. Bodies are NOT injected — only name/type/scope
@@ -148,6 +191,11 @@ pub const CATALOG_MAX_ENTRIES: usize = 48;
 /// ~2.5k tokens at the chars/4 heuristic used elsewhere in the harness.
 pub const CATALOG_MAX_CHARS: usize = 10_000;
 const CATALOG_DESC_MAX_CHARS: usize = 100;
+/// Maximum pinned entries shown in the standing catalog, so a large set of
+/// pinned convention/decision memories can't crowd out operational
+/// architecture/note/gotcha knowledge. Pinned entries beyond this budget are
+/// omitted (still visible via `list`/`get`).
+pub const CATALOG_PIN_BUDGET: usize = 16;
 
 /// Per-turn relevant-memory tail (transient, not prefix-cached).
 pub const RELEVANT_MAX_ENTRIES: usize = 8;
@@ -324,10 +372,26 @@ pub fn scan_memories_scoped(workspace: &Path, scope: Scope) -> Vec<MemoryEntry> 
 /// facts), then workspace (project-specific). Each entry's `scope` field
 /// identifies its origin. Used by `memory_injection` so the system prompt
 /// carries forward both universal and project-specific learnings.
+///
+/// Results are process-cached per workspace hash and invalidated on write.
 pub fn scan_all_memories(workspace: &Path) -> Vec<MemoryEntry> {
+    let hash = hash_workspace(workspace);
+    {
+        let cache = SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.ws_hash == hash && cache.scanned_at.is_some() {
+            return cache.entries.clone();
+        }
+    }
     let store = Store::new(Store::default_root());
     let mut entries = store.scan_scoped(workspace, Scope::Global);
     entries.extend(store.scan_scoped(workspace, Scope::Workspace));
+    {
+        let mut cache = SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.ws_hash = hash;
+        cache.entries = entries.clone();
+        cache.relevant = None;
+        cache.scanned_at = Some(Instant::now());
+    }
     entries
 }
 
@@ -384,7 +448,7 @@ pub fn save_memory_scoped_with_importance(
     importance: Importance,
 ) -> Result<PathBuf, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    Store::new(Store::default_root()).save_scoped_with_importance(
+    let path = Store::new(Store::default_root()).save_scoped_with_importance(
         workspace,
         scope,
         name,
@@ -392,7 +456,11 @@ pub fn save_memory_scoped_with_importance(
         mem_type,
         description,
         importance,
-    )
+    )?;
+    // Drop after write succeeds so the next scan/relevance call re-reads disk.
+    drop(_guard);
+    invalidate_scan_cache();
+    Ok(path)
 }
 
 /// Append `new_facts` to an existing memory (same name/slug), capped to
@@ -457,7 +525,7 @@ fn append_memory_locked(
     max_bytes: usize,
 ) -> Result<PathBuf, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    append_memory_into(
+    let path = append_memory_into(
         store,
         workspace,
         scope,
@@ -466,7 +534,10 @@ fn append_memory_locked(
         mem_type,
         description,
         max_bytes,
-    )
+    )?;
+    drop(_guard);
+    invalidate_scan_cache();
+    Ok(path)
 }
 
 fn append_memory_into(
@@ -560,6 +631,8 @@ pub fn forget_memory_scoped(workspace: &Path, scope: Scope, id: &str) -> Result<
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("failed to remove memory: {e}"))?;
         rebuild_index(&dir, scope)?;
+        drop(_guard);
+        invalidate_scan_cache();
         Ok(())
     } else {
         Err(format!("no memory found with id/name '{id}'"))
@@ -626,6 +699,153 @@ pub fn memory_count(workspace: &Path) -> usize {
     scan_all_memories(workspace).len()
 }
 
+/// Report from a stale-reference migration pass ([`migrate_memories`]).
+#[derive(Clone, Debug, Default)]
+pub struct MigrateReport {
+    pub migrated: Vec<String>,
+    pub message: String,
+}
+
+/// Old → new project-name substitution map applied by [`migrate_memories`].
+/// Targets dead path/env references left by the umans-harness → catalyst-code
+/// rename. The provider name "Umans" is intentionally NOT rewritten (it is a
+/// distinct, still-valid name).
+fn apply_rename_map(s: &str) -> String {
+    s.replace("UMANS_CORE", "CATALYST_CODE")
+        .replace(".umans-harness", ".catalyst-code")
+        .replace("umans-harness", "catalyst-code")
+}
+
+/// Emit a memory markdown file from explicit parsed fields (preserving
+/// `pinned`/`importance`/deprecation metadata exactly as parsed — unlike
+/// [`Store::save_scoped_with_importance`], which re-derives `pin` from type).
+fn write_memory_file(
+    path: &Path,
+    e: &MemoryEntry,
+    content: &str,
+    description: &str,
+) -> std::io::Result<()> {
+    let pin_line = if e.pinned { "pin: true\n" } else { "" };
+    let importance_line = if e.importance != Importance::Normal {
+        format!("importance: {}\n", e.importance.as_str())
+    } else {
+        String::new()
+    };
+    let dep_line = if e.deprecated {
+        "deprecated: true\n".to_string()
+    } else {
+        String::new()
+    };
+    let sup_line = match &e.superseded_by {
+        Some(s) if !s.trim().is_empty() => format!("superseded_by: {}\n", s),
+        _ => String::new(),
+    };
+    let body = format!(
+        "---\nname: {}\ndescription: {}\ntype: {}\n{pin_line}{importance_line}{dep_line}{sup_line}---\n{}",
+        e.name, description, e.mem_type, content
+    );
+    atomic_write(path, &body)
+}
+
+/// One-time, idempotent migration of stale project-name references in memory
+/// bodies + descriptions (`umans-harness` → `catalyst-code`, `UMANS_CORE` →
+/// `CATALYST_CODE`). Architecture/convention docs that still point at dead
+/// `.umans-harness/` / `UMANS_CORE` paths are actively misleading; this
+/// rewrites them in place, preserving all metadata. Memories whose NAME
+/// describes the rename itself are skipped so the historical record isn't
+/// corrupted ("renamed umans-harness to …").
+pub fn migrate_memories(workspace: &Path) -> Result<MigrateReport, String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = scan_all_memories(workspace);
+    let mut report = MigrateReport::default();
+    for e in &entries {
+        let lname = e.name.to_lowercase();
+        if lname.contains("rename") || lname.contains("naming") || lname.contains("migrat") {
+            continue;
+        }
+        let new_content = apply_rename_map(&e.content);
+        let new_desc = apply_rename_map(&e.description);
+        if new_content == e.content && new_desc == e.description {
+            continue;
+        }
+        write_memory_file(&e.path, e, &new_content, &new_desc)
+            .map_err(|err| format!("failed to rewrite memory '{}': {err}", e.name))?;
+        report.migrated.push(e.name.clone());
+    }
+    report.message = if report.migrated.is_empty() {
+        "migrate: no stale references found".into()
+    } else {
+        format!(
+            "migrate: rewrote {} memor(y/ies): {}",
+            report.migrated.len(),
+            report.migrated.join(", ")
+        )
+    };
+    drop(_guard);
+    if !report.migrated.is_empty() {
+        invalidate_scan_cache();
+    }
+    Ok(report)
+}
+
+/// Mark a memory deprecated (superseded/invalidated) by rewriting its
+/// frontmatter to set `deprecated: true` and (optionally) `superseded_by:
+/// <name>`, preserving the body. Deprecated memories are excluded from the
+/// standing catalog and the per-turn relevant tail; they remain visible via
+/// `list`/`get`/`forget` so they can be audited. This is the invalidation
+/// mechanism behind `memory save ... replaces=...` / `memory deprecate`.
+pub fn mark_memory_deprecated(
+    workspace: &Path,
+    scope: Scope,
+    id: &str,
+    superseded_by: Option<&str>,
+) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = Store::new(Store::default_root());
+    let dir = store.dir_scoped(workspace, scope);
+    let slug = slugify(id);
+    if slug.is_empty() {
+        return Err("memory id/name must contain at least one alphanumeric character".into());
+    }
+    let path = dir.join(format!("{slug}.md"));
+    if !path.exists() {
+        return Err(format!(
+            "no {} memory found with id/name '{id}'",
+            scope.as_str()
+        ));
+    }
+    let entry = parse_memory_file(&path).ok_or_else(|| format!("memory '{id}' is unreadable"))?;
+    let mut new_entry = entry.clone();
+    new_entry.deprecated = true;
+    new_entry.superseded_by = superseded_by
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    write_memory_file(
+        &path,
+        &new_entry,
+        &new_entry.content,
+        &new_entry.description,
+    )
+    .map_err(|e| format!("failed to write memory: {e}"))?;
+    rebuild_index(&dir, scope)?;
+    drop(_guard);
+    invalidate_scan_cache();
+    Ok(())
+}
+
+/// Mark a memory deprecated, searching both scopes (workspace first). Used by
+/// `memory save replaces=...` / `memory deprecate` when the caller doesn't know
+/// which scope the superseded memory lives in.
+pub fn mark_memory_deprecated_any(
+    workspace: &Path,
+    id: &str,
+    superseded_by: Option<&str>,
+) -> Result<(), String> {
+    mark_memory_deprecated(workspace, Scope::Workspace, id, superseded_by)
+        .or_else(|_| mark_memory_deprecated(workspace, Scope::Global, id, superseded_by))
+}
+
 /// One-line description for catalog display: prefer frontmatter description,
 /// else the first non-empty content line. Truncated for standing-prompt budget.
 fn catalog_blurb(entry: &MemoryEntry) -> String {
@@ -668,20 +888,52 @@ pub fn memory_injection(workspace: &Path, prompt: &str) -> String {
 
 /// Transient per-turn relevant-memory block for the request tail (not persisted,
 /// not spliced into the standing system prompt — keeps the prefix cache stable).
+///
+/// Cached for the lifetime of a user-prompt string within a process; mid-turn
+/// model rounds reuse the same tail until a memory write invalidates the scan.
 pub fn relevant_memories_tail(workspace: &Path, prompt: &str) -> String {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return String::new();
     }
+    let hash = hash_workspace(workspace);
+    {
+        let cache = SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.ws_hash == hash {
+            if let Some((ref p, ref tail)) = cache.relevant {
+                if p == prompt {
+                    return tail.clone();
+                }
+            }
+        }
+    }
     let memories = scan_all_memories(workspace);
     crate::memory_recall::begin_turn(workspace, prompt, &memories);
-    build_relevant_tail(&memories, prompt)
+    let tail = build_relevant_tail(&memories, prompt);
+    {
+        let mut cache = SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        // Only retain if scan still matches this workspace (a concurrent write
+        // could have invalidated between scan and here).
+        if cache.ws_hash == hash || cache.scanned_at.is_some() {
+            cache.ws_hash = hash;
+            cache.relevant = Some((prompt.to_string(), tail.clone()));
+        }
+    }
+    tail
 }
 
-/// When the memory store grows past this, switch ranking from boolean keyword
-/// match to bag-of-words cosine similarity — a local retrieval foundation that
-/// needs no external embedding model (SELF_LEARNING Milestone 4 trigger).
-pub const RETRIEVAL_SCALE_THRESHOLD: usize = 500;
+/// Per-turn relevant-memory tail WITHOUT recall telemetry (for subagents, whose
+/// task is not a user turn and would otherwise clobber the orchestrator's
+/// in-flight turn tracking in [`memory_recall::begin_turn`]). Returns the same
+/// semantic `[RELEVANT MEMORIES]` block as [`relevant_memories_tail`].
+pub fn relevant_tail_for_subagent(workspace: &Path, prompt: &str) -> String {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return String::new();
+    }
+    let memories = scan_all_memories(workspace);
+    build_relevant_tail(&memories, prompt)
+}
 
 fn importance_rank(i: Importance) -> u8 {
     match i {
@@ -703,8 +955,10 @@ fn build_injection(memories: &[MemoryEntry], prompt: &str) -> String {
 }
 
 fn build_catalog(memories: &[MemoryEntry]) -> String {
-    // Pinned/high-importance first (stable within group by name), then the rest.
-    let mut order: Vec<&MemoryEntry> = memories.iter().collect();
+    // Exclude deprecated (superseded) memories — the successor carries the
+    // knowledge; they remain visible via `list`/`get`. Pinned/high-importance
+    // first (stable within group by name), then the rest.
+    let mut order: Vec<&MemoryEntry> = memories.iter().filter(|m| !m.deprecated).collect();
     order.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)
@@ -720,7 +974,16 @@ fn build_catalog(memories: &[MemoryEntry]) -> String {
     );
     let mut listed = 0usize;
     let mut omitted = 0usize;
+    let mut pins_listed = 0usize;
     for m in order {
+        // Cap pinned entries so a large set of pinned convention/decision
+        // memories can't crowd out operational architecture/note/gotcha
+        // knowledge. Over-budget pinned entries are omitted (still visible via
+        // `list`/`get`); unpinned entries fill the rest on importance/scope/name.
+        if m.pinned && pins_listed >= CATALOG_PIN_BUDGET {
+            omitted += 1;
+            continue;
+        }
         let blurb = catalog_blurb(m);
         let line = format!(
             "- **{}** ({}, {}){}\n",
@@ -743,6 +1006,9 @@ fn build_catalog(memories: &[MemoryEntry]) -> String {
         }
         out.push_str(&line);
         listed += 1;
+        if m.pinned {
+            pins_listed += 1;
+        }
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -753,51 +1019,62 @@ fn build_catalog(memories: &[MemoryEntry]) -> String {
 }
 
 fn build_relevant_tail(memories: &[MemoryEntry], prompt: &str) -> String {
-    let use_vector = memories.len() >= RETRIEVAL_SCALE_THRESHOLD;
-    let mut scored: Vec<(&MemoryEntry, f64)> = if use_vector {
-        let q = bag_vector(prompt);
-        memories
-            .iter()
-            .filter_map(|m| {
-                let text = format!("{} {} {}", m.name, m.description, m.content);
-                let score = cosine_sim(&q, &bag_vector(&text));
-                // Soft floor so sparse queries still surface a few candidates.
-                if score > 0.02 {
-                    Some((m, score))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        memories
-            .iter()
-            .filter(|m| is_relevant(m, prompt))
-            .map(|m| (m, 1.0))
-            .collect()
-    };
+    // Exclude deprecated (superseded) memories — the successor carries the
+    // knowledge; they remain visible via `list`/`get`.
+    let live: Vec<&MemoryEntry> = memories.iter().filter(|m| !m.deprecated).collect();
+    if live.is_empty() {
+        return String::new();
+    }
+    // Always-on semantic retrieval: tf·idf-weighted cosine over significant
+    // tokens, plus a keyword bonus for exact name/description token hits.
+    // This is the local Milestone-4 stand-in (no external embedding model): it
+    // ranks by query relevance rather than type-pinning, so pinned-but-irrelevant
+    // memories can no longer crowd out real matches. The synonym-miss signal
+    // from `memory_recall` (body matched but name didn't) is what unfroze this —
+    // the deferral gate's condition has been met.
+    let idf = compute_idf(&live);
+    let q = tfidf_vector(prompt, &idf);
+    let mut scored: Vec<(&MemoryEntry, f64)> = live
+        .iter()
+        .copied()
+        .filter_map(|m| {
+            let text = format!("{} {} {}", m.name, m.description, m.content);
+            let sem = cosine_sim(&q, &tfidf_vector(&text, &idf));
+            // Exact name/description keyword hit is a strong signal — give it a
+            // small flat bonus so a genuine match edges out a near-synonym, and
+            // guarantees real matches surface even when the corpus is tiny.
+            let kw = if is_name_relevant(m, prompt) {
+                0.15
+            } else {
+                0.0
+            };
+            let score = sem + kw;
+            if sem > 0.0 || kw > 0.0 {
+                Some((m, score))
+            } else {
+                None
+            }
+        })
+        .collect();
     if scored.is_empty() {
         return String::new();
     }
-    // Prefer higher retrieval score, then pinned/high-importance, then name.
+    // Relevance dominates; pinning/importance are only tie-breakers (a query-" "
+    // relevant unpinned memory must outrank a pinned-but-irrelevant one).
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.pinned.cmp(&a.0.pinned))
             .then_with(|| importance_rank(b.0.importance).cmp(&importance_rank(a.0.importance)))
+            .then_with(|| b.0.pinned.cmp(&a.0.pinned))
             .then_with(|| a.0.name.cmp(&b.0.name))
     });
     let total = scored.len();
     scored.truncate(RELEVANT_MAX_ENTRIES);
 
-    let header = if use_vector {
-        "[RELEVANT MEMORIES] — vector-ranked matches for this turn (transient; \
-         bag-of-words cosine over the memory store). Use memory action=get for full text.\n"
-    } else {
-        "[RELEVANT MEMORIES] — keyword matches for this turn (transient). \
-         Use memory action=get for full text.\n"
-    };
-    let mut out = String::from(header);
+    let mut out = String::from(
+        "[RELEVANT MEMORIES] — semantic matches for this turn (transient; \
+         tf·idf cosine + keyword over the memory store). Use memory action=get for full text.\n",
+    );
     for (m, _score) in &scored {
         let blurb = catalog_blurb(m);
         out.push_str(&format!(
@@ -834,16 +1111,40 @@ fn build_relevant_tail(memories: &[MemoryEntry], prompt: &str) -> String {
     out
 }
 
-/// Sparse bag-of-words vector over significant tokens (local embedding stand-in).
-fn bag_vector(text: &str) -> std::collections::HashMap<String, f64> {
-    let mut v = std::collections::HashMap::new();
+/// Document frequency of each significant token across the live memory corpus,
+/// for idf weighting (rarer terms discriminate better; common tokens like
+/// "core"/"system"/"file" get down-weighted so they can't false-match).
+fn compute_idf(memories: &[&MemoryEntry]) -> std::collections::HashMap<String, f64> {
+    let n = memories.len().max(1) as f64;
+    let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in memories {
+        let toks: std::collections::HashSet<String> =
+            significant_tokens(&format!("{} {} {}", m.name, m.description, m.content))
+                .into_iter()
+                .collect();
+        for t in toks {
+            *df.entry(t).or_insert(0) += 1;
+        }
+    }
+    df.into_iter()
+        .map(|(t, d)| (t, (n / d.max(1) as f64).ln().max(0.0)))
+        .collect()
+}
+
+/// tf·idf-weighted bag over significant tokens (local semantic vector).
+fn tfidf_vector(
+    text: &str,
+    idf: &std::collections::HashMap<String, f64>,
+) -> std::collections::HashMap<String, f64> {
+    let mut v: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for t in significant_tokens(text) {
-        *v.entry(t).or_insert(0.0) += 1.0;
+        let w = idf.get(&t).copied().unwrap_or(1.0);
+        *v.entry(t).or_insert(0.0) += w;
     }
     v
 }
 
-fn cosine_sim(
+pub fn cosine_sim(
     a: &std::collections::HashMap<String, f64>,
     b: &std::collections::HashMap<String, f64>,
 ) -> f64 {
@@ -926,6 +1227,8 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     let mut mem_type = String::new();
     let mut pinned = false;
     let mut importance = Importance::Normal;
+    let mut deprecated = false;
+    let mut superseded_by: Option<String> = None;
 
     for line in fm_block.lines() {
         let line = line.trim();
@@ -943,6 +1246,16 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
             "importance" => importance = Importance::parse(&val),
             "pin" | "pinned" => {
                 pinned = matches!(val.to_lowercase().as_str(), "true" | "yes" | "1");
+            }
+            "deprecated" => {
+                deprecated = matches!(val.to_lowercase().as_str(), "true" | "yes" | "1");
+            }
+            "superseded_by" | "replaces" | "replaced_by" => {
+                superseded_by = if val.trim().is_empty() {
+                    None
+                } else {
+                    Some(val)
+                };
             }
             _ => {}
         }
@@ -969,14 +1282,22 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         scope: Scope::Workspace,
         pinned,
         importance,
+        deprecated,
+        superseded_by,
     })
 }
 
-/// Built-in pin heuristic for memory types that should survive catalog truncation.
+/// Built-in pin heuristic for memory types that are almost always relevant
+/// (identity-shaped) and so deserve a guaranteed catalog slot. Convention and
+/// decision memories are NOT auto-pinned here — previously `is_pinned_type`
+/// auto-pinned them, which let ~38 convention/decision memories seize ~38 of 48
+/// catalog slots and crowd out operational architecture/note/gotcha knowledge.
+/// Pin convention/decision explicitly via `pin: true` or `importance: high`
+/// when a memory is truly always-relevant; otherwise let it compete on merit.
 fn is_pinned_type(mem_type: &str) -> bool {
     matches!(
         mem_type.trim().to_lowercase().as_str(),
-        "convention" | "decision" | "user" | "identity" | "preference"
+        "user" | "identity" | "preference"
     )
 }
 
@@ -1016,13 +1337,6 @@ fn rebuild_index(dir: &Path, scope: Scope) -> Result<(), String> {
 
 // ---- relevance ----
 
-/// Basic keyword matching: if any significant word (>2 chars, not a stop-word)
-/// from the memory's name or description appears in the prompt (case-insensitive),
-/// the memory is considered relevant.
-fn is_relevant(entry: &MemoryEntry, prompt: &str) -> bool {
-    is_name_relevant(entry, prompt)
-}
-
 /// Public for recall telemetry: name+description keyword overlap with prompt.
 pub fn is_name_relevant(entry: &MemoryEntry, prompt: &str) -> bool {
     let prompt_lower = prompt.to_lowercase();
@@ -1043,6 +1357,14 @@ pub fn significant_tokens(text: &str) -> Vec<String> {
 }
 
 fn is_stopword(w: &str) -> bool {
+    // Common, low-discrimination words excluded from significant tokens. The
+    // bar is "would this false-match a keyword-relevance check?" — short common
+    // words like "all"/"use"/"new"/"get" are the worst offenders: they appear in
+    // most descriptions, so a user message containing them (e.g. "implement
+    // all") matched nearly every memory and crowded out real matches. Code-
+    // generic words (file/code/data) are similarly low-value in a coding-agent
+    // store. The tf·idf cosine also down-weights these, but the keyword bonus
+    // path uses raw token presence, so stopwords must cover them explicitly.
     matches!(
         w.to_lowercase().as_str(),
         "the"
@@ -1054,11 +1376,75 @@ fn is_stopword(w: &str) -> bool {
             | "from"
             | "are"
             | "was"
+            | "were"
             | "has"
+            | "had"
+            | "have"
             | "not"
             | "but"
             | "its"
             | "can"
+            | "all"
+            | "any"
+            | "new"
+            | "use"
+            | "used"
+            | "using"
+            | "get"
+            | "set"
+            | "put"
+            | "add"
+            | "via"
+            | "etc"
+            | "now"
+            | "also"
+            | "into"
+            | "onto"
+            | "over"
+            | "under"
+            | "more"
+            | "most"
+            | "one"
+            | "two"
+            | "file"
+            | "code"
+            | "data"
+            | "here"
+            | "when"
+            | "then"
+            | "than"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "must"
+            | "you"
+            | "your"
+            | "they"
+            | "them"
+            | "their"
+            | "what"
+            | "which"
+            | "how"
+            | "why"
+            | "where"
+            | "some"
+            | "such"
+            | "very"
+            | "much"
+            | "many"
+            | "each"
+            | "every"
+            | "both"
+            | "only"
+            | "even"
+            | "still"
+            | "yet"
+            | "just"
+            | "our"
+            | "out"
     )
 }
 
@@ -1128,6 +1514,50 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn scan_cache_reuses_until_write_invalidates() {
+        let _serial = memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tmp_root();
+        let ws = fake_workspace("scan_cache");
+        let _guard = override_memory_root(root.clone());
+        invalidate_scan_cache();
+        save_memory_scoped(
+            &ws,
+            Scope::Workspace,
+            "cache-fact",
+            "body about widgets",
+            "note",
+            "widgets blurb",
+        )
+        .unwrap();
+        let a = scan_all_memories(&ws);
+        let b = scan_all_memories(&ws);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a[0].name, b[0].name);
+        // Same prompt reuses the relevant-tail string.
+        let t1 = relevant_memories_tail(&ws, "tell me about widgets");
+        let t2 = relevant_memories_tail(&ws, "tell me about widgets");
+        assert_eq!(t1, t2);
+        assert!(t1.contains("cache-fact") || t1.contains("widgets"), "{t1}");
+        // Write invalidates so a new name appears on next scan.
+        save_memory_scoped(
+            &ws,
+            Scope::Workspace,
+            "other-fact",
+            "body about sprockets",
+            "note",
+            "sprockets blurb",
+        )
+        .unwrap();
+        let c = scan_all_memories(&ws);
+        assert_eq!(c.len(), 2);
+        invalidate_scan_cache();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1232,12 +1662,14 @@ mod tests {
             scope: Scope::Workspace,
             pinned: true,
             importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
         };
-        assert!(is_relevant(&e, "write a strict TypeScript component"));
-        assert!(is_relevant(&e, "use enums in this file"));
-        assert!(is_relevant(&e, "TypeScript rules"));
-        assert!(!is_relevant(&e, "write a Python script"));
-        assert!(!is_relevant(&e, "hello world"));
+        assert!(is_name_relevant(&e, "write a strict TypeScript component"));
+        assert!(is_name_relevant(&e, "use enums in this file"));
+        assert!(is_name_relevant(&e, "TypeScript rules"));
+        assert!(!is_name_relevant(&e, "write a Python script"));
+        assert!(!is_name_relevant(&e, "hello world"));
     }
 
     #[test]
@@ -1251,11 +1683,13 @@ mod tests {
             scope: Scope::Workspace,
             pinned: false,
             importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
         };
-        assert!(!is_relevant(&e, "the quick brown fox"));
-        assert!(!is_relevant(&e, "this and that"));
-        assert!(is_relevant(&e, "use standard formatting please"));
-        assert!(is_relevant(&e, "adjust indent width"));
+        assert!(!is_name_relevant(&e, "the quick brown fox"));
+        assert!(!is_name_relevant(&e, "this and that"));
+        assert!(is_name_relevant(&e, "use standard formatting please"));
+        assert!(is_name_relevant(&e, "adjust indent width"));
     }
 
     #[test]
@@ -1347,6 +1781,8 @@ mod tests {
                 scope: Scope::Workspace,
                 pinned: false,
                 importance: Importance::Normal,
+                deprecated: false,
+                superseded_by: None,
             });
         }
         memories.push(MemoryEntry {
@@ -1358,6 +1794,8 @@ mod tests {
             scope: Scope::Workspace,
             pinned: true,
             importance: Importance::High,
+            deprecated: false,
+            superseded_by: None,
         });
         let injection = build_catalog(&memories);
         assert!(injection.contains("[MEMORY CATALOG]"));
@@ -1371,6 +1809,114 @@ mod tests {
         );
         let listed = injection.lines().filter(|l| l.starts_with("- **")).count();
         assert_eq!(listed, CATALOG_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn stopword_all_no_longer_false_matches() {
+        // Regression: "all" (3 chars, was NOT a stopword) matched every memory
+        // whose description contained "all" against a user message containing
+        // "all" (e.g. "implement all") — surfacing 5 pinned-but-irrelevant
+        // architecture memories every turn. "all" is now a stopword.
+        let e = MemoryEntry {
+            name: "ship-policy".into(),
+            description: "Repo .gitignore: only source + shipped; all build artifacts ignored"
+                .into(),
+            mem_type: "convention".into(),
+            content: String::new(),
+            path: PathBuf::from("/fake/g.md"),
+            scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::High,
+            deprecated: false,
+            superseded_by: None,
+        };
+        assert!(
+            !significant_tokens("implement all").contains(&"all".to_string()),
+            "'all' must be a stopword"
+        );
+        assert!(
+            !is_name_relevant(&e, "implement all"),
+            "'all' false-match must not mark this memory relevant"
+        );
+    }
+
+    #[test]
+    fn semantic_tail_surfaces_real_match_not_common_token_noise() {
+        // A pinned convention memory that only shares the common word "all" must
+        // NOT crowd out an unpinned architecture memory that genuinely matches.
+        let real = MemoryEntry {
+            name: "self-learning-system".into(),
+            description: "architecture of the self-learning memory system".into(),
+            mem_type: "architecture".into(),
+            content: "memory recall, skills, auto-reflect".into(),
+            path: PathBuf::from("/fake/sl.md"),
+            scope: Scope::Workspace,
+            pinned: false,
+            importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
+        };
+        let noise = MemoryEntry {
+            name: "ship-policy".into(),
+            description: "all build artifacts are ignored on ship".into(),
+            mem_type: "convention".into(),
+            content: "gitignore rules".into(),
+            path: PathBuf::from("/fake/sp.md"),
+            scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::High,
+            deprecated: false,
+            superseded_by: None,
+        };
+        let memories = vec![noise.clone(), real.clone()];
+        let tail = build_injection(&memories, "what is our self learning system");
+        assert!(
+            tail.contains("self-learning-system"),
+            "real match must surface: {tail}"
+        );
+        assert!(
+            !tail.contains("ship-policy"),
+            "common-token false match must NOT surface: {tail}"
+        );
+    }
+
+    #[test]
+    fn deprecated_memory_excluded_from_catalog_and_tail() {
+        let live = MemoryEntry {
+            name: "cursor-provider".into(),
+            description: "current: native cursor provider via Connect-RPC".into(),
+            mem_type: "architecture".into(),
+            content: "the real facts".into(),
+            path: PathBuf::from("/fake/live.md"),
+            scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::High,
+            deprecated: false,
+            superseded_by: None,
+        };
+        let dead = MemoryEntry {
+            name: "cursor-provider-old".into(),
+            description: "stale: there is no native cursor provider".into(),
+            mem_type: "architecture".into(),
+            content: "wrong facts".into(),
+            path: PathBuf::from("/fake/dead.md"),
+            scope: Scope::Workspace,
+            pinned: true,
+            importance: Importance::High,
+            deprecated: true,
+            superseded_by: Some("cursor-provider".into()),
+        };
+        let catalog = build_catalog(&[live.clone(), dead.clone()]);
+        assert!(catalog.contains("cursor-provider"));
+        assert!(
+            !catalog.contains("cursor-provider-old"),
+            "deprecated must be excluded from catalog: {catalog}"
+        );
+        let tail = build_injection(&[live, dead], "cursor provider");
+        assert!(
+            !tail.contains("cursor-provider-old"),
+            "deprecated must be excluded from relevant tail: {tail}"
+        );
     }
 
     #[test]

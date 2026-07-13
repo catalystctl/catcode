@@ -347,6 +347,8 @@ mod tests {
             scope: crate::memory::Scope::Workspace,
             pinned: false,
             importance: crate::memory::Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
         }
     }
 

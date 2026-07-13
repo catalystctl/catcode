@@ -20,6 +20,9 @@ Then `/plugin-reload` after edits. Make scripts executable (`chmod +x`).
 | `hello-command` | `/hello` slash command + `notify` / `status` |
 | `sqlite-memory` | `memory_provider` backed by SQLite |
 | `sandbox-deny-env` | `bash` tool `override` that blocks secret-touching commands |
-| `grok-oauth` | Plugin-declared OAuth provider |
+| `grok-oauth` | Plugin-declared OAuth provider (template; fill in client id) |
+
+For a working ChatGPT Plus/Pro (Codex) subscription plugin, see
+`https://github.com/karutoil/catcode-chatgpt-provider` (install with `/plugin-install https://github.com/karutoil/catcode-chatgpt-provider`).
 
 Also see the bundled `telemetry` and `vision-handoff` plugins under `.catalyst-code/plugins/`.

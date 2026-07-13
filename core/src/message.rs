@@ -419,6 +419,15 @@ impl Message {
 /// REPLACES the old `build_anthropic_request(msgs: &[Value])` — it works on
 /// typed Messages instead of opaque JSON, so there are no `.get("role")` /
 /// `.get("content")` string-key lookups to silently return the wrong field.
+///
+/// Prompt-cache breakpoints (`cache_control: ephemeral`):
+/// - Standing system prompt (leading system messages only) gets an explicit
+///   breakpoint — stable across turns within a session.
+/// - System messages that appear AFTER conversation content (relevant-memory /
+///   work-state tails) are emitted as a final **user** message so they never
+///   sit under the system breakpoint (that would bust the cache every turn).
+/// - A rolling breakpoint is placed on the last content block of the last
+///   **persisted** message (not on the transient tail).
 pub fn build_anthropic_request(
     messages: &[Message],
     tools: &[Value],
@@ -427,14 +436,23 @@ pub fn build_anthropic_request(
     max_tokens: u32,
 ) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
+    let mut trailing_transient: Vec<String> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
+    let mut seen_non_system = false;
 
     for m in messages {
         match m {
             Message::System { content, .. } => {
-                push_content(content, &mut system_parts);
+                if !seen_non_system {
+                    push_content(content, &mut system_parts);
+                } else {
+                    // Transient tails pushed after conversation content — keep
+                    // them out of the cached system prefix.
+                    push_content(content, &mut trailing_transient);
+                }
             }
             Message::User { content, .. } => {
+                seen_non_system = true;
                 push_or_merge_anth(&mut out, "user", content_to_blocks(content));
             }
             Message::Assistant {
@@ -443,6 +461,7 @@ pub fn build_anthropic_request(
                 tool_calls,
                 ..
             } => {
+                seen_non_system = true;
                 let mut blocks = Vec::new();
                 if let Some(t) = text {
                     if !t.is_empty() {
@@ -473,6 +492,7 @@ pub fn build_anthropic_request(
                 ref content,
                 ..
             } => {
+                seen_non_system = true;
                 push_or_merge_anth(
                     &mut out,
                     "user",
@@ -486,20 +506,60 @@ pub fn build_anthropic_request(
         }
     }
 
+    // Rolling breakpoint on the last persisted message (before any transient
+    // tail we may append below). Anthropic's lookback is 20 blocks.
+    if let Some(last) = out.last_mut() {
+        if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+            if let Some(block) = arr.last_mut() {
+                if block.is_object() {
+                    block
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("cache_control".into(), json!({"type": "ephemeral"}));
+                }
+            }
+        }
+    }
+
+    // Transient tails as a final user message — no cache_control (changes
+    // every turn; must not be the automatic/explicit breakpoint).
+    if !trailing_transient.is_empty() {
+        out.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": trailing_transient.join("\n\n"),
+            }]
+        }));
+    }
+
     let mut body = serde_json::Map::new();
     // model is set by the caller (stream_turn_anthropic appends it)
     body.insert("max_tokens".into(), json!(max_tokens));
     if !system_parts.is_empty() {
-        body.insert("system".into(), json!(system_parts.join("\n\n")));
+        // Explicit system breakpoint: standing prompt is large enough to clear
+        // Anthropic's min-token threshold and is stable within a session.
+        body.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system_parts.join("\n\n"),
+                "cache_control": {"type": "ephemeral"}
+            }]),
+        );
     }
     if !out.is_empty() {
         body.insert("messages".into(), Value::Array(out));
     }
     if !tools.is_empty() {
-        body.insert(
-            "tools".into(),
-            Value::Array(anthropic_tools_from_defs(tools)),
-        );
+        let mut atools = anthropic_tools_from_defs(tools);
+        // Cache tools+system as a shared prefix: breakpoint on the last tool.
+        if let Some(last) = atools.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            }
+        }
+        body.insert("tools".into(), Value::Array(atools));
         body.insert("tool_choice".into(), json!({"type": "auto"}));
     }
 
@@ -783,14 +843,23 @@ mod tests {
             }
         })];
         let body = build_anthropic_request(&msgs, &tools, "none", &[], 4096);
-        // System is in top-level system field
-        assert_eq!(body["system"], "you are a helpful assistant");
+        // System is an array of content blocks with an explicit cache breakpoint.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "you are a helpful assistant");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // Last tool carries a tools-prefix breakpoint.
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         let messages = body["messages"].as_array().unwrap();
         // user, assistant(tool_use), user(tool_result) — roles alternate
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[2]["role"], "user");
+        // Rolling breakpoint on the last persisted message (tool_result).
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         // assistant content is a tool_use block
         let blocks = messages[1]["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_use");
@@ -806,6 +875,37 @@ mod tests {
         let at = body["tools"].as_array().unwrap();
         assert_eq!(at[0]["name"], "read_file");
         assert_eq!(at[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn anthropic_transient_system_tail_not_under_system_breakpoint() {
+        // Standing system + conversation + trailing work-state system message:
+        // the tail must become a user message WITHOUT cache_control, and the
+        // rolling breakpoint must land on the prior persisted message.
+        let msgs = vec![
+            Message::system("stable system"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::system("[WORK STATE]\ngoal: x"),
+        ];
+        let body = build_anthropic_request(&msgs, &[], "none", &[], 4096);
+        assert_eq!(body["system"][0]["text"], "stable system");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+        assert!(messages[2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[WORK STATE]"));
+        assert!(messages[2]["content"][0].get("cache_control").is_none());
+        // Rolling breakpoint on the assistant reply (last persisted).
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]

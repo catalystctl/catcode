@@ -74,7 +74,7 @@ Key highlights:
 
 * **Multi-provider, no lock-in** — one `/login` picker for Umans, OpenAI, Gemini, xAI,
   and Anthropic. Be logged into several at once; any model you pick routes that
-  turn to its endpoint. API key *and* subscription OAuth (no key) supported.
+  turn to its endpoint. API keys in core; subscription OAuth via plugins.
 * **Human-in-the-loop safety** — destructive tools (`bash`, `write_file`,
   `edit`, …) require consent under the default `destructive` mode. Restricted
   paths (`.env`, `.git`, `.ssh`) are gated for reads *and* writes. Optional Linux
@@ -281,10 +281,10 @@ endpoint.
 | Preset | Wire | Endpoint | Key env var |
 |:---|:---|:---|:---|
 | **Umans (GLM-5.2)** | OpenAI | `api.code.umans.ai/v1` | `UMANS_API_KEY` |
-| **OpenAI (Codex)** | OpenAI | `chatgpt.com/backend-api/codex` | `OPENAI_API_KEY` or OAuth |
-| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) or OAuth |
-| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` or OAuth |
-| **xAI Grok** | OpenAI | `api.x.ai/v1` | **OAuth only** (SuperGrok / X Premium+) |
+| **OpenAI (Codex)** | OpenAI | `chatgpt.com/backend-api/codex` | `OPENAI_API_KEY` |
+| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) |
+| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
+| **xAI Grok** | OpenAI | `api.x.ai/v1` | `XAI_API_KEY` |
 | **OpenCode Go** | OpenAI + Anthropic | `opencode.ai/zen/go/v1` | `OPENCODE_GO_API_KEY` |
 
 Keys are persisted per-provider (the env-var *name* is stored when a key came
@@ -292,23 +292,23 @@ from the environment, so the secret never lands in a config file).
 
 </details>
 
-### Subscription login (OAuth) — no API key
+### Subscription login (OAuth) — plugins only
 
-ChatGPT Plus/Pro (Codex), Google One AI (Gemini), Claude Pro/Max, and SuperGrok
-are reached via **OAuth**, performed by `/login` itself (no official CLI needed):
+Built-in presets are **API-key only**. ChatGPT Plus/Pro, Claude Pro/Max,
+SuperGrok, and similar subscription logins live in **plugins** that declare an
+`oauth` block in `plugin.json`. The harness still owns `/login` / `/oauth-code`
+loopback + paste UX; the plugin script owns authorize/token/refresh.
 
-* **Gemini** — authorization-code + PKCE + loopback redirect. Reuses
-  `gcloud auth application-default login` if present.
-* **Anthropic Claude** — authorize + PKCE + loopback redirect. Reuses the
-  `claude` CLI token if present.
-* **OpenAI Codex** — device-code / loopback OAuth against ChatGPT subscription.
-* **xAI Grok** — **OAuth device-code only** (SuperGrok or X Premium+). Opens
-  `accounts.x.ai`, polls until you approve; no `XAI_API_KEY`. Works over SSH
-  (print URL + user code). Default model: `grok-build-0.1`.
+Example (ChatGPT / Codex):
 
-Tokens are stored at `~/.config/catalyst-code/oauth/<id>.json` (`0600`) and
-refreshed automatically. An explicit API key always takes precedence over OAuth
-(except xAI, which is OAuth-only).
+```text
+/plugin-install ~/catcode-chatgpt-provider global
+/login chatgpt
+```
+
+See [docs/examples/plugins/grok-oauth](docs/examples/plugins/grok-oauth) for the
+script contract, and the plugin-authoring skill for the full OAuth schema.
+An explicit API key always takes precedence over a plugin OAuth token.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -347,7 +347,7 @@ src/memory.rs     persistent memory store (injected into the system prompt)
 src/git_ctx.rs    git status/branch context for the system prompt
 src/vision.rs     vision model config + image attachment
 src/fetch_tool.rs HTTP fetch tool (read-only, egress-controlled)
-src/oauth.rs      OAuth flows (Gemini, Anthropic, Codex)
+src/oauth.rs      Plugin OAuth plumbing (loopback, enrich, PendingOauth)
 src/logging.rs    JSONL debug log + token estimation
 src/staging.rs    global default-file staging (~/.catalyst-code/)
 ```

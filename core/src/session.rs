@@ -44,7 +44,9 @@ pub fn ensure(path: &Path) {
 }
 
 /// Append one message to the session file (creating it with a header if needed).
-/// fsync'd so a crash never truncates a finalized message mid-write.
+/// Flushed to the kernel but not `fsync`'d — durability is deferred to
+/// [`sync`] at turn end so multi-message rounds aren't serialized behind a
+/// disk sync per tool result. Crash window: last incomplete turn.
 pub fn append(path: &Path, msg: &Message) {
     ensure_header(path);
     let Ok(mut f) = OpenOptions::new().append(true).open(path) else {
@@ -54,7 +56,17 @@ pub fn append(path: &Path, msg: &Message) {
     line.push('\n');
     let _ = f.write_all(line.as_bytes());
     let _ = f.flush();
-    let _ = f.sync_all(); // crash durability for finalized turns
+}
+
+/// fsync the session file so finalized turns survive a crash. Call at turn
+/// end (and on abort paths that have already appended results).
+pub fn sync(path: &Path) {
+    if let Ok(f) = OpenOptions::new().append(true).open(path) {
+        let _ = f.sync_all();
+    }
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
 }
 
 /// Load all messages from a session file. Skips the version header and any
@@ -357,6 +369,21 @@ mod tests {
         // rewrite
         rewrite(&p, &[Message::system("y")]);
         assert_eq!(load(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn append_flush_then_sync_persists() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_sync_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &Message::user("one"));
+        append(&p, &Message::user("two"));
+        // Durability is deferred to sync — content must already be readable
+        // after flush-only appends, and sync must be a no-op success.
+        assert_eq!(load(&p).unwrap().len(), 2);
+        sync(&p);
+        assert_eq!(load(&p).unwrap().len(), 2);
     }
 
     #[test]

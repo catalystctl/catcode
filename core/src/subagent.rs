@@ -555,6 +555,87 @@ pub(crate) fn discover_skills_full(workspace: &Path) -> Vec<SkillEntry> {
     out
 }
 
+/// Suggest a skill whose name+description semantically matches the prompt, so
+/// the agent can apply it without remembering `/skill:<name>`. Mirrors the
+/// memory relevant-tail: tf·idf cosine over the skill corpus (down-weights
+/// common tokens so a skill isn't suggested just for sharing "all"/"use").
+/// Returns a short hint string, or None when no skill clears the relevance bar.
+pub(crate) fn relevant_skill_hint(workspace: &Path, prompt: &str) -> Option<String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    let skills = discover_skills(workspace);
+    if skills.len() < 2 {
+        return None;
+    }
+    let n = skills.len() as f64;
+    let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (name, desc, _loc) in &skills {
+        let toks: std::collections::HashSet<String> =
+            crate::memory::significant_tokens(&format!("{name} {desc}"))
+                .into_iter()
+                .collect();
+        for t in toks {
+            *df.entry(t).or_insert(0) += 1;
+        }
+    }
+    let idf: std::collections::HashMap<String, f64> = df
+        .into_iter()
+        .map(|(t, d)| (t, (n / d.max(1) as f64).ln().max(0.0)))
+        .collect();
+    let q = skill_tfidf(prompt, &idf);
+    if q.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for (i, (name, desc, _loc)) in skills.iter().enumerate() {
+        if name == "pi-subagents" {
+            continue;
+        }
+        let v = skill_tfidf(&format!("{name} {desc}"), &idf);
+        let score = crate::memory::cosine_sim(&q, &v);
+        if score > 0.0 && best.is_none_or(|b| score > b.1) {
+            best = Some((i, score));
+        }
+    }
+    let (i, score) = best?;
+    if score < 0.05 {
+        return None;
+    }
+    let (name, desc, loc) = &skills[i];
+    let ident = std::path::Path::new(loc)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|x| x.to_str())
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .unwrap_or_else(|| name.clone());
+    let d = desc.trim();
+    Some(format!(
+        "[RELEVANT SKILL] — '{ident}' (score {score:.2}) matches this task. \
+         Apply with /skill:{ident} if useful; read it first if applying.{rest}",
+        rest = if d.is_empty() {
+            String::new()
+        } else {
+            format!("\n  {d}")
+        }
+    ))
+}
+
+/// tf·idf-weighted bag over significant tokens, against a precomputed idf map.
+fn skill_tfidf(
+    text: &str,
+    idf: &std::collections::HashMap<String, f64>,
+) -> std::collections::HashMap<String, f64> {
+    let mut v: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for t in crate::memory::significant_tokens(text) {
+        let w = idf.get(&t).copied().unwrap_or(1.0);
+        *v.entry(t).or_insert(0.0) += w;
+    }
+    v
+}
+
 fn skills_injection(workspace: &Path, names: &[String]) -> String {
     if names.is_empty() {
         return String::new();
@@ -1217,6 +1298,26 @@ async fn run_agent_inner(
             sub.push(Message::system(format!(
                 "Reference files read before your task:\n\n{read_ctx}"
             )));
+        }
+    }
+
+    // --- per-turn relevant memories + skill hint: mirrors the main loop's
+    // transient tail so subagents recall durable facts for their specific task.
+    // Uses the telemetry-free path — subagents aren't user turns, and calling
+    // `relevant_memories_tail` would clobber the orchestrator's in-flight
+    // recall tracking in `memory_recall::begin_turn`.
+    if !task.trim().is_empty() {
+        let mut tail = crate::memory::relevant_tail_for_subagent(&workspace, task);
+        if let Some(h) = relevant_skill_hint(&workspace, task) {
+            if tail.is_empty() {
+                tail = h;
+            } else {
+                tail.push_str("\n\n");
+                tail.push_str(&h);
+            }
+        }
+        if !tail.is_empty() {
+            sub.push(Message::system(tail));
         }
     }
 

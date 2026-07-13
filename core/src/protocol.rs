@@ -59,7 +59,7 @@ pub enum Command {
     /// create the provider config, set its API key, persist, and re-aggregate
     /// models so the provider's models appear in `/models` alongside any others
     /// already logged in. Requires an explicit `api_key` paste (env vars are not
-    /// scanned). For OAuth subscription login use `login_oauth` instead.
+    /// scanned). For plugin subscription OAuth use `login_oauth` instead.
     /// Multiple providers can be logged in at once; each turn routes to the
     /// selected model's provider.
     #[serde(rename = "login")]
@@ -73,19 +73,13 @@ pub enum Command {
     /// models disappear from `/models`. No-op (error event) when not logged in.
     #[serde(rename = "logout")]
     Logout { provider: String },
-    /// Perform the interactive OAuth subscription login for a preset (`gemini` |
-    /// `anthropic`) — no official CLI needed. The core runs the OAuth flow
-    /// (Google device-code / Claude authorize+PKCE+loopback), emitting
-    /// `oauth_prompt` events with the URL/code to visit, stores the resulting
-    /// token, then re-aggregates models. Codex (Responses API) is not supported
-    /// here yet. Use `login` for an API-key login instead.
+    /// Perform interactive OAuth for a **plugin-declared** `provider_id`
+    /// (built-in vendor OAuth was removed from core). Emits `oauth_prompt`
+    /// events; on success creates the provider config and refreshes models.
     #[serde(rename = "login_oauth")]
     LoginOauth { preset: String },
-    /// Complete a pending no-browser (manual-code) OAuth login by submitting the
-    /// authorization code the user pasted after visiting the URL from a prior
-    /// `oauth_prompt` (the SSH/headless Google flow). The core holds the PKCE
-    /// verifier from that prompt; this exchanges the code, stores the token,
-    /// and re-aggregates models. No-op (error event) when no login is pending.
+    /// Complete a pending plugin OAuth login by submitting the authorization /
+    /// user code (or redirect URL) from a prior `oauth_prompt`.
     #[serde(rename = "oauth_code")]
     OauthCode { code: String },
     #[serde(rename = "send")]

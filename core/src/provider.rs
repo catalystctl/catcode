@@ -24,6 +24,12 @@ const OPENAI_MODELS_PATH: &str = "/models";
 const CHAT_PATH: &str = "/chat/completions";
 /// Anthropic Messages API requires an `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Identity betas Anthropic's gateway expects for Claude subscription (OAuth)
+/// Bearer tokens on the Messages API. Plugin OAuth providers that use Claude
+/// Pro/Max should also send matching UA / x-app via plugin headers.
+const CLAUDE_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.1.160";
+const CLAUDE_OAUTH_X_APP: &str = "cli";
 /// Anthropic endpoints: `{base_url}/messages` and `{base_url}/models`
 /// (base_url conventionally ends in `/v1`, e.g. `https://api.anthropic.com/v1`).
 const ANTHROPIC_MESSAGES_PATH: &str = "/messages";
@@ -204,7 +210,7 @@ pub async fn fetch_provider_usage(
         }
         return ProviderUsage::unavailable(
             "Anthropic API-key mode has no account usage endpoint. \
-             Use a Claude Pro/Max subscription via /login for 5-hour and weekly limits, \
+             Use a Claude Pro/Max subscription via a plugin OAuth provider for 5-hour and weekly limits, \
              or check console.anthropic.com for organization rate limits.",
         );
     }
@@ -785,9 +791,9 @@ async fn fetch_anthropic_oauth_usage(
     let resp = client
         .get(url)
         .bearer_auth(access_token)
-        .header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA)
-        .header("user-agent", crate::oauth::CLAUDE_OAUTH_USER_AGENT)
-        .header("x-app", crate::oauth::CLAUDE_OAUTH_X_APP)
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("user-agent", CLAUDE_OAUTH_USER_AGENT)
+        .header("x-app", CLAUDE_OAUTH_X_APP)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(10))
@@ -2483,6 +2489,47 @@ pub fn is_codex_endpoint(base_url: &str) -> bool {
         || host_path == "chatgpt-staging.com/backend-api/codex"
 }
 
+/// Default headers the official `codex` CLI attaches to every ChatGPT Codex
+/// request. `originator` identifies the client; `User-Agent` avoids looking
+/// like a bare bot. Idempotent — skips names already present.
+pub fn inject_codex_headers(headers: &mut Vec<(String, String)>) {
+    const ORIGINATOR: &str = "codex_cli_rs";
+    let mut has_originator = false;
+    let mut has_ua = false;
+    for (k, _) in headers.iter() {
+        let kl = k.to_ascii_lowercase();
+        if kl == "originator" {
+            has_originator = true;
+        }
+        if kl == "user-agent" {
+            has_ua = true;
+        }
+    }
+    if !has_originator {
+        headers.push(("originator".to_string(), ORIGINATOR.to_string()));
+    }
+    if !has_ua {
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
+        } else if cfg!(target_os = "windows") {
+            "Windows"
+        } else if cfg!(target_os = "linux") {
+            "Linux"
+        } else {
+            "Unix"
+        };
+        headers.push((
+            "User-Agent".to_string(),
+            format!(
+                "codex_cli_rs/{} ({}; {})",
+                env!("CARGO_PKG_VERSION"),
+                os,
+                std::env::consts::ARCH
+            ),
+        ));
+    }
+}
+
 /// True if the base URL points at an OpenCode Go endpoint. OpenCode Go is a
 /// single subscription that serves some models via an OpenAI-compatible
 /// `/v1/chat/completions` endpoint and others via an Anthropic `/v1/messages`
@@ -4075,14 +4122,23 @@ async fn stream_turn_gemini(
     let base_url = provider.base_url.trim_end_matches('/');
     let max_attempts = 3u32;
 
-    // Onboarding: get the Code Assist project ID (cached for process lifetime).
-    let project = crate::oauth::code_assist_project(client)
-        .await
-        .ok_or_else(|| {
-            "Code Assist onboarding failed: could not obtain a project ID. \
-             Try /login again or check your Google account."
-                .to_string()
-        })?;
+    // Project ID for Code Assist / Antigravity. Built-in Google OAuth was
+    // removed; plugins (or env) must supply the project. Fall back to the
+    // public Antigravity default used by CLIProxy / business accounts.
+    let project = provider
+        .headers
+        .iter()
+        .find(|(k, _)| {
+            let kl = k.to_ascii_lowercase();
+            kl == "x-goog-user-project"
+                || kl == "cloudaicompanion-project"
+                || kl == "x-code-assist-project"
+        })
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("CODE_ASSIST_PROJECT").ok())
+        .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rising-fact-p41fc".to_string());
 
     // Convert messages + tools to GenAI format.
     let (contents, system_instruction) = messages_to_genai_contents(messages);
@@ -4978,7 +5034,7 @@ async fn send_anthropic_request(
             if let Some(k) = provider.api_key.as_deref() {
                 req = req.header("authorization", format!("Bearer {k}"));
             }
-            req = req.header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA);
+            req = req.header("anthropic-beta", CLAUDE_OAUTH_BETA);
         } else if let Some(k) = provider.api_key.as_deref() {
             req = req.header("x-api-key", k);
         }
@@ -5408,7 +5464,7 @@ async fn discover_models_anthropic(
         if let Some(k) = provider.api_key.as_deref() {
             req = req.header("authorization", format!("Bearer {k}"));
         }
-        req = req.header("anthropic-beta", crate::oauth::CLAUDE_OAUTH_BETA);
+        req = req.header("anthropic-beta", CLAUDE_OAUTH_BETA);
     } else if let Some(k) = provider.api_key.as_deref() {
         req = req.header("x-api-key", k);
     }
