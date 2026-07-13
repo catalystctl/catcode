@@ -869,6 +869,14 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
     }
 
     let mut any_failed = false;
+    // Track failed step IDs so we can skip their dependents in later waves
+    // instead of fail-fast aborting the entire deploy on a single failure.
+    let mut failed_steps: HashSet<String> = HashSet::new();
+    // Map step_id → depends_on for skip-on-failure logic.
+    let deps_by_id: HashMap<String, Vec<String>> = steps
+        .iter()
+        .map(|s| (s.id.clone(), s.depends_on.clone()))
+        .collect();
 
     for wave in waves {
         if cancel.is_cancelled() {
@@ -889,9 +897,27 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
             sync_work_state_from_prompts(&st, &mode).await;
         }
 
-        // Collect wave tasks.
+        // Collect wave tasks, skipping steps whose dependencies failed or
+        // were themselves skipped (transitive skip: if B was skipped because
+        // A failed, anything depending on B must also be skipped).
         let mut wave_prompts: Vec<DeployPrompt> = Vec::new();
         for id in &wave {
+            if let Some(deps) = deps_by_id.get(id) {
+                if deps.iter().any(|d| failed_steps.contains(d)) {
+                    let mut mode = st.goal.lock().await;
+                    if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
+                        p.status = DeployStatus::Skipped;
+                        p.summary = Some("skipped: a dependency step failed or was skipped".into());
+                    }
+                    mode.touch();
+                    emit_goal_state(&mode);
+                    sync_work_state_from_prompts(&st, &mode).await;
+                    // Propagate: mark this step as unavailable so its own
+                    // dependents are skipped in later waves too.
+                    failed_steps.insert(id.clone());
+                    continue;
+                }
+            }
             if let Some(p) = prompt_by_id.get(id) {
                 wave_prompts.push(p.clone());
             }
@@ -901,7 +927,10 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
         }
 
         // Run each step with global + per-model concurrency caps.
-        let mut handles = Vec::new();
+        // Track step_id alongside each handle so a JoinError (panic) can still
+        // mark the right step as failed.
+        let mut handles: Vec<(String, tokio::task::JoinHandle<(String, bool, String)>)> =
+            Vec::new();
         for p in wave_prompts {
             if cancel.is_cancelled() {
                 break;
@@ -917,44 +946,48 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
             let cancel_c = cancel.clone();
             let parent = parent_model.clone();
             let step_id = p.step_id.clone();
-            handles.push(tokio::spawn(async move {
-                let _g = match g_sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return (step_id, false, "global concurrency semaphore closed".into());
+            let step_id_outer = step_id.clone();
+            handles.push((
+                step_id_outer,
+                tokio::spawn(async move {
+                    let _g = match g_sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (step_id, false, "global concurrency semaphore closed".into());
+                        }
+                    };
+                    let _m = match m_sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (step_id, false, "model concurrency semaphore closed".into());
+                        }
+                    };
+                    if cancel_c.is_cancelled() {
+                        return (step_id, false, "cancelled".into());
                     }
-                };
-                let _m = match m_sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return (step_id, false, "model concurrency semaphore closed".into());
+                    let mut args = json!({
+                        "agent": p.agent,
+                        "task": p.task,
+                        "context": "fresh",
+                    });
+                    if let Some(m) = &p.model {
+                        args["model"] = json!(m);
                     }
-                };
-                if cancel_c.is_cancelled() {
-                    return (step_id, false, "cancelled".into());
-                }
-                let mut args = json!({
-                    "agent": p.agent,
-                    "task": p.task,
-                    "context": "fresh",
-                });
-                if let Some(m) = &p.model {
-                    args["model"] = json!(m);
-                }
-                let provider = st_c
-                    .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
-                    .await;
-                let outcome =
-                    crate::subagent::execute(st_c, client_c, provider, parent, args, cancel_c, 0)
+                    let provider = st_c
+                        .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
                         .await;
-                (step_id, outcome.ok, outcome.output)
-            }));
+                    let outcome =
+                        crate::subagent::execute(st_c, client_c, provider, parent, args, cancel_c, 0)
+                            .await;
+                    (step_id, outcome.ok, outcome.output)
+                }),
+            ));
         }
 
         let mut wave_failed = false;
-        for h in handles {
+        for (step_id, h) in handles {
             match h.await {
-                Ok((step_id, ok, output)) => {
+                Ok((_id, ok, output)) => {
                     let mut mode = st.goal.lock().await;
                     if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
                         if ok {
@@ -965,6 +998,7 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
                             p.summary = Some(truncate_str(&output, 400));
                             wave_failed = true;
                             any_failed = true;
+                            failed_steps.insert(step_id.clone());
                         }
                     }
                     mode.touch();
@@ -974,6 +1008,15 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
                 Err(e) => {
                     any_failed = true;
                     wave_failed = true;
+                    failed_steps.insert(step_id.clone());
+                    let mut mode = st.goal.lock().await;
+                    if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
+                        p.status = DeployStatus::Failed;
+                        p.summary = Some(format!("task join error: {e}"));
+                    }
+                    mode.touch();
+                    emit_goal_state(&mode);
+                    sync_work_state_from_prompts(&st, &mode).await;
                     emit(&Event::new("error").with(
                         "message",
                         json!(format!("goal deploy task join error: {e}")),
@@ -982,10 +1025,10 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
             }
         }
 
-        if wave_failed {
-            // Fail-fast on a wave failure (blocking dependency chain).
-            break;
-        }
+        // Do NOT fail-fast: continue to the next wave so independent steps
+        // still run. Steps whose depends_on includes a failed step are
+        // skipped at the top of the next wave iteration.
+        let _ = wave_failed;
     }
 
     {
@@ -993,15 +1036,39 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
         if mode.id != goal_id {
             return;
         }
-        if any_failed || cancel.is_cancelled() {
-            let msg = if cancel.is_cancelled() {
-                "goal cancelled"
-            } else {
-                "one or more deploy steps failed"
-            };
-            fail_goal(&mut mode, msg);
+        if cancel.is_cancelled() {
+            fail_goal(&mut mode, "goal cancelled");
         } else {
-            transition(&mut mode, GoalPhase::Done, Some("goal complete"));
+            // All waves processed. Even if some steps failed (and their
+            // dependents were skipped), the deploy ran to completion — mark
+            // Done so the user can review failed/skipped steps and re-run
+            // them rather than the whole goal appearing aborted.
+            let failed: Vec<&str> = mode
+                .prompts
+                .iter()
+                .filter(|p| p.status == DeployStatus::Failed)
+                .map(|p| p.step_id.as_str())
+                .collect();
+            let skipped: Vec<&str> = mode
+                .prompts
+                .iter()
+                .filter(|p| p.status == DeployStatus::Skipped)
+                .map(|p| p.step_id.as_str())
+                .collect();
+            let msg = if failed.is_empty() {
+                "goal complete".to_string()
+            } else {
+                format!(
+                    "goal complete with {} failed step(s){}",
+                    failed.len(),
+                    if skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} skipped", skipped.len())
+                    }
+                )
+            };
+            transition(&mut mode, GoalPhase::Done, Some(&msg));
         }
         sync_work_state_from_prompts(&st, &mode).await;
     }
@@ -1009,7 +1076,7 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
     emit(&Event::new("info").with(
         "message",
         json!(if any_failed {
-            "Goal mode finished with failures — see goal_state prompts"
+            "Goal deploy complete — some steps failed (see goal_state); independent steps continued"
         } else {
             "Goal mode complete"
         }),
@@ -1391,5 +1458,61 @@ mod tests {
         apply_plan(&mut mode, &args, &HashSet::new()).unwrap();
         // stripped → falls back to first allowed model
         assert_eq!(mode.prompts[0].model.as_deref(), Some("m1"));
+    }
+
+    /// Verify the no-fail-fast skip logic: when a step fails, its dependents
+    /// are skipped but independent steps in later waves still run. This mirrors
+    /// the `deps_by_id` + `failed_steps` logic in `deploy_goal`.
+    #[test]
+    fn deploy_skips_dependents_of_failed_steps_not_independent_ones() {
+        let steps = vec![
+            GoalStep {
+                id: "recon".into(),
+                agent: "scout".into(),
+                title: "recon".into(),
+                task: "recon".into(),
+                model: None,
+                depends_on: vec![],
+                parallel_group: None,
+            },
+            GoalStep {
+                id: "plan".into(),
+                agent: "planner".into(),
+                title: "plan".into(),
+                task: "plan".into(),
+                model: None,
+                depends_on: vec!["recon".into()],
+                parallel_group: None,
+            },
+            GoalStep {
+                id: "independent".into(),
+                agent: "worker".into(),
+                title: "independent".into(),
+                task: "independent".into(),
+                model: None,
+                depends_on: vec![],
+                parallel_group: None,
+            },
+        ];
+        let waves = topo_waves(&steps).unwrap();
+        // Wave 0: recon + independent (parallel). Wave 1: plan (depends on recon).
+        assert_eq!(waves.len(), 2);
+
+        // Simulate: recon FAILED, independent SUCCEEDED.
+        let failed_steps: HashSet<String> = ["recon".to_string()].into_iter().collect();
+        let deps_by_id: HashMap<String, Vec<String>> = steps
+            .iter()
+            .map(|s| (s.id.clone(), s.depends_on.clone()))
+            .collect();
+
+        // In wave 1, "plan" depends on failed "recon" → should be skipped.
+        let plan_deps = deps_by_id.get("plan").unwrap();
+        assert!(plan_deps.iter().any(|d| failed_steps.contains(d)),
+            "plan depends on failed recon → should be skipped");
+
+        // "independent" has no deps → should NOT be skipped.
+        let indep_deps = deps_by_id.get("independent").unwrap();
+        assert!(!indep_deps.iter().any(|d| failed_steps.contains(d)),
+            "independent has no failed deps → should still run");
     }
 }

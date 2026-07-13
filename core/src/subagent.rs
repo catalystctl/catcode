@@ -1981,7 +1981,41 @@ async fn dispatch_subagent_tool(
             }
         }
         "contact_supervisor" => {
-            execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await
+            // During a goal deploy (phase Running) there is no active leader
+            // turn to answer a need_decision — the orchestrator's turn ended
+            // after writing the plan. Blocking for the 5-min intercom timeout
+            // wastes time and the "do NOT proceed" error can cascade into a
+            // step failure. Short-circuit instead: tell the subagent to make a
+            // reasonable decision and document it, so the deploy keeps moving.
+            let reason = exec_args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("need_decision");
+            let goal_running = {
+                let g = st.goal.lock().await;
+                g.phase == crate::goal::GoalPhase::Running
+            };
+            if goal_running && reason == "need_decision" {
+                let msg = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                emit(
+                    &Event::new("intercom_message")
+                        .with("from", json!(my_target))
+                        .with("to", json!(st.intercom.orchestrator_target()))
+                        .with("reason", json!("need_decision"))
+                        .with("message", json!(msg))
+                        .with("auto_resolved", json!(true)),
+                );
+                Outcome::ok(
+                    "No active supervisor during goal deploy — the orchestrator turn has ended. \
+                     Proceed with the most reasonable decision for the task and document it in your \
+                     final summary. Do NOT block or re-ask; continue implementing."
+                )
+            } else {
+                execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await
+            }
         }
         "intercom" => execute_intercom(&exec_args, &st.intercom, my_target, cancel).await,
         "subagent" | "spawn" => {
