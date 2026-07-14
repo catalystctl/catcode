@@ -226,10 +226,10 @@ func TestAskRequiredErrorIsInlineNotSpam(t *testing.T) {
 		t.Fatalf("flyout should render the inline error %q; got:\n%s", s.pendingAsk.errMsg, rendered)
 	}
 	// CRITICAL: no transcript error blocks were appended (the old logError spam).
-	// The ask_request logInfo adds one info block; nothing else should appear.
+	// ask_request status is a toast now (not a transcript block).
 	newBlocks := len(s.blocks) - beforeBlocks
-	if newBlocks > 1 {
-		t.Fatalf("repeated Enter must not spam the transcript: %d new blocks (want <=1)", newBlocks)
+	if newBlocks > 0 {
+		t.Fatalf("repeated Enter must not spam the transcript: %d new blocks (want 0)", newBlocks)
 	}
 
 	// Typing clears the stale inline error.

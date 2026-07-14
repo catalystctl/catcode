@@ -59,10 +59,12 @@ type providerPreset struct {
 }
 
 type approvalPrompt struct {
-	requestID string
-	tool      string
-	args      string
-	diff      string // unified-diff preview for write/edit/patch (empty for other tools)
+	requestID  string
+	tool       string
+	args       string
+	diff       string // unified-diff preview for write/edit/patch (empty for other tools)
+	expanded   bool   // full diff is visible; toggled by the tool-output keybind
+	diffScroll int    // first rendered row of the expanded diff window
 }
 
 type subProgressEntry struct {
@@ -85,6 +87,7 @@ type sessionEntry struct {
 	Messages int    `json:"messages"`
 	Mtime    uint64 `json:"mtime"`
 	Current  bool   `json:"current"`
+	Pinned   bool   `json:"pinned"`
 }
 
 // memoryEntry mirrors one element of the core's "memory_list" event array
@@ -191,8 +194,14 @@ func (e *coreEvent) rawKey(key string) (json.RawMessage, bool) {
 // Tea messages
 // ---------------------------------------------------------------------------
 
-type coreEventMsg struct{ event *coreEvent }
-type coreEOFMsg struct{}
+// Core lifecycle messages carry the subprocess generation that produced them.
+// A retry may start a replacement before the old stdout reader has completely
+// unwound; generation tags keep stale events/EOF from mutating the new run.
+type coreEventMsg struct {
+	event *coreEvent
+	gen   uint64
+}
+type coreEOFMsg struct{ gen uint64 }
 type tickMsg struct{ time time.Time }
 
 // ---------------------------------------------------------------------------

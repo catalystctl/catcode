@@ -1,11 +1,15 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // typeRune types a string into the session input via handleKey, the way a
@@ -75,37 +79,57 @@ func TestMentionRecursiveFilter(t *testing.T) {
 	}
 }
 
-// TestMentionDirCompletionDrillsIn verifies "@../" lists the parent directory
-// (files outside the CWD) and that accepting a directory keeps the flyout open
-// for further drilling.
-func TestMentionDirCompletionDrillsIn(t *testing.T) {
+// TestMentionDirCompletionStaysInWorkspace verifies traversal and absolute
+// paths cannot expose files outside the workspace boundary.
+func TestMentionDirCompletionStaysInWorkspace(t *testing.T) {
 	s := newMentionSession()
 	typeRune(s, "@../")
 	if !s.mentionActive {
 		t.Fatal("flyout should be active after @../")
 	}
-	if len(s.mentionItems) == 0 {
-		t.Fatal("@../ should list the parent directory")
+	if len(s.mentionItems) != 0 {
+		t.Fatalf("@../ must not list outside-workspace entries; got %v", itemsDisplay(s.mentionItems))
 	}
-	// The parent (workspace root) must contain a "core" directory.
-	idx := -1
-	for i, it := range s.mentionItems {
-		if it.display == "core/" {
-			idx = i
-			break
+}
+
+func TestMentionGitIndexHonorsIgnoreRules(t *testing.T) {
+	dir := t.TempDir()
+	if err := exec.Command("git", "-C", dir, "init", "-q").Run(); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+	for name, contents := range map[string]string{
+		"tracked.txt": "tracked", "visible.txt": "visible", ".gitignore": "ignored.txt\n", "ignored.txt": "ignored",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if idx < 0 {
-		t.Fatalf("@../ should list core/ (parent dir); got %v", itemsDisplay(s.mentionItems))
+	if err := exec.Command("git", "-C", dir, "add", "tracked.txt", ".gitignore").Run(); err != nil {
+		t.Fatal(err)
 	}
-	s.mentionCursor = idx
-	s.handleKey(keyMsg("tab"))
-	// Accepting a directory keeps the flyout open, drilled into that dir.
-	if !s.mentionActive {
-		t.Fatal("accepting a directory should keep the flyout open for drilling")
+	items, ok := gitMentionList(dir)
+	if !ok {
+		t.Fatal("expected git-backed index")
 	}
-	if !strings.Contains(s.input.Value(), "@../core/") {
-		t.Fatalf("input should contain @../core/; got %q", s.input.Value())
+	displays := strings.Join(itemsDisplay(items), "\n")
+	if !strings.Contains(displays, "tracked.txt") || !strings.Contains(displays, "visible.txt") {
+		t.Fatalf("git index omitted tracked/untracked files: %s", displays)
+	}
+	if strings.Contains(displays, "ignored.txt") {
+		t.Fatalf("git index exposed ignored file: %s", displays)
+	}
+}
+
+func TestMentionFlyoutNeverExceedsTerminalWidth(t *testing.T) {
+	s := newMentionSession()
+	s.input.SetValue("@")
+	s.input.SetCursor(1)
+	s.evalMention()
+	for width := 1; width <= 24; width++ {
+		s.width = width
+		if got := lipgloss.Width(s.renderMentionFlyout()); got > s.width {
+			t.Fatalf("flyout width=%d exceeds terminal width=%d", got, s.width)
+		}
 	}
 }
 
@@ -119,9 +143,9 @@ func TestMentionDoesNotTriggerOnEmail(t *testing.T) {
 	}
 }
 
-// TestMentionEnterWithNoMatchesSends verifies that when the flyout is open but
-// has no matches, Enter falls through and sends the message as typed.
-func TestMentionEnterWithNoMatchesSends(t *testing.T) {
+// TestMentionEnterWithNoMatchesFallsThrough verifies that when the flyout is
+// open but has no matches, Enter reaches normal submission handling.
+func TestMentionEnterWithNoMatchesFallsThrough(t *testing.T) {
 	s := newMentionSession()
 	typeRune(s, "@zzzznope")
 	if !s.mentionActive {
@@ -136,7 +160,7 @@ func TestMentionEnterWithNoMatchesSends(t *testing.T) {
 		t.Fatal("sending the message should clear the flyout")
 	}
 	if s.input.Value() != "" {
-		t.Fatalf("input should be cleared after send; got %q", s.input.Value())
+		t.Fatalf("input should be cleared after submission; got %q", s.input.Value())
 	}
 }
 

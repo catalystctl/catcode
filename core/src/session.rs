@@ -267,6 +267,57 @@ pub struct SessionInfo {
     pub messages: usize,
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+fn meta_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta.json", path.display()))
+}
+
+fn process_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", path.display()))
+}
+
+fn meta_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta.lock", path.display()))
+}
+
+pub fn read_meta(path: &Path) -> SessionMeta {
+    std::fs::read(meta_path(path))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+pub fn update_meta(
+    path: &Path,
+    update: impl FnOnce(&mut SessionMeta),
+) -> Result<SessionMeta, String> {
+    let _lock =
+        crate::fsutil::FileLock::acquire(&meta_lock_path(path)).map_err(|e| e.to_string())?;
+    let mut meta = read_meta(path);
+    update(&mut meta);
+    let data = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+    crate::fsutil::atomic_write(&meta_path(path), &data).map_err(|e| e.to_string())?;
+    Ok(meta)
+}
+
+pub fn delete_with_sidecars(path: &Path) -> Result<(), String> {
+    if process_lock_path(path).exists() {
+        return Err("session is active in another process".into());
+    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(meta_path(path));
+    let _ = std::fs::remove_file(stats_path(path));
+    let _ = std::fs::remove_file(meta_lock_path(path));
+    Ok(())
+}
+
 /// Scan a session file once (streaming, bounded) and return its title + message
 /// count. The title is the first user message's text, truncated to 80 chars.
 /// Returns `title: None, messages: 0` for a missing or header-only file.
@@ -510,5 +561,51 @@ mod tests {
             (s.tokens_in, s.tokens_out, s.cached_tokens, s.turns),
             (0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn metadata_roundtrip_and_delete_removes_sidecars() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_meta_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &Message::user("hello"));
+        save_stats(
+            &p,
+            &SessionStats {
+                turns: 1,
+                ..SessionStats::default()
+            },
+        );
+
+        update_meta(&p, |meta| {
+            meta.title = Some("Renamed conversation".into());
+            meta.pinned = true;
+        })
+        .unwrap();
+        let meta = read_meta(&p);
+        assert_eq!(meta.title.as_deref(), Some("Renamed conversation"));
+        assert!(meta.pinned);
+
+        delete_with_sidecars(&p).unwrap();
+        assert!(!p.exists());
+        assert!(!meta_path(&p).exists());
+        assert!(!stats_path(&p).exists());
+    }
+
+    #[test]
+    fn delete_refuses_a_session_locked_by_another_process() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_locked_delete_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &Message::user("still active"));
+        std::fs::write(process_lock_path(&p), "pid=123").unwrap();
+
+        assert!(delete_with_sidecars(&p).is_err());
+        assert!(p.exists());
+        std::fs::remove_file(process_lock_path(&p)).unwrap();
+        delete_with_sidecars(&p).unwrap();
+        assert!(!p.exists());
     }
 }

@@ -17,7 +17,7 @@ func TestModalWidthResponsive(t *testing.T) {
 		{140, 110, 110}, // wide terminal hits the cap
 		{100, 110, 96},  // terminal-4, below cap
 		{60, 110, 56},   // terminal-4
-		{20, 110, 28},   // floor
+		{20, 110, 20},   // compact: never wider than the terminal
 		{140, 72, 72},   // settings-style cap
 	}
 	for _, c := range cases {

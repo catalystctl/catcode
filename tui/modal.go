@@ -3,6 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
@@ -49,6 +52,8 @@ const (
 	modalGoalPlan           // plan-ready review (approve / revise / cancel)
 	modalPluginInstallScope // global vs workspace after /plugin-install path
 	modalSearchKey          // pick Exa/Tavily to set/clear its web_search API key
+	modalRestartConfirm     // restart core to apply launch-only settings
+	modalConfirm            // destructive action confirmation (cancel selected by default)
 )
 
 // goalDraft is the multi-field form state for modalGoal.
@@ -165,6 +170,8 @@ const (
 	editTargetParallel         = "parallel"
 	editTargetChain            = "chain"
 	editTargetCompact          = "compact"
+	editTargetTranscriptFind   = "transcript_find"
+	editTargetSessionRename    = "session_rename:"
 	editTargetSearchKey        = "search_key" // +":" + provider (exa|tavily)
 )
 
@@ -175,14 +182,19 @@ const (
 )
 
 type modal struct {
-	kind       modalKind
-	filter     string // typed filter (list modals)
-	cursor     int    // selected index in the filtered list
-	scroll     int    // help modal vertical scroll
-	fieldIdx   int    // legacy field index (unused by hub; kept for edit buffer routing)
-	editing    bool   // value-edit / login key capture
-	editBuf    textinput.Model
-	editTarget string // which setting modalValueEdit is editing
+	kind        modalKind
+	filter      string // typed filter (list modals)
+	cursor      int    // selected index in the filtered list
+	scroll      int    // help modal vertical scroll
+	fieldIdx    int    // legacy field index (unused by hub; kept for edit buffer routing)
+	editing     bool   // value-edit / login key capture
+	editBuf     textinput.Model
+	editTarget  string // which setting modalValueEdit is editing
+	confirm     string // reset | plugin-remove | memory-forget
+	confirmID   string // exact plugin name / memory id (empty for reset)
+	confirmDesc string // user-facing consequence/target
+	loading     bool   // async picker is waiting for the core
+	loadError   string // durable async error; r retries, esc cancels
 }
 
 // openReasoningPicker opens a list of the selected model's advertised
@@ -209,6 +221,22 @@ func newModal() modal {
 	return m
 }
 
+func (s *session) openDestructiveConfirm(action, id, desc string) {
+	s.modal = newModal()
+	s.modal.kind = modalConfirm
+	s.modal.confirm = action
+	s.modal.confirmID = id
+	s.modal.confirmDesc = desc
+	s.modal.cursor = 0 // Cancel is deliberately the safe default.
+}
+
+func (s *session) confirmItems() []listItem {
+	return []listItem{
+		{label: "Cancel", desc: "keep everything unchanged"},
+		{label: "Confirm", desc: s.modal.confirmDesc},
+	}
+}
+
 // listItem is a generic filtered-list entry.
 type listItem struct {
 	label string
@@ -216,6 +244,7 @@ type listItem struct {
 	tag   string // left marker (e.g. "▸" for selected)
 	meta  string // opaque payload for executeListSelect (e.g. preset id)
 	meta2 string // opaque kind hint for executeListSelect (e.g. "preset"/"provider")
+	group string // optional section header in filtered lists (command palette)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +255,26 @@ func (s *session) openCommandPalette() {
 	s.modal = newModal()
 	s.modal.kind = modalCommand
 	s.modal.cursor = 0
+}
+
+// offerCoreRestart opens a yes/no modal to restart the core so launch-only
+// settings (sandbox, idle-timeout, …) take effect immediately.
+func (s *session) offerCoreRestart(reason string) {
+	s.modal = newModal()
+	s.modal.kind = modalRestartConfirm
+	s.modal.editTarget = reason // reason text (not a filter query)
+	s.modal.cursor = 0
+}
+
+func (s *session) restartConfirmItems() []listItem {
+	reason := s.modal.editTarget
+	if reason == "" {
+		reason = "settings"
+	}
+	return []listItem{
+		{label: "Restart now", desc: "apply " + reason + " immediately"},
+		{label: "Later", desc: "applies on next launch"},
+	}
 }
 
 func (s *session) openModelPicker() {
@@ -426,6 +475,7 @@ func (s *session) openCompactModal() {
 // openGoalModal opens the multi-field goal form. prefill seeds the goal text
 // when the user typed `/goal fix auth` (still confirm concurrency/models).
 func (s *session) openGoalModal(prefill string) {
+	s.goalPlan = nil
 	s.modal = newModal()
 	s.modal.kind = modalGoal
 	d := goalDraft{
@@ -458,6 +508,30 @@ func (s *session) openGoalPlanReview() {
 	s.modal.cursor = 0
 }
 
+// appendModalPaste routes bracketed paste text into the active modal-owned
+// input. The top-level input router calls this before considering the composer.
+// Keeping this helper beside the modal state makes it difficult for a new
+// filter/edit modal to accidentally leak pasted text into chat.
+func (s *session) appendModalPaste(text string) bool {
+	if s.modal.kind == modalNone {
+		return false
+	}
+	if s.modal.editing || (s.modal.kind == modalGoal && s.goalDraft.editing) {
+		s.modal.editBuf.SetValue(s.modal.editBuf.Value() + text)
+		s.modal.editBuf.CursorEnd()
+		return true
+	}
+	switch s.modal.kind {
+	case modalCommand, modalModels, modalSessions, modalMemory, modalReasoning,
+		modalProviders, modalLogout, modalSettings, modalVision:
+		s.modal.filter += text
+		s.modal.cursor = 0
+		s.modal.scroll = 0
+		return true
+	}
+	return false
+}
+
 // openMemoryPicker shows saved memories so the user can forget one by Enter.
 // Call after memoryList has been populated from a list_memory core event.
 func (s *session) openMemoryPicker() {
@@ -470,8 +544,9 @@ func (s *session) openMemoryPicker() {
 // once the response arrives (see memory_list event handling).
 func (s *session) requestMemoryPicker() {
 	s.pendingMemoryPicker = true
+	s.openMemoryPicker()
+	s.modal.loading = true
 	s.sendCore(map[string]any{"type": "list_memory"})
-	s.logInfo("loading memories…")
 }
 
 // requestPluginPicker asks the core for plugins and opens the plugin modal
@@ -481,12 +556,11 @@ func (s *session) requestPluginPicker(mode string) {
 		mode = pluginModeToggle
 	}
 	s.pluginPickerMode = mode
+	s.pendingPluginPicker = true
+	s.modal = newModal()
+	s.modal.kind = modalPlugins
+	s.modal.loading = true
 	s.sendCore(map[string]any{"type": "list_plugins"})
-	if mode == pluginModeRemove {
-		s.logInfo("loading plugins (enter to uninstall)…")
-	} else {
-		s.logInfo("loading plugins…")
-	}
 }
 
 func (s *session) openHelp() {
@@ -519,6 +593,13 @@ func (s *session) openVisionPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalVision
 	s.modal.cursor = 0
+}
+
+func (s *session) requestVisionPicker() {
+	s.pendingVisionPicker = true
+	s.openVisionPicker()
+	s.modal.loading = true
+	s.sendCore(map[string]any{"type": "get_vision_config"})
 }
 
 // openLoginPicker opens the /login picker. It lists the first-party presets
@@ -603,6 +684,24 @@ func (s *session) providerItems() []listItem {
 		items = append(items, listItem{label: label, desc: "switch · configured", meta: name, meta2: "provider"})
 	}
 	return items
+}
+
+func (s *session) recordRecentCommand(label string) {
+	if label == "" {
+		return
+	}
+	for i, existing := range s.recentCommands {
+		if existing == label {
+			s.recentCommands = append(s.recentCommands[:i], s.recentCommands[i+1:]...)
+			break
+		}
+	}
+	s.recentCommands = append(s.recentCommands, label)
+	if len(s.recentCommands) > 5 {
+		s.recentCommands = append([]string(nil), s.recentCommands[len(s.recentCommands)-5:]...)
+	}
+	s.settings.RecentCommands = append([]string(nil), s.recentCommands...)
+	_ = s.settings.save()
 }
 
 // logoutItems builds the /logout picker list: only providers that are logged in.
@@ -761,9 +860,15 @@ func (s *session) handleVisionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // the description shows the live message count and last-modified time, which
 // update as the session grows. The active session is annotated.
 func (s *session) sessionItems() []listItem {
+	if len(s.sessionList) == 0 {
+		return []listItem{{label: "(no saved sessions)", desc: "start one with /new"}}
+	}
 	items := make([]listItem, len(s.sessionList))
 	for i, e := range s.sessionList {
 		label := truncateRunes(e.Title, 200) // fitListRow truncates to the actual row width
+		if e.Pinned {
+			label = "★ " + label
+		}
 		if e.Current {
 			label = label + "  (current)"
 		}
@@ -789,6 +894,11 @@ func (s *session) openThemePicker() {
 }
 
 func (s *session) closeModal() {
+	if s.modal.loading {
+		s.pendingMemoryPicker = false
+		s.pendingPluginPicker = false
+		s.pendingVisionPicker = false
+	}
 	s.modal.kind = modalNone
 	s.modal.editing = false
 	s.pluginPickerMode = ""
@@ -801,56 +911,57 @@ func (s *session) closeModal() {
 
 func (s *session) commandItems() []listItem {
 	items := []listItem{
-		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
-		{label: "/logout", desc: "log out of a provider"},
-		{label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
-		{label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily, paste modal)"},
-		{label: "/model", desc: "switch model"},
-		{label: "/approval", desc: "never · destructive · always"},
-		{label: "/reasoning", desc: "set reasoning effort (per model)"},
-		{label: "/theme", desc: "switch colour theme"},
-		{label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
-		{label: "/auto-compact", desc: "auto context compaction on/off"},
-		{label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
-		{label: "/no-network", desc: "block network in sandbox on/off"},
-		{label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
-		{label: "/idle-timeout", desc: "idle timeout (seconds)"},
-		{label: "/max-session-tokens", desc: "max session tokens (0=unlimited)"},
-		{label: "/reset", desc: "wipe conversation + session file"},
-		{label: "/clear", desc: "clear view (keep session file)"},
-		{label: "/undo", desc: "drop last turn"},
-		{label: "/compact", desc: "force compaction (modal for optional instructions)"},
-		{label: "/sessions", desc: "open session picker"},
-		{label: "/new", desc: "start a fresh session file"},
-		{label: "/stats", desc: "token + turn totals"},
-		{label: "/context", desc: "token-usage breakdown (top consumers)"},
-		{label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
-		{label: "/abort", desc: "stop running turn (or Esc)"},
-		{label: "/exit", desc: "quit the app (alias: /quit)"},
-		{label: "/steer", desc: "steer an in-flight turn (modal)"},
-		{label: "/settings", desc: "settings hub (dedicated modals per option)"},
-		{label: "/keybinds", desc: "view & customize keybindings"},
-		{label: "/help", desc: "keybindings & commands"},
-		{label: "/copy", desc: "copy last assistant reply"},
-		{label: "/attach", desc: "attach an image (vision) — path modal"},
-		{label: "/vision", desc: "configure vision models & handoff target"},
-		{label: "/plugin-install", desc: "install path/URL · prompts global vs workspace"},
-		{label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
-		{label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
-		{label: "/plugin-reload", desc: "re-scan plugin directories"},
-		{label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
-		{label: "/run", desc: "delegate to a subagent (single) — modal"},
-		{label: "/parallel", desc: "run subagents in parallel — modal"},
-		{label: "/chain", desc: "run a subagent chain — modal"},
-		{label: "/subagents", desc: "list available subagents"},
-		{label: "/cancel-goal", desc: "cancel active goal mode"},
-		{label: "/subagents-doctor", desc: "subagent setup diagnostics"},
-		{label: "/subagents-status", desc: "show active subagent runs"},
-		{label: "/remember", desc: "save a memory note (modal)"},
-		{label: "/memory", desc: "list / forget saved memories (picker)"},
-		{label: "/forget", desc: "forget a memory (picker)"},
-		{label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
-		{label: "/reflect", desc: "reflect on this session, persist durable learnings"},
+		{group: "Provider", label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
+		{group: "Provider", label: "/logout", desc: "log out of a provider"},
+		{group: "Provider", label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
+		{group: "Provider", label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily, paste modal)"},
+		{group: "Provider", label: "/model", desc: "switch model"},
+		{group: "Session", label: "/approval", desc: "auto-approve · ask destructive · ask every tool"},
+		{group: "Session", label: "/reasoning", desc: "set reasoning effort (per model)"},
+		{group: "Session", label: "/theme", desc: "switch colour theme"},
+		{group: "Session", label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
+		{group: "Session", label: "/auto-compact", desc: "auto context compaction on/off"},
+		{group: "Session", label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
+		{group: "Session", label: "/no-network", desc: "block network in sandbox on/off"},
+		{group: "Session", label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
+		{group: "Session", label: "/idle-timeout", desc: "idle timeout (seconds)"},
+		{group: "Session", label: "/max-session-tokens", desc: "max session tokens (0=unlimited)"},
+		{group: "Session", label: "/reset", desc: "wipe conversation + session file"},
+		{group: "Session", label: "/clear", desc: "clear view (keep session file)"},
+		{group: "Session", label: "/undo", desc: "drop last turn (keeps prior history)"},
+		{group: "Session", label: "/compact", desc: "force compaction (modal for optional instructions)"},
+		{group: "Session", label: "/sessions", desc: "open session picker"},
+		{group: "Session", label: "/new", desc: "start a fresh session file"},
+		{group: "Session", label: "/stats", desc: "token + turn totals"},
+		{group: "Session", label: "/context", desc: "token-usage breakdown (top consumers)"},
+		{group: "Session", label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
+		{group: "Session", label: "/abort", desc: "stop running turn (or Esc)"},
+		{group: "Session", label: "/exit", desc: "quit the app (alias: /quit)"},
+		{group: "Session", label: "/steer", desc: "steer an in-flight turn (modal)"},
+		{group: "Session", label: "/settings", desc: "settings hub (dedicated modals per option)"},
+		{group: "Session", label: "/keybinds", desc: "view & customize keybindings"},
+		{group: "Session", label: "/help", desc: "keybindings & commands"},
+		{group: "Session", label: "/copy", desc: "copy last assistant reply"},
+		{group: "Session", label: "/find", desc: "search and focus transcript blocks"},
+		{group: "Session", label: "/attach", desc: "attach an image (vision) — path modal"},
+		{group: "Session", label: "/vision", desc: "configure vision models & handoff target"},
+		{group: "Agent", label: "/plugin-install", desc: "install path/URL · prompts global vs workspace"},
+		{group: "Agent", label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
+		{group: "Agent", label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
+		{group: "Agent", label: "/plugin-reload", desc: "re-scan plugin directories"},
+		{group: "Agent", label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
+		{group: "Agent", label: "/run", desc: "delegate to a subagent (single) — modal"},
+		{group: "Agent", label: "/parallel", desc: "run subagents in parallel — modal"},
+		{group: "Agent", label: "/chain", desc: "run a subagent chain — modal"},
+		{group: "Agent", label: "/subagents", desc: "list available subagents"},
+		{group: "Agent", label: "/cancel-goal", desc: "cancel active goal mode"},
+		{group: "Agent", label: "/subagents-doctor", desc: "subagent setup diagnostics"},
+		{group: "Agent", label: "/subagents-status", desc: "show active subagent runs"},
+		{group: "Agent", label: "/remember", desc: "save a memory note (modal)"},
+		{group: "Agent", label: "/memory", desc: "list / forget saved memories (picker)"},
+		{group: "Agent", label: "/forget", desc: "forget a memory (picker)"},
+		{group: "Agent", label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
+		{group: "Agent", label: "/reflect", desc: "reflect on this session, persist durable learnings"},
 	}
 	// Append one /skill:<name> entry per discoverable skill so skills created
 	// manually or by the learning system are invocable from the palette with
@@ -860,7 +971,7 @@ func (s *session) commandItems() []listItem {
 		if desc == "" {
 			desc = "apply skill"
 		}
-		items = append(items, listItem{label: "/skill:" + sk.Name, desc: desc})
+		items = append(items, listItem{group: "Skills", label: "/skill:" + sk.Name, desc: desc})
 	}
 	// Plugin-declared slash commands (/{name}).
 	for _, pc := range s.pluginCommands {
@@ -871,9 +982,31 @@ func (s *session) commandItems() []listItem {
 		if pc.Plugin != "" {
 			desc = desc + " · " + pc.Plugin
 		}
-		items = append(items, listItem{label: "/" + pc.Name, desc: desc})
+		items = append(items, listItem{group: "Plugins", label: "/" + pc.Name, desc: desc})
 	}
-	return items
+	if len(s.recentCommands) == 0 {
+		return items
+	}
+	byLabel := make(map[string]listItem, len(items))
+	for _, item := range items {
+		byLabel[item.label] = item
+	}
+	seen := map[string]bool{}
+	reordered := make([]listItem, 0, len(items))
+	for i := len(s.recentCommands) - 1; i >= 0; i-- {
+		label := s.recentCommands[i]
+		if item, ok := byLabel[label]; ok && !seen[label] {
+			item.group = "Recent"
+			reordered = append(reordered, item)
+			seen[label] = true
+		}
+	}
+	for _, item := range items {
+		if !seen[item.label] {
+			reordered = append(reordered, item)
+		}
+	}
+	return reordered
 }
 
 func (s *session) modelItems() []listItem {
@@ -926,7 +1059,7 @@ func (s *session) reasoningItems() []listItem {
 func (s *session) settingsHubItems() []listItem {
 	return []listItem{
 		{label: "/login", desc: "provider · " + s.providerFieldLabel()},
-		{label: "/approval", desc: "safety gate · " + s.approvalMode()},
+		{label: "/approval", desc: "safety gate · " + approvalModeLabel(s.approvalMode())},
 		{label: "/reasoning", desc: "effort · " + s.settings.ReasoningEffort},
 		{label: "/theme", desc: "colour · " + activeTheme.name},
 		{label: "/bash-timeout", desc: fmt.Sprintf("%ds", s.coreBashTimeout)},
@@ -942,11 +1075,11 @@ func (s *session) settingsHubItems() []listItem {
 
 func (s *session) approvalItems() []listItem {
 	modes := []struct {
-		mode, desc string
+		mode, label, desc string
 	}{
-		{"never", "auto-approve all tools"},
-		{"destructive", "prompt for write / bash / destructive only"},
-		{"always", "prompt for every tool call"},
+		{"never", "Auto-approve all tools", "no approval prompts"},
+		{"destructive", "Ask for destructive tools", "prompt for writes, shell, and destructive actions"},
+		{"always", "Ask for every tool", "prompt before every tool call"},
 	}
 	cur := s.approvalMode()
 	items := make([]listItem, len(modes))
@@ -955,28 +1088,55 @@ func (s *session) approvalItems() []listItem {
 		if m.mode == cur {
 			desc = "current · " + desc
 		}
-		items[i] = listItem{label: m.mode, desc: desc}
+		items[i] = listItem{label: m.label, desc: desc, meta: m.mode}
 	}
 	return items
+}
+
+func approvalModeLabel(mode string) string {
+	switch mode {
+	case "never":
+		return "auto-approve all tools"
+	case "always":
+		return "ask for every tool"
+	default:
+		return "ask for destructive tools"
+	}
 }
 
 func (s *session) sandboxItems() []listItem {
 	modes := []struct {
 		mode, desc string
 	}{
-		{"none", "no sandbox (applies on next launch)"},
-		{"firejail", "firejail sandbox (Linux; applies on next launch)"},
-		{"seatbelt", "seatbelt / sandbox-exec (macOS; applies on next launch)"},
+		{"none", "no sandbox"},
+		{"firejail", "firejail sandbox (Linux)"},
+		{"seatbelt", "seatbelt / sandbox-exec (macOS)"},
 	}
 	items := make([]listItem, len(modes))
 	for i, m := range modes {
 		desc := m.desc
+		if !sandboxModeAvailable(m.mode) {
+			desc = "unavailable on " + runtime.GOOS + " · " + desc
+		}
 		if m.mode == s.settings.Sandbox {
 			desc = "current · " + desc
 		}
 		items[i] = listItem{label: m.mode, desc: desc}
 	}
 	return items
+}
+
+func sandboxModeAvailable(mode string) bool {
+	switch mode {
+	case "none":
+		return true
+	case "firejail":
+		return runtime.GOOS == "linux"
+	case "seatbelt":
+		return runtime.GOOS == "darwin"
+	default:
+		return false
+	}
 }
 
 // toggleItems builds a two-option on/off list with "current" marked.
@@ -1093,6 +1253,62 @@ func (s *session) removePlugin(idx int) {
 	sPluginStore = append(sPluginStore[:idx], sPluginStore[idx+1:]...)
 }
 
+func pluginNameAt(idx int) string {
+	if idx < 0 || idx >= len(sPluginStore) {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(sPluginStore[idx], &m) != nil {
+		return ""
+	}
+	return get(m, "name")
+}
+
+func (s *session) executeDestructive(action, id string) {
+	switch action {
+	case "reset":
+		s.sendCore(map[string]any{"type": "reset"})
+		s.blocks = nil
+		s.cur = nil
+		s.contextTokens = 0
+		s.follow = true
+		s.invalidateAll()
+		s.viewport.SetContent("")
+		s.logInfo("conversation and session reset")
+	case "plugin-remove":
+		if id == "" {
+			return
+		}
+		s.sendCore(map[string]any{"type": "remove_plugin", "name": id})
+		s.logInfo("removing plugin: " + id)
+		for i := range sPluginStore {
+			if pluginNameAt(i) == id {
+				sPluginStore = append(sPluginStore[:i], sPluginStore[i+1:]...)
+				break
+			}
+		}
+	case "memory-forget":
+		if id == "" {
+			return
+		}
+		s.sendCore(map[string]any{"type": "forget_memory", "id": id})
+		s.logInfo("forgetting memory " + id)
+		for i, memory := range s.memoryList {
+			if memory.ID == id {
+				s.memoryList = append(s.memoryList[:i], s.memoryList[i+1:]...)
+				break
+			}
+		}
+	case "session-delete":
+		if id == "" {
+			return
+		}
+		if s.sendCore(map[string]any{"type": "delete_session", "path": id}) {
+			s.logInfo("deleting saved session…")
+		}
+	}
+}
+
 // togglePlugin flips the enabled state of the plugin at store index idx. It
 // sends the matching core command (enable_plugin / disable_plugin) and
 // optimistically updates the cached store so the picker re-renders the new
@@ -1126,11 +1342,50 @@ func (s *session) togglePlugin(idx int) {
 // filter (case-insensitive). Empty filter returns all.
 func filterList(items []listItem, q string) []int {
 	q = strings.ToLower(strings.TrimSpace(q))
-	var idx []int
-	for i, it := range items {
-		if q == "" || strings.Contains(strings.ToLower(it.label), q) || strings.Contains(strings.ToLower(it.desc), q) {
-			idx = append(idx, i)
+	if q == "" {
+		idx := make([]int, len(items))
+		for i := range items {
+			idx[i] = i
 		}
+		return idx
+	}
+	type hit struct{ idx, score int }
+	var hits []hit
+	for i, it := range items {
+		label := strings.ToLower(it.label)
+		hay := label + " " + strings.ToLower(it.desc)
+		score := -1
+		switch {
+		case strings.HasPrefix(label, q):
+			score = 1000 - len(label)
+		case strings.Contains(label, q):
+			score = 800 - strings.Index(label, q)
+		case strings.Contains(hay, q):
+			score = 600 - strings.Index(hay, q)
+		default:
+			qi, gaps := 0, 0
+			last := -1
+			for pos, r := range hay {
+				if qi < len(q) && byte(r) == q[qi] {
+					if last >= 0 {
+						gaps += pos - last - 1
+					}
+					last = pos
+					qi++
+				}
+			}
+			if qi == len(q) {
+				score = 400 - gaps
+			}
+		}
+		if score >= 0 {
+			hits = append(hits, hit{i, score})
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	idx := make([]int, len(hits))
+	for i, h := range hits {
+		idx[i] = h.idx
 	}
 	return idx
 }
@@ -1170,18 +1425,14 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
 		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory, modalPluginInstallScope,
-		modalSearchKey:
+		modalSearchKey, modalRestartConfirm, modalConfirm:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
 	case modalHelp:
 		return s.handleHelpKey(msg)
 	case modalContext, modalUsage:
-		// Display-only modal: enter or esc dismisses it.
-		if msg.String() == "enter" || s.kb(msg, "select") || s.kbAny(msg, "close", "quit") {
-			s.closeModal()
-		}
-		return s, nil
+		return s.handleHelpKey(msg)
 	}
 	return s, nil
 }
@@ -1191,6 +1442,9 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	d := &s.goalDraft
 	key := msg.String()
 	fields := goalVisibleFields(d.advanced)
+	if key != "" {
+		s.modal.loadError = ""
+	}
 
 	// Ctrl+Enter submits from any field.
 	if key == "ctrl+enter" || key == "ctrl+j" {
@@ -1513,14 +1767,17 @@ func (s *session) submitGoalModal() tea.Cmd {
 	}
 	goal := strings.TrimSpace(d.goal)
 	if goal == "" {
+		s.modal.loadError = "Goal text is required."
 		s.logError("goal text is required")
 		return nil
 	}
 	if !s.authed {
+		s.modal.loadError = "Log in before starting a goal."
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
 	if len(s.models) == 0 {
+		s.modal.loadError = "Models are still unavailable; try again after they load."
 		s.logError("no models loaded yet")
 		return nil
 	}
@@ -1585,20 +1842,26 @@ func (s *session) submitGoalModal() tea.Cmd {
 			}
 		}
 	}
+	if !s.sendCore(cmd) {
+		s.modal.loadError = "Core is not accepting the goal yet; your form was preserved."
+		return nil
+	}
 	s.closeModal()
 	s.follow = true
 	s.busy = true
 	s.logUser(fmt.Sprintf("🎯 Goal: %s  ↳ /goal", goal))
-	s.sendCore(cmd)
 	return nil
 }
 
 func (s *session) handleGoalPlanKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	switch {
-	case key == "a" || key == "enter" || s.kb(msg, "select"):
+	case key == "a":
+		if !s.sendCore(map[string]any{"type": "approve_goal_plan"}) {
+			s.modal.loadError = "Core is not accepting the approval; the plan remains open."
+			return s, nil
+		}
 		s.closeModal()
-		s.sendCore(map[string]any{"type": "approve_goal_plan"})
 		s.logInfo("approving goal plan…")
 		s.busy = true
 		return s, nil
@@ -1612,11 +1875,25 @@ func (s *session) handleGoalPlanKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.sendCore(map[string]any{"type": "cancel_goal"})
 		s.logInfo("cancelling goal…")
 		return s, nil
+	case s.kbAny(msg, "nav_up", "nav_up_alt"):
+		s.modal.scroll = max(0, s.modal.scroll-1)
+	case s.kbAny(msg, "nav_down", "nav_down_alt"):
+		s.modal.scroll++
+	case s.kb(msg, "scroll_page_up"):
+		s.modal.scroll = max(0, s.modal.scroll-10)
+	case s.kb(msg, "scroll_page_down"):
+		s.modal.scroll += 10
 	}
 	return s, nil
 }
 
 func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if (s.modal.loading || s.modal.loadError != "") && strings.EqualFold(msg.String(), "r") {
+		s.modal.loading = true
+		s.modal.loadError = ""
+		s.retryAsyncPicker()
+		return s, nil
+	}
 	var items []listItem
 	switch s.modal.kind {
 	case modalCommand:
@@ -1653,9 +1930,43 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.pluginInstallScopeItems()
 	case modalSearchKey:
 		items = s.searchKeyItems()
+	case modalRestartConfirm:
+		items = s.restartConfirmItems()
+	case modalConfirm:
+		items = s.confirmItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
+	if s.modal.kind == modalSessions && n > 0 {
+		if s.modal.cursor >= n {
+			s.modal.cursor = 0
+		}
+		abs := idx[s.modal.cursor]
+		if abs >= 0 && abs < len(s.sessionList) {
+			e := &s.sessionList[abs]
+			switch strings.ToLower(msg.String()) {
+			case "ctrl+r":
+				s.openValueEditModal(editTargetSessionRename+e.Path, "Rename Session", "session title", e.Title)
+				return s, nil
+			case "ctrl+p":
+				if s.sendCore(map[string]any{"type": "pin_session", "path": e.Path, "pinned": !e.Pinned}) {
+					s.logInfo("updating session pin…")
+				}
+				return s, nil
+			case "ctrl+d":
+				if e.Current {
+					s.modal.loadError = "The active session cannot be deleted; start or load another first."
+					return s, nil
+				}
+				if sessionLockedByAnotherProcess(e.Path) {
+					s.modal.loadError = "That session is active in another terminal and cannot be deleted."
+					return s, nil
+				}
+				s.openDestructiveConfirm("session-delete", e.Path, "permanently delete session “"+e.Title+"”")
+				return s, nil
+			}
+		}
+	}
 
 	switch {
 	case msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
@@ -1697,6 +2008,25 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
+func (s *session) retryAsyncPicker() {
+	switch s.modal.kind {
+	case modalMemory:
+		s.pendingMemoryPicker = true
+		s.sendCore(map[string]any{"type": "list_memory"})
+	case modalPlugins:
+		s.pendingPluginPicker = true
+		s.sendCore(map[string]any{"type": "list_plugins"})
+	case modalVision:
+		s.pendingVisionPicker = true
+		s.sendCore(map[string]any{"type": "get_vision_config"})
+	case modalSessions:
+		if !s.sendCore(map[string]any{"type": "list_sessions"}) {
+			s.modal.loading = false
+			s.modal.loadError = "The core is busy; press r to retry."
+		}
+	}
+}
+
 // executeListSelect runs the action for the chosen absolute index.
 func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
@@ -1716,7 +2046,24 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	case modalSessions:
 		if abs >= 0 && abs < len(s.sessionList) {
 			e := s.sessionList[abs]
-			s.sendCore(map[string]any{"type": "load_session", "path": e.Path})
+			if e.Current {
+				s.logInfo("already using this session")
+				s.closeModal()
+				return s, nil
+			}
+			if s.busy {
+				s.modal.loadError = "Wait for the active turn to finish (or stop it) before switching sessions."
+				return s, nil
+			}
+			if !reserveSession(e.Path) {
+				s.modal.loadError = "That session is active in another terminal. Close it there or choose a different session."
+				return s, nil
+			}
+			if !s.sendCore(map[string]any{"type": "load_session", "path": e.Path}) {
+				cancelSessionReservation(e.Path)
+				s.modal.loadError = "The core is busy; the current session was left unchanged."
+				return s, nil
+			}
 			s.logInfo("loading session: " + e.Title)
 		}
 		s.closeModal()
@@ -1751,34 +2098,32 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		// Toggle mode: enter flips enable/disable (modal stays open).
 		// Remove mode (/plugin-remove): enter uninstalls and stays open.
 		if s.pluginPickerMode == pluginModeRemove {
-			s.removePlugin(abs)
-			if s.modal.cursor >= len(sPluginStore) && s.modal.cursor > 0 {
-				s.modal.cursor--
+			if name := pluginNameAt(abs); name != "" {
+				s.openDestructiveConfirm("plugin-remove", name, "uninstall plugin "+name+" and remove its files")
 			}
 		} else {
 			s.togglePlugin(abs)
 		}
 		return s, nil
 	case modalMemory:
-		// Enter forgets the selected memory and drops it from the local list.
+		// Forget is destructive: show the exact id/text and make Cancel default.
 		items := s.memoryItems()
 		if abs >= 0 && abs < len(items) {
 			id := items[abs].meta
 			if id != "" && id != "?" {
-				s.sendCore(map[string]any{"type": "forget_memory", "id": id})
-				s.logInfo("forgetting memory " + id)
-				// Drop from cache so the row vanishes without a re-fetch.
-				if abs < len(s.memoryList) {
-					s.memoryList = append(s.memoryList[:abs], s.memoryList[abs+1:]...)
-				}
-				if s.modal.cursor >= len(s.memoryList) && s.modal.cursor > 0 {
-					s.modal.cursor--
-				}
+				desc := "permanently forget memory " + id + ": " + truncate(items[abs].label, 40)
+				s.openDestructiveConfirm("memory-forget", id, desc)
 			}
 		}
-		if len(s.memoryList) == 0 {
+		return s, nil
+	case modalConfirm:
+		if abs == 0 {
 			s.closeModal()
+			return s, nil
 		}
+		action, id := s.modal.confirm, s.modal.confirmID
+		s.closeModal()
+		s.executeDestructive(action, id)
 		return s, nil
 	case modalReasoning:
 		levels := s.thinkingLevels()
@@ -1792,7 +2137,7 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	case modalApproval:
 		items := s.approvalItems()
 		if abs >= 0 && abs < len(items) {
-			mode := items[abs].label
+			mode := items[abs].meta
 			s.applyApprovalMode(mode)
 		}
 		s.closeModal()
@@ -1801,9 +2146,16 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		items := s.sandboxItems()
 		if abs >= 0 && abs < len(items) {
 			mode := items[abs].label
+			if !sandboxModeAvailable(mode) {
+				s.modal.loadError = fmt.Sprintf("%s sandbox is unavailable on %s", mode, runtime.GOOS)
+				return s, nil
+			}
 			s.settings.Sandbox = mode
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", mode))
+			s.logInfo(fmt.Sprintf("sandbox: %s", mode))
+			s.closeModal()
+			s.offerCoreRestart("sandbox mode")
+			return s, nil
 		}
 		s.closeModal()
 		return s, nil
@@ -1812,6 +2164,8 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		if abs >= 0 && abs < len(items) {
 			on := items[abs].label == "on"
 			s.coreAutoCompact = on
+			s.settings.AutoCompact = on
+			_ = s.settings.save()
 			s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": on})
 			s.logInfo(fmt.Sprintf("auto-compact: %s", boolStr(on)))
 		}
@@ -1823,9 +2177,20 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 			on := items[abs].label == "on"
 			s.settings.NoNetwork = on
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("no-network: %s (applies on next launch)", boolStr(on)))
+			s.logInfo(fmt.Sprintf("no-network: %s", boolStr(on)))
+			s.closeModal()
+			s.offerCoreRestart("no-network")
+			return s, nil
 		}
 		s.closeModal()
+		return s, nil
+	case modalRestartConfirm:
+		items := s.restartConfirmItems()
+		s.closeModal()
+		if abs >= 0 && abs < len(items) && items[abs].label == "Restart now" {
+			return s, s.requestCoreRestart()
+		}
+		s.logInfo("restart skipped — change applies on next launch")
 		return s, nil
 	case modalMouseWheel:
 		items := s.mouseWheelItems()
@@ -1883,7 +2248,7 @@ func (s *session) applyApprovalMode(mode string) {
 		s.logError(fmt.Sprintf("failed to save settings: %v", err))
 		return
 	}
-	s.logInfo("approval: " + mode)
+	s.logInfo("approval: " + approvalModeLabel(mode))
 }
 
 // dispatchSettingsCommand opens the dedicated modal (or runs the command) for
@@ -2086,8 +2451,9 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	// /skill:<name> — insert into the input box (with a trailing space) instead
 	// of dispatching immediately, so the user can append a task message and send
 	// them as one turn. Press Enter again to run the bare skill with no task.
-	// Other commands are instant actions (they take no inline argument), so
-	// they still dispatch right away.
+	// Every built-in palette entry goes through the same typed-command dispatcher
+	// so palette, slash input, aliases, confirmation policy, and error handling
+	// cannot drift into separate implementations.
 	if strings.HasPrefix(label, "/skill:") {
 		s.closeModal()
 		s.input.SetValue(label + " ")
@@ -2095,76 +2461,7 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 		s.evalMention()
 		return s.input.Focus()
 	}
-	switch label {
-	case "/login":
-		s.openLoginPicker()
-		return nil
-	case "/logout":
-		s.openLogoutPicker()
-		return nil
-	case "/search-key":
-		s.openSearchKeyPicker()
-		return nil
-	case "/model":
-		s.openModelPicker()
-		return nil
-	case "/approval", "/approvals":
-		s.openApprovalPicker()
-		return nil
-	case "/reasoning":
-		s.openReasoningPicker()
-		return nil
-	case "/bash-timeout":
-		s.openBashTimeoutModal()
-		return nil
-	case "/auto-compact":
-		s.openAutoCompactPicker()
-		return nil
-	case "/sandbox":
-		s.openSandboxPicker()
-		return nil
-	case "/no-network":
-		s.openNoNetworkPicker()
-		return nil
-	case "/mouse-wheel":
-		s.openMouseWheelPicker()
-		return nil
-	case "/idle-timeout":
-		s.openIdleTimeoutModal()
-		return nil
-	case "/max-session-tokens":
-		s.openMaxSessionTokensModal()
-		return nil
-	case "/reset":
-		s.sendCore(map[string]any{"type": "reset"})
-		s.blocks = nil
-		s.cur = nil
-		s.invalidateAll()
-		s.viewport.SetContent("")
-		return nil
-	case "/abort":
-		s.sendCore(map[string]any{"type": "abort"})
-		return nil
-	case "/settings":
-		s.openSettings()
-		return nil
-	case "/keybinds":
-		s.openKeybindsModal()
-		return nil
-	case "/theme":
-		s.openThemePicker()
-		return nil
-	case "/help":
-		s.openHelp()
-		return nil
-	case "/copy":
-		return s.copyLastAssistant()
-	default:
-		// Any command not explicitly handled above (e.g. /sessions, /stats,
-		// /clear, /undo, /compact, /attach) dispatches through handleUserLine
-		// so the palette never needs a second dispatch table.
-		return s.handleUserLine(commands[i].label)
-	}
+	return s.handleUserLine(label)
 }
 
 // ---------------------------------------------------------------------------
@@ -2208,6 +2505,7 @@ func (s *session) handleSettingsEditKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 		// by an unbound select binding (mirrors list modals).
 		return s.commitEditField()
 	}
+	s.modal.loadError = ""
 	var cmd tea.Cmd
 	s.modal.editBuf, cmd = s.modal.editBuf.Update(msg)
 	return s, cmd
@@ -2282,12 +2580,103 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
-// commitValueEdit applies a free-form setting from modalValueEdit and closes.
+// valueEditError validates fields whose failure is knowable before dispatch.
+// Returning the error here keeps the modal, the user's text, and focus intact.
+func (s *session) valueEditError(target, val string) string {
+	if strings.HasPrefix(target, editTargetSessionRename) && val == "" {
+		return "Enter a session title."
+	}
+	parseInt := func(min int, message string) string {
+		n, err := strconv.Atoi(val)
+		if err != nil || n < min {
+			return message
+		}
+		return ""
+	}
+	requireReady := func() string {
+		if !s.authed {
+			return "Log in before submitting this value."
+		}
+		if len(s.models) == 0 {
+			return "Models are still unavailable; try again after they load."
+		}
+		return ""
+	}
+	switch target {
+	case editTargetBashTimeout:
+		return parseInt(1, "Bash timeout must be a positive integer (seconds).")
+	case editTargetIdleTimeout:
+		return parseInt(10, "Idle timeout must be at least 10 seconds.")
+	case editTargetMaxSessionTokens:
+		return parseInt(0, "Max session tokens must be 0 or greater.")
+	case editTargetRemember:
+		if val == "" {
+			return "Enter the memory text to save."
+		}
+	case editTargetTranscriptFind:
+		if val == "" {
+			return "Enter text to search for."
+		}
+	case editTargetAttach:
+		if val == "" {
+			return "Enter an image path."
+		}
+		if _, err := validateImage(val); err != nil {
+			return err.Error()
+		}
+		return requireReady()
+	case editTargetPluginInstall:
+		if val == "" {
+			return "Enter a plugin path or GitHub URL."
+		}
+		if _, _, err := parsePluginInstallArgs(strings.Fields(val)); err != nil {
+			return err.Error()
+		}
+	case editTargetSteer:
+		if val == "" {
+			return "Enter a steer message."
+		}
+		return requireReady()
+	case editTargetRun, editTargetParallel, editTargetChain:
+		if val == "" {
+			return "Enter a subagent task."
+		}
+		return requireReady()
+	case "goal_revise":
+		if val == "" {
+			return "Enter what should change in the plan."
+		}
+		if len(s.models) == 0 {
+			return "Models are still unavailable; try again after they load."
+		}
+	}
+	return ""
+}
+
+// commitValueEdit validates and applies a free-form setting. Invalid input
+// remains visible and editable with an inline error instead of disappearing.
 func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 	val := strings.TrimSpace(s.modal.editBuf.Value())
 	target := s.modal.editTarget
+	if message := s.valueEditError(target, val); message != "" {
+		s.modal.loadError = message
+		s.modal.editing = true
+		s.modal.editBuf.Focus()
+		return s, nil
+	}
+	s.modal.loadError = ""
 	s.modal.editing = false
 	s.closeModal()
+	if strings.HasPrefix(target, editTargetSessionRename) {
+		path := strings.TrimPrefix(target, editTargetSessionRename)
+		if !s.sendCore(map[string]any{"type": "rename_session", "path": path, "title": val}) {
+			s.openValueEditModal(target, "Rename Session", "session title", val)
+			s.modal.loadError = "The core is busy; your title was kept. Try again."
+			return s, nil
+		}
+		s.logInfo("renaming saved session…")
+		return s, nil
+	}
 	// /search-key paste modal: target is "search_key:<provider>". An empty
 	// paste clears the key (matches /search-key <p> --clear).
 	if strings.HasPrefix(target, editTargetSearchKey+":") {
@@ -2305,6 +2694,8 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
 			s.coreBashTimeout = n
+			s.settings.BashTimeoutSecs = n
+			_ = s.settings.save()
 			s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": n})
 			s.logInfo(fmt.Sprintf("bash timeout: %ds", n))
 		} else {
@@ -2315,7 +2706,8 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 10 {
 			s.settings.IdleTimeout = n
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("idle timeout: %ds (applies on next launch)", n))
+			s.logInfo(fmt.Sprintf("idle timeout: %ds", n))
+			s.offerCoreRestart("idle timeout")
 		} else {
 			s.logError("idle timeout must be ≥ 10 seconds")
 		}
@@ -2324,7 +2716,8 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 0 {
 			s.settings.MaxSessionTokens = n
 			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("max session tokens: %d (applies on next launch)", n))
+			s.logInfo(fmt.Sprintf("max session tokens: %d", n))
+			s.offerCoreRestart("max session tokens")
 		} else {
 			s.logError("max session tokens must be ≥ 0 (0=unlimited)")
 		}
@@ -2376,6 +2769,8 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 			s.sendCore(map[string]any{"type": "compact", "instructions": val})
 		}
 		s.logInfo("forcing context compaction…")
+	case editTargetTranscriptFind:
+		s.findTranscript(val)
 	case "goal_revise":
 		if val == "" {
 			s.logError("revision feedback is empty")
@@ -2385,12 +2780,16 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 			s.logError("no models loaded yet")
 			return s, nil
 		}
-		s.sendCore(map[string]any{
+		if !s.sendCore(map[string]any{
 			"type":             "revise_goal",
 			"feedback":         val,
 			"model":            s.models[s.modelIdx].ID,
 			"reasoning_effort": s.settings.ReasoningEffort,
-		})
+		}) {
+			s.openValueEditModal("goal_revise", "Revise Goal Plan", "what should change?", val)
+			s.modal.loadError = "Core is not accepting the revision; your feedback was preserved."
+			return s, nil
+		}
 		s.busy = true
 		s.logInfo("revising goal plan…")
 	}
@@ -2495,50 +2894,16 @@ func (s *session) helpText() string {
 		"Slash commands",
 		"  (bare commands open modals; skills still take optional task text)",
 		"  !command         run bash and add output to model context",
-		"  !!command        run bash without adding output to context",
-		"  /login           log in / switch provider (OpenAI · Gemini · Claude · xAI · Qwen · OpenRouter · …)",
-		"  /logout          log out of a provider",
-		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
-		"  /search-key      set Exa/Tavily search API key: /search-key exa|tavily [key|--clear]",
-		"  /model           switch model",
-		"  /approval        never | destructive | always",
-		"  /reasoning       set reasoning effort (per model)",
-		"  /theme           switch colour theme",
-		"  /bash-timeout    bash tool timeout (seconds)",
-		"  /auto-compact    auto context compaction on/off",
-		"  /sandbox         sandbox mode (none · firejail · seatbelt)",
-		"  /no-network      block network in sandbox on/off",
-		"  /mouse-wheel     mouse-wheel scrolling on/off",
-		"  /idle-timeout    idle timeout (seconds)",
-		"  /max-session-tokens  max session tokens (0=unlimited)",
-		"  /reset            wipe conversation + session file",
-		"  /clear            clear view (keep session file)",
-		"  /undo             drop last turn",
-		"  /compact          force context compaction",
-		"  /sessions         open session picker",
-		"  /new              start a fresh session file",
-		"  /stats            token + turn totals",
-		"  /context          token-usage breakdown (top consumers)",
-		"  /usage            provider plan limits (5h · weekly · …)",
-		"  /abort            stop running turn",
-		"  /exit · /quit     quit the app",
-		"  /steer            steer an in-flight turn",
-		"  /settings         settings hub (opens dedicated modals)",
-		"  /keybinds         view & customize keybindings",
-		"  /copy             copy last assistant reply",
-		"  /attach           send an image (vision)",
-		"  /vision           configure vision models & handoff target",
-		"  /remember         save a memory note",
-		"  /memory · /forget list / forget memories",
-		"  /plugin-install   install from path/URL (prompts global|workspace)",
-		"  /plugin-config    enable / disable plugins",
-		"  /plugin-remove    uninstall a plugin",
-		"  /plugin-reload    re-scan plugin directories",
-		"  /goal             goal mode — plan & deploy subagents (modal)",
-		"  /cancel-goal      cancel active goal mode",
-		"  /run · /parallel · /chain  subagent delegation",
-		"  /skill:<name> [task]  apply a skill (task optional)",
-		"  /{plugin-cmd}     plugin-declared slash command",
+		"  !!command        run bash without adding output to context")
+	prevGroup := ""
+	for _, item := range s.commandItems() {
+		if item.group != "" && item.group != prevGroup {
+			prevGroup = item.group
+			lines = append(lines, "", "  "+item.group)
+		}
+		lines = append(lines, fmt.Sprintf("    %-22s %s", item.label, item.desc))
+	}
+	lines = append(lines,
 		"",
 		"Settings persist to ~/.config/catalyst-code/settings.json",
 		"Config (core) persists to ~/.config/catalyst-code/config.json",
@@ -2627,6 +2992,18 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("No Network", s.noNetworkItems(), false)
 	case modalMouseWheel:
 		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
+	case modalRestartConfirm:
+		title := "Restart core?"
+		if r := strings.TrimSpace(s.modal.editTarget); r != "" {
+			title = "Restart core to apply " + r + "?"
+		}
+		return s.renderListModal(title, s.restartConfirmItems(), false)
+	case modalConfirm:
+		title := "Confirm destructive action"
+		if s.modal.confirmID != "" {
+			title += " · " + s.modal.confirmID
+		}
+		return s.renderListModal(title, s.confirmItems(), false)
 	case modalPluginInstallScope:
 		title := "Install where?"
 		if p := strings.TrimSpace(s.pendingPluginInstallPath); p != "" {
@@ -2684,6 +3061,9 @@ func (s *session) renderGoalModal() string {
 	lines = append(lines, row(goalFieldGoal, "Goal", goalVal))
 	lines = append(lines, row(goalFieldConcurrency, "Concurrency", fmt.Sprintf("%d  (←/→)", d.concurrency)))
 	lines = append(lines, row(goalFieldMaxTasks, "Max tasks", fmt.Sprintf("%d  (←/→)", d.maxTasks)))
+	if s.modal.loadError != "" {
+		lines = append(lines, errStyle.Render("  ✗ "+s.modal.loadError))
+	}
 
 	// Providers multi-select
 	provs := s.goalProviderOptions()
@@ -2826,27 +3206,52 @@ func (s *session) renderGoalModal() string {
 
 	lines = append(lines, "")
 	lines = append(lines, dimStyle.Render("  ↑↓ fields · space toggle · ←/→ cycle · ctrl+enter submit · esc cancel"))
+	// Keep the active field (or active row within a multi-select) visible on
+	// short terminals. Title/separator and footer remain anchored.
+	focusLine := 2
+	for i, line := range lines {
+		if strings.Contains(line, "▸") {
+			focusLine = i
+		}
+	}
+	maxBody := s.height - 2 // modalBox border rows
+	lines = focusWindow(lines, focusLine, maxBody, 2, 2)
 	return modalBox(w, strings.Join(lines, "\n"))
 }
 
 func (s *session) renderGoalPlanModal() string {
 	w := s.modalWidth(78)
 	var lines []string
-	lines = append(lines, accentStyle.Render("◆ Goal Plan Ready"))
-	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
-	if s.goalState != nil {
-		g := s.goalState.Goal
-		if len([]rune(g)) > w-10 {
-			g = string([]rune(g)[:w-11]) + "…"
+	if s.goalPlan != nil && strings.TrimSpace(s.goalPlan.Summary) != "" {
+		lines = append(lines, baseStyle.Render("Summary"))
+		for _, line := range wrapUsageText(s.goalPlan.Summary, max(1, w-6)) {
+			lines = append(lines, "  "+line)
 		}
-		lines = append(lines, baseStyle.Render("  "+g))
 		lines = append(lines, "")
+	}
+	if s.goalState != nil {
+		lines = append(lines, baseStyle.Render("Goal"))
+		for _, line := range wrapUsageText(s.goalState.Goal, max(1, w-6)) {
+			lines = append(lines, "  "+line)
+		}
+		lines = append(lines, "")
+		lines = append(lines, baseStyle.Render(fmt.Sprintf("Plan steps (%d)", len(s.goalState.Prompts))))
 		for i, p := range s.goalState.Prompts {
 			title := p.Title
 			if title == "" {
 				title = p.StepID
 			}
-			lines = append(lines, fmt.Sprintf("  %d. [%s] %s", i+1, p.Agent, title))
+			status := p.Status
+			if status == "" {
+				status = "planned"
+			}
+			lines = append(lines, accentStyle.Render(fmt.Sprintf("  %d. %s", i+1, title)))
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("     agent: %s · status: %s · id: %s", p.Agent, status, p.StepID)))
+			if strings.TrimSpace(p.Summary) != "" {
+				for _, line := range wrapUsageText(p.Summary, max(1, w-9)) {
+					lines = append(lines, "     "+mutedStyle.Render(line))
+				}
+			}
 		}
 		if len(s.goalState.Prompts) == 0 {
 			lines = append(lines, dimStyle.Render("  (no steps in plan)"))
@@ -2854,9 +3259,24 @@ func (s *session) renderGoalPlanModal() string {
 	} else {
 		lines = append(lines, dimStyle.Render("  (no goal_state yet)"))
 	}
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  a/enter approve · r revise · q/esc cancel"))
-	return modalBox(w, strings.Join(lines, "\n"))
+	if s.goalPlan != nil && len(s.goalPlan.Risks) > 0 {
+		lines = append(lines, "", warnStyle.Render("Risks"))
+		for _, risk := range s.goalPlan.Risks {
+			for _, line := range wrapUsageText("• "+risk, max(1, w-6)) {
+				lines = append(lines, "  "+line)
+			}
+		}
+	}
+	if s.goalPlan != nil && len(s.goalPlan.Validation) > 0 {
+		lines = append(lines, "", successStyle.Render("Validation"))
+		for _, check := range s.goalPlan.Validation {
+			for _, line := range wrapUsageText("• "+check, max(1, w-6)) {
+				lines = append(lines, "  "+line)
+			}
+		}
+	}
+	return s.renderScrollableReport(w, "Goal Plan Ready", lines,
+		"a approve · r revise · q/esc cancel · ↑↓ scroll")
 }
 
 // fitListRow builds a single-line list row — marker + label + desc — that
@@ -2900,17 +3320,48 @@ func fitListRow(marker, label, desc string, markerW, width int) string {
 	return row
 }
 
+// fitIdentityListRow gives the selectable identity (command/model/provider)
+// first claim on a narrow row. Descriptions are supporting copy and may be
+// abbreviated; hiding the thing Enter will select is much more disorienting.
+func fitIdentityListRow(marker, label, desc string, markerW, width int) string {
+	budget := max(0, width-markerW)
+	if desc == "" {
+		return marker + baseStyle.Render(truncate(label, budget))
+	}
+	labelW := lipgloss.Width(label)
+	descW := lipgloss.Width(desc)
+	if labelW+2+descW <= budget {
+		return marker + baseStyle.Render(label) + "  " + dimStyle.Render(desc)
+	}
+	// Keep at least two thirds for identity on compact terminals.
+	labelBudget := budget * 2 / 3
+	if labelBudget < 1 {
+		labelBudget = 1
+	}
+	label = truncate(label, labelBudget)
+	remaining := budget - lipgloss.Width(label) - 2
+	row := marker + baseStyle.Render(label)
+	if remaining > 0 {
+		row += "  " + dimStyle.Render(truncate(desc, remaining))
+	}
+	return row
+}
+
 // modalWidth returns a responsive modal width: as wide as the terminal
-// allows (minus margins) up to cap, floored at 28. Replaces the old fixed
+// allows (minus margins) up to cap. On compact terminals it sheds the normal
+// side margins instead of inventing a minimum wider than the viewport.
 // 52/60 so longer content — session names especially — stays visible instead
 // of being truncated.
 func (s *session) modalWidth(cap int) int {
 	w := s.width - 4
+	if s.width < 32 {
+		w = s.width
+	}
 	if w > cap {
 		w = cap
 	}
-	if w < 28 {
-		w = 28
+	if w < 1 {
+		w = 1
 	}
 	return w
 }
@@ -2924,19 +3375,48 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	// Overhead (title + filter + separator + "(N more)" + blank + footer +
 	// the 2 border rows) is 8 lines, so maxVisible = height-9 leaves one line of
 	// headroom. Floor at 1 (not 4) so short terminals still fit without overflow.
-	maxVisible := s.height - 9
-	if maxVisible < 1 {
-		maxVisible = 1
+	// Budget physical lines rather than just items: grouped palettes also emit
+	// a heading whenever the visible group changes.
+	lineBudget := s.height - 9
+	if !showFilter {
+		lineBudget++
 	}
-	if n > maxVisible {
-		// keep the cursor inside the window
-		if s.modal.cursor < s.modal.scroll {
-			s.modal.scroll = s.modal.cursor
-		} else if s.modal.cursor >= s.modal.scroll+maxVisible {
-			s.modal.scroll = s.modal.cursor - maxVisible + 1
-		}
-	} else {
+	if lineBudget < 1 {
+		lineBudget = 1
+	}
+	if s.modal.cursor < 0 {
+		s.modal.cursor = 0
+	}
+	if s.modal.cursor >= n && n > 0 {
+		s.modal.cursor = n - 1
+	}
+	if s.modal.scroll > s.modal.cursor {
+		s.modal.scroll = s.modal.cursor
+	}
+	if s.modal.scroll < 0 {
 		s.modal.scroll = 0
+	}
+	windowEnd := func(start int) int {
+		used, end, group := 0, start, ""
+		for end < n {
+			g := items[idx[end]].group
+			cost := 1
+			if g != "" && g != group {
+				cost++
+			}
+			if used > 0 && used+cost > lineBudget {
+				break
+			}
+			// A one-line viewport still shows the selected item, omitting its
+			// group heading below when there is no room for both.
+			used += cost
+			group = g
+			end++
+		}
+		return end
+	}
+	for n > 0 && s.modal.cursor >= windowEnd(s.modal.scroll) && s.modal.scroll < s.modal.cursor {
+		s.modal.scroll++
 	}
 	rowW := w - 4 // modal border(2) + padding(2)
 	if rowW < 1 {
@@ -2962,31 +3442,43 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		lines = append(lines, truncStyle.Render(inputPromptStyle.Render("⟩ ")+mutedStyle.Render(fq)))
 	}
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
-	if n == 0 {
+	if s.modal.loading {
+		lines = append(lines, accentStyle.Render("  ◷ Loading…"))
+	} else if s.modal.loadError != "" {
+		lines = append(lines, errStyle.Render("  ✗ "+truncate(s.modal.loadError, rowW-4)))
+		lines = append(lines, dimStyle.Render("  press r to retry"))
+	} else if n == 0 {
 		lines = append(lines, dimStyle.Render("  (no matches)"))
 	}
 	visStart := s.modal.scroll
-	visEnd := visStart + maxVisible
-	if visEnd > n {
-		visEnd = n
-	}
+	visEnd := windowEnd(visStart)
+	prevGroup := ""
 	for vi := visStart; vi < visEnd; vi++ {
 		abs := idx[vi]
+		if g := items[abs].group; g != "" && g != prevGroup && (visEnd-visStart < lineBudget || vi > visStart) {
+			prevGroup = g
+			lines = append(lines, truncStyle.Render(dimStyle.Render("  "+g)))
+		}
 		marker := "  "
 		if vi == s.modal.cursor {
 			marker = accentStyle.Render("▸ ")
 		}
 		// Fit marker + label + desc into one line of rowW columns, truncating the
 		// label first so the description (msg count · time) is kept whole.
+		identityFirst := s.modal.kind == modalCommand || s.modal.kind == modalModels ||
+			s.modal.kind == modalProviders || s.modal.kind == modalLogout
 		row := fitListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+		if identityFirst {
+			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+		}
 		row = truncStyle.Render(row) // safety: guarantee a single line ≤ rowW
 		if vi == s.modal.cursor {
 			row = hiStyle.Render(row) // full-width highlight bar (pads to rowW)
 		}
 		lines = append(lines, row)
 	}
-	if n > maxVisible {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d more · ↑↓ scroll)", n-maxVisible)))
+	if visEnd < n && s.height >= 9 {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d more · ↑↓ scroll)", n-visEnd)))
 	}
 	lines = append(lines, "")
 	footer := "  ↑↓ navigate · enter select · esc close"
@@ -2999,6 +3491,9 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 	}
 	if s.modal.kind == modalMemory {
 		footer = "  ↑↓ navigate · enter forget · esc close"
+	}
+	if s.modal.kind == modalSessions {
+		footer = "  ↑↓ select · enter load · ^R rename · ^P pin · ^D delete · esc close"
 	}
 	if s.modal.kind == modalVision {
 		footer = "  ↑↓ navigate · space toggle vision · enter set target · esc close"
@@ -3014,14 +3509,10 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 func (s *session) renderUsageModal() string {
 	w := s.modalWidth(78)
 	var lines []string
-	lines = append(lines, accentStyle.Render("◆ Provider Usage"))
-	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
 	ur := s.usageReport
 	if ur == nil {
 		lines = append(lines, mutedStyle.Render("  loading…"))
-		lines = append(lines, "")
-		lines = append(lines, dimStyle.Render("  esc close"))
-		return modalBox(w, strings.Join(lines, "\n"))
+		return s.renderScrollableReport(w, "Provider Usage", lines, "esc close · ↑↓ scroll")
 	}
 	// Header: provider + model.
 	prov := ur.Provider
@@ -3047,9 +3538,7 @@ func (s *session) renderUsageModal() string {
 		for _, ln := range wrapUsageText(msg, w-4) {
 			lines = append(lines, "  "+mutedStyle.Render(ln))
 		}
-		lines = append(lines, "")
-		lines = append(lines, dimStyle.Render("  esc close"))
-		return modalBox(w, strings.Join(lines, "\n"))
+		return s.renderScrollableReport(w, "Provider Usage", lines, "esc close · ↑↓ scroll")
 	}
 
 	if len(ur.Windows) == 0 {
@@ -3093,9 +3582,7 @@ func (s *session) renderUsageModal() string {
 			lines = append(lines, "  "+mutedStyle.Render(ln))
 		}
 	}
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  esc close"))
-	return modalBox(w, strings.Join(lines, "\n"))
+	return s.renderScrollableReport(w, "Provider Usage", lines, "esc close · ↑↓ scroll")
 }
 
 // formatUsageAmount returns a human used/limit string and a 0–1 bar ratio.
@@ -3222,14 +3709,10 @@ func wrapUsageText(s string, width int) []string {
 func (s *session) renderContextModal() string {
 	w := s.modalWidth(78)
 	var lines []string
-	lines = append(lines, accentStyle.Render("◆ Context Breakdown"))
-	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
 	cb := s.ctxBreakdown
 	if cb == nil {
 		lines = append(lines, mutedStyle.Render("  no data"))
-		lines = append(lines, "")
-		lines = append(lines, dimStyle.Render("  esc close"))
-		return modalBox(w, strings.Join(lines, "\n"))
+		return s.renderScrollableReport(w, "Context Breakdown", lines, "esc close · ↑↓ scroll")
 	}
 	lines = append(lines, fmt.Sprintf("%s: %s / %s  (%s%%)",
 		baseStyle.Render("Total"),
@@ -3279,9 +3762,7 @@ func (s *session) renderContextModal() string {
 				c.Index, c.Role, humanTokens(c.Tokens), mutedStyle.Render(prev)))
 		}
 	}
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  esc close"))
-	return modalBox(w, strings.Join(lines, "\n"))
+	return s.renderScrollableReport(w, "Context Breakdown", lines, "esc close · ↑↓ scroll")
 }
 
 // renderValueEditModal renders a free-form edit box for a single setting
@@ -3302,6 +3783,11 @@ func (s *session) renderValueEditModal() string {
 	lines = append(lines, accentStyle.Render("◆ "+title))
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
 	lines = append(lines, accentStyle.Render("▸ ")+baseStyle.Render(display))
+	if s.modal.loadError != "" {
+		for _, line := range wrapUsageText(s.modal.loadError, max(1, w-6)) {
+			lines = append(lines, errStyle.Render("  ✗ "+line))
+		}
+	}
 	lines = append(lines, "")
 	lines = append(lines, dimStyle.Render("  type a value · enter save · esc cancel"))
 	return modalBox(w, strings.Join(lines, "\n"))
@@ -3309,39 +3795,117 @@ func (s *session) renderValueEditModal() string {
 
 func (s *session) renderHelpModal() string {
 	w := s.modalWidth(80)
-	h := s.height - 6
-	if h < 6 {
-		h = 6
+	allLines := wrapPlainReport(strings.Split(s.helpText(), "\n"), max(1, w-4))
+	return s.renderScrollableReport(w, "Help", allLines, "↑↓/PgUp/PgDn scroll · esc close")
+}
+
+// renderScrollableReport keeps report chrome pinned while windowing its body.
+// It is shared by help, usage, context, and goal review so none of those
+// display-only surfaces can be silently top-clipped on a short terminal.
+func (s *session) renderScrollableReport(w int, title string, lines []string, footer string) string {
+	visible := s.height - 5 // border(2), title, separator, footer
+	if visible < 1 {
+		visible = 1
 	}
-	allLines := strings.Split(s.helpText(), "\n")
-	maxScroll := len(allLines) - h
-	if maxScroll < 0 {
-		maxScroll = 0
+	maxScroll := max(0, len(lines)-visible)
+	s.modal.scroll = min(max(0, s.modal.scroll), maxScroll)
+	end := min(len(lines), s.modal.scroll+visible)
+	window := lines[s.modal.scroll:end]
+	position := ""
+	if len(lines) > visible {
+		position = fmt.Sprintf(" · %d–%d/%d", s.modal.scroll+1, end, len(lines))
 	}
-	if s.modal.scroll > maxScroll {
-		s.modal.scroll = maxScroll
+	body := []string{
+		accentStyle.Render("◆ " + title),
+		separatorStyle.Render(strings.Repeat("─", max(0, w-2))),
 	}
-	if s.modal.scroll < 0 {
-		s.modal.scroll = 0
+	body = append(body, window...)
+	body = append(body, dimStyle.Render("  "+footer+position))
+	return modalBox(w, strings.Join(body, "\n"))
+}
+
+func wrapPlainReport(lines []string, width int) []string {
+	if width < 1 {
+		width = 1
 	}
-	start := s.modal.scroll
-	end := start + h
-	if end > len(allLines) {
-		end = len(allLines)
+	var out []string
+	for _, line := range lines {
+		if lipgloss.Width(line) <= width || strings.TrimSpace(line) == "" {
+			out = append(out, line)
+			continue
+		}
+		indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		contentWidth := max(1, width-len(indent))
+		wrapped := wrapUsageText(strings.TrimSpace(line), contentWidth)
+		for _, part := range wrapped {
+			out = append(out, indent+part)
+		}
 	}
-	visible := strings.Join(allLines[start:end], "\n")
-	body := accentStyle.Render("◆ Help") + "\n" + visible + "\n" + dimStyle.Render("  ↑↓ scroll · esc close")
-	return modalBox(w, body)
+	return out
 }
 
 // modalBox wraps a body in a rounded border with padding.
 func modalBox(w int, body string) string {
+	if w < 1 {
+		w = 1
+	}
+	contentW := w - 4
+	if contentW < 1 {
+		contentW = 1
+	}
+	clip := lipgloss.NewStyle().MaxWidth(contentW)
+	lines := strings.Split(body, "\n")
+	for i := range lines {
+		lines[i] = clip.Render(lines[i])
+	}
+	body = strings.Join(lines, "\n")
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(c.accent)).
 		Padding(0, 1).
 		Width(w).
 		Render(body)
+}
+
+// focusWindow keeps fixed chrome and a window around the focused control. It
+// is used by forms whose fields can outgrow a short terminal.
+func focusWindow(lines []string, focus, maxLines, head, tail int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	if len(lines) <= maxLines {
+		return lines
+	}
+	if focus < 0 {
+		focus = 0
+	}
+	if focus >= len(lines) {
+		focus = len(lines) - 1
+	}
+	if maxLines == 1 {
+		return []string{lines[focus]}
+	}
+	// On extremely short terminals chrome yields to the focused control.
+	if head+tail >= maxLines {
+		head = min(head, 1)
+		tail = min(tail, maxLines-head-1)
+	}
+	midCap := maxLines - head - tail
+	midStart, midEnd := head, len(lines)-tail
+	start := focus - midCap/2
+	if start < midStart {
+		start = midStart
+	}
+	if start+midCap > midEnd {
+		start = midEnd - midCap
+	}
+	if start < midStart {
+		start = midStart
+	}
+	out := append([]string(nil), lines[:head]...)
+	out = append(out, lines[start:min(start+midCap, midEnd)]...)
+	out = append(out, lines[len(lines)-tail:]...)
+	return out
 }
 
 func isPrintable(msg tea.KeyPressMsg) bool {

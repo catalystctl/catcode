@@ -96,6 +96,30 @@ func (s *session) recallHistory(dir int) string {
 	return s.history[s.histIdx]
 }
 
+// historyRecallAllowed gates Up/Down history against multi-line editing.
+// dir -1 = Up (history_prev): only when input is empty or cursor is on the
+// first line. dir +1 = Down: empty or cursor on the last line.
+func (s *session) historyRecallAllowed(dir int) bool {
+	val := s.input.Value()
+	if val == "" {
+		return true
+	}
+	pos := s.input.Position()
+	r := []rune(val)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(r) {
+		pos = len(r)
+	}
+	if dir < 0 {
+		// Up: no newline before the cursor → already on first line.
+		return !strings.ContainsRune(string(r[:pos]), '\n')
+	}
+	// Down: no newline after the cursor → already on last line.
+	return !strings.ContainsRune(string(r[pos:]), '\n')
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard: copy the last assistant block's text.
 // ---------------------------------------------------------------------------
@@ -106,9 +130,17 @@ func (s *session) copyLastAssistant() tea.Cmd {
 		if b.kind == blkAssistant && b.text.Len() > 0 {
 			text := strings.TrimSpace(b.text.String())
 			if text != "" {
-				_ = clipboard.WriteAll(text)
-				s.logSuccess("copied last reply to clipboard")
-				return nil
+				if err := clipboard.WriteAll(text); err == nil {
+					s.logSuccess("copied last reply to clipboard")
+					return nil
+				} else {
+					// Headless/SSH sessions commonly have no host clipboard. OSC 52
+					// targets the user's terminal clipboard and is the most useful
+					// fallback, but support is terminal-controlled and cannot be
+					// acknowledged, so report that distinction honestly.
+					s.logWarn("system clipboard unavailable; sent copy request to terminal (OSC 52)")
+					return writeOSC52Cmd(text)
+				}
 			}
 		}
 	}
@@ -122,9 +154,10 @@ func (s *session) copyLastAssistant() tea.Cmd {
 
 // approvalMode returns the current approval mode (settings-backed, updated from
 // core events). Never returns blank — falls back to the persisted setting, then
-// destructive.
+// destructive. Ignores "<kind>:always" escalation strings that used to leak
+// into approvalModeStr and display as "destructive".
 func (s *session) approvalMode() string {
-	if s.approvalModeStr != "" {
+	if s.approvalModeStr != "" && !strings.Contains(s.approvalModeStr, ":") {
 		return normalizeApproval(s.approvalModeStr)
 	}
 	if s.settings != nil && s.settings.Approval != "" {

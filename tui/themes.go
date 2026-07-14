@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -39,7 +40,7 @@ var themes = []theme{
 		name:    "catalyst",
 		bg:      "#1a1a1a", // 0 0% 10% (gray, not near-black)
 		fg:      "#f0f0f0", // 0 0% 94%
-		dim:     "#4d4d4d", // 0 0% 30%
+		dim:     "#4d4d4d", // subdued neutral used by the authored Catalyst palette
 		muted:   "#858585", // 0 0% 52%
 		accent:  "#cf8a59", // peach  25 55% 58%
 		user:    "#cf8a59", // peach (terminal prompt)
@@ -476,6 +477,8 @@ var themes = []theme{
 
 var activeTheme = themes[0]
 
+func init() { applyTheme(activeTheme) }
+
 // setTheme looks up a theme by name (case-insensitive), applies it to the
 // palette `c` and rebuilds every derived style var. Returns false if not found.
 func setTheme(name string) bool {
@@ -502,6 +505,50 @@ func applyTheme(t theme) {
 	c.success = t.success
 	c.warn = t.warn
 	c.err = t.err
+
+	if colorsDisabled() {
+		baseStyle = lipgloss.NewStyle()
+		boldBaseStyle = lipgloss.NewStyle().Bold(true)
+		dimStyle = lipgloss.NewStyle()
+		mutedStyle = lipgloss.NewStyle()
+		accentStyle = lipgloss.NewStyle().Bold(true)
+		successStyle = lipgloss.NewStyle().Bold(true)
+		errStyle = lipgloss.NewStyle().Bold(true)
+		warnStyle = lipgloss.NewStyle().Bold(true)
+		assistantStyle = lipgloss.NewStyle()
+		thinkStyle = lipgloss.NewStyle().Italic(true)
+		toolNameStyle = lipgloss.NewStyle().Bold(true)
+		toolDetailStyle = lipgloss.NewStyle()
+		resultStyle = lipgloss.NewStyle()
+		headerStyle = lipgloss.NewStyle().Bold(true)
+		keyHintStyle = lipgloss.NewStyle()
+		separatorStyle = lipgloss.NewStyle()
+		inputPromptStyle = lipgloss.NewStyle().Bold(true)
+		placeholderStyle = lipgloss.NewStyle()
+		codeTextStyle = lipgloss.NewStyle()
+		codeInlineStyle = lipgloss.NewStyle().Bold(true)
+		italicStyle = lipgloss.NewStyle().Italic(true)
+		linkStyle = lipgloss.NewStyle().Underline(true)
+		roleUserStyle = lipgloss.NewStyle().Bold(true)
+		roleAssistantStyle = lipgloss.NewStyle().Bold(true)
+		roleThinkStyle = lipgloss.NewStyle().Italic(true)
+		roleToolStyle = lipgloss.NewStyle().Bold(true)
+		roleResultStyle = lipgloss.NewStyle().Bold(true)
+		roleErrorStyle = lipgloss.NewStyle().Bold(true)
+		roleWarnStyle = lipgloss.NewStyle().Bold(true)
+		roleSuccessStyle = lipgloss.NewStyle().Bold(true)
+		// Keep semantic colors on the style objects: diff classification and
+		// third-party renderers inspect these values. Full View output is stripped
+		// of ANSI below when NO_COLOR is active.
+		toolDiffAdded = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success))
+		toolDiffRemoved = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+		toolDiffContext = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
+		toolDiffMeta = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
+		roToolNameStyle = lipgloss.NewStyle().Bold(true)
+		errOutStyle = lipgloss.NewStyle().Bold(true)
+		errRuleStyle = lipgloss.NewStyle().Bold(true)
+		return
+	}
 
 	baseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
 	boldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Bold(true)
@@ -537,6 +584,14 @@ func applyTheme(t theme) {
 	toolDiffRemoved = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	toolDiffContext = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
 	toolDiffMeta = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
+	roToolNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
+	errOutStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+	errRuleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+}
+
+func colorsDisabled() bool {
+	_, disabled := os.LookupEnv("NO_COLOR")
+	return disabled
 }
 
 func themeNames() []string {

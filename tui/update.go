@@ -258,22 +258,31 @@ func launchUpdateCheck(prog *tea.Program) {
 // present it performs the action and returns (exitCode, true); otherwise
 // (0, false) so main() proceeds to launch the TUI.
 func handleCLIArgs(args []string) (int, bool) {
-	for _, a := range args {
-		switch a {
-		case "-h", "--help":
-			printUsage()
-			return 0, true
-		case "-v", "--version":
-			fmt.Printf("catcode %s\n", coreVersion)
-			fmt.Printf("repo: github.com/%s\n", githubRepo)
-			return 0, true
-		case "--check-update":
-			return runCheckUpdate(), true
-		case "--update", "-u", "update":
-			return runUpdate(), true
-		}
+	if len(args) == 0 {
+		return 0, false
 	}
-	return 0, false
+	if len(args) != 1 {
+		fmt.Fprintf(os.Stderr, "catcode: expected one command/flag, got %d\n", len(args))
+		fmt.Fprintln(os.Stderr, "Run `catcode --help` for usage.")
+		return 2, true
+	}
+	switch args[0] {
+	case "-h", "--help":
+		printUsage()
+		return 0, true
+	case "-v", "--version":
+		fmt.Printf("catcode %s\n", coreVersion)
+		fmt.Printf("repo: github.com/%s\n", githubRepo)
+		return 0, true
+	case "--check-update":
+		return runCheckUpdate(), true
+	case "--update", "-u", "update":
+		return runUpdate(), true
+	default:
+		fmt.Fprintf(os.Stderr, "catcode: unknown argument %q\n", args[0])
+		fmt.Fprintln(os.Stderr, "Run `catcode --help` for usage.")
+		return 2, true
+	}
 }
 
 func printUsage() {

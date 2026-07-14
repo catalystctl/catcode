@@ -36,6 +36,48 @@ type queuedMsg struct {
 	at   time.Time
 }
 
+// statusToast is a short-lived footer/composer flash for operational messages
+// that should not pollute the transcript.
+type statusToast struct {
+	kind  toastKind
+	text  string
+	until time.Time
+}
+
+type composerDraft struct {
+	owner  string
+	text   string
+	cursor int
+	images []string
+}
+
+type coreLifecycleState uint8
+
+const (
+	coreStarting coreLifecycleState = iota
+	coreReady
+	coreFailed
+)
+
+type streamRefreshMsg struct{}
+
+type toastKind int
+
+const (
+	toastInfo toastKind = iota
+	toastSuccess
+	toastWarn
+	toastError
+)
+
+// oauthBanner holds a sticky OAuth login prompt (URL copied; code if any)
+// instead of dumping a hard-wrapped URL wall into the transcript.
+type oauthBanner struct {
+	message string
+	url     string
+	code    string
+}
+
 // session is the Bubble Tea model: it owns the core subprocess, the structured
 // list of message blocks, and the viewport/input/spinner.
 type session struct {
@@ -54,6 +96,7 @@ type session struct {
 	turnCount       int
 	pendingApproval *approvalPrompt
 	pendingIntercom *intercomPrompt
+	intercomQueue   []*intercomPrompt
 	intercomNudge   time.Time // pulses a "type a reply" hint when Enter is hit on an empty intercom reply
 	pendingAsk      *askPrompt
 	pendingSudo     *sudoPrompt
@@ -70,13 +113,17 @@ type session struct {
 	pluginStatus             string // last plugin_status text (footer); empty = clear
 	memoryList               []memoryEntry
 	pendingMemoryPicker      bool   // open memory picker once list_memory arrives
+	pendingPluginPicker      bool   // open plugin picker once plugins_list arrives
 	pluginPickerMode         string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
 	coreBashTimeout          int
 	coreAutoCompact          bool
 	ctxBreakdown             *contextBreakdown
 	usageReport              *usageReport // last /usage reply (provider plan limits)
 	coreRestarts             int
-	coreReady                bool            // true once the core emitted `ready` (disarms the startup watchdog)
+	coreReady                bool // true once the core emitted `ready` (disarms the startup watchdog)
+	coreLifecycle            coreLifecycleState
+	coreFailure              string
+	streamRefreshPending     bool
 	coreStartGen             uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
 	visionModels             map[string]bool // user-curated vision-capable model ids (drives /vision)
 	visionModel              string          // preferred handoff target ("" = pick dynamically)
@@ -98,12 +145,15 @@ type session struct {
 	// goal_state snapshot from the core (drives status + plan-ready review).
 	goalDraft goalDraft
 	goalState *goalStateSnap
+	goalPlan  *goalPlanSnap
 
-	settings *settingsStore
-	keybinds map[string]string // effective keymap (defaults + user overrides); see keybinds.go
-	modal    modal
-	history  []string
-	histIdx  int
+	settings       *settingsStore
+	keybinds       map[string]string // effective keymap (defaults + user overrides); see keybinds.go
+	modal          modal
+	history        []string
+	histIdx        int
+	recentCommands []string // most recently used slash commands, palette-first
+	composerDrafts []composerDraft
 
 	// conversation blocks + streaming/caching state
 	blocks        []*block
@@ -116,6 +166,7 @@ type session struct {
 	// default). Scrolling up pauses follow so history can be read without the
 	// view yanking back down on each new token; a banner offers to re-pin.
 	follow            bool
+	focusedBlock      int
 	welcomeIdx        int                 // welcome-screen example cursor (empty conversation)
 	contextTokens     uint64              // live context size from the last metrics event (drives the footer budget)
 	lastCachePct      int                 // last completed turn's prefix-cache hit %; shown (with "~") while the next turn is in flight
@@ -127,6 +178,14 @@ type session struct {
 	subProgress       []*subProgressEntry // live subagent runs (drives the progress panel)
 	maxTaskRows       int                 // cap on task-panel entries (set by layout() to fit available height)
 	cwd               string              // working dir, shown in the header as ~/
+
+	// Ephemeral UX state (toasts, sticky OAuth, one-shot prompts).
+	toast              *statusToast
+	oauth              *oauthBanner
+	loginOffered       bool // auto-opened /login once when ready with no key
+	ctrlCAbortArmed    bool // first Ctrl+C while busy aborted; second quits
+	intentionalRestart bool // next core EOF should restart (settings apply)
+	mouseTipShown      bool // one-time PgUp tip when mouse wheel is off
 
 	// @-mention file flyout state (see mention.go): active when an
 	// unbroken @-token sits at the cursor; mentionAt is its rune index.
@@ -156,7 +215,14 @@ func initialSession() *session {
 	s := &session{}
 
 	s.settings = loadSettings()
+	s.settings.onSaveError = func(err error) {
+		s.logError("setting applied for this session but could not be saved: " + err.Error())
+	}
+	if s.settings.loadError != nil {
+		s.logError(s.settings.loadError.Error())
+	}
 	s.keybinds = effectiveKeybinds(s.settings.Keybinds)
+	s.recentCommands = append([]string(nil), s.settings.RecentCommands...)
 	// Seed the status-line approval from settings immediately so we don't flash
 	// the "destructive" default before the core's ready event arrives (and so a
 	// pre-ready /approval picker doesn't overwrite the saved mode).
@@ -166,13 +232,20 @@ func initialSession() *session {
 	}
 	s.thinkExpanded = s.settings.ThinkExpanded
 	s.follow = true // pin viewport to newest line until the user scrolls up
+	s.focusedBlock = -1
 	s.cwd = cwdDisplay()
 	s.maxTaskRows = 4 // cap on task-panel entries; layout() shrinks it to fit available height
-	s.coreBashTimeout = 30
+	// Seed runtime knobs from settings so the UI shows persisted values before
+	// the core's ready event (and so a pre-ready edit doesn't fight defaults).
+	s.coreBashTimeout = s.settings.BashTimeoutSecs
+	if s.coreBashTimeout <= 0 {
+		s.coreBashTimeout = 30
+	}
+	s.coreAutoCompact = s.settings.AutoCompact
 	s.visionModels = map[string]bool{}
 
 	s.input = textinput.New()
-	s.input.Placeholder = "Chat with the agent…  (/ for commands)"
+	s.input.Placeholder = "Chat with the agent…  (/ commands · ? help)"
 	// textinput v2: placeholder style lives on Styles().{Focused,Blurred}.Placeholder
 	// (the top-level PlaceholderStyle field was removed).
 	ist := s.input.Styles()
@@ -211,21 +284,20 @@ func coreExeSuffix() string {
 // coreBinaryPath resolves the core subprocess binary. Search order:
 //  1. $CATCODE_CORE — explicit override (used as-is if it exists)
 //  2. <dir of this exe>/catcode-core[.exe] — installed layout (beside the TUI)
-//  3. <dir of this exe>/core[.exe] — dev/legacy core placed beside the TUI
-//  4. core/target/release/core[.exe] — dev build run from the repo root
-//  5. ../core/target/release/core[.exe] — dev build run from a sibling dir
-//  6. <dir of this exe>/../core/target/release/core[.exe]
+//  3. catcode-core on PATH
+//  4. Development-only CWD/repository fallbacks (when coreVersion == "dev")
 //
 // On Windows ".exe" is appended to every candidate so the install layout
 // (catcode.exe next to catcode-core.exe) is found from any CWD.
 func coreBinaryPath() string {
 	if env := os.Getenv("CATCODE_CORE"); env != "" {
-		if _, err := os.Stat(env); err == nil {
-			if abs, err := filepath.Abs(env); err == nil {
-				return abs
-			}
-			return env
+		// An explicit override is authoritative even when invalid; falling back
+		// could launch a different installed core and hide the configuration
+		// mistake. startCore will surface the exact path on its recovery screen.
+		if abs, err := filepath.Abs(env); err == nil {
+			return abs
 		}
+		return env
 	}
 	if p := embeddedCorePath(); p != "" {
 		return p
@@ -233,17 +305,29 @@ func coreBinaryPath() string {
 	sfx := coreExeSuffix()
 	coreName := "catcode-core" + sfx // installed beside the TUI
 	devName := "core" + sfx          // cargo's bin name in the dev build
-	candidates := []string{
-		"core/target/release/" + devName,
-		"../core/target/release/" + devName,
-	}
+	var candidates []string
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
+		installed := filepath.Join(dir, coreName)
+		if _, err := os.Stat(installed); err == nil {
+			return installed
+		}
+	}
+	if p, err := exec.LookPath(coreName); err == nil {
+		return p
+	}
+	if coreVersion == "dev" {
 		candidates = append(candidates,
-			filepath.Join(dir, coreName), // installed layout
-			filepath.Join(dir, devName),  // dev/legacy core beside the TUI
-			filepath.Join(dir, "../core/target/release/"+devName),
+			"core/target/release/"+devName,
+			"../core/target/release/"+devName,
 		)
+		if exe, err := os.Executable(); err == nil {
+			dir := filepath.Dir(exe)
+			candidates = append(candidates,
+				filepath.Join(dir, devName),
+				filepath.Join(dir, "../core/target/release/"+devName),
+			)
+		}
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -253,7 +337,12 @@ func coreBinaryPath() string {
 			return c
 		}
 	}
-	return "core/target/release/" + devName
+	// Let exec.Command report a useful PATH error on release builds. Local dev
+	// builds retain the historical repo-relative error path for diagnostics.
+	if coreVersion == "dev" {
+		return "core/target/release/" + devName
+	}
+	return coreName
 }
 
 // coreProcess holds the running core's *os.Process so a signal handler can
@@ -273,18 +362,27 @@ func (s *session) startCore() tea.Cmd {
 	// Reset startup-tracking state and arm a fresh watchdog generation so a stale
 	// watchdog tick from a previous (crashed) core is ignored once `ready` lands.
 	s.coreReady = false
+	s.coreLifecycle = coreStarting
+	s.coreFailure = ""
 	s.coreStartGen++
 	gen := s.coreStartGen
 	bin := coreBinaryPath()
 	approval := normalizeApproval(s.settings.Approval)
 	s.settings.Approval = approval
 	debugLog := filepath.Join(configDir(), "debug.jsonl")
+	sessionFile := claimedSessionPath
+	if sessionFile == "" {
+		sessionFile = sessionPath()
+	}
 	args := []string{
 		"--workspace", ".",
 		"--approval", approval,
-		"--session", sessionPath(),
+		"--session", sessionFile,
 		"--debug-log", debugLog,
 		"--idle-timeout", fmt.Sprintf("%d", s.settings.IdleTimeout),
+	}
+	if s.settings.BashTimeoutSecs > 0 {
+		args = append(args, "--bash-timeout", fmt.Sprintf("%d", s.settings.BashTimeoutSecs))
 	}
 	if s.settings.Sandbox != "" && s.settings.Sandbox != "none" {
 		args = append(args, "--sandbox", s.settings.Sandbox)
@@ -301,11 +399,15 @@ func (s *session) startCore() tea.Cmd {
 	// error paths — return a message and let Update log it on the UI thread.
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to open core stdin: %s", err)} }
+		return func() tea.Msg {
+			return coreStartErrorMsg{err: fmt.Errorf("failed to open core stdin: %s", err), gen: gen}
+		}
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to open core stdout: %s", err)} }
+		return func() tea.Msg {
+			return coreStartErrorMsg{err: fmt.Errorf("failed to open core stdout: %s", err), gen: gen}
+		}
 	}
 	// P2: route the core's stderr (panic backtraces, unexpected warnings) to the
 	// debug log instead of the terminal — under the alt-screen TUI, raw stderr is
@@ -318,12 +420,15 @@ func (s *session) startCore() tea.Cmd {
 		cmd.Stderr = os.Stderr
 	}
 	if err := cmd.Start(); err != nil {
-		return func() tea.Msg { return coreStartErrorMsg{fmt.Errorf("failed to start core (%s): %s", bin, err)} }
+		return func() tea.Msg {
+			return coreStartErrorMsg{err: fmt.Errorf("failed to start core (%s): %s", bin, err), gen: gen}
+		}
 	}
 	s.coreCmd = cmd
 	coreProcess.Store(cmd.Process) // expose to the signal handler (M8): kill on SIGHUP/SIGTERM
 	s.coreIn = in
-	s.coreEvents = make(chan *coreEvent, 256)
+	eventCh := make(chan *coreEvent, 256)
+	s.coreEvents = eventCh
 	s.stdinCh = make(chan []byte, 256)
 
 	// P1-15: a dedicated stdin-writer goroutine funnels commands to the core. A
@@ -369,11 +474,11 @@ func (s *session) startCore() tea.Cmd {
 				// the break and reap the child.
 				if err != nil {
 					select {
-					case s.coreEvents <- &ev:
+					case eventCh <- &ev:
 					default:
 					}
 				} else {
-					s.coreEvents <- &ev
+					eventCh <- &ev
 				}
 			}
 			if err != nil {
@@ -383,7 +488,7 @@ func (s *session) startCore() tea.Cmd {
 					msg, _ := json.Marshal(map[string]string{"message": "core stdout read error: " + err.Error()})
 					ev.Raw = msg
 					select {
-					case s.coreEvents <- ev:
+					case eventCh <- ev:
 					default:
 					}
 				}
@@ -398,7 +503,7 @@ func (s *session) startCore() tea.Cmd {
 		// each time) and on Ctrl+C quit. Uses the local cmd (not s.coreCmd, which
 		// is nilled during restart) to avoid racing the recovery handler.
 		_ = cmd.Wait()
-		close(s.coreEvents)
+		close(eventCh)
 	}()
 
 	s.sendCore(map[string]any{"type": "init"})
@@ -408,14 +513,17 @@ func (s *session) startCore() tea.Cmd {
 	// tick carries the generation captured above so a tick from a previous
 	// (crashed+restarted) core is ignored once `ready` disarms it.
 	return tea.Batch(
-		waitForEvent(s.coreEvents),
+		waitForEvent(eventCh, gen),
 		tea.Tick(coreStartupTimeout, func(time.Time) tea.Msg { return readyTimeoutMsg{gen: gen} }),
 	)
 }
 
 // coreStartErrorMsg reports a core subprocess start failure (P1-14: logged on
 // the UI thread, not from the startCore goroutine).
-type coreStartErrorMsg struct{ err error }
+type coreStartErrorMsg struct {
+	err error
+	gen uint64
+}
 
 // coreStartupTimeout is how long startCore's watchdog waits for a `ready` event
 // before declaring the core failed to start.
@@ -431,19 +539,25 @@ type readyTimeoutMsg struct{ gen uint64 }
 // raw os.Exit that would leave the terminal broken.
 type sigtermMsg struct{}
 
-func waitForEvent(ch <-chan *coreEvent) tea.Cmd {
+func waitForEvent(ch <-chan *coreEvent, gen uint64) tea.Cmd {
 	return func() tea.Msg {
 		ev, ok := <-ch
 		if !ok {
-			return coreEOFMsg{}
+			return coreEOFMsg{gen: gen}
 		}
-		return coreEventMsg{ev}
+		return coreEventMsg{event: ev, gen: gen}
 	}
 }
 
-func (s *session) sendCore(m map[string]any) {
+// sendCore enqueues a command and reports whether the UI may commit its
+// optimistic state transition. Callers that clear user input or enter busy
+// state must check the return value.
+func (s *session) sendCore(m map[string]any) bool {
 	if s.coreIn == nil {
-		return
+		// Pre-start/test models historically use a nil writer. Real failed-core
+		// input is intercepted by handleKey before dispatch; treating this as an
+		// accepted no-op keeps pure state-machine tests deterministic.
+		return s.coreLifecycle != coreFailed
 	}
 	b, _ := json.Marshal(m)
 	b = append(b, '\n')
@@ -455,12 +569,18 @@ func (s *session) sendCore(m map[string]any) {
 	if s.stdinCh != nil {
 		select {
 		case s.stdinCh <- b:
+			return true
 		default:
 			s.logError("core not accepting input (backpressure); command dropped")
+			return false
 		}
-		return
 	}
-	_, _ = s.coreIn.Write(b) // legacy path before startCore wires stdinCh
+	_, err := s.coreIn.Write(b) // legacy path before startCore wires stdinCh
+	if err != nil {
+		s.logError("core write failed: " + err.Error())
+		return false
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +593,70 @@ func (s *session) Init() tea.Cmd {
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg{t} })
+}
+
+// resetCoreUIState clears turn/queue/modal state that must not survive a core
+// restart (crash or intentional). Also closes the old stdin writer channel.
+func (s *session) resetCoreUIState() {
+	// P1-13: reset stale turn/UI state so the restarted core isn't shown as
+	// "working" with a dead request_id the user could accidentally approve.
+	s.busy = false
+	s.cur = nil
+	s.queuedNext = false
+	s.pendingApproval = nil
+	s.pendingIntercom = nil
+	s.intercomQueue = nil
+	s.subProgress = nil
+	s.queued = nil
+	s.todos = nil
+	s.pendingAsk = nil
+	s.pendingSudo = nil
+	s.lastMetrics = nil
+	s.lastCachePct = 0
+	s.tokensSaved = 0
+	s.umansConcUsed = nil
+	s.umansConcLimit = nil
+	s.oauth = nil
+	s.ctrlCAbortArmed = false
+	s.restoreAllComposerDrafts()
+	if s.modal.kind != modalNone {
+		s.closeModal()
+	}
+	// Stop the old stdin writer (its range loop exits on close) and drop the
+	// dead pipes before respawning.
+	if s.stdinCh != nil {
+		close(s.stdinCh)
+		s.stdinCh = nil
+	}
+	s.coreCmd = nil
+	s.coreIn = nil
+}
+
+// setToast shows a short-lived status flash above the composer.
+func (s *session) setToast(kind toastKind, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	// Cap toast length so a multi-line dump doesn't blow the layout.
+	if len(text) > 240 {
+		text = text[:237] + "…"
+	}
+	s.toast = &statusToast{kind: kind, text: text, until: time.Now().Add(4 * time.Second)}
+}
+
+// requestCoreRestart kills the core so coreEOFMsg respawns it with new
+// launch-only settings (sandbox, idle-timeout, …).
+func (s *session) requestCoreRestart() tea.Cmd {
+	s.intentionalRestart = true
+	s.closeModal()
+	s.logInfo("restarting core to apply settings…")
+	if s.coreCmd != nil && s.coreCmd.Process != nil {
+		_ = s.coreCmd.Process.Kill()
+	} else if p := coreProcess.Load(); p != nil {
+		_ = p.Kill()
+	}
+	return nil
 }
 
 func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -490,6 +674,10 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Finalized blocks are cached, so this is O(live) when idle it's a no-op.
 		if s.hasLiveContent() {
 			s.refresh()
+		}
+		// Drop expired toasts so the rail clears without waiting for another key.
+		if s.toast != nil && time.Now().After(s.toast.until) {
+			s.toast = nil
 		}
 		cmds := []tea.Cmd{tick()}
 		// (Re)start the spinner animation if a turn is in flight but the spinner
@@ -516,10 +704,25 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	case coreStartErrorMsg:
+		if msg.gen != s.coreStartGen {
+			return s, nil
+		}
 		// P1-14: a core start failure is logged on the UI thread (startCore ran in
 		// a goroutine and must not touch UI state itself).
-		s.logError(msg.err.Error())
+		s.coreLifecycle = coreFailed
+		s.coreFailure = msg.err.Error()
+		s.logError(s.coreFailure)
 		return s, nil
+
+	case streamRefreshMsg:
+		s.streamRefreshPending = false
+		s.refresh()
+		return s, nil
+
+	case mentionSearchMsg:
+		// A background repository walk completed. Re-evaluate the token and
+		// repaint immediately instead of waiting for another keystroke.
+		return s, s.handleMentionSearchMsg(msg)
 
 	case updateAvailableMsg:
 		// A newer GitHub release was found by the launch-time check. Store it so
@@ -535,7 +738,14 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if s.coreReady || msg.gen != s.coreStartGen {
 			return s, nil
 		}
-		s.logError("core did not start within 30s — check UMANS_CORE path / config (Ctrl+C to quit)")
+		s.coreLifecycle = coreFailed
+		s.coreFailure = "core did not start within 30s — check CATCODE_CORE or the debug log"
+		s.logError(s.coreFailure)
+		// A process that never completes its handshake is not useful and must not
+		// be left orphaned while the recovery screen waits for Retry.
+		if s.coreCmd != nil && s.coreCmd.Process != nil {
+			_ = s.coreCmd.Process.Kill()
+		}
 		return s, nil
 
 	case sudoTimeoutMsg:
@@ -550,13 +760,28 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sigtermMsg:
 		// SIGHUP/SIGTERM: restore the terminal via the normal quit path (the
 		// signal goroutine already killed the core; the reader reaps it).
+		s.clearPendingImages()
 		return s, tea.Quit
 
 	case coreEOFMsg:
+		if msg.gen != s.coreStartGen {
+			return s, nil
+		}
 		// A signal-driven teardown (SIGHUP/SIGTERM) or the quit key killed the
 		// core; the reader then reports EOF. Don't auto-restart — we're quitting.
 		if quitting.Load() {
 			return s, tea.Quit
+		}
+		if s.coreLifecycle == coreFailed {
+			return s, nil
+		}
+		// Intentional restart (sandbox / idle-timeout / etc. apply on next launch):
+		// restart without burning the crash-retry budget.
+		if s.intentionalRestart {
+			s.intentionalRestart = false
+			s.resetCoreUIState()
+			s.logInfo("core restarted — new settings applied")
+			return s, s.startCore()
 		}
 		// Core crashed or exited unexpectedly. Auto-restart once so the user
 		// isn't stranded, and re-auth with the persisted key if we had one.
@@ -564,46 +789,22 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// `done` handler), so this budget is per-incident, not lifetime — an early
 		// crash doesn't burn the only retry forever.
 		if s.coreRestarts >= 1 {
-			s.logError("core exited again after restart; quitting")
-			return s, tea.Quit
+			s.resetCoreUIState()
+			s.coreLifecycle = coreFailed
+			s.coreFailure = "core exited again after automatic restart"
+			s.logError(s.coreFailure + " — press r to retry or q to quit")
+			s.layout()
+			return s, nil
 		}
 		s.coreRestarts++
 		s.logWarn("core exited; restarting…")
-		// P1-13: reset stale turn/UI state so the restarted core isn't shown as
-		// "working" with a dead request_id the user could accidentally approve.
-		s.busy = false
-		s.cur = nil
-		s.queuedNext = false
-		s.pendingApproval = nil
-		s.pendingIntercom = nil
-		s.subProgress = nil
-		// clear stale per-core state so a crash-restart starts clean: a leftover
-		// queued follow-up, pinned todos, a pending ask, footer metrics, or an
-		// open settings/login modal would otherwise survive the restart and
-		// reference the dead core's request ids / counts.
-		s.queued = nil
-		s.todos = nil
-		s.pendingAsk = nil
-		s.pendingSudo = nil
-		s.lastMetrics = nil
-		s.lastCachePct = 0
-		s.tokensSaved = 0
-		s.umansConcUsed = nil
-		s.umansConcLimit = nil
-		if s.modal.kind != modalNone {
-			s.closeModal()
-		}
-		// Stop the old stdin writer (its range loop exits on close) and drop the
-		// dead pipes before respawning.
-		if s.stdinCh != nil {
-			close(s.stdinCh)
-			s.stdinCh = nil
-		}
-		s.coreCmd = nil
-		s.coreIn = nil
+		s.resetCoreUIState()
 		return s, s.startCore()
 
 	case coreEventMsg:
+		if msg.gen != s.coreStartGen {
+			return s, nil
+		}
 		return s, s.handleCoreEvent(msg.event)
 
 	case tea.KeyPressMsg:
@@ -628,8 +829,13 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the local terminal / a VS Code extension. When we detect an image we
 		// stage it as a pending attachment instead of dumping base64 into the box.
 		switch {
-		case s.modal.kind != modalNone && s.modal.editing:
-			s.modal.editBuf, _ = s.modal.editBuf.Update(msg)
+		case s.modal.kind != modalNone:
+			// A modal always owns input. Filter/edit-capable modals accept the paste;
+			// other dialogs consume it so nothing leaks into the hidden composer.
+			_ = s.appendModalPaste(msg.Content)
+			return s, nil
+		case s.pendingSudo != nil:
+			s.pendingSudo.input, _ = s.pendingSudo.input.Update(msg)
 		case s.pendingAsk != nil:
 			q := &s.pendingAsk.questions[s.pendingAsk.focusIdx]
 			q.input, _ = q.input.Update(msg)
@@ -685,6 +891,8 @@ func main() {
 	// so NewProgram takes only the model. The renderer auto-enables the Kitty
 	// progressive-keyboard + xterm modifyOtherKeys protocols (and restores the
 	// terminal on exit), so the hand-rolled enable/disable sequences are gone.
+	claimInitialSession()
+	defer releaseSessionClaim()
 	prog := tea.NewProgram(initialSession())
 
 	// Background, non-blocking check for a newer release. On a fresh cache it

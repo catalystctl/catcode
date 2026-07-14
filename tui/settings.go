@@ -9,6 +9,122 @@ import (
 	"time"
 )
 
+var claimedSessionPath string
+var claimedSessionLock string
+var reservedSessionPath string
+var reservedSessionLock string
+
+// claimSession prevents two TUI processes in one workspace from appending to
+// the same JSONL session. Day-old locks are treated as crash leftovers.
+func claimSession(path string) bool {
+	if !reserveSession(path) {
+		return false
+	}
+	return commitSessionClaim(path)
+}
+
+// reserveSession acquires the target without releasing the currently active
+// session. The old claim remains authoritative until core acknowledges that
+// it switched files, preventing a failed/backpressured handoff from exposing
+// the still-active JSONL to another process.
+func reserveSession(path string) bool {
+	if path == "" {
+		return false
+	}
+	if path == claimedSessionPath {
+		return true
+	}
+	if path == reservedSessionPath && reservedSessionLock != "" {
+		return true
+	}
+	lock := path + ".lock"
+	f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil && staleSessionLock(lock) {
+		_ = os.Remove(lock)
+		f, err = os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	}
+	if err != nil {
+		return false
+	}
+	_, _ = fmt.Fprintf(f, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+	_ = f.Close()
+	if reservedSessionLock != "" && reservedSessionLock != lock {
+		_ = os.Remove(reservedSessionLock)
+	}
+	reservedSessionPath, reservedSessionLock = path, lock
+	return true
+}
+
+func staleSessionLock(lock string) bool {
+	data, err := os.ReadFile(lock)
+	if err != nil {
+		return false
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(data), "pid=%d", &pid); err == nil && pid > 0 {
+		return !sessionLockProcessAlive(pid)
+	}
+	info, err := os.Stat(lock)
+	return err == nil && time.Since(info.ModTime()) > 24*time.Hour
+}
+
+func commitSessionClaim(path string) bool {
+	if path == claimedSessionPath {
+		return true
+	}
+	if path != reservedSessionPath || reservedSessionLock == "" {
+		return false
+	}
+	if claimedSessionLock != "" && claimedSessionLock != reservedSessionLock {
+		_ = os.Remove(claimedSessionLock)
+	}
+	claimedSessionPath, claimedSessionLock = reservedSessionPath, reservedSessionLock
+	reservedSessionPath, reservedSessionLock = "", ""
+	return true
+}
+
+func cancelSessionReservation(path string) {
+	if path != "" && path != reservedSessionPath {
+		return
+	}
+	if reservedSessionLock != "" {
+		_ = os.Remove(reservedSessionLock)
+	}
+	reservedSessionPath, reservedSessionLock = "", ""
+}
+
+func sessionLockedByAnotherProcess(path string) bool {
+	if path == "" || path == claimedSessionPath || path == reservedSessionPath {
+		return false
+	}
+	lock := path + ".lock"
+	if staleSessionLock(lock) {
+		_ = os.Remove(lock)
+		return false
+	}
+	_, err := os.Stat(lock)
+	return err == nil
+}
+
+func claimInitialSession() string {
+	path := sessionPath()
+	if claimSession(path) {
+		return path
+	}
+	path = filepath.Join(sessionsDir(), newSessionFilename())
+	_ = os.MkdirAll(filepath.Dir(path), 0700)
+	_ = claimSession(path)
+	return path
+}
+
+func releaseSessionClaim() {
+	if claimedSessionLock != "" {
+		_ = os.Remove(claimedSessionLock)
+	}
+	claimedSessionLock, claimedSessionPath = "", ""
+	cancelSessionReservation("")
+}
+
 // ---------------------------------------------------------------------------
 // Settings persistence (TUI-owned prefs)
 //
@@ -20,8 +136,10 @@ import (
 
 type settingsStore struct {
 	path          string
-	APIKey        string `json:"api_key,omitempty"`
-	SelectedModel string `json:"model,omitempty"`
+	onSaveError   func(error) `json:"-"`
+	loadError     error       `json:"-"`
+	APIKey        string      `json:"api_key,omitempty"`
+	SelectedModel string      `json:"model,omitempty"`
 	// Approval is intentionally NOT omitempty — an empty value must not drop the
 	// key on save (that looked like a "settings reset" after restart).
 	Approval        string `json:"approval"`
@@ -31,9 +149,13 @@ type settingsStore struct {
 	// Production knobs (item 3/7): passed to the core on launch.
 	Sandbox          string `json:"sandbox,omitempty"` // none | firejail | seatbelt
 	NoNetwork        bool   `json:"no_network,omitempty"`
-	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds
+	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds (also written as idle_timeout_secs for core)
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
 	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
+	// Runtime knobs: also applied live via set_config; persisted so restart keeps them.
+	// JSON names match core apply_json so the core reads them from settings.json too.
+	BashTimeoutSecs int  `json:"bash_timeout_secs,omitempty"`
+	AutoCompact     bool `json:"auto_compact"` // not omitempty — default is true; false must survive round-trip
 
 	// Custom providers (openai/anthropic endpoints). ActiveProvider is the
 	// provider name selected in the TUI; the core re-applies it on launch via
@@ -47,7 +169,8 @@ type settingsStore struct {
 	// string tea.KeyPressMsg.String() produces). Only user overrides are stored; the
 	// full effective map (defaults + overrides) is computed at startup via
 	// effectiveKeybinds(). See keybinds.go.
-	Keybinds map[string]string `json:"keybinds,omitempty"`
+	Keybinds       map[string]string `json:"keybinds,omitempty"`
+	RecentCommands []string          `json:"recent_commands,omitempty"`
 }
 
 func configDir() string {
@@ -145,16 +268,37 @@ func fnv64a(s string) uint64 {
 // loadSettings reads the persisted prefs, returning a zero-value store on any
 // error (missing file is not an error — first run).
 func loadSettings() *settingsStore {
-	s := &settingsStore{path: settingsPath(), ReasoningEffort: "high", Approval: "destructive"}
+	return loadSettingsFrom(settingsPath())
+}
+
+// loadSettingsFrom is the testable core of loadSettings (path-injectable).
+func loadSettingsFrom(path string) *settingsStore {
+	s := &settingsStore{
+		path:            path,
+		ReasoningEffort: "high",
+		Approval:        "destructive",
+		Sandbox:         "none",
+		IdleTimeout:     120,
+		BashTimeoutSecs: 30,
+		AutoCompact:     true,
+	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			s.loadError = fmt.Errorf("could not read settings: %w", err)
+		}
 		return s
 	}
 	// Keep defaults for fields absent from the file.
 	var onDisk settingsStore
 	if err := json.Unmarshal(data, &onDisk); err != nil {
+		s.loadError = fmt.Errorf("settings file is invalid JSON; defaults are active: %w", err)
 		return s
 	}
+	// Raw map for keys whose Go zero-value collides with a non-zero default
+	// (auto_compact defaults true; missing must not become false).
+	var raw map[string]any
+	_ = json.Unmarshal(data, &raw)
 	if onDisk.APIKey != "" {
 		s.APIKey = onDisk.APIKey
 	}
@@ -173,17 +317,22 @@ func loadSettings() *settingsStore {
 	s.ThinkExpanded = onDisk.ThinkExpanded
 	if onDisk.Sandbox != "" {
 		s.Sandbox = onDisk.Sandbox
-	} else {
-		s.Sandbox = "none"
 	}
 	s.NoNetwork = onDisk.NoNetwork
 	if onDisk.IdleTimeout > 0 {
 		s.IdleTimeout = onDisk.IdleTimeout
-	} else {
-		s.IdleTimeout = 120
+	} else if n, ok := jsonNumber(raw["idle_timeout_secs"]); ok && n > 0 {
+		// Core-compatible alias written by save(); accept on load for round-trip.
+		s.IdleTimeout = n
 	}
 	s.MaxSessionTokens = onDisk.MaxSessionTokens
 	s.MouseWheel = onDisk.MouseWheel
+	if onDisk.BashTimeoutSecs > 0 {
+		s.BashTimeoutSecs = onDisk.BashTimeoutSecs
+	}
+	if v, ok := raw["auto_compact"].(bool); ok {
+		s.AutoCompact = v
+	}
 	if onDisk.ActiveProvider != "" {
 		s.ActiveProvider = onDisk.ActiveProvider
 	}
@@ -203,7 +352,28 @@ func loadSettings() *settingsStore {
 			s.Keybinds[k] = v // keep empty (disabled) values
 		}
 	}
+	if len(onDisk.RecentCommands) > 0 {
+		s.RecentCommands = append([]string(nil), onDisk.RecentCommands...)
+	}
 	return s
+}
+
+// jsonNumber coerces a JSON number (float64 from encoding/json) or int-like
+// value into an int. Used when reading aliased keys from the raw settings map.
+func jsonNumber(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return int(i), err == nil
+	default:
+		return 0, false
+	}
 }
 
 // normalizeApproval returns a valid approval mode, defaulting blank/unknown to
@@ -222,7 +392,12 @@ func normalizeApproval(mode string) string {
 // Uses a read-merge-write against the on-disk JSON object so we never drop
 // keys that this process doesn't know about (forward-compat) and never blank
 // out approval if memory somehow lost it mid-session.
-func (s *settingsStore) save() error {
+func (s *settingsStore) save() (err error) {
+	defer func() {
+		if err != nil && s.onSaveError != nil {
+			s.onSaveError(err)
+		}
+	}()
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -244,19 +419,34 @@ func (s *settingsStore) save() error {
 	}
 	s.Approval = normalizeApproval(s.Approval)
 
-	cur, err := json.Marshal(s)
-	if err != nil {
-		return err
-	}
-	var overlay map[string]any
-	if err := json.Unmarshal(cur, &overlay); err != nil {
-		return err
+	// Do not build the overlay by marshaling settingsStore: omitempty would
+	// leave the old on-disk value behind precisely when a user clears a string,
+	// disables a bool, resets a number, logs out, or removes the last map entry.
+	// Keep this list explicit so every known key has replace (not merge) semantics
+	// while unknown/newer-core keys above remain untouched.
+	overlay := map[string]any{
+		"api_key": s.APIKey, "model": s.SelectedModel,
+		"approval": s.Approval, "reasoning_effort": s.ReasoningEffort,
+		"theme": s.Theme, "think_expanded": s.ThinkExpanded,
+		"sandbox": s.Sandbox, "no_network": s.NoNetwork,
+		"idle_timeout": s.IdleTimeout, "max_session_tokens": s.MaxSessionTokens,
+		"mouse_wheel": s.MouseWheel, "bash_timeout_secs": s.BashTimeoutSecs,
+		"auto_compact": s.AutoCompact, "active_provider": s.ActiveProvider,
+		"provider_keys":   nonNilStringMap(s.ProviderKeys),
+		"keybinds":        nonNilStringMap(s.Keybinds),
+		"recent_commands": append([]string(nil), s.RecentCommands...),
 	}
 	for k, v := range overlay {
 		merged[k] = v
 	}
-	// Always persist approval explicitly (overlay may omit zero values for other fields).
+	// Always persist approval / auto_compact explicitly (bool defaults + omitempty
+	// must not drop a deliberate false, and blank approval must not wipe disk).
 	merged["approval"] = s.Approval
+	merged["auto_compact"] = s.AutoCompact
+	// Core apply_json reads idle_timeout_secs; keep the TUI's idle_timeout too.
+	merged["idle_timeout"] = s.IdleTimeout
+	merged["idle_timeout_secs"] = s.IdleTimeout
+	merged["bash_timeout_secs"] = s.BashTimeoutSecs
 
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
@@ -295,4 +485,11 @@ func (s *settingsStore) save() error {
 		return err
 	}
 	return nil
+}
+
+func nonNilStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
 }

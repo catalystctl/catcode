@@ -51,6 +51,10 @@ var keybindDefs = []keybindDef{
 	{"scroll_line_down", "Scrolling", "Scroll down one line", "ctrl+down"},
 	{"scroll_top", "Scrolling", "Jump to top", "ctrl+home"},
 	{"scroll_bottom", "Scrolling", "Jump to bottom", "ctrl+end"},
+	{"transcript_prev", "Scrolling", "Focus previous transcript block", "alt+up"},
+	{"transcript_next", "Scrolling", "Focus next transcript block", "alt+down"},
+	{"transcript_find", "Scrolling", "Search transcript", "ctrl+f"},
+	{"copy_focused", "Scrolling", "Copy focused transcript block", "ctrl+y"},
 
 	// Navigation — modals, welcome screen, @-mention flyout.
 	{"nav_up", "Navigation", "Move selection up", "up"},
@@ -220,6 +224,20 @@ func keybindLabel(key string) string {
 	return strings.Join(parts, "+")
 }
 
+// keyHint returns the display form of the effective binding for action. An
+// unbound action returns "" so live help can omit controls that do not work.
+// Runtime banners and composer hints should use this instead of hard-coded
+// key names so /keybinds never makes the UI lie to the user.
+func (s *session) keyHint(action string) string {
+	if s == nil || s.keybinds == nil {
+		return ""
+	}
+	if s.keybinds[action] == "" {
+		return ""
+	}
+	return keybindLabel(s.keybinds[action])
+}
+
 // ---------------------------------------------------------------------------
 // /keybinds modal
 //
@@ -312,6 +330,23 @@ func keybindsInGroup(idx int) []string {
 		}
 	}
 	return out
+}
+
+func (s *session) keybindConflicts(idx int) []string {
+	if idx < 0 || idx >= len(keybindDefs) {
+		return nil
+	}
+	key := s.keybinds[keybindDefs[idx].Action]
+	if key == "" {
+		return nil
+	}
+	var conflicts []string
+	for _, action := range keybindsInGroup(idx) {
+		if s.keybinds[action] == key {
+			conflicts = append(conflicts, action)
+		}
+	}
+	return conflicts
 }
 
 // applyKeybind assigns key to the action at def index idx, updates the live
@@ -446,15 +481,16 @@ func (s *session) renderKeybindsModal() string {
 			marker = accentStyle.Render("▸ ")
 		}
 		key := s.keybinds[d.Action]
-		if key == "" {
-			key = d.Default
-		}
 		keyLabel := keybindLabel(key)
 		descW := rowW - 2 - 22 - 16
 		if descW < 0 {
 			descW = 0
 		}
-		desc := truncateFit(d.Desc, descW)
+		descText := d.Desc
+		if conflicts := s.keybindConflicts(i); len(conflicts) > 0 {
+			descText += " · conflicts: " + strings.Join(conflicts, ", ")
+		}
+		desc := truncateFit(descText, descW)
 		var rowStr string
 		if s.modal.editing && i == s.modal.cursor {
 			capture := "press a key…"
@@ -515,6 +551,9 @@ func (s *session) renderKeybindsModal() string {
 	} else {
 		footer := fmt.Sprintf("  %s/%s navigate · %s rebind · ⌫ reset · del clear · esc close",
 			navKey, keybindLabel(s.keybinds["nav_down"]), selectKey)
+		if conflicts := s.keybindConflicts(s.modal.cursor); len(conflicts) > 0 {
+			footer = "  ⚠ same-group conflict: " + strings.Join(conflicts, ", ") + " · rebind or clear one"
+		}
 		lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	}
 	bodyStr := strings.Join(lines, "\n")
@@ -530,6 +569,9 @@ func runeLen(s string) int {
 // keymap so /help always reflects the user's current bindings.
 func (s *session) helpKeybindLines() []string {
 	key := func(action string) string {
+		if s.keybinds[action] == "" {
+			return "Disabled"
+		}
 		return keybindLabel(s.keybinds[action])
 	}
 	return []string{

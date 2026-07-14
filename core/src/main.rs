@@ -2332,11 +2332,24 @@ async fn main() {
                 if let Some(p) = state.cfg.read().await.session_file.as_ref() {
                     session::rewrite(p, &conv);
                 }
+                // Replay remaining history so the TUI rebuilds the transcript
+                // (trimmed last turn only) instead of wiping the whole view.
+                let visible: Vec<Value> = conv
+                    .iter()
+                    .filter(|m| !m.is_system())
+                    .map(Value::from)
+                    .collect();
+                let est = estimate_messages_tokens(&conv);
                 drop(conv);
                 // The dropped turn invalidates the real baseline's length anchor.
                 state.invalidate_real_token_baseline().await;
+                *state.estimated_tokens.lock().await = est;
                 clear_work_state(&state).await;
-                emit(&Event::new("reset")); // TUI clears blocks; core keeps the trimmed conv
+                emit(
+                    &Event::new("history")
+                        .with("messages", json!(visible))
+                        .with("tokens_in", json!(est)),
+                );
             }
             Command::Compact { instructions } => {
                 // Force compaction now, then emit a compacted event. Uses the
@@ -2461,6 +2474,7 @@ async fn main() {
                         }
                         let name = e.file_name().to_string_lossy().to_string();
                         let info = session::describe(&path);
+                        let meta = session::read_meta(&path);
                         let mtime = e
                             .metadata()
                             .ok()
@@ -2472,8 +2486,9 @@ async fn main() {
                             .as_ref()
                             .map(|n| *n == e.file_name())
                             .unwrap_or(false);
-                        let title = info
+                        let title = meta
                             .title
+                            .or(info.title)
                             .unwrap_or_else(|| "(no messages yet)".to_string());
                         entries.push(json!({
                             "name": name,
@@ -2482,15 +2497,22 @@ async fn main() {
                             "messages": info.messages,
                             "mtime": mtime,
                             "current": current,
+                            "pinned": meta.pinned,
                         }));
                     }
                 }
                 // Most recently modified first.
                 entries.sort_by(|a, b| {
-                    b["mtime"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        .cmp(&a["mtime"].as_u64().unwrap_or(0))
+                    b["pinned"]
+                        .as_bool()
+                        .unwrap_or(false)
+                        .cmp(&a["pinned"].as_bool().unwrap_or(false))
+                        .then_with(|| {
+                            b["mtime"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                .cmp(&a["mtime"].as_u64().unwrap_or(0))
+                        })
                 });
                 let files: Vec<String> = entries
                     .iter()
@@ -2503,7 +2525,6 @@ async fn main() {
                 );
             }
             Command::LoadSession { path } => {
-                cancel_in_flight_turn(&state).await;
                 let mut p = std::path::PathBuf::from(&path);
                 // Resolve relative paths against the sessions dir so the picker
                 // (which may send a bare filename) works.
@@ -2522,10 +2543,15 @@ async fn main() {
                 let loaded = match session::load(&p) {
                     Ok(v) => v,
                     Err(e) => {
-                        emit(&Event::new("error").with("message", json!(e)));
+                        emit(
+                            &Event::new("session_change_failed")
+                                .with("path", json!(path))
+                                .with("message", json!(e)),
+                        );
                         continue;
                     }
                 };
+                cancel_in_flight_turn(&state).await;
                 *state.conversation.lock().await = loaded.clone();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
@@ -2534,7 +2560,12 @@ async fn main() {
                 // its real totals, not the prior session's.
                 restore_stats(&state, &p).await;
                 // Point the session_file at the loaded path so future appends go there.
-                state.cfg.write().await.session_file = Some(p);
+                state.cfg.write().await.session_file = Some(p.clone());
+                emit(
+                    &Event::new("session_changed")
+                        .with("path", json!(p.display().to_string()))
+                        .with("new", json!(false)),
+                );
                 emit(&Event::new("reset"));
                 // Replay the loaded transcript so the TUI shows prior turns
                 // instead of an empty view after switching/resuming a session.
@@ -2558,6 +2589,97 @@ async fn main() {
                     "message",
                     json!(format!("loaded {} messages from {}", loaded.len(), path)),
                 ));
+            }
+            Command::RenameSession { path, title } => {
+                let mut p = std::path::PathBuf::from(&path);
+                if !p.is_absolute() {
+                    if let Some(dir) = state
+                        .cfg
+                        .read()
+                        .await
+                        .session_file
+                        .as_ref()
+                        .and_then(|x| x.parent())
+                    {
+                        p = dir.join(&p);
+                    }
+                }
+                let title = title.trim();
+                if title.is_empty() {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!("session title cannot be empty")),
+                    );
+                    continue;
+                }
+                let title = title.chars().take(120).collect::<String>();
+                match session::update_meta(&p, |meta| meta.title = Some(title.clone())) {
+                    Ok(_) => emit(
+                        &Event::new("session_renamed")
+                            .with("path", json!(path))
+                            .with("title", json!(title)),
+                    ),
+                    Err(e) => emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("rename session failed: {e}"))),
+                    ),
+                }
+            }
+            Command::PinSession { path, pinned } => {
+                let mut p = std::path::PathBuf::from(&path);
+                if !p.is_absolute() {
+                    if let Some(dir) = state
+                        .cfg
+                        .read()
+                        .await
+                        .session_file
+                        .as_ref()
+                        .and_then(|x| x.parent())
+                    {
+                        p = dir.join(&p);
+                    }
+                }
+                match session::update_meta(&p, |meta| meta.pinned = pinned) {
+                    Ok(_) => emit(
+                        &Event::new("session_pinned")
+                            .with("path", json!(path))
+                            .with("pinned", json!(pinned)),
+                    ),
+                    Err(e) => emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("pin session failed: {e}"))),
+                    ),
+                }
+            }
+            Command::DeleteSession { path } => {
+                let mut p = std::path::PathBuf::from(&path);
+                if !p.is_absolute() {
+                    if let Some(dir) = state
+                        .cfg
+                        .read()
+                        .await
+                        .session_file
+                        .as_ref()
+                        .and_then(|x| x.parent())
+                    {
+                        p = dir.join(&p);
+                    }
+                }
+                let current = state.cfg.read().await.session_file.clone();
+                if current.as_ref() == Some(&p) {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!("cannot delete the active session; start or load another first"),
+                    ));
+                    continue;
+                }
+                match session::delete_with_sidecars(&p) {
+                    Ok(()) => emit(&Event::new("session_deleted").with("path", json!(path))),
+                    Err(e) => emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("delete session failed: {e}"))),
+                    ),
+                }
             }
             Command::NewSession { path } => {
                 // Stop any in-flight turn so it can't keep writing into the new session.
@@ -2612,6 +2734,11 @@ async fn main() {
                 state.logger.log(
                     "new_session",
                     json!({ "path": new_path.display().to_string() }),
+                );
+                emit(
+                    &Event::new("session_changed")
+                        .with("path", json!(new_path.display().to_string()))
+                        .with("new", json!(true)),
                 );
                 emit(&Event::new("reset"));
                 emit(&Event::new("info").with(

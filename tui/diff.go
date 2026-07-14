@@ -22,8 +22,12 @@ import (
 //
 // Lines are wrapped to the panel width on their RAW text before styling so the
 // per-line style's ANSI escapes can't corrupt the rune-counted wrap.
-func renderDiffPanel(diff string, expanded bool, w int) string {
+func renderDiffPanel(diff string, expanded bool, w int, toggleHint ...string) string {
 	const headLines = 3
+	toggle := "ctrl+o"
+	if len(toggleHint) > 0 && strings.TrimSpace(toggleHint[0]) != "" {
+		toggle = toggleHint[0]
+	}
 	diff = strings.TrimSpace(diff)
 	if diff == "" {
 		return ""
@@ -79,12 +83,12 @@ func renderDiffPanel(diff string, expanded bool, w int) string {
 		more := len(rawLines) - headLines
 		panel := panelBody(rawLines[:headLines])
 		hint := dimStyle.Italic(true).Render(
-			fmt.Sprintf("│ … +%d line%s  (ctrl+o expand)", more, pluralS(more)))
+			fmt.Sprintf("│ … +%d line%s  (%s expand)", more, pluralS(more), toggle))
 		return panel + "\n" + hint
 	}
 	panel := panelBody(rawLines)
 	if len(rawLines) > headLines && expanded {
-		panel += "\n" + dimStyle.Italic(true).Render("│ (ctrl+o collapse)")
+		panel += "\n" + dimStyle.Italic(true).Render("│ ("+toggle+" collapse)")
 	}
 	return panel
 }

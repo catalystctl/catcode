@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,8 +26,8 @@ func TestApprovalCommandOpensPicker(t *testing.T) {
 			t.Fatalf("%s: approvalItems len=%d, want 3", cmd, len(items))
 		}
 		for i, mode := range []string{"never", "destructive", "always"} {
-			if items[i].label != mode {
-				t.Errorf("%s: items[%d]=%q, want %q", cmd, i, items[i].label, mode)
+			if items[i].meta != mode {
+				t.Errorf("%s: items[%d] mode=%q, want %q", cmd, i, items[i].meta, mode)
 			}
 		}
 		body := stripANSI(s.renderModalBody())
@@ -34,7 +35,7 @@ func TestApprovalCommandOpensPicker(t *testing.T) {
 			t.Errorf("%s: modal body missing title:\n%s", cmd, body)
 		}
 		// Selected mode should appear (cursor starts on current = destructive).
-		if !strings.Contains(body, "destructive") && !strings.Contains(body, "destru") {
+		if !strings.Contains(body, "Ask for destructive tools") {
 			t.Errorf("%s: modal body missing current mode:\n%s", cmd, body)
 		}
 	}
@@ -51,6 +52,36 @@ func TestApprovalCommandWithArgSetsDirectly(t *testing.T) {
 	}
 	if s.settings.Approval != "always" {
 		t.Errorf("settings.Approval = %q, want always", s.settings.Approval)
+	}
+}
+
+// TestApprovalEscalationDoesNotResetMode: core's "<kind>:always" event must not
+// flip the footer/settings to "destructive" (normalizeApproval's fallback).
+func TestApprovalEscalationDoesNotResetMode(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
+	s.applyApprovalMode("never")
+	if s.approvalMode() != "never" {
+		t.Fatalf("precondition: approvalMode=%q", s.approvalMode())
+	}
+
+	raw, _ := json.Marshal(map[string]any{
+		"type": "approval_changed",
+		"mode": "destructive:always",
+	})
+	s.handleCoreEvent(&coreEvent{Type: "approval_changed", Raw: raw})
+
+	if s.approvalMode() != "never" {
+		t.Fatalf("after escalation: approvalMode=%q, want never", s.approvalMode())
+	}
+	if s.settings.Approval != "never" {
+		t.Fatalf("settings.Approval=%q, want never", s.settings.Approval)
+	}
+	// Stale escalation string must not leak into the display path.
+	s.approvalModeStr = "destructive:always"
+	if s.approvalMode() != "never" {
+		t.Fatalf("approvalMode with leaked escalation=%q, want never (from settings)", s.approvalMode())
 	}
 }
 
@@ -151,10 +182,16 @@ func TestToggleCommandsWithArgs(t *testing.T) {
 	if s.coreAutoCompact {
 		t.Error("auto-compact off should set coreAutoCompact=false")
 	}
+	if s.settings.AutoCompact {
+		t.Error("auto-compact off should persist AutoCompact=false")
+	}
 
 	s.handleUserLine("/bash-timeout 90")
 	if s.coreBashTimeout != 90 {
 		t.Errorf("bash timeout = %d, want 90", s.coreBashTimeout)
+	}
+	if s.settings.BashTimeoutSecs != 90 {
+		t.Errorf("settings.BashTimeoutSecs = %d, want 90", s.settings.BashTimeoutSecs)
 	}
 }
 

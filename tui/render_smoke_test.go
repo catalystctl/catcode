@@ -394,8 +394,8 @@ func TestActiveTasks(t *testing.T) {
 	if !strings.HasPrefix(lines[0], "╭") || !strings.HasPrefix(lines[2], "╰") {
 		t.Errorf("input box missing rounded borders:\n%s", box)
 	}
-	if !strings.Contains(lines[1], "Chat with the agent") {
-		t.Errorf("input box missing placeholder:\n%s", box)
+	if !strings.Contains(lines[1], "Enter queues") {
+		t.Errorf("busy input box missing in-flight placeholder:\n%s", box)
 	}
 	t.Logf("INPUTBOX:\n%s", box)
 }

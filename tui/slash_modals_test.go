@@ -59,8 +59,8 @@ func TestBareForgetAndMemoryRequestPicker(t *testing.T) {
 		if !s.pendingMemoryPicker {
 			t.Errorf("%s: expected pendingMemoryPicker", cmd)
 		}
-		if s.modal.kind != modalNone {
-			t.Errorf("%s: should wait for list_memory before opening modal; kind=%v", cmd, s.modal.kind)
+		if s.modal.kind != modalMemory || !s.modal.loading {
+			t.Errorf("%s: should open a durable loading modal; kind=%v loading=%v", cmd, s.modal.kind, s.modal.loading)
 		}
 	}
 }
@@ -99,16 +99,16 @@ func TestMemoryPickerEnterForgets(t *testing.T) {
 	// Select first row.
 	s.modal.cursor = 0
 	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if s.modal.kind != modalConfirm || len(s.memoryList) != 2 {
+		t.Fatalf("forget must require confirmation; kind=%v list=%v", s.modal.kind, s.memoryList)
+	}
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyDown}) // Cancel is the safe default.
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if len(s.memoryList) != 1 || s.memoryList[0].ID != "def" {
 		t.Fatalf("after forget: memoryList=%v", s.memoryList)
 	}
-	if s.modal.kind != modalMemory {
-		t.Fatalf("picker should stay open with remaining items; kind=%v", s.modal.kind)
-	}
-	// Forget the last one → modal closes.
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if s.modal.kind != modalNone {
-		t.Fatalf("empty list should close modal; kind=%v", s.modal.kind)
+		t.Fatalf("confirmation should close after action; kind=%v", s.modal.kind)
 	}
 }
 
@@ -275,6 +275,11 @@ func TestPluginRemoveSelectUninstalls(t *testing.T) {
 	if s.modal.kind != modalPlugins {
 		t.Fatalf("kind=%v", s.modal.kind)
 	}
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if s.modal.kind != modalConfirm || len(sPluginStore) != 1 {
+		t.Fatalf("uninstall must require confirmation; kind=%v len=%d", s.modal.kind, len(sPluginStore))
+	}
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if len(sPluginStore) != 0 {
 		t.Fatalf("plugin should be dropped from store; len=%d", len(sPluginStore))

@@ -179,7 +179,6 @@ func (s *session) sendAskReply(a *askPrompt, answers any) {
 		"answers":    answers,
 	})
 	s.pendingAsk = nil
-	s.input.Reset()
 	s.input.Focus()
 	s.layout()
 }
@@ -282,16 +281,22 @@ func (s *session) renderAskOverlay(base string) string {
 func (s *session) renderAskBox() string {
 	a := s.pendingAsk
 	boxW := s.width - 8
+	if s.width < 44 {
+		boxW = s.width
+	}
 	if boxW > 74 {
 		boxW = 74
 	}
-	if boxW < 36 {
-		boxW = 36
+	if boxW < 1 {
+		boxW = 1
 	}
-	inner := boxW - 4 // border + padding
+	inner := boxW - 6 // border(2) + horizontal padding(4)
+	if inner < 1 {
+		inner = 1
+	}
 
 	var b strings.Builder
-	title := accentStyle.Render("❓ Answer the questions")
+	title := accentStyle.Render(truncate("❓ Answer the questions", inner))
 	b.WriteString(title + "\n\n")
 
 	for i, q := range a.questions {
@@ -306,7 +311,7 @@ func (s *session) renderAskBox() string {
 		if q.required {
 			req = mutedStyle.Render(" *")
 		}
-		b.WriteString(fmt.Sprintf("%s %s%s\n", accentStyle.Render(marker), promptStyle.Render(truncate(q.prompt, inner-4)), req))
+		b.WriteString(fmt.Sprintf("%s %s%s\n", accentStyle.Render(marker), promptStyle.Render(truncate(q.prompt, max(1, inner-4))), req))
 
 		if q.qtype == "select" && !q.isCustom() {
 			// Horizontal cycle: ◀  Option  ▶  [i/n]
@@ -321,7 +326,7 @@ func (s *session) renderAskBox() string {
 			if q.isCustom() {
 				pos = n
 			}
-			opt := accentStyle.Render("◀") + "  " + boldBaseStyle.Render(truncate(cur, inner-16)) + "  " + accentStyle.Render("▶")
+			opt := accentStyle.Render("◀") + "  " + boldBaseStyle.Render(truncate(cur, max(1, inner-16))) + "  " + accentStyle.Render("▶")
 			cnt := mutedStyle.Render(fmt.Sprintf("[%d/%d]", pos, n))
 			line := "    " + opt
 			pad := inner - lipgloss.Width(opt) - lipgloss.Width(cnt) - 4
@@ -334,10 +339,12 @@ func (s *session) renderAskBox() string {
 			if q.allowCustom {
 				hint = mutedStyle.Render("←/→ · cycle to “Custom…” to type your own")
 			}
-			b.WriteString("    " + hint + "\n")
+			if inner >= 28 {
+				b.WriteString("    " + hint + "\n")
+			}
 		} else {
 			// Text input (text question, or select-in-custom-mode).
-			q.input.SetWidth(inner - 8)
+			q.input.SetWidth(max(1, inner-8))
 			if q.isCustom() {
 				b.WriteString("    " + mutedStyle.Render("Custom answer:") + "\n")
 			}
@@ -350,19 +357,45 @@ func (s *session) renderAskBox() string {
 	}
 
 	b.WriteString("\n")
-	footer := mutedStyle.Render("[Tab/↑↓] navigate · [Enter] submit · [Esc] skip")
+	sendKey, closeKey := s.keyHint("send"), s.keyHint("close")
+	if sendKey == "" {
+		sendKey = "unbound"
+	}
+	if closeKey == "" {
+		closeKey = "unbound"
+	}
+	footerText := fmt.Sprintf("[Tab/↑↓] navigate · [%s] submit · [%s] skip", sendKey, closeKey)
 	if a.focusIdx < len(a.questions) {
 		q := a.questions[a.focusIdx]
 		if q.qtype == "select" && !q.isCustom() {
-			footer = mutedStyle.Render("[←/→] choose · [Tab/↑↓] navigate · [Enter] submit · [Esc] skip")
+			footerText = fmt.Sprintf("[←/→] choose · [Tab/↑↓] navigate · [%s] submit · [%s] skip", sendKey, closeKey)
 		}
 	}
+	footer := mutedStyle.Render(truncate(footerText, inner))
 	b.WriteString(footer)
 	if a.errMsg != "" {
-		b.WriteString("\n" + errStyle.Render("✗ "+a.errMsg))
+		b.WriteString("\n" + errStyle.Render(truncate("✗ "+a.errMsg, inner)))
 	}
 
-	body := b.String()
+	bodyLines := strings.Split(b.String(), "\n")
+	focusLine := 0
+	for i, line := range bodyLines {
+		if strings.Contains(line, "❯") {
+			focusLine = i
+		}
+	}
+	// Rounded border + vertical padding consume four rows. Preserve title and
+	// footer while centering the active question in the remaining viewport.
+	tail := 2
+	if a.errMsg != "" {
+		tail = 3
+	}
+	bodyLines = focusWindow(bodyLines, focusLine, s.height-4, 2, tail)
+	clip := lipgloss.NewStyle().MaxWidth(inner)
+	for i := range bodyLines {
+		bodyLines[i] = clip.Render(bodyLines[i])
+	}
+	body := strings.Join(bodyLines, "\n")
 	return lipgloss.NewStyle().
 		Width(boxW).
 		Padding(1, 2).

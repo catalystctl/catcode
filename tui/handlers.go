@@ -4,8 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -26,7 +26,7 @@ import (
 func (s *session) accumulateSaved(ev *coreEvent) {
 	before, err1 := strconv.ParseUint(ev.get("before_tokens"), 10, 64)
 	after, err2 := strconv.ParseUint(ev.get("after_tokens"), 10, 64)
-	if err1 != nil || err2 != nil || before > after {
+	if err1 != nil || err2 != nil || before <= after {
 		return
 	}
 	s.tokensSaved += before - after
@@ -55,6 +55,7 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 	}
 	if m.Phase == "idle" || m.ID == "" {
 		s.goalState = nil
+		s.goalPlan = nil
 		return
 	}
 	snap := &goalStateSnap{
@@ -95,6 +96,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	switch ev.Type {
 	case "ready":
 		s.coreReady = true // disarm the startup watchdog
+		s.coreLifecycle = coreReady
+		s.coreFailure = ""
 		var models []modelInfo
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
@@ -147,20 +150,41 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
+		// Bind a pre-provider-era global key to the provider reported at startup.
+		// This must happen before any later switch can change activeProvider.
+		s.migrateLegacyProviderKey(s.activeProvider)
 		s.applyModels(models)
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
-		// Settings.json is the source of truth for approval. Re-apply after ready
-		// so a stale core default / config-file layer can't silently diverge from
-		// what the TUI persisted (and so crash-restarts keep the user's choice).
+		// Settings.json is the source of truth for approval + runtime knobs.
+		// Re-apply after ready so a stale core default / config-file layer can't
+		// silently diverge from what the TUI persisted (and so crash-restarts
+		// keep the user's choice).
 		desired := normalizeApproval(s.settings.Approval)
 		s.settings.Approval = desired
 		if s.approvalModeStr != desired {
 			s.sendCore(map[string]any{"type": "set_approval", "mode": desired})
 		}
 		s.approvalModeStr = desired
+		if s.settings.BashTimeoutSecs > 0 && s.coreBashTimeout != s.settings.BashTimeoutSecs {
+			s.coreBashTimeout = s.settings.BashTimeoutSecs
+			s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": s.settings.BashTimeoutSecs})
+		} else if s.settings.BashTimeoutSecs > 0 {
+			s.coreBashTimeout = s.settings.BashTimeoutSecs
+		}
+		if s.coreAutoCompact != s.settings.AutoCompact {
+			s.coreAutoCompact = s.settings.AutoCompact
+			s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": s.settings.AutoCompact})
+		} else {
+			s.coreAutoCompact = s.settings.AutoCompact
+		}
 		// Populate plugin slash commands for the palette (list_plugins also
 		// emits plugin_commands as a companion; this covers cold start).
 		s.sendCore(map[string]any{"type": "list_plugin_commands"})
+		// The viewport may currently contain the pre-ready "Starting…" welcome.
+		// Auth/model state changes do not add a transcript block, so explicitly
+		// rebuild it now; otherwise the cached startup screen remains forever even
+		// though the footer and composer have advanced to ready.
+		s.layout()
 		// Sync a persisted provider selection that differs from the core's
 		// startup choice (e.g. switched in a previous session). The core emits
 		// provider_changed + models, which re-resolves the key below.
@@ -172,15 +196,21 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			// spinner keeps ticking but nothing streams (TUI deadlock). The
 			// set_provider round-trip is async; provider_changed will arrive and
 			// be handled normally on the next pump tick.
-			return waitForEvent(s.coreEvents)
+			return waitForEvent(s.coreEvents, s.coreStartGen)
 		}
 		s.reauthActiveProvider()
+		// First-run auth: open /login once when ready with no key so the user
+		// isn't forced to burn a failed send to discover the path.
+		if !s.authed && !s.loginOffered && s.modal.kind == modalNone {
+			s.loginOffered = true
+			s.openLoginPicker()
+		}
 
 	case "provider_changed":
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
-			_ = json.Unmarshal([]byte(get(m, "provider")), &s.activeProvider)
-			_ = json.Unmarshal([]byte(get(m, "kind")), &s.providerKind)
+			s.activeProvider = get(m, "provider")
+			s.providerKind = get(m, "kind")
 			if hk := get(m, "has_key"); hk != "" {
 				var b bool
 				_ = json.Unmarshal([]byte(hk), &b)
@@ -192,12 +222,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				s.authed = b
 			}
 		}
+		// A persisted provider may be applied asynchronously after ready. The
+		// migration helper requires it to match the previously persisted owner,
+		// so this cannot bind a legacy secret to an arbitrary newly-selected one.
+		s.migrateLegacyProviderKey(s.activeProvider)
 		// Persist the selection so the next session restores it.
 		if s.activeProvider != "" && s.settings.ActiveProvider != s.activeProvider {
 			s.settings.ActiveProvider = s.activeProvider
 			_ = s.settings.save()
 		}
 		s.reauthActiveProvider()
+		s.layout()
 
 	case "authed":
 		// Honor ok=false (e.g. future unauth signals); default missing ok to true.
@@ -210,6 +245,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.authed = ok
 		s.providerHasKey = ok
 		if ok {
+			s.oauth = nil
 			s.logSuccess("authenticated")
 		}
 		s.refresh()
@@ -259,14 +295,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.cur.model = s.models[s.modelIdx].ID
 		}
 		s.cur.text.WriteString(ev.get("text"))
-		s.refresh()
+		return s.scheduleStreamRefresh()
 
 	case "thinking":
 		if s.cur == nil || s.cur.kind != blkThinking {
 			s.push(blkThinking)
 		}
 		s.cur.text.WriteString(ev.get("text"))
-		s.refresh()
+		return s.scheduleStreamRefresh()
 
 	case "tool_call":
 		name := ev.get("name")
@@ -411,7 +447,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logInfo("conversation reset")
 
 	case "history":
-		// Loading a session is a conversation boundary — clear any in-flight
+		// Loading a session / undo is a conversation boundary — clear any in-flight
 		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with
 		// busy=true and a wiped transcript.
 		s.busy = false
@@ -455,12 +491,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if at, err := strconv.ParseUint(ev.get("after_tokens"), 10, 64); err == nil {
 			s.contextTokens = at
 		}
+		s.accumulateSaved(ev)
+		if n, err := strconv.Atoi(ev.get("summary_chars")); err == nil && n >= 0 {
+			s.summaryChars = n
+		}
 		s.logInfo(fmt.Sprintf("context compacted: %s → %s tokens", ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "digested":
 		if at, err := strconv.ParseUint(ev.get("after_tokens"), 10, 64); err == nil {
 			s.contextTokens = at
 		}
+		s.accumulateSaved(ev)
 		s.logInfo(fmt.Sprintf("reclaimed stale tool payload(s): %s, %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "reflecting":
@@ -475,8 +516,22 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "approval_changed":
-		s.approvalModeStr = ev.get("mode")
-		s.logInfo(fmt.Sprintf("approval mode: %s", ev.get("mode")))
+		// Core emits two shapes:
+		//   "never"|"destructive"|"always"  — session gate mode changed
+		//   "<kind>:always"                 — user hit "always allow" for one
+		//                                    tool kind (escalation); NOT a mode
+		//                                    change. Treating it as a mode made
+		//                                    the footer flip to "destructive"
+		//                                    (normalizeApproval fallback) and
+		//                                    look like the user's /approval
+		//                                    never preference had been wiped.
+		mode := ev.get("mode")
+		if strings.Contains(mode, ":") {
+			s.logInfo(fmt.Sprintf("approval escalation: %s", mode))
+			break
+		}
+		s.approvalModeStr = normalizeApproval(mode)
+		s.logInfo(fmt.Sprintf("approval mode: %s", s.approvalModeStr))
 
 	case "config_changed":
 		s.logInfo(fmt.Sprintf("config: %s = %s", ev.get("key"), ev.get("value")))
@@ -522,6 +577,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.umansConcProvider = ev.get("provider")
 
 	case "approval_request":
+		owner := "approval:" + ev.get("request_id")
+		s.suspendComposer(owner)
 		s.pendingApproval = &approvalPrompt{
 			requestID: ev.get("request_id"),
 			tool:      ev.get("tool"),
@@ -553,16 +610,15 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// open /dev/tty to read the password, garbling the TUI — so the core
 		// blocks here and surfaces it to the user. On Enter the password is fed
 		// via `sudo -S` on stdin; on Esc the agent is told the request was
-		// declined (command NOT run). The flyout auto-closes after 30s.
-		var cmd tea.Cmd
+		// declined (command NOT run). There is intentionally no user-facing
+		// timeout: password-manager and assistive workflows may take longer.
 		if rid := ev.get("request_id"); rid != "" {
 			s.pendingSudo = newSudoPrompt(rid, ev.get("command"))
 			s.input.Blur()
 			s.logInfo("🔐 sudo command requested — approve or decline")
 			s.layout()
-			cmd = sudoTimeoutCmd(rid)
 		}
-		return tea.Batch(cmd, waitForEvent(s.coreEvents))
+		return waitForEvent(s.coreEvents, s.coreStartGen)
 	case "intercom_message":
 		// A subagent is prompting the orchestrator for a decision (or a progress
 		// update). need_decision blocks until we reply; progress_update is a log line.
@@ -570,15 +626,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if reason == "progress_update" {
 			s.logInfo(fmt.Sprintf("⟵ %s (progress): %s", ev.get("from"), ev.get("message")))
 		} else {
-			s.pendingIntercom = &intercomPrompt{
+			p := &intercomPrompt{
 				requestID: ev.get("id"),
 				from:      ev.get("from"),
 				reason:    reason,
 				message:   ev.get("message"),
 			}
+			s.enqueueIntercom(p)
 			s.logWarn(fmt.Sprintf("⟵ subagent %s asks: %s", ev.get("from"), ev.get("message")))
-			s.input.SetValue("")
-			s.input.Focus()
 			s.layout()
 		}
 
@@ -642,41 +697,24 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "oauth_prompt":
 		// The core needs the user to complete an interactive OAuth login (visit a
-		// URL and, for the device flow, enter a code). Surface it prominently in the
-		// transcript and try to open the URL via the OS.
+		// URL and, for the device flow, enter a code). Sticky banner + clipboard
+		// instead of dumping a hard-wrapped URL wall into the transcript.
 		url := ev.get("url")
 		code := ev.get("code")
 		message := ev.get("message")
 		if message == "" {
 			message = "complete the OAuth login in your browser"
 		}
-		// Copy the URL to the LOCAL clipboard via OSC 52 — works over SSH in
-		// most modern terminals (iTerm2/kitty/WezTerm/Windows Terminal/
-		// gnome-terminal/alacritty): the escape sequence passes through to the
-		// local terminal, which writes its clipboard, so the user can just paste.
-		// Best-effort: terminals that lack OSC 52 (e.g. macOS Terminal.app) ignore
-		// it and the user copies from the hard-wrapped URL shown below instead.
 		clipCmd := writeOSC52Cmd(url)
-		var b strings.Builder
-		b.WriteString(message)
+		if url != "" || code != "" || message != "" {
+			s.oauth = &oauthBanner{message: message, url: url, code: code}
+			s.layout()
+		}
 		if url != "" {
-			b.WriteString("\n  url (copied to your clipboard — just paste into a browser; if paste is empty your terminal lacks OSC 52 — copy from below):")
-			ww := s.width - 6
-			if ww < 20 {
-				ww = 20
-			} else if ww > 200 {
-				ww = 200
-			}
-			for _, ln := range wrapRunes([]rune(url), ww) {
-				b.WriteString("\n    ")
-				b.WriteString(string(ln))
-			}
+			s.logInfo("OAuth URL copied — paste into a browser (or copy from the banner)")
+		} else {
+			s.logInfo(message)
 		}
-		if code != "" {
-			b.WriteString("\n  code: ")
-			b.WriteString(code)
-		}
-		s.logInfo(b.String())
 		// Progress heartbeats re-use oauth_prompt without a new URL — don't
 		// re-open the browser on every "still waiting…" tick.
 		if url != "" && !strings.Contains(strings.ToLower(message), "still waiting") {
@@ -687,7 +725,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// "logged into … OAuth" / authed / models events sat unread until a TUI
 		// restart. That made SuperGrok login look stuck after browser approval.
 		if clipCmd != nil {
-			return tea.Batch(clipCmd, waitForEvent(s.coreEvents))
+			return tea.Batch(clipCmd, waitForEvent(s.coreEvents, s.coreStartGen))
 		}
 		// fall through to the shared waitForEvent return below
 
@@ -705,11 +743,51 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				_ = json.Unmarshal(raw, &entries)
 			}
 		}
-		if len(entries) == 0 {
-			s.logInfo("no saved sessions found")
+		s.sessionList = entries
+		if s.modal.kind == modalSessions {
+			s.modal.loading = false
+			s.modal.loadError = ""
+		}
+
+	case "session_changed":
+		path := ev.get("path")
+		if !commitSessionClaim(path) {
+			s.logError("session changed, but its local ownership claim was lost")
+		} else if ev.get("new") == "true" {
+			s.logSuccess("new session ready")
 		} else {
-			s.sessionList = entries
-			s.openSessionsPicker()
+			s.logSuccess("session loaded")
+		}
+
+	case "session_change_failed":
+		path := ev.get("path")
+		cancelSessionReservation(path)
+		msg := ev.get("message")
+		s.logError("session switch failed: " + msg)
+		if s.modal.kind == modalSessions {
+			s.modal.loading = false
+			s.modal.loadError = msg
+		}
+
+	case "session_renamed":
+		s.logSuccess("session renamed")
+		accepted := s.sendCore(map[string]any{"type": "list_sessions"})
+		if s.modal.kind == modalSessions && accepted {
+			s.modal.loading = true
+		}
+
+	case "session_pinned":
+		s.logSuccess("session pin updated")
+		accepted := s.sendCore(map[string]any{"type": "list_sessions"})
+		if s.modal.kind == modalSessions && accepted {
+			s.modal.loading = true
+		}
+
+	case "session_deleted":
+		s.logSuccess("session deleted")
+		accepted := s.sendCore(map[string]any{"type": "list_sessions"})
+		if s.modal.kind == modalSessions && accepted {
+			s.modal.loading = true
 		}
 
 	case "stats":
@@ -724,22 +802,22 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		turns := ev.get("turns")
 		msgs := ev.get("messages")
 		sessionFile := ev.get("session_file")
-		s.logInfo(fmt.Sprintf("stats: %s in / %s out · %s turns · %s msgs", ti, to, turns, msgs))
+		s.logPersist(blkInfo, fmt.Sprintf("stats: %s in / %s out · %s turns · %s msgs", ti, to, turns, msgs))
 		if totalIn != "" && totalIn != "0" {
-			s.logInfo(fmt.Sprintf("totals: %s prompt in / %s out (cumulative)", totalIn, to))
+			s.logPersist(blkInfo, fmt.Sprintf("totals: %s prompt in / %s out (cumulative)", totalIn, to))
 		}
 		if sessionFile != "" {
-			s.logInfo(fmt.Sprintf("session: %s", sessionFile))
+			s.logPersist(blkInfo, fmt.Sprintf("session: %s", sessionFile))
 		}
 		if cached != "" && cached != "0" {
 			if ratio != "" {
 				if r, err := strconv.ParseFloat(ratio, 64); err == nil {
-					s.logSuccess(fmt.Sprintf("cache: %s cached · %.0f%% hit", cached, r*100))
+					s.logPersist(blkSuccess, fmt.Sprintf("cache: %s cached · %.0f%% hit", cached, r*100))
 				} else {
-					s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
+					s.logPersist(blkSuccess, fmt.Sprintf("cache: %s cached", cached))
 				}
 			} else {
-				s.logSuccess(fmt.Sprintf("cache: %s cached", cached))
+				s.logPersist(blkSuccess, fmt.Sprintf("cache: %s cached", cached))
 			}
 		}
 
@@ -776,9 +854,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "goal_state":
 		s.applyGoalState(ev.Raw)
 	case "goal_plan":
-		// Keep plan summary as info; detailed steps land via goal_state prompts.
-		if sum := ev.get("summary"); sum != "" {
-			s.logInfo("plan: " + sum)
+		var raw struct {
+			Summary    string           `json:"summary"`
+			Steps      []map[string]any `json:"steps"`
+			Risks      []string         `json:"risks"`
+			Validation []string         `json:"validation"`
+		}
+		if json.Unmarshal(ev.Raw, &raw) == nil {
+			s.goalPlan = &goalPlanSnap{Summary: raw.Summary, Steps: raw.Steps, Risks: raw.Risks, Validation: raw.Validation}
+		}
+		if raw.Summary != "" {
+			s.logInfo("plan: " + raw.Summary)
 		}
 	case "goal_phase":
 		from, to := ev.get("from"), ev.get("to")
@@ -810,11 +896,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// requiring `/forget <id>` on the command line.
 		if s.pendingMemoryPicker {
 			s.pendingMemoryPicker = false
-			if len(entries) == 0 {
-				s.logInfo("no memories saved")
-				break
+			if s.modal.kind == modalMemory {
+				s.modal.loading = false
+				s.modal.loadError = ""
+			} else {
+				s.openMemoryPicker()
 			}
-			s.openMemoryPicker()
 			break
 		}
 		if len(entries) == 0 {
@@ -837,7 +924,27 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.logRaw(strings.Join(rows, "\n"))
 	case "error":
-		s.logError(ev.get("message"))
+		msg := ev.get("message")
+		s.logError(msg)
+		if s.modal.loading {
+			s.modal.loading = false
+			s.modal.loadError = msg
+			s.pendingMemoryPicker = false
+			s.pendingPluginPicker = false
+			s.pendingVisionPicker = false
+		}
+		// Core rejected a second queue while the TUI banner already flipped —
+		// restore honesty: drop the optimistic queued pointer so Esc won't
+		// clear a prompt the core no longer has (or thinks it has the old one).
+		if strings.Contains(strings.ToLower(msg), "already queued") {
+			// Keep the prior queue banner if we still have one from the first
+			// accept; the optimistic overwrite already happened client-side
+			// before this error. Without a core echo of the live queue text we
+			// can only clear the lie and tell the user to Esc / wait.
+			s.queued = nil
+			s.queuedNext = false
+			s.layout()
+		}
 	case "plugin_installed":
 		scope := ev.get("scope")
 		if scope == "" {
@@ -861,7 +968,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
 			if raw, ok := m["plugins"]; ok {
 				var plugins []json.RawMessage
-				if json.Unmarshal(raw, &plugins) == nil {
+				if json.Unmarshal(raw, &plugins) == nil && s.pendingPluginPicker {
+					s.pendingPluginPicker = false
 					s.openPluginPicker(plugins)
 				}
 			}
@@ -922,7 +1030,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.skillsList = skills
 	}
-	return waitForEvent(s.coreEvents)
+	return waitForEvent(s.coreEvents, s.coreStartGen)
 }
 
 // handleMouseWheel routes mouse-wheel events to the transcript viewport,
@@ -983,10 +1091,31 @@ func (s *session) providerKey(name string) string {
 	if k, ok := s.settings.ProviderKeys[name]; ok && k != "" {
 		return k
 	}
-	if s.settings.APIKey != "" {
+	// The legacy key predates named providers. It is safe only for the provider
+	// that was active when the old settings were loaded; once a provider has
+	// been selected/persisted, never treat it as a universal fallback.
+	if s.settings.APIKey != "" && s.settings.ActiveProvider == "" && name == s.activeProvider {
 		return s.settings.APIKey
 	}
 	return ""
+}
+
+// migrateLegacyProviderKey binds the old global key to the provider it
+// actually belonged to. Call only after the core's initial ready event has
+// identified that provider, never after an arbitrary provider switch.
+func (s *session) migrateLegacyProviderKey(name string) {
+	if name == "" || s.settings.APIKey == "" ||
+		(s.settings.ActiveProvider != "" && s.settings.ActiveProvider != name) {
+		return
+	}
+	if s.settings.ProviderKeys == nil {
+		s.settings.ProviderKeys = map[string]string{}
+	}
+	if s.settings.ProviderKeys[name] == "" {
+		s.settings.ProviderKeys[name] = s.settings.APIKey
+	}
+	s.settings.APIKey = ""
+	_ = s.settings.save()
 }
 
 // deleteProviderKey drops a provider's persisted key from the per-provider map
@@ -1067,15 +1196,17 @@ func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
 		return nil
 	}
 	model := s.models[s.modelIdx].ID
+	payload := s.withImages(map[string]any{
+		"type": "send", "prompt": prompt, "model": model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}, prompt)
+	if !s.sendCore(payload) {
+		return nil
+	}
 	s.follow = true
 	s.logUser(prompt + "  ↳ " + cmdName)
 	s.pushHistory(prompt)
-	s.sendCore(s.withImages(map[string]any{
-		"type":             "send",
-		"prompt":           prompt,
-		"model":            model,
-		"reasoning_effort": s.settings.ReasoningEffort,
-	}, prompt))
+	s.clearPendingImages()
 	s.busy = true
 	return nil
 }
@@ -1208,6 +1339,12 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 		return nil
 	}
 	model := s.models[s.modelIdx].ID
+	if !s.sendCore(map[string]any{
+		"type": "steer", "prompt": prompt, "model": model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}) {
+		return nil
+	}
 	s.follow = true
 	s.logUser(prompt + "  ↳ steer")
 	s.pushHistory(prompt)
@@ -1216,13 +1353,10 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 	s.layout()
 	// Steer currently has no images field in the core protocol; path tokens in
 	// the prompt still help for context, but pending image bytes are not
-	// forwarded. Clear them so they don't stick around for a later send.
-	s.sendCore(map[string]any{
-		"type":             "steer",
-		"prompt":           prompt,
-		"model":            model,
-		"reasoning_effort": s.settings.ReasoningEffort,
-	})
+	// forwarded. Warn before clearing so the user knows attachments were dropped.
+	if n := len(s.pendingImages); n > 0 {
+		s.logWarn(fmt.Sprintf("steer dropped %d attached image%s (not supported on steer — use Enter to queue a follow-up with images)", n, pluralS(n)))
+	}
 	s.clearPendingImages()
 	return nil
 }
@@ -1236,8 +1370,11 @@ func (s *session) steerFromInput() tea.Cmd {
 	if text == "" {
 		text = "Describe this image."
 	}
-	s.input.Reset()
-	return s.sendSteer(text)
+	cmd := s.sendSteer(text)
+	if s.queued != nil && s.queued.kind == "steer" {
+		s.input.Reset()
+	}
+	return cmd
 }
 
 // queueFollowUp sends prompt as a follow-up: the core buffers it (one-deep)
@@ -1252,7 +1389,18 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 		s.logError("no models loaded yet")
 		return nil
 	}
+	if s.queued != nil {
+		s.logWarn("queue full — Esc to cancel the queued message, then send")
+		return nil
+	}
 	model := s.models[s.modelIdx].ID
+	payload := s.withImages(map[string]any{
+		"type": "send", "prompt": text, "model": model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}, text)
+	if !s.sendCore(payload) {
+		return nil
+	}
 	s.follow = true
 	disp := text + "  ↳ queued"
 	if n := len(s.pendingImages); n > 0 {
@@ -1263,12 +1411,6 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 	s.queuedNext = true
 	s.queued = &queuedMsg{kind: "follow-up", text: text, at: time.Now()}
 	s.layout()
-	s.sendCore(s.withImages(map[string]any{
-		"type":             "send",
-		"prompt":           text,
-		"model":            model,
-		"reasoning_effort": s.settings.ReasoningEffort,
-	}, text))
 	s.clearPendingImages()
 	return nil
 }
@@ -1278,14 +1420,63 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// global: the quit key (default Ctrl+C) quits unless a modal is open
-	// (where esc / ctrl+c closes the modal instead).
+	// global: the quit key (default Ctrl+C). While a turn is running, the first
+	// press aborts (or peels the queue) — matching CLI muscle memory — and a
+	// second press within a short window quits. Idle Ctrl+C still quits.
 	if s.kb(msg, "quit") && s.modal.kind == modalNone {
+		if s.busy {
+			if s.ctrlCAbortArmed {
+				s.ctrlCAbortArmed = false
+				return s, s.quit()
+			}
+			s.ctrlCAbortArmed = true
+			if s.queued != nil {
+				kind := s.queued.kind
+				s.queued = nil
+				s.queuedNext = false
+				s.sendCore(map[string]any{"type": "clear_queue"})
+				s.layout()
+				if kind == "steer" {
+					s.logInfo("steer cancelled — Ctrl+C again to quit")
+				} else {
+					s.logInfo("queued follow-up cancelled — Ctrl+C again to quit")
+				}
+				return s, nil
+			}
+			s.queuedNext = false
+			s.sendCore(map[string]any{"type": "abort"})
+			s.logWarn("aborting… (Ctrl+C again to quit)")
+			return s, nil
+		}
 		return s, s.quit()
+	}
+	s.ctrlCAbortArmed = false
+	// A startup failure is a persistent recovery screen. Keep its two actions
+	// deliberately simple so they remain usable even when the normal composer
+	// and provider state never initialized.
+	if s.coreLifecycle == coreFailed && s.modal.kind == modalNone {
+		switch strings.ToLower(msg.String()) {
+		case "r":
+			s.resetCoreUIState()
+			return s, s.startCore()
+		case "q":
+			return s, s.quit()
+		default:
+			return s, nil
+		}
 	}
 	// modal intercept: when a modal is active it owns all keys.
 	if s.modal.kind != modalNone {
 		return s.handleModalKey(msg)
+	}
+	// Blocking prompts own the keyboard before any global composer shortcuts.
+	// In particular, Shift+Enter and clipboard-image bindings must never mutate
+	// the hidden chat draft while a password or answer field is focused.
+	if s.pendingAsk != nil {
+		return s.handleAskKey(msg)
+	}
+	if s.pendingSudo != nil {
+		return s.handleSudoKey(msg)
 	}
 	// Shift+Enter inserts a line break so the user can compose multi-line
 	// messages. This works while idle AND while a turn runs (so a follow-up can
@@ -1310,23 +1501,28 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return s, nil
 	}
-	// ask flyout: a blocking `ask` question is a modal-style overlay that owns
-	// all keys (option cycling, text entry, submit, skip). Dispatched before
-	// scrolling/global keys just like the modal above — without it the flyout
-	// never receives keystrokes even after ask_request set s.pendingAsk.
-	if s.pendingAsk != nil {
-		return s.handleAskKey(msg)
-	}
-	// sudo flyout: a bash command invokes `sudo` and the core is blocking on
-	// approval. Same precedence as the ask flyout — owns all keys (password
-	// entry, Enter approve, Esc decline) until resolved.
-	if s.pendingSudo != nil {
-		return s.handleSudoKey(msg)
-	}
 	// transcript scrolling works in every state (idle/busy/approval) so the
 	// user can read history while a turn runs or a decision is pending.
+	if s.handleApprovalDiffScroll(msg) {
+		return s, nil
+	}
 	if s.handleScrollKey(msg) {
 		return s, nil
+	}
+	if s.kb(msg, "transcript_prev") {
+		s.moveTranscriptFocus(-1)
+		return s, nil
+	}
+	if s.kb(msg, "transcript_next") {
+		s.moveTranscriptFocus(1)
+		return s, nil
+	}
+	if s.kb(msg, "transcript_find") {
+		s.openValueEditModal(editTargetTranscriptFind, "Find in Transcript", "search messages and tool output", "")
+		return s, nil
+	}
+	if s.kb(msg, "copy_focused") {
+		return s, s.copyFocusedBlock()
 	}
 	// global: toggle reasoning-block collapse/expand
 	if s.kb(msg, "toggle_reasoning") {
@@ -1342,11 +1538,19 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.refresh()
 		return s, nil
 	}
-	// global: toggle full output for the most recent tool block.
-	// Tool output is truncated to the first 3 lines by default; this expands
-	// (or collapses) the last tool call so the user can inspect full output.
+	// global: toggle full output for the tool nearest the viewport (not always
+	// the chronologically last one — scrolling up to inspect an older truncated
+	// tool should expand that one).
 	if s.kb(msg, "toggle_tool_output") {
-		if b := s.lastToolOutputBlock(); b != nil {
+		if s.pendingApproval != nil && strings.TrimSpace(s.pendingApproval.diff) != "" {
+			s.pendingApproval.expanded = !s.pendingApproval.expanded
+			if !s.pendingApproval.expanded {
+				s.pendingApproval.diffScroll = 0
+			}
+			s.layout()
+			return s, nil
+		}
+		if b := s.nearestToolOutputBlock(); b != nil {
 			b.expanded = !b.expanded
 			s.invalidateAll()
 			s.refresh()
@@ -1369,6 +1573,10 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.openCommandPalette()
 		return s, nil
 	}
+	// "?" opens help when the input is empty (matches the header tip).
+	if msg.String() == "?" && s.input.Value() == "" {
+		return s, s.handleUserLine("/help")
+	}
 	// @-mention flyout: when open it owns arrow/tab/enter/esc; printable
 	// and editing keys fall through to the input and re-evaluate the token.
 	if s.mentionActive && s.handleMentionNav(msg) {
@@ -1381,10 +1589,8 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// isn't stuck.
 		if s.kb(msg, "close") {
 			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": "[no reply — proceed with your best judgment]"})
-			s.pendingIntercom = nil
+			s.advanceIntercom()
 			s.layout()
-			s.input.Reset()
-			s.input.Focus()
 			return s, nil
 		}
 		if s.kb(msg, "send") {
@@ -1400,8 +1606,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			s.sendCore(map[string]any{"type": "intercom_reply", "request_id": s.pendingIntercom.requestID, "reply": reply})
 			s.logSuccess(fmt.Sprintf("↦ reply to %s sent", s.pendingIntercom.from))
-			s.pendingIntercom = nil
-			s.input.Reset()
+			s.advanceIntercom()
 			s.layout()
 			return s, nil
 		}
@@ -1410,25 +1615,30 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return s, cmd
 	}
 	if s.pendingApproval != nil {
+		inputEmpty := strings.TrimSpace(s.input.Value()) == ""
+		owner := "approval:" + s.pendingApproval.requestID
 		switch {
-		case s.kb(msg, "approve"):
+		case inputEmpty && s.kb(msg, "approve"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "yes"})
+			s.resolveLatestApproval("approved once")
 			s.pendingApproval = nil
-		case s.kb(msg, "approve_always"):
+		case inputEmpty && s.kb(msg, "approve_always"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "always"})
+			s.resolveLatestApproval("always allowed")
 			s.pendingApproval = nil
-		case s.kbAny(msg, "deny", "close"):
+		case inputEmpty && s.kbAny(msg, "deny", "close"):
 			s.sendCore(map[string]any{"type": "approve", "request_id": s.pendingApproval.requestID, "decision": "no"})
+			s.resolveLatestApproval("denied")
 			s.logError("denied")
 			s.pendingApproval = nil
 		default:
-			// P2-17: pass non-decision keys to the input so typing isn't swallowed
-			// while an approval banner is up (and the user can't accidentally
-			// approve by typing "y...").
+			// Decision keys only fire when the composer is empty so drafting a
+			// follow-up (typing "yes" / "y…") can't accidentally approve.
 			var cmd tea.Cmd
 			s.input, cmd = s.input.Update(msg)
 			return s, cmd
 		}
+		s.restoreComposer(owner)
 		s.layout() // banner released, grow viewport back
 		return s, nil
 	}
@@ -1468,18 +1678,41 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if text == "" && len(s.pendingImages) == 0 {
 				return s, nil
 			}
+			if text == "?" || text == "/?" {
+				s.input.Reset()
+				return s, s.handleUserLine("/help")
+			}
 			// Image-only follow-up: default caption so the core still gets a prompt.
 			if text == "" {
 				text = "Describe this image."
 			}
-			s.input.Reset()
-			s.evalMention()
+			// Queue is one-deep — refuse a second follow-up instead of lying
+			// with a banner that overwrites the real queued prompt.
+			if s.queued != nil && !(len(s.pendingImages) == 0 && (strings.HasPrefix(text, "/") || isBangCommand(text))) {
+				s.logWarn("queue full — Esc to cancel the queued message, then send")
+				return s, nil
+			}
 			// Slash commands and bang bash (`!` / `!!`) run immediately even
 			// while a turn is in flight — same as PI interactive mode.
 			if len(s.pendingImages) == 0 && (strings.HasPrefix(text, "/") || isBangCommand(text)) {
+				s.input.Reset()
+				s.evalMention()
 				return s, s.handleUserLine(text)
 			}
-			return s, s.queueFollowUp(text)
+			cmd := s.queueFollowUp(text)
+			if s.queued != nil && s.queued.text == text {
+				s.input.Reset()
+				s.evalMention()
+			}
+			return s, cmd
+		case s.kb(msg, "history_prev") && len(s.history) > 0 && s.historyRecallAllowed(-1):
+			val := s.recallHistory(-1)
+			s.input.SetValue(val)
+			return s, s.evalMention()
+		case s.kb(msg, "history_next") && len(s.history) > 0 && s.historyRecallAllowed(+1):
+			val := s.recallHistory(+1)
+			s.input.SetValue(val)
+			return s, s.evalMention()
 		}
 		// Backspace on empty input pops the last attached image (same affordance
 		// as removing a chip in the web composer).
@@ -1490,42 +1723,48 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		s.input, cmd = s.input.Update(msg)
-		s.evalMention()
-		return s, cmd
+		return s, tea.Batch(cmd, s.evalMention())
 	}
 
 	// welcome-screen navigation: when the conversation is empty, ↑/↓ move the
 	// example cursor; enter drops the selected example into the (editable)
 	// input. Only arrow keys are used so typing letters/digits is unaffected.
-	if len(s.blocks) == 0 && s.pendingApproval == nil {
-		switch {
-		case s.kb(msg, "nav_up"):
-			s.welcomeIdx = (s.welcomeIdx - 1 + len(welcomeExamples)) % len(welcomeExamples)
-			return s, nil
-		case s.kb(msg, "nav_down"):
-			s.welcomeIdx = (s.welcomeIdx + 1) % len(welcomeExamples)
-			return s, nil
-		}
-		if s.kb(msg, "select") && strings.TrimSpace(s.input.Value()) == "" {
-			s.input.SetValue(welcomeExamples[s.welcomeIdx])
-			s.evalMention()
-			s.input.Focus()
-			return s, nil
+	if !s.hasConversation() && s.pendingApproval == nil && strings.TrimSpace(s.input.Value()) == "" {
+		if !s.authed {
+			if s.kb(msg, "select") && strings.TrimSpace(s.input.Value()) == "" {
+				s.openLoginPicker()
+				return s, nil
+			}
+		} else {
+			switch {
+			case s.kb(msg, "nav_up"):
+				s.welcomeIdx = (s.welcomeIdx - 1 + len(welcomeExamples)) % len(welcomeExamples)
+				return s, nil
+			case s.kb(msg, "nav_down"):
+				s.welcomeIdx = (s.welcomeIdx + 1) % len(welcomeExamples)
+				return s, nil
+			}
+			if s.kb(msg, "select") && strings.TrimSpace(s.input.Value()) == "" {
+				s.input.SetValue(welcomeExamples[s.welcomeIdx])
+				s.evalMention()
+				s.input.Focus()
+				return s, nil
+			}
 		}
 	}
 
-	// history recall: up/down when the input is focused and not empty-positioned
-	if s.kb(msg, "history_prev") && len(s.history) > 0 {
+	// history recall: only when the draft is empty, or the cursor is already on
+	// the first (Up) / last (Down) line — otherwise Up/Down navigate inside the
+	// multi-line composition (shell/IDE pattern).
+	if s.kb(msg, "history_prev") && len(s.history) > 0 && s.historyRecallAllowed(-1) {
 		val := s.recallHistory(-1)
 		s.input.SetValue(val)
-		s.evalMention()
-		return s, nil
+		return s, s.evalMention()
 	}
-	if s.kb(msg, "history_next") && len(s.history) > 0 {
+	if s.kb(msg, "history_next") && len(s.history) > 0 && s.historyRecallAllowed(+1) {
 		val := s.recallHistory(+1)
 		s.input.SetValue(val)
-		s.evalMention()
-		return s, nil
+		return s, s.evalMention()
 	}
 
 	if s.kb(msg, "send") {
@@ -1533,9 +1772,23 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if text == "" && len(s.pendingImages) == 0 {
 			return s, nil
 		}
+		if text == "?" || text == "/?" {
+			s.input.Reset()
+			return s, s.handleUserLine("/help")
+		}
 		// Image-only send: give the model a default caption prompt.
 		if text == "" {
 			text = "Describe this image."
+		}
+		if !strings.HasPrefix(text, "/") && !isBangCommand(text) {
+			if !s.authed {
+				s.logError("not authenticated — run /login first")
+				return s, nil
+			}
+			if len(s.models) == 0 {
+				s.logError("no models loaded yet")
+				return s, nil
+			}
 		}
 		s.input.Reset()
 		s.evalMention()
@@ -1550,9 +1803,34 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return s, nil
 	}
 
-	s.input, _ = s.input.Update(msg)
-	s.evalMention()
-	return s, nil
+	var cmd tea.Cmd
+	s.input, cmd = s.input.Update(msg)
+	return s, tea.Batch(cmd, s.evalMention())
+}
+
+func (s *session) handleApprovalDiffScroll(msg tea.KeyPressMsg) bool {
+	a := s.pendingApproval
+	if a == nil || !a.expanded || strings.TrimSpace(a.diff) == "" {
+		return false
+	}
+	step := max(1, s.height/3)
+	switch {
+	case s.kb(msg, "scroll_page_up"):
+		a.diffScroll -= step
+	case s.kb(msg, "scroll_page_down"):
+		a.diffScroll += step
+	case s.kb(msg, "scroll_line_up"):
+		a.diffScroll--
+	case s.kb(msg, "scroll_line_down"):
+		a.diffScroll++
+	default:
+		return false
+	}
+	if a.diffScroll < 0 {
+		a.diffScroll = 0
+	}
+	s.layout()
+	return true
 }
 
 // handleScrollKey moves the transcript viewport and manages follow mode.
@@ -1564,6 +1842,10 @@ func (s *session) handleScrollKey(msg tea.KeyPressMsg) bool {
 	case s.kb(msg, "scroll_page_up"):
 		s.follow = false
 		s.viewport.PageUp()
+		if !s.settings.MouseWheel && !s.mouseTipShown {
+			s.mouseTipShown = true
+			s.logInfo("tip: /mouse-wheel on enables wheel scrolling (hold Shift to select/copy)")
+		}
 		return true
 	case s.kb(msg, "scroll_page_down"):
 		s.viewport.PageDown()
@@ -1604,6 +1886,7 @@ func (s *session) handleScrollKey(msg tea.KeyPressMsg) bool {
 // tea.Quit command. Shared by the quit key and the /exit · /quit commands.
 func (s *session) quit() tea.Cmd {
 	quitting.Store(true)
+	s.clearPendingImages()
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
 		_ = s.coreCmd.Process.Kill()
 	}
@@ -1624,6 +1907,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	}
 	if strings.HasPrefix(text, "/") {
 		parts := strings.Fields(text)
+		s.recordRecentCommand(parts[0])
 		// /skill:<name> [optional task] — invoke a discoverable skill. Handled
 		// before the switch because the command token is dynamic (/skill:<x>
 		// has no fixed case). The core reads the SKILL.md and runs the turn.
@@ -1695,7 +1979,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.openOauthCodeModal()
 			return nil
-		case "/model":
+		case "/model", "/models":
 			if len(parts) < 2 {
 				s.openModelPicker()
 				return nil
@@ -1725,13 +2009,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logInfo(fmt.Sprintf("model: %s", s.models[idx].ID))
 			return nil
 		case "/reset":
-			s.sendCore(map[string]any{"type": "reset"})
-			s.blocks = nil
-			s.cur = nil
-			s.contextTokens = 0
-			s.follow = true
-			s.invalidateAll()
-			s.viewport.SetContent("")
+			s.openDestructiveConfirm("reset", "", "wipe the conversation and its session file")
 			return nil
 		case "/abort":
 			s.queuedNext = false
@@ -1790,6 +2068,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				var n int
 				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n > 0 {
 					s.coreBashTimeout = n
+					s.settings.BashTimeoutSecs = n
+					_ = s.settings.save()
 					s.sendCore(map[string]any{"type": "set_config", "key": "bash_timeout_secs", "value": n})
 					s.logInfo(fmt.Sprintf("bash timeout: %ds", n))
 				} else {
@@ -1804,10 +2084,14 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				switch strings.ToLower(parts[1]) {
 				case "on", "true", "1":
 					s.coreAutoCompact = true
+					s.settings.AutoCompact = true
+					_ = s.settings.save()
 					s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": true})
 					s.logInfo("auto-compact: on")
 				case "off", "false", "0":
 					s.coreAutoCompact = false
+					s.settings.AutoCompact = false
+					_ = s.settings.save()
 					s.sendCore(map[string]any{"type": "set_config", "key": "auto_compact", "value": false})
 					s.logInfo("auto-compact: off")
 				default:
@@ -1820,10 +2104,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/sandbox":
 			if len(parts) >= 2 {
 				mode := parts[1]
-				if mode == "none" || mode == "firejail" || mode == "seatbelt" {
+				if sandboxModeAvailable(mode) {
 					s.settings.Sandbox = mode
 					_ = s.settings.save()
-					s.logInfo(fmt.Sprintf("sandbox: %s (applies on next launch)", mode))
+					s.logInfo(fmt.Sprintf("sandbox: %s", mode))
+					s.offerCoreRestart("sandbox mode")
+				} else if mode == "firejail" || mode == "seatbelt" {
+					s.logError(fmt.Sprintf("sandbox %s is unavailable on this operating system", mode))
 				} else {
 					s.logError("usage: /sandbox none|firejail|seatbelt")
 				}
@@ -1837,11 +2124,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				case "on", "true", "1":
 					s.settings.NoNetwork = true
 					_ = s.settings.save()
-					s.logInfo("no-network: on (applies on next launch)")
+					s.logInfo("no-network: on")
+					s.offerCoreRestart("no-network")
 				case "off", "false", "0":
 					s.settings.NoNetwork = false
 					_ = s.settings.save()
-					s.logInfo("no-network: off (applies on next launch)")
+					s.logInfo("no-network: off")
+					s.offerCoreRestart("no-network")
 				default:
 					s.logError("usage: /no-network [on|off]")
 				}
@@ -1875,7 +2164,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n >= 10 {
 					s.settings.IdleTimeout = n
 					_ = s.settings.save()
-					s.logInfo(fmt.Sprintf("idle timeout: %ds (applies on next launch)", n))
+					s.logInfo(fmt.Sprintf("idle timeout: %ds", n))
+					s.offerCoreRestart("idle timeout")
 				} else {
 					s.logError("usage: /idle-timeout <seconds≥10>")
 				}
@@ -1889,7 +2179,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n >= 0 {
 					s.settings.MaxSessionTokens = n
 					_ = s.settings.save()
-					s.logInfo(fmt.Sprintf("max session tokens: %d (applies on next launch)", n))
+					s.logInfo(fmt.Sprintf("max session tokens: %d", n))
+					s.offerCoreRestart("max session tokens")
 				} else {
 					s.logError("usage: /max-session-tokens <n≥0>  (0=unlimited)")
 				}
@@ -1933,13 +2224,10 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.logInfo("in-memory conversation cleared (session file kept)")
 			return nil
 		case "/undo":
+			// Core emits history with the trimmed conversation; do not wipe the
+			// transcript optimistically (that looked like total data loss).
 			s.sendCore(map[string]any{"type": "undo"})
-			s.blocks = nil
-			s.cur = nil
-			s.contextTokens = 0
-			s.invalidateAll()
-			s.viewport.SetContent("")
-			s.logInfo("dropped last turn")
+			s.logInfo("dropping last turn…")
 			return nil
 		case "/compact":
 			// Bare /compact opens a modal for optional preserve-instructions;
@@ -1988,7 +2276,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				s.requestMemoryPicker()
 				return nil
 			}
-			s.sendCore(map[string]any{"type": "forget_memory", "id": parts[1]})
+			s.openDestructiveConfirm("memory-forget", parts[1], "permanently forget memory "+parts[1])
 			return nil
 		case "/index":
 			// Bootstrap learning on this repo: walk the structure and persist durable
@@ -2018,20 +2306,40 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			task := "Reflect on the work done in this session so far. Identify: (1) any convention, architecture fact, decision, or gotcha worth persisting so future sessions don't rediscover it, and (2) any repetitive pattern you performed more than once that should become a reusable skill under `.catalyst-code/skills/`. Use the `memory` tool (action: append if a topic memory exists, else save) to persist durable facts only — skip transient task state. If you wrote a skill, name it. Finish with a two-line summary: what you learned and what you persisted."
 			return s.sendDelegation(task, "/reflect")
 		case "/sessions":
-			s.sendCore(map[string]any{"type": "list_sessions"})
+			s.openSessionsPicker()
+			s.modal.loading = true
+			if !s.sendCore(map[string]any{"type": "list_sessions"}) {
+				s.modal.loading = false
+				s.modal.loadError = "The core is busy; press r to retry."
+			}
 			return nil
 		case "/new":
-			s.sendCore(map[string]any{"type": "new_session", "path": newSessionFilename()})
-			s.blocks = nil
-			s.cur = nil
-			s.contextTokens = 0
-			s.follow = true
-			s.invalidateAll()
-			s.viewport.SetContent("")
+			if s.busy {
+				s.logWarn("wait for the active turn to finish (or stop it) before starting a new session")
+				return nil
+			}
+			path := filepath.Join(sessionsDir(), newSessionFilename())
+			if !reserveSession(path) {
+				s.logError("could not reserve a new session file")
+				return nil
+			}
+			if !s.sendCore(map[string]any{"type": "new_session", "path": path}) {
+				cancelSessionReservation(path)
+				s.logError("the core is busy; the current session was left unchanged")
+				return nil
+			}
 			s.logInfo("starting a new session…")
 			return nil
 		case "/stats":
 			s.sendCore(map[string]any{"type": "stats"})
+			return nil
+		case "/find":
+			query := strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
+			if query == "" {
+				s.openValueEditModal(editTargetTranscriptFind, "Find in Transcript", "search messages and tool output", "")
+				return nil
+			}
+			s.findTranscript(query)
 			return nil
 		case "/plugin-install":
 			if len(parts) < 2 {
@@ -2063,13 +2371,11 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.requestPluginPicker(pluginModeToggle)
 			return nil
 		case "/vision":
-			s.pendingVisionPicker = true
-			s.sendCore(map[string]any{"type": "get_vision_config"})
-			s.logInfo("loading vision config…")
+			s.requestVisionPicker()
 			return nil
 		case "/plugin-remove":
 			if len(parts) >= 2 {
-				s.sendCore(map[string]any{"type": "remove_plugin", "name": parts[1]})
+				s.openDestructiveConfirm("plugin-remove", parts[1], "uninstall plugin "+parts[1]+" and remove its files")
 				return nil
 			}
 			s.requestPluginPicker(pluginModeRemove)
@@ -2131,6 +2437,17 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		return nil
 	}
 	model := s.models[s.modelIdx].ID
+	payload := s.withImages(map[string]any{
+		"type": "send", "prompt": text, "model": model,
+		"reasoning_effort": s.settings.ReasoningEffort,
+	}, text)
+	if !s.sendCore(payload) {
+		// handleKey may already have transferred the draft to this function;
+		// restore it so backpressure never turns into user-visible data loss.
+		s.input.SetValue(text)
+		s.input.CursorEnd()
+		return nil
+	}
 	s.follow = true // jump to bottom so the user sees their turn + the response
 	disp := text
 	if n := len(s.pendingImages); n > 0 {
@@ -2138,12 +2455,6 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	}
 	s.logUser(disp)
 	s.pushHistory(text)
-	s.sendCore(s.withImages(map[string]any{
-		"type":             "send",
-		"prompt":           text,
-		"model":            model,
-		"reasoning_effort": s.settings.ReasoningEffort,
-	}, text))
 	s.clearPendingImages()
 	s.busy = true
 	return nil
@@ -2176,14 +2487,17 @@ func (s *session) sendAttach(imgPath, promptText string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	s.follow = true
-	s.logUser(promptText + " [image: " + imgPath + "]")
-	s.sendCore(s.withImages(map[string]any{
+	payload := s.withImages(map[string]any{
 		"type":             "send",
 		"prompt":           promptText,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
 		"images":           []string{abs},
-	}, promptText))
+	}, promptText)
+	if !s.sendCore(payload) {
+		return nil
+	}
+	s.logUser(promptText + " [image: " + imgPath + "]")
 	s.clearPendingImages()
 	s.busy = true
 	s.input.Reset()
@@ -2230,9 +2544,6 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 	if task != "" {
 		display = token + " " + task
 	}
-	s.follow = true
-	s.logUser(display)
-	s.pushHistory(display)
 	cmd := map[string]any{
 		"type":             "apply_skill",
 		"name":             found.Name,
@@ -2242,7 +2553,12 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 	if task != "" {
 		cmd["task"] = task
 	}
-	s.sendCore(cmd)
+	if !s.sendCore(cmd) {
+		return nil
+	}
+	s.follow = true
+	s.logUser(display)
+	s.pushHistory(display)
 	s.busy = true
 	return nil
 }
@@ -2273,21 +2589,21 @@ func openURL(url string) {
 // paste (Ctrl/Cmd+V) into their local browser without copying from the
 // (wrapped, hard-to-select) transcript. Best-effort: terminals that don't
 // support OSC 52 ignore it. The sequence is invisible (no cursor move / no
-// text). Routing the stdout write through a returned tea.Cmd serializes it with
-// Bubble Tea's renderer goroutine (which also writes stdout) — a direct
-// os.Stdout write from Update races the renderer and can garble the screen.
+// text). tea.Raw routes the bytes through Bubble Tea's renderer, avoiding an
+// asynchronous os.Stdout race with frame output.
 func writeOSC52Cmd(text string) tea.Cmd {
 	if text == "" {
 		return nil
 	}
 	// OSC 52: ESC ] 52 ; <selection> ; <base64> BEL.  'c' = the CLIPBOARD
 	// selection (the Ctrl/Cmd+V paste buffer).
+	const maxOSC52Bytes = 100_000
+	if len(text) > maxOSC52Bytes {
+		text = text[:maxOSC52Bytes]
+	}
 	enc := base64.StdEncoding.EncodeToString([]byte(text))
 	seq := "\x1b]52;c;" + enc + "\x07"
-	return func() tea.Msg {
-		os.Stdout.WriteString(seq)
-		return nil
-	}
+	return tea.Raw(seq)
 }
 
 // parsePluginInstallArgs extracts the plugin source and install scope from

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -23,9 +24,14 @@ var imageExtensions = map[string]bool{
 
 // maxAttachImageBytes guards against slurping a huge file into a base64 data URL.
 const maxAttachImageBytes = 20 * 1024 * 1024 // 20 MiB
+const maxTotalAttachBytes = 40 * 1024 * 1024 // bound synchronous encoding/JSON work
 
 // maxPendingImages caps how many images can be staged in the composer at once.
 const maxPendingImages = 8
+
+const ownedImageMaxAge = 24 * time.Hour
+
+var cleanupOwnedImagesOnce sync.Once
 
 // ---------------------------------------------------------------------------
 // Path extraction (typed / pasted / @-mentioned file paths)
@@ -180,6 +186,14 @@ func (s *session) withImages(payload map[string]any, text string) map[string]any
 	if len(imgs) == 0 {
 		return payload
 	}
+	// Files created from raw clipboard/paste bytes are TUI-owned. Materialize
+	// them into the payload before deleting them so the core never races a temp
+	// cleanup while reading an attachment.
+	for i, p := range imgs {
+		if ref, ok := materializeOwnedImage(p); ok {
+			imgs[i] = ref
+		}
+	}
 	existing, _ := payload["images"].([]string)
 	seen := make(map[string]bool, len(existing)+len(imgs))
 	merged := make([]string, 0, len(existing)+len(imgs))
@@ -236,14 +250,40 @@ func (s *session) addPendingImage(ref string) bool {
 	}
 	if len(s.pendingImages) >= maxPendingImages {
 		s.logError(fmt.Sprintf("too many attached images (max %d)", maxPendingImages))
+		removeOwnedImage(ref)
+		return false
+	}
+	total := attachmentRefBytes(ref)
+	for _, existing := range s.pendingImages {
+		total += attachmentRefBytes(existing)
+	}
+	if total > maxTotalAttachBytes {
+		s.logError("attachments exceed the 40 MiB total limit")
+		removeOwnedImage(ref)
 		return false
 	}
 	s.pendingImages = append(s.pendingImages, ref)
 	return true
 }
 
+func attachmentRefBytes(ref string) int64 {
+	if strings.HasPrefix(ref, "data:") {
+		if i := strings.Index(ref, ","); i >= 0 {
+			return int64((len(ref) - i - 1) * 3 / 4)
+		}
+		return int64(len(ref))
+	}
+	if info, err := os.Stat(ref); err == nil && !info.IsDir() {
+		return info.Size()
+	}
+	return 0
+}
+
 // clearPendingImages drops all staged paste/clipboard attachments.
 func (s *session) clearPendingImages() {
+	for _, ref := range s.pendingImages {
+		removeOwnedImage(ref)
+	}
 	s.pendingImages = nil
 }
 
@@ -252,6 +292,7 @@ func (s *session) popPendingImage() bool {
 	if len(s.pendingImages) == 0 {
 		return false
 	}
+	removeOwnedImage(s.pendingImages[len(s.pendingImages)-1])
 	s.pendingImages = s.pendingImages[:len(s.pendingImages)-1]
 	return true
 }
@@ -424,6 +465,7 @@ func saveImageBytes(data []byte, ext string) (string, error) {
 		ext = ".png"
 	}
 	dir := filepath.Join(os.TempDir(), "catcode-paste")
+	cleanupOwnedImagesOnce.Do(func() { cleanupStaleOwnedImages(time.Now()) })
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -433,6 +475,75 @@ func saveImageBytes(data []byte, ext string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func ownedImageDir() string {
+	return filepath.Clean(filepath.Join(os.TempDir(), "catcode-paste"))
+}
+
+// isOwnedImage reports whether ref names a regular paste-* file in the private
+// temp directory created by this TUI. User-provided image paths are never
+// deleted, even when they happen to live elsewhere under the system temp dir.
+func isOwnedImage(ref string) bool {
+	if ref == "" || strings.HasPrefix(ref, "data:") {
+		return false
+	}
+	abs, err := filepath.Abs(ref)
+	if err != nil || filepath.Dir(filepath.Clean(abs)) != ownedImageDir() ||
+		!strings.HasPrefix(filepath.Base(abs), "paste-") {
+		return false
+	}
+	info, err := os.Lstat(abs)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func removeOwnedImage(ref string) {
+	if isOwnedImage(ref) {
+		_ = os.Remove(ref)
+	}
+}
+
+func materializeOwnedImage(ref string) (string, bool) {
+	if !isOwnedImage(ref) {
+		return ref, false
+	}
+	b, err := os.ReadFile(ref)
+	if err != nil || len(b) > maxAttachImageBytes {
+		return ref, false
+	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(ref)), ".")
+	switch ext {
+	case "jpg":
+		ext = "jpeg"
+	case "svg":
+		ext = "svg+xml"
+	case "tif":
+		ext = "tiff"
+	}
+	dataURL := "data:image/" + ext + ";base64," + base64.StdEncoding.EncodeToString(b)
+	// Keep the owned file until the command is accepted by the core writer.
+	// The caller clears pending images only after a successful enqueue, so a
+	// backpressured/broken core cannot destroy the user's attachment.
+	return dataURL, true
+}
+
+// cleanupStaleOwnedImages removes abandoned files from crashed/terminated
+// sessions. It is intentionally best-effort and only touches the TUI's own
+// paste-* namespace.
+func cleanupStaleOwnedImages(now time.Time) {
+	entries, err := os.ReadDir(ownedImageDir())
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "paste-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && now.Sub(info.ModTime()) > ownedImageMaxAge {
+			_ = os.Remove(filepath.Join(ownedImageDir(), entry.Name()))
+		}
+	}
 }
 
 // extractDataURLImages pulls data:image/...;base64,... URLs out of text and

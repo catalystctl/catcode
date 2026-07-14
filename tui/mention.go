@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,10 +24,9 @@ import (
 // with the chosen path), Esc closes it.
 //
 // The query is the text between the last unbroken "@" and the cursor. A "/"
-// in the query switches to directory-listing completion (so "@../core/sr"
-// lists ../core entries beginning with "sr"); a bare query (no slash) does a
-// recursive name search under the CWD. "@../" therefore reaches files outside
-// the working directory, and "@/" reaches absolute paths.
+// in the query switches to directory-listing completion; a bare query (no
+// slash) does a recursive name search under the workspace CWD. Mentions never
+// escape that boundary, including through absolute paths or ".." traversal.
 // ---------------------------------------------------------------------------
 
 const mentionMaxResults = 12
@@ -36,6 +36,21 @@ type mentionItem struct {
 	display string // text shown in the flyout (dirs get a trailing "/")
 	insert  string // path inserted after "@" on accept
 	isDir   bool
+}
+
+type mentionSearchState uint8
+
+const (
+	mentionSearchReady mentionSearchState = iota
+	mentionSearchLoading
+	mentionSearchFailed
+)
+
+// mentionSearchMsg wakes Bubble Tea when the asynchronous repository walk
+// finishes. The cwd is carried so a late result from a previous directory can
+// never overwrite the flyout for the current one.
+type mentionSearchMsg struct {
+	cwd string
 }
 
 // mentionAt is the rune index of the active "@" in the input; mentionScroll
@@ -50,7 +65,7 @@ func (s *session) closeMention() {
 // evalMention inspects the input at the cursor and activates/refreshes the
 // flyout when an @-token is present, or closes it otherwise. Called after
 // every keystroke that mutates the input.
-func (s *session) evalMention() {
+func (s *session) evalMention() tea.Cmd {
 	s.mentionActive = false
 	s.mentionItems = nil
 	runes := []rune(s.input.Value())
@@ -58,7 +73,7 @@ func (s *session) evalMention() {
 	if pos <= 0 || pos > len(runes) {
 		s.mentionCursor = 0
 		s.mentionScroll = 0
-		return
+		return nil
 	}
 	// Walk back from the cursor for an "@" with no whitespace between it and
 	// the cursor — that span is the mention query.
@@ -76,7 +91,7 @@ func (s *session) evalMention() {
 	if at < 0 {
 		s.mentionCursor = 0
 		s.mentionScroll = 0
-		return
+		return nil
 	}
 	// Require a word boundary before "@" so emails / "foo@bar" don't trigger.
 	if at > 0 {
@@ -84,13 +99,18 @@ func (s *session) evalMention() {
 		if prev != ' ' && prev != '\t' && prev != '\n' {
 			s.mentionCursor = 0
 			s.mentionScroll = 0
-			return
+			return nil
 		}
 	}
 	query := string(runes[at+1 : pos])
 	s.mentionAt = at
 	s.mentionActive = true
-	s.mentionItems = computeMentionItems(query)
+	var refresh tea.Cmd
+	if query != "" && !strings.Contains(query, "/") {
+		s.mentionItems, refresh = recursiveSearchWithRefresh(query)
+	} else {
+		s.mentionItems = dirCompletion(query)
+	}
 	if s.mentionCursor >= len(s.mentionItems) {
 		s.mentionCursor = 0
 	}
@@ -98,6 +118,21 @@ func (s *session) evalMention() {
 		s.mentionCursor = 0
 	}
 	s.mentionScroll = 0
+	return refresh
+}
+
+// handleMentionSearchMsg refreshes an open flyout after its background walk.
+// Callers should route mentionSearchMsg through session.Update and return this
+// command (normally nil; it is non-nil only if the cwd changed concurrently).
+func (s *session) handleMentionSearchMsg(msg mentionSearchMsg) tea.Cmd {
+	if !s.mentionActive {
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil || cwd != msg.cwd {
+		return nil
+	}
+	return s.evalMention()
 }
 
 // handleMentionNav owns arrow/tab/enter/esc while the flyout is open. Returns
@@ -189,6 +224,10 @@ func computeMentionItems(query string) []mentionItem {
 
 // dirCompletion lists one directory and filters by the final path component.
 func dirCompletion(query string) []mentionItem {
+	cwd, err := os.Getwd()
+	if err != nil || filepath.IsAbs(filepath.FromSlash(query)) {
+		return nil
+	}
 	var dirPart, prefix string
 	if i := strings.LastIndex(query, "/"); i >= 0 {
 		dirPart = query[:i]
@@ -198,9 +237,9 @@ func dirCompletion(query string) []mentionItem {
 		dirPart = "."
 		prefix = query
 	}
-	base := dirPart
-	if base == "" {
-		base = "/" // query like "/foo" → list root
+	base := filepath.Clean(filepath.Join(cwd, filepath.FromSlash(dirPart)))
+	if !withinWorkspace(cwd, base) {
+		return nil
 	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -219,7 +258,10 @@ func dirCompletion(query string) []mentionItem {
 		}
 		isDir := e.IsDir()
 		disp := name
-		ins := dirPart + "/" + name
+		ins := name
+		if dirPart != "." && dirPart != "" {
+			ins = strings.TrimSuffix(filepath.ToSlash(dirPart), "/") + "/" + name
+		}
 		if isDir {
 			disp += "/"
 			ins += "/"
@@ -233,6 +275,11 @@ func dirCompletion(query string) []mentionItem {
 	return items
 }
 
+func withinWorkspace(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // mentionCache memoizes the recursive file list for the CWD so a bare `@query`
 // doesn't re-walk the whole tree (up to 40k entries) on every keystroke (P1-18).
 // The walk is the expensive part (40k stat calls); filtering the cached list by
@@ -243,6 +290,8 @@ var mentionCache = struct {
 	list    []mentionItem
 	at      time.Time
 	walking bool // a background walk for `cwd` is in flight (prevents duplicate/clobbering walks)
+	done    chan struct{}
+	err     error
 }{}
 
 const mentionCacheTTL = 2 * time.Second
@@ -254,9 +303,18 @@ const mentionCacheCap = 10000
 // returns an empty result while the first walk is in flight. The `walking` flag
 // guarantees only one walk per cwd at a time (no duplicate or clobbering fills).
 func recursiveSearch(prefix string) []mentionItem {
+	items, _ := recursiveSearchWithRefresh(prefix)
+	return items
+}
+
+// recursiveSearchWithRefresh returns currently cached matches and, while a
+// walk is in flight, a command that emits mentionSearchMsg as soon as it
+// finishes. Returning a Tea command is what makes the flyout redraw without
+// requiring the user to press another key.
+func recursiveSearchWithRefresh(prefix string) ([]mentionItem, tea.Cmd) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	mentionCache.Lock()
 	needWalk := false
@@ -266,21 +324,32 @@ func recursiveSearch(prefix string) []mentionItem {
 		if !mentionCache.walking || mentionCache.cwd != cwd {
 			mentionCache.walking = true
 			mentionCache.cwd = cwd // claim this cwd so a concurrent call doesn't re-walk
+			mentionCache.done = make(chan struct{})
+			mentionCache.err = nil
 			needWalk = true
 		}
 	}
 	list := mentionCache.list
+	done := mentionCache.done
+	walking := mentionCache.walking
 	mentionCache.Unlock()
 
 	if needWalk {
-		go fillMentionCache(cwd)
+		go fillMentionCache(cwd, done)
 	}
 
 	// While the first walk is in flight the cache is empty — return nothing so
 	// the flyout stays open (the next keystroke re-evals against the filled
 	// cache). On a large repo the walk completes well within a few keystrokes.
+	var refresh tea.Cmd
+	if needWalk && walking && done != nil {
+		refresh = func() tea.Msg {
+			<-done
+			return mentionSearchMsg{cwd: cwd}
+		}
+	}
 	if len(list) == 0 {
-		return nil
+		return nil, refresh
 	}
 
 	lp := strings.ToLower(prefix)
@@ -294,29 +363,47 @@ func recursiveSearch(prefix string) []mentionItem {
 		}
 	}
 	sortMentionItems(items)
-	return items
+	return items, refresh
 }
 
 // fillMentionCache walks the CWD once and stores the result. Runs in a goroutine
 // so it never blocks the UI thread; only commits if the cwd hasn't changed
 // under us (a cd race), and always clears the in-progress flag.
-func fillMentionCache(cwd string) {
-	walked := walkMentionList(cwd)
+func fillMentionCache(cwd string, done chan struct{}) {
+	walked, walkErr := walkMentionListResult(cwd)
 	mentionCache.Lock()
 	defer mentionCache.Unlock()
 	if mentionCache.cwd == cwd {
 		mentionCache.list = walked
 		mentionCache.at = time.Now()
+		mentionCache.err = walkErr
+		mentionCache.walking = false
+		if mentionCache.done == done {
+			mentionCache.done = nil
+		}
 	}
-	mentionCache.walking = false
+	if done != nil {
+		close(done)
+	}
 }
 
 // walkMentionList walks the CWD once, collecting non-ignored entries (capped at
 // mentionCacheCap) with relative paths. Hidden files and heavy dirs are pruned.
 func walkMentionList(cwd string) []mentionItem {
+	items, _ := walkMentionListResult(cwd)
+	return items
+}
+
+func walkMentionListResult(cwd string) ([]mentionItem, error) {
+	if items, ok := gitMentionList(cwd); ok {
+		return items, nil
+	}
 	var items []mentionItem
 	visited := 0
-	_ = filepath.WalkDir(cwd, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(cwd, func(path string, d fs.DirEntry, err error) error {
+		if path == cwd && err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}
@@ -352,7 +439,61 @@ func walkMentionList(cwd string) []mentionItem {
 		}
 		return nil
 	})
-	return items
+	return items, err
+}
+
+// gitMentionList asks Git for tracked and non-ignored untracked files. Besides
+// honoring the repository's real ignore policy, this avoids traversing heavy
+// generated directories. Inferred directory rows preserve drill-in discovery.
+func gitMentionList(cwd string) ([]mentionItem, bool) {
+	cmd := exec.Command("git", "-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false
+	}
+	seen := make(map[string]bool)
+	var items []mentionItem
+	add := func(path string, dir bool) {
+		path = filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+		if path == "." || filepath.IsAbs(path) || strings.HasPrefix(path, "../") || seen[path] {
+			return
+		}
+		seen[path] = true
+		display, insert := path, path
+		if dir {
+			display += "/"
+			insert += "/"
+		}
+		items = append(items, mentionItem{display: display, insert: insert, isDir: dir})
+	}
+	for _, raw := range strings.Split(string(out), "\x00") {
+		path := strings.TrimPrefix(filepath.ToSlash(raw), "./")
+		if path == "" {
+			continue
+		}
+		parts := strings.Split(path, "/")
+		for i := 1; i < len(parts); i++ {
+			add(strings.Join(parts[:i], "/"), true)
+		}
+		add(path, false)
+		if len(items) >= mentionCacheCap {
+			break
+		}
+	}
+	sortMentionItems(items)
+	return items, true
+}
+
+func currentMentionSearchState() (mentionSearchState, error) {
+	mentionCache.Lock()
+	defer mentionCache.Unlock()
+	if mentionCache.walking {
+		return mentionSearchLoading, nil
+	}
+	if mentionCache.err != nil {
+		return mentionSearchFailed, mentionCache.err
+	}
+	return mentionSearchReady, nil
 }
 
 func isIgnoredDir(name string) bool {
@@ -383,18 +524,10 @@ func (s *session) renderMentionFlyout() string {
 	if !s.mentionActive {
 		return ""
 	}
-	w := s.width
-	if w < 24 {
-		w = 24
-	}
-	boxW := w - 2
-	if boxW < 20 {
-		boxW = 20
-	}
+	w := max(1, s.width)
+	boxW := max(1, w-2)
 	rowW := boxW - 4 // rounded border(2) + padding(2)
-	if rowW < 4 {
-		rowW = 4
-	}
+	rowW = max(1, rowW)
 
 	hiStyle := lipgloss.NewStyle().
 		Background(lipgloss.Color(c.dim)).
@@ -414,7 +547,20 @@ func (s *session) renderMentionFlyout() string {
 	}
 
 	var lines []string
-	if n == 0 {
+	state, searchErr := mentionSearchReady, error(nil)
+	runes := []rune(s.input.Value())
+	pos := s.input.Position()
+	if s.mentionAt >= 0 && pos > s.mentionAt && pos <= len(runes) {
+		query := string(runes[s.mentionAt+1 : pos])
+		if query != "" && !strings.Contains(query, "/") {
+			state, searchErr = currentMentionSearchState()
+		}
+	}
+	if state == mentionSearchLoading {
+		lines = append(lines, dimStyle.Render("  Searching files…"))
+	} else if state == mentionSearchFailed {
+		lines = append(lines, dimStyle.Render("  Search failed: "+truncateFit(searchErr.Error(), max(1, rowW-4))))
+	} else if n == 0 {
 		lines = append(lines, dimStyle.Render("  (no file matches)"))
 	} else {
 		start := s.mentionScroll
@@ -427,7 +573,7 @@ func (s *session) renderMentionFlyout() string {
 			if i == s.mentionCursor {
 				marker = accentStyle.Render("▸ ")
 			}
-			disp := truncateRunes(items[i].display, rowW-3)
+			disp := truncateRunes(items[i].display, max(1, rowW-3))
 			icon := "  "
 			if items[i].isDir {
 				icon = mutedStyle.Render("▾ ")
@@ -442,7 +588,18 @@ func (s *session) renderMentionFlyout() string {
 			lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d more · ↑↓ scroll)", n-mentionMaxVisible)))
 		}
 	}
-	hint := dimStyle.Render("  ↑↓ navigate · tab/enter select · esc close")
+	accept, selectKey, closeKey := s.keyHint("mention_accept"), s.keyHint("select"), s.keyHint("close")
+	var controls []string
+	if accept != "" {
+		controls = append(controls, accept+" select")
+	}
+	if selectKey != "" && selectKey != accept {
+		controls = append(controls, selectKey+" select")
+	}
+	if closeKey != "" {
+		controls = append(controls, closeKey+" close")
+	}
+	hint := dimStyle.Render("  ↑↓ navigate · " + strings.Join(controls, " · "))
 	lines = append(lines, hint)
 	body := strings.Join(lines, "\n")
 	return lipgloss.NewStyle().
@@ -450,6 +607,7 @@ func (s *session) renderMentionFlyout() string {
 		BorderForeground(lipgloss.Color(c.accent)).
 		Padding(0, 1).
 		Width(boxW).
+		MaxWidth(w).
 		Render(body)
 }
 

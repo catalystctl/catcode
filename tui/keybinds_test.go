@@ -485,11 +485,13 @@ func TestRemappedApprovalKey(t *testing.T) {
 	s.keybinds["approve"] = "x"
 	s.pendingApproval = &approvalPrompt{requestID: "r1", tool: "bash", args: "{}"}
 
-	// 'y' should no longer approve.
+	// 'y' should no longer approve (and is typed into the composer instead).
 	_, _ = s.handleKey(keyMsg("y"))
 	if s.pendingApproval == nil {
 		t.Fatal("y should NOT approve after remap to x")
 	}
+	// Decision keys only fire when the composer is empty.
+	s.input.Reset()
 	// 'x' should approve.
 	_, _ = s.handleKey(keyMsg("x"))
 	if s.pendingApproval != nil {

@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -31,28 +33,42 @@ const (
 	blkWarn
 	blkError
 	blkApprove
-	blkRaw // pre-styled string rendered verbatim (e.g. the /model list)
+	blkTrimmed // synthetic marker showing that older in-memory history was evicted
+	blkRaw     // pre-styled string rendered verbatim (e.g. the /model list)
+)
+
+type approvalBlockState uint8
+
+const (
+	approvalPending approvalBlockState = iota
+	approvalApproved
+	approvalAlways
+	approvalDenied
 )
 
 type block struct {
-	kind      blockKind
-	text      strings.Builder // streamed content (assistant / thinking) or raw
-	name      string          // tool name (blkTool / blkApprove)
-	args      string          // tool args
-	output    string          // blkToolResult
-	diff      string          // blkTool: unified-diff text (tool_result only); shown instead of output when present
-	started   time.Time       // blkTool: when the call began
-	dur       time.Duration   // blkTool: elapsed until result
-	collapsed bool            // blkThinking only
-	model     string          // blkAssistant: model id (for the role line)
-	sub       bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
-	id        string          // blkTool: tool-call id, to match results out of order
-	expanded  bool            // blkTool / blkToolResult: full output shown (ctrl+o)
-	ok        bool            // blkTool: outcome.ok from tool_result (false on error/deny)
-	hasOk     bool            // blkTool: true once a result landed (distinguishes in-flight)
-	renderW   int             // P1-12: width the streaming block was last rendered at
-	renderLen int             // P1-12: text length at last render (throttle)
-	renderStr string          // P1-12: cached render of the streaming block
+	kind        blockKind
+	text        strings.Builder // streamed content (assistant / thinking) or raw
+	name        string          // tool name (blkTool / blkApprove)
+	args        string          // tool args
+	output      string          // blkToolResult
+	diff        string          // blkTool: unified-diff text (tool_result only); shown instead of output when present
+	started     time.Time       // blkTool: when the call began
+	dur         time.Duration   // blkTool: elapsed until result
+	collapsed   bool            // blkThinking only
+	model       string          // blkAssistant: model id (for the role line)
+	sub         bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
+	id          string          // blkTool: tool-call id, to match results out of order
+	expanded    bool            // blkTool / blkToolResult: full output shown (ctrl+o)
+	ok          bool            // blkTool: outcome.ok from tool_result (false on error/deny)
+	hasOk       bool            // blkTool: true once a result landed (distinguishes in-flight)
+	renderW     int             // P1-12: width the streaming block was last rendered at
+	renderLen   int             // P1-12: text length at last render (throttle)
+	renderStr   string          // P1-12: cached render of the streaming block
+	renderStart int             // first rendered transcript line (zero based)
+	renderEnd   int             // last rendered transcript line (inclusive)
+	approval    approvalBlockState
+	trimmed     int // blkTrimmed: number of evicted blocks
 }
 
 // push appends a block and updates the streaming cursor. Streaming kinds
@@ -72,15 +88,28 @@ func (s *session) push(kind blockKind) *block {
 		// Drop the oldest finalized blocks and reset the render cache (its prefix
 		// no longer matches the shifted indices). `s.cur` is always the newest
 		// block, so it's never trimmed.
-		trim := len(s.blocks) - maxBlocks
+		trim := len(s.blocks) - (maxBlocks - 1)
+		trimmed := trim
+		if len(s.blocks) > 0 && s.blocks[0] != nil && s.blocks[0].kind == blkTrimmed {
+			trim = len(s.blocks) - maxBlocks
+			trimmed = trim + s.blocks[0].trimmed
+			trim++ // discard the old marker as well
+		}
 		// Copy into a fresh backing slice instead of slicing (s.blocks[trim:]).
 		// Slicing alone keeps the old backing array — and the *block pointers in
 		// its dropped prefix — alive for the whole session, pinning the trimmed
 		// blocks' rendered strings and slowly creeping RSS. A fresh copy lets the
 		// GC reclaim the old array and its stale prefix.
 		kept := make([]*block, 0, maxBlocks+8)
+		kept = append(kept, &block{kind: blkTrimmed, trimmed: trimmed})
 		kept = append(kept, s.blocks[trim:]...)
 		s.blocks = kept
+		if s.focusedBlock >= 0 {
+			s.focusedBlock = s.focusedBlock - trim + 1 // new marker occupies index 0
+			if s.focusedBlock < 0 {
+				s.focusedBlock = -1
+			}
+		}
 		s.invalidateAll()
 	}
 	if kind == blkAssistant || kind == blkThinking {
@@ -96,6 +125,16 @@ func (s *session) push(kind blockKind) *block {
 func (s *session) invalidateAll() {
 	s.cache.Reset()
 	s.cacheIdx = 0
+	for _, b := range s.blocks {
+		if b != nil {
+			b.renderStr = ""
+		}
+	}
+	for _, b := range s.blocks {
+		if b != nil {
+			b.renderStart, b.renderEnd = 0, -1
+		}
+	}
 }
 
 // renderBlocks returns the full viewport content. Finalized blocks are cached
@@ -105,8 +144,27 @@ func (s *session) invalidateAll() {
 // ponytail: full re-render (invalidateAll) only on resize/toggle; very long
 // histories re-wrap the current streaming block per token (upgrade: cache
 // wrapped lines per finalized block keyed by width).
+// hasConversation reports whether the transcript contains real chat turns
+// (user/assistant/tools). Status/error-only blocks do not count, so the
+// welcome screen survives startup chatter and failed auth probes.
+func (s *session) hasConversation() bool {
+	for _, b := range s.blocks {
+		if b == nil {
+			continue
+		}
+		switch b.kind {
+		case blkUser, blkAssistant, blkThinking, blkTool, blkToolResult, blkApprove:
+			return true
+		}
+	}
+	return false
+}
+
 func (s *session) renderBlocks() string {
-	if len(s.blocks) == 0 {
+	if s.coreLifecycle == coreFailed && !s.hasConversation() {
+		return s.renderCoreFailure()
+	}
+	if !s.hasConversation() {
 		return s.renderWelcome()
 	}
 	w := s.viewport.Width()
@@ -115,14 +173,20 @@ func (s *session) renderBlocks() string {
 		if blk == s.cur || isInFlight(blk) {
 			break // don't cache the live streaming block or in-flight tools
 		}
-		s.cache.WriteString(s.renderBlock(blk, w))
+		start := renderedLineOffset(s.cache.String())
+		rendered := s.renderBlock(blk, w)
+		blk.renderStart, blk.renderEnd = start, start+lipgloss.Height(rendered)-1
+		s.cache.WriteString(rendered)
 		s.cache.WriteString("\n\n") // breathing room between blocks
 		s.cacheIdx++
 	}
 	var b strings.Builder
 	b.WriteString(s.cache.String())
 	if s.cur != nil {
-		b.WriteString(s.renderBlock(s.cur, w))
+		rendered := s.renderBlock(s.cur, w)
+		start := renderedLineOffset(b.String())
+		s.cur.renderStart, s.cur.renderEnd = start, start+lipgloss.Height(rendered)-1
+		b.WriteString(rendered)
 		b.WriteString("\n\n")
 	}
 	// Trailing in-flight tools render live: a spawn scout is shown in the
@@ -136,10 +200,59 @@ func (s *session) renderBlocks() string {
 		if blk.name == "spawn" || blk.name == "subagent" {
 			continue // active-tasks panel renders the scout
 		}
-		b.WriteString(s.renderBlock(blk, w))
+		rendered := s.renderBlock(blk, w)
+		start := renderedLineOffset(b.String())
+		blk.renderStart, blk.renderEnd = start, start+lipgloss.Height(rendered)-1
+		b.WriteString(rendered)
 		b.WriteString("\n\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderedLineOffset(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n")
+}
+
+// scheduleStreamRefresh coalesces token deltas into one viewport rebuild per
+// frame. The core-event pump remains armed, so streaming throughput and tool /
+// approval latency are unaffected while long transcripts avoid SetContent on
+// every token.
+func (s *session) scheduleStreamRefresh() tea.Cmd {
+	wait := waitForEvent(s.coreEvents, s.coreStartGen)
+	if s.streamRefreshPending {
+		return wait
+	}
+	s.streamRefreshPending = true
+	frameDelay := 33 * time.Millisecond
+	if len(s.blocks) > 300 {
+		frameDelay = 100 * time.Millisecond
+	} else if len(s.blocks) > 100 {
+		frameDelay = 66 * time.Millisecond
+	}
+	return tea.Batch(wait, tea.Tick(frameDelay, func(time.Time) tea.Msg {
+		return streamRefreshMsg{}
+	}))
+}
+
+func (s *session) renderCoreFailure() string {
+	w, h := s.viewport.Width(), s.viewport.Height()
+	msg := strings.TrimSpace(s.coreFailure)
+	if msg == "" {
+		msg = "The core failed to start."
+	}
+	rows := []string{
+		errStyle.Render("Core unavailable"), "", baseStyle.Render(msg), "",
+		accentStyle.Render("r") + baseStyle.Render(" retry   ") + accentStyle.Render("q") + baseStyle.Render(" quit"),
+		"", dimStyle.Render("Debug log: " + filepath.Join(configDir(), "debug.jsonl")),
+	}
+	panelW := min(68, max(20, w-4))
+	panel := lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.err)).Padding(0, 1).Width(panelW).
+		Render(strings.Join(rows, "\n"))
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 }
 
 // refresh re-renders the transcript into the viewport. When follow mode is on
@@ -162,26 +275,34 @@ func (s *session) logUser(text string) {
 	s.refresh()
 }
 
+// logInfo / logSuccess / logWarn go to the ephemeral toast rail so operational
+// chatter does not pollute the transcript or kill the welcome screen.
 func (s *session) logInfo(text string) {
-	b := s.push(blkInfo)
-	b.text.WriteString(text)
-	s.refresh()
+	s.setToast(toastInfo, text)
 }
 
 func (s *session) logSuccess(text string) {
-	b := s.push(blkSuccess)
-	b.text.WriteString(text)
-	s.refresh()
+	s.setToast(toastSuccess, text)
 }
 
 func (s *session) logWarn(text string) {
-	b := s.push(blkWarn)
-	b.text.WriteString(text)
-	s.refresh()
+	s.setToast(toastWarn, text)
 }
 
+// logError stays in the transcript — real failures should remain reviewable —
+// and also flashes a toast so the user notices without scrolling.
 func (s *session) logError(text string) {
 	b := s.push(blkError)
+	b.text.WriteString(text)
+	s.refresh()
+	s.setToast(toastError, text)
+}
+
+// logPersist writes a lasting info/success line into the transcript (stats,
+// multi-line reports). Prefer this over logInfo when the user needs to scroll
+// back to the content.
+func (s *session) logPersist(kind blockKind, text string) {
+	b := s.push(kind)
 	b.text.WriteString(text)
 	s.refresh()
 }
@@ -249,6 +370,31 @@ func (s *session) logApproveDiff(tool, args, diff string) {
 	s.refresh()
 }
 
+// resolveLatestApproval makes the transcript truthful after the sticky
+// approval prompt is dismissed. Call it with the core decision ("yes",
+// "always", or "no") or its equivalent UI label before clearing the prompt.
+func (s *session) resolveLatestApproval(decision string) {
+	for i := len(s.blocks) - 1; i >= 0; i-- {
+		b := s.blocks[i]
+		if b == nil || b.kind != blkApprove || b.approval != approvalPending {
+			continue
+		}
+		switch decision {
+		case "yes", "approved once":
+			b.approval = approvalApproved
+		case "always", "always allowed":
+			b.approval = approvalAlways
+		case "no", "denied":
+			b.approval = approvalDenied
+		default:
+			return
+		}
+		s.invalidateAll()
+		s.refresh()
+		return
+	}
+}
+
 // logRaw pushes a pre-styled string verbatim (no further wrapping/styling).
 func (s *session) logRaw(styled string) {
 	b := s.push(blkRaw)
@@ -279,13 +425,30 @@ func (s *session) renderBlock(b *block, w int) string {
 		if !force && len(text)-b.renderLen < streamBatch {
 			return b.renderStr
 		}
-		out := s.renderBlockFull(b, w)
+		out := s.decorateFocusedBlock(b, s.renderKeyHints(s.renderBlockFull(b, w)))
 		b.renderW = w
 		b.renderStr = out
 		b.renderLen = len(text)
 		return out
 	}
-	return s.renderBlockFull(b, w)
+	return s.decorateFocusedBlock(b, s.renderKeyHints(s.renderBlockFull(b, w)))
+}
+
+func (s *session) decorateFocusedBlock(b *block, out string) string {
+	if s.focusedBlock >= 0 && s.focusedBlock < len(s.blocks) && s.blocks[s.focusedBlock] == b {
+		return accentStyle.Render("▸ focused") + "\n" + out
+	}
+	return out
+}
+
+func (s *session) renderKeyHints(out string) string {
+	if key := s.keyLabel("toggle_tool_output"); key != "" {
+		out = strings.ReplaceAll(out, "ctrl+o", key)
+	}
+	if key := s.keyLabel("toggle_reasoning"); key != "" {
+		out = strings.ReplaceAll(out, "ctrl+t", key)
+	}
+	return out
 }
 
 const streamBatch = 64 // P1-12: bytes of streaming growth between full re-renders
@@ -337,16 +500,41 @@ func (s *session) renderBlockFull(b *block, w int) string {
 	case blkApprove:
 		// compact history marker; the live decision is the sticky banner. Reuses
 		// the per-tool head grammar so the marker names the target, not a JSON blob.
-		head := warnStyle.Render("? approve ") +
+		prefix, style := "? awaiting approval ", warnStyle
+		switch b.approval {
+		case approvalApproved:
+			prefix, style = "✓ approved ", successStyle
+		case approvalAlways:
+			prefix, style = "✓ approved always ", successStyle
+		case approvalDenied:
+			prefix, style = "✗ denied ", errStyle
+		}
+		head := style.Render(prefix) +
 			toolNameStyleFor(b.name).Render(toolIcon(b.name)+" "+toolDisplayName(b.name))
 		if ka := keyArgFor(b.name, b.args); ka != "" {
 			head += toolDetailStyle.Render("  " + truncate(ka, 60))
 		}
-		head += dimStyle.Render("   [y]es  [n]o  [a]lways")
+		if b.approval == approvalPending {
+			var controls []string
+			if key := s.keyHint("approve"); key != "" {
+				controls = append(controls, "["+key+"] approve")
+			}
+			if key := s.keyHint("deny"); key != "" {
+				controls = append(controls, "["+key+"] deny")
+			}
+			if key := s.keyHint("approve_always"); key != "" {
+				controls = append(controls, "["+key+"] always")
+			}
+			if len(controls) > 0 {
+				head += dimStyle.Render("   " + strings.Join(controls, "  "))
+			}
+		}
 		if strings.TrimSpace(b.diff) != "" {
-			head += "\n" + renderDiffPanel(b.diff, b.expanded, s.width)
+			head += "\n" + renderDiffPanel(b.diff, b.expanded, s.width, s.keyHint("toggle_tool_output"))
 		}
 		return head
+	case blkTrimmed:
+		return dimStyle.Italic(true).Render(fmt.Sprintf("⋯ %d older transcript blocks hidden · reopen the session to view full history", b.trimmed))
 	case blkRaw:
 		return b.text.String()
 	}
@@ -475,7 +663,7 @@ func resultPanel(output string, w int, err bool) string {
 
 // lastToolOutputBlock returns the most recent block carrying tool output
 // (a top-level blkTool with a result, or a standalone blkToolResult). Used
-// by ctrl+o to expand the call the user just saw.
+// by ctrl+o when pinned to the bottom.
 func (s *session) lastToolOutputBlock() *block {
 	for i := len(s.blocks) - 1; i >= 0; i-- {
 		b := s.blocks[i]
@@ -490,6 +678,58 @@ func (s *session) lastToolOutputBlock() *block {
 		}
 	}
 	return nil
+}
+
+// nearestToolOutputBlock picks the tool output nearest the visible viewport.
+// renderBlocks records exact line ranges, avoiding the old scroll-percentage
+// approximation (which selected the wrong card whenever block heights varied).
+func (s *session) nearestToolOutputBlock() *block {
+	var candidates []*block
+	for _, b := range s.blocks {
+		if b == nil {
+			continue
+		}
+		if b.kind == blkToolResult {
+			candidates = append(candidates, b)
+			continue
+		}
+		if b.kind == blkApprove && strings.TrimSpace(b.diff) != "" {
+			candidates = append(candidates, b)
+			continue
+		}
+		if b.kind == blkTool && !b.sub && b.dur > 0 && strings.TrimSpace(b.output) != "" {
+			candidates = append(candidates, b)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if s.follow || s.viewport.AtBottom() {
+		return candidates[len(candidates)-1]
+	}
+	top := s.viewport.YOffset()
+	bottom := top + max(1, s.viewport.VisibleLineCount()) - 1
+	center := (top + bottom) / 2
+	best, bestDistance := candidates[0], int(^uint(0)>>1)
+	for _, candidate := range candidates {
+		distance := 0
+		switch {
+		case candidate.renderEnd < top:
+			distance = top - candidate.renderEnd
+		case candidate.renderStart > bottom:
+			distance = candidate.renderStart - bottom
+		default:
+			blockCenter := (candidate.renderStart + candidate.renderEnd) / 2
+			distance = blockCenter - center
+			if distance < 0 {
+				distance = -distance
+			}
+		}
+		if distance < bestDistance {
+			best, bestDistance = candidate, distance
+		}
+	}
+	return best
 }
 
 // findSubProgress returns the live progress entry for runID, or nil.
@@ -627,6 +867,43 @@ func (s *session) renderWelcome() string {
 
 	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
 	sub := mutedStyle.Render("a multi-provider coding agent")
+	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
+		panelW := min(50, max(20, w-4))
+		panel := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(c.dim)).
+			Padding(0, 1).
+			Width(panelW).
+			Render(accentStyle.Render("◷ Starting…") + "\n\n" +
+				baseStyle.Render("Connecting to the core and checking credentials."))
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, brand+"\n"+sub+"\n\n"+panel)
+	}
+
+	// Unauthed first-run: lead with login instead of example prompts.
+	if !s.authed {
+		panelW := 50
+		if w-4 < panelW {
+			panelW = w - 4
+		}
+		if panelW < 30 {
+			panelW = 30
+		}
+		rows := []string{
+			accentStyle.Render("◆ Get started"),
+			"",
+			baseStyle.Render("No API key yet — log in to start chatting."),
+			"",
+			dimStyle.Render("Enter opens /login · / for commands · ? help"),
+		}
+		panel := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(c.dim)).
+			Padding(0, 1).
+			Width(panelW).
+			Render(strings.Join(rows, "\n"))
+		content := brand + "\n" + sub + "\n\n" + panel
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
+	}
 
 	// build the example panel
 	panelW := 50

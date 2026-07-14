@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/rivo/uniseg"
 )
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,9 @@ var (
 // pillStyle returns a solid-background pill chip style for header tags.
 // ponytail: no rounded border on pills — solid bg reads cleaner at small size.
 func pillStyle(bg string) lipgloss.Style {
+	if colorsDisabled() {
+		return lipgloss.NewStyle().Bold(true).Underline(true).Padding(0, 1)
+	}
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color(c.bg)).
 		Background(lipgloss.Color(bg)).
@@ -96,9 +100,9 @@ func renderFlow(text string, st lipgloss.Style) string {
 	return strings.Join(lines, "\n")
 }
 
-// wrapPlain is a greedy word-wrap (breaks at spaces, hard-breaks long tokens).
-// rune-counted, not display-width-aware: CJK/emoji wide chars may overflow.
-// ponytail: swap for runewidth-based wrap if wide-char content misaligns boxes.
+// wrapPlain is a greedy display-cell-aware word-wrap. It iterates grapheme
+// clusters, so combining marks and emoji ZWJ sequences are never split and
+// wide CJK characters cannot overflow bordered surfaces.
 func wrapPlain(text string, w int) string {
 	if w < 1 {
 		w = 1
@@ -111,33 +115,49 @@ func wrapPlain(text string, w int) string {
 }
 
 func wrapLine(line string, w int) []string {
-	r := []rune(line)
-	if len(r) == 0 {
+	type cluster struct {
+		text  string
+		width int
+	}
+	var cs []cluster
+	g := uniseg.NewGraphemes(line)
+	for g.Next() {
+		cs = append(cs, cluster{text: g.Str(), width: g.Width()})
+	}
+	if len(cs) == 0 {
 		return []string{""}
 	}
 	var out []string
-	for len(r) > 0 {
-		end := w
-		if end > len(r) {
-			end = len(r)
-		}
-		if end < len(r) {
-			// break at the last space within r[1:end] to keep words intact
-			brk := -1
-			for j := end - 1; j > 0; j-- {
-				if r[j] == ' ' {
-					brk = j
-					break
-				}
+	for len(cs) > 0 {
+		width, end, lastSpace := 0, 0, -1
+		for end < len(cs) {
+			cw := cs[end].width
+			if end > 0 && width+cw > w {
+				break
 			}
-			if brk > 0 {
-				out = append(out, string(r[:brk]))
-				r = r[brk+1:] // skip the space
-				continue
+			// Always consume one cluster, even when it is wider than a
+			// pathological one-column viewport, so wrapping makes progress.
+			width += cw
+			if cs[end].text == " " {
+				lastSpace = end
+			}
+			end++
+			if width >= w {
+				break
 			}
 		}
-		out = append(out, string(r[:end]))
-		r = r[end:]
+		cut := end
+		skip := 0
+		if end < len(cs) && lastSpace > 0 {
+			cut = lastSpace
+			skip = 1
+		}
+		var b strings.Builder
+		for _, c := range cs[:cut] {
+			b.WriteString(c.text)
+		}
+		out = append(out, b.String())
+		cs = cs[cut+skip:]
 	}
 	return out
 }
@@ -150,19 +170,29 @@ func dimRule(w int) string {
 	return dimStyle.Render(strings.Repeat("─", w))
 }
 
-// truncate clips a string to maxRunes, appending "…" if it was shortened.
-func truncate(s string, maxRunes int) string {
-	if maxRunes <= 0 {
+// truncate clips a string to maxCells display columns, appending "…" if it
+// was shortened. Grapheme clusters are kept intact.
+func truncate(s string, maxCells int) string {
+	if maxCells <= 0 {
 		return s
 	}
-	r := []rune(s)
-	if len(r) <= maxRunes {
+	if uniseg.StringWidth(s) <= maxCells {
 		return s
 	}
-	if maxRunes <= 1 {
+	if maxCells <= 1 {
 		return "…"
 	}
-	return string(r[:maxRunes-1]) + "…"
+	var b strings.Builder
+	used := 0
+	g := uniseg.NewGraphemes(s)
+	for g.Next() {
+		if used+g.Width() > maxCells-1 {
+			break
+		}
+		b.WriteString(g.Str())
+		used += g.Width()
+	}
+	return b.String() + "…"
 }
 
 // truncatePath front-truncates a filesystem path (keeps the last segments, the
@@ -172,11 +202,26 @@ func truncatePath(p string, maxRunes int) string {
 	if maxRunes <= 3 {
 		return p
 	}
-	r := []rune(p)
-	if len(r) <= maxRunes {
+	if uniseg.StringWidth(p) <= maxRunes {
 		return p
 	}
-	return "…" + string(r[len(r)-(maxRunes-1):])
+	// Build from the end while preserving whole grapheme clusters.
+	var parts []string
+	used := 1
+	g := uniseg.NewGraphemes(p)
+	for g.Next() {
+		parts = append(parts, g.Str())
+	}
+	start := len(parts)
+	for start > 0 {
+		cw := uniseg.StringWidth(parts[start-1])
+		if used+cw > maxRunes {
+			break
+		}
+		used += cw
+		start--
+	}
+	return "…" + strings.Join(parts[start:], "")
 }
 
 // ---------------------------------------------------------------------------

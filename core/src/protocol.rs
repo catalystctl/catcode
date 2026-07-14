@@ -140,6 +140,15 @@ pub enum Command {
     /// Load a specific session file (replaces the current conversation).
     #[serde(rename = "load_session")]
     LoadSession { path: String },
+    /// Set a human-readable title for a saved session.
+    #[serde(rename = "rename_session")]
+    RenameSession { path: String, title: String },
+    /// Delete a non-active saved session and its metadata.
+    #[serde(rename = "delete_session")]
+    DeleteSession { path: String },
+    /// Pin/unpin a session in the picker.
+    #[serde(rename = "pin_session")]
+    PinSession { path: String, pinned: bool },
     /// Start a fresh session file in the same project directory. The current
     /// file is left intact so sessions accumulate per project. An optional
     /// `path` (a filename) overrides the auto-generated name.

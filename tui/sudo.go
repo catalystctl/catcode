@@ -69,7 +69,6 @@ func (s *session) sendSudoReply(p *sudoPrompt, approved bool) {
 		"password":   pw,
 	})
 	s.pendingSudo = nil
-	s.input.Reset()
 	s.input.Focus()
 	s.layout()
 }
@@ -93,7 +92,11 @@ func (s *session) handleSudoKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Enter: approve + send the password.
 	if s.kb(msg, "send") {
 		if strings.TrimSpace(p.input.Value()) == "" {
-			p.errMsg = "Password is required — type it, or press Esc to decline"
+			closeKey := s.keyHint("close")
+			if closeKey == "" {
+				closeKey = "the decline key"
+			}
+			p.errMsg = "Password is required — type it, or press " + closeKey + " to decline"
 			return s, nil
 		}
 		s.sendSudoReply(p, true)
@@ -128,23 +131,29 @@ func (s *session) renderSudoOverlay(base string) string {
 func (s *session) renderSudoBox() string {
 	p := s.pendingSudo
 	boxW := s.width - 8
+	if s.width < 48 {
+		boxW = s.width
+	}
 	if boxW > 74 {
 		boxW = 74
 	}
-	if boxW < 40 {
-		boxW = 40
+	if boxW < 1 {
+		boxW = 1
 	}
-	inner := boxW - 4
+	inner := boxW - 6 // border(2) + horizontal padding(4)
+	if inner < 1 {
+		inner = 1
+	}
 
 	var b strings.Builder
-	title := warnStyle.Render("🔐 Sudo command requested")
+	title := warnStyle.Render(truncate("🔐 Sudo command requested", inner))
 	b.WriteString(title + "\n\n")
 
-	b.WriteString(mutedStyle.Render("The agent wants to run a command that needs sudo:") + "\n")
-	b.WriteString(codeTextStyle.Render(truncate(p.command, inner-2)) + "\n\n")
+	b.WriteString(mutedStyle.Render(truncate("The agent wants to run a command that needs sudo:", inner)) + "\n")
+	b.WriteString(codeTextStyle.Render(truncate(p.command, max(1, inner-2))) + "\n\n")
 
-	b.WriteString(mutedStyle.Render("Enter your sudo password to approve:") + "\n")
-	p.input.SetWidth(inner - 8)
+	b.WriteString(mutedStyle.Render(truncate("Enter your sudo password to approve:", inner)) + "\n")
+	p.input.SetWidth(max(1, inner-8))
 	b.WriteString("    " + p.input.View() + "\n")
 
 	b.WriteString("\n")
@@ -153,14 +162,38 @@ func (s *session) renderSudoBox() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	footer := mutedStyle.Render("[Enter] approve · [Esc] decline (command will NOT run)")
-	countdown := warnStyle.Render(fmt.Sprintf("⏱ auto-close in %ds", remaining))
-	b.WriteString(footer + "  " + countdown)
+	sendKey, closeKey := s.keyHint("send"), s.keyHint("close")
+	if sendKey == "" {
+		sendKey = "unbound"
+	}
+	if closeKey == "" {
+		closeKey = "unbound"
+	}
+	footer := fmt.Sprintf("[%s] approve · [%s] decline · auto-close %ds", sendKey, closeKey, remaining)
+	b.WriteString(mutedStyle.Render(truncate(footer, inner)))
 	if p.errMsg != "" {
-		b.WriteString("\n" + errStyle.Render("✗ "+p.errMsg))
+		b.WriteString("\n" + errStyle.Render(truncate("✗ "+p.errMsg, inner)))
 	}
 
-	body := b.String()
+	bodyLines := strings.Split(b.String(), "\n")
+	// Keep the password control and actions visible on very short terminals.
+	focusLine := 0
+	for i, line := range bodyLines {
+		if strings.Contains(line, p.input.View()) {
+			focusLine = i
+			break
+		}
+	}
+	tail := 2
+	if p.errMsg != "" {
+		tail = 3
+	}
+	bodyLines = focusWindow(bodyLines, focusLine, s.height-4, 1, tail)
+	clip := lipgloss.NewStyle().MaxWidth(inner)
+	for i := range bodyLines {
+		bodyLines[i] = clip.Render(bodyLines[i])
+	}
+	body := strings.Join(bodyLines, "\n")
 	return lipgloss.NewStyle().
 		Width(boxW).
 		Padding(1, 2).

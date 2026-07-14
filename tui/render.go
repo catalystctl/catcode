@@ -6,6 +6,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,9 +32,34 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	headerLines      = 3 // brand row + cwd row + separator
 	positionBarLines = 1 // scroll-position / new-messages bar
 )
+
+func envEnabled(names ...string) bool {
+	for _, name := range names {
+		switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	}
+	return false
+}
+
+// These environment switches make the TUI usable in assistive/log-oriented
+// environments without adding persisted settings that older cores reject.
+func prefersReducedMotion() bool {
+	return envEnabled("CATCODE_REDUCED_MOTION", "REDUCED_MOTION")
+}
+
+func plainTerminalMode() bool {
+	return envEnabled("CATCODE_PLAIN", "CATCODE_NO_ALT_SCREEN")
+}
+
+var noColorANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// headerHeight is deliberately measured rather than hard-coded: compact
+// terminals use a single header row, while normal terminals retain both rows.
+func (s *session) headerHeight() int { return lipgloss.Height(s.renderHeader()) + 1 }
 
 // relayoutHeights recomputes the viewport height to fit the current input-box
 // height + panels and applies it. It is CHEAP: it does not re-render the
@@ -47,6 +74,9 @@ func (s *session) relayoutHeights() {
 	// Fixed-height optional panels (everything except the active-tasks panel,
 	// whose entry count we cap below to fit).
 	fixedExtra := 0
+	if s.coreLifecycle == coreFailed && s.hasConversation() {
+		fixedExtra++
+	}
 	if s.updateInfo != nil {
 		fixedExtra++
 	}
@@ -58,21 +88,29 @@ func (s *session) relayoutHeights() {
 	}
 	fixedExtra += s.mentionFlyoutHeight()
 	fixedExtra += s.todoPanelHeight() + s.queueBannerHeight()
+	fixedExtra += s.toastHeight() + s.oauthBannerHeight()
 	// Space left for the viewport + the active-tasks panel, leaving 1 line of
 	// slack for v2's cursed renderer (it scrolls/overlaps when the view fills
 	// the terminal exactly).
-	avail := s.height - headerLines - positionBarLines - s.footerHeight() - fixedExtra - 1
+	avail := s.height - s.headerHeight() - positionBarLines - s.footerHeight() - fixedExtra - 1
 	// Cap the active-tasks panel so it (plus a 1-line viewport) fits the
 	// available height. Each entry renders up to 2 rows; the panel adds 3
 	// (border + header). Measured AFTER setting the cap so activeTasksHeight()
 	// reflects the truncated panel.
-	const perEntry, panelOverhead, minViewport = 2, 3, 1
+	minViewport := 3
+	if s.height < 14 {
+		minViewport = 1
+	}
+	const perEntry, panelOverhead = 2, 3
 	fit := (avail - panelOverhead - minViewport) / perEntry
 	if fit > 4 {
 		fit = 4
 	}
 	if fit < 0 {
 		fit = 0
+	}
+	if s.pendingApproval != nil {
+		fit = 0 // approvals take priority; active tasks remain in the transcript
 	}
 	s.maxTaskRows = fit
 	tasksH := s.activeTasksHeight()
@@ -82,7 +120,7 @@ func (s *session) relayoutHeights() {
 	}
 	s.viewport.SetWidth(s.width)
 	s.viewport.SetHeight(h)
-	s.input.SetWidth(s.width - 4)
+	s.input.SetWidth(max(1, s.width-4))
 }
 
 // layout recomputes heights AND re-renders the transcript. Use it on events
@@ -101,14 +139,25 @@ func (s *session) layout() {
 
 func (s *session) renderIntercomBanner() string {
 	i := s.pendingIntercom
+	sendKey, closeKey := s.keyHint("send"), s.keyHint("close")
+	if sendKey == "" {
+		sendKey = "send"
+	}
+	if closeKey == "" {
+		closeKey = "skip"
+	}
 	var msg string
 	if !s.intercomNudge.IsZero() && time.Since(s.intercomNudge) < 1500*time.Millisecond {
-		msg = "⚠ type a reply below, then ↵   ·   esc to skip"
+		msg = fmt.Sprintf("⚠ type a reply below, then %s   ·   %s to skip", sendKey, closeKey)
 	} else {
-		msg = fmt.Sprintf("❓ subagent %s asks: %s   type reply + ↵   ·   esc skip", i.from, truncate(i.message, max(1, s.width-60)))
+		queue := ""
+		if n := 1 + len(s.intercomQueue); n > 1 {
+			queue = fmt.Sprintf(" [1 of %d]", n)
+		}
+		msg = fmt.Sprintf("❓ subagent %s%s asks: %s   type reply + %s   ·   %s skip", i.from, queue, truncate(i.message, max(1, s.width-60)), sendKey, closeKey)
 	}
 	return lipgloss.NewStyle().
-		Width(s.width).
+		Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
 		Background(lipgloss.Color(c.accent)).
 		Foreground(lipgloss.Color(c.bg)).
 		Bold(true).
@@ -116,11 +165,30 @@ func (s *session) renderIntercomBanner() string {
 		Render(msg)
 }
 
+func (s *session) renderCoreFailureBanner() string {
+	if s.coreLifecycle != coreFailed || !s.hasConversation() {
+		return ""
+	}
+	msg := "core unavailable · r retry · q quit"
+	if s.coreFailure != "" && s.width >= 64 {
+		msg = truncate(s.coreFailure+" · r retry · q quit", max(1, s.width-2))
+	}
+	return lipgloss.NewStyle().MaxWidth(max(1, s.width)).
+		Foreground(lipgloss.Color(c.bg)).Background(lipgloss.Color(c.err)).Bold(true).
+		Render(" " + msg)
+}
+
 // renderHeader: a 2-line branded banner — brand + tagline on row 1, the
 // working directory + a tip on row 2 (right-aligned). The model/auth state
 // moved to the footer so the header stays clean like the reference design.
 func (s *session) renderHeader() string {
 	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
+	if s.width < 50 {
+		// On small screens identity and location are the only durable context.
+		// Tips and taglines remain available in help and would otherwise wrap.
+		cwd := dimStyle.Render(truncatePath(s.cwd, max(1, s.width-16)))
+		return lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, brand, cwd))
+	}
 	tagline := mutedStyle.Render("a multi-provider coding agent")
 	row1 := fitRow(s.width, brand, tagline)
 
@@ -147,7 +215,7 @@ func (s *session) renderPositionBar() string {
 		pct := int(s.viewport.ScrollPercent() * 100)
 		msg := fmt.Sprintf("↓ %d new · %d%% · PgDn scroll · Ctrl+End jump", below, pct)
 		return lipgloss.NewStyle().
-			Width(w).
+			Width(max(1, w-2)).MaxWidth(w).
 			Background(lipgloss.Color(c.accent)).
 			Foreground(lipgloss.Color(c.bg)).
 			Bold(true).
@@ -180,24 +248,63 @@ func (s *session) renderPositionBar() string {
 // below so the decision is on the real change, not the search/replace blobs.
 func (s *session) renderApprovalBanner() string {
 	a := s.pendingApproval
-	avail := s.width - 52 // ⚠ approve + icon name + suffix + padding headroom
+	var actions []string
+	if key := s.keyHint("approve"); key != "" {
+		actions = append(actions, "["+key+"] approve")
+	}
+	if key := s.keyHint("deny"); key != "" {
+		actions = append(actions, "["+key+"] deny")
+	}
+	if key := s.keyHint("approve_always"); key != "" {
+		actions = append(actions, "["+key+"] always")
+	}
+	controls := strings.Join(actions, " · ")
+	avail := s.width - lipgloss.Width(controls) - 24
 	if avail < 8 {
 		avail = 8
 	}
 	summary := truncate(approvalSummary(a.tool, a.args), avail)
-	msg := "⚠  approve  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " +
-		summary + "   [y]es   [n]o   [a]lways"
+	msg := "⚠  approve  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " + summary
+	if controls != "" {
+		msg += "   " + controls
+	}
 	banner := lipgloss.NewStyle().
-		Width(s.width).
+		Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
 		Background(lipgloss.Color(c.warn)).
 		Foreground(lipgloss.Color(c.bg)).
 		Bold(true).
 		Padding(0, 1).
 		Render(msg)
 	if strings.TrimSpace(a.diff) != "" {
-		banner += "\n" + renderDiffPanel(a.diff, false, s.width)
+		banner += "\n" + s.renderApprovalDiff(a)
 	}
 	return banner
+}
+
+func (s *session) renderApprovalDiff(a *approvalPrompt) string {
+	if !a.expanded {
+		return renderDiffPanel(a.diff, false, s.width, s.keyHint("toggle_tool_output"))
+	}
+	all := strings.Split(renderDiffPanel(a.diff, true, s.width, s.keyHint("toggle_tool_output")), "\n")
+	capRows := s.height / 2
+	if capRows < 3 {
+		capRows = 3
+	}
+	if capRows > len(all) {
+		capRows = len(all)
+	}
+	maxScroll := len(all) - capRows
+	if a.diffScroll > maxScroll {
+		a.diffScroll = maxScroll
+	}
+	if a.diffScroll < 0 {
+		a.diffScroll = 0
+	}
+	view := strings.Join(all[a.diffScroll:a.diffScroll+capRows], "\n")
+	if len(all) > capRows {
+		view += "\n" + dimStyle.Render(fmt.Sprintf("│ diff rows %d–%d/%d · PgUp/PgDn scroll", a.diffScroll+1, a.diffScroll+capRows, len(all)))
+	}
+	return view
 }
 
 // renderFooter: the status rail under the input box, split across two lines so
@@ -209,9 +316,14 @@ func (s *session) renderApprovalBanner() string {
 // Splitting the old single line lets the metrics breathe and keeps the state
 // read glanceable.
 func (s *session) renderFooter() string {
+	if s.width < 50 {
+		return s.renderCompactFooter()
+	}
 	// Line 1 — state & identity.
 	var left strings.Builder
-	if s.busy {
+	if s.coreLifecycle == coreFailed {
+		left.WriteString(errStyle.Render("● core unavailable"))
+	} else if s.busy {
 		left.WriteString(s.spinner.View())
 		left.WriteString(" " + accentStyle.Render("working"))
 	} else if s.authed {
@@ -227,7 +339,7 @@ func (s *session) renderFooter() string {
 	} else if len(s.models) == 0 {
 		left.WriteString(dimStyle.Render(" · leader · ") + dimStyle.Render("no model"))
 	}
-	left.WriteString(dimStyle.Render(" · " + s.approvalMode()))
+	left.WriteString(dimStyle.Render(" · " + approvalModeLabel(s.approvalMode())))
 	eff := s.settings.ReasoningEffort
 	if eff == "" {
 		eff = s.preferredLevel(s.thinkingLevels())
@@ -240,7 +352,7 @@ func (s *session) renderFooter() string {
 		left.WriteString(dimStyle.Render(" · "))
 		left.WriteString(mutedStyle.Render(s.pluginStatus))
 	}
-	statusLine := left.String()
+	statusLine := lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(left.String())
 
 	// Line 2 — metrics (left) + context budget (right). Both can be empty
 	// before the first turn; then we emit just the status line.
@@ -249,7 +361,57 @@ func (s *session) renderFooter() string {
 	if mid == "" && right == "" {
 		return statusLine
 	}
-	return statusLine + "\n" + fitRow(s.width, mutedStyle.Render(mid), right)
+	styledMid := mutedStyle.Render(mid)
+	second := fitRow(s.width, styledMid, right)
+	// Context pressure is the safety-critical field. On narrow terminals keep it
+	// instead of letting fitRow silently discard the right-hand side.
+	if right != "" && lipgloss.Width(styledMid)+lipgloss.Width(right)+1 > s.width {
+		second = right
+	}
+	return statusLine + "\n" + second
+}
+
+// renderCompactFooter keeps the safety-critical state/context visible in one
+// row. Lower-priority approval, reasoning, plugin and mouse details remain in
+// the settings/status modals instead of pushing the composer off tiny screens.
+func (s *session) renderCompactFooter() string {
+	var state string
+	switch {
+	case s.coreLifecycle == coreFailed:
+		state = errStyle.Render("● core down")
+	case s.busy:
+		if prefersReducedMotion() {
+			state = accentStyle.Render("● working")
+		} else {
+			state = s.spinner.View() + " " + accentStyle.Render("working")
+		}
+	case s.authed:
+		state = successStyle.Render("● ready")
+	case len(s.models) > 0:
+		state = warnStyle.Render("● no key")
+	default:
+		state = dimStyle.Render("● starting")
+	}
+
+	right := ""
+	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+		right = boldBaseStyle.Render(truncate(s.models[s.modelIdx].ID, max(4, s.width-lipgloss.Width(state)-3)))
+	}
+	if s.contextTokens > 0 {
+		var maxToks uint64
+		if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+			maxToks = uint64(s.models[s.modelIdx].ContextWindow)
+		}
+		ctx := compactTokens(s.contextTokens)
+		if maxToks > 0 {
+			pct := min(100, int(float64(s.contextTokens)/float64(maxToks)*100))
+			ctx = fmt.Sprintf("%d%% %s/%s", pct, ctx, compactTokens(maxToks))
+		}
+		if lipgloss.Width(state)+lipgloss.Width(ctx)+1 <= s.width {
+			right = mutedStyle.Render(ctx)
+		}
+	}
+	return lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, state, right))
 }
 
 // renderMetrics builds the throughput string for the footer's second line:
@@ -376,14 +538,17 @@ func (s *session) renderUmansConc() string {
 
 // fitRow places left flush and right flush, padding the gap.
 func fitRow(width int, left, right string) string {
+	if width < 1 {
+		return ""
+	}
 	tl := lipgloss.Width(left)
 	if tl > width {
-		return left
+		return lipgloss.NewStyle().MaxWidth(width).Render(left)
 	}
 	tr := lipgloss.Width(right)
 	gap := width - tl - tr
 	if gap < 0 {
-		return left
+		return lipgloss.NewStyle().MaxWidth(width).Render(left)
 	}
 	return left + strings.Repeat(" ", gap) + right
 }
@@ -474,6 +639,52 @@ func (s *session) renderContext() string {
 	return barStyle.Render(bar) + " " + mutedStyle.Render(fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks)))
 }
 
+// composerPlaceholder returns the empty-input hint, contextualized for busy /
+// approval / queue so in-flight controls aren't invisible.
+func (s *session) composerPlaceholder() string {
+	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
+		return "Starting core and checking credentials…"
+	}
+	if s.coreLifecycle == coreFailed {
+		return "Core unavailable — r retry · q quit · see the recovery panel"
+	}
+	if s.pendingApproval != nil {
+		return "Type a follow-up, or clear input to use the approval keys…"
+	}
+	if s.busy {
+		send, close := s.keyHint("send"), s.keyHint("close")
+		if send == "" {
+			send = "Send"
+		}
+		if close == "" {
+			close = "Close"
+		}
+		if s.queued != nil {
+			return "Queue full — " + close + " cancels queued · again aborts…"
+		}
+		steer := s.keyHint("steer")
+		if steer == "" {
+			steer = "Ctrl+Enter"
+		}
+		return send + " queues · " + close + " aborts · " + steer + " steers · / commands"
+	}
+	if !s.authed {
+		return "Log in first — /login · / for commands · ? help"
+	}
+	if s.input.Placeholder != "" {
+		return s.input.Placeholder
+	}
+	return "Chat with the agent…  (/ commands · ? help)"
+}
+
+// keyLabel returns the live binding string for an action, or "".
+func (s *session) keyLabel(action string) string {
+	if s.keybinds == nil {
+		return ""
+	}
+	return s.keybinds[action]
+}
+
 // renderInputBox wraps the chat input in a rounded border so it reads as a
 // distinct chat composer. Unlike a plain textinput (which scrolls the line
 // horizontally when it overflows), the value is soft-wrapped to the box width
@@ -482,8 +693,11 @@ func (s *session) renderContext() string {
 // (blink / focus-blur behavior stays identical to the stock textinput).
 func (s *session) renderInputBox() string {
 	w := s.width
-	if w < 6 {
-		w = 6
+	if w < 1 {
+		w = 1
+	}
+	if w < 4 {
+		return lipgloss.NewStyle().MaxWidth(w).Render(s.inputContent(w))
 	}
 	innerW := w - 4 // "│ " + content + " │"
 	// Attachment chips sit above the typed text so pasted images are visible
@@ -496,7 +710,11 @@ func (s *session) renderInputBox() string {
 		}
 		chip := strings.Join(parts, " ")
 		// Hint for detaching — only when there's room.
-		hint := "  ctrl+shift+x remove"
+		detach := s.keyHint("detach_image")
+		hint := ""
+		if detach != "" {
+			hint = "  " + detach + " remove"
+		}
 		if lipgloss.Width(chip)+lipgloss.Width(hint) <= innerW {
 			chipLine = accentStyle.Render(chip) + dimStyle.Render(hint)
 		} else {
@@ -509,7 +727,12 @@ func (s *session) renderInputBox() string {
 		lines = append(lines, chipLine)
 	}
 	lines = append(lines, strings.Split(content, "\n")...)
-	if s.busy {
+	// Busy / approval hint under the typed text when the box has content so
+	// controls stay discoverable even after the placeholder is gone.
+	if hint := s.composerHintLine(innerW); hint != "" && s.input.Value() != "" {
+		lines = append(lines, hint)
+	}
+	if s.busy && !prefersReducedMotion() {
 		return s.renderInputBoxAnimated(w, innerW, lines)
 	}
 	top := "╭" + strings.Repeat("─", w-2) + "╮"
@@ -525,6 +748,37 @@ func (s *session) renderInputBox() string {
 	}
 	b.WriteString("\n" + bot)
 	return b.String()
+}
+
+// composerHintLine is a dim second line inside the composer while busy/queued/
+// approval is active and the user is already typing (placeholder is hidden).
+func (s *session) composerHintLine(innerW int) string {
+	var text string
+	switch {
+	case s.pendingApproval != nil:
+		var parts []string
+		for _, action := range []struct{ id, label string }{{"approve", "approve"}, {"deny", "deny"}, {"approve_always", "always"}} {
+			if key := s.keyHint(action.id); key != "" {
+				parts = append(parts, key+" "+action.label)
+			}
+		}
+		parts = append(parts, "clear input first")
+		text = strings.Join(parts, " · ")
+	case s.queued != nil:
+		text = "queue full"
+		if key := s.keyHint("close"); key != "" {
+			text += " · " + key + " cancels queued"
+		}
+	case s.busy:
+		steer := s.keyHint("steer")
+		if steer == "" {
+			steer = "Ctrl+Enter"
+		}
+		text = s.keyHint("send") + " queues · " + s.keyHint("close") + " aborts · " + steer + " steers"
+	default:
+		return ""
+	}
+	return dimStyle.Render(truncateRunes(text, innerW))
 }
 
 // renderInputBoxAnimated draws the input box with a "comet": a soft accent
@@ -666,8 +920,8 @@ const maxInputLines = 5
 // textinput cursor cell placed on the correct wrapped line. Returns the
 // placeholder when the value is empty. textinput v2 no longer exposes its
 // internal Cursor (SetChar/View) or top-level TextStyle/PlaceholderStyle
-// fields, so the active StyleState (Focused/Blurred) is read via Styles() and
-// the cursor cell is rendered directly as reverse video when focused.
+// fields, so composer text and cursor colors are derived directly from the
+// active theme instead of inheriting the terminal's default grey.
 func (s *session) inputContent(w int) string {
 	if w < 1 {
 		w = 1
@@ -680,7 +934,7 @@ func (s *session) inputContent(w int) string {
 		active = st.Blurred
 	}
 	if value == "" {
-		ph := s.input.Placeholder
+		ph := s.composerPlaceholder()
 		// When a subagent is waiting on an intercom reply, make it obvious the
 		// chat box below is where you type it (the banner alone reads as
 		// "press ↵ to reply", which leads users to hit Enter on an empty box).
@@ -766,18 +1020,18 @@ func (s *session) inputContent(w int) string {
 		restLines = wrapRunesMultiline(restAfter, w)
 	}
 
-	styleText := active.Text.Inline(true).Render
+	styleText := composerTextStyle().Render
 	out := make([]string, 0, cLine+1+len(restLines)+1)
 	for i := 0; i < cLine; i++ {
 		out = append(out, styleText(string(beforeLines[i])))
 	}
 	// cursor line: text before cursor + cursor cell + text after (on this line).
-	// v2 dropped textinput's internal Cursor.SetChar/View, so the cursor cell is
-	// rendered as reverse video when focused (a solid block cursor) and plain
-	// text when blurred — focus/blur distinction is preserved.
+	// v2 dropped textinput's internal Cursor.SetChar/View. Use explicit theme
+	// colors here: Reverse(true) inherits the terminal's foreground/background,
+	// which produced the same light-grey cursor in every theme.
 	line := styleText(string(beforeLines[cLine]))
 	if s.input.Focused() {
-		line += lipgloss.NewStyle().Reverse(true).Render(curChar)
+		line += composerCursorStyle().Render(curChar)
 	} else {
 		line += styleText(curChar)
 	}
@@ -814,6 +1068,22 @@ func (s *session) inputContent(w int) string {
 		out = capped
 	}
 	return strings.Join(out, "\n")
+}
+
+func composerTextStyle() lipgloss.Style {
+	if colorsDisabled() {
+		return lipgloss.NewStyle().Inline(true)
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Inline(true)
+}
+
+func composerCursorStyle() lipgloss.Style {
+	if colorsDisabled() {
+		return lipgloss.NewStyle().Reverse(true)
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(c.bg)).
+		Background(lipgloss.Color(c.accent))
 }
 
 // wrapRunesMultiline splits r on literal '\n' then width-wraps each segment
@@ -882,11 +1152,20 @@ func (s *session) footerHeight() int {
 // context budget is shown in the footer instead. Add per-scout metrics if the
 // core grows a subagent-usage event.
 func (s *session) renderActiveTasks(w int) string {
-	if len(s.subProgress) == 0 || s.maxTaskRows == 0 {
+	if s.height < 12 || len(s.subProgress) == 0 || s.maxTaskRows == 0 {
 		return ""
 	}
-	entries := s.subProgress
+	entries := append([]*subProgressEntry(nil), s.subProgress...)
+	// Surface potentially stuck work first; it is more actionable than a
+	// freshly-started run when the panel must collapse.
+	sort.SliceStable(entries, func(i, j int) bool {
+		istuck := entries[i].toolRunning && time.Since(entries[i].toolStart) > 30*time.Second
+		jstuck := entries[j].toolRunning && time.Since(entries[j].toolStart) > 30*time.Second
+		return istuck && !jstuck
+	})
+	hidden := 0
 	if len(entries) > s.maxTaskRows {
+		hidden = len(entries) - s.maxTaskRows
 		entries = entries[:s.maxTaskRows]
 	}
 	var rows []string
@@ -908,16 +1187,17 @@ func (s *session) renderActiveTasks(w int) string {
 			}
 		}
 	}
-	body := accentStyle.Render("subagents") + "\n" + strings.Join(rows, "\n")
-	boxW := w - 2
-	if boxW < 20 {
-		boxW = 20
+	title := fmt.Sprintf("subagents %d/%d active", len(entries), len(s.subProgress))
+	if hidden > 0 {
+		title += fmt.Sprintf(" · +%d hidden", hidden)
 	}
+	body := accentStyle.Render(title) + "\n" + strings.Join(rows, "\n")
+	boxW := max(1, w-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(c.dim)).
 		Padding(0, 1).
-		Width(boxW).
+		Width(boxW).MaxWidth(max(1, w)).MaxHeight(max(1, s.height)).
 		Render(body)
 }
 
@@ -948,6 +1228,9 @@ const maxPinnedTodos = 5
 // todo_write state so the plan/progress is glanceable without scrolling the
 // transcript. Returns "" when there are no todos.
 func (s *session) renderTodoPanel() string {
+	if s.height < 12 {
+		return ""
+	}
 	todos := s.todos
 	if len(todos) == 0 {
 		return ""
@@ -955,6 +1238,9 @@ func (s *session) renderTodoPanel() string {
 	done, pend, run := countTodoStatuses(todos)
 	head := accentStyle.Render("tasks") +
 		dimStyle.Render(fmt.Sprintf("  · %d items (%d✓ %d○ %d•)", len(todos), done, run, pend))
+	if s.pendingApproval != nil {
+		return head // preserve decision context; expand the checklist after approval
+	}
 	// inner content width = boxW - 2(border) - 2(padding); each row indents 2 + "[✓] " 4.
 	cw := s.width - 2 - 4 - 2 - 4
 	if cw < 4 {
@@ -977,15 +1263,12 @@ func (s *session) renderTodoPanel() string {
 	if more > 0 {
 		body += "\n" + dimStyle.Italic(true).Render(fmt.Sprintf("  … +%d more", more))
 	}
-	boxW := s.width - 2
-	if boxW < 20 {
-		boxW = 20
-	}
+	boxW := max(1, s.width-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(c.dim)).
 		Padding(0, 1).
-		Width(boxW).
+		Width(boxW).MaxWidth(max(1, s.width)).MaxHeight(max(1, s.height)).
 		Render(body)
 }
 
@@ -1014,9 +1297,12 @@ func (s *session) renderQueueBanner() string {
 	if avail < 6 {
 		avail = 6
 	}
-	msg := fmt.Sprintf("%s: %s   esc to cancel", label, truncate(q.text, avail))
+	msg := fmt.Sprintf("%s: %s", label, truncate(q.text, avail))
+	if key := s.keyHint("close"); key != "" {
+		msg += "   " + key + " to cancel"
+	}
 	return lipgloss.NewStyle().
-		Width(s.width).
+		Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
 		Background(lipgloss.Color(c.user)).
 		Foreground(lipgloss.Color(c.bg)).
 		Bold(true).
@@ -1026,6 +1312,76 @@ func (s *session) renderQueueBanner() string {
 
 func (s *session) queueBannerHeight() int {
 	if s.queued == nil {
+		return 0
+	}
+	return 1
+}
+
+func (s *session) renderToast() string {
+	if s.height < 10 || s.toast == nil {
+		return ""
+	}
+	if time.Now().After(s.toast.until) {
+		s.toast = nil
+		return ""
+	}
+	style := mutedStyle
+	prefix := "· "
+	switch s.toast.kind {
+	case toastSuccess:
+		style = successStyle
+		prefix = "✓ "
+	case toastWarn:
+		style = warnStyle
+		prefix = "! "
+	case toastError:
+		style = errStyle
+		prefix = "✗ "
+	}
+	msg := truncate(prefix+s.toast.text, max(8, s.width-2))
+	return style.Render(msg)
+}
+
+func (s *session) toastHeight() int {
+	if s.renderToast() == "" {
+		return 0
+	}
+	return 1
+}
+
+func (s *session) renderOauthBanner() string {
+	o := s.oauth
+	if o == nil {
+		return ""
+	}
+	msg := o.message
+	if msg == "" {
+		msg = "OAuth login"
+	}
+	extra := ""
+	if o.code != "" {
+		extra = " · code " + o.code
+	}
+	line := fmt.Sprintf("🔑 %s%s · URL on clipboard", msg, extra)
+	if o.url != "" && s.width > 60 {
+		// Show a short URL tail when there's room; full URL is clipboarded.
+		u := o.url
+		if len(u) > 48 {
+			u = u[:45] + "…"
+		}
+		line = fmt.Sprintf("🔑 %s%s · %s", msg, extra, u)
+	}
+	return lipgloss.NewStyle().
+		Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
+		Background(lipgloss.Color(c.accent)).
+		Foreground(lipgloss.Color(c.bg)).
+		Bold(true).
+		Padding(0, 1).
+		Render(truncate(line, max(8, s.width-2)))
+}
+
+func (s *session) oauthBannerHeight() int {
+	if s.oauth == nil {
 		return 0
 	}
 	return 1
@@ -1048,8 +1404,14 @@ func (s *session) View() tea.View {
 			s.renderHeader(),
 			s.renderSeparator(),
 		}
-		if b := s.renderUpdateBanner(); b != "" {
+		if b := s.renderCoreFailureBanner(); b != "" {
 			parts = append(parts, b)
+		}
+		if b := s.renderUpdateBanner(); b != "" && s.height >= 10 {
+			parts = append(parts, b)
+		}
+		if o := s.renderOauthBanner(); o != "" {
+			parts = append(parts, o)
 		}
 		parts = append(parts, s.viewport.View(), s.renderPositionBar())
 		if p := s.renderTodoPanel(); p != "" {
@@ -1071,6 +1433,9 @@ func (s *session) View() tea.View {
 		if f := s.renderMentionFlyout(); f != "" {
 			parts = append(parts, f)
 		}
+		if t := s.renderToast(); t != "" {
+			parts = append(parts, t)
+		}
 		parts = append(parts, s.renderInputBox(), s.renderFooter())
 		view := strings.Join(parts, "\n")
 		if s.modal.kind != modalNone {
@@ -1083,15 +1448,30 @@ func (s *session) View() tea.View {
 		// sudo flyout: a blocking sudo_request (bash command invokes sudo) renders
 		// as a centered overlay with a password field. No-op when nil.
 		content = s.renderSudoOverlay(content)
+		// Final containment is an invariant, not a best effort. Do not paint a
+		// background around the multiline view: terminals carry that SGR color
+		// across the unused remainder of each row, creating large rectangles after
+		// short text. Individual banners/modals still own their intentional fills.
+		content = constrainViewContent(content, s.width, s.height)
+		if colorsDisabled() {
+			content = noColorANSIRe.ReplaceAllString(content, "")
+		}
 	}
 	v := tea.NewView(content)
 	// v2 is declarative: alt-screen + mouse mode are View fields, not program
 	// options. The renderer also always enables Kitty progressive-keyboard
 	// disambiguation + xterm modifyOtherKeys level 2 (restoring them on exit),
 	// so modified keys (Shift/Ctrl+Enter, Esc) arrive as real KeyPressMsgs.
-	v.AltScreen = true
+	v.AltScreen = !plainTerminalMode()
 	if s.settings.MouseWheel {
 		v.MouseMode = tea.MouseModeCellMotion
 	}
 	return v
+}
+
+func constrainViewContent(content string, width, height int) string {
+	return lipgloss.NewStyle().
+		MaxWidth(max(1, width)).
+		MaxHeight(max(1, height)).
+		Render(content)
 }
