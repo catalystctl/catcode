@@ -1,4 +1,4 @@
-import { existsSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -22,3 +22,14 @@ const result = spawnSync(process.execPath, [tsc, "-p", join(sdkRoot, "tsconfig.j
 
 if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
+
+// Bun may materialize the `file:../sdk` package before the postinstall build,
+// leaving a directory that does not contain the freshly generated dist files.
+// Point the installed package at the source SDK after compilation so both the
+// TypeScript declarations and runtime entry resolve on clean checkouts.
+const sdkLink = join(webModules, "@catalyst-code", "coding-agent");
+if (!existsSync(join(sdkLink, "dist", "index.d.ts"))) {
+  rmSync(sdkLink, { recursive: true, force: true });
+  mkdirSync(dirname(sdkLink), { recursive: true });
+  symlinkSync(sdkRoot, sdkLink, process.platform === "win32" ? "junction" : "dir");
+}
