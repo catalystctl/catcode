@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
 import { IdeContext, useIdeContext } from "@/lib/ide-context";
 import { useIsMobile } from "@/lib/use-media-query";
-import { Chat } from "@/components/chat";
+import { ChatInner } from "@/components/chat";
 import type {
   DockPosition,
   GitStatus,
@@ -20,7 +20,9 @@ import {
   PANELS,
 } from "./panel-registry";
 import { ActivityBar } from "./activity-bar";
+import { ProjectSwitcher } from "./project-switcher";
 import { ResizeHandle } from "./resize-handle";
+import { SettingsModal } from "@/components/settings";
 import {
   FileIcon,
   GitBranchIcon,
@@ -30,6 +32,7 @@ import {
   FolderIcon,
   TerminalIcon,
   GlobeIcon,
+  BoltIcon,
 } from "@/components/icons";
 
 const MOVABLE: MovablePanelId[] = ["chat", "terminal", "git", "preview"];
@@ -49,7 +52,22 @@ export function IdeShell() {
   const isMobile = useIsMobile();
   const [dragging, setDragging] = useState<MovablePanelId | null>(null);
   const [mobileView, setMobileView] = useState<MobileView>("chat");
-  const ctx = useMemo(() => ({ workspace, ide }), [workspace, ide]);
+  const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const openSettings = useCallback(() => {
+    setProjectSwitcherOpen(false);
+    setSettingsOpen(true);
+    void agent.getVisionConfig();
+  }, [agent]);
+  const openProjects = useCallback(() => {
+    setSettingsOpen(false);
+    setProjectSwitcherOpen((open) => !open);
+    void agent.listProjects();
+  }, [agent]);
+  const ctx = useMemo(
+    () => ({ workspace, ide, openSettings }),
+    [workspace, ide, openSettings],
+  );
 
   // When a file is opened from the explorer on mobile, jump to the editor.
   useEffect(() => {
@@ -97,17 +115,23 @@ export function IdeShell() {
 
   return (
     <IdeContext.Provider value={ctx}>
-      {isMobile ? (
-        <MobileShell
-          workspace={workspace}
-          agent={agent}
-          mobileView={mobileView}
-          onSelectView={selectMobileView}
-          connected={agent.connected}
-        />
-      ) : (
-        <div className="relative flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
-          <ActivityBar />
+      <>
+        {isMobile ? (
+          <MobileShell
+            workspace={workspace}
+            agent={agent}
+            mobileView={mobileView}
+            onSelectView={selectMobileView}
+            onOpenProjects={openProjects}
+            onOpenSettings={openSettings}
+            connected={agent.connected}
+          />
+        ) : (
+          <div className="relative flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
+            <ActivityBar
+              onOpenProjects={openProjects}
+              onOpenSettings={openSettings}
+            />
 
           {!ide.state.sidebarCollapsed && (
             <>
@@ -191,9 +215,46 @@ export function IdeShell() {
             />
           </div>
 
-          {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
-        </div>
-      )}
+            {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
+          </div>
+        )}
+
+        {projectSwitcherOpen && (
+          <ProjectSwitcher
+            workspace={workspace}
+            projects={agent.state.projects}
+            switching={agent.state.switching}
+            mobile={isMobile}
+            onSwitchWorkspace={(path) => void agent.switchWorkspace(path)}
+            onRemoveProject={(path) => void agent.removeProject(path)}
+            onClose={() => setProjectSwitcherOpen(false)}
+          />
+        )}
+
+        {settingsOpen && (
+          <SettingsModal
+            ready={agent.state.ready}
+            models={agent.state.models}
+            selectedModel={agent.state.selectedModel}
+            thinkingLevel={agent.state.thinkingLevel}
+            approvalMode={agent.state.approvalMode}
+            autoCompact={agent.state.ready?.auto_compact ?? true}
+            sandbox={agent.state.ready?.sandbox ?? "none"}
+            onSelectModel={agent.setModel}
+            onSelectThinking={agent.setThinking}
+            onSetApproval={agent.setApproval}
+            onSetBashTimeout={(secs) => void agent.setConfig("bash_timeout_secs", secs)}
+            onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
+            onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
+            visionConfig={agent.state.visionConfig}
+            onSetVisionConfig={(visionModel, visionModels) =>
+              void agent.setVisionConfig(visionModel, visionModels)
+            }
+            onRefreshVision={() => void agent.getVisionConfig()}
+            onClose={() => setSettingsOpen(false)}
+          />
+        )}
+      </>
     </IdeContext.Provider>
   );
 }
@@ -203,18 +264,45 @@ function MobileShell({
   agent,
   mobileView,
   onSelectView,
+  onOpenProjects,
+  onOpenSettings,
   connected,
 }: {
   workspace: string;
   agent: ReturnType<typeof useAgent>;
   mobileView: MobileView;
   onSelectView: (view: MobileView) => void;
+  onOpenProjects: () => void;
+  onOpenSettings: () => void;
   connected: boolean;
 }) {
   const { ide } = useIdeContext();
 
   return (
     <div className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-ink-950 text-ink-100 pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)]">
+      <div className="flex h-10 shrink-0 items-center border-b border-ink-800 bg-ink-925 px-2">
+        <button
+          type="button"
+          onClick={onOpenProjects}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-ink-200 hover:bg-ink-850"
+          aria-label="Switch project"
+        >
+          <FolderIcon width={15} height={15} className="shrink-0 text-accent-soft" />
+          <span className="truncate font-medium">
+            {workspace ? workspace.split(/[\\/]/).pop() ?? workspace : "Select project"}
+          </span>
+          <ChevronRight width={13} height={13} className="shrink-0 rotate-90 text-ink-500" />
+        </button>
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          className="rounded-md p-2 text-ink-500 hover:bg-ink-850 hover:text-ink-100"
+          aria-label="Settings"
+          title="Settings"
+        >
+          <BoltIcon width={17} height={17} />
+        </button>
+      </div>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {(mobileView === "editor" || mobileView === "preview") && (
           <MobileTabStrip
@@ -226,8 +314,10 @@ function MobileShell({
         )}
         <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
           {mobileView === "files" && <FileTree />}
-          {mobileView === "editor" && <MainContent workspace={workspace} />}
-          {mobileView === "chat" && <Chat agent={agent} docked />}
+          {mobileView === "editor" && (
+            <MainContent workspace={workspace} onOpenPreview={() => onSelectView("preview")} />
+          )}
+          {mobileView === "chat" && <ChatInner agent={agent} docked />}
           {mobileView === "git" && <GitPanel />}
           {mobileView === "terminal" && (
             <TerminalPanel
@@ -574,7 +664,7 @@ function PanelContent({
   agent: ReturnType<typeof useAgent>;
 }) {
   const { ide } = useIdeContext();
-  if (panel === "chat") return <Chat agent={agent} docked />;
+  if (panel === "chat") return <ChatInner agent={agent} docked />;
   if (panel === "git") return <GitPanel />;
   if (panel === "preview") {
     return <Preview workspace={workspace} preview={ide.state.preview} onPreviewChange={ide.setPreview} />;
@@ -711,7 +801,13 @@ function TabStrip({
   );
 }
 
-function MainContent({ workspace }: { workspace: string }) {
+function MainContent({
+  workspace,
+  onOpenPreview,
+}: {
+  workspace: string;
+  onOpenPreview?: () => void;
+}) {
   const { ide } = useIdeContext();
   const tab = ide.state.openTabs.find((item) => item.id === ide.state.activeTabId) ?? null;
   if (!tab) {
@@ -721,7 +817,7 @@ function MainContent({ workspace }: { workspace: string }) {
       </div>
     );
   }
-  if (tab.kind === "file") return <Editor tab={tab} />;
+  if (tab.kind === "file") return <Editor tab={tab} onOpenPreview={onOpenPreview} />;
   if (tab.kind === "preview") return <Preview target={tab.target} workspace={workspace} />;
   return null;
 }

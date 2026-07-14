@@ -1,210 +1,258 @@
 "use client";
-/* eslint-disable @next/next/no-img-element -- the editor previews workspace
-   image files via <img src="/api/preview?..."> per contract §5.2; next/image
-   doesn't fit a dynamic workspace-path src. */
-// Tabbed code editor. Per docs/IDE_PANELS_CONTRACT.md §5.2.
-//   export function Editor({ tab }: { tab: IdeTab })
-// CodeMirror 6 via @uiw/react-codemirror. On mount / tab.target change: GET
-// /api/file → set content. On edit: ide.markDirty(tab.id, true). Ctrl/Cmd+S →
-// PUT /api/file → ide.markDirty(tab.id, false). Language packs are dynamically
-// imported per tab.language (§6.3) so only the needed one ships. Non-text image
-// files render via <img src="/api/preview?path="> (read-only).
-//
-// Note: @uiw/react-codemirror annotates programmatic `value` changes with an
-// ExternalChange annotation and its update listener SKIPS onChange for those —
-// so loading file content via setState does not spuriously mark the file dirty.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import CodeMirror from "@uiw/react-codemirror";
-import { keymap } from "@codemirror/view";
-import type { Extension } from "@codemirror/state";
+/* eslint-disable @next/next/no-img-element -- workspace image previews use a
+   dynamic API path and are intentionally not processed by next/image. */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type * as Monaco from "monaco-editor";
+import { GlobeIcon } from "@/components/icons";
 import { useIdeContext } from "@/lib/ide-context";
+import { registerEditorModel } from "@/lib/editor-model-registry";
+import { canPreviewFile } from "@/lib/preview-support";
 import type { IdeTab } from "@/lib/types";
+import { currentMonacoTheme, loadMonaco } from "./monaco-loader";
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
-/** Dynamically load only the needed CodeMirror language extension (§6.3). */
-async function loadLangExtension(lang: string | undefined, path: string): Promise<Extension[]> {
-  const jsx = /\.(t|j)sx$/.test(path);
-  switch (lang) {
-    case "typescript":
-    case "javascript": {
-      const m = await import("@codemirror/lang-javascript");
-      return [m.javascript({ typescript: lang === "typescript", jsx })];
-    }
-    case "python": {
-      const m = await import("@codemirror/lang-python");
-      return [m.python()];
-    }
-    case "rust": {
-      const m = await import("@codemirror/lang-rust");
-      return [m.rust()];
-    }
-    case "markdown": {
-      const m = await import("@codemirror/lang-markdown");
-      return [m.markdown()];
-    }
-    case "json": {
-      const m = await import("@codemirror/lang-json");
-      return [m.json()];
-    }
-    case "css": {
-      const m = await import("@codemirror/lang-css");
-      return [m.css()];
-    }
-    case "html": {
-      const m = await import("@codemirror/lang-html");
-      return [m.html()];
-    }
-    case "yaml": {
-      const m = await import("@codemirror/lang-yaml");
-      return [m.yaml()];
-    }
-    case "sql": {
-      const m = await import("@codemirror/lang-sql");
-      return [m.sql()];
-    }
-    default:
-      return [];
-  }
+type MonacoApi = typeof Monaco;
+
+function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
+  return monaco.Uri.from({
+    scheme: "catalyst-workspace",
+    path: `/${normalized}`,
+    query: `workspace=${encodeURIComponent(workspace)}`,
+  });
 }
 
-export function Editor({ tab }: { tab: IdeTab }) {
+/** Match Monaco's complete language registry, including filenames such as
+ * Dockerfile and extensions that are not part of the server's small hint map. */
+function resolveLanguage(monaco: MonacoApi, path: string, hint?: string): string {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  const filename = normalized.split("/").pop() ?? normalized;
+  const languages = monaco.languages.getLanguages();
+  const filenameMatch = languages.find((language) =>
+    language.filenames?.some((name) => name.toLowerCase() === filename),
+  );
+  if (filenameMatch) return filenameMatch.id;
+
+  const extensionMatch = languages
+    .flatMap((language) => (language.extensions ?? []).map((extension) => ({ language, extension })))
+    .sort((a, b) => b.extension.length - a.extension.length)
+    .find(({ extension }) => normalized.endsWith(extension.toLowerCase()));
+  if (extensionMatch) return extensionMatch.language.id;
+
+  if (hint && languages.some((language) => language.id === hint)) return hint;
+  return "plaintext";
+}
+
+function useMonacoTheme(enabled: boolean): void {
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const apply = () => {
+      void loadMonaco().then((monaco) => {
+        if (!cancelled) monaco.editor.setTheme(currentMonacoTheme());
+      });
+    };
+    apply();
+    const observer = new MutationObserver(apply);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [enabled]);
+}
+
+export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: () => void }) {
   const { workspace, ide } = useIdeContext();
-  const [content, setContent] = useState("");
-  const [langExt, setLangExt] = useState<Extension[]>([]);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const contentRef = useRef("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const isImage = IMAGE_EXT.test(tab.target);
-  // `ide` is recreated on every IdeState change (its useMemo deps include
-  // `state` so consumers see fresh state). Destructure the stable `markDirty`
-  // callback (useCallback []) and depend on IT, not `ide`, in the effects below
-  // — otherwise markDirty(false) after a fetch mutates state → new `ide` ref →
-  // effect re-runs → cancels the in-flight fetch → infinite "Loading…" loop.
-  const { markDirty } = ide;
+  const previewable = canPreviewFile(tab.target);
+  const { markDirty, setPreview, showDockPanel } = ide;
 
-  // Fetch file content on mount / when the target changes.
+  useMonacoTheme(!isImage);
+
+  const save = useCallback(async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/file", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: tab.target, content: contentRef.current, workspace }),
+      });
+      if (!response.ok) throw new Error(`Failed to save (${response.status})`);
+      markDirty(tab.id, false);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  }, [markDirty, tab.id, tab.target, workspace]);
+  const saveRef = useRef(save);
+  saveRef.current = save;
+
+  const openPreview = useCallback(() => {
+    if (!previewable) return;
+    setPreview({ kind: "file", target: tab.target });
+    showDockPanel("preview");
+    onOpenPreview?.();
+  }, [onOpenPreview, previewable, setPreview, showDockPanel, tab.target]);
+
+  const previewButton = previewable ? (
+    <button
+      type="button"
+      onClick={openPreview}
+      title={tab.dirty ? "Open saved version in Preview — save changes to refresh" : "Open in Preview"}
+      aria-label="Open in Preview"
+      className="flex h-7 items-center gap-1.5 rounded-md border border-ink-700 bg-ink-900/90 px-2 text-[11px] font-medium text-ink-300 shadow-sm backdrop-blur transition-colors hover:border-ink-600 hover:bg-ink-800 hover:text-ink-100"
+    >
+      <GlobeIcon width={13} height={13} />
+      <span>Preview</span>
+    </button>
+  ) : null;
+
   useEffect(() => {
     if (isImage) {
       setLoading(false);
       return;
     }
+
     let cancelled = false;
+    let changeSubscription: Monaco.IDisposable | undefined;
+    let saveAction: Monaco.IDisposable | undefined;
     setLoading(true);
     setError(null);
-    fetch(`/api/file?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`)
-      .then(async (r) => {
-        if (r.status === 404) throw new Error("File not found");
-        if (!r.ok) throw new Error(`Failed to load (${r.status})`);
-        return (await r.json()) as { content?: string };
-      })
-      .then((d) => {
+
+    void loadMonaco()
+      .then(async (monaco) => {
         if (cancelled) return;
-        setContent(d.content ?? "");
-        markDirty(tab.id, false);
+        const uri = modelUri(monaco, workspace, tab.target);
+        let model = monaco.editor.getModel(uri);
+
+        // Models outlive the visible editor so switching tabs preserves dirty
+        // text, selections, and undo history. Only fetch a model the first time.
+        if (!model) {
+          const response = await fetch(
+            `/api/file?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`,
+          );
+          if (response.status === 404) throw new Error("File not found");
+          if (!response.ok) throw new Error(`Failed to load (${response.status})`);
+          const data = (await response.json()) as { content?: string };
+          if (cancelled) return;
+          model = monaco.editor.createModel(
+            data.content ?? "",
+            resolveLanguage(monaco, tab.target, tab.language),
+            uri,
+          );
+          markDirty(tab.id, false);
+        }
+
+        registerEditorModel(tab.id, () => {
+          if (!model?.isDisposed()) model?.dispose();
+        });
+
+        contentRef.current = model.getValue();
+        if (!containerRef.current || cancelled) return;
+
+        const editor = monaco.editor.create(containerRef.current, {
+          model,
+          theme: currentMonacoTheme(),
+          automaticLayout: true,
+          fontFamily: '"JetBrains Mono Variable", "SFMono-Regular", Consolas, monospace',
+          fontSize: 13,
+          lineHeight: 20,
+          fontLigatures: true,
+          cursorBlinking: "smooth",
+          cursorSmoothCaretAnimation: "on",
+          smoothScrolling: true,
+          mouseWheelZoom: true,
+          minimap: { enabled: true, showSlider: "mouseover", scale: 1 },
+          stickyScroll: { enabled: true },
+          bracketPairColorization: { enabled: true, independentColorPoolPerBracketType: true },
+          guides: { bracketPairs: true, indentation: true, highlightActiveIndentation: true },
+          formatOnPaste: true,
+          links: true,
+          folding: true,
+          glyphMargin: true,
+          renderWhitespace: "selection",
+          renderControlCharacters: true,
+          suggest: { showWords: true, preview: true },
+          padding: { top: 8, bottom: 8 },
+          fixedOverflowWidgets: true,
+          scrollBeyondLastLine: false,
+        });
+        editorRef.current = editor;
+
+        changeSubscription = model.onDidChangeContent(() => {
+          contentRef.current = model.getValue();
+          markDirty(tab.id, true);
+        });
+        saveAction = editor.addAction({
+          id: "catalyst.save-file",
+          label: "Save File",
+          keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+          run: () => saveRef.current(),
+        });
+        setLoading(false);
+        requestAnimationFrame(() => editor.layout());
       })
-      .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+          setLoading(false);
+        }
       });
+
     return () => {
       cancelled = true;
+      changeSubscription?.dispose();
+      saveAction?.dispose();
+      editorRef.current?.dispose();
+      editorRef.current = null;
     };
-  }, [tab.target, tab.id, workspace, markDirty, isImage]);
-
-  // Load the language extension (dynamic import — only the needed pack ships).
-  useEffect(() => {
-    let cancelled = false;
-    loadLangExtension(tab.language, tab.target).then((ext) => {
-      if (!cancelled) setLangExt(ext);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [tab.language, tab.target]);
-
-  const contentRef = useRef(content);
-  contentRef.current = content;
-
-  const save = useCallback(async () => {
-    setSaving(true);
-    try {
-      const r = await fetch("/api/file", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: tab.target, content: contentRef.current, workspace }),
-      });
-      if (r.ok) markDirty(tab.id, false);
-    } catch {
-      /* ignore transient network errors */
-    } finally {
-      setSaving(false);
-    }
-  }, [tab.target, tab.id, workspace, markDirty]);
-  const saveRef = useRef(save);
-  saveRef.current = save;
-
-  // Ctrl/Cmd+S → save (intercepted so the browser "save page" dialog doesn't fire).
-  const saveKeymap = useMemo(
-    () =>
-      keymap.of([
-        { key: "Mod-s", preventDefault: true, run: () => { void saveRef.current(); return true; } },
-      ]),
-    [],
-  );
-
-  const extensions = useMemo(() => [...langExt, saveKeymap], [langExt, saveKeymap]);
-
-  const onChange = useCallback(
-    (value: string) => {
-      setContent(value);
-      markDirty(tab.id, true);
-    },
-    [markDirty, tab.id],
-  );
+  }, [isImage, markDirty, tab.id, tab.language, tab.target, workspace]);
 
   if (isImage) {
     return (
-      <div className="flex h-full items-center justify-center overflow-auto bg-ink-950 p-4">
+      <div className="relative flex h-full items-center justify-center overflow-auto bg-ink-950 p-4">
         <img
           src={`/api/preview?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`}
           alt={tab.label}
           className="max-h-full max-w-full object-contain"
         />
+        <div className="absolute right-3 top-2 z-20">{previewButton}</div>
       </div>
     );
   }
 
-  if (loading)
-    return <div className="flex h-full items-center justify-center text-sm text-ink-500">Loading…</div>;
-  if (error)
-    return (
-      <div className="flex h-full items-center justify-center px-6 text-center text-sm text-ink-500">
-        {error}
-      </div>
-    );
-
   return (
     <div className="relative flex h-full flex-col bg-ink-950">
-      <div className="min-h-0 flex-1 overflow-hidden">
-        <CodeMirror
-          value={content}
-          onChange={onChange}
-          extensions={extensions}
-          theme="dark"
-          height="100%"
-          className="h-full text-[13px]"
-        />
-      </div>
-      {saving ? (
-        <div className="absolute right-3 top-2 rounded bg-ink-800/80 px-2 py-0.5 text-[11px] text-ink-300">
-          Saving…
+      <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" aria-label={`Editor for ${tab.label}`} />
+      {loading ? (
+        <div className="absolute inset-0 flex items-center justify-center bg-ink-950 text-sm text-ink-500">
+          Loading editor…
         </div>
       ) : null}
+      {error ? (
+        <div className="absolute inset-x-0 top-0 z-10 border-b border-red-500/30 bg-red-950/90 px-3 py-2 text-center text-xs text-red-200">
+          {error}
+        </div>
+      ) : null}
+      <div className="absolute right-3 top-2 z-20 flex items-center gap-2">
+        {saving ? (
+          <div className="rounded bg-ink-800/80 px-2 py-0.5 text-[11px] text-ink-300">Saving…</div>
+        ) : null}
+        {previewButton}
+      </div>
       {tab.dirty ? (
-        <div className="absolute left-3 top-2 text-[11px] text-amber-300" title="Unsaved changes">
+        <div className="absolute left-3 top-2 z-20 text-[11px] text-amber-300" title="Unsaved changes">
           ●
         </div>
       ) : null}

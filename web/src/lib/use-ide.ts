@@ -19,6 +19,7 @@ import type {
   MovablePanelId,
 } from "./types";
 import { basename, detectLanguage } from "./lang";
+import { disposeEditorModel } from "./editor-model-registry";
 
 const STORAGE_KEY = "catcode:ide-layout";
 
@@ -326,6 +327,11 @@ export function useIde(): IdeApi {
   }, []);
 
   const closeTab = useCallback((id: string) => {
+    if (stateRef.current.openTabs.some((tab) => tab.id === id)) {
+      // Let React detach the visible editor before disposing the backing model.
+      // Tab switches do not come through here, so their undo history survives.
+      queueMicrotask(() => disposeEditorModel(id));
+    }
     setState((s) => {
       const idx = s.openTabs.findIndex((t) => t.id === id);
       if (idx < 0) return s;

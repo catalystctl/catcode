@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgent, type AgentApi } from "@/lib/use-agent";
+import { useIdeContext } from "@/lib/ide-context";
 import { basename } from "@/lib/format";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
@@ -22,7 +23,6 @@ import { WorkStatePanel } from "./work-state";
 import { SubagentsPanel } from "./subagents";
 import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
-import { SettingsModal } from "./settings";
 import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalStatusChip } from "./goal-modal";
 import { ProviderLoginModal } from "./provider-login-modal";
@@ -80,9 +80,8 @@ function lsSet(k: string, v: string): void {
   }
 }
 
-export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: boolean } = {}) {
-  const ownAgent = useAgent();
-  const agent = injected ?? ownAgent;
+export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean }) {
+  const { openSettings } = useIdeContext();
   const { state } = agent;
   const { confirm, prompt, dialog } = useAppDialog();
   const dialogApi = useRef({ confirm, prompt });
@@ -97,10 +96,15 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<
-    null | "memory" | "plugins" | "settings" | "subagents" | "help" | "goal" | "login" | "logout" | "diagnostics"
+    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "login" | "logout" | "diagnostics"
   >(null);
   const [images, setImages] = useState<string[]>([]);
-  const [theme, setTheme] = useState<string>(() => lsGet("umans:theme") ?? "dark");
+  // Keep the server and first client render deterministic. The inline script in
+  // layout.tsx applies the persisted value before paint; after hydration we
+  // adopt that value into React state. Reading localStorage in the initializer
+  // made the theme button's server/client markup disagree in light mode.
+  const [theme, setTheme] = useState<string>("dark");
+  const themeMountedRef = useRef(false);
 
   // Refs so the edit/regenerate/command callbacks can stay stable (empty deps)
   // — this keeps <Message> memoized: only the streaming message re-renders on
@@ -109,6 +113,10 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
   useEffect(() => {
     agentRef.current = agent;
   }, [agent]);
+  const openSettingsRef = useRef(openSettings);
+  useEffect(() => {
+    openSettingsRef.current = openSettings;
+  }, [openSettings]);
   const msgsRef = useRef(state.messages);
   useEffect(() => {
     msgsRef.current = state.messages;
@@ -120,6 +128,12 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
 
   // Theme: toggle a data-theme attribute + persist. CSS variables adjust.
   useEffect(() => {
+    if (!themeMountedRef.current) {
+      themeMountedRef.current = true;
+      const initial = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+      if (initial !== theme) setTheme(initial);
+      return;
+    }
     document.documentElement.setAttribute("data-theme", theme);
     lsSet("umans:theme", theme);
   }, [theme]);
@@ -272,12 +286,12 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
             return void a.setConfig("sandbox", mode);
           }
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         }
         case "settings":
         case "vision":
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         case "model": {
           const id = args?.trim();
           if (id) {
@@ -290,7 +304,7 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
             }
           }
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         }
         case "reasoning": {
           const level = args?.trim().toLowerCase();
@@ -299,7 +313,7 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
             return;
           }
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         }
         case "approval": {
           const mode = args?.trim().toLowerCase();
@@ -307,7 +321,7 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
             return void a.setApproval(mode);
           }
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         }
         case "subagents":
           void a.listAgents();
@@ -404,7 +418,7 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
           const n = Number((args ?? "").trim());
           if (Number.isFinite(n) && n > 0) return void a.setConfig("bash_timeout_secs", n);
           void a.getVisionConfig();
-          return setModal("settings");
+          return openSettingsRef.current();
         }
         case "run": {
           let raw = args?.trim();
@@ -539,8 +553,6 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
         embedded={docked}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
-        workspace={state.workspace}
-        projects={state.projects}
         switching={switching}
         sessions={state.sessions}
         currentSessionFile={state.currentSessionFile}
@@ -560,11 +572,8 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
           if (p === "memory") agent.listMemory();
           if (p === "plugins") agent.listPlugins();
           if (p === "subagents") void agent.listAgents();
-          if (p === "settings") void agent.getVisionConfig();
-          setModal(p as "memory" | "plugins" | "settings" | "subagents" | "help");
+          setModal(p as "memory" | "plugins" | "subagents" | "help");
         }}
-        onSwitchWorkspace={(p) => agent.switchWorkspace(p)}
-        onRemoveProject={(p) => agent.removeProject(p)}
         onDeleteSession={(p) => agent.deleteSession(p)}
         onRenameSession={(name, title) => agent.renameSession(name, title)}
         onConfirmDelete={async (title) =>
@@ -759,7 +768,7 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
               state.pendingOauth
             )
           }
-          connected={agent.connected && !switching}
+          connected={agent.connected}
           canSend={!!currentModel && !switching}
           thinkingLevel={state.thinkingLevel}
           modelLabel={modelLabel}
@@ -805,29 +814,6 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
           runs={state.subagentRuns}
           agents={state.availableAgents}
           onRefreshAgents={() => void agent.listAgents()}
-          onClose={() => setModal(null)}
-        />
-      )}
-      {modal === "settings" && (
-        <SettingsModal
-          ready={state.ready}
-          models={state.models}
-          selectedModel={state.selectedModel}
-          thinkingLevel={state.thinkingLevel}
-          approvalMode={state.approvalMode}
-          autoCompact={state.ready?.auto_compact ?? true}
-          sandbox={state.ready?.sandbox ?? "none"}
-          onSelectModel={agent.setModel}
-          onSelectThinking={agent.setThinking}
-          onSetApproval={agent.setApproval}
-          onSetBashTimeout={(secs) => agent.setConfig("bash_timeout_secs", secs)}
-          onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
-          onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
-          visionConfig={state.visionConfig}
-          onSetVisionConfig={(vision_model, vision_models) =>
-            void agent.setVisionConfig(vision_model, vision_models)
-          }
-          onRefreshVision={() => void agent.getVisionConfig()}
           onClose={() => setModal(null)}
         />
       )}
@@ -878,6 +864,12 @@ export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: b
       )}
     </div>
   );
+}
+
+// Thin wrapper: calls useAgent for standalone (non-IdeShell) usage.
+export function Chat(props: { docked?: boolean } = {}) {
+  const agent = useAgent();
+  return <ChatInner agent={agent} docked={props.docked} />;
 }
 
 function EmptyState({

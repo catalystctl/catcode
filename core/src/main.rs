@@ -663,6 +663,37 @@ impl State {
         None
     }
 
+    /// Resolve a Umans provider to force-refresh the model cache at startup.
+    /// Prefers a configured Umans provider that has a key (the logged-in case,
+    /// same as [`Self::umans_provider_with_key`]); falls back to ANY Umans
+    /// provider — including the legacy keyless default — because the Umans
+    /// `/models/info` endpoint is public and needs no auth, so an
+    /// unauthenticated default still benefits from a startup model refresh.
+    /// Returns `None` only when no Umans provider is active or configured.
+    pub async fn umans_provider_for_model_refresh(&self) -> Option<ResolvedProvider> {
+        if let Some(rp) = self.umans_provider_with_key().await {
+            return Some(rp);
+        }
+        // No key'd Umans provider — accept a keyless one (public endpoint).
+        // Check the active/legacy provider first, then any configured provider.
+        let active = self.resolved_provider().await;
+        if provider::is_umans(&active.base_url) {
+            return Some(active);
+        }
+        let names: Vec<String> = {
+            let cfg = self.cfg.read().await;
+            cfg.providers.iter().map(|p| p.name.clone()).collect()
+        };
+        for name in &names {
+            if let Some(rp) = self.resolve_provider_by_name(name).await {
+                if provider::is_umans(&rp.base_url) {
+                    return Some(rp);
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve the provider that should serve a turn for `model`: look up the
     /// model in the aggregated list, route to its owning provider; fall back to
     /// the active/legacy provider when the model has no provider tag (legacy
@@ -1609,6 +1640,49 @@ async fn main() {
                 }
                 tokio::time::sleep(interval).await;
             }
+        });
+    }
+
+    // Startup background refresh of the Umans model cache. The TTL-gated cache
+    // (8h, see provider::MODELS_CACHE_TTL) means newly-added Umans models
+    // wouldn't appear until the TTL expires; this one-shot task forces a live
+    // `/models/info` fetch on every launch so new models are cached locally and
+    // surface in `/models` without a restart. Non-blocking: init already loaded
+    // the (possibly stale) cached models for an instant first render, and we
+    // only re-emit a `models` event when the live id set actually changed, so
+    // the TUI's model selection (by id) is preserved and an unchanged or
+    // offline fetch causes no spurious churn. Mirrors the launch-time update
+    // check + conc poll: background, best-effort, silent on failure.
+    {
+        let st = state.clone();
+        let cl = client.clone();
+        tokio::spawn(async move {
+            let Some(rp) = st.umans_provider_for_model_refresh().await else {
+                return; // No Umans provider (active or configured) — nothing to refresh.
+            };
+            // Snapshot the model ids we currently hold for this provider so we
+            // can tell whether the live fetch actually changed anything.
+            let prev_ids: std::collections::HashSet<String> = {
+                let models = st.models.read().await;
+                models
+                    .iter()
+                    .filter(|m| m.provider == rp.name)
+                    .map(|m| m.id.clone())
+                    .collect()
+            };
+            // Force a live fetch (bypassing the TTL) and rewrite the cache. On
+            // HTTP failure this falls back to the stale cache / curated
+            // snapshot, so the id set is unchanged and we skip the re-emit.
+            let live = provider::discover_models_force_refresh(&cl, &rp).await;
+            let new_ids: std::collections::HashSet<String> =
+                live.iter().map(|m| m.id.clone()).collect();
+            if new_ids == prev_ids {
+                return; // No new/removed models — leave the in-memory list alone.
+            }
+            // The live set changed: re-aggregate (reads the now-updated cache
+            // for every provider) and re-emit `models` so the TUI/web pick up
+            // the new models mid-session without a restart.
+            st.refresh_models(&cl).await;
         });
     }
 

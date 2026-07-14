@@ -24,7 +24,13 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
   if (!hasSessionCookie(req)) {
-    const url = req.nextUrl.clone();
+    // Standalone Next builds construct req.nextUrl from their bind hostname
+    // even when a reverse proxy supplies Host/X-Forwarded-Host. Prefer the
+    // configured canonical origin so external users never get sent to the
+    // loopback address.
+    const url = process.env.CATCODE_WEB_ORIGIN
+      ? new URL(req.nextUrl.pathname, process.env.CATCODE_WEB_ORIGIN)
+      : req.nextUrl.clone();
     url.pathname = "/login";
     url.search = "";
     return NextResponse.redirect(url);

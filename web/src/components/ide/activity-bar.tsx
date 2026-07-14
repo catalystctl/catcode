@@ -7,11 +7,17 @@
 // toggles copilotVisible — the Chat dock itself is hosted by IdeShell, not here.
 
 import { useIdeContext } from "@/lib/ide-context";
-import { SparkIcon } from "@/components/icons";
+import { BoltIcon, FolderIcon, SparkIcon } from "@/components/icons";
 import { PANELS, PANEL_ORDER } from "./panel-registry";
 import type { IdePanelId } from "@/lib/types";
 
-export function ActivityBar() {
+export function ActivityBar({
+  onOpenProjects,
+  onOpenSettings,
+}: {
+  onOpenProjects: () => void;
+  onOpenSettings: () => void;
+}) {
   const { ide } = useIdeContext();
   const {
     sidebarCollapsed,
@@ -70,6 +76,26 @@ export function ActivityBar() {
       })}
 
       <div className="flex-1" />
+
+      <button
+        type="button"
+        title="Switch project"
+        aria-label="Switch project"
+        onClick={onOpenProjects}
+        className="flex h-10 w-10 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800/60 hover:text-ink-200"
+      >
+        <FolderIcon width={21} height={21} />
+      </button>
+
+      <button
+        type="button"
+        title="Settings"
+        aria-label="Settings"
+        onClick={onOpenSettings}
+        className="flex h-10 w-10 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800/60 hover:text-ink-200"
+      >
+        <BoltIcon width={21} height={21} />
+      </button>
 
       <button
         type="button"

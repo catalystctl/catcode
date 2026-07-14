@@ -1,13 +1,17 @@
 "use client";
 
-// Markdown — react-markdown + GFM + syntax highlighting (rehype-highlight).
+// Compact Markdown — react-markdown + GFM + syntax highlighting.
 // Code blocks get a header bar with the language + a copy button.
 
-import { memo, useRef, useState, type ComponentPropsWithoutRef } from "react";
+import { memo, useMemo, useRef, useState, type ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { CopyIcon, CheckIcon } from "./icons";
+
+const DEFAULT_REHYPE_PLUGINS: ComponentPropsWithoutRef<typeof ReactMarkdown>["rehypePlugins"] = [
+  rehypeHighlight,
+];
 
 function CodeBlock({ className, children }: { className?: string; children?: React.ReactNode }) {
   const lang = /language-(\w+)/.exec(className || "")?.[1] ?? "text";
@@ -48,7 +52,7 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
   );
 }
 
-const components: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] = {
+const baseComponents: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] = {
   pre({ children }) {
     // The CodeBlock wrapper replaces the default <pre>; react-markdown already
     // rendered <pre><code class="language-x">...</code></pre>.
@@ -58,19 +62,61 @@ const components: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] =
     const props = codeEl?.props ?? {};
     return <CodeBlock className={props.className}>{props.children}</CodeBlock>;
   },
-  a({ children, ...props }) {
+  table({ children, ...props }) {
     return (
-      <a target="_blank" rel="noopener noreferrer" {...props}>
-        {children}
-      </a>
+      <div className="markdown-table-scroll" role="region" aria-label="Scrollable table" tabIndex={0}>
+        <table {...props}>{children}</table>
+      </div>
     );
   },
 };
 
-export const Markdown = memo(function Markdown({ children }: { children: string }) {
+export const Markdown = memo(function Markdown({
+  children,
+  variant = "compact",
+  resolveImageUrl,
+  rehypePlugins = DEFAULT_REHYPE_PLUGINS,
+}: {
+  children: string;
+  variant?: "compact" | "document";
+  resolveImageUrl?: (source: string) => string;
+  rehypePlugins?: ComponentPropsWithoutRef<typeof ReactMarkdown>["rehypePlugins"];
+}) {
+  const components = useMemo<ComponentPropsWithoutRef<typeof ReactMarkdown>["components"]>(
+    () => ({
+      ...baseComponents,
+      a({ children: linkChildren, href, ...props }) {
+        const fragment = typeof href === "string" && href.startsWith("#");
+        const safeHref = fragment && !href.startsWith("#user-content-")
+          ? `#user-content-${href.slice(1)}`
+          : href;
+        return (
+          <a
+            {...props}
+            href={safeHref}
+            target={fragment ? undefined : "_blank"}
+            rel={fragment ? undefined : "noopener noreferrer"}
+          >
+            {linkChildren}
+          </a>
+        );
+      },
+      img({ src, alt, ...props }) {
+        const source = typeof src === "string" ? src : "";
+        // eslint-disable-next-line @next/next/no-img-element -- Markdown images may be workspace API URLs.
+        return <img {...props} src={resolveImageUrl?.(source) ?? source} alt={alt ?? ""} loading="lazy" decoding="async" />;
+      },
+    }),
+    [resolveImageUrl],
+  );
+
   return (
-    <div className="prose-catalyst">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={components}>
+    <div className={`prose-catalyst ${variant === "document" ? "prose-catalyst-document" : ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={rehypePlugins}
+        components={components}
+      >
         {children}
       </ReactMarkdown>
     </div>

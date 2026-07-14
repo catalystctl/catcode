@@ -561,7 +561,6 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               rows={1}
               value={text}
               aria-label="Message the agent"
-              disabled={!connected}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={onKey}
               onPaste={onPaste}

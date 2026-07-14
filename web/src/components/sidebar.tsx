@@ -1,20 +1,18 @@
 "use client";
 
-// Sidebar — project switcher + session history + quick actions.
-//   • Project picker: a dropdown listing recent workspaces; switch/add/remove.
+// Sidebar — chat session history + chat-specific quick actions.
 //   • Session list: shows the session title (auto-derived or user-renamed),
 //     with inline rename (double-click or pencil → input → Enter to save).
-//   • Quick actions: memory / plugins / agents / settings + reset / compact /
+//   • Quick actions: memory / plugins / agents / help + reset / compact /
 //     stats, with a live token/turn readout.
 
 import { useEffect, useRef, useState } from "react";
-import type { ProjectEntry, SessionEntry, Stats } from "@/lib/types";
+import type { SessionEntry, Stats } from "@/lib/types";
 import { relativeTime, basename, formatTokens } from "@/lib/format";
-import { useOutsideClose } from "@/lib/use-outside-close";
 import {
   PlusIcon, HistoryIcon, TrashIcon, CompactIcon, DotIcon, XIcon,
-  BrainIcon, TerminalIcon, BoltIcon, SparkIcon, FolderIcon,
-  ChevronDown, CheckIcon, FolderPlusIcon, SearchIcon, PencilIcon, RefreshIcon,
+  BrainIcon, TerminalIcon, SparkIcon,
+  SearchIcon, PencilIcon, RefreshIcon,
   HelpIcon,
 } from "./icons";
 
@@ -23,8 +21,6 @@ interface Props {
   embedded?: boolean;
   open: boolean;
   onClose: () => void;
-  workspace: string;
-  projects: ProjectEntry[];
   switching: boolean;
   sessions: SessionEntry[];
   currentSessionFile: string | null;
@@ -35,8 +31,6 @@ interface Props {
   onCompact: () => void;
   onStats: () => void;
   onOpenPanel: (panel: string) => void;
-  onSwitchWorkspace: (path: string) => void;
-  onRemoveProject: (path: string) => void;
   onDeleteSession: (path: string) => void;
   onRenameSession: (name: string, title: string) => void;
   /** Optional confirm dialog (avoids window.confirm). */
@@ -45,11 +39,8 @@ interface Props {
 
 export function Sidebar(props: Props) {
   const [query, setQuery] = useState("");
-  const [projectOpen, setProjectOpen] = useState(false);
-  const [newProjectPath, setNewProjectPath] = useState("");
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const projectRef = useOutsideClose(() => setProjectOpen(false));
   const renameInputRef = useRef<HTMLInputElement>(null);
   const renameCancelledRef = useRef(false);
 
@@ -67,9 +58,6 @@ export function Sidebar(props: Props) {
           s.name.toLowerCase().includes(query.toLowerCase()),
       )
     : props.sessions;
-
-  const currentProject = props.projects.find((p) => p.path === props.workspace);
-  const projectLabel = currentProject?.name ?? basename(props.workspace) ?? "workspace";
 
   const startRename = (s: SessionEntry) => {
     setRenaming(s.name);
@@ -103,98 +91,6 @@ export function Sidebar(props: Props) {
             : "-translate-x-full pointer-events-none lg:pointer-events-auto"
         }`}
       >
-        {/* ── Project switcher ── */}
-        <div className="relative border-b border-ink-800/80" ref={projectRef}>
-          <button
-            onClick={() => setProjectOpen((o) => !o)}
-            disabled={props.switching}
-            className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-ink-900/60 disabled:opacity-50"
-          >
-            <FolderIcon width={15} height={15} className="shrink-0 text-accent-soft" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[13px] font-semibold text-ink-100">{projectLabel}</div>
-              <div className="truncate font-mono text-[10px] text-ink-500">
-                {props.switching ? "switching…" : basename(props.workspace) || props.workspace}
-              </div>
-            </div>
-            <ChevronDown
-              width={14}
-              height={14}
-              className={`shrink-0 text-ink-500 transition-transform ${projectOpen ? "rotate-180" : ""}`}
-            />
-          </button>
-          {projectOpen && (
-            <div className="absolute left-0 right-0 z-40 mt-px max-h-72 overflow-auto rounded-b-xl border border-t-0 border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in">
-              {props.projects.length === 0 && (
-                <div className="px-3 py-2 text-[12px] text-ink-600">No projects yet.</div>
-              )}
-              {props.projects.map((p) => {
-                const active = p.path === props.workspace;
-                return (
-                  <div
-                    key={p.path}
-                    className="group/proj flex items-center gap-1 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-ink-800"
-                  >
-                    <button
-                      onClick={() => {
-                        if (!active) props.onSwitchWorkspace(p.path);
-                        setProjectOpen(false);
-                      }}
-                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                    >
-                      <FolderIcon width={13} height={13} className={active ? "text-accent-soft" : "text-ink-500"} />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[12px] font-medium text-ink-100">{p.name}</div>
-                        <div className="truncate font-mono text-[10px] text-ink-500">{p.path}</div>
-                      </div>
-                      {active && <CheckIcon width={13} height={13} className="shrink-0 text-accent-soft" />}
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        props.onRemoveProject(p.path);
-                      }}
-                      className="shrink-0 rounded p-0.5 text-ink-600 opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group/proj:opacity-100"
-                      title="Remove from list"
-                    >
-                      <XIcon width={12} height={12} />
-                    </button>
-                  </div>
-                );
-              })}
-              {/* Add project */}
-              <div className="mt-1 flex items-center gap-1.5 border-t border-ink-800 pt-1.5">
-                <input
-                  value={newProjectPath}
-                  onChange={(e) => setNewProjectPath(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && newProjectPath.trim()) {
-                      props.onSwitchWorkspace(newProjectPath.trim());
-                      setNewProjectPath("");
-                      setProjectOpen(false);
-                    }
-                  }}
-                  placeholder="/path/to/project"
-                  className="min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-[11px] text-ink-200 placeholder:text-ink-600 focus:border-accent/40 focus:outline-none"
-                />
-                <button
-                  onClick={() => {
-                    if (newProjectPath.trim()) {
-                      props.onSwitchWorkspace(newProjectPath.trim());
-                      setNewProjectPath("");
-                      setProjectOpen(false);
-                    }
-                  }}
-                  className="flex shrink-0 items-center justify-center rounded-lg bg-accent px-2 py-1 text-accent"
-                  title="Add & switch to project"
-                >
-                  <FolderPlusIcon width={13} height={13} className="text-white" />
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
         {/* ── Sessions header ── */}
         <div className="flex items-center justify-between px-4 py-2.5">
           <div className="flex items-center gap-2">
@@ -344,11 +240,10 @@ export function Sidebar(props: Props) {
 
         {/* ── Footer: quick actions + stats ── */}
         <div className="border-t border-ink-800/80 p-2">
-          <div className="mb-1.5 grid grid-cols-3 gap-1.5 sm:grid-cols-5">
+          <div className="mb-1.5 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
             <ActionBtn icon={<SparkIcon width={13} height={13} />} label="Agents" onClick={() => props.onOpenPanel("subagents")} />
-            <ActionBtn icon={<BoltIcon width={13} height={13} />} label="Settings" onClick={() => props.onOpenPanel("settings")} />
             <ActionBtn icon={<HelpIcon width={13} height={13} />} label="Help" onClick={() => props.onOpenPanel("help")} />
           </div>
           <div className="grid grid-cols-3 gap-1.5">

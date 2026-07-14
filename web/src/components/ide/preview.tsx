@@ -22,8 +22,9 @@
 // history still work standalone.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Markdown } from "@/components/markdown";
+import { MarkdownDocument } from "@/components/markdown-document";
 import { ChevronRight, GlobeIcon, RefreshIcon } from "@/components/icons";
+import { PREVIEW_IMAGE_EXTENSIONS, previewExtension } from "@/lib/preview-support";
 import type { PreviewState } from "@/lib/types";
 
 export interface PreviewProps {
@@ -38,13 +39,6 @@ export interface PreviewProps {
 }
 
 const NONE: PreviewState = { kind: "none", target: "" };
-
-const IMAGE_EXT = new Set(["svg", "png", "jpg", "jpeg", "gif", "webp"]);
-
-function extOf(target: string): string {
-  const i = target.lastIndexOf(".");
-  return i < 0 ? "" : target.slice(i + 1).toLowerCase();
-}
 
 /** Small inline icon (kept local to avoid touching the shared icons module). */
 function ExternalLinkIcon({ width = 14, height = 14 }: { width?: number; height?: number }) {
@@ -132,11 +126,11 @@ export function Preview({ target, workspace, preview, onPreviewChange }: Preview
     return `/api/preview?${qs.toString()}`;
   }, [active.kind, active.target, workspace]);
 
-  const ext = extOf(active.target);
+  const ext = previewExtension(active.target);
   const isMarkdown = ext === "md" || ext === "markdown";
   const isHtml = ext === "html" || ext === "htm";
   const isPdf = ext === "pdf";
-  const isImage = IMAGE_EXT.has(ext);
+  const isImage = PREVIEW_IMAGE_EXTENSIONS.has(ext);
 
   // ── Markdown fetch (rendered client-side) ──
   const [md, setMd] = useState<string | null>(null);
@@ -200,6 +194,25 @@ export function Preview({ target, workspace, preview, onPreviewChange }: Preview
   }, [active.kind, active.target, fileUrl]);
 
   const canOpen = active.kind === "url" ? !!active.target : !!fileUrl;
+
+  const resolveMarkdownImage = useCallback(
+    (source: string) => {
+      if (!source || /^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(source)) return source;
+      const cleanSource = source.split(/[?#]/, 1)[0].replace(/\\/g, "/");
+      const base = source.startsWith("/")
+        ? []
+        : active.target.replace(/\\/g, "/").split("/").slice(0, -1);
+      for (const segment of cleanSource.replace(/^\/+/, "").split("/")) {
+        if (!segment || segment === ".") continue;
+        if (segment === "..") base.pop();
+        else base.push(segment);
+      }
+      const qs = new URLSearchParams({ path: base.join("/") });
+      if (workspace) qs.set("workspace", workspace);
+      return `/api/preview?${qs.toString()}`;
+    },
+    [active.target, workspace],
+  );
 
   // ── Toolbar ──
   const toolbar = (
@@ -298,8 +311,8 @@ export function Preview({ target, workspace, preview, onPreviewChange }: Preview
         content = <EmptyHint text="Loading…" />;
       } else if (md != null) {
         content = (
-          <div className="h-full overflow-auto bg-white px-4 py-3 text-ink-900">
-            <Markdown>{md}</Markdown>
+          <div className="h-full overflow-auto bg-ink-950 px-4 py-5 text-ink-200 sm:px-7 sm:py-7">
+            <MarkdownDocument resolveImageUrl={resolveMarkdownImage}>{md}</MarkdownDocument>
           </div>
         );
       } else {

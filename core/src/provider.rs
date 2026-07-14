@@ -1646,8 +1646,29 @@ pub async fn discover_models(
 ) -> Vec<ModelInfo> {
     let cache_key = provider_cache_key(provider);
     match provider.kind {
-        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key).await,
-        ProviderKind::Anthropic => discover_models_anthropic(client, provider, &cache_key).await,
+        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, false).await,
+        ProviderKind::Anthropic => {
+            discover_models_anthropic(client, provider, &cache_key, false).await
+        }
+    }
+}
+
+/// Like [`discover_models`], but bypasses the fresh-cache (TTL) early return so a
+/// live fetch is ALWAYS performed and the disk cache is rewritten with the
+/// current model list. Used by the startup background refresh (see `main.rs`)
+/// for the Umans provider so newly-added models appear without waiting out the
+/// 8h TTL. Still falls back to the stale cache / curated snapshot on HTTP
+/// failure, so an unreachable endpoint never degrades the caller.
+pub async fn discover_models_force_refresh(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+) -> Vec<ModelInfo> {
+    let cache_key = provider_cache_key(provider);
+    match provider.kind {
+        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, true).await,
+        ProviderKind::Anthropic => {
+            discover_models_anthropic(client, provider, &cache_key, true).await
+        }
     }
 }
 
@@ -1664,6 +1685,7 @@ async fn discover_models_openai(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
     cache_key: &str,
+    force_live: bool,
 ) -> Vec<ModelInfo> {
     // OpenCode Go: the single /v1/models endpoint serves every model over both
     // wire protocols with no protocol field, so fetch it live and filter to
@@ -1672,9 +1694,13 @@ async fn discover_models_openai(
     if is_opencode_go(&provider.base_url) {
         return opencode_go_discover_models(client, provider, cache_key, true).await;
     }
-    // 1. Try disk cache (fresh: < 8 hours old).
-    if let Some(models) = read_models_cache(cache_key) {
-        return models;
+    // 1. Try disk cache (fresh: < 8 hours old). Skipped on a forced live refresh
+    //    (the startup background check) so newly-added models are picked up every
+    //    launch instead of waiting out the TTL window.
+    if !force_live {
+        if let Some(models) = read_models_cache(cache_key) {
+            return models;
+        }
     }
 
     // 2. Fetch live from the endpoint. Auth is optional here (Umans /models/info
@@ -5447,6 +5473,7 @@ async fn discover_models_anthropic(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
     cache_key: &str,
+    force_live: bool,
 ) -> Vec<ModelInfo> {
     // OpenCode Go: the single /v1/models endpoint serves every model over both
     // wire protocols with no protocol field, so fetch it live and filter to
@@ -5455,8 +5482,10 @@ async fn discover_models_anthropic(
     if is_opencode_go(&provider.base_url) {
         return opencode_go_discover_models(client, provider, cache_key, false).await;
     }
-    if let Some(models) = read_models_cache(cache_key) {
-        return models;
+    if !force_live {
+        if let Some(models) = read_models_cache(cache_key) {
+            return models;
+        }
     }
     let url = format!("{}{ANTHROPIC_MODELS_PATH}", provider.base_url);
     let mut req = client.get(&url).timeout(Duration::from_secs(8));
@@ -6913,5 +6942,42 @@ mod tests {
         let msgs: Vec<Message> = vec![Message::user("x")];
         let out = summarize(&client, &provider, "mock-model", &msgs, &cancel, None).await;
         assert!(out.is_none());
+    }
+
+    /// Live integration check, run on demand:
+    ///   cargo test --bin core -- --ignored --nocapture refresh_live_umans_models_cache
+    ///
+    /// Hits the REAL public Umans `/models/info` endpoint (no key required)
+    /// through the exact `discover_models_force_refresh` code path the startup
+    /// background task uses, and writes the result into the real on-disk models
+    /// cache so the latest models are cached locally. Ignored by default so it
+    /// never runs in normal `cargo test` / CI (network + writes the user cache).
+    #[tokio::test]
+    #[ignore = "live: hits the real Umans endpoint and writes the models cache"]
+    async fn refresh_live_umans_models_cache() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("client");
+        let provider = ResolvedProvider {
+            name: "umans".to_string(),
+            kind: ProviderKind::OpenAI,
+            base_url: "https://api.code.umans.ai/v1".to_string(),
+            api_key: None, // /models/info is public
+            headers: Vec::new(),
+            oauth: false,
+        };
+        let models = discover_models_force_refresh(&client, &provider).await;
+        assert!(
+            !models.is_empty(),
+            "live Umans /models/info returned no models"
+        );
+        eprintln!("fetched {} Umans model(s):", models.len());
+        for m in &models {
+            eprintln!(
+                "  {} ({}) ctx={} out={} reasoning={} vision={} levels={:?}",
+                m.id, m.name, m.context_window, m.max_tokens, m.reasoning, m.vision, m.thinking_levels
+            );
+        }
     }
 }

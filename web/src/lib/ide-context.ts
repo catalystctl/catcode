@@ -11,6 +11,8 @@ export interface IdeContextValue {
   workspace: string;
   /** The IDE layout/panel state api. */
   ide: IdeApi;
+  /** Opens application settings from any IDE panel or command surface. */
+  openSettings: () => void;
 }
 
 export const IdeContext = createContext<IdeContextValue | null>(null);
