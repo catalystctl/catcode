@@ -42,6 +42,7 @@ var keybindDefs = []keybindDef{
 	{"command_palette", "Global", "Open command palette", "ctrl+p"},
 	{"command_palette_alt", "Global", "Open command palette (alternate)", "ctrl+k"},
 	{"reasoning_picker", "Global", "Set reasoning effort (per model)", "ctrl+r"},
+	{"toggle_activity", "Global", "Expand / collapse activity shelf", "ctrl+g"},
 	{"close", "Global", "Close modal / deny / abort / cancel", "esc"},
 
 	// Scrolling — transcript viewport, every state.
@@ -80,7 +81,7 @@ var keybindDefs = []keybindDef{
 
 	// Approval — when a destructive action is pending.
 	{"approve", "Approval", "Approve once", "y"},
-	{"approve_always", "Approval", "Approve & stop asking", "a"},
+	{"approve_always", "Approval", "Always allow this tool type", "a"},
 	{"deny", "Approval", "Deny", "n"},
 
 	// Mention — @-mention file flyout.
@@ -600,7 +601,7 @@ func (s *session) helpKeybindLines() []string {
 		"",
 		"Approval (when prompted)",
 		fmt.Sprintf("  %-18s approve once", key("approve")),
-		fmt.Sprintf("  %-18s approve & stop asking", key("approve_always")),
+		fmt.Sprintf("  %-18s always allow this tool type", key("approve_always")),
 		fmt.Sprintf("  %-18s deny", key("deny")),
 		"",
 		"Navigation (modals, welcome, @-mention)",

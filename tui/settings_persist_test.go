@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -165,6 +166,43 @@ func TestLoadSettingsAutoCompactMissingKey(t *testing.T) {
 	}
 	if s.BashTimeoutSecs != 45 {
 		t.Fatalf("BashTimeoutSecs=%d, want 45", s.BashTimeoutSecs)
+	}
+}
+
+func TestFooterMetricsDefaultsOnAndPersistsOff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	s := loadSettingsFrom(path)
+	if !s.FooterMetrics {
+		t.Fatal("footer metrics should default on")
+	}
+	s.FooterMetrics = false
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadSettingsFrom(path)
+	if loaded.FooterMetrics {
+		t.Fatal("footer metrics off should survive reload")
+	}
+}
+
+func TestFooterMetricsCommandAndRender(t *testing.T) {
+	s := initialSession()
+	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.models = []modelInfo{{ID: "glm-5.2", ContextWindow: 128000}}
+	s.modelIdx = 0
+	s.lastMetrics = json.RawMessage(`{"tps":"51.7","ttft_ms":"180"}`)
+	s.settings.FooterMetrics = true
+	footer := stripANSI(s.renderFooter())
+	for _, want := range []string{"glm-5.2", "52 tok/s", "180ms ttft"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("footer missing %q:\n%s", want, footer)
+		}
+	}
+	_ = s.handleUserLine("/footer-metrics off")
+	if s.settings.FooterMetrics || strings.Contains(stripANSI(s.renderFooter()), "tok/s") {
+		t.Fatal("footer-metrics off should hide the performance row")
 	}
 }
 

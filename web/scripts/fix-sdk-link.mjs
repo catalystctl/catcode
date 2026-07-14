@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -23,12 +30,22 @@ const result = spawnSync(process.execPath, [tsc, "-p", join(sdkRoot, "tsconfig.j
 if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 
-// Bun may materialize the `file:../sdk` package before the postinstall build,
-// leaving a directory that does not contain the freshly generated dist files.
-// Point the installed package at the source SDK after compilation so both the
-// TypeScript declarations and runtime entry resolve on clean checkouts.
+// Bun materializes `file:../sdk` as a real directory containing per-file
+// symlinks. Turbopack treats a symlinked package.json as a redirect and refuses
+// to parse it. Require one package-directory symlink/junction instead; checking
+// only for dist/index.d.ts is insufficient because Bun's broken layout includes
+// that file too when the SDK was previously built.
 const sdkLink = join(webModules, "@catalyst-code", "coding-agent");
-if (!existsSync(join(sdkLink, "dist", "index.d.ts"))) {
+let isDirectSdkLink = false;
+try {
+  isDirectSdkLink =
+    lstatSync(sdkLink).isSymbolicLink() &&
+    realpathSync(sdkLink) === realpathSync(sdkRoot);
+} catch {
+  isDirectSdkLink = false;
+}
+
+if (!isDirectSdkLink) {
   rmSync(sdkLink, { recursive: true, force: true });
   mkdirSync(dirname(sdkLink), { recursive: true });
   symlinkSync(sdkRoot, sdkLink, process.platform === "win32" ? "junction" : "dir");

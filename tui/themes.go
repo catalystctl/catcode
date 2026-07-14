@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -505,6 +508,11 @@ func applyTheme(t theme) {
 	c.success = t.success
 	c.warn = t.warn
 	c.err = t.err
+	// Theme authors choose the aesthetic palette; these two semantic colours
+	// make that palette safe for small terminal text and structural boundaries.
+	// They only move a colour toward the theme foreground when needed.
+	c.secondary = ensureThemeContrast(t.muted, t.bg, t.fg, 4.5)
+	c.decor = ensureThemeContrast(t.dim, t.bg, t.fg, 3.0)
 
 	if colorsDisabled() {
 		baseStyle = lipgloss.NewStyle()
@@ -552,29 +560,29 @@ func applyTheme(t theme) {
 
 	baseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
 	boldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Bold(true)
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
+	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
 	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
 	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success))
 	errStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.warn)).Bold(true)
 	assistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.assist))
-	thinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim)).Italic(true)
+	thinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary)).Italic(true)
 	toolNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool)).Bold(true)
 	toolDetailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool))
 	resultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
 	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
-	keyHintStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
-	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
+	keyHintStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
+	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.decor))
 	inputPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
-	placeholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
+	placeholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
 	codeTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
 	codeInlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool))
 	italicStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Italic(true)
 	linkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Underline(true)
 	roleUserStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.user)).Bold(true)
 	roleAssistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
-	roleThinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim)).Italic(true)
+	roleThinkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary)).Italic(true)
 	roleToolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool)).Bold(true)
 	roleResultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success)).Bold(true)
 	roleErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err)).Bold(true)
@@ -587,6 +595,69 @@ func applyTheme(t theme) {
 	roToolNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
 	errOutStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	errRuleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+}
+
+func parseHexColor(s string) ([3]float64, bool) {
+	var rgb [3]float64
+	if len(s) != 7 || s[0] != '#' {
+		return rgb, false
+	}
+	for i := 0; i < 3; i++ {
+		v, err := strconv.ParseUint(s[1+i*2:3+i*2], 16, 8)
+		if err != nil {
+			return rgb, false
+		}
+		rgb[i] = float64(v) / 255
+	}
+	return rgb, true
+}
+
+func relativeLuminance(rgb [3]float64) float64 {
+	for i, v := range rgb {
+		if v <= 0.04045 {
+			rgb[i] = v / 12.92
+		} else {
+			rgb[i] = math.Pow((v+0.055)/1.055, 2.4)
+		}
+	}
+	return 0.2126*rgb[0] + 0.7152*rgb[1] + 0.0722*rgb[2]
+}
+
+func colorContrast(a, b string) float64 {
+	ar, aok := parseHexColor(a)
+	br, bok := parseHexColor(b)
+	if !aok || !bok {
+		return 1
+	}
+	la, lb := relativeLuminance(ar), relativeLuminance(br)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+func ensureThemeContrast(color, bg, toward string, minimum float64) string {
+	if colorContrast(color, bg) >= minimum {
+		return color
+	}
+	from, ok1 := parseHexColor(color)
+	to, ok2 := parseHexColor(toward)
+	if !ok1 || !ok2 {
+		return toward
+	}
+	best := toward
+	for step := 1; step <= 100; step++ {
+		t := float64(step) / 100
+		candidate := fmt.Sprintf("#%02x%02x%02x",
+			int(math.Round((from[0]+(to[0]-from[0])*t)*255)),
+			int(math.Round((from[1]+(to[1]-from[1])*t)*255)),
+			int(math.Round((from[2]+(to[2]-from[2])*t)*255)))
+		best = candidate
+		if colorContrast(candidate, bg) >= minimum {
+			return candidate
+		}
+	}
+	return best
 }
 
 func colorsDisabled() bool {

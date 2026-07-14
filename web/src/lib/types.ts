@@ -822,9 +822,61 @@ export interface GitStatus {
   head: { oid: string; message: string; author: string; ts: number } | null;
   /** True if the workspace is not a git repo (panel shows "initialize" CTA). */
   bare: boolean;
+  /** Configured upstream for the current branch, if any. */
+  upstream?: string | null;
+  /** Local and remote branches. */
+  branches?: GitBranch[];
+  /** Recent commits across all refs. */
+  commits?: GitCommit[];
+  /** Saved worktree snapshots. */
+  stashes?: GitStash[];
+  /** Repository tags. */
+  tags?: GitTag[];
+  /** Configured remotes and their fetch/push URLs. */
+  remotes?: GitRemote[];
 }
 
-/** A live terminal session (one PTY-less spawn per tab). */
+export interface GitBranch {
+  name: string;
+  oid: string;
+  current: boolean;
+  remote: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+}
+
+export interface GitCommit {
+  oid: string;
+  shortOid: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  email: string;
+  ts: number;
+  refs: string[];
+}
+
+export interface GitStash {
+  ref: string;
+  oid: string;
+  subject: string;
+  ts: number;
+}
+
+export interface GitTag {
+  name: string;
+  oid: string;
+  subject: string;
+}
+
+export interface GitRemote {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+/** A live, persistent PTY session rendered by Ghostty in the browser. */
 export interface TerminalSession {
   /** Client-generated id (e.g. "term_<ts>_<n>"). */
   id: string;

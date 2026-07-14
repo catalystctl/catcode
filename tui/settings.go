@@ -152,6 +152,7 @@ type settingsStore struct {
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds (also written as idle_timeout_secs for core)
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
 	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
+	FooterMetrics    bool   `json:"footer_metrics"`               // default on; false hides model/performance footer row
 	// Runtime knobs: also applied live via set_config; persisted so restart keeps them.
 	// JSON names match core apply_json so the core reads them from settings.json too.
 	BashTimeoutSecs int  `json:"bash_timeout_secs,omitempty"`
@@ -281,6 +282,7 @@ func loadSettingsFrom(path string) *settingsStore {
 		IdleTimeout:     120,
 		BashTimeoutSecs: 30,
 		AutoCompact:     true,
+		FooterMetrics:   true,
 	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
@@ -327,6 +329,9 @@ func loadSettingsFrom(path string) *settingsStore {
 	}
 	s.MaxSessionTokens = onDisk.MaxSessionTokens
 	s.MouseWheel = onDisk.MouseWheel
+	if v, ok := raw["footer_metrics"].(bool); ok {
+		s.FooterMetrics = v
+	}
 	if onDisk.BashTimeoutSecs > 0 {
 		s.BashTimeoutSecs = onDisk.BashTimeoutSecs
 	}
@@ -430,7 +435,7 @@ func (s *settingsStore) save() (err error) {
 		"theme": s.Theme, "think_expanded": s.ThinkExpanded,
 		"sandbox": s.Sandbox, "no_network": s.NoNetwork,
 		"idle_timeout": s.IdleTimeout, "max_session_tokens": s.MaxSessionTokens,
-		"mouse_wheel": s.MouseWheel, "bash_timeout_secs": s.BashTimeoutSecs,
+		"mouse_wheel": s.MouseWheel, "footer_metrics": s.FooterMetrics, "bash_timeout_secs": s.BashTimeoutSecs,
 		"auto_compact": s.AutoCompact, "active_provider": s.ActiveProvider,
 		"provider_keys":   nonNilStringMap(s.ProviderKeys),
 		"keybinds":        nonNilStringMap(s.Keybinds),
@@ -443,6 +448,7 @@ func (s *settingsStore) save() (err error) {
 	// must not drop a deliberate false, and blank approval must not wipe disk).
 	merged["approval"] = s.Approval
 	merged["auto_compact"] = s.AutoCompact
+	merged["footer_metrics"] = s.FooterMetrics
 	// Core apply_json reads idle_timeout_secs; keep the TUI's idle_timeout too.
 	merged["idle_timeout"] = s.IdleTimeout
 	merged["idle_timeout_secs"] = s.IdleTimeout

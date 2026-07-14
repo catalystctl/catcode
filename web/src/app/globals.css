@@ -107,10 +107,18 @@ body {
   color: rgb(var(--ink-100));
 }
 
+html {
+  /* Avoid horizontal rubber-banding from wide code/diff blocks. */
+  overflow-x: hidden;
+}
+
 body {
   font-feature-settings: "cv02", "cv03", "cv04", "ss01";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* Mobile: stop accidental overscroll chaining out of the app shell. */
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
@@ -260,10 +268,14 @@ body {
   margin: 1.2em 0;
 }
 .prose-catalyst table {
+  display: block;
   width: 100%;
+  max-width: 100%;
   border-collapse: collapse;
   margin: 0.7em 0;
   font-size: 0.9em;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .prose-catalyst th,
 .prose-catalyst td {
@@ -302,6 +314,16 @@ body {
   border: none;
   color: inherit;
   font-family: var(--font-mono);
+}
+
+/* CodeMirror: keep long lines inside the editor scroller on narrow screens. */
+.cm-editor {
+  height: 100%;
+  max-width: 100%;
+}
+.cm-scroller {
+  overflow-x: auto !important;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* highlight.js — atom-one-dark theme (dark) / atom-one-light (light). */
@@ -484,4 +506,54 @@ body {
 .auth-btn-ghost:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Responsive modal shells ─────────────────────────────────────────────
+   Full-screen / bottom sheet on phones; centered card from sm up.            */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.6);
+  padding: 0;
+  backdrop-filter: blur(4px);
+}
+@media (min-width: 640px) {
+  .modal-backdrop {
+    align-items: center;
+    padding: 1rem;
+  }
+}
+.modal-sheet {
+  display: flex;
+  width: 100%;
+  max-height: 100dvh;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 1rem 1rem 0 0;
+  border: 1px solid rgb(var(--ink-700));
+  border-bottom: 0;
+  background: rgb(var(--ink-900));
+  box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.5);
+  animation: fade-in 0.18s ease-out;
+}
+.modal-sheet-auto {
+  height: auto;
+  max-height: min(92dvh, 100%);
+  margin-top: auto;
+}
+@media (min-width: 640px) {
+  .modal-sheet {
+    height: auto;
+    max-height: min(85vh, 900px);
+    border-radius: 1rem;
+    border-bottom: 1px solid rgb(var(--ink-700));
+  }
+  .modal-sheet-auto {
+    margin-top: 0;
+  }
 }

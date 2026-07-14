@@ -22,10 +22,10 @@ export function DiagnosticsModal({ stats, context, usage, onRefresh, onClose }: 
   const trapRef = useFocusTrap<HTMLDivElement>();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet max-w-lg"
         role="dialog"
         aria-modal="true"
         aria-label="Diagnostics"

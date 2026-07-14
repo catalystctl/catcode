@@ -63,6 +63,36 @@ func TestCompactPanelsNeverForceTerminalWidth(t *testing.T) {
 	assertFitsViewport(t, "subagents", s.renderActiveTasks(s.width), s.width, s.height)
 }
 
+func TestActivityShelfPrioritizesSubagentsAndScrollsIntoTasks(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.activityExpanded = true
+	for i := 0; i < 8; i++ {
+		s.subProgress = append(s.subProgress, &subProgressEntry{
+			agent: fmt.Sprintf("agent-%d", i), started: time.Now(),
+			curTool: "read_file", toolStart: time.Now(), toolRunning: true,
+		})
+	}
+	for i := 0; i < 3; i++ {
+		s.todos = append(s.todos, map[string]json.RawMessage{
+			"subject": json.RawMessage(fmt.Sprintf("%q", fmt.Sprintf("task-%d", i))),
+			"status":  json.RawMessage(`"pending"`),
+		})
+	}
+	s.layout()
+	top := stripANSI(s.renderActivityShelf())
+	if !strings.Contains(top, "Subagents") || !strings.Contains(top, "agent-0") {
+		t.Fatalf("activity shelf did not prioritize subagents:\n%s", top)
+	}
+	_, _ = s.handleKey(keyMsg("pgdown"))
+	_, _ = s.handleKey(keyMsg("pgdown"))
+	bottom := stripANSI(s.renderActivityShelf())
+	if !strings.Contains(bottom, "Tasks") || !strings.Contains(bottom, "task-2") {
+		t.Fatalf("activity shelf could not scroll through tasks:\n%s", bottom)
+	}
+}
+
 func TestApplyThemePreservesAuthoredPalette(t *testing.T) {
 	original := activeTheme
 	t.Cleanup(func() { applyTheme(original) })
@@ -70,6 +100,20 @@ func TestApplyThemePreservesAuthoredPalette(t *testing.T) {
 		applyTheme(th)
 		if c.bg != th.bg || c.fg != th.fg || c.dim != th.dim || c.muted != th.muted || c.accent != th.accent {
 			t.Errorf("theme %q palette was rewritten: got bg=%s fg=%s dim=%s muted=%s accent=%s", th.name, c.bg, c.fg, c.dim, c.muted, c.accent)
+		}
+	}
+}
+
+func TestEveryThemeDerivesAccessibleSemanticColors(t *testing.T) {
+	original := activeTheme
+	t.Cleanup(func() { applyTheme(original) })
+	for _, th := range themes {
+		applyTheme(th)
+		if got := colorContrast(c.secondary, c.bg); got < 4.5 {
+			t.Errorf("theme %q secondary text contrast=%.2f, want >= 4.5", th.name, got)
+		}
+		if got := colorContrast(c.decor, c.bg); got < 3.0 {
+			t.Errorf("theme %q boundary contrast=%.2f, want >= 3.0", th.name, got)
 		}
 	}
 }

@@ -16,6 +16,7 @@ const nextConfig = {
     "better-sqlite3",
     "kysely",
     "ws", // server-only (custom server /api/terminal WS); never bundled for the client
+    "node-pty", // native PTY binding; loaded only by the custom server
   ],
   // Produce a self-contained server bundle (.next/standalone) for the release
   // pipeline — `release-web.sh` ships it as a ready-to-run tarball so the

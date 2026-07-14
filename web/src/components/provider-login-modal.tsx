@@ -39,10 +39,10 @@ export function ProviderLoginModal({
   const current = list.find((p) => p.id === selected) ?? null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[85vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet max-w-md"
         role="dialog"
         aria-modal="true"
         aria-label={mode === "logout" ? "Log out of provider" : "Log in to provider"}

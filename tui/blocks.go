@@ -436,7 +436,9 @@ func (s *session) renderBlock(b *block, w int) string {
 
 func (s *session) decorateFocusedBlock(b *block, out string) string {
 	if s.focusedBlock >= 0 && s.focusedBlock < len(s.blocks) && s.blocks[s.focusedBlock] == b {
-		return accentStyle.Render("▸ focused") + "\n" + out
+		parts := strings.SplitN(out, "\n", 2)
+		parts[0] = accentStyle.Render("▸ ") + parts[0]
+		return strings.Join(parts, "\n")
 	}
 	return out
 }
@@ -855,28 +857,26 @@ func roleLine(glyph, role, meta, color string) string {
 // ---------------------------------------------------------------------------
 
 var welcomeExamples = []string{
-	"Explain how this codebase is organized",
-	"Write a unit test for a core module",
-	"Review my code for potential issues",
-	"Refactor the most complex function for readability",
+	"Understand this repository",
+	"Find and fix a bug",
+	"Add or improve tests",
+	"Review recent changes",
 }
 
 func (s *session) renderWelcome() string {
 	w := s.viewport.Width()
 	h := s.viewport.Height()
 
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
-	sub := mutedStyle.Render("a multi-provider coding agent")
 	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
 		panelW := min(50, max(20, w-4))
 		panel := lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(c.dim)).
+			BorderForeground(lipgloss.Color(c.decor)).
 			Padding(0, 1).
 			Width(panelW).
 			Render(accentStyle.Render("◷ Starting…") + "\n\n" +
 				baseStyle.Render("Connecting to the core and checking credentials."))
-		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, brand+"\n"+sub+"\n\n"+panel)
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 	}
 
 	// Unauthed first-run: lead with login instead of example prompts.
@@ -885,8 +885,8 @@ func (s *session) renderWelcome() string {
 		if w-4 < panelW {
 			panelW = w - 4
 		}
-		if panelW < 30 {
-			panelW = 30
+		if panelW < 1 {
+			panelW = 1
 		}
 		rows := []string{
 			accentStyle.Render("◆ Get started"),
@@ -897,12 +897,20 @@ func (s *session) renderWelcome() string {
 		}
 		panel := lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(c.dim)).
+			BorderForeground(lipgloss.Color(c.decor)).
 			Padding(0, 1).
 			Width(panelW).
 			Render(strings.Join(rows, "\n"))
-		content := brand + "\n" + sub + "\n\n" + panel
-		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
+	}
+	if h < 10 || w < 32 {
+		idx := min(max(0, s.welcomeIdx), len(welcomeExamples)-1)
+		lines := []string{
+			accentStyle.Render("What would you like to build?"),
+			accentStyle.Render(fmt.Sprintf("▸ %d. %s", idx+1, welcomeExamples[idx])),
+			dimStyle.Render("↑↓ choose · enter use · / commands"),
+		}
+		return lipgloss.Place(w, h, lipgloss.Left, lipgloss.Center, strings.Join(lines, "\n"))
 	}
 
 	// build the example panel
@@ -910,26 +918,30 @@ func (s *session) renderWelcome() string {
 	if w-4 < panelW {
 		panelW = w - 4
 	}
-	if panelW < 30 {
-		panelW = 30
+	if panelW < 1 {
+		panelW = 1
 	}
 	var rows []string
-	rows = append(rows, accentStyle.Render("◆ Examples"))
+	rows = append(rows, accentStyle.Render("What would you like to build?"), "")
 	for i, ex := range welcomeExamples {
 		marker := "  "
 		if i == s.welcomeIdx {
 			marker = accentStyle.Render("▸ ")
 		}
 		num := dimStyle.Render(fmt.Sprintf("%d.", i+1))
-		text := baseStyle.Render(ex)
+		textStyle := baseStyle
 		if i == s.welcomeIdx {
-			text = accentStyle.Render(ex)
+			textStyle = accentStyle
 		}
-		row := marker + num + " " + text
-		if i == s.welcomeIdx {
-			row = lipgloss.NewStyle().Background(lipgloss.Color(c.bg)).Width(panelW).Render(row)
+		prefix := marker + num + " "
+		wrapped := strings.Split(wrapPlain(ex, max(8, panelW-lipgloss.Width(prefix)-4)), "\n")
+		for j, line := range wrapped {
+			if j == 0 {
+				rows = append(rows, prefix+textStyle.Render(line))
+			} else {
+				rows = append(rows, strings.Repeat(" ", lipgloss.Width(prefix))+textStyle.Render(line))
+			}
 		}
-		rows = append(rows, row)
 	}
 	rows = append(rows, "")
 	rows = append(rows, dimStyle.Render("↑↓ pick · enter to use · / commands · ? help"))
@@ -938,13 +950,12 @@ func (s *session) renderWelcome() string {
 	// wrap the panel in a subtle rounded border
 	panel = lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.dim)).
+		BorderForeground(lipgloss.Color(c.decor)).
 		Padding(0, 1).
 		Width(panelW).
 		Render(panel)
 
-	content := brand + "\n" + sub + "\n\n" + panel
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, content)
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 }
 
 // rebuildBlocksFromHistory reconstructs the transcript blocks from a loaded

@@ -93,7 +93,7 @@ function UserMessage({
 
   return (
     <div className="group flex justify-end px-4 py-2 sm:px-6">
-      <div className="relative max-w-[85%]">
+      <div className="relative max-w-[min(85%,28rem)] sm:max-w-[85%]">
         {editing ? (
           <div className="rounded-2xl rounded-tr-sm border border-accent/40 bg-ink-800/70 p-2">
             <textarea
@@ -177,7 +177,7 @@ function AssistantMessage({
             <DotIcon className="animate-pulse" /> streaming
           </span>
         )}
-        <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <span className="ml-auto flex items-center gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
           {canRegenerate && onRegenerate && !m.streaming && (
             <button
               onClick={onRegenerate}
@@ -191,7 +191,7 @@ function AssistantMessage({
           <CopyBtn text={m.text} />
         </span>
       </div>
-      <div className="pl-7">
+      <div className="pl-0 sm:pl-7">
         <Thinking text={m.thinking} active={m.streaming} />
         {m.text ? (
           m.streaming ? (
@@ -231,7 +231,7 @@ function AssistantMessage({
 function ToolMessage({ m }: { m: ToolMsg }) {
   return (
     <div className="px-4 py-1 sm:px-6">
-      <div className="ml-7 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2">
+      <div className="ml-0 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2 sm:ml-7">
         <div className="font-mono text-[11px] text-ink-400">
           {m.toolName || "tool"} result · {m.ok ? "ok" : "error"}
         </div>
@@ -251,7 +251,7 @@ function BashMessage({ m }: { m: BashMsg }) {
   const prefix = m.excludeFromContext ? "!!" : "!";
   return (
     <div className="px-4 py-1 sm:px-6">
-      <div className="ml-7 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2">
+      <div className="ml-0 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2 sm:ml-7">
         <div className="font-mono text-[11px] text-ink-400">
           {prefix} bash · {m.ok ? "ok" : "error"}
           {m.excludeFromContext ? " · no context" : ""}

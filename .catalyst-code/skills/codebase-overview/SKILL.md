@@ -11,6 +11,7 @@ Use this when the user asks for a concise orientation to an unfamiliar repositor
 
 ## Steps
 
+0. **Leverage existing memory first.** Call `memory` action=get on any architecture/overview memory (e.g. `repo-top-level-architecture`) and `action=list` to see the catalog. A repo you've worked on before may already be mapped — retrieving notes first avoids re-deriving the whole layout. **Then verify the memory is current** against the actual repo in the steps below; append corrections (`memory` action=append) if the real layout has drifted (new modules, changed versions). Use `wc -l`/`grep` on real source to confirm a quoted module map still matches before presenting it as fact.
 1. Inspect the top-level layout with `list_dir ""`.
 2. Read the main README (usually `README.md`) enough to identify the project's stated purpose, components, and run/build instructions.
 3. Read package/manifests for the main stacks, such as `Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml`, or similar.

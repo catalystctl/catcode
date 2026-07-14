@@ -19,42 +19,14 @@
 // Low-level CoreProcess layer (not the PI-compatible AgentSession): this gives
 // full yes/no/always approval control and direct session/model/stats commands.
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, relative, normalize, sep } from "node:path";
 import type { AgentState, CoreCommand, CoreEvent, ProjectEntry, ReadyPayload } from "@/lib/types";
 import { loadTitles, setTitle } from "@/lib/session-titles";
 import { loadProjects, touchProject, removeProject } from "@/lib/projects";
 import { LiveSession, type SessionCallbacks, type SessionEnv } from "./live-session";
-
-interface HarnessSettings {
-  apiKey?: string;
-  model?: string;
-  baseUrl?: string;
-  provider?: string;
-}
-
-/** Read the TUI's settings.json (~/.config/catalyst-code/settings.json) for
- *  model/baseUrl/provider prefs. API keys are not auto-injected from the
- *  environment — users paste a key or complete OAuth via `/login`. Keys already
- *  saved in settings (`api_key` / `provider_keys`) are still loaded by the core
- *  from that file for returning users. */
-function loadSettings(): HarnessSettings {
-  const path = join(homedir() || ".", ".config", "catalyst-code", "settings.json");
-  try {
-    if (!existsSync(path)) return {};
-    const raw = readFileSync(path, "utf8");
-    const s = JSON.parse(raw) as Record<string, unknown>;
-    const out: HarnessSettings = {};
-    // Do not forward api_key via UMANS_API_KEY — that was silent env auth.
-    if (typeof s.model === "string" && s.model) out.model = s.model;
-    if (typeof s.base_url === "string" && s.base_url) out.baseUrl = s.base_url;
-    if (typeof s.provider === "string" && s.provider) out.provider = s.provider;
-    return out;
-  } catch {
-    return {};
-  }
-}
+import { loadSettings } from "./settings-file";
 
 interface CoreRoot {
   binary: string;
@@ -159,17 +131,18 @@ class HarnessBridge {
   }
 
   private env(): SessionEnv {
-    if (!this.cachedEnv) {
-      const { binary } = resolveCore();
-      const s = loadSettings();
-      this.cachedEnv = {
-        binary,
-        apiKey: s.apiKey,
-        model: s.model,
-        baseUrl: s.baseUrl,
-        provider: s.provider,
-      };
-    }
+    // Re-read settings each time so a TUI/web approval change is visible to
+    // newly spawned sessions (the binary/model bits rarely change).
+    const { binary } = resolveCore();
+    const s = loadSettings();
+    this.cachedEnv = {
+      binary,
+      apiKey: s.apiKey,
+      model: s.model,
+      baseUrl: s.baseUrl,
+      provider: s.provider,
+      approval: s.approval,
+    };
     return this.cachedEnv;
   }
 

@@ -5,9 +5,8 @@
 // GET  /api/git?workspace=<abs>&diff=<rel>&staged=<0|1>  → { diff }   (task-driven
 //      extension for the panel's click→diff-view; absent in the planner contract
 //      §4.3 which only specifies status. Documented here as a minimal addition.)
-// POST /api/git  body: { action, path?, message?, branch?, workspace? }
-//      action: stage|unstage|stageAll|unstageAll|commit|pull|push|fetch|
-//              checkout|discard|init  → { ok, status: GitStatus }
+// POST /api/git performs validated, user-initiated changes across files,
+// commits, sync, branches, history, stashes, tags, remotes, and recovery.
 //
 // All git commands run via execFile (arg arrays — never a shell, so no
 // injection). File-path actions are confined via confinePath. Auth required on
@@ -17,7 +16,15 @@
 import { execFile } from "node:child_process";
 import { getSession } from "@/lib/auth";
 import { resolveWorkspace, confinePath } from "@/server/workspace";
-import type { GitStatus, GitStatusEntry } from "@/lib/types";
+import type {
+  GitBranch,
+  GitCommit,
+  GitRemote,
+  GitStash,
+  GitStatus,
+  GitStatusEntry,
+  GitTag,
+} from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -79,7 +86,7 @@ function parsePorcelain(stdout: string): {
     } else if (line.startsWith("1 ")) {
       // 1 XY sub mH mI mW hH hI path  (path may contain spaces → keep rest)
       const parts = line.split(" ", 9);
-      entries.push(makeEntry(parts[1] ?? "  ", parts[8] ?? "", null, false));
+      entries.push(...makeEntries(parts[1] ?? "  ", parts[8] ?? "", null, false));
     } else if (line.startsWith("2 ")) {
       // 2 XY sub mH mI mW hH hI Xscore path\torigPath
       const parts = line.split(" ", 10);
@@ -88,11 +95,11 @@ function parsePorcelain(stdout: string): {
       const newPath = tab >= 0 ? tail.slice(0, tab) : tail;
       const origPath = tab >= 0 ? tail.slice(tab + 1) : null;
       // path = new (real, openable/stageable) path; oldPath = original.
-      entries.push(makeEntry(parts[1] ?? "  ", newPath, origPath, false));
+      entries.push(...makeEntries(parts[1] ?? "  ", newPath, origPath, false));
     } else if (line.startsWith("u ")) {
       // u XY sub m1 m2 m3 mW h1 h2 h3 path  (unmerged → conflicted)
       const parts = line.split(" ", 11);
-      entries.push(makeEntry(parts[1] ?? "  ", parts[10] ?? "", null, true));
+      entries.push(...makeEntries(parts[1] ?? "  ", parts[10] ?? "", null, true));
     } else if (line.startsWith("? ")) {
       const path = line.slice(2);
       entries.push({
@@ -108,24 +115,32 @@ function parsePorcelain(stdout: string): {
   return { branch, ahead, behind, entries };
 }
 
-function makeEntry(
+function makeEntries(
   xy: string,
   path: string,
   oldPath: string | null,
   conflicted: boolean,
-): GitStatusEntry {
+): GitStatusEntry[] {
   if (conflicted) {
-    return { path, oldPath, xy, status: "conflicted", staged: false };
+    return [{ path, oldPath, xy, status: "conflicted", staged: false }];
   }
   const X = xy[0] ?? " ";
   const Y = xy[1] ?? " ";
-  let status: GitStatusEntry["status"];
-  if (X === "R" || Y === "R" || X === "C" || Y === "C") status = "renamed";
-  else if (X === "D" || Y === "D") status = "deleted";
-  else if (X === "A" || Y === "A") status = "added";
-  else status = "modified"; // M, T, or anything else
-  const staged = X !== " " && X !== "?";
-  return { path, oldPath, xy, status, staged };
+  const entries: GitStatusEntry[] = [];
+  if (X !== " " && X !== "?") {
+    entries.push({ path, oldPath, xy, status: statusFromCode(X), staged: true });
+  }
+  if (Y !== " " && Y !== "?") {
+    entries.push({ path, oldPath, xy, status: statusFromCode(Y), staged: false });
+  }
+  return entries;
+}
+
+function statusFromCode(code: string): GitStatusEntry["status"] {
+  if (code === "R" || code === "C") return "renamed";
+  if (code === "D") return "deleted";
+  if (code === "A") return "added";
+  return "modified";
 }
 
 /** Build the full GitStatus for a workspace (status + HEAD commit). */
@@ -147,12 +162,36 @@ async function buildStatus(workspace: string): Promise<GitStatus> {
   }
   const { branch, ahead, behind, entries } = parsePorcelain(statusRes.stdout);
 
+  const [headRes, upstreamRes, branchesRes, commitsRes, stashesRes, tagsRes, remotesRes] =
+    await Promise.all([
+      runGit(workspace, ["log", "-1", "--format=%h%x09%s%x09%an%x09%ct"]),
+      runGit(workspace, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]),
+      runGit(workspace, [
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname:short)%00%(objectname:short)%00%(HEAD)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(refname)",
+        "refs/heads",
+        "refs/remotes",
+      ]),
+      runGit(workspace, [
+        "log",
+        "--all",
+        "-n",
+        "100",
+        "--date-order",
+        "--format=%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%ct%x1f%D%x1e",
+      ]),
+      runGit(workspace, ["stash", "list", "--format=%gd%x1f%H%x1f%s%x1f%ct%x1e"]),
+      runGit(workspace, [
+        "for-each-ref",
+        "--sort=-creatordate",
+        "--format=%(refname:short)%00%(objectname:short)%00%(subject)",
+        "refs/tags",
+      ]),
+      runGit(workspace, ["remote", "-v"]),
+    ]);
+
   let head: GitStatus["head"] = null;
-  const headRes = await runGit(workspace, [
-    "log",
-    "-1",
-    "--format=%h%x09%s%x09%an%x09%ct",
-  ]);
   if (headRes.code === 0 && headRes.stdout.trim()) {
     const [oid, message, author, ts] = headRes.stdout.trim().split("\t");
     head = {
@@ -170,7 +209,74 @@ async function buildStatus(workspace: string): Promise<GitStatus> {
     entries,
     head,
     bare: false,
+    upstream: upstreamRes.code === 0 ? upstreamRes.stdout.trim() || null : null,
+    branches: parseBranches(branchesRes.stdout),
+    commits: parseCommits(commitsRes.stdout),
+    stashes: parseStashes(stashesRes.stdout),
+    tags: parseTags(tagsRes.stdout),
+    remotes: parseRemotes(remotesRes.stdout),
   };
+}
+
+function parseBranches(stdout: string): GitBranch[] {
+  return stdout.split("\n").filter(Boolean).map((line) => {
+    const [name = "", oid = "", marker = "", upstream = "", track = "", ref = ""] =
+      line.split("\0");
+    return {
+      name,
+      oid,
+      current: marker === "*",
+      remote: ref.startsWith("refs/remotes/"),
+      upstream: upstream || null,
+      ahead: Number(track.match(/ahead (\d+)/)?.[1] ?? 0),
+      behind: Number(track.match(/behind (\d+)/)?.[1] ?? 0),
+    };
+  }).filter((branch) => branch.name && !branch.name.endsWith("/HEAD"));
+}
+
+function parseCommits(stdout: string): GitCommit[] {
+  return stdout.split("\x1e").map((record) => record.trim()).filter(Boolean).map((record) => {
+    const [oid = "", shortOid = "", parents = "", subject = "", author = "", email = "", ts = "0", refs = ""] =
+      record.split("\x1f");
+    return {
+      oid,
+      shortOid,
+      parents: parents ? parents.split(" ") : [],
+      subject,
+      author,
+      email,
+      ts: Number(ts) * 1000,
+      refs: refs ? refs.split(", ").map((ref) => ref.replace(/^HEAD -> /, "")) : [],
+    };
+  });
+}
+
+function parseStashes(stdout: string): GitStash[] {
+  return stdout.split("\x1e").map((record) => record.trim()).filter(Boolean).map((record) => {
+    const [ref = "", oid = "", subject = "", ts = "0"] = record.split("\x1f");
+    return { ref, oid, subject, ts: Number(ts) * 1000 };
+  });
+}
+
+function parseTags(stdout: string): GitTag[] {
+  return stdout.split("\n").filter(Boolean).map((line) => {
+    const [name = "", oid = "", subject = ""] = line.split("\0");
+    return { name, oid, subject };
+  }).filter((tag) => tag.name);
+}
+
+function parseRemotes(stdout: string): GitRemote[] {
+  const remotes = new Map<string, GitRemote>();
+  for (const line of stdout.split("\n")) {
+    const match = line.match(/^(\S+)\s+(.+)\s+\((fetch|push)\)$/);
+    if (!match) continue;
+    const [, name, url, kind] = match;
+    const remote = remotes.get(name) ?? { name, fetchUrl: "", pushUrl: "" };
+    if (kind === "fetch") remote.fetchUrl = url;
+    else remote.pushUrl = url;
+    remotes.set(name, remote);
+  }
+  return [...remotes.values()];
 }
 
 function requirePath(p: unknown): string {
@@ -193,6 +299,25 @@ function requireBranch(b: unknown): string {
   return b;
 }
 
+function requireRef(value: unknown, label = "ref"): string {
+  if (typeof value !== "string" || !value.trim() || value.startsWith("-")) {
+    throw new Error(`invalid ${label}`);
+  }
+  if (!/^[A-Za-z0-9._/@{}:+~-]+$/.test(value)) throw new Error(`invalid ${label}`);
+  return value;
+}
+
+function requireUrl(value: unknown): string {
+  if (typeof value !== "string" || !value.trim() || value.startsWith("-")) {
+    throw new Error("invalid remote URL");
+  }
+  return value.trim();
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === "string" && allowed.includes(value as T) ? value as T : fallback;
+}
+
 /** Build the git arg array for an action. Returns null for unknown actions. */
 function argsForAction(
   action: string,
@@ -208,17 +333,76 @@ function argsForAction(
     case "unstageAll":
       return ["reset", "-q"];
     case "commit":
-      return ["commit", "-m", requireMessage(body.message)];
+      return [
+        "commit",
+        ...(body.amend === true ? ["--amend"] : []),
+        ...(body.signoff === true ? ["--signoff"] : []),
+        ...(body.noVerify === true ? ["--no-verify"] : []),
+        "-m",
+        requireMessage(body.message),
+      ];
     case "pull":
-      return ["pull", "--no-edit"];
+      return ["pull", oneOf(body.mode, ["--rebase", "--no-rebase", "--ff-only"] as const, "--no-rebase"), "--no-edit"];
     case "push":
-      return ["push"];
+      return ["push", ...(body.forceWithLease === true ? ["--force-with-lease"] : []), ...(body.setUpstream === true ? ["--set-upstream", requireRef(body.remote ?? "origin", "remote"), requireBranch(body.branch)] : [])];
     case "fetch":
-      return ["fetch"];
+      return ["fetch", ...(body.all === true ? ["--all"] : []), ...(body.prune === true ? ["--prune"] : [])];
     case "checkout":
       return ["checkout", requireBranch(body.branch)];
     case "discard":
       return ["restore", "--", requirePath(body.path)];
+    case "discardAll":
+      return ["restore", "."];
+    case "clean":
+      return ["clean", "-fd", ...(body.includeIgnored === true ? ["-x"] : [])];
+    case "createBranch":
+      return body.checkout === false
+        ? ["branch", requireBranch(body.branch), ...(body.startPoint ? [requireRef(body.startPoint, "start point")] : [])]
+        : ["switch", "-c", requireBranch(body.branch), ...(body.startPoint ? [requireRef(body.startPoint, "start point")] : [])];
+    case "deleteBranch":
+      return ["branch", body.force === true ? "-D" : "-d", requireBranch(body.branch)];
+    case "renameBranch":
+      return ["branch", "-m", requireBranch(body.branch), requireBranch(body.newName)];
+    case "merge":
+      return ["merge", ...(body.noFf === true ? ["--no-ff"] : []), ...(body.squash === true ? ["--squash"] : []), requireRef(body.ref)];
+    case "rebase":
+      return ["rebase", requireRef(body.ref)];
+    case "continue":
+      return [oneOf(body.operation, ["merge", "rebase", "cherry-pick", "revert"] as const, "rebase"), "--continue"];
+    case "abort":
+      return [oneOf(body.operation, ["merge", "rebase", "cherry-pick", "revert"] as const, "rebase"), "--abort"];
+    case "cherryPick":
+      return ["cherry-pick", requireRef(body.ref)];
+    case "revert":
+      return ["revert", "--no-edit", requireRef(body.ref)];
+    case "reset":
+      return ["reset", `--${oneOf(body.mode, ["soft", "mixed", "hard"] as const, "mixed")}`, requireRef(body.ref)];
+    case "stashPush":
+      return ["stash", "push", ...(body.includeUntracked === true ? ["--include-untracked"] : []), ...(body.keepIndex === true ? ["--keep-index"] : []), ...(typeof body.message === "string" && body.message.trim() ? ["-m", body.message.trim()] : [])];
+    case "stashApply":
+      return ["stash", body.pop === true ? "pop" : "apply", ...(body.index === true ? ["--index"] : []), requireRef(body.ref)];
+    case "stashDrop":
+      return ["stash", "drop", requireRef(body.ref)];
+    case "stashBranch":
+      return ["stash", "branch", requireBranch(body.branch), requireRef(body.ref)];
+    case "tagCreate":
+      return ["tag", ...(body.annotated === true ? ["-a", "-m", requireMessage(body.message)] : []), requireRef(body.tag, "tag"), ...(body.ref ? [requireRef(body.ref)] : [])];
+    case "tagDelete":
+      return ["tag", "-d", requireRef(body.tag, "tag")];
+    case "tagPush":
+      return ["push", requireRef(body.remote ?? "origin", "remote"), requireRef(body.tag, "tag")];
+    case "remoteAdd":
+      return ["remote", "add", requireRef(body.remote, "remote"), requireUrl(body.url)];
+    case "remoteRemove":
+      return ["remote", "remove", requireRef(body.remote, "remote")];
+    case "remoteRename":
+      return ["remote", "rename", requireRef(body.remote, "remote"), requireRef(body.newName, "remote")];
+    case "remoteSetUrl":
+      return ["remote", "set-url", requireRef(body.remote, "remote"), requireUrl(body.url)];
+    case "setUpstream":
+      return ["branch", "--set-upstream-to", requireRef(body.upstream, "upstream"), requireBranch(body.branch)];
+    case "unsetUpstream":
+      return ["branch", "--unset-upstream", requireBranch(body.branch)];
     case "init":
       return ["init"];
     default:

@@ -1501,6 +1501,35 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return s, nil
 	}
+	// Expanded activity is a lightweight focus mode. Subagents and tasks can
+	// outnumber the available rows, so navigation scrolls that shelf before the
+	// transcript; Esc or the toggle key returns focus to the composer.
+	if s.activityExpanded && s.pendingApproval == nil && s.pendingIntercom == nil && s.queued == nil &&
+		(len(s.subProgress) > 0 || len(s.todos) > 0) {
+		switch {
+		case s.kb(msg, "toggle_activity") || s.kb(msg, "close"):
+			s.activityExpanded = false
+			s.activityScroll = 0
+			s.layout()
+			return s, nil
+		case s.kbAny(msg, "nav_up", "nav_up_alt", "scroll_line_up"):
+			s.activityScroll = max(0, s.activityScroll-1)
+			s.layout()
+			return s, nil
+		case s.kb(msg, "scroll_page_up"):
+			s.activityScroll = max(0, s.activityScroll-5)
+			s.layout()
+			return s, nil
+		case s.kbAny(msg, "nav_down", "nav_down_alt", "scroll_line_down"):
+			s.activityScroll++
+			s.layout()
+			return s, nil
+		case s.kb(msg, "scroll_page_down"):
+			s.activityScroll += 5
+			s.layout()
+			return s, nil
+		}
+	}
 	// transcript scrolling works in every state (idle/busy/approval) so the
 	// user can read history while a turn runs or a decision is pending.
 	if s.handleApprovalDiffScroll(msg) {
@@ -1565,6 +1594,12 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// global: open the reasoning-effort picker for the active model.
 	if s.kb(msg, "reasoning_picker") {
 		s.openReasoningPicker()
+		return s, nil
+	}
+	if s.kb(msg, "toggle_activity") {
+		s.activityExpanded = !s.activityExpanded
+		s.activityScroll = 0
+		s.layout()
 		return s, nil
 	}
 	// "/" opens the palette when the input is empty — works while idle and
@@ -2158,6 +2193,24 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.openMouseWheelPicker()
 			return nil
+		case "/footer-metrics":
+			if len(parts) >= 2 {
+				switch strings.ToLower(parts[1]) {
+				case "on", "true", "1":
+					s.settings.FooterMetrics = true
+				case "off", "false", "0":
+					s.settings.FooterMetrics = false
+				default:
+					s.logError("usage: /footer-metrics [on|off]")
+					return nil
+				}
+				_ = s.settings.save()
+				s.logInfo("footer metrics: " + boolStr(s.settings.FooterMetrics))
+				s.layout()
+				return nil
+			}
+			s.openFooterMetricsPicker()
+			return nil
 		case "/idle-timeout":
 			if len(parts) >= 2 {
 				var n int
@@ -2332,6 +2385,31 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/stats":
 			s.sendCore(map[string]any{"type": "stats"})
+			return nil
+		case "/status":
+			model := "no model"
+			if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+				model = s.models[s.modelIdx].ID
+			}
+			provider := s.activeProvider
+			if provider == "" {
+				provider = "not selected"
+			}
+			effort := s.settings.ReasoningEffort
+			if effort == "" {
+				effort = s.preferredLevel(s.thinkingLevels())
+			}
+			lines := []string{
+				"Status",
+				"model: " + model + " · provider: " + provider,
+				"approval: " + approvalModeLabel(s.approvalMode()) + " · reasoning: " + effort,
+				"theme: " + activeTheme.name + " · mouse: " + boolStr(s.settings.MouseWheel),
+			}
+			if metrics := s.renderMetrics(); metrics != "" {
+				lines = append(lines, "performance: "+metrics)
+			}
+			lines = append(lines, "context: "+noColorANSIRe.ReplaceAllString(s.renderContext(), ""))
+			s.logPersist(blkInfo, strings.Join(lines, "\n"))
 			return nil
 		case "/find":
 			query := strings.TrimSpace(strings.TrimPrefix(text, parts[0]))

@@ -14,10 +14,10 @@
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import { type Duplex } from "node:stream";
 import { parse } from "node:url";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 import { normalize, join, relative, sep } from "node:path";
 import next from "next";
+import * as pty from "node-pty";
+import type { IPty } from "node-pty";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { getSession } from "../lib/auth";
 import { getBridge } from "./core-bridge";
@@ -56,26 +56,10 @@ function rawToString(raw: RawData): string {
   return Buffer.from(raw).toString("utf8");
 }
 
-// xterm.js expects CRLF line endings (it does not auto-CR on LF). Normalise
-// every chunk we send back so shell output renders on its own line.
-function toOut(s: string): string {
-  return s.replace(/\r?\n/g, "\r\n");
-}
-
-// No-PTY local echo: the shell's stdin is a pipe (not a TTY) so it never echoes
-// typed input. Mirror input back to the client so the user can see what they
-// type. Enter → newline, Backspace/DEL → erase one cell.
-function toEcho(s: string): string {
-  return s
-    .replace(/\r/g, "\r\n")
-    .replace(/\n/g, "\r\n")
-    .replace(/\x7f/g, "\b \b")
-    .replace(/\x08/g, "\b \b");
-}
-
 // ── WS message envelopes (contract §4.5) ───────────────────────────────────
 interface OpenMsg {
   type: "open";
+  sessionId: string;
   workspace?: string;
   cwd?: string;
   cols?: number;
@@ -84,26 +68,70 @@ interface OpenMsg {
 interface DataMsg { type: "data"; data: string; }
 interface ResizeMsg { type: "resize"; cols: number; rows: number; }
 interface PingMsg { type: "ping"; }
-type ClientMsg = OpenMsg | DataMsg | ResizeMsg | PingMsg;
+interface TerminateMsg { type: "terminate"; sessionId: string; }
+type ClientMsg = OpenMsg | DataMsg | ResizeMsg | PingMsg | TerminateMsg;
 
 function send(ws: WebSocket, msg: Record<string, unknown>): void {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
 function fail(ws: WebSocket, message: string): void {
-  send(ws, { type: "data", data: toOut(message) });
+  send(ws, { type: "data", data: `\r\nerror: ${message}\r\n` });
   send(ws, { type: "exit", code: 1 });
   try { ws.close(); } catch { /* already closed */ }
 }
 
-// Spawn the line-mode shell (child_process pipes, NOT a PTY — contract §0.5).
-// Returns the child on success; returns null after closing the socket on error.
-function openShell(
-  ws: WebSocket,
-  msg: OpenMsg,
-  outDec: StringDecoder,
-  errDec: StringDecoder,
-): ChildProcessWithoutNullStreams | null {
+const MAX_SCROLLBACK_BYTES = 2 * 1024 * 1024;
+const DETACHED_TTL_MS = 30 * 60 * 1000;
+
+interface TerminalProcess {
+  key: string;
+  id: string;
+  ownerId: string;
+  pty: IPty | null;
+  clients: Set<WebSocket>;
+  scrollback: string;
+  exitCode: number | null;
+  cleanupTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const terminals = new Map<string, TerminalProcess>();
+
+function terminalKey(ownerId: string, sessionId: string): string {
+  return `${ownerId}:${sessionId}`;
+}
+
+function validSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+function clampDimension(value: number | undefined, fallback: number, max: number): number {
+  return Number.isFinite(value) ? Math.max(2, Math.min(max, Math.floor(value!))) : fallback;
+}
+
+function broadcast(session: TerminalProcess, msg: Record<string, unknown>): void {
+  for (const client of session.clients) send(client, msg);
+}
+
+function destroyTerminal(session: TerminalProcess): void {
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  terminals.delete(session.key);
+  try { session.pty?.kill(); } catch { /* already exited */ }
+  session.pty = null;
+  for (const client of session.clients) {
+    send(client, { type: "terminated" });
+    try { client.close(); } catch { /* already closed */ }
+  }
+  session.clients.clear();
+}
+
+function scheduleDetachedCleanup(session: TerminalProcess): void {
+  if (terminals.get(session.key) !== session || session.clients.size || session.cleanupTimer) return;
+  session.cleanupTimer = setTimeout(() => destroyTerminal(session), DETACHED_TTL_MS);
+  session.cleanupTimer.unref?.();
+}
+
+function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
   let workspace: string;
   try {
     // The terminal always runs in the configured workspace. A client-provided
@@ -112,8 +140,7 @@ function openShell(
     // `cwd` (workspace-relative, confined below) is respected.
     workspace = getBridge().getDefaultWorkspace();
   } catch (err) {
-    fail(ws, `error: no workspace configured: ${String(err)}\n`);
-    return null;
+    throw new Error(`no workspace configured: ${String(err)}`);
   }
 
   let cwd = workspace;
@@ -121,67 +148,58 @@ function openShell(
     try {
       cwd = confinePath(workspace, msg.cwd);
     } catch {
-      fail(ws, "error: cwd outside workspace\n");
-      return null;
+      throw new Error("cwd outside workspace");
     }
   }
 
-  const cols = msg.cols && msg.cols > 0 ? msg.cols : 80;
-  const rows = msg.rows && msg.rows > 0 ? msg.rows : 24;
+  const cols = clampDimension(msg.cols, 80, 500);
+  const rows = clampDimension(msg.rows, 24, 300);
 
   const shell =
     process.env.SHELL ||
     (process.platform === "win32" ? process.env.COMSPEC || "cmd.exe" : "/bin/sh");
-  const env = {
+  const env = Object.fromEntries(Object.entries({
     ...process.env,
     TERM: "xterm-256color",
+    COLORTERM: "truecolor",
+    TERM_PROGRAM: "Catalyst Code",
     COLUMNS: String(cols),
     LINES: String(rows),
+  }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+
+  const key = terminalKey(ownerId, msg.sessionId);
+  const terminal: TerminalProcess = {
+    key,
+    id: msg.sessionId,
+    ownerId,
+    pty: null,
+    clients: new Set(),
+    scrollback: "",
+    exitCode: null,
+    cleanupTimer: null,
   };
-
-  let child: ChildProcessWithoutNullStreams;
-  try {
-    child = spawn(shell, [], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
-  } catch (err) {
-    fail(ws, `error: failed to spawn shell: ${String(err)}\n`);
-    return null;
-  }
-
-  child.stdout.on("data", (chunk: Buffer) => {
-    const s = outDec.write(chunk);
-    if (s) send(ws, { type: "data", data: toOut(s) });
+  terminal.pty = pty.spawn(shell, [], { name: "xterm-256color", cwd, env, cols, rows });
+  terminal.pty.onData((data) => {
+    terminal.scrollback += data;
+    if (Buffer.byteLength(terminal.scrollback) > MAX_SCROLLBACK_BYTES) {
+      terminal.scrollback = terminal.scrollback.slice(-MAX_SCROLLBACK_BYTES);
+    }
+    broadcast(terminal, { type: "data", data });
   });
-  child.stderr.on("data", (chunk: Buffer) => {
-    const s = errDec.write(chunk);
-    if (s) send(ws, { type: "data", data: toOut(s) });
+  terminal.pty.onExit(({ exitCode, signal }) => {
+    terminal.exitCode = exitCode ?? (signal ? 128 + signal : 0);
+    terminal.pty = null;
+    broadcast(terminal, { type: "exit", code: terminal.exitCode });
+    scheduleDetachedCleanup(terminal);
   });
-  child.stdin.on("error", () => {}); // swallow EPIPE on client disconnect
-  child.stdout.on("error", () => {});
-  child.stderr.on("error", () => {});
-
-  child.on("exit", (code, signal) => {
-    const tail = outDec.end() + errDec.end();
-    if (tail) send(ws, { type: "data", data: toOut(tail) });
-    send(ws, { type: "exit", code: code ?? (signal ? 128 : 0) });
-    try { ws.close(); } catch { /* already closed */ }
-  });
-
-  send(ws, {
-    type: "data",
-    data: toOut(
-      "Catalyst Code terminal — line mode (no PTY: no vim/nano/TUI apps).\n" +
-        `cwd: ${cwd}\n`,
-    ),
-  });
-  return child;
+  terminals.set(key, terminal);
+  return terminal;
 }
 
-// Per-connection handler. The first message MUST be {type:"open"}; afterwards
-// data/resize/ping are wired to the shell.
-function handleTerminal(ws: WebSocket): void {
-  let child: ChildProcessWithoutNullStreams | null = null;
-  const outDec = new StringDecoder("utf8");
-  const errDec = new StringDecoder("utf8");
+// Per-connection handler. PTYs live independently of sockets so switching
+// panels or reloading the browser detaches and later replays buffered output.
+function handleTerminal(ws: WebSocket, ownerId: string): void {
+  let attached: TerminalProcess | null = null;
 
   ws.on("message", (raw: RawData) => {
     let msg: ClientMsg;
@@ -191,26 +209,46 @@ function handleTerminal(ws: WebSocket): void {
       return; // ignore malformed envelopes
     }
 
-    if (!child) {
-      if (msg.type !== "open") {
-        fail(ws, 'error: expected {type:"open"} as first message\n');
+    if (!attached) {
+      if (msg.type === "terminate") {
+        if (!validSessionId(msg.sessionId)) { fail(ws, "invalid terminal session ID"); return; }
+        const existing = terminals.get(terminalKey(ownerId, msg.sessionId));
+        if (existing) destroyTerminal(existing);
+        else { send(ws, { type: "terminated" }); ws.close(); }
         return;
       }
-      child = openShell(ws, msg, outDec, errDec);
+      if (msg.type !== "open" || !validSessionId(msg.sessionId)) {
+        fail(ws, 'expected a valid {type:"open", sessionId} message');
+        return;
+      }
+      const key = terminalKey(ownerId, msg.sessionId);
+      try {
+        attached = terminals.get(key) ?? createTerminal(ownerId, msg);
+      } catch (err) {
+        fail(ws, `failed to open terminal: ${String(err)}`);
+        return;
+      }
+      if (attached.cleanupTimer) clearTimeout(attached.cleanupTimer);
+      attached.cleanupTimer = null;
+      attached.clients.add(ws);
+      send(ws, { type: "ready", sessionId: attached.id });
+      if (attached.scrollback) send(ws, { type: "data", data: attached.scrollback, replay: true });
+      if (attached.exitCode !== null) send(ws, { type: "exit", code: attached.exitCode });
       return;
     }
 
     switch (msg.type) {
       case "data":
-        // local echo (no PTY) so typed input is visible
-        send(ws, { type: "data", data: toEcho(msg.data) });
-        // shells expect LF; xterm sends CR on Enter
-        if (!child.stdin.destroyed && child.stdin.writable) {
-          child.stdin.write(msg.data.replace(/\r/g, "\n"));
-        }
+        if (typeof msg.data === "string" && msg.data.length <= 1024 * 1024) attached.pty?.write(msg.data);
         break;
       case "resize":
-        // No PTY → cannot signal the running shell. Best-effort only (§4.5).
+        attached.pty?.resize(
+          clampDimension(msg.cols, attached.pty.cols, 500),
+          clampDimension(msg.rows, attached.pty.rows, 300),
+        );
+        break;
+      case "terminate":
+        if (msg.sessionId === attached.id) destroyTerminal(attached);
         break;
       case "ping":
         send(ws, { type: "pong" });
@@ -221,13 +259,10 @@ function handleTerminal(ws: WebSocket): void {
   });
 
   const cleanup = (): void => {
-    if (!child) return;
-    try { child.kill("SIGTERM"); } catch { /* already dead */ }
-    // escalate if it refuses to die
-    const t = setTimeout(() => {
-      try { child?.kill("SIGKILL"); } catch { /* already dead */ }
-    }, 1500);
-    t.unref?.();
+    if (!attached) return;
+    attached.clients.delete(ws);
+    scheduleDetachedCleanup(attached);
+    attached = null;
   };
   ws.on("close", cleanup);
   ws.on("error", cleanup);
@@ -252,6 +287,19 @@ const wss = new WebSocketServer({ noServer: true });
 // Authenticate the WS upgrade (same-origin; better-auth cookies are host-only
 // so same-host any-port works) and, on success, hand off to wss.handleUpgrade.
 function handleTerminalUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      if (new URL(origin).host !== req.headers.host) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+    } catch {
+      socket.destroy();
+      return;
+    }
+  }
   getSession(toHeaders(req.headers))
     .then((session) => {
       if (!session) {
@@ -259,7 +307,7 @@ function handleTerminalUpgrade(req: IncomingMessage, socket: Duplex, head: Buffe
         socket.destroy();
         return;
       }
-      wss.handleUpgrade(req, socket, head, (ws) => handleTerminal(ws));
+      wss.handleUpgrade(req, socket, head, (ws) => handleTerminal(ws, session.user.id));
     })
     .catch((err) => {
       console.error("[terminal] auth error:", err);

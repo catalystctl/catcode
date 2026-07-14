@@ -35,9 +35,9 @@ func TestRenderSmoke(t *testing.T) {
 	s.modelIdx = 0
 	s.layout()
 
-	// welcome screen: brand + a selectable example panel
+	// welcome screen: action-oriented selectable examples; branding stays in the header
 	welcome := stripANSI(s.renderBlocks())
-	for _, want := range []string{"Catalyst Code", "Examples", "Explain"} {
+	for _, want := range []string{"What would you like to build?", "Understand", "Review recent"} {
 		if !strings.Contains(welcome, want) {
 			t.Errorf("welcome missing %q:\n%s", want, welcome)
 		}
@@ -71,34 +71,35 @@ func TestRenderSmoke(t *testing.T) {
 	}
 	t.Logf("BLOCKS:\n%s", blocks)
 
-	// header: brand + tagline / cwd + tip (model & approval moved to footer)
+	// header: one-row brand + cwd + operational identity
 	hdr := stripANSI(s.renderHeader())
-	for _, want := range []string{"Catalyst Code", "Tip"} {
+	for _, want := range []string{"Catalyst", "ready", "umans-glm-5.2"} {
 		if !strings.Contains(hdr, want) {
 			t.Errorf("header missing %q:\n%s", want, hdr)
 		}
 	}
 	t.Logf("HEADER:\n%s", hdr)
 
-	// footer: ready state · leader · model · approval · context budget
+	// footer: contextual controls + context budget (toasts temporarily replace controls)
+	s.toast = nil
 	ftr := stripANSI(s.renderFooter())
-	for _, want := range []string{"ready", "leader", "umans-glm-5.2", "destructive"} {
+	for _, want := range []string{"Enter", "send", "commands", "0%"} {
 		if !strings.Contains(ftr, want) {
 			t.Errorf("footer missing %q:\n%s", want, ftr)
 		}
 	}
 	t.Logf("FOOTER:\n%s", ftr)
 
-	// position bar: pinned to bottom shows a 100% rule (no new-lines affordance)
+	// position rail is absent at the bottom; it only appears while reading history.
 	pos := stripANSI(s.renderPositionBar())
-	if !strings.Contains(pos, "100%") {
-		t.Errorf("position bar missing 100%% when pinned:\n%s", pos)
+	if pos != "" {
+		t.Errorf("position bar should be hidden when pinned:\n%s", pos)
 	}
 	t.Logf("POSITION:\n%s", pos)
 
 	s.pendingApproval = &approvalPrompt{requestID: "r1", tool: "bash", args: "rm -rf /tmp/cache"}
 	banner := stripANSI(s.renderApprovalBanner())
-	if !strings.Contains(banner, "approve") || !strings.Contains(banner, "bash") {
+	if !strings.Contains(banner, "approval required") || !strings.Contains(banner, "bash") {
 		t.Errorf("approval banner missing content:\n%s", banner)
 	}
 	t.Logf("BANNER:\n%s", banner)
@@ -201,7 +202,7 @@ func TestThemeAndMetrics(t *testing.T) {
 		s.invalidateAll()
 		s.refresh()
 		out := stripANSI(s.renderHeader())
-		if !strings.Contains(out, "Catalyst Code") {
+		if !strings.Contains(out, "Catalyst") {
 			t.Errorf("theme %q header broke: %s", name, out)
 		}
 	}
@@ -329,7 +330,7 @@ func TestFullView(t *testing.T) {
 	s.refresh()
 
 	view := stripANSI(s.View().Content)
-	for _, want := range []string{"Catalyst Code", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "tok/s", "Chat with the agent"} {
+	for _, want := range []string{"Catalyst", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "Enter send", "Chat with the agent"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("full view missing %q:\n%s", want, view)
 		}
@@ -337,10 +338,8 @@ func TestFullView(t *testing.T) {
 	t.Logf("FULL VIEW:\n%s", view)
 }
 
-// TestActiveTasks covers the active-tasks panel: an in-flight subagent run
-// (driven by subagent_progress events into s.subProgress) renders a bordered
-// panel with the agent, live tool count, tokens, and current tool; clearing
-// the run empties it. Also checks the bordered input box renders.
+// TestActiveTasks covers the unified activity shelf: routine activity is a
+// single summary row, expands on demand, and clears when work finishes.
 func TestActiveTasks(t *testing.T) {
 	s := initialSession()
 	s.ready = true
@@ -361,28 +360,29 @@ func TestActiveTasks(t *testing.T) {
 	s.busy = true
 	s.layout() // simulate the tool_call handler making room for the panel
 
-	panel := stripANSI(s.renderActiveTasks(s.width))
+	panel := stripANSI(s.renderActivityShelf())
 	if panel == "" {
-		t.Fatal("active-tasks panel should render while a scout is in flight")
+		t.Fatal("activity shelf should render while a scout is in flight")
 	}
-	for _, want := range []string{"subagents", "scout", "read_file", "tools"} {
+	for _, want := range []string{"Subagents", "active", "expand"} {
 		if !strings.Contains(panel, want) {
-			t.Errorf("panel missing %q:\n%s", want, panel)
+			t.Errorf("shelf missing %q:\n%s", want, panel)
 		}
 	}
-	if h := s.activeTasksHeight(); h == 0 {
-		t.Error("activeTasksHeight should be > 0 while a scout is in flight")
+	s.activityExpanded = true
+	panel = stripANSI(s.renderActivityShelf())
+	for _, want := range []string{"Activity", "Subagents", "scout", "read_file", "Esc close"} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("expanded shelf missing %q:\n%s", want, panel)
+		}
 	}
 	t.Logf("PANEL:\n%s", panel)
 
 	// finalize the run → the panel clears
 	s.subProgress = nil
 	s.invalidateAll()
-	if p := s.renderActiveTasks(s.width); p != "" {
-		t.Errorf("panel should be empty once the run finishes, got:\n%s", p)
-	}
-	if h := s.activeTasksHeight(); h != 0 {
-		t.Errorf("activeTasksHeight should be 0 once finished, got %d", h)
+	if p := s.renderActivityShelf(); p != "" {
+		t.Errorf("shelf should be empty once the run finishes, got:\n%s", p)
 	}
 
 	// bordered input box: top + input row + bottom

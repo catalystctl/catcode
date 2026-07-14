@@ -11,7 +11,9 @@
 #     PORT=49283 HOSTNAME=0.0.0.0 CATCODE_CORE=/usr/local/bin/catcode-core \
 #       node server.js
 #
-# ONE tarball serves every platform (Linux/macOS/Windows) — it is pure JS.
+# The web application is portable, while its real terminal uses node-pty's
+# native binding. Build the artifact on the Linux architecture it will run on;
+# node-pty's packaged macOS/Windows prebuilds remain available for local use.
 # Requires Bun (https://bun.sh) or Node+npm to BUILD (on the release host),
 # and Node or Bun to RUN (on the install host). `install.sh --with-web` /
 # `install-web.ps1` download this tarball instead of building.
@@ -49,16 +51,16 @@ echo "[4/5] web: next build (output: standalone)..."
 # --- 2b. bundle the custom Next server (WS terminal at /api/terminal) --------
 # Next app-router route handlers cannot upgrade to WebSocket, so the custom
 # server (web/src/server/server.ts) wraps next() and attaches a ws.WebSocketServer
-# at /api/terminal on the SAME port. Bundle it to one pure-JS file with esbuild
+# at /api/terminal on the SAME port. Bundle its JavaScript with esbuild
 # (Node-compatible — works whether the release host built with bun or npm) and
 # ship it IN PLACE of Next's standalone server.js, so the release serves HTTP
 # plus the terminal WebSocket on a single port. (Contract §7.4.)
-# Pure-JS output → the tarball stays cross-platform (Linux/macOS/Windows).
+# Keep native node-pty external and copy its package into the final artifact.
 echo "[4b/5] web: bundle custom server (esbuild) -> .server-bundle.js..."
 ( cd web && ./node_modules/.bin/esbuild src/server/server.ts \
     --bundle --platform=node --format=esm \
     --outfile=.server-bundle.js \
-    --external:next --external:ws --external:better-sqlite3 --external:kysely \
+    --external:next --external:ws --external:node-pty --external:better-sqlite3 --external:kysely \
     --external:better-auth --external:@better-auth/passkey \
     --external:@catalyst-code/coding-agent )
 
@@ -93,6 +95,15 @@ if [[ ! -d "$STAGE/node_modules/ws" ]]; then
   cp -a "web/node_modules/ws/." "$STAGE/node_modules/ws/"
 fi
 
+# node-pty is external to esbuild because it loads an OS-native .node binding.
+# Include the package (and its small build-time/runtime support dependency) so
+# the shipped WebSocket server has a real PTY, not pipe-based line mode.
+for pkg in node-pty node-addon-api; do
+  rm -rf "$STAGE/node_modules/$pkg"
+  mkdir -p "$STAGE/node_modules/$pkg"
+  cp -a "web/node_modules/$pkg/." "$STAGE/node_modules/$pkg/"
+done
+
 # Sanity: the entrypoint must exist.
 [[ -f "$STAGE/server.js" ]] || { echo "error: $STAGE/server.js missing — standalone build failed?" >&2; exit 1; }
 
@@ -123,5 +134,4 @@ echo
 echo "Run it:"
 echo "  tar xzf $(basename "$OUT")"
 echo "  PORT=49283 HOSTNAME=0.0.0.0 CATCODE_CORE=/usr/local/bin/catcode-core node start.js"
-echo "Cross-platform (pure JS) — runs on Linux, macOS, Windows (under Node)."
-echo "Serves HTTP + the /api/terminal WebSocket (line-mode shell, no PTY) on one port."
+echo "Serves HTTP + a persistent, real-PTY /api/terminal WebSocket on one port."

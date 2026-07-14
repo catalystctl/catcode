@@ -12,57 +12,61 @@ import (
 // ---------------------------------------------------------------------------
 
 var c = struct {
-	bg      string
-	fg      string
-	dim     string
-	muted   string
-	accent  string
-	user    string
-	assist  string
-	tool    string
-	success string
-	warn    string
-	err     string
+	bg        string
+	fg        string
+	dim       string
+	muted     string
+	decor     string // derived non-text boundary colour (>= 3:1 against bg)
+	secondary string // derived supporting-text colour (>= 4.5:1 against bg)
+	accent    string
+	user      string
+	assist    string
+	tool      string
+	success   string
+	warn      string
+	err       string
 }{
-	bg:      "#1e1e2e",
-	fg:      "#cdd6f4",
-	dim:     "#6c7086",
-	muted:   "#9399b2",
-	accent:  "#74c7ec",
-	user:    "#89b4fa",
-	assist:  "#cdd6f4",
-	tool:    "#f9e2af",
-	success: "#a6e3a1",
-	warn:    "#fab387",
-	err:     "#f38ba8",
+	bg:        "#1e1e2e",
+	fg:        "#cdd6f4",
+	dim:       "#6c7086",
+	muted:     "#9399b2",
+	decor:     "#6c7086",
+	secondary: "#9399b2",
+	accent:    "#74c7ec",
+	user:      "#89b4fa",
+	assist:    "#cdd6f4",
+	tool:      "#f9e2af",
+	success:   "#a6e3a1",
+	warn:      "#fab387",
+	err:       "#f38ba8",
 }
 
 var (
 	baseStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
 	boldBaseStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Bold(true)
-	dimStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
-	mutedStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
+	dimStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
+	mutedStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
 	accentStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
 	successStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success))
 	errStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	warnStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(c.warn)).Bold(true)
 	assistantStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.assist))
-	thinkStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim)).Italic(true)
+	thinkStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary)).Italic(true)
 	toolNameStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool)).Bold(true)
 	toolDetailStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool))
 	resultStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.muted))
 	headerStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
-	keyHintStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
-	separatorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
+	keyHintStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
+	separatorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.decor))
 	inputPromptStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
-	placeholderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim))
+	placeholderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
 	codeTextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
 	codeInlineStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool))
 	italicStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Italic(true)
 	linkStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Underline(true)
 	roleUserStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(c.user)).Bold(true)
 	roleAssistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
-	roleThinkStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.dim)).Italic(true)
+	roleThinkStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary)).Italic(true)
 	roleToolStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool)).Bold(true)
 	roleResultStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.success)).Bold(true)
 	roleErrorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err)).Bold(true)

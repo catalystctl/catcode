@@ -126,16 +126,16 @@ export function SettingsModal(props: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[88vh] w-[80vw] max-w-5xl flex-col overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet max-w-5xl sm:max-h-[min(88vh,900px)]"
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-6 py-4">
+        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3.5 sm:px-6 sm:py-4">
           <div className="flex items-center gap-2">
             <BoltIcon width={18} height={18} className="text-accent-soft" />
             <h2 className="text-[16px] font-semibold text-ink-100">Settings</h2>
@@ -149,7 +149,7 @@ export function SettingsModal(props: Props) {
         </div>
 
         {/* Two-column body */}
-        <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto p-6 lg:grid-cols-2">
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-6 lg:grid-cols-2">
           {/* Left column: account + approval + timeout + auto-compact */}
           <div className="flex flex-col gap-5">
             <div>

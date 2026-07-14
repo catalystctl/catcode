@@ -520,7 +520,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const flyoutOpen = cmdOpen || fileOpen;
 
   return (
-    <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-3 pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
+    <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {/* Flyout (positioned above the input box) */}
@@ -544,6 +544,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           )}
 
           <div
+            // Browser password managers can inject data-* attributes into this
+            // form-like container before hydration. Ignore that external-only
+            // attribute mismatch while preserving SSR for the composer.
+            suppressHydrationWarning
             className={
               "flex items-end gap-2 rounded-2xl p-2 shadow-lg shadow-black/20 transition-all duration-200 " +
               (streaming
@@ -568,11 +572,13 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               placeholder={
                 connected
                   ? streaming
-                    ? "Queue a follow-up… (Enter) · Ctrl+Enter to steer"
-                    : "Message the agent…  (/ for commands, @ for files)"
-                  : "Connecting to catcode-core…"
+                    ? "Queue a follow-up…"
+                    : compact
+                      ? "Message… (/ commands, @ files)"
+                      : "Message the agent…  (/ for commands, @ for files)"
+                  : "Connecting…"
               }
-              className="max-h-60 flex-1 resize-none bg-transparent px-2 py-1.5 text-[14px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50"
+              className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-[16px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50 sm:max-h-60 sm:text-[14px]"
             />
             {streaming ? (
               <>

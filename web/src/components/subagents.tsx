@@ -299,10 +299,10 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
   const agentList = agents && agents.length > 0 ? agents : FALLBACK_AGENTS;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet max-w-2xl"
         role="dialog"
         aria-modal="true"
         aria-label="Subagents"

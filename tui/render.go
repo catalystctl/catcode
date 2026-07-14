@@ -31,10 +31,6 @@ import (
 // The posbar is always reserved so scrolling up never reflows the transcript.
 // ---------------------------------------------------------------------------
 
-const (
-	positionBarLines = 1 // scroll-position / new-messages bar
-)
-
 func envEnabled(names ...string) bool {
 	for _, name := range names {
 		switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
@@ -59,7 +55,7 @@ var noColorANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
 
 // headerHeight is deliberately measured rather than hard-coded: compact
 // terminals use a single header row, while normal terminals retain both rows.
-func (s *session) headerHeight() int { return lipgloss.Height(s.renderHeader()) + 1 }
+func (s *session) headerHeight() int { return lipgloss.Height(s.renderHeader()) }
 
 // relayoutHeights recomputes the viewport height to fit the current input-box
 // height + panels and applies it. It is CHEAP: it does not re-render the
@@ -80,41 +76,16 @@ func (s *session) relayoutHeights() {
 	if s.updateInfo != nil {
 		fixedExtra++
 	}
-	if s.pendingApproval != nil {
-		fixedExtra += s.approvalHeight()
-	}
-	if s.pendingIntercom != nil {
-		fixedExtra++
-	}
 	fixedExtra += s.mentionFlyoutHeight()
-	fixedExtra += s.todoPanelHeight() + s.queueBannerHeight()
-	fixedExtra += s.toastHeight() + s.oauthBannerHeight()
+	fixedExtra += s.activityShelfHeight() + s.oauthBannerHeight()
 	// Space left for the viewport + the active-tasks panel, leaving 1 line of
 	// slack for v2's cursed renderer (it scrolls/overlaps when the view fills
 	// the terminal exactly).
-	avail := s.height - s.headerHeight() - positionBarLines - s.footerHeight() - fixedExtra - 1
-	// Cap the active-tasks panel so it (plus a 1-line viewport) fits the
-	// available height. Each entry renders up to 2 rows; the panel adds 3
-	// (border + header). Measured AFTER setting the cap so activeTasksHeight()
-	// reflects the truncated panel.
-	minViewport := 3
-	if s.height < 14 {
-		minViewport = 1
-	}
-	const perEntry, panelOverhead = 2, 3
-	fit := (avail - panelOverhead - minViewport) / perEntry
-	if fit > 4 {
-		fit = 4
-	}
-	if fit < 0 {
-		fit = 0
-	}
-	if s.pendingApproval != nil {
-		fit = 0 // approvals take priority; active tasks remain in the transcript
-	}
-	s.maxTaskRows = fit
-	tasksH := s.activeTasksHeight()
-	h := avail - tasksH
+	avail := s.height - s.headerHeight() - s.positionBarHeight() - s.footerHeight() - fixedExtra - 1
+	// Legacy/detail renderer remains available to tests and explicit reports;
+	// the main View uses the unified shelf instead.
+	s.maxTaskRows = min(2, len(s.subProgress))
+	h := avail
 	if h < 0 {
 		h = 0 // panels fill the screen; hide the transcript rather than overflow
 	}
@@ -178,24 +149,31 @@ func (s *session) renderCoreFailureBanner() string {
 		Render(" " + msg)
 }
 
-// renderHeader: a 2-line branded banner — brand + tagline on row 1, the
-// working directory + a tip on row 2 (right-aligned). The model/auth state
-// moved to the footer so the header stays clean like the reference design.
+// renderHeader is deliberately one row: product + location on the left and
+// the current operational state on the right. This preserves transcript space
+// and avoids repeating the same identity in both header and empty state.
 func (s *session) renderHeader() string {
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
-	if s.width < 50 {
-		// On small screens identity and location are the only durable context.
-		// Tips and taglines remain available in help and would otherwise wrap.
-		cwd := dimStyle.Render(truncatePath(s.cwd, max(1, s.width-16)))
-		return lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, brand, cwd))
+	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst")
+	left := brand
+	if s.width >= 30 && s.cwd != "" {
+		left += dimStyle.Render("  " + truncatePath(s.cwd, max(8, s.width/2-12)))
 	}
-	tagline := mutedStyle.Render("a multi-provider coding agent")
-	row1 := fitRow(s.width, brand, tagline)
-
-	cwd := dimStyle.Render(truncatePath(s.cwd, max(20, s.width-40)))
-	tip := dimStyle.Render("Tip: / for commands · ! for bash · ? for help")
-	row2 := fitRow(s.width, cwd, tip)
-	return row1 + "\n" + row2
+	state := "starting"
+	switch {
+	case s.coreLifecycle == coreFailed:
+		state = "core down"
+	case s.busy:
+		state = "working"
+	case s.authed:
+		state = "ready"
+	case len(s.models) > 0:
+		state = "no key"
+	}
+	right := state
+	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) && s.width >= 42 {
+		right += " · " + truncate(s.models[s.modelIdx].ID, max(8, s.width/3))
+	}
+	return fitRow(s.width, left, mutedStyle.Render(right))
 }
 
 // renderPositionBar: a thin scroll affordance. Pinned to the bottom it is a
@@ -222,23 +200,14 @@ func (s *session) renderPositionBar() string {
 			Padding(0, 1).
 			Render(msg)
 	}
-	// pinned to bottom: a subtle dim rule with the scroll position centred.
-	pct := 100
-	bar := fmt.Sprintf(" %d%% ", pct)
-	// build: dashes + bar + dashes, centred.
-	bl := lipgloss.Width(bar)
-	if bl >= w {
-		return dimStyle.Render(strings.Repeat("─", w))
+	return ""
+}
+
+func (s *session) positionBarHeight() int {
+	if s.renderPositionBar() == "" {
+		return 0
 	}
-	left := (w - bl) / 2
-	right := w - bl - left
-	if left < 0 {
-		left = 0
-	}
-	if right < 0 {
-		right = 0
-	}
-	return dimStyle.Render(strings.Repeat("─", left)) + mutedStyle.Render(bar) + dimStyle.Render(strings.Repeat("─", right))
+	return 1
 }
 
 // approvalBanner: a full-width sticky bar shown while a decision is pending.
@@ -250,13 +219,13 @@ func (s *session) renderApprovalBanner() string {
 	a := s.pendingApproval
 	var actions []string
 	if key := s.keyHint("approve"); key != "" {
-		actions = append(actions, "["+key+"] approve")
+		actions = append(actions, "["+key+"] once")
 	}
 	if key := s.keyHint("deny"); key != "" {
 		actions = append(actions, "["+key+"] deny")
 	}
 	if key := s.keyHint("approve_always"); key != "" {
-		actions = append(actions, "["+key+"] always")
+		actions = append(actions, "["+key+"] type")
 	}
 	controls := strings.Join(actions, " · ")
 	avail := s.width - lipgloss.Width(controls) - 24
@@ -264,7 +233,7 @@ func (s *session) renderApprovalBanner() string {
 		avail = 8
 	}
 	summary := truncate(approvalSummary(a.tool, a.args), avail)
-	msg := "⚠  approve  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " + summary
+	msg := "⚠  approval required  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " + summary
 	if controls != "" {
 		msg += "   " + controls
 	}
@@ -307,111 +276,84 @@ func (s *session) renderApprovalDiff(a *approvalPrompt) string {
 	return view
 }
 
-// renderFooter: the status rail under the input box, split across two lines so
-// each carries one concern instead of cramming everything onto a single row:
-//
-//	line 1 — identity/state: working|ready badge · leader · model · approval · think effort [· mouse]
-//	line 2 — performance: throughput + cache hit (left) · context budget (right)
-//
-// Splitting the old single line lets the metrics breathe and keeps the state
-// read glanceable.
+// renderFooter is a one-line, contextual control rail. Operational identity
+// lives in the header; detailed performance and policy data live in /status,
+// /stats, and /context. A toast temporarily replaces the left-hand controls so
+// feedback never inserts another layout row.
 func (s *session) renderFooter() string {
-	if s.width < 50 {
-		return s.renderCompactFooter()
-	}
-	// Line 1 — state & identity.
-	var left strings.Builder
-	if s.coreLifecycle == coreFailed {
-		left.WriteString(errStyle.Render("● core unavailable"))
-	} else if s.busy {
-		left.WriteString(s.spinner.View())
-		left.WriteString(" " + accentStyle.Render("working"))
-	} else if s.authed {
-		left.WriteString(successStyle.Render("● ready"))
-	} else if len(s.models) > 0 {
-		left.WriteString(warnStyle.Render("● no key"))
+	left := s.footerControlHint()
+	if toast := s.renderToast(); toast != "" {
+		left = toast
 	} else {
-		left.WriteString(dimStyle.Render("● initializing…"))
+		left = dimStyle.Render(left)
 	}
-	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
-		left.WriteString(dimStyle.Render(" · leader · "))
-		left.WriteString(boldBaseStyle.Render(s.models[s.modelIdx].ID))
-	} else if len(s.models) == 0 {
-		left.WriteString(dimStyle.Render(" · leader · ") + dimStyle.Render("no model"))
-	}
-	left.WriteString(dimStyle.Render(" · " + approvalModeLabel(s.approvalMode())))
-	eff := s.settings.ReasoningEffort
-	if eff == "" {
-		eff = s.preferredLevel(s.thinkingLevels())
-	}
-	left.WriteString(dimStyle.Render(" · think:" + eff))
-	if s.settings.MouseWheel {
-		left.WriteString(dimStyle.Render(" · mouse:on"))
-	}
-	if s.pluginStatus != "" {
-		left.WriteString(dimStyle.Render(" · "))
-		left.WriteString(mutedStyle.Render(s.pluginStatus))
-	}
-	statusLine := lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(left.String())
-
-	// Line 2 — metrics (left) + context budget (right). Both can be empty
-	// before the first turn; then we emit just the status line.
-	mid := s.renderMetrics()
 	right := s.renderContext()
-	if mid == "" && right == "" {
-		return statusLine
+	if s.width < 50 {
+		if lipgloss.Width(left)+lipgloss.Width(right)+1 > s.width {
+			left = dimStyle.Render(s.primaryFooterHint())
+		}
 	}
-	styledMid := mutedStyle.Render(mid)
-	second := fitRow(s.width, styledMid, right)
-	// Context pressure is the safety-critical field. On narrow terminals keep it
-	// instead of letting fitRow silently discard the right-hand side.
-	if right != "" && lipgloss.Width(styledMid)+lipgloss.Width(right)+1 > s.width {
-		second = right
+	controlLine := lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, left, right))
+	if !s.settings.FooterMetrics {
+		return controlLine
 	}
-	return statusLine + "\n" + second
+	return controlLine + "\n" + s.renderFooterPerformance()
 }
 
-// renderCompactFooter keeps the safety-critical state/context visible in one
-// row. Lower-priority approval, reasoning, plugin and mouse details remain in
-// the settings/status modals instead of pushing the composer off tiny screens.
 func (s *session) renderCompactFooter() string {
-	var state string
-	switch {
-	case s.coreLifecycle == coreFailed:
-		state = errStyle.Render("● core down")
-	case s.busy:
-		if prefersReducedMotion() {
-			state = accentStyle.Render("● working")
-		} else {
-			state = s.spinner.View() + " " + accentStyle.Render("working")
-		}
-	case s.authed:
-		state = successStyle.Render("● ready")
-	case len(s.models) > 0:
-		state = warnStyle.Render("● no key")
-	default:
-		state = dimStyle.Render("● starting")
-	}
+	return s.renderFooter()
+}
 
-	right := ""
+func (s *session) primaryFooterHint() string {
+	if s.pendingApproval != nil {
+		return s.keyHint("approve") + " allow · " + s.keyHint("deny") + " deny"
+	}
+	if s.busy {
+		return s.keyHint("send") + " queue · " + s.keyHint("close") + " abort"
+	}
+	return s.keyHint("send") + " send"
+}
+
+func (s *session) footerControlHint() string {
+	if s.pendingApproval != nil {
+		return s.keyHint("approve") + " allow once · " + s.keyHint("deny") + " deny · " +
+			s.keyHint("approve_always") + " always allow type"
+	}
+	if s.busy {
+		return s.keyHint("send") + " queue · " + s.keyHint("close") + " abort · " +
+			s.keyHint("steer") + " steer"
+	}
+	return s.keyHint("send") + " send · " + s.keyHint("newline") + " newline · " +
+		s.keyHint("command_palette") + " commands"
+}
+
+func (s *session) renderFooterPerformance() string {
+	model := "no model"
 	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
-		right = boldBaseStyle.Render(truncate(s.models[s.modelIdx].ID, max(4, s.width-lipgloss.Width(state)-3)))
+		model = s.models[s.modelIdx].ID
 	}
-	if s.contextTokens > 0 {
-		var maxToks uint64
-		if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
-			maxToks = uint64(s.models[s.modelIdx].ContextWindow)
+	parts := []string{model}
+	var metrics map[string]json.RawMessage
+	if len(s.lastMetrics) > 0 && json.Unmarshal(s.lastMetrics, &metrics) == nil {
+		tps := get(metrics, "tps")
+		approx := false
+		if tps == "" || tps == "null" {
+			tps = get(metrics, "tps_est")
+			approx = tps != "" && tps != "null"
 		}
-		ctx := compactTokens(s.contextTokens)
-		if maxToks > 0 {
-			pct := min(100, int(float64(s.contextTokens)/float64(maxToks)*100))
-			ctx = fmt.Sprintf("%d%% %s/%s", pct, ctx, compactTokens(maxToks))
+		if value, err := strconv.ParseFloat(tps, 64); err == nil {
+			prefix := ""
+			if approx {
+				prefix = "~"
+			}
+			parts = append(parts, fmt.Sprintf("%s%d tok/s", prefix, int(math.Round(value))))
 		}
-		if lipgloss.Width(state)+lipgloss.Width(ctx)+1 <= s.width {
-			right = mutedStyle.Render(ctx)
+		if ttft := get(metrics, "ttft_ms"); ttft != "" && ttft != "null" {
+			parts = append(parts, ttft+"ms ttft")
 		}
 	}
-	return lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, state, right))
+	line := strings.Join(parts, " · ")
+	return mutedStyle.Render(truncate(line, max(1, s.width)))
 }
 
 // renderMetrics builds the throughput string for the footer's second line:
@@ -732,7 +674,10 @@ func (s *session) renderInputBox() string {
 	if hint := s.composerHintLine(innerW); hint != "" && s.input.Value() != "" {
 		lines = append(lines, hint)
 	}
-	if s.busy && !prefersReducedMotion() {
+	// The moving perimeter is an opt-in flourish; a static border keeps
+	// streaming text calm and behaves better over SSH. Reduced-motion always
+	// wins even when animation was explicitly requested.
+	if s.busy && envEnabled("CATCODE_ANIMATED_BORDER") && !prefersReducedMotion() {
 		return s.renderInputBoxAnimated(w, innerW, lines)
 	}
 	top := "╭" + strings.Repeat("─", w-2) + "╮"
@@ -757,7 +702,7 @@ func (s *session) composerHintLine(innerW int) string {
 	switch {
 	case s.pendingApproval != nil:
 		var parts []string
-		for _, action := range []struct{ id, label string }{{"approve", "approve"}, {"deny", "deny"}, {"approve_always", "always"}} {
+		for _, action := range []struct{ id, label string }{{"approve", "allow once"}, {"deny", "deny"}, {"approve_always", "always allow type"}} {
 			if key := s.keyHint(action.id); key != "" {
 				parts = append(parts, key+" "+action.label)
 			}
@@ -1195,7 +1140,7 @@ func (s *session) renderActiveTasks(w int) string {
 	boxW := max(1, w-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.dim)).
+		BorderForeground(lipgloss.Color(c.decor)).
 		Padding(0, 1).
 		Width(boxW).MaxWidth(max(1, w)).MaxHeight(max(1, s.height)).
 		Render(body)
@@ -1266,7 +1211,7 @@ func (s *session) renderTodoPanel() string {
 	boxW := max(1, s.width-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.dim)).
+		BorderForeground(lipgloss.Color(c.decor)).
 		Padding(0, 1).
 		Width(boxW).MaxWidth(max(1, s.width)).MaxHeight(max(1, s.height)).
 		Render(body)
@@ -1315,6 +1260,84 @@ func (s *session) queueBannerHeight() int {
 		return 0
 	}
 	return 1
+}
+
+// renderActivityShelf is the single home for transient work below the
+// transcript. Decision states take exclusive focus; routine tasks and
+// subagents collapse into one row and can be expanded without competing with
+// the composer or hiding the conversation.
+func (s *session) renderActivityShelf() string {
+	switch {
+	case s.pendingApproval != nil:
+		return s.renderApprovalBanner()
+	case s.pendingIntercom != nil:
+		return s.renderIntercomBanner()
+	case s.queued != nil:
+		return s.renderQueueBanner()
+	}
+	if len(s.todos) == 0 && len(s.subProgress) == 0 {
+		return ""
+	}
+	done, _, running := countTodoStatuses(s.todos)
+	parts := make([]string, 0, 2)
+	if len(s.subProgress) > 0 {
+		parts = append(parts, fmt.Sprintf("Subagents %d active", len(s.subProgress)))
+	}
+	if len(s.todos) > 0 {
+		parts = append(parts, fmt.Sprintf("Tasks %d/%d complete · %d active", done, len(s.todos), running))
+	}
+	toggle := s.keyHint("toggle_activity")
+	if toggle == "" {
+		toggle = "Ctrl+G"
+	}
+	if !s.activityExpanded {
+		return accentStyle.Render("◷ ") + baseStyle.Render(strings.Join(parts, " · ")) +
+			dimStyle.Render(" · "+toggle+" expand")
+	}
+
+	var details []string
+	if len(s.subProgress) > 0 {
+		details = append(details, accentStyle.Render("Subagents"))
+	}
+	for _, agent := range s.subProgress {
+		detail := agent.agent + " · " + formatDur(time.Since(agent.started))
+		if agent.curTool != "" {
+			detail += " · " + toolIcon(agent.curTool) + " " + agent.curTool
+		}
+		details = append(details, accentStyle.Render("◷ ")+baseStyle.Render(truncate(detail, max(8, s.width-10))))
+	}
+	if len(s.todos) > 0 {
+		details = append(details, accentStyle.Render("Tasks"))
+	}
+	for _, todo := range s.todos {
+		mark, st := todoCheckbox(get(todo, "status"))
+		details = append(details, st.Render(mark+" ")+baseStyle.Render(truncate(get(todo, "subject"), max(8, s.width-10))))
+	}
+	limit := max(2, min(7, s.height/3-2))
+	maxScroll := max(0, len(details)-limit)
+	s.activityScroll = min(max(0, s.activityScroll), maxScroll)
+	end := min(len(details), s.activityScroll+limit)
+	position := ""
+	if len(details) > limit {
+		position = fmt.Sprintf(" · %d–%d/%d", s.activityScroll+1, end, len(details))
+	}
+	lines := []string{accentStyle.Render("Activity") + dimStyle.Render(" · focused · ↑↓ scroll · Esc close"+position)}
+	lines = append(lines, details[s.activityScroll:end]...)
+	boxW := max(1, s.width-4)
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.decor)).
+		Padding(0, 1).
+		Width(boxW).MaxWidth(max(1, s.width)).
+		Render(strings.Join(lines, "\n"))
+}
+
+func (s *session) activityShelfHeight() int {
+	p := s.renderActivityShelf()
+	if p == "" {
+		return 0
+	}
+	return lipgloss.Height(p)
 }
 
 func (s *session) renderToast() string {
@@ -1400,10 +1423,7 @@ func (s *session) View() tea.View {
 		// overflow that pushes the footer off-screen between events. It's cheap
 		// (height math only; no transcript block re-render).
 		s.relayoutHeights()
-		parts := []string{
-			s.renderHeader(),
-			s.renderSeparator(),
-		}
+		parts := []string{s.renderHeader()}
 		if b := s.renderCoreFailureBanner(); b != "" {
 			parts = append(parts, b)
 		}
@@ -1413,28 +1433,15 @@ func (s *session) View() tea.View {
 		if o := s.renderOauthBanner(); o != "" {
 			parts = append(parts, o)
 		}
-		parts = append(parts, s.viewport.View(), s.renderPositionBar())
-		if p := s.renderTodoPanel(); p != "" {
+		parts = append(parts, s.viewport.View())
+		if p := s.renderPositionBar(); p != "" {
 			parts = append(parts, p)
 		}
-		if q := s.renderQueueBanner(); q != "" {
-			parts = append(parts, q)
-		}
-		if s.pendingApproval != nil {
-			parts = append(parts, s.renderApprovalBanner())
-		}
-		if s.pendingIntercom != nil {
-			parts = append(parts, s.renderIntercomBanner())
-		}
-
-		if p := s.renderActiveTasks(s.width); p != "" {
-			parts = append(parts, p)
+		if shelf := s.renderActivityShelf(); shelf != "" {
+			parts = append(parts, shelf)
 		}
 		if f := s.renderMentionFlyout(); f != "" {
 			parts = append(parts, f)
-		}
-		if t := s.renderToast(); t != "" {
-			parts = append(parts, t)
 		}
 		parts = append(parts, s.renderInputBox(), s.renderFooter())
 		view := strings.Join(parts, "\n")

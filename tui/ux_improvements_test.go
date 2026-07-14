@@ -21,7 +21,7 @@ func TestWelcomeSurvivesStatusToast(t *testing.T) {
 		t.Fatal("status toasts must not count as conversation")
 	}
 	welcome := stripANSI(s.renderBlocks())
-	if !strings.Contains(welcome, "Examples") {
+	if !strings.Contains(welcome, "What would you like to build?") {
 		t.Fatalf("welcome should survive status toasts:\n%s", welcome)
 	}
 	if s.toast == nil {

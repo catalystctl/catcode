@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
 import { IdeContext, useIdeContext } from "@/lib/ide-context";
+import { useIsMobile } from "@/lib/use-media-query";
 import { Chat } from "@/components/chat";
 import type {
   DockPosition,
@@ -16,6 +17,7 @@ import {
   Editor,
   TerminalPanel,
   Preview,
+  PANELS,
 } from "./panel-registry";
 import { ActivityBar } from "./activity-bar";
 import { ResizeHandle } from "./resize-handle";
@@ -24,6 +26,10 @@ import {
   GitBranchIcon,
   XIcon,
   ChevronRight,
+  SparkIcon,
+  FolderIcon,
+  TerminalIcon,
+  GlobeIcon,
 } from "@/components/icons";
 
 const MOVABLE: MovablePanelId[] = ["chat", "terminal", "git", "preview"];
@@ -34,12 +40,32 @@ const LABELS: Record<MovablePanelId, string> = {
   preview: "Preview",
 };
 
+type MobileView = "files" | "editor" | "chat" | "git" | "terminal" | "preview";
+
 export function IdeShell() {
   const agent = useAgent();
   const ide = useIde();
   const workspace = agent.state.workspace;
+  const isMobile = useIsMobile();
   const [dragging, setDragging] = useState<MovablePanelId | null>(null);
+  const [mobileView, setMobileView] = useState<MobileView>("chat");
   const ctx = useMemo(() => ({ workspace, ide }), [workspace, ide]);
+
+  // When a file is opened from the explorer on mobile, jump to the editor.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (ide.state.activeTabId && mobileView === "files") {
+      setMobileView("editor");
+    }
+  }, [isMobile, ide.state.activeTabId, mobileView]);
+
+  // Prefer chat on first mobile paint if it's already visible in the layout.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (ide.state.panelVisibility.chat) setMobileView("chat");
+    // Only on mobile enter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMobile]);
 
   const drop = (position: DockPosition, payload?: string) => {
     const panel = MOVABLE.includes(payload as MovablePanelId)
@@ -49,96 +75,306 @@ export function IdeShell() {
     setDragging(null);
   };
 
+  const selectMobileView = (view: MobileView) => {
+    setMobileView(view);
+    if (view === "files") {
+      ide.selectExplorer();
+      return;
+    }
+    if (view === "editor") {
+      ide.selectEditor();
+      return;
+    }
+    if (view === "chat") {
+      ide.showDockPanel("chat");
+      return;
+    }
+    if (view === "terminal" && ide.state.terminals.length === 0) {
+      ide.newTerminal();
+    }
+    ide.showDockPanel(view);
+  };
+
   return (
     <IdeContext.Provider value={ctx}>
-      <div className="relative flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
-        <ActivityBar />
+      {isMobile ? (
+        <MobileShell
+          workspace={workspace}
+          agent={agent}
+          mobileView={mobileView}
+          onSelectView={selectMobileView}
+          connected={agent.connected}
+        />
+      ) : (
+        <div className="relative flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
+          <ActivityBar />
 
-        {!ide.state.sidebarCollapsed && (
-          <>
-            <PrimarySidebar
-              workspace={workspace}
-              agent={agent}
-              onDragStart={setDragging}
-              onDragEnd={() => setDragging(null)}
-            />
-            <ResizeHandle
-              orientation="x"
-              size={ide.state.sidebarWidth}
-              onResize={ide.setSidebarWidth}
-              min={160}
-              max={640}
-            />
-          </>
-        )}
-
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex min-h-0 flex-1">
-            <main className="flex min-w-0 flex-1 flex-col">
-              <TabStrip
+          {!ide.state.sidebarCollapsed && (
+            <>
+              <PrimarySidebar
+                workspace={workspace}
+                agent={agent}
                 onDragStart={setDragging}
                 onDragEnd={() => setDragging(null)}
               />
-              <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
-                {activeMainPanel(ide) ? (
-                  <PanelContent
-                    panel={activeMainPanel(ide)!}
-                    workspace={workspace}
-                    agent={agent}
-                  />
-                ) : (
-                  <MainContent workspace={workspace} />
-                )}
-              </div>
-            </main>
-
-            {hasVisibleDock(ide, "right") && (
               <ResizeHandle
                 orientation="x"
+                size={ide.state.sidebarWidth}
+                onResize={ide.setSidebarWidth}
+                min={160}
+                max={640}
+              />
+            </>
+          )}
+
+          <div className="flex min-w-0 flex-1 flex-col">
+            <div className="flex min-h-0 flex-1">
+              <main className="flex min-w-0 flex-1 flex-col">
+                <TabStrip
+                  onDragStart={setDragging}
+                  onDragEnd={() => setDragging(null)}
+                />
+                <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
+                  {activeMainPanel(ide) ? (
+                    <PanelContent
+                      panel={activeMainPanel(ide)!}
+                      workspace={workspace}
+                      agent={agent}
+                    />
+                  ) : (
+                    <MainContent workspace={workspace} />
+                  )}
+                </div>
+              </main>
+
+              {hasVisibleDock(ide, "right") && (
+                <ResizeHandle
+                  orientation="x"
+                  invert
+                  size={ide.state.copilotWidth}
+                  onResize={ide.setCopilotWidth}
+                  min={280}
+                  max={900}
+                />
+              )}
+              <DockAt
+                position="right"
+                workspace={workspace}
+                agent={agent}
+                onDragStart={setDragging}
+                onDragEnd={() => setDragging(null)}
+              />
+            </div>
+
+            {hasVisibleDock(ide, "bottom") && (
+              <ResizeHandle
+                orientation="y"
                 invert
-                size={ide.state.copilotWidth}
-                onResize={ide.setCopilotWidth}
-                min={280}
-                max={900}
+                size={ide.state.bottomPanelHeight}
+                onResize={ide.setBottomPanelHeight}
+                min={120}
+                max={800}
               />
             )}
             <DockAt
-              position="right"
+              position="bottom"
               workspace={workspace}
               agent={agent}
               onDragStart={setDragging}
               onDragEnd={() => setDragging(null)}
             />
+
+            <StatusBar
+              connected={agent.connected}
+              workspace={workspace}
+              git={ide.state.gitStatus}
+            />
           </div>
 
-          {hasVisibleDock(ide, "bottom") && (
-            <ResizeHandle
-              orientation="y"
-              invert
-              size={ide.state.bottomPanelHeight}
-              onResize={ide.setBottomPanelHeight}
-              min={120}
-              max={800}
+          {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
+        </div>
+      )}
+    </IdeContext.Provider>
+  );
+}
+
+function MobileShell({
+  workspace,
+  agent,
+  mobileView,
+  onSelectView,
+  connected,
+}: {
+  workspace: string;
+  agent: ReturnType<typeof useAgent>;
+  mobileView: MobileView;
+  onSelectView: (view: MobileView) => void;
+  connected: boolean;
+}) {
+  const { ide } = useIdeContext();
+
+  return (
+    <div className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-ink-950 text-ink-100 pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)]">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {(mobileView === "editor" || mobileView === "preview") && (
+          <MobileTabStrip
+            showPreviewTab={mobileView === "preview" || ide.state.panelVisibility.preview}
+            activeView={mobileView}
+            onSelectEditor={() => onSelectView("editor")}
+            onSelectPreview={() => onSelectView("preview")}
+          />
+        )}
+        <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
+          {mobileView === "files" && <FileTree />}
+          {mobileView === "editor" && <MainContent workspace={workspace} />}
+          {mobileView === "chat" && <Chat agent={agent} docked />}
+          {mobileView === "git" && <GitPanel />}
+          {mobileView === "terminal" && (
+            <TerminalPanel
+              workspace={workspace}
+              sessions={ide.state.terminals}
+              activeId={ide.state.activeTerminalId}
+              onNew={() => ide.newTerminal()}
+              onClose={ide.closeTerminal}
+              onSelect={ide.setActiveTerminal}
+              onExit={ide.setTerminalExit}
             />
           )}
-          <DockAt
-            position="bottom"
-            workspace={workspace}
-            agent={agent}
-            onDragStart={setDragging}
-            onDragEnd={() => setDragging(null)}
-          />
-
-          <StatusBar
-            connected={agent.connected}
-            workspace={workspace}
-            git={ide.state.gitStatus}
-          />
+          {mobileView === "preview" && (
+            <Preview
+              workspace={workspace}
+              preview={ide.state.preview}
+              onPreviewChange={ide.setPreview}
+            />
+          )}
         </div>
-
-        {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
       </div>
-    </IdeContext.Provider>
+
+      <StatusBar
+        connected={connected}
+        workspace={workspace}
+        git={ide.state.gitStatus}
+        compact
+      />
+      <MobileBottomNav active={mobileView} onSelect={onSelectView} />
+    </div>
+  );
+}
+
+function MobileBottomNav({
+  active,
+  onSelect,
+}: {
+  active: MobileView;
+  onSelect: (view: MobileView) => void;
+}) {
+  const items: Array<{ id: MobileView; label: string; icon: typeof FolderIcon }> = [
+    { id: "files", label: PANELS.explorer.label, icon: FolderIcon },
+    { id: "editor", label: "Editor", icon: FileIcon },
+    { id: "chat", label: "Chat", icon: SparkIcon },
+    { id: "git", label: "Git", icon: GitBranchIcon },
+    { id: "terminal", label: "Term", icon: TerminalIcon },
+    { id: "preview", label: "Preview", icon: GlobeIcon },
+  ];
+
+  return (
+    <nav
+      className="flex shrink-0 items-stretch border-t border-ink-800 bg-ink-925"
+      aria-label="Primary"
+    >
+      {items.map((item) => {
+        const Icon = item.icon;
+        const isActive = active === item.id;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => onSelect(item.id)}
+            aria-label={item.label}
+            aria-current={isActive ? "page" : undefined}
+            className={`flex min-h-[3.25rem] min-w-0 flex-1 flex-col items-center justify-center gap-0.5 px-0.5 text-[10px] ${
+              isActive ? "text-accent-soft" : "text-ink-500"
+            }`}
+          >
+            <Icon width={20} height={20} />
+            <span className="max-w-full truncate leading-tight">{item.label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+function MobileTabStrip({
+  showPreviewTab,
+  activeView,
+  onSelectEditor,
+  onSelectPreview,
+}: {
+  showPreviewTab: boolean;
+  activeView: MobileView;
+  onSelectEditor: () => void;
+  onSelectPreview: () => void;
+}) {
+  const { ide } = useIdeContext();
+  const { openTabs, activeTabId } = ide.state;
+
+  return (
+    <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800 bg-ink-925">
+      {openTabs.length === 0 && activeView === "editor" && (
+        <span className="flex items-center px-3 text-xs text-ink-600">No open editors</span>
+      )}
+      {openTabs.map((tab) => {
+        const active = activeView === "editor" && tab.id === activeTabId;
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => {
+              ide.setActiveTab(tab.id);
+              onSelectEditor();
+            }}
+            title={tab.target}
+            className={`group flex items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${active ? "bg-ink-950 text-ink-100" : "text-ink-400"}`}
+          >
+            <FileIcon width={13} height={13} className="shrink-0 text-ink-500" />
+            <span className="max-w-[10rem] truncate">{tab.label}</span>
+            {tab.dirty && <span className="text-amber-300">●</span>}
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(event) => {
+                event.stopPropagation();
+                ide.closeTab(tab.id);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  ide.closeTab(tab.id);
+                }
+              }}
+              className="ml-1 text-ink-500 opacity-100 hover:text-ink-100"
+              aria-label={`close ${tab.label}`}
+            >
+              <XIcon width={12} height={12} />
+            </span>
+          </button>
+        );
+      })}
+      {showPreviewTab && (
+        <button
+          type="button"
+          onClick={onSelectPreview}
+          className={`flex items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${
+            activeView === "preview" ? "bg-ink-950 text-ink-100" : "text-ink-400"
+          }`}
+        >
+          <GlobeIcon width={13} height={13} className="shrink-0 text-ink-500" />
+          <span>Preview</span>
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -478,22 +714,57 @@ function TabStrip({
 function MainContent({ workspace }: { workspace: string }) {
   const { ide } = useIdeContext();
   const tab = ide.state.openTabs.find((item) => item.id === ide.state.activeTabId) ?? null;
-  if (!tab) return <div className="flex h-full items-center justify-center px-6 text-center text-sm text-ink-600">Open a file from the Explorer to start editing.</div>;
+  if (!tab) {
+    return (
+      <div className="flex h-full items-center justify-center px-6 text-center text-sm text-ink-600">
+        Open a file from the Explorer to start editing.
+      </div>
+    );
+  }
   if (tab.kind === "file") return <Editor tab={tab} />;
   if (tab.kind === "preview") return <Preview target={tab.target} workspace={workspace} />;
   return null;
 }
 
-function StatusBar({ connected, workspace, git }: { connected: boolean; workspace: string; git: GitStatus | null }) {
+function StatusBar({
+  connected,
+  workspace,
+  git,
+  compact = false,
+}: {
+  connected: boolean;
+  workspace: string;
+  git: GitStatus | null;
+  compact?: boolean;
+}) {
   const branch = git?.branch;
   const changes = git?.entries.length ?? 0;
   const wsName = workspace ? workspace.split(/[\\/]/).pop() ?? workspace : "—";
   return (
-    <div className="flex h-6 shrink-0 items-center justify-between border-t border-ink-700 bg-ink-900 px-2 text-[11px] text-ink-300">
-      <div className="flex items-center gap-2 overflow-hidden">
-        {branch ? <span className="flex items-center gap-1 whitespace-nowrap"><GitBranchIcon width={12} height={12} className="text-accent" /><span>{branch}</span><span className="text-ink-500">· {changes} {changes === 1 ? "change" : "changes"}</span></span> : <span className="text-ink-500">no git</span>}
+    <div className="flex h-6 shrink-0 items-center justify-between gap-2 border-t border-ink-700 bg-ink-900 px-2 text-[11px] text-ink-300">
+      <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+        {branch ? (
+          <span className="flex min-w-0 items-center gap-1 whitespace-nowrap">
+            <GitBranchIcon width={12} height={12} className="shrink-0 text-accent" />
+            <span className="truncate">{branch}</span>
+            {!compact && (
+              <span className="text-ink-500">
+                · {changes} {changes === 1 ? "change" : "changes"}
+              </span>
+            )}
+          </span>
+        ) : (
+          <span className="text-ink-500">no git</span>
+        )}
       </div>
-      <div className="flex items-center gap-3"><span className={connected ? "text-emerald-400" : "text-amber-300"}>{connected ? "● connected" : "● reconnecting…"}</span><span className="max-w-[20rem] truncate text-ink-400" title={workspace}>{wsName}</span></div>
+      <div className="flex min-w-0 shrink items-center gap-2 sm:gap-3">
+        <span className={connected ? "text-emerald-400" : "text-amber-300"}>
+          {compact ? (connected ? "●" : "○") : connected ? "● connected" : "● reconnecting…"}
+        </span>
+        <span className={`truncate text-ink-400 ${compact ? "max-w-[6rem]" : "max-w-[20rem]"}`} title={workspace}>
+          {wsName}
+        </span>
+      </div>
     </div>
   );
 }

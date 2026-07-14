@@ -1,26 +1,40 @@
 "use client";
 // web/src/components/ide/terminal.tsx
 //
-// xterm.js terminal over a WebSocket at /api/terminal (same origin). The shell
-// itself is spawned server-side by the custom Next server
-// (web/src/server/server.ts) — it is a line-mode child_process shell (no PTY,
-// to keep the release cross-platform pure-JS; see contract §0.5/§9.3).
+// Ghostty's VT engine (WASM) over a WebSocket at /api/terminal. The custom
+// Next server owns a real pseudoterminal and keeps it alive across panel
+// switches/reloads; this component is only the renderer + input transport.
 //
 // This component is loaded via next/dynamic({ ssr:false }) by the panel
-// registry so xterm.js never runs on the server and never enters the main
+// registry so Ghostty never runs on the server and never enters the main
 // bundle chunk. It is intentionally self-contained (props, not a shared
 // IdeContext) so it can be wired up before/without the rest of the IDE shell.
 
-import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef } from "react";
-import type { Terminal as XTerm } from "@xterm/xterm";
-import type { FitAddon as FitAddonT } from "@xterm/addon-fit";
+import type { Terminal as GhosttyTerminal } from "ghostty-web";
 
 // ── WS message envelopes (mirror web/src/server/server.ts, contract §4.5) ──
 type ServerMsg =
   | { type: "data"; data: string }
   | { type: "exit"; code: number }
+  | { type: "ready"; sessionId: string }
+  | { type: "terminated" }
   | { type: "pong" };
+
+let ghosttyReady: Promise<void> | null = null;
+
+function terminalSocketUrl(): string {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.host}/api/terminal`;
+}
+
+/** Explicitly terminate a persistent server-side PTY, including when detached. */
+function terminateTerminalSession(sessionId: string): void {
+  const socket = new WebSocket(terminalSocketUrl());
+  socket.onopen = () => socket.send(JSON.stringify({ type: "terminate", sessionId }));
+  socket.onmessage = () => socket.close();
+  socket.onerror = () => socket.close();
+}
 
 // ── Local TerminalSession type ─────────────────────────────────────────────
 // Matches contract types.ts §2 verbatim. Kept local here (rather than imported
@@ -51,16 +65,16 @@ export interface TerminalProps {
 }
 
 /**
- * One xterm.js terminal session bound to a single WebSocket. Opens the WS on
- * mount, sends {type:"open",workspace,cwd,cols,rows}, pipes data ↔ xterm, and
+ * One Ghostty terminal session bound to a single WebSocket. Opens the WS on
+ * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
 export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<XTerm | null>(null);
+  const termRef = useRef<GhosttyTerminal | null>(null);
 
   // Keep latest values in refs so the effect only re-runs when the session id
-  // changes (one xterm + WS per session), not on every parent render.
+  // changes (one renderer + WS attachment per session), not on parent renders.
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
   const cwdRef = useRef(cwd);
@@ -70,39 +84,33 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
 
   useEffect(() => {
     let disposed = false;
-    let fit: FitAddonT | null = null;
-    let term: XTerm | null = null;
+    let term: GhosttyTerminal | null = null;
     let ws: WebSocket | null = null;
     let pingTimer: ReturnType<typeof setInterval> | null = null;
-    let ro: ResizeObserver | null = null;
 
     (async () => {
-      // Dynamic imports keep xterm.js out of the server bundle + main chunk.
-      const [{ Terminal: XTerm }, { FitAddon: Fit }] = await Promise.all([
-        import("@xterm/xterm"),
-        import("@xterm/addon-fit"),
-      ]);
-      // web-links addon is optional; load best-effort.
-      let WebLinksAddon: typeof import("@xterm/addon-web-links").WebLinksAddon | null = null;
-      try {
-        ({ WebLinksAddon } = await import("@xterm/addon-web-links"));
-      } catch {
-        WebLinksAddon = null;
-      }
+      // Dynamic import keeps Ghostty's renderer + WASM out of the server and
+      // initial application chunks.
+      const ghostty = await import("ghostty-web");
+      ghosttyReady ??= ghostty.init();
+      await ghosttyReady;
       if (disposed || !containerRef.current) return;
 
-      term = new XTerm({
+      term = new ghostty.Terminal({
         fontFamily:
           "'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace",
         fontSize: 13,
-        lineHeight: 1.2,
         cursorBlink: true,
-        scrollback: 5000,
-        allowProposedApi: true,
+        scrollback: 10000,
+        theme: {
+          background: "#080a0f",
+          foreground: "#d6d9e0",
+          cursor: "#a78bfa",
+          selectionBackground: "#3b4261",
+        },
       });
-      fit = new Fit();
+      const fit = new ghostty.FitAddon();
       term.loadAddon(fit);
-      if (WebLinksAddon) term.loadAddon(new WebLinksAddon());
       term.open(containerRef.current);
       try {
         fit.fit();
@@ -112,12 +120,12 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
       termRef.current = term;
       term.focus();
 
-      const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${wsScheme}://${location.host}/api/terminal`);
+      ws = new WebSocket(terminalSocketUrl());
       ws.onopen = () => {
         ws!.send(
           JSON.stringify({
             type: "open",
+            sessionId,
             workspace: workspaceRef.current,
             cwd: cwdRef.current ?? "",
             cols: term!.cols,
@@ -141,7 +149,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
         /* surfaced via onclose; nothing else to do */
       };
 
-      // stdin: every xterm keystroke → WS data envelope.
+      // stdin: every Ghostty-encoded keystroke → the real PTY.
       const onDataDisp = term.onData((data) => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "data", data }));
@@ -155,34 +163,24 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
         }
       }, 30000);
 
-      // Resize: refit xterm to its container and notify the server.
-      const doResize = () => {
-        if (!fit || !term || !ws) return;
-        try {
-          fit.fit();
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-          }
-        } catch {
-          /* ignore */
+      const onResizeDisp = term.onResize(({ cols, rows }) => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "resize", cols, rows }));
         }
-      };
-      ro = new ResizeObserver(doResize);
-      ro.observe(containerRef.current);
-      window.addEventListener("resize", doResize);
+      });
+      fit.observeResize();
 
       // stash disposers for the cleanup fn
-      (term as XTerm & { __dispose?: () => void }).__dispose = () => {
+      (term as GhosttyTerminal & { __dispose?: () => void }).__dispose = () => {
         onDataDisp.dispose();
+        onResizeDisp.dispose();
         if (pingTimer) clearInterval(pingTimer);
-        if (ro) ro.disconnect();
-        window.removeEventListener("resize", doResize);
       };
     })();
 
     return () => {
       disposed = true;
-      const t = termRef.current as (XTerm & { __dispose?: () => void }) | null;
+      const t = termRef.current as (GhosttyTerminal & { __dispose?: () => void }) | null;
       t?.__dispose?.();
       if (ws) {
         ws.onopen = null;
@@ -203,7 +201,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
     };
   }, [sessionId]);
 
-  return <div ref={containerRef} className="h-full w-full overflow-hidden bg-black/40" />;
+  return <div ref={containerRef} className="h-full w-full overflow-hidden bg-[#080a0f]" />;
 }
 
 // ── Presentational panel (tab strip + active terminal) ─────────────────────
@@ -261,9 +259,10 @@ export function TerminalPanel({
               tabIndex={0}
               onClick={(e) => {
                 e.stopPropagation();
+                terminateTerminalSession(s.id);
                 onClose(s.id);
               }}
-              className="ml-1 text-ink-500 opacity-0 hover:text-ink-100 group-hover:opacity-100"
+              className="ml-1 text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100"
               aria-label={`close ${s.title}`}
             >
               ×
@@ -273,7 +272,7 @@ export function TerminalPanel({
         <button
           type="button"
           onClick={onNew}
-          className="ml-auto px-2 py-1 text-ink-400 hover:text-ink-100"
+          className="ml-auto min-h-9 px-3 py-1 text-ink-400 hover:text-ink-100"
           title="New terminal"
           aria-label="new terminal"
         >

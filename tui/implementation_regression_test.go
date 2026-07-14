@@ -36,7 +36,7 @@ func TestPendingApprovalDiffExpandsAndUsesLiveBindings(t *testing.T) {
 	}
 
 	collapsed := stripANSI(s.renderApprovalBanner())
-	if !strings.Contains(collapsed, "[Z] approve") || !strings.Contains(collapsed, "Ctrl+E expand") {
+	if !strings.Contains(collapsed, "[Z] once") || !strings.Contains(collapsed, "Ctrl+E expand") {
 		t.Fatalf("approval hints do not reflect keymap:\n%s", collapsed)
 	}
 	_, _ = s.handleKey(tea.KeyPressMsg{Code: 'e', Mod: tea.ModCtrl})

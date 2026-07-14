@@ -132,10 +132,10 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet max-w-lg"
         role="dialog"
         aria-modal="true"
         aria-label="Goal mode"
@@ -169,7 +169,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
             />
           </label>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="block">
               <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
                 Concurrency

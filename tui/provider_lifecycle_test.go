@@ -124,7 +124,7 @@ func TestReadyEventReplacesCachedStartingWelcome(t *testing.T) {
 	if strings.Contains(view, "Starting") || strings.Contains(view, "Get started") {
 		t.Fatalf("ready event left a stale startup screen:\n%s", view)
 	}
-	if !strings.Contains(view, "Explain how this codebase is organized") {
+	if !strings.Contains(view, "Understand this repository") {
 		t.Fatalf("authenticated welcome examples were not rendered:\n%s", view)
 	}
 	if !s.authed || s.coreLifecycle != coreReady {

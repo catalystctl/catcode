@@ -322,19 +322,20 @@ export function useAgent(): AgentApi {
     [],
   );
 
-  // Apply saved approval once the viewed session is known — applying
-  // set_approval before the stream resolves a session file can spawn an orphan
-  // core when the sessions dir is empty (freshSessionFile races).
+  // Mirror the live gate into localStorage once the session is ready. Do NOT
+  // push localStorage → set_approval here: that fought settings.json (TUI
+  // writes never; a stale umans:approval=destructive would reset the core on
+  // every tab open / session switch). Spawn already boots from settings.json.
   useEffect(() => {
-    if (!state.currentSessionFile) return;
-    const a = lsGet("umans:approval");
-    if (a !== "never" && a !== "destructive" && a !== "always") return;
-    void post({ type: "set_approval", mode: a });
-  }, [state.currentSessionFile, post]);
+    const a = state.approvalMode;
+    if (a === "never" || a === "destructive" || a === "always") {
+      lsSet("umans:approval", a);
+    }
+  }, [state.approvalMode]);
 
   // Switch the viewed session: reopen the SSE stream for it (the bridge starts
-  // its core if it isn't already live) and re-apply the user's global approval
-  // preference to the new session's core. Other live sessions keep running.
+  // its core if it isn't already live). Other live sessions keep running.
+  // Approval comes from settings.json on spawn — no localStorage override.
   const switchToSession = useCallback(
     (sessionFile: string, workspace?: string) => {
       // Clicking the already-active session must no-op — otherwise we set
@@ -372,12 +373,8 @@ export function useAgent(): AgentApi {
         workspace: workspace ?? s.workspace,
       }));
       setStreamSessionId(sessionFile);
-      const a = lsGet("umans:approval");
-      if (a === "never" || a === "destructive" || a === "always") {
-        void post({ type: "set_approval", mode: a });
-      }
     },
-    [post],
+    [],
   );
 
   const send = useCallback(

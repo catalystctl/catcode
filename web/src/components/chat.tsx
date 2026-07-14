@@ -957,10 +957,10 @@ function KeyOverlay({
   const closeRef = useOutsideClose(onDismiss);
   const trapRef = useFocusTrap<HTMLDivElement>();
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="relative w-full max-w-md rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl animate-fade-in"
+        className="modal-sheet modal-sheet-auto relative max-w-md p-6"
         role="dialog"
         aria-modal="true"
         aria-label="Connect your provider"

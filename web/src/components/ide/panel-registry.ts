@@ -6,7 +6,7 @@
 // ./file-tree, ./editor, ./terminal, ./git-panel, ./preview).
 //
 // Heavy panels (editor, terminal, preview) are loaded via next/dynamic with
-// ssr:false so CodeMirror / xterm.js / iframe logic never run on the server and
+// ssr:false so CodeMirror / Ghostty WASM / iframe logic never run on the server and
 // never enter the main bundle chunk — only the active panel's chunk loads.
 // Light panels (file-tree, git-panel) are static imports (they consume the
 // IdeContext and carry no heavy deps).

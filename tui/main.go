@@ -177,6 +177,8 @@ type session struct {
 	umansConcProvider string              // the Umans provider name the poll is tracking; conc shows only when the selected model routes here
 	subProgress       []*subProgressEntry // live subagent runs (drives the progress panel)
 	maxTaskRows       int                 // cap on task-panel entries (set by layout() to fit available height)
+	activityExpanded  bool                // expands the compact tasks/subagents activity shelf
+	activityScroll    int                 // first detail row shown in the focused activity shelf
 	cwd               string              // working dir, shown in the header as ~/
 
 	// Ephemeral UX state (toasts, sticky OAuth, one-shot prompts).

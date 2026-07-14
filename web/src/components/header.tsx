@@ -105,7 +105,7 @@ export function Header(props: Props) {
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {modelOpen && (
-          <div role="menu" className={`absolute right-0 z-30 mt-1 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-0 shadow-2xl shadow-black/40 animate-fade-in ${props.compact ? "w-64" : "w-80"}`}>
+          <div role="menu" className={`absolute right-0 z-30 mt-1 max-h-[min(70vh,28rem)] overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-0 shadow-2xl shadow-black/40 animate-fade-in ${props.compact ? "w-[min(18rem,calc(100vw-1rem))]" : "w-[min(20rem,calc(100vw-1rem))] sm:w-80"}`}>
             <ModelPicker
               models={props.models}
               selectedModel={props.selectedModel}

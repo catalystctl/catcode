@@ -159,10 +159,10 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
   return (
     <>
       <AppDialogHost dialog={dialog} />
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <div className="modal-backdrop">
         <div
           ref={mergeRefs(closeRef, trapRef)}
-          className="flex max-h-[85vh] w-full max-w-xl flex-col rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+          className="modal-sheet max-w-xl"
           role="dialog"
           aria-modal="true"
           aria-label="Memories"

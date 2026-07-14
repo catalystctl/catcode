@@ -16,7 +16,7 @@ export function Toasts({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id:
     <div
       role="status"
       aria-live="polite"
-      className="pointer-events-none fixed bottom-24 right-4 z-40 flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2"
+      className="pointer-events-none fixed bottom-[calc(6.5rem+env(safe-area-inset-bottom))] left-3 right-3 z-40 flex max-w-sm flex-col gap-2 sm:bottom-24 sm:left-auto sm:right-4 sm:w-80"
     >
       {toasts.map((t) => (
         <ToastItem key={t.id} toast={t} onDismiss={onDismiss} />
@@ -43,7 +43,9 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
       className={`pointer-events-auto flex items-start gap-2 rounded-xl border ${cfg.ring} ${cfg.tint} px-3 py-2.5 backdrop-blur animate-fade-in`}
     >
       <span className={`mt-0.5 shrink-0 ${cfg.text}`}>{cfg.icon}</span>
-      <p className="flex-1 text-[12px] leading-snug text-ink-200">{toast.message}</p>
+      <p className="flex-1 break-words text-[12px] leading-snug text-ink-200 sm:break-normal">
+        {toast.message}
+      </p>
       <button onClick={() => onDismiss(toast.id)} className="shrink-0 text-ink-500 hover:text-ink-100">
         <XIcon width={13} height={13} />
       </button>

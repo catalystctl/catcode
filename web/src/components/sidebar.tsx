@@ -93,8 +93,14 @@ export function Sidebar(props: Props) {
         />
       )}
       <aside
-        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-72 max-w-[88%] flex-col border-r border-ink-800/80 bg-ink-950/95 backdrop-blur transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0"} ${
-          props.open ? "translate-x-0" : "-translate-x-full"
+        // Password managers such as Proton Pass may annotate form containers
+        // before React hydrates. The attribute is harmless but otherwise
+        // produces a false-positive hydration mismatch in development.
+        suppressHydrationWarning
+        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-72 max-w-[88%] flex-col border-r border-ink-800/80 bg-ink-950/95 backdrop-blur transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto"} ${
+          props.open
+            ? "translate-x-0"
+            : "-translate-x-full pointer-events-none lg:pointer-events-auto"
         }`}
       >
         {/* ── Project switcher ── */}
@@ -338,7 +344,7 @@ export function Sidebar(props: Props) {
 
         {/* ── Footer: quick actions + stats ── */}
         <div className="border-t border-ink-800/80 p-2">
-          <div className="mb-1.5 grid grid-cols-5 gap-1.5">
+          <div className="mb-1.5 grid grid-cols-3 gap-1.5 sm:grid-cols-5">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
             <ActionBtn icon={<SparkIcon width={13} height={13} />} label="Agents" onClick={() => props.onOpenPanel("subagents")} />

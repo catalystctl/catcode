@@ -47,7 +47,7 @@ function TreeNode({ node, depth, ctx }: { node: FileNode; depth: number; ctx: Tr
         onClick={onClick}
         title={node.path}
         style={{ paddingLeft: depth * 12 + 6 }}
-        className={`flex w-full items-center gap-1 rounded py-0.5 pr-1.5 text-left text-[13px] ${
+        className={`flex w-full items-center gap-1 rounded py-1.5 pr-1.5 text-left text-[13px] sm:py-0.5 ${
           active ? "bg-ink-800 text-ink-100" : "text-ink-300 hover:bg-ink-800/60"
         }`}
       >

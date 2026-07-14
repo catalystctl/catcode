@@ -21,6 +21,7 @@ import { CoreProcess } from "@catalyst-code/coding-agent";
 import { reduce, initialState } from "@/lib/reducer";
 import type { AgentEvent, AgentState, CoreCommand, CoreEvent, ReadyPayload } from "@/lib/types";
 import { loadTitles } from "@/lib/session-titles";
+import { loadSettings, saveApproval } from "./settings-file";
 
 export interface SessionEnv {
   binary: string;
@@ -28,6 +29,8 @@ export interface SessionEnv {
   model?: string;
   baseUrl?: string;
   provider?: string;
+  /** Persisted gate from settings.json; defaults to destructive when unset. */
+  approval?: "never" | "destructive" | "always";
 }
 
 /** Cross-session concerns the owning bridge handles (broadcasts, project list). */
@@ -116,10 +119,14 @@ export class LiveSession {
       CATALYST_CODE_NO_BROWSER: "1",
     };
     if (this.env.apiKey) env.UMANS_API_KEY = this.env.apiKey;
+    // Fresh read so a TUI `/approval never` lands on the next web spawn even if
+    // this LiveSession was constructed before the change.
+    const approval = loadSettings().approval ?? this.env.approval ?? "destructive";
+    this.env.approval = approval;
     const core = new CoreProcess({
       cwd: this.workspace,
       binaryPath: this.env.binary,
-      approval: "destructive",
+      approval,
       model: this.env.model,
       baseUrl: this.env.baseUrl,
       provider: this.env.provider,
@@ -301,6 +308,20 @@ export class LiveSession {
       });
     }
     if (!this.core) throw new Error("session core not started");
+    // Persist gate changes to the shared settings.json so the next spawn (web
+    // or TUI) boots with the user's choice instead of the destructive default.
+    if (cmd.type === "set_approval") {
+      const mode = cmd.mode;
+      if (mode === "never" || mode === "destructive" || mode === "always") {
+        try {
+          saveApproval(mode);
+          // Keep the in-memory env in sync for any later respawn of this session.
+          this.env.approval = mode;
+        } catch {
+          /* non-fatal — core still gets the runtime set_approval */
+        }
+      }
+    }
     this.core.send(cmd as unknown as Parameters<CoreProcess["send"]>[0]);
   }
 

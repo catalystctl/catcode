@@ -271,7 +271,7 @@ Set `CATCODE_CORE=<path>` if the core isn't found automatically (it searches
 ## Providers and Login
 
 `/login` opens a picker of the bundled presets. You can be logged into several
-at once; `/models` lists every provider's models (tagged `[umans]`, `[openai]`,
+at once; `/model` lists every provider's models (tagged `[umans]`, `[openai]`,
 `[gemini]`, `[anthropic]`), and any model you pick routes that turn to its
 endpoint.
 

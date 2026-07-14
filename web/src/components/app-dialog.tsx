@@ -139,10 +139,10 @@ function ConfirmView({
   }, []);
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop z-[60]">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="w-full max-w-md overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet modal-sheet-auto max-w-md"
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="app-dialog-title"
@@ -236,10 +236,10 @@ function PromptView({
   };
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+    <div className="modal-backdrop z-[60]">
       <div
         ref={mergeRefs(closeRef, trapRef)}
-        className="w-full max-w-md overflow-hidden rounded-2xl border border-ink-700 bg-ink-900 shadow-2xl animate-fade-in"
+        className="modal-sheet modal-sheet-auto max-w-md"
         role="dialog"
         aria-modal="true"
         aria-labelledby="app-prompt-title"

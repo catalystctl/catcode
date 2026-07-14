@@ -46,6 +46,7 @@ const (
 	modalAutoCompact
 	modalNoNetwork
 	modalMouseWheel
+	modalFooterMetrics
 	modalValueEdit          // free-form edit (api_key, timeouts, remember, attach, run, …)
 	modalMemory             // pick a memory to forget
 	modalGoal               // multi-field /goal form (goal, concurrency, models, providers)
@@ -239,12 +240,13 @@ func (s *session) confirmItems() []listItem {
 
 // listItem is a generic filtered-list entry.
 type listItem struct {
-	label string
-	desc  string
-	tag   string // left marker (e.g. "▸" for selected)
-	meta  string // opaque payload for executeListSelect (e.g. preset id)
-	meta2 string // opaque kind hint for executeListSelect (e.g. "preset"/"provider")
-	group string // optional section header in filtered lists (command palette)
+	label    string
+	desc     string
+	shortcut string // optional right-aligned key hint
+	tag      string // left marker (e.g. "▸" for selected)
+	meta     string // opaque payload for executeListSelect (e.g. preset id)
+	meta2    string // opaque kind hint for executeListSelect (e.g. "preset"/"provider")
+	group    string // optional section header in filtered lists (command palette)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +364,16 @@ func (s *session) openMouseWheelPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalMouseWheel
 	if s.settings.MouseWheel {
+		s.modal.cursor = 0
+	} else {
+		s.modal.cursor = 1
+	}
+}
+
+func (s *session) openFooterMetricsPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalFooterMetrics
+	if s.settings.FooterMetrics {
 		s.modal.cursor = 0
 	} else {
 		s.modal.cursor = 1
@@ -924,6 +936,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
 		{group: "Session", label: "/no-network", desc: "block network in sandbox on/off"},
 		{group: "Session", label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
+		{group: "Session", label: "/footer-metrics", desc: "show model, TPS, and TTFT in footer"},
 		{group: "Session", label: "/idle-timeout", desc: "idle timeout (seconds)"},
 		{group: "Session", label: "/max-session-tokens", desc: "max session tokens (0=unlimited)"},
 		{group: "Session", label: "/reset", desc: "wipe conversation + session file"},
@@ -933,6 +946,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/sessions", desc: "open session picker"},
 		{group: "Session", label: "/new", desc: "start a fresh session file"},
 		{group: "Session", label: "/stats", desc: "token + turn totals"},
+		{group: "Session", label: "/status", desc: "model, policy, performance, and UI state"},
 		{group: "Session", label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{group: "Session", label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
 		{group: "Session", label: "/abort", desc: "stop running turn (or Esc)"},
@@ -984,6 +998,16 @@ func (s *session) commandItems() []listItem {
 		}
 		items = append(items, listItem{group: "Plugins", label: "/" + pc.Name, desc: desc})
 	}
+	shortcuts := map[string]string{
+		"/help": "?", "/reasoning": s.keyHint("reasoning_picker"),
+		"/find": s.keyHint("transcript_find"), "/abort": s.keyHint("close"),
+		"/exit": s.keyHint("quit"), "/copy": s.keyHint("copy_focused"),
+	}
+	for i := range items {
+		if shortcut, ok := shortcuts[items[i].label]; ok {
+			items[i].shortcut = shortcut
+		}
+	}
 	if len(s.recentCommands) == 0 {
 		return items
 	}
@@ -1014,19 +1038,20 @@ func (s *session) modelItems() []listItem {
 	for i, m := range s.models {
 		// Show the model's advertised thinking levels when it constrains them
 		// (e.g. GLM only takes "high"); omit the count for the standard trio.
-		desc := fmt.Sprintf("ctx:%d · max:%d", m.ContextWindow, m.MaxTokens)
+		desc := fmt.Sprintf("%s context · %s output", compactTokens(uint64(m.ContextWindow)), compactTokens(uint64(m.MaxTokens)))
 		if len(m.ThinkingLevels) > 0 {
 			desc += " · think:" + strings.Join(m.ThinkingLevels, "/")
 		}
 		// Tag the owning provider so a multi-login /models can mix providers
 		// (e.g. gpt-5-codex [openai], gemini-2.5-pro [gemini], claude-... [anthropic]).
 		label := m.ID
-		if m.Provider != "" {
-			label = fmt.Sprintf("%s  [%s]", m.ID, m.Provider)
+		if i == s.modelIdx {
+			desc = "current · " + desc
 		}
 		items[i] = listItem{
 			label: label,
 			desc:  desc,
+			group: m.Provider,
 		}
 	}
 	return items
@@ -1067,6 +1092,7 @@ func (s *session) settingsHubItems() []listItem {
 		{label: "/sandbox", desc: s.settings.Sandbox},
 		{label: "/no-network", desc: boolStr(s.settings.NoNetwork) + " (next launch)"},
 		{label: "/mouse-wheel", desc: boolStr(s.settings.MouseWheel)},
+		{label: "/footer-metrics", desc: boolStr(s.settings.FooterMetrics) + " · model, TPS, TTFT"},
 		{label: "/idle-timeout", desc: fmt.Sprintf("%ds (next launch)", s.settings.IdleTimeout)},
 		{label: "/max-session-tokens", desc: fmt.Sprintf("%d (next launch)", s.settings.MaxSessionTokens)},
 		{label: "/keybinds", desc: "view & customize keybindings"},
@@ -1167,6 +1193,12 @@ func (s *session) mouseWheelItems() []listItem {
 	return toggleItems(s.settings.MouseWheel,
 		"wheel scrolls transcript (Shift+drag to select)",
 		"native click-drag select/copy")
+}
+
+func (s *session) footerMetricsItems() []listItem {
+	return toggleItems(s.settings.FooterMetrics,
+		"show model, TPS, and TTFT below composer",
+		"use the compact one-line footer")
 }
 
 func (s *session) pluginItems() []listItem {
@@ -1424,7 +1456,7 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory, modalPluginInstallScope,
+		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalFooterMetrics, modalMemory, modalPluginInstallScope,
 		modalSearchKey, modalRestartConfirm, modalConfirm:
 		return s.handleListKey(msg)
 	case modalVision:
@@ -1926,6 +1958,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.noNetworkItems()
 	case modalMouseWheel:
 		items = s.mouseWheelItems()
+	case modalFooterMetrics:
+		items = s.footerMetricsItems()
 	case modalPluginInstallScope:
 		items = s.pluginInstallScopeItems()
 	case modalSearchKey:
@@ -2207,6 +2241,17 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.closeModal()
 		return s, nil
+	case modalFooterMetrics:
+		items := s.footerMetricsItems()
+		if abs >= 0 && abs < len(items) {
+			on := items[abs].label == "on"
+			s.settings.FooterMetrics = on
+			_ = s.settings.save()
+			s.logInfo(fmt.Sprintf("footer metrics: %s", boolStr(on)))
+			s.layout()
+		}
+		s.closeModal()
+		return s, nil
 	case modalPluginInstallScope:
 		items := s.pluginInstallScopeItems()
 		path := strings.TrimSpace(s.pendingPluginInstallPath)
@@ -2273,6 +2318,8 @@ func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
 		s.openNoNetworkPicker()
 	case "/mouse-wheel":
 		s.openMouseWheelPicker()
+	case "/footer-metrics":
+		s.openFooterMetricsPicker()
 	case "/idle-timeout":
 		s.openIdleTimeoutModal()
 	case "/max-session-tokens":
@@ -2992,6 +3039,8 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("No Network", s.noNetworkItems(), false)
 	case modalMouseWheel:
 		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
+	case modalFooterMetrics:
+		return s.renderListModal("Footer Metrics", s.footerMetricsItems(), false)
 	case modalRestartConfirm:
 		title := "Restart core?"
 		if r := strings.TrimSpace(s.modal.editTarget); r != "" {
@@ -3367,7 +3416,11 @@ func (s *session) modalWidth(cap int) int {
 }
 
 func (s *session) renderListModal(title string, items []listItem, showFilter bool) string {
-	w := s.modalWidth(110)
+	capWidth := 110
+	if s.modal.kind == modalCommand || s.modal.kind == modalModels {
+		capWidth = 84
+	}
+	w := s.modalWidth(capWidth)
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
 
@@ -3470,6 +3523,13 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		row := fitListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
 		if identityFirst {
 			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+		}
+		if s.modal.kind == modalCommand && items[abs].shortcut != "" {
+			shortcut := keyHintStyle.Render(items[abs].shortcut)
+			leftW := max(1, rowW-lipgloss.Width(shortcut)-2)
+			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, leftW)
+			gap := max(1, rowW-lipgloss.Width(row)-lipgloss.Width(shortcut))
+			row += strings.Repeat(" ", gap) + shortcut
 		}
 		row = truncStyle.Render(row) // safety: guarantee a single line ≤ rowW
 		if vi == s.modal.cursor {
