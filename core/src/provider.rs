@@ -2579,43 +2579,6 @@ pub fn is_opencode_go(base_url: &str) -> bool {
     host == "opencode.ai" && base_url.to_ascii_lowercase().contains("/zen/go/")
 }
 
-/// True for GitHub Copilot's OpenAI-compatible chat endpoint.
-pub fn is_github_copilot_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.githubcopilot.com"
-}
-
-/// True for Kimi Coding's OpenAI-compatible subscription endpoint.
-pub fn is_kimi_coding_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.kimi.com" && base_url.to_ascii_lowercase().contains("/coding/")
-}
-
-/// True for Kilo Code's OpenRouter-compatible gateway endpoint.
-pub fn is_kilocode_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.kilo.ai"
-}
-
-pub fn is_cline_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.cline.bot"
-}
-
-/// True when `base_url` points at Anthropic's API (`api.anthropic.com`).
-/// The Claude subscription OAuth token must ONLY be sent there — never to a
-/// third-party Anthropic-compatible endpoint (a proxy, a local server) — so
-/// `enrich_oauth` resolves it only when this is true (not on `kind` alone,
-/// which would leak the token to any `kind:"anthropic"` provider).
-pub fn is_anthropic_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.anthropic.com"
-}
-
-pub fn is_kimchi_endpoint(base_url: &str) -> bool {
-    let h = endpoint_host(base_url);
-    h == "llm.kimchi.dev" || h.ends_with(".kimchi.dev")
-}
-
-pub fn is_codebuddy_endpoint(base_url: &str) -> bool {
-    endpoint_host(base_url) == "copilot.tencent.com"
-}
-
 pub fn is_iflow_endpoint(base_url: &str) -> bool {
     let h = endpoint_host(base_url);
     h == "apis.iflow.cn" || h == "iflow.cn" || h.ends_with(".iflow.cn")
@@ -3006,23 +2969,6 @@ pub fn is_xai_endpoint(base_url: &str) -> bool {
     host == "api.x.ai" || host == "x.ai" || host.ends_with(".x.ai")
 }
 
-/// True when `base_url` points at Qwen Code's portal chat endpoint
-/// (`portal.qwen.ai`). Used by `oauth::enrich_oauth` and presence checks so a
-/// user-added provider at that host still picks up the Qwen OAuth token.
-pub fn is_qwen_endpoint(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "portal.qwen.ai" || host.ends_with(".portal.qwen.ai") || host == "chat.qwen.ai"
-}
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
 /// tool result message. Context compaction can drop tool results while keeping

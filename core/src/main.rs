@@ -6160,17 +6160,16 @@ async fn run_turn(
                         // password is fed via `sudo -S` on stdin; on decline
                         // (Esc) the agent is told the user declined.
                         //
-                        // Approval::Never optimization: when approval is Never
-                        // and the user has NOPASSWD sudo (or cached creds), we
-                        // skip the prompt entirely and run with `sudo -n`. Only
-                        // if a password is actually needed do we prompt — so
-                        // users with NOPASSWD never see a sudo flyout.
+                        // In Approval::Never, probe sudo non-interactively and
+                        // prompt only when it explicitly asks for a password.
+                        // NOPASSWD/cached credentials run immediately; other
+                        // failures are surfaced by `sudo -n` without a flyout.
                         if tools::command_uses_sudo(cmd) {
-                            let needs_prompt = match cfg.approval {
-                                crate::config::Approval::Never => {
-                                    tools::sudo_needs_password(&cfg).await
-                                }
-                                _ => true,
+                            let needs_prompt = if matches!(cfg.approval, Approval::Never) {
+                                let sudo_preflight = tools::sudo_preflight(&cfg).await;
+                                tools::sudo_should_prompt(&cfg.approval, sudo_preflight)
+                            } else {
+                                true
                             };
                             if needs_prompt {
                                 match request_sudo(st, cmd, &cancel).await {
@@ -6912,9 +6911,11 @@ async fn handle_user_bash(st: &Arc<State>, command: String, exclude_from_context
     let cancel = CancellationToken::new();
 
     let outcome = if tools::command_uses_sudo(&command) {
-        let needs_prompt = match cfg.approval {
-            crate::config::Approval::Never => tools::sudo_needs_password(&cfg).await,
-            _ => true,
+        let needs_prompt = if matches!(cfg.approval, Approval::Never) {
+            let sudo_preflight = tools::sudo_preflight(&cfg).await;
+            tools::sudo_should_prompt(&cfg.approval, sudo_preflight)
+        } else {
+            true
         };
         if needs_prompt {
             match request_sudo(st, &command, &cancel).await {

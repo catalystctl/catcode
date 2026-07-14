@@ -1147,12 +1147,6 @@ pub fn auto_login_env_presets(_cfg: &mut Config) -> Vec<String> {
     Vec::new()
 }
 
-/// Built-in presets no longer carry OAuth credentials (subscription login is
-/// plugin-only). Always returns false; kept so call sites compile during the
-/// migration away from vendor OAuth.
-pub fn preset_has_oauth_creds(_p: &ProviderPreset) -> bool {
-    false
-}
 
 impl Config {
     pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {

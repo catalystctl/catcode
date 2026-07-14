@@ -1,0 +1,5 @@
+{
+  "name": "plugin-umans",
+  "version": "0.1.0",
+  "description": "Umans Code API provider — key-sharing OpenAI-compatible endpoint. The core keeps umans built-in for models, tools (writing), and TUI; this plugin marks it as a user-discoverable provider so new installs can add it from the catalog."
+}

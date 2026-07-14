@@ -1843,23 +1843,54 @@ pub fn command_uses_sudo(command: &str) -> bool {
     SUDO_RE.is_match(command)
 }
 
-/// Pre-check: does this system need a password for sudo? Runs `sudo -n true`
-/// (non-interactive — never opens /dev/tty). Returns true if a password is
-/// needed (NOPASSWD not configured + no cached credentials). Used by the
-/// dispatch layer when approval is `Never` to decide whether to show the
-/// sudo prompt: users with NOPASSWD sudo never see it.
-pub async fn sudo_needs_password(cfg: &Config) -> bool {
+/// Result of checking whether sudo can authenticate without user input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SudoPreflight {
+    /// Sudo is ready (NOPASSWD, a valid credential timestamp, or root).
+    NonInteractive,
+    /// Sudo explicitly reported that authentication requires a password.
+    PasswordRequired,
+    /// Sudo could not be checked or failed for a reason a password cannot fix.
+    Unavailable,
+}
+
+/// Classify a `sudo -n true` result.  Keep this deliberately narrow: in
+/// permissive mode an absent sudo binary, a sudoers denial, or a broken policy
+/// must produce a normal command failure, not a misleading password prompt.
+fn classify_sudo_preflight(success: bool, stderr: &[u8]) -> SudoPreflight {
+    if success {
+        return SudoPreflight::NonInteractive;
+    }
+
+    // The probe sets LC_ALL=C so these are stable sudo diagnostics.  The
+    // additional variants cover older sudo/PAM combinations.
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("password is required")
+        || stderr.contains("password required")
+        || stderr.contains("no tty present and no askpass program specified")
+        || stderr.contains("a terminal is required to read the password")
+    {
+        SudoPreflight::PasswordRequired
+    } else {
+        SudoPreflight::Unavailable
+    }
+}
+
+/// Check whether sudo can run without a password. The probe is always
+/// non-interactive and can never open `/dev/tty`.
+pub async fn sudo_preflight(cfg: &Config) -> SudoPreflight {
     // POSIX-only (never reached on Windows: command_uses_sudo is false there,
     // so the caller's `if tools::command_uses_sudo(cmd)` branch is skipped).
     if !shell_is_posix() {
-        return true;
+        return SudoPreflight::Unavailable;
     }
-    let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-c").arg("sudo -n true 2>/dev/null");
+    let mut cmd = tokio::process::Command::new("sudo");
+    cmd.args(["-n", "true"]);
     cmd.current_dir(&cfg.workspace);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
     cmd.env_clear();
     cmd.env(
         "PATH",
@@ -1868,12 +1899,23 @@ pub async fn sudo_needs_password(cfg: &Config) -> bool {
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", home);
     }
-    // `sudo -n true` exits 0 if NOPASSWD or cached; non-zero if a password
-    // is needed. A timeout guards against hangs.
-    match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.status()).await {
-        Ok(Ok(status)) => !status.success(),
-        _ => true, // Timeout or spawn failure → assume password needed (safe).
+    cmd.env("LC_ALL", "C");
+    cmd.env("LANG", "C");
+
+    // A timeout/spawn error is not evidence that the account has a password.
+    // In Never mode it therefore falls through to a non-interactive execution,
+    // which reports the real error without opening a UI prompt.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+        Ok(Ok(output)) => classify_sudo_preflight(output.status.success(), &output.stderr),
+        _ => SudoPreflight::Unavailable,
     }
+}
+
+/// Sudo prompts are policy prompts outside permissive (`Never`) mode. In
+/// permissive mode they are authentication-only and appear solely when sudo
+/// explicitly says a password is required.
+pub fn sudo_should_prompt(approval: &Approval, preflight: SudoPreflight) -> bool {
+    !matches!(approval, Approval::Never) || matches!(preflight, SudoPreflight::PasswordRequired)
 }
 
 /// How to handle sudo when the command invokes it.
@@ -1885,7 +1927,8 @@ pub enum SudoAuth {
     Password(String),
     /// Run with `sudo -n` (non-interactive). Succeeds if NOPASSWD or cached
     /// credentials exist; fails cleanly (never opens /dev/tty) if a password
-    /// is needed. Used when approval is Never and NOPASSWD is confirmed.
+    /// is needed or sudo is unavailable. Used whenever approval is Never and
+    /// the preflight did not explicitly identify a password requirement.
     NonInteractive,
 }
 
@@ -5404,6 +5447,47 @@ mod tests {
         assert!(!command_uses_sudo("ls -la"));
         assert!(!command_uses_sudo("echo hello"));
         assert!(!command_uses_sudo(""));
+    }
+
+    #[test]
+    fn sudo_preflight_only_identifies_password_diagnostics() {
+        assert_eq!(
+            classify_sudo_preflight(true, b""),
+            SudoPreflight::NonInteractive
+        );
+        assert_eq!(
+            classify_sudo_preflight(false, b"sudo: a password is required\n"),
+            SudoPreflight::PasswordRequired
+        );
+        assert_eq!(
+            classify_sudo_preflight(false, b"sudo: user is not allowed to execute true\n"),
+            SudoPreflight::Unavailable
+        );
+        assert_eq!(
+            classify_sudo_preflight(false, b"sudo: command not found\n"),
+            SudoPreflight::Unavailable
+        );
+    }
+
+    #[test]
+    fn sudo_prompt_respects_permission_mode_and_password_state() {
+        assert!(!sudo_should_prompt(
+            &Approval::Never,
+            SudoPreflight::NonInteractive
+        ));
+        assert!(!sudo_should_prompt(
+            &Approval::Never,
+            SudoPreflight::Unavailable
+        ));
+        assert!(sudo_should_prompt(
+            &Approval::Never,
+            SudoPreflight::PasswordRequired
+        ));
+
+        for approval in [Approval::Destructive, Approval::Always] {
+            assert!(sudo_should_prompt(&approval, SudoPreflight::NonInteractive));
+            assert!(sudo_should_prompt(&approval, SudoPreflight::Unavailable));
+        }
     }
 
     #[test]
