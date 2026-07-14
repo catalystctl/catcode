@@ -69,6 +69,9 @@ jobs:
             mingw-w64 msitools xorriso jq zip curl python3 file libfuse2
       - name: Install Bun (web build)
         uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       # --- build everything -----------------------------------------------
       - name: Build all platform artifacts (TUI + core, all platforms)
