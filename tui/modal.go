@@ -2207,6 +2207,15 @@ func (s *session) commitEditField() (tea.Model, tea.Cmd) {
 		s.pendingLogin = ""
 		s.modal.editing = false
 		if key == "" {
+			// Built-in local presets (Ollama / LM Studio) deliberately have no
+			// API-key environment variable. Let the empty submit reach the core,
+			// which configures these providers without credentials.
+			if p := s.presetByID(name); p != nil && p.EnvVar == "" && !p.SupportsOauth {
+				s.sendCore(map[string]any{"type": "login", "preset": name})
+				s.logInfo("logging in to " + p.Label)
+				s.closeModal()
+				return s, nil
+			}
 			// Empty submit: if the provider is already logged in, treat as a
 			// switch (no override); otherwise cancel.
 			if p := s.presetByID(name); p != nil && p.LoggedIn {

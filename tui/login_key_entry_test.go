@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -93,5 +94,48 @@ func TestLoginKeyEntryEnterUnboundSelect(t *testing.T) {
 	}
 	if s.settings.ProviderKeys["umans"] != "sk-x" {
 		t.Errorf("key not committed; ProviderKeys=%v", s.settings.ProviderKeys)
+	}
+}
+
+func TestLoginKeyEntryAllowsEmptyKeyForLocalProvider(t *testing.T) {
+	s := initialSession()
+	s.keybinds = defaultKeybinds()
+	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.providerPresets = []providerPreset{{
+		ID: "ollama", Label: "Ollama (local)", Kind: "openai",
+		BaseURL: "http://localhost:11434/v1", EnvVar: "",
+	}}
+
+	s.openLoginPicker()
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if s.pendingLogin != "ollama" || !s.modal.editing {
+		t.Fatalf("setup failed: pendingLogin=%q editing=%v", s.pendingLogin, s.modal.editing)
+	}
+
+	wireCoreStub(s)
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	if s.modal.kind != modalNone {
+		t.Errorf("modal should close after keyless login; kind=%v", s.modal.kind)
+	}
+	if _, ok := s.settings.ProviderKeys["ollama"]; ok {
+		t.Errorf("keyless login should not persist an Ollama key; ProviderKeys=%v", s.settings.ProviderKeys)
+	}
+	select {
+	case b := <-s.stdinCh:
+		var command map[string]any
+		if err := json.Unmarshal(b, &command); err != nil {
+			t.Fatalf("decode login command: %v", err)
+		}
+		if command["type"] != "login" || command["preset"] != "ollama" {
+			t.Errorf("command = %v, want keyless Ollama login", command)
+		}
+		if _, ok := command["api_key"]; ok {
+			t.Errorf("keyless login unexpectedly included api_key: %v", command)
+		}
+	default:
+		t.Fatal("keyless login did not send a command to the core")
 	}
 }
