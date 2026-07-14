@@ -2409,8 +2409,14 @@ mod tests {
             "search_keys": {"exa": "exa-persisted", "tavily": "tvly-persisted"}
         });
         apply_json(&mut c, &v);
-        assert_eq!(c.search_keys.get("exa").map(|s| s.as_str()), Some("exa-persisted"));
-        assert_eq!(c.search_keys.get("tavily").map(|s| s.as_str()), Some("tvly-persisted"));
+        assert_eq!(
+            c.search_keys.get("exa").map(|s| s.as_str()),
+            Some("exa-persisted")
+        );
+        assert_eq!(
+            c.search_keys.get("tavily").map(|s| s.as_str()),
+            Some("tvly-persisted")
+        );
         // empty values are skipped (treated as unset)
         let v2 = json!({ "search_keys": {"exa": ""} });
         let mut c2 = Config::default();

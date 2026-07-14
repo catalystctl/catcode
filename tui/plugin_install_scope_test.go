@@ -89,4 +89,3 @@ func TestPluginInstallModalThenScopePicker(t *testing.T) {
 		t.Fatalf("pending=%q", s.pendingPluginInstallPath)
 	}
 }
-

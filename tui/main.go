@@ -67,21 +67,21 @@ type session struct {
 		Description string `json:"description"`
 		Plugin      string `json:"plugin"`
 	} // plugin-declared slash commands (drives /{name} palette + dispatch)
-	pluginStatus        string // last plugin_status text (footer); empty = clear
-	memoryList          []memoryEntry
-	pendingMemoryPicker bool   // open memory picker once list_memory arrives
-	pluginPickerMode    string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
-	coreBashTimeout     int
-	coreAutoCompact     bool
-	ctxBreakdown        *contextBreakdown
-	usageReport         *usageReport // last /usage reply (provider plan limits)
-	coreRestarts        int
-	coreReady           bool            // true once the core emitted `ready` (disarms the startup watchdog)
-	coreStartGen        uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
-	visionModels        map[string]bool // user-curated vision-capable model ids (drives /vision)
-	visionModel         string          // preferred handoff target ("" = pick dynamically)
-	pendingVisionPicker bool            // open the vision picker once the config arrives
-	pendingPluginInstallPath string     // path/URL awaiting scope pick (modalPluginInstallScope)
+	pluginStatus             string // last plugin_status text (footer); empty = clear
+	memoryList               []memoryEntry
+	pendingMemoryPicker      bool   // open memory picker once list_memory arrives
+	pluginPickerMode         string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
+	coreBashTimeout          int
+	coreAutoCompact          bool
+	ctxBreakdown             *contextBreakdown
+	usageReport              *usageReport // last /usage reply (provider plan limits)
+	coreRestarts             int
+	coreReady                bool            // true once the core emitted `ready` (disarms the startup watchdog)
+	coreStartGen             uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
+	visionModels             map[string]bool // user-curated vision-capable model ids (drives /vision)
+	visionModel              string          // preferred handoff target ("" = pick dynamically)
+	pendingVisionPicker      bool            // open the vision picker once the config arrives
+	pendingPluginInstallPath string          // path/URL awaiting scope pick (modalPluginInstallScope)
 
 	// Active model provider (openai/anthropic endpoint). activeProvider is the
 	// name the core resolved; providers is the list of configured names for the

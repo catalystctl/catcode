@@ -90,6 +90,8 @@ REVIEW.md
 skills-lock.json
 # Local scratch / working directories (not part of the shipped project)
 scripts/
+!web/scripts/
+!web/scripts/fix-sdk-link.mjs
 tmp/
 # Stray build/test artifacts
 .intentionally-empty-file.o

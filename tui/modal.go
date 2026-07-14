@@ -43,12 +43,12 @@ const (
 	modalAutoCompact
 	modalNoNetwork
 	modalMouseWheel
-	modalValueEdit // free-form edit (api_key, timeouts, remember, attach, run, …)
-	modalMemory    // pick a memory to forget
-	modalGoal      // multi-field /goal form (goal, concurrency, models, providers)
-	modalGoalPlan  // plan-ready review (approve / revise / cancel)
+	modalValueEdit          // free-form edit (api_key, timeouts, remember, attach, run, …)
+	modalMemory             // pick a memory to forget
+	modalGoal               // multi-field /goal form (goal, concurrency, models, providers)
+	modalGoalPlan           // plan-ready review (approve / revise / cancel)
 	modalPluginInstallScope // global vs workspace after /plugin-install path
-	modalSearchKey      // pick Exa/Tavily to set/clear its web_search API key
+	modalSearchKey          // pick Exa/Tavily to set/clear its web_search API key
 )
 
 // goalDraft is the multi-field form state for modalGoal.

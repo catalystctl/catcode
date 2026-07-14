@@ -1848,7 +1848,10 @@ async fn main() {
                     ));
                     return;
                 }
-                state.logger.log("set_search_key", json!({ "provider": &provider, "has_key": has_key }));
+                state.logger.log(
+                    "set_search_key",
+                    json!({ "provider": &provider, "has_key": has_key }),
+                );
                 emit(
                     &Event::new("search_key_set")
                         .with("provider", json!(&provider))

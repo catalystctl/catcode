@@ -804,7 +804,11 @@ async fn fetch_html_with_ct(
 }
 
 fn render_hits(query: &str, backend: &Backend, hits: &[Hit], note: Option<&str>) -> Outcome {
-    let mut header = format!("Search: {query}  ({}, {} hit(s)", backend.label(), hits.len());
+    let mut header = format!(
+        "Search: {query}  ({}, {} hit(s)",
+        backend.label(),
+        hits.len()
+    );
     if let Some(n) = note {
         header.push_str(&format!(" · {n}"));
     }
@@ -1103,7 +1107,10 @@ enum ApiOutcome {
     /// Real SERP, zero results -- stop (don't burn the other provider's quota).
     Empty,
     /// Rate-limited / quota-exceeded -- set cooldown, try the other provider.
-    RateLimited { retry_after_secs: u64, msg: String },
+    RateLimited {
+        retry_after_secs: u64,
+        msg: String,
+    },
     /// Other failure -- try the other provider / scrape fallback.
     Fail(String),
 }
@@ -1138,7 +1145,11 @@ async fn read_capped(
             break;
         }
     }
-    Ok((status, String::from_utf8_lossy(&collected).into_owned(), hdrs))
+    Ok((
+        status,
+        String::from_utf8_lossy(&collected).into_owned(),
+        hdrs,
+    ))
 }
 
 /// Truncate a string to ~`max` chars for inclusion in error messages.
@@ -1156,13 +1167,32 @@ fn parse_exa_results(doc: &Value, limit: usize) -> Vec<Hit> {
     };
     let mut hits = Vec::new();
     for r in results {
-        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let url = r
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if !url.starts_with("http") || title.is_empty() {
             continue;
         }
-        let snippet = r.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        hits.push(Hit { title, url, snippet });
+        let snippet = r
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        hits.push(Hit {
+            title,
+            url,
+            snippet,
+        });
         if hits.len() >= limit {
             break;
         }
@@ -1176,13 +1206,32 @@ fn parse_tavily_results(doc: &Value, limit: usize) -> Vec<Hit> {
     };
     let mut hits = Vec::new();
     for r in results {
-        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let url = r
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if !url.starts_with("http") || title.is_empty() {
             continue;
         }
-        let snippet = r.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        hits.push(Hit { title, url, snippet });
+        let snippet = r
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        hits.push(Hit {
+            title,
+            url,
+            snippet,
+        });
         if hits.len() >= limit {
             break;
         }
@@ -1267,7 +1316,9 @@ async fn search_tavily(
     byte_limit: usize,
 ) -> ApiOutcome {
     let Some(key) = ApiProvider::Tavily.key(cfg) else {
-        return ApiOutcome::Fail("Tavily: no API key (set TAVILY_API_KEY or use /search-key tavily)".into());
+        return ApiOutcome::Fail(
+            "Tavily: no API key (set TAVILY_API_KEY or use /search-key tavily)".into(),
+        );
     };
     if let Some(err) = egress_check("web_search", ApiProvider::Tavily.endpoint(), cfg) {
         return ApiOutcome::Fail(format!("Tavily: skipped ({err})"));
@@ -1313,7 +1364,10 @@ async fn search_tavily(
         };
     }
     if !status.is_success() {
-        return ApiOutcome::Fail(format!("Tavily: HTTP {status}: {}", truncate_msg(&text, 200)));
+        return ApiOutcome::Fail(format!(
+            "Tavily: HTTP {status}: {}",
+            truncate_msg(&text, 200)
+        ));
     }
     let doc: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
@@ -1373,7 +1427,10 @@ async fn try_api_providers(
         match search_provider(client, cfg, p, query, count, byte_limit).await {
             ApiOutcome::Hits(hits) => return Some((p.backend(), Attempt::Hits(hits), p)),
             ApiOutcome::Empty => return Some((p.backend(), Attempt::Empty, p)),
-            ApiOutcome::RateLimited { retry_after_secs, msg } => {
+            ApiOutcome::RateLimited {
+                retry_after_secs,
+                msg,
+            } => {
                 set_cooldown(p, retry_after_secs);
                 failures.push(msg);
             }
@@ -2097,7 +2154,10 @@ mod tests {
     #[test]
     fn provider_usable_under_budget_is_true() {
         let mut st = fresh_state();
-        st.exa = MonthlyUsage { month: current_month(), count: 0 };
+        st.exa = MonthlyUsage {
+            month: current_month(),
+            count: 0,
+        };
         assert!(provider_usable(&st, ApiProvider::Exa, true));
     }
 
@@ -2105,7 +2165,10 @@ mod tests {
     fn provider_usable_over_budget_is_false() {
         let mut st = fresh_state();
         // u64::MAX exceeds any monthly_limit (>=1), so always over budget.
-        st.tavily = MonthlyUsage { month: current_month(), count: u64::MAX };
+        st.tavily = MonthlyUsage {
+            month: current_month(),
+            count: u64::MAX,
+        };
         assert!(!provider_usable(&st, ApiProvider::Tavily, true));
     }
 

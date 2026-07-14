@@ -976,9 +976,10 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
                     let provider = st_c
                         .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
                         .await;
-                    let outcome =
-                        crate::subagent::execute(st_c, client_c, provider, parent, args, cancel_c, 0)
-                            .await;
+                    let outcome = crate::subagent::execute(
+                        st_c, client_c, provider, parent, args, cancel_c, 0,
+                    )
+                    .await;
                     (step_id, outcome.ok, outcome.output)
                 }),
             ));
@@ -1507,12 +1508,16 @@ mod tests {
 
         // In wave 1, "plan" depends on failed "recon" → should be skipped.
         let plan_deps = deps_by_id.get("plan").unwrap();
-        assert!(plan_deps.iter().any(|d| failed_steps.contains(d)),
-            "plan depends on failed recon → should be skipped");
+        assert!(
+            plan_deps.iter().any(|d| failed_steps.contains(d)),
+            "plan depends on failed recon → should be skipped"
+        );
 
         // "independent" has no deps → should NOT be skipped.
         let indep_deps = deps_by_id.get("independent").unwrap();
-        assert!(!indep_deps.iter().any(|d| failed_steps.contains(d)),
-            "independent has no failed deps → should still run");
+        assert!(
+            !indep_deps.iter().any(|d| failed_steps.contains(d)),
+            "independent has no failed deps → should still run"
+        );
     }
 }

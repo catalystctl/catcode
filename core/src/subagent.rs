@@ -2017,10 +2017,7 @@ async fn dispatch_subagent_tool(
                 g.phase == crate::goal::GoalPhase::Running
             };
             if goal_running && reason == "need_decision" {
-                let msg = args
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 emit(
                     &Event::new("intercom_message")
                         .with("from", json!(my_target))
