@@ -75,6 +75,8 @@ export interface AgentApi {
   sudoReply: (approved: boolean, password?: string) => Promise<void>;
   // ── OAuth ──
   submitOauthCode: (code: string) => Promise<void>;
+  // ── Search tool API keys (Exa / Tavily) ──
+  setSearchKey: (provider: string, apiKey: string) => Promise<void>;
   dismissOauth: () => void;
   // ── Turn / history ──
   undo: () => Promise<boolean>;
@@ -721,6 +723,15 @@ export function useAgent(): AgentApi {
   );
 
   // ── OAuth ──
+    // ── Search tool ──
+  // Set or clear a web_search API key (Exa/Tavily). Empty apiKey clears it.
+  const setSearchKey = useCallback(
+    async (provider: string, apiKey: string) => {
+      await send({ type: "set_search_key", provider, api_key: apiKey });
+    },
+    [send],
+  );
+
   // Complete a no-browser (manual-code) OAuth login by pasting the code or
   // final callback URL the provider returned. Mirrors the TUI's /oauth-code.
   const submitOauthCode = useCallback(
@@ -1139,6 +1150,7 @@ export function useAgent(): AgentApi {
       askReply,
       sudoReply,
       submitOauthCode,
+      setSearchKey,
       dismissOauth,
       undo,
       clear,

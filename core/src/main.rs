@@ -1721,6 +1721,8 @@ async fn main() {
                         )
                         .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
                         .with("auto_compact", json!(cfg.auto_compact))
+                        .with("context_compact_at", json!(cfg.context_compact_at))
+                        .with("context_digest_at", json!(cfg.context_digest_at))
                         .with("sandbox", json!(cfg.sandbox.as_str()))
                         .with("resumed_messages", json!(conv_len))
                         .with("plugins", json!(loaded_plugins))
@@ -1808,6 +1810,50 @@ async fn main() {
                         .with("provider", json!(name)),
                 );
                 state.refresh_models(&client).await;
+            }
+            Command::SetSearchKey { provider, api_key } => {
+                // Set or clear a search-tool API key (Exa / Tavily) for
+                // `web_search`. Persisted to config.json `search_keys` so it
+                // survives restarts; `search_tool` reads it ahead of the
+                // `EXA_API_KEY` / `TAVILY_API_KEY` env vars.
+                let provider = provider.trim().to_ascii_lowercase();
+                if provider != "exa" && provider != "tavily" {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "set_search_key: unknown provider '{provider}' (expected 'exa' or 'tavily')"
+                        )),
+                    ));
+                    return;
+                }
+                let key = api_key.trim().to_string();
+                let has_key = !key.is_empty();
+                let snapshot = {
+                    let mut cfg = state.cfg.write().await;
+                    if has_key {
+                        cfg.search_keys.insert(provider.clone(), key);
+                    } else {
+                        cfg.search_keys.remove(&provider);
+                    }
+                    cfg.search_keys.clone()
+                };
+                if let Err(e) = crate::config::save_search_keys(&snapshot) {
+                    state.logger.log(
+                        "set_search_key",
+                        json!({ "provider": &provider, "err": e.to_string() }),
+                    );
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!("set_search_key: failed to persist: {e}")),
+                    ));
+                    return;
+                }
+                state.logger.log("set_search_key", json!({ "provider": &provider, "has_key": has_key }));
+                emit(
+                    &Event::new("search_key_set")
+                        .with("provider", json!(&provider))
+                        .with("has_key", json!(has_key)),
+                );
             }
             Command::SetProvider { name } => {
                 // Set the default/fallback provider. In the multi-login model a
@@ -2300,20 +2346,34 @@ async fn main() {
                     let before_est = estimate_messages_tokens(&messages);
                     // Size the reclaim against the user's actual model window,
                     // not a hardcoded 200k.
-                    let model_ctx = {
+                    let (model_ctx, model_max_tokens) = {
                         let last = state.last_model.lock().await.clone();
                         let models = state.models.read().await;
                         last.as_deref()
                             .and_then(|m| models.iter().find(|mi| mi.id == m))
-                            .map(|m| m.context_window as u64)
-                            .unwrap_or(200_000)
+                            .map(|m| (m.context_window as u64, m.max_tokens))
+                            .unwrap_or((200_000, 8_192))
                     };
+                    let cfg = state.cfg.read().await.clone();
+                    let policy = context_policy(
+                        &messages,
+                        model_ctx,
+                        model_max_tokens,
+                        cfg.context_compact_at,
+                        cfg.context_digest_at,
+                    );
                     emit(
                         &Event::new("compacting")
                             .with("before_tokens", json!(before_est))
-                            .with("trigger", json!("manual")),
+                            .with("trigger", json!("manual"))
+                            .with("context_window", json!(model_ctx))
+                            .with("threshold_tokens", json!(policy.compact_threshold))
+                            .with("hard_limit_tokens", json!(policy.hard_limit))
+                            .with(
+                                "utilization_pct",
+                                json!(utilization_pct(before_est, model_ctx)),
+                            ),
                     );
-                    let cfg = state.cfg.read().await.clone();
                     let model_name = state.last_model.lock().await.clone().unwrap_or_default();
                     let rp = state.resolve_provider_for_model(&model_name).await;
                     // A `/compact <instructions>` override takes precedence over
@@ -2360,8 +2420,21 @@ async fn main() {
                         &Event::new("compacted")
                             .with("before_tokens", json!(before_est))
                             .with("after_tokens", json!(after_est))
-                            .with("summary_chars", json!(summary_chars)),
+                            .with("summary_chars", json!(summary_chars))
+                            .with("context_window", json!(model_ctx))
+                            .with("threshold_tokens", json!(policy.compact_threshold))
+                            .with("hard_limit_tokens", json!(policy.hard_limit))
+                            .with("within_limit", json!(after_est <= policy.hard_limit)),
                     );
+                    if after_est > policy.hard_limit {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
+                                policy.hard_limit
+                            )),
+                        ));
+                    }
                 } else {
                     emit(&Event::new("info").with("message", json!("nothing to compact yet")));
                 }
@@ -2638,14 +2711,22 @@ async fn main() {
                     let len_at = *state.conv_len_at_last_real.lock().await;
                     grounded_estimate(&conv, last_real, len_at)
                 };
-                let model_ctx = {
+                let (model_ctx, model_max_tokens) = {
                     let last = state.last_model.lock().await.clone();
                     let models = state.models.read().await;
                     last.as_deref()
                         .and_then(|m| models.iter().find(|mi| mi.id == m))
-                        .map(|m| m.context_window as u64)
-                        .unwrap_or(200_000)
+                        .map(|m| (m.context_window as u64, m.max_tokens))
+                        .unwrap_or((200_000, 8_192))
                 };
+                let cfg = state.cfg.read().await;
+                let policy = context_policy(
+                    &conv,
+                    model_ctx,
+                    model_max_tokens,
+                    cfg.context_compact_at,
+                    cfg.context_digest_at,
+                );
                 let pct = if model_ctx > 0 {
                     (total as f64 / model_ctx as f64 * 100.0).round() as u64
                 } else {
@@ -2703,6 +2784,11 @@ async fn main() {
                         .with("total_tokens", json!(total))
                         .with("context_window", json!(model_ctx))
                         .with("pct", json!(pct))
+                        .with("digest_threshold_tokens", json!(policy.digest_threshold))
+                        .with("compact_threshold_tokens", json!(policy.compact_threshold))
+                        .with("hard_limit_tokens", json!(policy.hard_limit))
+                        .with("response_reserve_tokens", json!(policy.response_reserve))
+                        .with("safety_margin_tokens", json!(policy.safety_margin))
                         .with("messages", json!(conv.len()))
                         .with("system_tokens", json!(system_tokens))
                         .with("by_role", role_obj)
@@ -4918,31 +5004,43 @@ async fn run_turn(
     // as the threshold path; falls back to naive drop-oldest without an api key.
     {
         let last = *st.last_turn_time.lock().await;
-        let auto_compact = st.cfg.read().await.auto_compact;
-        if auto_compact && last.elapsed().as_secs() > 3600 {
+        let cfg = st.cfg.read().await.clone();
+        if cfg.auto_compact && last.elapsed().as_secs() > 3600 {
             let mut messages = st.conversation.lock().await.clone();
-            let est = *st.estimated_tokens.lock().await;
-            // Fire idle compaction for tiny chats only when there's real
-            // content, but ALWAYS when the estimate is near the context
-            // window — a few-but-huge conversation (e.g. one giant pasted
-            // message) must compact even with <4 messages so the next turn
-            // doesn't hit an unrecoverable 400.
-            let idle_ctx = st
+            let est = grounded_estimate(
+                &messages,
+                *st.last_real_prompt_tokens.lock().await,
+                *st.conv_len_at_last_real.lock().await,
+            );
+            let (idle_ctx, idle_max_tokens) = st
                 .models
                 .read()
                 .await
                 .iter()
                 .find(|m| m.id == model)
-                .map(|m| m.context_window as u64)
-                .unwrap_or(200_000);
-            if messages.len() > 4 || est > (idle_ctx as f32 * 0.95) as u64 {
+                .map(|m| (m.context_window as u64, m.max_tokens))
+                .unwrap_or((200_000, 8_192));
+            let policy = context_policy(
+                &messages,
+                idle_ctx,
+                idle_max_tokens,
+                cfg.context_compact_at,
+                cfg.context_digest_at,
+            );
+            // Idleness alone is not token pressure. Only compact when this same
+            // conversation would cross the normal model-aware threshold.
+            if should_auto_compact(cfg.auto_compact, est, messages.len(), policy) {
                 emit(
                     &Event::new("compacting")
                         .with("before_tokens", json!(est))
-                        .with("trigger", json!("idle")),
+                        .with("trigger", json!("idle_threshold"))
+                        .with("context_window", json!(idle_ctx))
+                        .with("threshold_tokens", json!(policy.compact_threshold))
+                        .with("hard_limit_tokens", json!(policy.hard_limit))
+                        .with("response_reserve_tokens", json!(policy.response_reserve))
+                        .with("utilization_pct", json!(utilization_pct(est, idle_ctx))),
                 );
                 dispatch_lifecycle(st, "pre_compact").await;
-                let cfg = st.cfg.read().await.clone();
                 let rp = st.resolve_provider_for_model(&model).await;
                 let summary_chars = if rp.api_key.is_some() {
                     let mp = st.plugin_manager.memory_provider();
@@ -4975,8 +5073,23 @@ async fn run_turn(
                     &Event::new("compacted")
                         .with("before_tokens", json!(est))
                         .with("after_tokens", json!(after_est))
-                        .with("summary_chars", json!(summary_chars)),
+                        .with("summary_chars", json!(summary_chars))
+                        .with("context_window", json!(idle_ctx))
+                        .with("threshold_tokens", json!(policy.compact_threshold))
+                        .with("hard_limit_tokens", json!(policy.hard_limit))
+                        .with("within_limit", json!(after_est <= policy.hard_limit)),
                 );
+                if after_est > policy.hard_limit {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
+                            policy.hard_limit
+                        )),
+                    ));
+                    emit(&Event::new("done"));
+                    return;
+                }
             }
         }
     }
@@ -5029,14 +5142,11 @@ async fn run_turn(
         };
 
         let cfg = st.cfg.read().await.clone();
-        // Context window management: compact once past the configured threshold
-        // (default 90%). The 95% hard cap is a floor — compact by then even if the
-        // configured threshold is higher, and force the summarize strategy even
-        // when disabled (naive drop-oldest may not reclaim enough at critical capacity).
-        // `auto_compact` (default true) gates ALL automatic compaction (this threshold
-        // path + the idle-compaction block below). When false, no compaction fires
-        // automatically — the user must /compact manually (or /clear). Mirrors Claude
-        // Code's autoCompactEnabled / DISABLE_AUTO_COMPACT.
+        // Context window management: compact at the configured threshold
+        // (default 90%) or sooner when model-aware response headroom requires
+        // it. `auto_compact` gates every automatic history rewrite: pressure
+        // digest, threshold compaction, idle compaction, and subagent reclaim.
+        // When false, the user must /compact manually (or /clear).
         let mut messages = st.conversation.lock().await.clone();
         let (model_ctx, thinking_levels, max_tokens) = st
             .models
@@ -5064,16 +5174,20 @@ async fn run_turn(
         let len_at = *st.conv_len_at_last_real.lock().await;
         let mut est = grounded_estimate(&messages, last_real, len_at);
         *st.estimated_tokens.lock().await = est;
-        let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
-        let hard_cap = (model_ctx as f32 * 0.95) as u64;
+        let policy = context_policy(
+            &messages,
+            model_ctx,
+            max_tokens,
+            cfg.context_compact_at,
+            cfg.context_digest_at,
+        );
         // Soft digest: collapse stale, large tool results AND oversized tool-call
         // arguments into one-line digests well before the compaction threshold so
         // they stop being re-sent verbatim on every turn. Keep-window is sized by
         // token budget (20% of the context window), not a fixed message count —
         // a few huge recent results no longer block reclaim of everything older.
         // Idempotent; tool_call_id + role preserved so pairing stays intact.
-        let soft = (model_ctx as f32 * cfg.context_digest_at) as u64;
-        if cfg.context_digest_at > 0.0 && est > soft {
+        if should_auto_digest(cfg.auto_compact, est, policy) {
             let before_est = est;
             let changed = {
                 let mut cache = st.tool_output_cache.lock().await;
@@ -5097,19 +5211,30 @@ async fn run_turn(
                     &Event::new("digested")
                         .with("results", json!(changed))
                         .with("before_tokens", json!(before_est))
-                        .with("after_tokens", json!(est)),
+                        .with("after_tokens", json!(est))
+                        .with("trigger", json!("pressure"))
+                        .with("context_window", json!(model_ctx))
+                        .with("threshold_tokens", json!(policy.digest_threshold))
+                        .with("hard_limit_tokens", json!(policy.hard_limit))
+                        .with(
+                            "utilization_pct",
+                            json!(utilization_pct(before_est, model_ctx)),
+                        ),
                 );
             }
         }
-        let force_summarize = est > hard_cap;
-        if cfg.auto_compact
-            && est > threshold.min(hard_cap)
-            && (force_summarize || messages.len() > 4)
-        {
+        let force_summarize = est > policy.hard_limit;
+        if should_auto_compact(cfg.auto_compact, est, messages.len(), policy) {
             emit(
                 &Event::new("compacting")
                     .with("before_tokens", json!(est))
-                    .with("trigger", json!("threshold")),
+                    .with("trigger", json!("threshold"))
+                    .with("context_window", json!(model_ctx))
+                    .with("threshold_tokens", json!(policy.compact_threshold))
+                    .with("hard_limit_tokens", json!(policy.hard_limit))
+                    .with("response_reserve_tokens", json!(policy.response_reserve))
+                    .with("safety_margin_tokens", json!(policy.safety_margin))
+                    .with("utilization_pct", json!(utilization_pct(est, model_ctx))),
             );
             dispatch_lifecycle(st, "pre_compact").await;
             let summary_chars = {
@@ -5140,8 +5265,24 @@ async fn run_turn(
                 &Event::new("compacted")
                     .with("before_tokens", json!(est))
                     .with("after_tokens", json!(after_est))
-                    .with("summary_chars", json!(summary_chars)),
+                    .with("summary_chars", json!(summary_chars))
+                    .with("context_window", json!(model_ctx))
+                    .with("threshold_tokens", json!(policy.compact_threshold))
+                    .with("hard_limit_tokens", json!(policy.hard_limit))
+                    .with("within_limit", json!(after_est <= policy.hard_limit)),
             );
+            if after_est > policy.hard_limit {
+                emit(&Event::new("error").with(
+                    "message",
+                    json!(format!(
+                        "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
+                        policy.hard_limit
+                    )),
+                ));
+                sync_session_file(st).await;
+                emit(&Event::new("done"));
+                return;
+            }
         }
 
         // Sanitize orphaned tool calls + malformed tool-call arguments right
@@ -6780,9 +6921,108 @@ const SOFT_DIGEST_KEEP_FRACTION: f32 = 0.20;
 /// one-liners, denial messages) stay full — they're cheap and the model may
 /// need them verbatim.
 const DIGEST_MIN_BYTES: usize = 256;
+/// Soft reclaim leaves more history than full compaction while still creating
+/// useful runway. It is a target after the 70% default trigger, not a trigger.
+const SOFT_DIGEST_TARGET_FRACTION: f32 = 0.60;
 /// Post-compaction target: reclaim until the conversation fits under this
 /// fraction of the context window (was 0.50 — left too little runway).
 const POST_COMPACT_BUDGET_FRACTION: f32 = 0.35;
+
+/// One shared, model-aware policy for every automatic context rewrite. The
+/// configured percentages remain user-facing intent, while `hard_limit`
+/// reserves enough room for a likely response plus protocol/tokenizer drift.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContextPolicy {
+    pub digest_threshold: u64,
+    pub compact_threshold: u64,
+    pub hard_limit: u64,
+    pub response_reserve: u64,
+    pub safety_margin: u64,
+}
+
+pub(crate) fn context_policy(
+    messages: &[Message],
+    context_window: u64,
+    max_output_tokens: u32,
+    compact_at: f32,
+    digest_at: f32,
+) -> ContextPolicy {
+    if context_window == 0 {
+        return ContextPolicy {
+            digest_threshold: 0,
+            compact_threshold: 0,
+            hard_limit: 0,
+            response_reserve: 0,
+            safety_margin: 0,
+        };
+    }
+
+    // Start with 5% output runway, then grow it when recent assistant replies
+    // demonstrate that this session needs more. Bound it by both model metadata
+    // and 25% of the window so an advertised 128k output cap does not force a
+    // healthy 400k context to compact around 50–60%.
+    let base_reserve = ((context_window as f64 * 0.05) as u64)
+        .max(512)
+        .min(context_window / 10);
+    let observed = messages
+        .iter()
+        .rev()
+        .filter(|m| m.is_assistant())
+        .take(4)
+        .map(estimate_message_tokens)
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(2);
+    let metadata_cap = if max_output_tokens == 0 {
+        context_window / 4
+    } else {
+        (max_output_tokens as u64).min(context_window / 4)
+    };
+    let response_reserve = base_reserve
+        .max(observed)
+        .min(metadata_cap.max(base_reserve));
+    let safety_margin = ((context_window as f64 * 0.02) as u64)
+        .max(256)
+        .min(context_window / 20);
+    let hard_limit = context_window
+        .saturating_sub(response_reserve)
+        .saturating_sub(safety_margin);
+    let configured_compact = (context_window as f64 * compact_at as f64).round() as u64;
+    let compact_threshold = configured_compact.min(hard_limit);
+    let digest_threshold = if digest_at <= 0.0 {
+        0
+    } else {
+        ((context_window as f64 * digest_at as f64).round() as u64).min(compact_threshold)
+    };
+    ContextPolicy {
+        digest_threshold,
+        compact_threshold,
+        hard_limit,
+        response_reserve,
+        safety_margin,
+    }
+}
+
+fn utilization_pct(tokens: u64, context_window: u64) -> u64 {
+    if context_window == 0 {
+        0
+    } else {
+        ((tokens as f64 / context_window as f64) * 100.0).round() as u64
+    }
+}
+
+pub(crate) fn should_auto_digest(auto_compact: bool, est: u64, policy: ContextPolicy) -> bool {
+    auto_compact && policy.digest_threshold > 0 && est > policy.digest_threshold
+}
+
+pub(crate) fn should_auto_compact(
+    auto_compact: bool,
+    est: u64,
+    message_count: usize,
+    policy: ContextPolicy,
+) -> bool {
+    auto_compact && est > policy.compact_threshold && (est > policy.hard_limit || message_count > 4)
+}
 
 /// Index where the soft-digest keep-window begins: walk backward accumulating
 /// tokens until `keep_budget` (20% of context, floored at 4k) is exceeded,
@@ -6809,8 +7049,7 @@ fn soft_digest_keep_start(messages: &[Message], context_window: u64) -> usize {
 /// Soft-digest path used by the main loop and subagents: collapse stale large
 /// tool results AND oversized tool-call arguments outside the token-budgeted
 /// keep window, then budget-reclaim any remaining oversized call args / results
-/// that still push the conversation over half the window (aligned under the
-/// soft trigger so a few-huge-message chat at 40–50% still reclaims).
+/// that still push the conversation over the soft reclaim target.
 /// When `cache` is provided, restorable tool outputs are stored before they are
 /// replaced so "re-run identical call to restore" is truthful.
 /// Returns total items changed.
@@ -6841,9 +7080,10 @@ pub fn soft_digest_conversation(
     // else: keep_start==0 but n > MIN_KEEP means the whole history still fits
     // in the keep budget — don't collapse recent results; leave reclaim to
     // digest_to_budget below.
-    // Soft budget reclaim: target half the window (between digest-at ~40% and
-    // compact-at ~90%) so reclaim actually fires when soft digest triggers.
-    let soft_budget = ((context_window as f32) * 0.50) as u64;
+    // Soft budget reclaim: the default trigger is 70% and the target is 60%,
+    // leaving useful runway without making this lightweight path resemble a
+    // full compaction.
+    let soft_budget = ((context_window as f32) * SOFT_DIGEST_TARGET_FRACTION) as u64;
     changed += digest_to_budget(messages, soft_budget);
     changed
 }
@@ -8228,7 +8468,7 @@ mod compact_tests {
         for i in 0..12 {
             m.push(Message::assistant(format!("pad{i}")));
         }
-        // Small window so soft budget (50%) is under the write_file args size
+        // Small window so the soft target is under the write_file args size
         // and digest_to_budget must reclaim even if keep_start is 0.
         let n = soft_digest_conversation(&mut m, 8_000, None);
         assert!(n >= 1, "should digest oversized write_file args: {n}");
@@ -8265,6 +8505,57 @@ mod compact_tests {
             m[2].content_text().unwrap().starts_with("[digested:"),
             "{}",
             m[2].content_text().unwrap()
+        );
+    }
+
+    #[test]
+    fn context_policy_defaults_digest_at_70_and_compact_at_90() {
+        let policy = context_policy(&[], 100_000, 20_000, 0.90, 0.70);
+        assert_eq!(policy.digest_threshold, 70_000);
+        assert_eq!(policy.compact_threshold, 90_000);
+        assert_eq!(policy.response_reserve, 5_000);
+        assert_eq!(policy.safety_margin, 2_000);
+        assert_eq!(policy.hard_limit, 93_000);
+    }
+
+    #[test]
+    fn context_policy_reserves_more_after_large_responses() {
+        let messages = vec![Message::assistant("x".repeat(80_000))];
+        let policy = context_policy(&messages, 100_000, 50_000, 0.90, 0.70);
+        assert_eq!(policy.response_reserve, 25_000, "reserve is bounded at 25%");
+        assert!(policy.hard_limit < 75_000);
+        assert_eq!(policy.compact_threshold, policy.hard_limit);
+    }
+
+    #[test]
+    fn automatic_rewrites_honor_switch_and_boundaries() {
+        let policy = context_policy(&[], 100_000, 20_000, 0.90, 0.70);
+        assert!(!should_auto_digest(false, 99_000, policy));
+        assert!(!should_auto_compact(false, 99_000, 20, policy));
+        assert!(!should_auto_digest(true, 70_000, policy));
+        assert!(should_auto_digest(true, 70_001, policy));
+        assert!(!should_auto_compact(true, 90_000, 20, policy));
+        assert!(should_auto_compact(true, 90_001, 20, policy));
+        // Idleness now uses this same predicate, so message count alone cannot
+        // compact a low-pressure conversation.
+        assert!(!should_auto_compact(true, 10_000, 100, policy));
+        // A few-message conversation still compacts when it exceeds the hard
+        // safe-input limit.
+        assert!(should_auto_compact(true, 93_001, 2, policy));
+    }
+
+    #[test]
+    fn oversized_non_tool_tail_is_detected_after_compaction() {
+        let mut messages = vec![Message::system("sys")];
+        for i in 0..8 {
+            messages.push(Message::user(format!("small {i}")));
+        }
+        messages.push(Message::user("x".repeat(500_000)));
+        let policy = context_policy(&messages, 100_000, 20_000, 0.90, 0.70);
+        compact_conversation(&mut messages, 100_000);
+        assert!(
+            estimate_messages_tokens(&messages) > policy.hard_limit,
+            "caller must block a request when a singular non-tool payload cannot be reclaimed"
         );
     }
 }

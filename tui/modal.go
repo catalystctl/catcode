@@ -48,6 +48,7 @@ const (
 	modalGoal      // multi-field /goal form (goal, concurrency, models, providers)
 	modalGoalPlan  // plan-ready review (approve / revise / cancel)
 	modalPluginInstallScope // global vs workspace after /plugin-install path
+	modalSearchKey      // pick Exa/Tavily to set/clear its web_search API key
 )
 
 // goalDraft is the multi-field form state for modalGoal.
@@ -164,6 +165,7 @@ const (
 	editTargetParallel         = "parallel"
 	editTargetChain            = "chain"
 	editTargetCompact          = "compact"
+	editTargetSearchKey        = "search_key" // +":" + provider (exa|tavily)
 )
 
 // Plugin picker modes (session.pluginPickerMode).
@@ -253,6 +255,20 @@ func (s *session) openApprovalPicker() {
 			s.modal.cursor = i
 			break
 		}
+	}
+}
+
+func (s *session) openSearchKeyPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalSearchKey
+	s.modal.cursor = 0
+}
+
+// searchKeyItems is the fixed Exa/Tavily list for the /search-key picker.
+func (s *session) searchKeyItems() []listItem {
+	return []listItem{
+		{label: "Exa", desc: "Exa search API key — Enter to paste (blank clears)"},
+		{label: "Tavily", desc: "Tavily search API key — Enter to paste (blank clears)"},
 	}
 }
 
@@ -788,6 +804,7 @@ func (s *session) commandItems() []listItem {
 		{label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
 		{label: "/logout", desc: "log out of a provider"},
 		{label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
+		{label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily, paste modal)"},
 		{label: "/model", desc: "switch model"},
 		{label: "/approval", desc: "never · destructive · always"},
 		{label: "/reasoning", desc: "set reasoning effort (per model)"},
@@ -1152,7 +1169,8 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory, modalPluginInstallScope:
+		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalMemory, modalPluginInstallScope,
+		modalSearchKey:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
@@ -1633,6 +1651,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.mouseWheelItems()
 	case modalPluginInstallScope:
 		items = s.pluginInstallScopeItems()
+	case modalSearchKey:
+		items = s.searchKeyItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -1835,6 +1855,14 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 			s.sendPluginInstall(path, items[abs].label)
 		}
 		s.closeModal()
+		return s, nil
+	case modalSearchKey:
+		items := s.searchKeyItems()
+		if abs >= 0 && abs < len(items) {
+			name := strings.ToLower(items[abs].label)
+			s.openValueEditModal(editTargetSearchKey+":"+name, items[abs].label+" API Key",
+				"paste your key, then Enter (blank to clear, Esc to cancel)", "")
+		}
 		return s, nil
 	case modalProviders:
 		return s.selectProviderItem(abs)
@@ -2074,6 +2102,9 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	case "/logout":
 		s.openLogoutPicker()
 		return nil
+	case "/search-key":
+		s.openSearchKeyPicker()
+		return nil
 	case "/model":
 		s.openModelPicker()
 		return nil
@@ -2257,6 +2288,18 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 	target := s.modal.editTarget
 	s.modal.editing = false
 	s.closeModal()
+	// /search-key paste modal: target is "search_key:<provider>". An empty
+	// paste clears the key (matches /search-key <p> --clear).
+	if strings.HasPrefix(target, editTargetSearchKey+":") {
+		name := strings.TrimPrefix(target, editTargetSearchKey+":")
+		s.sendCore(map[string]any{"type": "set_search_key", "provider": name, "api_key": val})
+		if val == "" {
+			s.logInfo("clearing " + name + " search key…")
+		} else {
+			s.logInfo("saving " + name + " search key…")
+		}
+		return s, nil
+	}
 	switch target {
 	case editTargetBashTimeout:
 		var n int
@@ -2456,6 +2499,7 @@ func (s *session) helpText() string {
 		"  /login           log in / switch provider (OpenAI · Gemini · Claude · xAI · Qwen · OpenRouter · …)",
 		"  /logout          log out of a provider",
 		"  /oauth-code      paste OAuth code (SSH/headless Google login)",
+		"  /search-key      set Exa/Tavily search API key: /search-key exa|tavily [key|--clear]",
 		"  /model           switch model",
 		"  /approval        never | destructive | always",
 		"  /reasoning       set reasoning effort (per model)",
@@ -2573,6 +2617,8 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Settings", s.settingsHubItems(), true)
 	case modalApproval:
 		return s.renderListModal("Approval Mode", s.approvalItems(), false)
+	case modalSearchKey:
+		return s.renderListModal("Set Search API Key", s.searchKeyItems(), false)
 	case modalSandbox:
 		return s.renderListModal("Sandbox", s.sandboxItems(), false)
 	case modalAutoCompact:
@@ -3191,6 +3237,12 @@ func (s *session) renderContextModal() string {
 		mutedStyle.Render(humanTokens(cb.Window)),
 		accentStyle.Render(fmt.Sprintf("%d", cb.Pct))))
 	lines = append(lines, fmt.Sprintf("%s: %d", baseStyle.Render("Messages"), cb.Messages))
+	if cb.CompactAt > 0 {
+		lines = append(lines, fmt.Sprintf("%s: digest %s · compact %s · hard %s",
+			baseStyle.Render("Policy"), humanTokens(cb.DigestAt), humanTokens(cb.CompactAt), humanTokens(cb.HardLimit)))
+		lines = append(lines, fmt.Sprintf("%s: response %s · safety %s",
+			baseStyle.Render("Reserved"), humanTokens(cb.ResponseReserve), humanTokens(cb.SafetyMargin)))
+	}
 	// Per-role buckets.
 	if len(cb.ByRole) > 0 {
 		lines = append(lines, "")

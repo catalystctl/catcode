@@ -52,6 +52,10 @@ export interface ReadyPayload {
   bash_timeout_secs: number;
   /** When true, the core auto-compacts context on thresholds / idle. */
   auto_compact?: boolean;
+  /** Configured fractions; runtime thresholds may be lower when response
+   * headroom for the selected model requires it. */
+  context_compact_at?: number;
+  context_digest_at?: number;
   /** Bash hard sandbox: `"none"` | `"firejail"` | `"seatbelt"`. */
   sandbox?: string;
   plugins_skipped?: string[];
@@ -72,6 +76,11 @@ export interface ContextBreakdown {
   pct: number;
   messages: number;
   system_tokens: number;
+  digest_threshold_tokens?: number;
+  compact_threshold_tokens?: number;
+  hard_limit_tokens?: number;
+  response_reserve_tokens?: number;
+  safety_margin_tokens?: number;
   by_role: Record<string, number>;
   top_consumers: {
     index: number;
@@ -405,8 +414,28 @@ export type CoreEvent =
   | { type: "sudo_request"; request_id: string; command: string }
   | { type: "metrics" } & Metrics
   | { type: "umans_conc"; used: number | null; limit: number | null; provider: string }
-  | { type: "compacted"; before_tokens: number; after_tokens: number; summary_chars?: number }
-  | { type: "compacting"; before_tokens: number; trigger: string }
+  | {
+      type: "compacted";
+      before_tokens: number;
+      after_tokens: number;
+      summary_chars?: number;
+      context_window?: number;
+      threshold_tokens?: number;
+      hard_limit_tokens?: number;
+      within_limit?: boolean;
+      scope?: string;
+    }
+  | {
+      type: "compacting";
+      before_tokens: number;
+      trigger: string;
+      context_window?: number;
+      threshold_tokens?: number;
+      hard_limit_tokens?: number;
+      response_reserve_tokens?: number;
+      safety_margin_tokens?: number;
+      utilization_pct?: number;
+    }
   | ({ type: "context_breakdown" } & ContextBreakdown)
   | ({ type: "usage" } & UsageSnapshot)
   | { type: "agents"; agents: AgentInfo[] }
@@ -445,7 +474,18 @@ export type CoreEvent =
   | { type: "workspace_changed"; workspace: string; projects: ProjectEntry[] }
   | { type: "session_renamed"; name: string; title: string }
   // ── Compaction / config ──
-  | { type: "digested"; results: number; before_tokens?: number; after_tokens?: number }
+  | {
+      type: "digested";
+      results: number;
+      before_tokens?: number;
+      after_tokens?: number;
+      trigger?: string;
+      context_window?: number;
+      threshold_tokens?: number;
+      hard_limit_tokens?: number;
+      utilization_pct?: number;
+      scope?: string;
+    }
   | { type: "config_changed"; key: string; value: string | number | boolean }
   // ── OAuth / lifecycle status ──
   | { type: "oauth_prompt"; url: string; code?: string; message?: string }
@@ -473,6 +513,7 @@ export type CoreCommand =
   | { type: "approve"; request_id: string; decision: "yes" | "no" | "always" }
   | { type: "set_approval"; mode: "never" | "destructive" | "always" }
   | { type: "set_key"; api_key: string; provider?: string }
+  | { type: "set_search_key"; provider: string; api_key: string }
   | { type: "set_provider"; name: string }
   | { type: "list_provider_presets" }
   | { type: "login"; preset: string; api_key?: string }
@@ -723,3 +764,141 @@ export interface SnapshotEvent {
 }
 
 export type ServerToClient = CoreEvent | SnapshotEvent;
+
+// ─── IDE panel types (client-only + API DTOs) ──────────────────────────────
+// Per docs/IDE_PANELS_CONTRACT.md §2. Client-only layout state + API DTOs;
+// NEVER reduced into AgentState / never sent over SSE.
+
+/** A panel the IDE shell can show. "copilot" is handled separately (the dock). */
+export type IdePanelId = "explorer" | "git" | "terminal" | "preview";
+
+/** Panels that can be moved between IDE dock zones. */
+export type MovablePanelId = "chat" | "git" | "terminal" | "preview";
+
+/** A drop target around (or in place of) the fixed editor work area. */
+export type DockPosition = "left" | "right" | "bottom" | "main";
+
+/** One entry in the file-explorer tree (one level of a directory). */
+export interface FileNode {
+  /** Workspace-relative path with forward slashes (e.g. "src/lib/foo.ts"). */
+  path: string;
+  /** Just the basename. */
+  name: string;
+  /** True if this is a directory. */
+  dir: boolean;
+  /** File size in bytes (0 for dirs). */
+  size?: number;
+  /** mtime in ms (for change detection / refresh). */
+  mtime?: number;
+  /** True if the entry is a symlink (rendered with an arrow). */
+  symlink?: boolean;
+}
+
+/** One row of `git status --porcelain=v2`. */
+export interface GitStatusEntry {
+  /** Workspace-relative path. For renames: "old -> new". */
+  path: string;
+  /** Original path for renames, else null. */
+  oldPath?: string | null;
+  /** XY status codes from porcelain v2 (e.g. "M ", " M", "A ", "??", "R "). */
+  xy: string;
+  /** Human label. */
+  status: "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted";
+  /** Staged (index) vs unstaged (worktree). */
+  staged: boolean;
+}
+
+/** Aggregate git state for the git panel + status bar. */
+export interface GitStatus {
+  /** Current branch name, or "HEAD (detached)". */
+  branch: string;
+  /** Commits ahead of upstream (0 if no upstream). */
+  ahead: number;
+  /** Commits behind upstream. */
+  behind: number;
+  /** All changed entries (staged + unstaged + untracked). */
+  entries: GitStatusEntry[];
+  /** HEAD commit short oid, or null if no commits. */
+  head: { oid: string; message: string; author: string; ts: number } | null;
+  /** True if the workspace is not a git repo (panel shows "initialize" CTA). */
+  bare: boolean;
+}
+
+/** A live terminal session (one PTY-less spawn per tab). */
+export interface TerminalSession {
+  /** Client-generated id (e.g. "term_<ts>_<n>"). */
+  id: string;
+  /** Display title (defaults to shell name; user-renamable). */
+  title: string;
+  /** Workspace-relative or absolute cwd the shell started in. */
+  cwd: string;
+  /** True while the shell process is alive. */
+  alive: boolean;
+  /** Last exit code (null while alive / not yet exited). */
+  exitCode: number | null;
+}
+
+/** Preview panel state. */
+export interface PreviewState {
+  /** What is being previewed. */
+  kind: "file" | "url" | "none";
+  /** Workspace-relative file path (kind="file") or absolute URL (kind="url"). */
+  target: string;
+  /** Optional query/anchor to append. */
+  query?: string;
+}
+
+/** A tab in the main work area (open file / preview / terminal-host). */
+export interface IdeTab {
+  /** Unique id (path for files, "preview:<target>", "term:<id>"). */
+  id: string;
+  kind: "file" | "preview" | "terminal";
+  /** Workspace-relative path (file) or target (preview) or terminal id. */
+  target: string;
+  /** Display label (basename for files). */
+  label: string;
+  /** Dirty flag (unsaved editor changes). */
+  dirty: boolean;
+  /** Detected language id for the editor (e.g. "typescript", "markdown"). */
+  language?: string;
+}
+
+/** Client-only IDE layout state. NEVER sent over SSE / never in AgentState. */
+export interface IdeLayoutState {
+  /** Which panel's sidebar is shown in PrimarySidebar. */
+  activePanel: IdePanelId;
+  /** Open tabs in the main work area (ordered). */
+  openTabs: IdeTab[];
+  /** id of the active tab (null = none). */
+  activeTabId: string | null;
+  /** PrimarySidebar width in px. */
+  sidebarWidth: number;
+  /** True when PrimarySidebar is collapsed (hidden). */
+  sidebarCollapsed: boolean;
+  /** Bottom panel height in px (0 = collapsed). */
+  bottomPanelHeight: number;
+  /** True when the bottom panel is visible. */
+  bottomPanelVisible: boolean;
+  /** True when the copilot (Chat) dock is visible. */
+  copilotVisible: boolean;
+  /** Copilot dock width in px. */
+  copilotWidth: number;
+  /** Current dock position for every movable panel. */
+  panelLocations: Record<MovablePanelId, DockPosition>;
+  /** Panels remain mounted only while visible. */
+  panelVisibility: Record<MovablePanelId, boolean>;
+  /** Selected panel when several panels share a dock zone. */
+  activeDockPanels: Record<DockPosition, MovablePanelId | null>;
+  /** Shared width of the optional dock on the editor's left edge. */
+  leftDockWidth: number;
+  /** Live terminal sessions. */
+  terminals: TerminalSession[];
+  /** Active terminal session id (null = none). */
+  activeTerminalId: string | null;
+  /** Last-known git status (null until first refresh). */
+  gitStatus: GitStatus | null;
+  /** Current preview target. */
+  preview: PreviewState;
+  /** File-tree expanded directory paths (set, persisted across reloads). */
+  expandedDirs: string[];
+}

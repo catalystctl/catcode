@@ -107,12 +107,17 @@ type contextConsumer struct {
 // contextBreakdown mirrors the core's "context_breakdown" event payload so the
 // TUI can render a /context modal showing where the context budget is spent.
 type contextBreakdown struct {
-	Total        uint64            `json:"total_tokens"`
-	Window       uint64            `json:"context_window"`
-	Pct          uint64            `json:"pct"`
-	Messages     int               `json:"messages"`
-	ByRole       map[string]uint64 `json:"by_role"`
-	TopConsumers []contextConsumer `json:"top_consumers"`
+	Total           uint64            `json:"total_tokens"`
+	Window          uint64            `json:"context_window"`
+	Pct             uint64            `json:"pct"`
+	Messages        int               `json:"messages"`
+	DigestAt        uint64            `json:"digest_threshold_tokens"`
+	CompactAt       uint64            `json:"compact_threshold_tokens"`
+	HardLimit       uint64            `json:"hard_limit_tokens"`
+	ResponseReserve uint64            `json:"response_reserve_tokens"`
+	SafetyMargin    uint64            `json:"safety_margin_tokens"`
+	ByRole          map[string]uint64 `json:"by_role"`
+	TopConsumers    []contextConsumer `json:"top_consumers"`
 }
 
 // usageWindow is one rate-limit / quota row in a provider usage report.

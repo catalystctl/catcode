@@ -461,7 +461,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if at, err := strconv.ParseUint(ev.get("after_tokens"), 10, 64); err == nil {
 			s.contextTokens = at
 		}
-		s.logInfo(fmt.Sprintf("context digested: %s result(s), %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
+		s.logInfo(fmt.Sprintf("reclaimed stale tool payload(s): %s, %s → %s tokens", ev.get("results"), ev.get("before_tokens"), ev.get("after_tokens")))
 
 	case "reflecting":
 		// The auto-reflect seam fired: instead of completing on `finish`, the core
@@ -1633,6 +1633,38 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		switch parts[0] {
 		case "/login":
 			s.openLoginPicker()
+			return nil
+		case "/search-key":
+			// /search-key                       -> picker (Exa/Tavily → paste key)
+			// /search-key <exa|tavily>          -> paste modal for that provider
+			// /search-key <exa|tavily> <key>    -> set inline
+			// /search-key <exa|tavily> --clear  -> remove the stored key
+			if len(parts) < 2 {
+				s.openSearchKeyPicker()
+				return nil
+			}
+			name := strings.ToLower(parts[1])
+			if name != "exa" && name != "tavily" {
+				s.logError("/search-key: provider must be 'exa' or 'tavily' (got '" + parts[1] + "')")
+				return nil
+			}
+			if len(parts) >= 3 {
+				arg := strings.Join(parts[2:], " ")
+				if arg == "--clear" || arg == "clear" || arg == "off" {
+					s.sendCore(map[string]any{"type": "set_search_key", "provider": name, "api_key": ""})
+					s.logInfo("clearing " + name + " search key…")
+				} else {
+					s.sendCore(map[string]any{"type": "set_search_key", "provider": name, "api_key": arg})
+					s.logInfo("saving " + name + " search key…")
+				}
+				return nil
+			}
+			label := "Exa"
+			if name == "tavily" {
+				label = "Tavily"
+			}
+			s.openValueEditModal(editTargetSearchKey+":"+name, label+" API Key",
+				"paste your key, then Enter (blank to clear, Esc to cancel)", "")
 			return nil
 		case "/logout":
 			if len(parts) >= 2 {

@@ -42,6 +42,7 @@ export const COMMANDS: CommandDef[] = [
   { label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)", category: "config", action: "login" },
   { label: "/logout", desc: "log out of a provider", category: "config", action: "logout" },
   { label: "/oauth-code", desc: "complete a manual OAuth login (paste code/URL)", category: "config", action: "oauth-code" },
+  { label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily)", category: "config", action: "search-key" },
 
   // ── Agent ──
   { label: "/steer", desc: "steer an in-flight turn", category: "agent", action: "steer", streaming: true },

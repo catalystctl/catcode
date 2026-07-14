@@ -6,7 +6,7 @@
 // message edit/regenerate, transcript export, and the slash-command dispatch.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useAgent } from "@/lib/use-agent";
+import { useAgent, type AgentApi } from "@/lib/use-agent";
 import { basename } from "@/lib/format";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
@@ -80,8 +80,9 @@ function lsSet(k: string, v: string): void {
   }
 }
 
-export function Chat() {
-  const agent = useAgent();
+export function Chat({ agent: injected, docked }: { agent?: AgentApi; docked?: boolean } = {}) {
+  const ownAgent = useAgent();
+  const agent = injected ?? ownAgent;
   const { state } = agent;
   const { confirm, prompt, dialog } = useAppDialog();
   const dialogApi = useRef({ confirm, prompt });
@@ -331,7 +332,7 @@ export function Chat() {
           if (key?.trim()) void a.setKey(key.trim());
           return;
         }
-        case "oauth-code": {
+                case "oauth-code": {
           const code = await d.prompt({
             title: "OAuth code",
             message: "Paste the OAuth code or final callback URL.",
@@ -340,6 +341,28 @@ export function Chat() {
             confirmLabel: "Submit",
           });
           if (code?.trim()) void a.submitOauthCode(code.trim());
+          return;
+        }
+        case "search-key": {
+          let provider = (args ?? "").trim().toLowerCase();
+          if (provider !== "exa" && provider !== "tavily") {
+            const picked = await d.prompt({
+              title: "Search API key provider",
+              message: "Which search provider? Type exa or tavily.",
+              placeholder: "exa",
+              confirmLabel: "Next",
+            });
+            provider = (picked ?? "").trim().toLowerCase();
+            if (provider !== "exa" && provider !== "tavily") return;
+          }
+          const key = await d.prompt({
+            title: `${provider === "exa" ? "Exa" : "Tavily"} API key`,
+            message: `Paste your ${provider} search API key (leave blank to clear).`,
+            placeholder: provider === "exa" ? "exa-key…" : "tvly-key…",
+            password: true,
+            confirmLabel: "Save",
+          });
+          if (key !== null) void a.setSearchKey(provider, key.trim());
           return;
         }
         case "login":
@@ -511,8 +534,9 @@ export function Chat() {
   const switching = state.switching;
 
   return (
-    <div className="flex h-[100dvh] w-full overflow-hidden bg-ink-950 bg-grid text-ink-100">
+    <div className={`chat-panel relative flex min-h-0 min-w-0 ${docked ? "h-full" : "h-[100dvh]"} w-full overflow-hidden bg-ink-950 bg-grid text-ink-100`}>
       <Sidebar
+        embedded={docked}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         workspace={state.workspace}
@@ -555,6 +579,7 @@ export function Chat() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <Header
+          compact={docked}
           connected={agent.connected}
           workspace={state.workspace}
           provider={state.provider}
@@ -722,6 +747,7 @@ export function Chat() {
 
         <Composer
           ref={composerRef}
+          compact={docked}
           streaming={state.streaming}
           followUpQueued={state.followUpQueued}
           hitlOpen={

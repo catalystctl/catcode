@@ -201,4 +201,26 @@ export const RefreshIcon = (p: P) => (
   </svg>
 );
 
+export const MinusIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M5 12h14" />
+  </svg>
+);
+
+export const GitBranchIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M6 3v12" />
+    <circle cx="18" cy="6" r="2.5" />
+    <circle cx="6" cy="18" r="2.5" />
+    <path d="M18 8.5a9 9 0 0 1-9 9" />
+  </svg>
+);
+
 export const EditIcon = PencilIcon;
+
+export const FileIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <path d="M14 2v6h6" />
+  </svg>
+);

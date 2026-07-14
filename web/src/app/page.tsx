@@ -1,6 +1,6 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { Chat } from "@/components/chat";
+import { IdeShell } from "@/components/ide/shell";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { accountExists, getSession } from "@/lib/auth";
 
@@ -13,7 +13,7 @@ export default async function Page() {
 
   return (
     <ErrorBoundary label="app">
-      <Chat />
+      <IdeShell />
     </ErrorBoundary>
   );
 }

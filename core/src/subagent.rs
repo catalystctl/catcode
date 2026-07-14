@@ -1351,6 +1351,7 @@ async fn run_agent_inner(
     let model_ctx = first_model
         .map(|m| m.context_window as u64)
         .unwrap_or(200_000);
+    let model_max_tokens = first_model.map(|m| m.max_tokens).unwrap_or(8_192);
     let mut timer = TurnTimer::new();
     let mut sub_in: u64 = 0;
     let mut sub_out: u64 = 0;
@@ -1397,8 +1398,14 @@ async fn run_agent_inner(
             continue; // re-enter loop with new context
         }
         let est = grounded_estimate(&sub, last_real, len_at_real);
-        let soft = (model_ctx as f32 * cfg.context_digest_at) as u64;
-        if cfg.context_digest_at > 0.0 && est > soft {
+        let policy = crate::context_policy(
+            &sub,
+            model_ctx,
+            model_max_tokens,
+            cfg.context_compact_at,
+            cfg.context_digest_at,
+        );
+        if crate::should_auto_digest(cfg.auto_compact, est, policy) {
             let changed = {
                 let mut cache = st.tool_output_cache.lock().await;
                 crate::soft_digest_conversation(&mut sub, model_ctx, Some(&mut cache))
@@ -1410,7 +1417,12 @@ async fn run_agent_inner(
                     &Event::new("digested")
                         .with("scope", json!("subagent"))
                         .with("results", json!(changed))
-                        .with("after_tokens", json!(estimate_messages_tokens(&sub))),
+                        .with("before_tokens", json!(est))
+                        .with("after_tokens", json!(estimate_messages_tokens(&sub)))
+                        .with("trigger", json!("pressure"))
+                        .with("context_window", json!(model_ctx))
+                        .with("threshold_tokens", json!(policy.digest_threshold))
+                        .with("hard_limit_tokens", json!(policy.hard_limit)),
                 );
             }
         }
@@ -1418,9 +1430,7 @@ async fn run_agent_inner(
         // available so compaction fires at the right context level, not a
         // whole-history char/4 guess that drifts late.
         let est = grounded_estimate(&sub, last_real, len_at_real);
-        let threshold = (model_ctx as f32 * cfg.context_compact_at) as u64;
-        let hard_cap = (model_ctx as f32 * 0.95) as u64;
-        if est > threshold.min(hard_cap) && sub.len() > 4 {
+        if crate::should_auto_compact(cfg.auto_compact, est, sub.len(), policy) {
             // Mirror the main loop: let pre_compact plugin hooks run before
             // summarizing a subagent's context (otherwise subagent compaction
             // silently bypasses the hook the user configured).
@@ -1433,7 +1443,7 @@ async fn run_agent_inner(
                 candidates.first().unwrap(),
                 &mut sub,
                 cancel,
-                est > hard_cap,
+                est > policy.hard_limit,
                 model_ctx,
                 cfg.compact_instructions.as_deref(),
                 mp.as_ref(),
@@ -1442,12 +1452,23 @@ async fn run_agent_inner(
             // Compaction rewrote `sub`; the real baseline no longer applies.
             last_real = None;
             len_at_real = 0;
+            let after = estimate_messages_tokens(&sub);
             emit(
                 &Event::new("compacted")
                     .with("scope", json!("subagent"))
                     .with("before_tokens", json!(est))
-                    .with("after_tokens", json!(estimate_messages_tokens(&sub))),
+                    .with("after_tokens", json!(after))
+                    .with("context_window", json!(model_ctx))
+                    .with("threshold_tokens", json!(policy.compact_threshold))
+                    .with("hard_limit_tokens", json!(policy.hard_limit))
+                    .with("within_limit", json!(after <= policy.hard_limit)),
             );
+            if after > policy.hard_limit {
+                return Outcome::err(format!(
+                    "subagent context remains too large after compaction ({after} > safe limit {}); split the task or reduce oversized input",
+                    policy.hard_limit
+                ));
+            }
         }
 
         // Sanitize the conversation directly (it's already Vec<Message>).

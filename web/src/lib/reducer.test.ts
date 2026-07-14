@@ -507,7 +507,7 @@ describe("digested without before_tokens", () => {
       results: 2,
       after_tokens: 1000,
     } as AgentEvent);
-    expect(s.toasts[0].message).toContain("Compacted");
+    expect(s.toasts[0].message).toContain("Reclaimed");
     expect(s.toasts[0].message).toContain("1,000");
   });
 });

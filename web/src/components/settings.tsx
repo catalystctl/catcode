@@ -246,8 +246,9 @@ export function SettingsModal(props: Props) {
                 })}
               </div>
               <p className="mt-1.5 text-[11px] text-ink-500">
-                Automatically compact context near limits or after idle. Manual /compact always
-                works.
+                Automatically reclaim stale tool payloads near 70% and summarize near 90%, with
+                model-specific response headroom. Off disables all automatic history rewrites;
+                manual /compact always works.
               </p>
             </div>
 

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +107,60 @@ func TestFindAsset(t *testing.T) {
 	}
 	if a := findAsset(rel, "missing"); a != nil {
 		t.Fatalf("expected nil for missing asset, got %+v", a)
+	}
+}
+
+func TestCreateUpdateStageUsesTempDir(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+
+	f, err := createUpdateStage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.Name()
+	f.Close()
+	t.Cleanup(func() { os.Remove(name) })
+
+	if filepath.Dir(name) != tempRoot {
+		t.Fatalf("staging file created in %q, want %q", filepath.Dir(name), tempRoot)
+	}
+	if !strings.HasPrefix(filepath.Base(name), "catcode-update.") {
+		t.Fatalf("unexpected staging filename %q", filepath.Base(name))
+	}
+}
+
+func TestSelfReplaceFromSeparateStagingDir(t *testing.T) {
+	stageDir := t.TempDir()
+	binDir := t.TempDir()
+	staged := filepath.Join(stageDir, "catcode-update.test")
+	exe := filepath.Join(binDir, "catcode")
+
+	if err := os.WriteFile(staged, []byte("new binary"), 0o751); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := selfReplace(staged, exe); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new binary" {
+		t.Fatalf("installed content = %q, want %q", got, "new binary")
+	}
+	if _, err := os.Stat(staged); err != nil {
+		t.Fatalf("staged download should remain for caller cleanup: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(binDir, ".catcode-replace.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("replacement temp files left in install directory: %v", matches)
 	}
 }

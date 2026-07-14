@@ -42,6 +42,22 @@ echo "[3/5] web: install deps (${RT})..."
 echo "[4/5] web: next build (output: standalone)..."
 ( cd web && NEXT_TELEMETRY_DISABLED=1 $RT run build )
 
+# --- 2b. bundle the custom Next server (WS terminal at /api/terminal) --------
+# Next app-router route handlers cannot upgrade to WebSocket, so the custom
+# server (web/src/server/server.ts) wraps next() and attaches a ws.WebSocketServer
+# at /api/terminal on the SAME port. Bundle it to one pure-JS file with esbuild
+# (Node-compatible — works whether the release host built with bun or npm) and
+# ship it IN PLACE of Next's standalone server.js, so the release serves HTTP
+# plus the terminal WebSocket on a single port. (Contract §7.4.)
+# Pure-JS output → the tarball stays cross-platform (Linux/macOS/Windows).
+echo "[4b/5] web: bundle custom server (esbuild) -> .server-bundle.js..."
+( cd web && ./node_modules/.bin/esbuild src/server/server.ts \
+    --bundle --platform=node --format=esm \
+    --outfile=.server-bundle.js \
+    --external:next --external:ws --external:better-sqlite3 --external:kysely \
+    --external:better-auth --external:@better-auth/passkey \
+    --external:@catalyst-code/coding-agent )
+
 # --- 3. assemble the standalone bundle -------------------------------------
 # Next standalone puts server.js + minimal node_modules at .next/standalone/,
 # but the static assets (CSS/JS chunks, fonts) live at .next/static/ and the
@@ -60,6 +76,19 @@ if [[ -d web/public ]]; then
   cp -a "web/public/." "$STAGE/public/"
 fi
 
+# Replace Next's standalone server.js with our CUSTOM server: same next() HTTP
+# handling PLUS the /api/terminal WebSocket. Pure-JS, single file.
+cp -f "web/.server-bundle.js" "$STAGE/server.js"
+rm -f "web/.server-bundle.js"
+# ws is NOT traced into the standalone node_modules (the custom server lives
+# outside the Next app graph) — copy it in so the terminal WS works. The rest
+# (next, better-sqlite3, kysely, better-auth, @catalyst-code/coding-agent) ARE
+# traced via the app routes + serverExternalPackages. (Contract §7.4.)
+if [[ ! -d "$STAGE/node_modules/ws" ]]; then
+  mkdir -p "$STAGE/node_modules/ws"
+  cp -a "web/node_modules/ws/." "$STAGE/node_modules/ws/"
+fi
+
 # Sanity: the entrypoint must exist.
 [[ -f "$STAGE/server.js" ]] || { echo "error: $STAGE/server.js missing — standalone build failed?" >&2; exit 1; }
 
@@ -68,10 +97,12 @@ fi
 # start.js so it is obvious it is the process entrypoint.
 cat >"$STAGE/start.js" <<'EOF'
 // Entry point for the prebuilt Catalyst Code web bundle.
-// Env: PORT (default 49283), HOSTNAME (default 0.0.0.0).
+// Env: PORT (default 49283), HOSTNAME (default 0.0.0.0), NODE_ENV (default production).
 process.env.PORT = process.env.PORT || "49283";
 process.env.HOSTNAME = process.env.HOSTNAME || "0.0.0.0";
-// next standalone server reads HOSTNAME/PORT from env.
+// The custom server (server.js) reads NODE_ENV to pick dev vs prod serving;
+// default to production so `node start.js` serves the prebuilt .next.
+process.env.NODE_ENV = process.env.NODE_ENV || "production";
 import("./server.js");
 EOF
 
@@ -89,3 +120,4 @@ echo "Run it:"
 echo "  tar xzf $(basename "$OUT")"
 echo "  PORT=49283 HOSTNAME=0.0.0.0 CATCODE_CORE=/usr/local/bin/catcode-core node start.js"
 echo "Cross-platform (pure JS) — runs on Linux, macOS, Windows (under Node)."
+echo "Serves HTTP + the /api/terminal WebSocket (line-mode shell, no PTY) on one port."

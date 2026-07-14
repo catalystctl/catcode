@@ -14,11 +14,26 @@ const CONFIG_DIR = path.join(process.env.HOME || os.homedir(), ".config", "catal
 const DB_PATH = path.join(CONFIG_DIR, "auth.db");
 const SECRET_PATH = path.join(CONFIG_DIR, "auth-secret");
 
-// ── origin / rpID (passkey WebAuthn) ────────────────────────
-// CATCODE_WEB_ORIGIN lets a user override when accessing via a tunnel/domain.
-// Single-user default stays localhost; tunnels/domains must set the env var.
-const ORIGIN = process.env.CATCODE_WEB_ORIGIN || "http://localhost:49283";
-const RPID = new URL(ORIGIN).hostname;
+// ── origins ────────────────────────────────────────────────
+// The app is served on two loopback ports: the systemd service (49283) and
+// local dev (3000). Better Auth's CSRF check rejects authenticated POSTs
+// (sign-out, 2FA verify, passkey add, change-password …) whose Origin header
+// isn't in trustedOrigins, so BOTH ports must be listed — for localhost AND
+// 127.0.0.1 (the service binds to 127.0.0.1; either address may be in the
+// URL bar). Set CATCODE_WEB_ORIGIN to add a tunnel / custom domain.
+const SYSTEMD_ORIGIN = "http://localhost:49283";
+const DEV_ORIGIN = "http://localhost:3000";
+const ORIGIN = process.env.CATCODE_WEB_ORIGIN || SYSTEMD_ORIGIN;
+const RPID = new URL(ORIGIN).hostname; // "localhost" — shared by both ports
+const TRUSTED_ORIGINS = Array.from(
+  new Set([
+    ORIGIN,
+    SYSTEMD_ORIGIN,
+    DEV_ORIGIN,
+    "http://127.0.0.1:49283",
+    "http://127.0.0.1:3000",
+  ]),
+);
 if (
   process.env.NODE_ENV === "production" &&
   !process.env.CATCODE_WEB_ORIGIN &&
@@ -71,10 +86,16 @@ export const auth = betterAuth({
   database: { db, type: "sqlite" as const },
   secret: getSecret(),
   baseURL: ORIGIN,
-  trustedOrigins: [ORIGIN],
+  trustedOrigins: TRUSTED_ORIGINS,
   emailAndPassword: { enabled: true, autoSignIn: true },
   plugins: [
-    passkey({ rpID: RPID, rpName: "Catalyst Code", origin: ORIGIN }),
+    // `origin` is intentionally omitted: the passkey plugin derives the
+    // WebAuthn expectedOrigin from each request's Origin header
+    // (options?.origin || ctx.headers.get("origin")), so a passkey registered
+    // on port 3000 validates on 49283 and vice-versa — rpID "localhost" is
+    // shared by both ports. (The Origin header is already CSRF-validated by
+    // better-auth's origin-check middleware before this handler runs.)
+    passkey({ rpID: RPID, rpName: "Catalyst Code" }),
     twoFactor({ issuer: "Catalyst Code", skipVerificationOnEnable: false }),
   ],
   databaseHooks: {

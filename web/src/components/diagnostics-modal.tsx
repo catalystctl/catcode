@@ -91,6 +91,21 @@ export function DiagnosticsModal({ stats, context, usage, onRefresh, onClose }: 
                 <div className="grid grid-cols-2 gap-1.5 font-mono text-[10px] text-ink-400">
                   <Stat label="messages" value={String(context.messages)} />
                   <Stat label="system" value={formatTokens(context.system_tokens)} />
+                  {context.digest_threshold_tokens != null && (
+                    <Stat label="digest at" value={formatTokens(context.digest_threshold_tokens)} />
+                  )}
+                  {context.compact_threshold_tokens != null && (
+                    <Stat label="compact at" value={formatTokens(context.compact_threshold_tokens)} />
+                  )}
+                  {context.hard_limit_tokens != null && (
+                    <Stat label="hard limit" value={formatTokens(context.hard_limit_tokens)} />
+                  )}
+                  {context.response_reserve_tokens != null && (
+                    <Stat
+                      label="response reserve"
+                      value={formatTokens(context.response_reserve_tokens)}
+                    />
+                  )}
                   {Object.entries(context.by_role ?? {}).map(([role, n]) => (
                     <Stat key={role} label={role} value={formatTokens(n)} />
                   ))}

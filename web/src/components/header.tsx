@@ -22,6 +22,8 @@ import {
 } from "./icons";
 
 interface Props {
+  /** Use container-friendly chrome when hosted in an IDE dock. */
+  compact?: boolean;
   connected: boolean;
   workspace: string;
   provider: string;
@@ -64,18 +66,18 @@ export function Header(props: Props) {
   const approvalModes: Array<"never" | "destructive" | "always"> = ["never", "destructive", "always"];
 
   return (
-    <header className="relative z-20 flex items-center gap-2 border-b border-ink-800/80 bg-ink-950/60 px-3 py-2 backdrop-blur sm:px-4">
+    <header className={`relative z-20 flex min-w-0 items-center gap-1.5 border-b border-ink-800/80 bg-ink-950/60 px-2 py-2 backdrop-blur ${props.compact ? "flex-wrap" : "sm:px-4"}`}>
       {/* Mobile sidebar toggle */}
       <button
         onClick={props.onMenuClick}
-        className="rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 lg:hidden"
+        className={`rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 ${props.compact ? "" : "lg:hidden"}`}
         aria-label="Open sessions"
       >
         <MenuIcon />
       </button>
 
       {/* Brand + workspace */}
-      <div className="flex min-w-0 items-center gap-2">
+      <div className={`min-w-0 items-center gap-2 ${props.compact ? "hidden" : "flex"}`}>
         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-accent to-accent-deep text-sm font-bold text-white shadow-glow">
           c
         </span>
@@ -99,11 +101,11 @@ export function Header(props: Props) {
           className="flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/70 px-2.5 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850"
         >
           <ModelIcon width={13} height={13} className="text-accent-soft" />
-          <span className="max-w-[120px] truncate">{current?.name || current?.id || "no model"}</span>
+          <span className={`${props.compact ? "max-w-[82px]" : "max-w-[120px]"} truncate`}>{current?.name || current?.id || "no model"}</span>
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {modelOpen && (
-          <div role="menu" className="absolute right-0 z-30 mt-1 w-80 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-0 shadow-2xl shadow-black/40 animate-fade-in">
+          <div role="menu" className={`absolute right-0 z-30 mt-1 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 p-0 shadow-2xl shadow-black/40 animate-fade-in ${props.compact ? "w-64" : "w-80"}`}>
             <ModelPicker
               models={props.models}
               selectedModel={props.selectedModel}
@@ -125,7 +127,7 @@ export function Header(props: Props) {
           title={`Thinking: ${props.thinkingLevel}`}
         >
           <BrainIcon width={13} height={13} className="text-accent-soft" />
-          <span className="hidden capitalize sm:inline">{props.thinkingLevel}</span>
+          <span className={props.compact ? "hidden" : "hidden capitalize sm:inline"}>{props.thinkingLevel}</span>
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {thinkOpen && (
@@ -164,7 +166,7 @@ export function Header(props: Props) {
           title="Approval mode"
         >
           <ShieldIcon width={13} height={13} />
-          <span className="hidden capitalize md:inline">{props.approvalMode}</span>
+          <span className={props.compact ? "hidden" : "hidden capitalize md:inline"}>{props.approvalMode}</span>
           <ChevronDown width={12} height={12} className="text-ink-500" />
         </button>
         {approvOpen && (
@@ -190,7 +192,7 @@ export function Header(props: Props) {
       {/* Metrics + connection */}
       <div className="flex items-center gap-2 pl-1">
         {m && (
-          <div className="hidden items-center gap-2.5 font-mono text-[10px] text-ink-400 lg:flex">
+          <div className={`${props.compact ? "hidden" : "hidden lg:flex"} items-center gap-2.5 font-mono text-[10px] text-ink-400`}>
             {m.prompt_tokens != null && <span title="input tokens">↑{formatTokens(m.prompt_tokens)}</span>}
             {m.tokens_out != null && <span title="output tokens">↓{formatTokens(m.tokens_out)}</span>}
             {conc && conc.used != null && current?.provider === conc.provider && (
@@ -233,7 +235,7 @@ export function Header(props: Props) {
               props.streaming || props.retrying || props.switching ? "animate-pulse" : ""
             }`}
           />
-          <span className="hidden capitalize sm:inline">
+          <span className={props.compact ? "hidden" : "hidden capitalize sm:inline"}>
             {props.switching
               ? "switching"
               : props.retrying

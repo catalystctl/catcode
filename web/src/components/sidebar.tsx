@@ -19,6 +19,8 @@ import {
 } from "./icons";
 
 interface Props {
+  /** Render as an overlay inside a constrained chat dock, regardless of viewport width. */
+  embedded?: boolean;
   open: boolean;
   onClose: () => void;
   workspace: string;
@@ -86,12 +88,12 @@ export function Sidebar(props: Props) {
       {/* Mobile backdrop */}
       {props.open && (
         <div
-          className="fixed inset-0 z-20 bg-black/50 backdrop-blur-sm lg:hidden"
+          className={`${props.embedded ? "absolute" : "fixed"} inset-0 z-20 bg-black/50 backdrop-blur-sm ${props.embedded ? "" : "lg:hidden"}`}
           onClick={props.onClose}
         />
       )}
       <aside
-        className={`fixed left-0 top-0 z-30 flex h-full w-72 flex-col border-r border-ink-800/80 bg-ink-950/95 backdrop-blur transition-transform duration-200 lg:static lg:z-0 lg:translate-x-0 ${
+        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-72 max-w-[88%] flex-col border-r border-ink-800/80 bg-ink-950/95 backdrop-blur transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0"} ${
           props.open ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -196,7 +198,7 @@ export function Sidebar(props: Props) {
           </div>
           <button
             onClick={props.onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 lg:hidden"
+            className={`rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 ${props.embedded ? "" : "lg:hidden"}`}
           >
             <XIcon width={16} height={16} />
           </button>

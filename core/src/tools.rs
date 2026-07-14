@@ -626,7 +626,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Web search (no API key). Uses public SearXNG instances (google+bing engines, ranked from searx.space), then falls back to DDG/Mojeek scrapes. Returns top hits as text. Honors --no-network / fetch_allowlist. Pair with fetch to read a page.",
+                "description": "Web search. Prefers the Exa and Tavily APIs (set EXA_API_KEY / TAVILY_API_KEY) with round-robin load balancing + monthly quota tracking; with both keys it alternates and cooldowns on rate limits. Falls back to public SearXNG instances + DDG/Mojeek scrapes when no key is set or all API providers are exhausted. Returns top hits as text. Honors --no-network / fetch_allowlist. Pair with fetch to read a page.",
                 "parameters": {
                     "type": "object",
                     "properties": {

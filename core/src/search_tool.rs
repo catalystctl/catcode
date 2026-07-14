@@ -22,11 +22,12 @@ use crate::config::Config;
 use crate::fetch_tool::{egress_check, html_to_text};
 use crate::tools::{smart_truncate, Outcome};
 use regex::Regex;
-#[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SEARX_SPACE_INSTANCES: &str = "https://searx.space/data/instances.json";
 /// How many ranked public instances to try before falling through to DDG.
@@ -165,6 +166,8 @@ struct Hit {
 /// Which backend produced the hits (shown in the tool output header).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Backend {
+    Exa,
+    Tavily,
     Searx(String),
     DdgLite,
     DdgHtml,
@@ -174,6 +177,8 @@ enum Backend {
 impl Backend {
     fn label(&self) -> String {
         match self {
+            Backend::Exa => "Exa API".into(),
+            Backend::Tavily => "Tavily API".into(),
             Backend::Searx(host) => format!("SearXNG ({host})"),
             Backend::DdgLite => "DuckDuckGo Lite".into(),
             Backend::DdgHtml => "DuckDuckGo HTML".into(),
@@ -324,7 +329,10 @@ async fn load_searx_instances(
     let (status, body, _trunc) = fetch_html(
         client,
         SEARX_SPACE_INSTANCES,
-        cfg.fetch_max_bytes.max(64 * 1024),
+        // searx.space instances.json is ~1-2MB; the default fetch_max_bytes
+        // (256KB) truncates it mid-string → "JSON parse failed: EOF at column
+        // 262144". Floor this one fetch at 8MB so the instance list parses.
+        cfg.fetch_max_bytes.max(8 * 1024 * 1024),
     )
     .await?;
     if !status.is_success() {
@@ -702,6 +710,10 @@ fn classify_response(
 
     let low = html.to_ascii_lowercase();
     let has_markers = match backend {
+        // API providers never flow through classify_response (they return parsed
+        // hits directly); mark as "has markers" so they can't trip the no-markers
+        // fail path if ever reached defensively.
+        Backend::Exa | Backend::Tavily => true,
         Backend::DdgLite => low.contains("result-link") || low.contains("result-snippet"),
         Backend::DdgHtml => {
             low.contains("result__a")
@@ -722,6 +734,7 @@ fn classify_response(
     }
 
     let hits = match backend {
+        Backend::Exa | Backend::Tavily => Vec::new(),
         Backend::DdgLite => parse_ddg_lite(html, limit),
         Backend::DdgHtml => parse_ddg_html(html, limit),
         Backend::Mojeek => parse_mojeek(html, limit),
@@ -790,12 +803,13 @@ async fn fetch_html_with_ct(
     Ok((status, html, ct, truncated))
 }
 
-fn render_hits(query: &str, backend: &Backend, hits: &[Hit]) -> Outcome {
-    let mut text = format!(
-        "Search: {query}  ({}, {} hit(s))\n\n",
-        backend.label(),
-        hits.len()
-    );
+fn render_hits(query: &str, backend: &Backend, hits: &[Hit], note: Option<&str>) -> Outcome {
+    let mut header = format!("Search: {query}  ({}, {} hit(s)", backend.label(), hits.len());
+    if let Some(n) = note {
+        header.push_str(&format!(" · {n}"));
+    }
+    header.push_str(")\n\n");
+    let mut text = header;
     for (i, h) in hits.iter().enumerate() {
         text.push_str(&format!(
             "{}. {}\n   {}\n   {}\n\n",
@@ -811,6 +825,562 @@ fn render_hits(query: &str, backend: &Backend, hits: &[Hit]) -> Outcome {
         text = smart_truncate(&text, OUT_CAP);
     }
     Outcome::ok(text)
+}
+
+// ============================================================================
+// Paid API providers (Exa + Tavily) with load balancing + usage tracking.
+//
+// When EXA_API_KEY and/or TAVILY_API_KEY are set, web_search prefers them
+// (structured snippets, higher quality than scraping). With both keys set,
+// requests round-robin between the two. Cumulative monthly usage persists to
+// ~/.config/catalyst-code/search-usage.json so a restarted session won't blow
+// past the free-tier quota (default 1000/mo each; override via
+// EXA_MONTHLY_LIMIT / TAVILY_MONTHLY_LIMIT).
+//
+// On a 429 / quota-exceeded response the provider enters a cooldown (parsed
+// from `retry-after`, default 60s) and the OTHER provider is tried. Only if
+// every API provider is unavailable / exhausted / failing do we fall through
+// to the no-key scrape chain (SearXNG -> DDG -> Mojeek) below -- so web_search
+// ALWAYS has a path to results.
+//
+// Egress: API endpoints go through the same `egress_check` as scrape URLs, so
+// `--no-network` + empty allowlist denies them too (consistent). Add the API
+// hosts to `fetch_allowlist` to opt them in under a locked-down config.
+// ============================================================================
+
+/// A paid API search provider. Keys resolve from env vars; `ALL` order is the
+/// deterministic round-robin priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiProvider {
+    Exa,
+    Tavily,
+}
+
+impl ApiProvider {
+    const ALL: [ApiProvider; 2] = [ApiProvider::Exa, ApiProvider::Tavily];
+
+    fn env_key(&self) -> &'static str {
+        match self {
+            ApiProvider::Exa => "EXA_API_KEY",
+            ApiProvider::Tavily => "TAVILY_API_KEY",
+        }
+    }
+    fn endpoint(&self) -> &'static str {
+        match self {
+            ApiProvider::Exa => "https://api.exa.ai/search",
+            ApiProvider::Tavily => "https://api.tavily.com/search",
+        }
+    }
+    /// Monthly request/credit budget. Override via env; default = free tier.
+    fn monthly_limit(&self) -> u64 {
+        let env = match self {
+            ApiProvider::Exa => "EXA_MONTHLY_LIMIT",
+            ApiProvider::Tavily => "TAVILY_MONTHLY_LIMIT",
+        };
+        std::env::var(env)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1000)
+    }
+    /// Resolved API key (non-empty). A key set via `/search-key` (persisted in
+    /// `cfg.search_keys`) wins over the env var, so slash-command keys override.
+    fn key(&self, cfg: &Config) -> Option<String> {
+        let name = match self {
+            ApiProvider::Exa => "exa",
+            ApiProvider::Tavily => "tavily",
+        };
+        if let Some(k) = cfg.search_keys.get(name) {
+            if !k.is_empty() {
+                return Some(k.clone());
+            }
+        }
+        std::env::var(self.env_key())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    fn backend(self) -> Backend {
+        match self {
+            ApiProvider::Exa => Backend::Exa,
+            ApiProvider::Tavily => Backend::Tavily,
+        }
+    }
+}
+
+/// Persisted monthly usage for one provider (resets when the calendar month
+/// rolls over so quotas are month-bound, not lifetime).
+#[derive(Clone, Debug, Default)]
+struct MonthlyUsage {
+    /// "YYYY-MM" -- when this differs from the current month, count resets to 0.
+    month: String,
+    count: u64,
+}
+
+/// In-process usage + cooldown state (loaded lazily from disk on first use).
+#[derive(Default)]
+struct UsageState {
+    exa: MonthlyUsage,
+    tavily: MonthlyUsage,
+    exa_cooldown_until: Option<Instant>,
+    tavily_cooldown_until: Option<Instant>,
+    loaded: bool,
+}
+
+static USAGE: LazyLock<Mutex<UsageState>> = LazyLock::new(|| Mutex::new(UsageState::default()));
+/// Round-robin cursor: incremented once per search; the starting provider is
+/// `cursor % available.len()`, so two available providers strictly alternate.
+static ROUND_ROBIN: AtomicU64 = AtomicU64::new(0);
+
+/// Current calendar month as "YYYY-MM" (no chrono dep -- Howard Hinnant's
+/// civil-from-days algorithm applied to the Unix epoch second).
+fn current_month() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}")
+}
+
+fn usage_file_path() -> Option<PathBuf> {
+    crate::config::home_dir().map(|h| h.join(".config/catalyst-code/search-usage.json"))
+}
+
+/// Lazily load persisted monthly counts into the in-process state (once).
+/// A stored month that doesn't match the current month resets the count to 0.
+fn load_usage(state: &mut UsageState) {
+    if state.loaded {
+        return;
+    }
+    state.loaded = true;
+    let Some(path) = usage_file_path() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&content) else {
+        return;
+    };
+    let month = current_month();
+    state.exa = read_provider_usage(&doc, "exa", &month);
+    state.tavily = read_provider_usage(&doc, "tavily", &month);
+}
+
+fn read_provider_usage(doc: &Value, name: &str, current: &str) -> MonthlyUsage {
+    let Some(p) = doc.get(name) else {
+        return MonthlyUsage::default();
+    };
+    let month = p
+        .get("month")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let count = p.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    if month == current {
+        MonthlyUsage { month, count }
+    } else {
+        // New calendar month -> quota resets.
+        MonthlyUsage {
+            month: current.to_string(),
+            count: 0,
+        }
+    }
+}
+
+/// Best-effort persist of the monthly counts (ignore errors -- usage tracking
+/// is advisory, never blocks a search).
+fn save_usage(state: &UsageState) {
+    let Some(path) = usage_file_path() else {
+        return;
+    };
+    let doc = json!({
+        "exa": { "month": state.exa.month, "count": state.exa.count },
+        "tavily": { "month": state.tavily.month, "count": state.tavily.count }
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, doc.to_string());
+}
+
+/// Record a billable call against the provider's monthly quota. Returns the
+/// post-increment monthly count (for the usage note in the output).
+fn record_request(p: ApiProvider, credits: u64) -> u64 {
+    let credits = credits.max(1);
+    let mut state = USAGE.lock().unwrap();
+    load_usage(&mut state);
+    let month = current_month();
+    let usage = match p {
+        ApiProvider::Exa => &mut state.exa,
+        ApiProvider::Tavily => &mut state.tavily,
+    };
+    if usage.month != month {
+        *usage = MonthlyUsage {
+            month: month.clone(),
+            count: 0,
+        };
+    }
+    usage.count = usage.count.saturating_add(credits);
+    let count = usage.count;
+    save_usage(&state);
+    count
+}
+
+/// Park a provider in cooldown for `secs` (rate-limit / quota response).
+fn set_cooldown(p: ApiProvider, secs: u64) {
+    let mut state = USAGE.lock().unwrap();
+    let until = Instant::now() + Duration::from_secs(secs.max(1));
+    match p {
+        ApiProvider::Exa => state.exa_cooldown_until = Some(until),
+        ApiProvider::Tavily => state.tavily_cooldown_until = Some(until),
+    }
+}
+
+/// Is `p` usable right now given a key is (or isn't) present? Checks the
+/// cooldown + monthly budget only (key presence is passed in so the quota
+/// logic is unit-testable without env vars).
+fn provider_usable(state: &UsageState, p: ApiProvider, has_key: bool) -> bool {
+    if !has_key {
+        return false;
+    }
+    let cooldown = match p {
+        ApiProvider::Exa => state.exa_cooldown_until,
+        ApiProvider::Tavily => state.tavily_cooldown_until,
+    };
+    if let Some(until) = cooldown {
+        if Instant::now() < until {
+            return false;
+        }
+    }
+    let usage = match p {
+        ApiProvider::Exa => &state.exa,
+        ApiProvider::Tavily => &state.tavily,
+    };
+    usage.count < p.monthly_limit()
+}
+
+/// Is `p` usable right now? Requires: key set, not over monthly budget, not in
+/// an active cooldown.
+fn provider_available(state: &UsageState, p: ApiProvider, cfg: &Config) -> bool {
+    provider_usable(state, p, p.key(cfg).is_some())
+}
+
+/// Providers usable right now, in deterministic round-robin priority order.
+fn available_providers(state: &UsageState, cfg: &Config) -> Vec<ApiProvider> {
+    ApiProvider::ALL
+        .iter()
+        .copied()
+        .filter(|p| provider_available(state, *p, cfg))
+        .collect()
+}
+
+/// "43/1000 this month" -- surfaced in the search output header so the model
+/// / user can see quota pressure building.
+fn usage_note(p: ApiProvider) -> String {
+    let mut state = USAGE.lock().unwrap();
+    load_usage(&mut state);
+    let usage = match p {
+        ApiProvider::Exa => &state.exa,
+        ApiProvider::Tavily => &state.tavily,
+    };
+    format!("{}/{} this month", usage.count, p.monthly_limit())
+}
+
+/// Outcome of one API provider attempt.
+enum ApiOutcome {
+    Hits(Vec<Hit>),
+    /// Real SERP, zero results -- stop (don't burn the other provider's quota).
+    Empty,
+    /// Rate-limited / quota-exceeded -- set cooldown, try the other provider.
+    RateLimited { retry_after_secs: u64, msg: String },
+    /// Other failure -- try the other provider / scrape fallback.
+    Fail(String),
+}
+
+/// Parse a `retry-after` header (delta-seconds form per RFC 7231).
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(60)
+}
+
+/// Read a response body, streaming and capped at `byte_limit` (defends against
+/// a runaway response). Returns (status, body_text, response_headers).
+async fn read_capped(
+    resp: reqwest::Response,
+    byte_limit: usize,
+) -> Result<(reqwest::StatusCode, String, reqwest::header::HeaderMap), String> {
+    let status = resp.status();
+    let hdrs = resp.headers().clone();
+    use futures_util::StreamExt;
+    let mut collected: Vec<u8> = Vec::with_capacity(byte_limit.min(64 * 1024));
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("failed to read body: {e}"))?;
+        let room = byte_limit - collected.len();
+        if chunk.len() <= room {
+            collected.extend_from_slice(&chunk);
+        } else {
+            collected.extend_from_slice(&chunk[..room]);
+            break;
+        }
+    }
+    Ok((status, String::from_utf8_lossy(&collected).into_owned(), hdrs))
+}
+
+/// Truncate a string to ~`max` chars for inclusion in error messages.
+fn truncate_msg(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
+fn parse_exa_results(doc: &Value, limit: usize) -> Vec<Hit> {
+    let Some(results) = doc.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for r in results {
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if !url.starts_with("http") || title.is_empty() {
+            continue;
+        }
+        let snippet = r.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        hits.push(Hit { title, url, snippet });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+fn parse_tavily_results(doc: &Value, limit: usize) -> Vec<Hit> {
+    let Some(results) = doc.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for r in results {
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if !url.starts_with("http") || title.is_empty() {
+            continue;
+        }
+        let snippet = r.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        hits.push(Hit { title, url, snippet });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+/// Query Exa. Bills 1 search/call. 429 -> cooldown; 402/403 -> quota/auth.
+async fn search_exa(
+    client: &reqwest::Client,
+    cfg: &Config,
+    query: &str,
+    count: usize,
+    byte_limit: usize,
+) -> ApiOutcome {
+    let Some(key) = ApiProvider::Exa.key(cfg) else {
+        return ApiOutcome::Fail("Exa: no API key (set EXA_API_KEY or use /search-key exa)".into());
+    };
+    if let Some(err) = egress_check("web_search", ApiProvider::Exa.endpoint(), cfg) {
+        return ApiOutcome::Fail(format!("Exa: skipped ({err})"));
+    }
+    let body = json!({
+        "query": query,
+        "numResults": count,
+        "type": "auto",
+        "contents": { "text": { "maxCharacters": 300 } }
+    });
+    let resp = match client
+        .post(ApiProvider::Exa.endpoint())
+        .header("x-api-key", key.as_str())
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ApiOutcome::Fail(format!("Exa: request failed: {e}")),
+    };
+    let (status, text, hdrs) = match read_capped(resp, byte_limit).await {
+        Ok(v) => v,
+        Err(e) => return ApiOutcome::Fail(format!("Exa: {e}")),
+    };
+    let code = status.as_u16();
+    // Map failure modes to cooldown durations so a bad/exhausted key isn't
+    // retried every call (respect `retry-after` when present):
+    //   429 rate-limit -> transient (retry-after, floor 30s)
+    //   401/403 auth   -> bad key/billing (60s; restart to fix the env var)
+    //   402 payment    -> quota exhausted (1h; won't heal until plan change)
+    let (cooldown, label) = match code {
+        429 => (parse_retry_after(&hdrs).max(30), "rate-limited"),
+        401 | 403 => (60, "auth error"),
+        402 => (3600, "payment required / quota"),
+        _ => (0, ""),
+    };
+    if cooldown > 0 {
+        return ApiOutcome::RateLimited {
+            retry_after_secs: cooldown,
+            msg: format!("Exa: {label} (HTTP {code}): {}", truncate_msg(&text, 120)),
+        };
+    }
+    if !status.is_success() {
+        return ApiOutcome::Fail(format!("Exa: HTTP {status}: {}", truncate_msg(&text, 200)));
+    }
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return ApiOutcome::Fail(format!("Exa: JSON parse failed: {e}")),
+    };
+    let hits = parse_exa_results(&doc, count);
+    record_request(ApiProvider::Exa, 1);
+    if hits.is_empty() {
+        ApiOutcome::Empty
+    } else {
+        ApiOutcome::Hits(hits)
+    }
+}
+
+/// Query Tavily. Bills `usage.credits` (1 for basic depth). 429/432/433 -> quota.
+async fn search_tavily(
+    client: &reqwest::Client,
+    cfg: &Config,
+    query: &str,
+    count: usize,
+    byte_limit: usize,
+) -> ApiOutcome {
+    let Some(key) = ApiProvider::Tavily.key(cfg) else {
+        return ApiOutcome::Fail("Tavily: no API key (set TAVILY_API_KEY or use /search-key tavily)".into());
+    };
+    if let Some(err) = egress_check("web_search", ApiProvider::Tavily.endpoint(), cfg) {
+        return ApiOutcome::Fail(format!("Tavily: skipped ({err})"));
+    }
+    let body = json!({
+        "query": query,
+        "search_depth": "basic",
+        "max_results": count,
+        "topic": "general",
+        "include_answer": false,
+        "include_raw_content": false,
+        "include_usage": true
+    });
+    let resp = match client
+        .post(ApiProvider::Tavily.endpoint())
+        .bearer_auth(key.as_str())
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ApiOutcome::Fail(format!("Tavily: request failed: {e}")),
+    };
+    let (status, text, hdrs) = match read_capped(resp, byte_limit).await {
+        Ok(v) => v,
+        Err(e) => return ApiOutcome::Fail(format!("Tavily: {e}")),
+    };
+    let code = status.as_u16();
+    // Cooldown per failure mode (respect `retry-after` when present):
+    //   429 rate-limit    -> transient (retry-after, floor 30s)
+    //   401/403 auth     -> bad key (60s; restart to fix)
+    //   432/433 plan/pay -> monthly quota exhausted (1h; won't heal soon)
+    let (cooldown, label) = match code {
+        429 => (parse_retry_after(&hdrs).max(30), "rate-limited"),
+        401 | 403 => (60, "auth error"),
+        432 | 433 => (3600, "plan quota exhausted"),
+        _ => (0, ""),
+    };
+    if cooldown > 0 {
+        return ApiOutcome::RateLimited {
+            retry_after_secs: cooldown,
+            msg: format!("Tavily: {label} (HTTP {code})"),
+        };
+    }
+    if !status.is_success() {
+        return ApiOutcome::Fail(format!("Tavily: HTTP {status}: {}", truncate_msg(&text, 200)));
+    }
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return ApiOutcome::Fail(format!("Tavily: JSON parse failed: {e}")),
+    };
+    let credits = doc
+        .get("usage")
+        .and_then(|u| u.get("credits"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let hits = parse_tavily_results(&doc, count);
+    record_request(ApiProvider::Tavily, credits);
+    if hits.is_empty() {
+        ApiOutcome::Empty
+    } else {
+        ApiOutcome::Hits(hits)
+    }
+}
+
+async fn search_provider(
+    client: &reqwest::Client,
+    cfg: &Config,
+    p: ApiProvider,
+    query: &str,
+    count: usize,
+    byte_limit: usize,
+) -> ApiOutcome {
+    match p {
+        ApiProvider::Exa => search_exa(client, cfg, query, count, byte_limit).await,
+        ApiProvider::Tavily => search_tavily(client, cfg, query, count, byte_limit).await,
+    }
+}
+
+/// Try the available API providers in round-robin order. Returns the backend +
+/// outcome + which provider succeeded (for the usage note). On rate-limit /
+/// failure of one, tries the next; returns None only when none are available or
+/// all failed (caller then falls through to the scrape chain).
+async fn try_api_providers(
+    client: &reqwest::Client,
+    cfg: &Config,
+    query: &str,
+    count: usize,
+    byte_limit: usize,
+    failures: &mut Vec<String>,
+) -> Option<(Backend, Attempt, ApiProvider)> {
+    let avail = {
+        let mut state = USAGE.lock().unwrap();
+        load_usage(&mut state);
+        available_providers(&state, cfg)
+    };
+    if avail.is_empty() {
+        return None;
+    }
+    let start = ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) as usize % avail.len();
+    for i in 0..avail.len() {
+        let p = avail[(start + i) % avail.len()];
+        match search_provider(client, cfg, p, query, count, byte_limit).await {
+            ApiOutcome::Hits(hits) => return Some((p.backend(), Attempt::Hits(hits), p)),
+            ApiOutcome::Empty => return Some((p.backend(), Attempt::Empty, p)),
+            ApiOutcome::RateLimited { retry_after_secs, msg } => {
+                set_cooldown(p, retry_after_secs);
+                failures.push(msg);
+            }
+            ApiOutcome::Fail(msg) => failures.push(msg),
+        }
+    }
+    None
 }
 
 pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
@@ -873,7 +1443,27 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
     let byte_limit = cfg.fetch_max_bytes.max(64 * 1024);
     let mut failures: Vec<String> = Vec::new();
 
-    // 1) SearXNG via searx.space ranking
+    // 1) Paid API providers (Exa / Tavily) -- round-robin load-balanced,
+    //    quota-tracked, cooldown-aware. Only falls through to scraping when no
+    //    API key is set or every provider is unavailable / over budget.
+    if let Some((backend, attempt, provider)) =
+        try_api_providers(&client, cfg, query, count, byte_limit, &mut failures).await
+    {
+        match attempt {
+            Attempt::Hits(hits) => {
+                return render_hits(query, &backend, &hits, Some(&usage_note(provider)));
+            }
+            Attempt::Empty => {
+                return Outcome::ok(format!(
+                    "No results found for {query:?} on {}.",
+                    backend.label()
+                ));
+            }
+            Attempt::Fail(reason) => failures.push(reason),
+        }
+    }
+
+    // 2) SearXNG via searx.space ranking
     if let Some((backend, attempt)) = try_searxng(
         &client,
         cfg,
@@ -886,7 +1476,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
     .await
     {
         match attempt {
-            Attempt::Hits(hits) => return render_hits(query, &backend, &hits),
+            Attempt::Hits(hits) => return render_hits(query, &backend, &hits, None),
             Attempt::Empty => {
                 return Outcome::ok(format!(
                     "No results found for {query:?} on {}.",
@@ -897,7 +1487,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         }
     }
 
-    // 2) DDG / Mojeek scrape fallbacks
+    // 3) DDG / Mojeek scrape fallbacks
     for (backend, url) in &scrape_backends {
         if let Some(err) = egress_check("web_search", url, cfg) {
             failures.push(format!("{}: skipped ({err})", backend.label()));
@@ -913,7 +1503,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         };
 
         match classify_response(backend, status, &html, html.len(), truncated, count) {
-            Attempt::Hits(hits) => return render_hits(query, backend, &hits),
+            Attempt::Hits(hits) => return render_hits(query, backend, &hits, None),
             Attempt::Empty => {
                 return Outcome::ok(format!(
                     "No results found for {query:?} on {}.{}",
@@ -1377,13 +1967,232 @@ mod tests {
             url: "https://example.com/".into(),
             snippet: "S".into(),
         }];
-        let out = render_hits("q", &Backend::Mojeek, &hits);
+        let out = render_hits("q", &Backend::Mojeek, &hits, None);
         assert!(out.ok);
         assert!(out.output.contains("Mojeek"));
         assert!(out.output.contains("https://example.com/"));
 
-        let out = render_hits("q", &Backend::Searx("searx.example".into()), &hits);
+        let out = render_hits("q", &Backend::Searx("searx.example".into()), &hits, None);
         assert!(out.ok);
         assert!(out.output.contains("SearXNG (searx.example)"));
+    }
+
+    // ---- Exa / Tavily API provider tests (hermetic: no env, no network, no file) ----
+
+    #[test]
+    fn parse_exa_results_structured() {
+        let doc = json!({
+            "requestId": "abc",
+            "results": [
+                {"title": "Rust Lang", "url": "https://www.rust-lang.org/", "text": "Empowering everyone.", "score": 0.9},
+                {"title": "std docs", "url": "https://doc.rust-lang.org/std/", "text": "Standard library.", "score": 0.8},
+                {"title": "bad", "url": "not-a-url", "text": "x"},
+                {"title": "", "url": "https://example.com/", "text": "x"}
+            ]
+        });
+        let hits = parse_exa_results(&doc, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust Lang");
+        assert_eq!(hits[0].url, "https://www.rust-lang.org/");
+        assert_eq!(hits[0].snippet, "Empowering everyone.");
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/std/");
+    }
+
+    #[test]
+    fn parse_exa_results_respects_limit() {
+        let doc = json!({
+            "results": [
+                {"title": "a", "url": "https://a.example/", "text": ""},
+                {"title": "b", "url": "https://b.example/", "text": ""},
+                {"title": "c", "url": "https://c.example/", "text": ""}
+            ]
+        });
+        assert_eq!(parse_exa_results(&doc, 2).len(), 2);
+    }
+
+    #[test]
+    fn parse_exa_results_missing_array() {
+        assert!(parse_exa_results(&json!({"requestId": "x"}), 5).is_empty());
+        assert!(parse_exa_results(&json!({"results": "notarray"}), 5).is_empty());
+    }
+
+    #[test]
+    fn parse_tavily_results_structured() {
+        let doc = json!({
+            "query": "rust",
+            "answer": "Rust is...",
+            "results": [
+                {"title": "Rust Lang", "url": "https://www.rust-lang.org/", "content": "Empowering everyone.", "score": 0.81},
+                {"title": "std", "url": "https://doc.rust-lang.org/std/", "content": "Std lib.", "score": 0.7}
+            ],
+            "usage": {"credits": 1}
+        });
+        let hits = parse_tavily_results(&doc, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust Lang");
+        assert_eq!(hits[0].snippet, "Empowering everyone.");
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/std/");
+    }
+
+    #[test]
+    fn parse_tavily_results_skips_invalid() {
+        let doc = json!({
+            "results": [
+                {"title": "ok", "url": "https://ok.example/", "content": "c"},
+                {"title": "no-url", "url": "", "content": "c"},
+                {"title": "", "url": "https://notitle.example/", "content": "c"}
+            ]
+        });
+        let hits = parse_tavily_results(&doc, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://ok.example/");
+    }
+
+    #[test]
+    fn current_month_is_yyyy_mm() {
+        let m = current_month();
+        assert_eq!(m.len(), 7);
+        assert_eq!(m.as_bytes()[4], b'-');
+        let (y, mo) = m.split_once('-').unwrap();
+        assert!(y.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(y.len(), 4);
+        let mon: u32 = mo.parse().unwrap();
+        assert!((1..=12).contains(&mon));
+    }
+
+    #[test]
+    fn read_provider_usage_keeps_count_same_month() {
+        let doc = json!({"exa": {"month": "2025-06", "count": 42}});
+        let u = read_provider_usage(&doc, "exa", "2025-06");
+        assert_eq!(u.month, "2025-06");
+        assert_eq!(u.count, 42);
+    }
+
+    #[test]
+    fn read_provider_usage_resets_on_new_month() {
+        let doc = json!({"exa": {"month": "2025-06", "count": 42}});
+        let u = read_provider_usage(&doc, "exa", "2025-07");
+        assert_eq!(u.month, "2025-07");
+        assert_eq!(u.count, 0);
+    }
+
+    #[test]
+    fn read_provider_usage_missing_is_default() {
+        let u = read_provider_usage(&json!({}), "exa", "2025-06");
+        assert_eq!(u.count, 0);
+        assert!(u.month.is_empty());
+    }
+
+    fn fresh_state() -> UsageState {
+        UsageState::default()
+    }
+
+    #[test]
+    fn provider_usable_no_key_is_false() {
+        let st = fresh_state();
+        assert!(!provider_usable(&st, ApiProvider::Exa, false));
+        assert!(!provider_usable(&st, ApiProvider::Tavily, false));
+    }
+
+    #[test]
+    fn provider_usable_under_budget_is_true() {
+        let mut st = fresh_state();
+        st.exa = MonthlyUsage { month: current_month(), count: 0 };
+        assert!(provider_usable(&st, ApiProvider::Exa, true));
+    }
+
+    #[test]
+    fn provider_usable_over_budget_is_false() {
+        let mut st = fresh_state();
+        // u64::MAX exceeds any monthly_limit (>=1), so always over budget.
+        st.tavily = MonthlyUsage { month: current_month(), count: u64::MAX };
+        assert!(!provider_usable(&st, ApiProvider::Tavily, true));
+    }
+
+    #[test]
+    fn provider_usable_in_cooldown_is_false() {
+        let mut st = fresh_state();
+        st.exa_cooldown_until = Some(Instant::now() + Duration::from_secs(120));
+        assert!(!provider_usable(&st, ApiProvider::Exa, true));
+    }
+
+    #[test]
+    fn provider_usable_expired_cooldown_is_true() {
+        let mut st = fresh_state();
+        st.exa_cooldown_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(provider_usable(&st, ApiProvider::Exa, true));
+    }
+
+    #[test]
+    fn truncate_msg_passthrough_and_cut() {
+        assert_eq!(truncate_msg("short", 10), "short");
+        let long = "abcdefghij".repeat(5);
+        let t = truncate_msg(&long, 10);
+        assert!(t.len() <= 13); // 10 + "..."
+        assert!(t.starts_with("abcdefghij"));
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_and_default() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), 30);
+
+        let h2 = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&h2), 60);
+    }
+
+    #[test]
+    fn api_provider_labels() {
+        assert_eq!(Backend::Exa.label(), "Exa API");
+        assert_eq!(Backend::Tavily.label(), "Tavily API");
+        assert_eq!(ApiProvider::Exa.backend(), Backend::Exa);
+        assert_eq!(ApiProvider::Tavily.backend(), Backend::Tavily);
+    }
+
+    #[test]
+    fn api_provider_key_reads_persisted_config() {
+        // A key set via /search-key (persisted in cfg.search_keys) is returned
+        // directly — independent of any env var.
+        let mut cfg = Config::default();
+        cfg.search_keys
+            .insert("exa".into(), "exa-persisted-key".into());
+        assert_eq!(
+            ApiProvider::Exa.key(&cfg).as_deref(),
+            Some("exa-persisted-key")
+        );
+        cfg.search_keys
+            .insert("tavily".into(), "tvly-persisted-key".into());
+        assert_eq!(
+            ApiProvider::Tavily.key(&cfg).as_deref(),
+            Some("tvly-persisted-key")
+        );
+    }
+
+    #[test]
+    fn provider_available_with_persisted_key() {
+        // A persisted key (in cfg) makes the provider usable (not over budget,
+        // not in cooldown) even with no env var.
+        let mut cfg = Config::default();
+        cfg.search_keys.insert("exa".into(), "k".into());
+        let st = UsageState::default();
+        assert!(provider_available(&st, ApiProvider::Exa, &cfg));
+        // Do not assert that Tavily is unavailable here: provider resolution
+        // intentionally falls back to TAVILY_API_KEY, which may be present in
+        // the developer/CI environment. No-key behavior is covered directly by
+        // provider_usable_no_key_is_false without consulting process globals.
+    }
+
+    #[test]
+    fn render_hits_shows_usage_note() {
+        let hits = vec![Hit {
+            title: "T".into(),
+            url: "https://example.com/".into(),
+            snippet: "S".into(),
+        }];
+        let out = render_hits("q", &Backend::Exa, &hits, Some("5/1000 this month"));
+        assert!(out.ok);
+        assert!(out.output.contains("Exa API"));
+        assert!(out.output.contains("5/1000 this month"));
     }
 }

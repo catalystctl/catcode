@@ -695,6 +695,11 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         pct: ev.pct,
         messages: ev.messages,
         system_tokens: ev.system_tokens,
+        digest_threshold_tokens: ev.digest_threshold_tokens,
+        compact_threshold_tokens: ev.compact_threshold_tokens,
+        hard_limit_tokens: ev.hard_limit_tokens,
+        response_reserve_tokens: ev.response_reserve_tokens,
+        safety_margin_tokens: ev.safety_margin_tokens,
         by_role: ev.by_role ?? {},
         top_consumers: ev.top_consumers ?? [],
       };
@@ -1015,8 +1020,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           state.toasts,
           "info",
           n > 1
-            ? `Compacted ${n} large result(s)${range}`
-            : `Compacted a large result${range}`,
+            ? `Reclaimed ${n} stale tool payloads${range}`
+            : `Reclaimed a stale tool payload${range}`,
         ),
       };
     }

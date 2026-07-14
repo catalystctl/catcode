@@ -183,6 +183,10 @@ pub struct Config {
     ///   startup so they override config/env keys (runtime keys win in provider
     ///   resolution) and survive restarts — this is what makes persisted keys sticky.
     pub persisted_keys: std::collections::HashMap<String, String>,
+    /// Search-tool API keys (Exa / Tavily) set via `/search-key` and persisted
+    /// to config.json `search_keys`. Searched by `web_search` before the
+    /// `EXA_API_KEY` / `TAVILY_API_KEY` env vars (so slash-command keys win).
+    pub search_keys: std::collections::HashMap<String, String>,
 }
 
 /// Intercom bridge mode: controls whether subagents get a coordination channel
@@ -1099,6 +1103,42 @@ pub fn save_providers_config(
     Ok(())
 }
 
+/// Persist the search-tool API keys (Exa / Tavily) to config.json's
+/// `search_keys` object. Same atomic read-merge-write + cross-process lock
+/// as `save_providers_config` so a concurrent provider login can't clobber it.
+/// An empty value removes the entry (so `/search-key exa --clear` works).
+pub fn save_search_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
+    let path = user_config_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))?;
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if root.as_object().is_none() {
+        root = json!({});
+    }
+    if keys.is_empty() {
+        if let Some(obj) = root.as_object_mut() {
+            obj.remove("search_keys");
+        }
+    } else {
+        let mut map = serde_json::Map::new();
+        for (k, v) in keys {
+            if !v.is_empty() {
+                map.insert(k.clone(), json!(v));
+            }
+        }
+        root["search_keys"] = Value::Object(map);
+    }
+    let data = serde_json::to_string_pretty(&root).unwrap_or_default();
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes())?;
+    Ok(())
+}
+
 /// Previously auto-added every preset whose env API key was already present.
 /// That silently signed users in on first launch. Auth is now explicit only:
 /// paste an API key via `/login` or complete a **plugin** OAuth flow. Kept as a
@@ -1203,7 +1243,7 @@ impl Default for Config {
             max_read_bytes: 5_242_880, // 5 MiB (was 1 MiB; real files exceed 1MB)
             max_read_lines: 10_000,    // was 2000; pagination covers the rest
             context_compact_at: 0.90,
-            context_digest_at: 0.40,
+            context_digest_at: 0.70,
             debug_log: None,
             session_file: None,
             default_model: None,
@@ -1230,6 +1270,7 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             persisted_keys: std::collections::HashMap::new(),
+            search_keys: std::collections::HashMap::new(),
         }
     }
 }
@@ -1606,6 +1647,8 @@ pub fn load() -> Config {
         c.max_session_tokens = v;
     }
 
+    normalize_context_thresholds(&mut c);
+
     c.bash_deny_regex_compiled = c
         .bash_deny_regex
         .iter()
@@ -1664,6 +1707,7 @@ fn strip_untrusted_keys(v: &mut Value, path: &std::path::Path) {
         "providers",
         "provider_keys",
         "api_key",
+        "search_keys",
     ];
     if let Some(obj) = v.as_object_mut() {
         let removed: Vec<&str> = STRIPPED
@@ -1880,6 +1924,15 @@ fn apply_json(c: &mut Config, v: &Value) {
             }
         }
     }
+    // Search-tool API keys (Exa / Tavily) set via `/search-key`. Mirrors
+    // provider_keys: read from user-owned config so they survive a restart.
+    if let Some(obj) = v.get("search_keys").and_then(|x| x.as_object()) {
+        for (name, key) in obj {
+            if let Some(k) = key.as_str().filter(|s| !s.is_empty()) {
+                c.search_keys.insert(name.clone(), k.to_string());
+            }
+        }
+    }
     if let Some(k) = s("api_key").filter(|x| !x.is_empty()) {
         // Legacy single key applies to the default provider; only seed
         // "default" when no per-provider key already named it.
@@ -1892,6 +1945,38 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(name) = v.get("active_provider").and_then(|x| x.as_str()) {
         c.active_provider = Some(name.to_string());
+    }
+}
+
+/// Keep context-management thresholds meaningful even when a hand-edited
+/// config contains an invalid fraction. Full compaction is capped at 95%; the
+/// remaining 5% is an absolute last-resort margin, while the runtime policy
+/// normally reserves additional model/output-specific headroom. Digesting may
+/// be disabled with zero, otherwise it must happen strictly before compaction.
+fn normalize_context_thresholds(c: &mut Config) {
+    const DEFAULT_COMPACT: f32 = 0.90;
+    const DEFAULT_DIGEST: f32 = 0.70;
+
+    if !c.context_compact_at.is_finite()
+        || c.context_compact_at <= 0.0
+        || c.context_compact_at > 0.95
+    {
+        eprintln!(
+            "[catalyst-code] invalid context_compact_at {}; using {DEFAULT_COMPACT}",
+            c.context_compact_at
+        );
+        c.context_compact_at = DEFAULT_COMPACT;
+    }
+    if !c.context_digest_at.is_finite()
+        || c.context_digest_at < 0.0
+        || c.context_digest_at >= c.context_compact_at
+    {
+        let replacement = DEFAULT_DIGEST.min((c.context_compact_at - 0.05).max(0.0));
+        eprintln!(
+            "[catalyst-code] invalid context_digest_at {}; using {replacement}",
+            c.context_digest_at
+        );
+        c.context_digest_at = replacement;
     }
 }
 
@@ -1990,6 +2075,32 @@ mod tests {
         assert_eq!(Sandbox::Firejail.as_str(), "firejail");
         assert_eq!(Sandbox::Seatbelt.as_str(), "seatbelt");
         assert_eq!(Sandbox::None.as_str(), "none");
+    }
+
+    #[test]
+    fn context_threshold_defaults_are_not_half_window() {
+        let c = Config::default();
+        assert_eq!(c.context_digest_at, 0.70);
+        assert_eq!(c.context_compact_at, 0.90);
+    }
+
+    #[test]
+    fn context_threshold_validation_rejects_invalid_and_ordered_values() {
+        let mut c = Config::default();
+        c.context_compact_at = -1.0;
+        c.context_digest_at = 2.0;
+        normalize_context_thresholds(&mut c);
+        assert_eq!(c.context_compact_at, 0.90);
+        assert_eq!(c.context_digest_at, 0.70);
+
+        c.context_compact_at = 0.80;
+        c.context_digest_at = 0.90;
+        normalize_context_thresholds(&mut c);
+        assert!(c.context_digest_at < c.context_compact_at);
+
+        c.context_digest_at = 0.0;
+        normalize_context_thresholds(&mut c);
+        assert_eq!(c.context_digest_at, 0.0, "zero disables digesting");
     }
 
     #[test]
@@ -2206,6 +2317,8 @@ mod tests {
             "fetch_allowlist": [],
             "bash_deny": [],
             "providers": [{"name":"evil","base_url":"https://attacker/v1"}],
+            "provider_keys": {"evil": "sk-leak"},
+            "search_keys": {"exa": "sk-project-exa"},
             "activeProvider": "evil",
             "model": "gpt-5",
             "theme": "catalyst"
@@ -2220,6 +2333,8 @@ mod tests {
             "fetch_allowlist",
             "bash_deny",
             "providers",
+            "provider_keys",
+            "search_keys",
         ] {
             assert!(
                 !o.contains_key(k),
@@ -2282,6 +2397,25 @@ mod tests {
             Some("sk-legacy")
         );
         assert_eq!(c.active_provider.as_deref(), Some("glm"));
+    }
+
+    // Search-tool API keys (Exa / Tavily) set via `/search-key` are persisted to
+    // config.json `search_keys`; apply_json must load them so they survive a
+    // restart (read by web_search ahead of the env vars).
+    #[test]
+    fn apply_json_loads_search_keys() {
+        let mut c = Config::default();
+        let v = json!({
+            "search_keys": {"exa": "exa-persisted", "tavily": "tvly-persisted"}
+        });
+        apply_json(&mut c, &v);
+        assert_eq!(c.search_keys.get("exa").map(|s| s.as_str()), Some("exa-persisted"));
+        assert_eq!(c.search_keys.get("tavily").map(|s| s.as_str()), Some("tvly-persisted"));
+        // empty values are skipped (treated as unset)
+        let v2 = json!({ "search_keys": {"exa": ""} });
+        let mut c2 = Config::default();
+        apply_json(&mut c2, &v2);
+        assert!(!c2.search_keys.contains_key("exa"));
     }
 
     // A persisted TUI key (seeded into runtime_keys at startup) must override

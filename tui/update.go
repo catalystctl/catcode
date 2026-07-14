@@ -424,23 +424,64 @@ func humanBytes(n int64) string {
 	}
 }
 
-// selfReplace atomically swaps the freshly downloaded tmp file over the
-// running executable. On Windows the running exe can't be overwritten in place,
-// so it's moved aside to <exe>.old first (left for the next launch to delete).
-func selfReplace(tmp, exe string) error {
+// createUpdateStage creates the download staging file in the OS temporary
+// directory (/tmp on the usual Unix installations), rather than beside the
+// installed executable.
+func createUpdateStage() (*os.File, error) {
+	return os.CreateTemp(os.TempDir(), "catcode-update.*"+coreExeSuffix())
+}
+
+// selfReplace copies a verified staged download to a short-lived file beside
+// the executable, then atomically swaps it into place. The adjacent file is
+// necessary because rename is only atomic within one filesystem; the full
+// download remains staged in the OS temporary directory.
+//
+// On Windows the running exe can't be overwritten in place, so it's moved
+// aside to <exe>.old first (left for the next launch to delete).
+func selfReplace(staged, exe string) error {
+	src, err := os.Open(staged)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	replacement, err := os.CreateTemp(filepath.Dir(exe), ".catcode-replace.*"+coreExeSuffix())
+	if err != nil {
+		return err
+	}
+	replacementName := replacement.Name()
+	defer os.Remove(replacementName)
+
+	if _, err := io.Copy(replacement, src); err != nil {
+		replacement.Close()
+		return err
+	}
+	if err := replacement.Sync(); err != nil {
+		replacement.Close()
+		return err
+	}
+	if err := replacement.Close(); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(staged); err != nil {
+		return err
+	} else if err := os.Chmod(replacementName, fi.Mode()); err != nil {
+		return err
+	}
+
 	if runtime.GOOS == "windows" {
 		old := exe + ".old"
 		_ = os.Remove(old) // clean up a previous run's leftover (best-effort)
 		if err := os.Rename(exe, old); err != nil {
 			return err
 		}
-		if err := os.Rename(tmp, exe); err != nil {
+		if err := os.Rename(replacementName, exe); err != nil {
 			_ = os.Rename(old, exe) // try to restore the old binary
 			return err
 		}
 		return nil
 	}
-	return os.Rename(tmp, exe)
+	return os.Rename(replacementName, exe)
 }
 
 // canWriteDir reports whether the current user can create (and remove) a
@@ -546,9 +587,10 @@ func runUpdate() int {
 		return 1
 	}
 
-	// Download into a temp file in the SAME directory (so the rename is atomic
-	// and never crosses a filesystem boundary).
-	tmp, err := os.CreateTemp(dir, ".catcode-update.*"+coreExeSuffix())
+	// Keep the potentially large download out of the install directory. After
+	// verification, selfReplace performs the minimal adjacent copy required for
+	// an atomic final rename.
+	tmp, err := createUpdateStage()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ✗ could not create temp file: %v\n", err)
 		return 1

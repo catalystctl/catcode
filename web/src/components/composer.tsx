@@ -29,6 +29,7 @@ import { COMMANDS, filterCommands } from "@/lib/commands";
 import type { FileEntry, SkillInfo } from "@/lib/types";
 
 interface Props {
+  compact?: boolean;
   streaming: boolean;
   followUpQueued?: boolean;
   /** When a HITL banner owns Esc (approve/ask/sudo/intercom), composer must not abort. */
@@ -107,6 +108,7 @@ function isCommandSearch(text: string): boolean {
 
 export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   {
+    compact = false,
     streaming,
     followUpQueued = false,
     hitlOpen = false,
@@ -518,7 +520,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const flyoutOpen = cmdOpen || fileOpen;
 
   return (
-    <div className="relative border-t border-ink-800/80 bg-ink-950/80 px-4 pb-4 pt-2 backdrop-blur sm:px-6">
+    <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-3 pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {/* Flyout (positioned above the input box) */}
@@ -582,7 +584,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                       className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
                       title="Queue follow-up (Enter)"
                     >
-                      <SendIcon width={14} height={14} /> Queue
+                      <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Queue</span>
                     </button>
                     <button
                       onClick={submitSteer}
@@ -590,7 +592,8 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                       className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3.5 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
                       title="Steer in-flight turn (Ctrl+Enter)"
                     >
-                      Steer
+                      {compact && <span aria-hidden="true">↗</span>}
+                      <span className={compact ? "sr-only" : ""}>Steer</span>
                     </button>
                   </>
                 )}
@@ -598,7 +601,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                   onClick={onAbort}
                   className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3.5 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
                 >
-                  <StopIcon width={14} height={14} /> Stop
+                  <StopIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Stop</span>
                 </button>
               </>
             ) : (
@@ -607,12 +610,12 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                 disabled={disabled || (!text.trim() && images.length === 0)}
                 className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3.5 text-[13px] font-semibold text-white transition-all hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
               >
-                <SendIcon width={14} height={14} /> Send
+                <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Send</span>
               </button>
             )}
           </div>
         </div>
-        <div className="mt-1.5 flex items-center justify-between px-1 text-[11px] text-ink-500">
+        <div className={`mt-1.5 items-center justify-between px-1 text-[11px] text-ink-500 ${compact ? "hidden" : "flex"}`}>
           <span className="flex items-center gap-1.5">
             <BoltIcon width={11} height={11} className="text-accent-soft" />
             <span className="font-mono">{modelLabel}</span>

@@ -44,6 +44,12 @@ pub enum Command {
         #[serde(default)]
         provider: Option<String>,
     },
+    /// Set or clear a search-tool API key (Exa / Tavily) for `web_search`.
+    /// `provider` is "exa" | "tavily"; an empty `api_key` clears it. Persisted
+    /// to config.json `search_keys` so it survives restarts; read by
+    /// `search_tool` ahead of the `EXA_API_KEY` / `TAVILY_API_KEY` env vars.
+    #[serde(rename = "set_search_key")]
+    SetSearchKey { provider: String, api_key: String },
     /// Switch the active model provider at runtime. Re-resolves base URL / key /
     /// wire protocol, re-discovers models, and emits `provider_changed` + a
     /// fresh `models` event. Unknown names are ignored (stays on current).
