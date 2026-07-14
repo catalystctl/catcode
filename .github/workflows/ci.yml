@@ -112,7 +112,7 @@ jobs:
         run: bun test
       - name: build
         working-directory: web
-        run: bun run build
+        run: node node_modules/next/dist/bin/next build
         env:
           # Single-user localhost default; build must not require a public origin.
           CATCODE_WEB_ORIGIN: http://localhost:49283

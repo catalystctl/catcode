@@ -28,6 +28,10 @@ RT="" RT_BIN=""
 if command -v bun >/dev/null 2>&1; then RT="bun"; RT_BIN="$(command -v bun)"
 elif command -v npm >/dev/null 2>&1; then RT="npm"; RT_BIN="$(command -v npm)"
 else echo "error: need bun or npm to build the web bundle" >&2; exit 1; fi
+command -v node >/dev/null 2>&1 || {
+  echo "error: need Node.js to build the Next.js web bundle" >&2
+  exit 1
+}
 echo "==> building catalyst-code web ${VERSION} (runtime: ${RT})"
 
 # --- 1. SDK -----------------------------------------------------------------
@@ -40,7 +44,7 @@ echo "[2/5] sdk: build (tsc -> sdk/dist/)..."
 echo "[3/5] web: install deps (${RT})..."
 ( cd web && $RT install )
 echo "[4/5] web: next build (output: standalone)..."
-( cd web && NEXT_TELEMETRY_DISABLED=1 $RT run build )
+( cd web && NEXT_TELEMETRY_DISABLED=1 node node_modules/next/dist/bin/next build )
 
 # --- 2b. bundle the custom Next server (WS terminal at /api/terminal) --------
 # Next app-router route handlers cannot upgrade to WebSocket, so the custom
