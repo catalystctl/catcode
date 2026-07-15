@@ -1,6 +1,9 @@
 // AgentSessionEvent — the event union pi-web's `handleEvent` switch consumes.
 // Mirrors `@earendil-works/pi-agent-core` `AgentEvent` (base variants) plus the
 // session-specific overrides/additions from `pi-coding-agent`'s `AgentSession`.
+//
+// Every raw harness JSONL event is ALSO re-emitted as `{ type: "core_event", event }`
+// so SDK consumers can observe the full core protocol without dropping PI mapping.
 
 import type {
   AgentMessage,
@@ -9,8 +12,10 @@ import type {
   ThinkingLevel,
   ToolResultMessage,
 } from "./types.js";
+import type { CoreEvent } from "./core-events.js";
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+export type CoreEventListener = (event: CoreEvent) => void;
 
 export type AgentSessionEvent =
   // ── base AgentEvent variants ──
@@ -56,7 +61,9 @@ export type AgentSessionEvent =
       delayMs: number;
       errorMessage: string;
     }
-  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+  /** Passthrough of every raw core JSONL event (including ones with no PI mapping). */
+  | { type: "core_event"; event: CoreEvent };
 
 /** Prompt options — mirrors `pi-coding-agent`'s `PromptOptions`. */
 export interface PromptOptions {

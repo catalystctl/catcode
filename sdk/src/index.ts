@@ -52,10 +52,41 @@ export type {
 export type {
   AgentSessionEvent,
   AgentSessionEventListener,
+  CoreEventListener,
   PromptOptions,
   InputSource,
   ModelCycleResult,
 } from "./events.js";
+
+// Core JSONL event catalog (every harness Event::new kind)
+export {
+  CORE_EVENT_TYPES,
+  isKnownCoreEventType,
+  type CoreEvent,
+  type CoreEventType,
+  type NarrowCoreEvent,
+  type ProtocolHelloEvent,
+  type FileChangeEvent,
+  type CheckpointCreatedEvent,
+  type CheckpointRestoredEvent,
+  type CheckpointsEvent,
+  type WorktreeReadyEvent,
+  type WorktreeCleanedEvent,
+  type WorktreePromotedEvent,
+  type AuditEvent,
+  type CostUpdateEvent,
+  type GoalStepVerdictEvent,
+  type GoalStateEvent,
+  type GoalPlanEvent,
+  type GoalPhaseEvent,
+  type SubagentStartEvent,
+  type SubagentDoneEvent,
+  type SubagentProgressEvent,
+  type ApprovalRequestEvent,
+  type AskRequestEvent,
+  type SudoRequestEvent,
+  type MetricsEvent,
+} from "./core-events.js";
 
 // Theme
 export {
@@ -180,4 +211,4 @@ export {
 } from "./sdk.js";
 
 // Low-level process bridge (advanced usage / testing).
-export { CoreProcess, type CoreProcessOptions, type ReadyPayload, type CoreEvent, type CoreCommand } from "./core-process.js";
+export { CoreProcess, type CoreProcessOptions, type ReadyPayload, type CoreCommand } from "./core-process.js";

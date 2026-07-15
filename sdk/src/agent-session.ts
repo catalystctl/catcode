@@ -37,6 +37,7 @@ import {
 import {
   type AgentSessionEvent,
   type AgentSessionEventListener,
+  type CoreEventListener,
   type ModelCycleResult,
   type PromptOptions,
 } from "./events.js";
@@ -254,6 +255,21 @@ export class AgentSession {
   subscribe(listener: AgentSessionEventListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to raw core JSONL events (every `Event::new` kind from the
+   * harness). Prefer this when you need protocol fidelity; use `subscribe`
+   * for the PI-compatible stream (which also re-emits each raw event as
+   * `{ type: "core_event", event }`).
+   */
+  subscribeCore(listener: CoreEventListener): () => void {
+    return this.core.on(listener);
+  }
+
+  /** Low-level access to the spawned core process (commands + raw events). */
+  get coreProcess(): CoreProcess {
+    return this.core;
   }
 
   private emit(event: AgentSessionEvent): void {
@@ -834,13 +850,17 @@ export class AgentSession {
 
   // ── Core event translation ──
   private handleCoreEvent(ev: CoreEvent): void {
+    // Always re-emit the raw harness event so every core kind is available via
+    // `subscribe()` as `{ type: "core_event", event }` (and via `subscribeCore`).
+    this.emit({ type: "core_event", event: ev });
+
     switch (ev.type) {
       case "ready":
       case "authed":
       case "provider_changed":
         break;
       case "models": {
-        const models = (ev.models ?? []).map((m: any) => toModel(m, this._provider));
+        const models = ((ev.models as any[]) ?? []).map((m: any) => toModel(m, this._provider));
         this.services.modelRegistry._setModels(models);
         break;
       }
@@ -848,12 +868,12 @@ export class AgentSession {
         this.onDelta(String(ev.text ?? ""));
         break;
       case "thinking":
-        this.onThinking(String(ev.text ?? ""));
+        this.onThinking(String(ev.thinking ?? ev.text ?? ""));
         break;
       case "tool_call_start":
       case "tool_call_name":
       case "tool_call_args":
-        // Granular streaming events — ignored (canonical `tool_call` is used).
+        // Granular streaming events — ignored for PI mapping (canonical `tool_call`).
         break;
       case "tool_call":
         this.onToolCall(ev);
@@ -880,7 +900,6 @@ export class AgentSession {
         this.onError2(String(ev.message ?? "unknown error"));
         break;
       case "info":
-        // info notices (queued prompt, vision handoff, etc.) — ignored.
         break;
       case "history":
         this.onHistory(ev);
@@ -892,23 +911,21 @@ export class AgentSession {
       case "compacted":
         this.onCompacted(ev);
         break;
-      case "digested":
-        break;
-      case "sessions":
-        break;
       case "approval_request":
         void this.onApprovalRequest(ev);
         break;
-      case "approval_changed":
+      case "ask_request":
+        void this.onAskRequest(ev);
+        break;
+      case "sudo_request":
+        void this.onSudoRequest(ev);
         break;
       case "intercom_message":
         void this.onIntercomMessage(ev);
         break;
-      case "subagent_progress":
-        // Surfaced via the parent spawn tool_call/tool_result; nothing to emit.
-        break;
+      // Remaining core events are available via `core_event` / `subscribeCore`
+      // (protocol_hello, file_change, checkpoints, worktrees, goals, plugins, …).
       default:
-        // Unknown event — ignore.
         break;
     }
   }
@@ -1259,6 +1276,68 @@ export class AgentSession {
       }
     }
     this.core.send({ type: "approve", request_id: requestId, decision });
+  }
+
+  private async onAskRequest(ev: CoreEvent): Promise<void> {
+    const requestId = String(ev.request_id ?? "");
+    const questions = ev.questions;
+    let answers: Record<string, unknown> | null = {};
+    if (this.uiContext) {
+      try {
+        const summary = Array.isArray(questions)
+          ? questions
+              .map((q: any) => String(q?.prompt ?? q?.id ?? ""))
+              .filter(Boolean)
+              .join("\n")
+          : String(questions ?? "");
+        const reply = await this.uiContext.input("Agent question", summary || "Answer the agent");
+        if (reply === undefined) {
+          answers = null; // skip
+        } else if (Array.isArray(questions) && questions.length === 1 && questions[0]?.id) {
+          answers = { [String(questions[0].id)]: reply };
+        } else {
+          answers = { answer: reply };
+        }
+      } catch {
+        answers = null;
+      }
+    }
+    this.core.send({
+      type: "ask_reply",
+      request_id: requestId,
+      answers: answers === null ? null : answers,
+    });
+  }
+
+  private async onSudoRequest(ev: CoreEvent): Promise<void> {
+    const requestId = String(ev.request_id ?? "");
+    const command = String(ev.command ?? "");
+    let approved = false;
+    let password: string | undefined;
+    if (this.uiContext) {
+      try {
+        approved = await this.uiContext.confirm(
+          "Approve sudo?",
+          command || "Agent requested elevated privileges",
+        );
+        if (approved) {
+          const pw = await this.uiContext.input("sudo password", "Password (not stored)");
+          if (pw === undefined) {
+            approved = false;
+          } else {
+            password = pw;
+          }
+        }
+      } catch {
+        approved = false;
+      }
+    }
+    this.core.send({
+      type: "sudo_reply",
+      request_id: requestId,
+      approved,
+      ...(password !== undefined ? { password } : {}),
+    });
   }
 
   private async onIntercomMessage(ev: CoreEvent): Promise<void> {

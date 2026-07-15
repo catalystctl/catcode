@@ -76,9 +76,13 @@ async function main() {
       case "thinking_level_changed": console.log(event.level); break;
       case "session_info_changed": console.log(event.name); break;
       case "queue_update": console.log(event.steering.length); break;
+      case "core_event": console.log(event.event.type); break;
     }
   });
-
+  const unsubCore = session.subscribeCore((ev) => {
+    console.log("core", ev.type);
+  });
+  void unsubCore;
   // model/thinking interception (pi-web monkey-patches extensionRunner.emit)
   const runner = session.extensionRunner;
   const original = runner.emit.bind(runner);

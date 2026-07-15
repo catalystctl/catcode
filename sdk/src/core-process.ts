@@ -12,6 +12,36 @@ import { createInterface } from "node:readline";
 import { openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { resolveCoreBinary, configDir, ensureDir } from "./config.js";
+import type { CoreEvent } from "./core-events.js";
+
+export type { CoreEvent } from "./core-events.js";
+export {
+  CORE_EVENT_TYPES,
+  isKnownCoreEventType,
+  type CoreEventType,
+  type NarrowCoreEvent,
+  type ProtocolHelloEvent,
+  type FileChangeEvent,
+  type CheckpointCreatedEvent,
+  type CheckpointRestoredEvent,
+  type CheckpointsEvent,
+  type WorktreeReadyEvent,
+  type WorktreeCleanedEvent,
+  type WorktreePromotedEvent,
+  type AuditEvent,
+  type CostUpdateEvent,
+  type GoalStepVerdictEvent,
+  type GoalStateEvent,
+  type GoalPlanEvent,
+  type GoalPhaseEvent,
+  type SubagentStartEvent,
+  type SubagentDoneEvent,
+  type SubagentProgressEvent,
+  type ApprovalRequestEvent,
+  type AskRequestEvent,
+  type SudoRequestEvent,
+  type MetricsEvent,
+} from "./core-events.js";
 
 export interface CoreProcessOptions {
   cwd: string;
@@ -47,8 +77,6 @@ export interface ReadyPayload {
   bash_timeout_secs: number;
   resumed_messages: number;
 }
-
-export type CoreEvent = Record<string, any> & { type: string };
 
 export interface PendingRequest {
   matchType: string | string[];

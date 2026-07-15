@@ -98,10 +98,15 @@ reads the named env var at request time.
 ## Protocol mapping
 
 The core speaks newline-delimited JSON over stdin/stdout. `AgentSession`
-translates it into the PI event stream:
+translates a subset into the PI event stream, and **always** re-emits every
+raw harness event as `{ type: "core_event", event }` so no core kind is
+dropped. Prefer `session.subscribeCore(fn)` (or `session.coreProcess`) when
+you need the full protocol without PI wrapping. The catalog is exported as
+`CORE_EVENT_TYPES` / `CoreEvent` from `@catalyst-code/coding-agent`.
 
 | Harness event        | PI `AgentSessionEvent`(s)                                              |
 |----------------------|------------------------------------------------------------------------|
+| *(every event)*      | `core_event` (passthrough; also via `subscribeCore`)                   |
 | `ready` / `models`   | (populates the shared `ModelRegistry`; no PI event)                    |
 | `delta`              | `agent_start` → `turn_start` → `message_start` → `message_update` (`text_delta`) |
 | `thinking`           | `message_update` (`thinking_delta`)                                   |
@@ -112,13 +117,17 @@ translates it into the PI event stream:
 | `aborted`            | `message_end`? → `turn_end` → `agent_end`                            |
 | `http_retry`         | `auto_retry_start` / `auto_retry_end`                                  |
 | `compacted`          | `compaction_start` → `compaction_end`                                 |
-| `approval_request`  | routed through bound `ExtensionUIContext.confirm` → `approve`          |
+| `approval_request`   | routed through bound `ExtensionUIContext.confirm` → `approve`          |
+| `ask_request`        | routed through `ExtensionUIContext.input` → `ask_reply`                |
+| `sudo_request`       | routed through `confirm`/`input` → `sudo_reply`                        |
 | `intercom_message`   | routed through `ExtensionUIContext.input` → `intercom_reply`           |
 | `history`            | rebuilds `session.messages` from the resumed transcript               |
+| `protocol_hello`, `file_change`, `cost_update`, `audit`, `checkpoint_*`, `worktree_*`, `goal_*`, `plugin_*`, … | `core_event` only (no PI mapping) |
 
 Commands sent to the core: `init`, `send`/`steer` (with `model` +
 `reasoning_effort`), `abort`, `compact`, `set_model`/`set_provider`/`set_key`,
-`stats`, `new_session`/`load_session`, `approve`, `intercom_reply`.
+`stats`, `new_session`/`load_session`, `approve`, `ask_reply`, `sudo_reply`,
+`intercom_reply`, checkpoint/worktree commands as supported by core.
 
 ## Package layout
 
@@ -128,6 +137,7 @@ src/
   types.ts                  # Model, messages, AgentState, … (PI-compatible)
   ai.ts                     # pi-ai subset: getSupportedThinkingLevels, getModel, …
   events.ts                 # AgentSessionEvent union + PromptOptions
+  core-events.ts            # CORE_EVENT_TYPES + CoreEvent catalog
   theme.ts                  # Theme, initTheme, ThemeColor, ThemeBg
   auth-storage.ts           # AuthStorage (+ runtime-key forwarding)
   model-registry.ts         # ModelRegistry + shared singletons
