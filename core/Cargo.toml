@@ -22,9 +22,12 @@ base64 = "0.22"
 rand = "0.8"
 libc = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+bytes = "1"
 
 [dev-dependencies]
 filetime = "0.2"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
+lto = "thin"
+codegen-units = 1

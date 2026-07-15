@@ -245,6 +245,15 @@ pub fn summary(workspace: &Path) -> RecallSummary {
     Store::new(Store::default_root()).summary(workspace)
 }
 
+/// Rolling synonym miss/hit counts for the embedding preference gate.
+pub fn rolling_synonym_counts() -> (u64, u64) {
+    // Best-effort: use the current process cwd as workspace; callers in
+    // build_relevant_tail don't always have a Path, and empty is fine (gate off).
+    let ws = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let s = summary(&ws);
+    (s.synonym_miss_offers, s.synonym_miss_gets)
+}
+
 /// JSON-friendly summary for tool output / metrics.
 pub fn summary_json(workspace: &Path) -> serde_json::Value {
     let s = summary(workspace);

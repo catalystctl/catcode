@@ -1,9 +1,11 @@
 //! Goal mode: first-class plan-then-deploy orchestration.
 //!
 //! `/goal` (TUI/web) sends `start_goal`. The core owns a phase machine:
-//! planning → plan_ready (optional) → deploying → running → done|failed.
+//! planning → plan_ready (optional) → deploying → running → synthesizing →
+//! done|failed.
 //! The planning turn must call `goal_write_plan` with a structured plan;
 //! deploy runs subagents under the user's concurrency and model/provider caps.
+//! After workers finish, a parent synthesizing turn reports results to the user.
 
 use crate::protocol::{emit, Event};
 use crate::tools::Outcome;
@@ -27,6 +29,8 @@ pub enum GoalPhase {
     PlanReady,
     Deploying,
     Running,
+    /// Workers finished; parent turn is summarizing results for the user.
+    Synthesizing,
     Blocked,
     Done,
     Failed,
@@ -40,6 +44,7 @@ impl GoalPhase {
             GoalPhase::PlanReady => "plan_ready",
             GoalPhase::Deploying => "deploying",
             GoalPhase::Running => "running",
+            GoalPhase::Synthesizing => "synthesizing",
             GoalPhase::Blocked => "blocked",
             GoalPhase::Done => "done",
             GoalPhase::Failed => "failed",
@@ -155,6 +160,9 @@ pub struct GoalMode {
     /// Optional revise feedback appended on the next planning turn.
     #[serde(default)]
     pub revise_feedback: Option<String>,
+    /// Speculative scout findings gathered while the planner runs.
+    #[serde(default)]
+    pub scout_findings: Option<String>,
 }
 
 impl Default for GoalMode {
@@ -179,6 +187,7 @@ impl Default for GoalMode {
             reasoning_effort: "medium".into(),
             deploy_after_turn: false,
             revise_feedback: None,
+            scout_findings: None,
         }
     }
 }
@@ -238,6 +247,49 @@ impl GoalMode {
     }
 }
 
+/// Human-facing scheduling profile derived from the user's concurrency cap.
+/// A high cap is treated as an instruction to shape the plan for breadth, not
+/// merely as a larger semaphore for a plan that may still be entirely serial.
+pub fn execution_profile(concurrency: u32) -> &'static str {
+    match concurrency {
+        0 | 1 => "serial",
+        2..=7 => "parallel",
+        _ => "ultra_parallel",
+    }
+}
+
+fn planning_parallelism_guidance(mode: &GoalMode) -> String {
+    let available = mode.concurrency.min(mode.max_tasks).max(1);
+    match execution_profile(mode.concurrency) {
+        "ultra_parallel" => {
+            // Leave room for an integration/review task when the task budget
+            // permits, while still asking the planner to fill almost all of a
+            // large concurrency window immediately.
+            let roots = if mode.max_tasks > available {
+                available
+            } else {
+                available.saturating_sub(1).max(1)
+            };
+            format!(
+                r#"Execution profile: ULTRA PARALLEL.
+- Treat the {available} available slots as a throughput budget that should be actively used.
+- Aim for about {roots} useful root steps (empty depends_on) in the first launch window when the goal has enough separable work.
+- Split reconnaissance by independent area and run it concurrently; do not put one global scout in front of unrelated workers.
+- Partition implementation steps by non-overlapping files/components. Add dependencies only when a step truly consumes another step's artifact.
+- Reserve a final integration/review step when useful, depending only on the specific work it validates.
+- A sequential chain is still correct for genuinely indivisible work, but briefly say why in the plan summary."#
+            )
+        }
+        "parallel" => format!(
+            r#"Execution profile: PARALLEL.
+- Expose up to {available} independent root steps where the work naturally separates.
+- Do not make unrelated work wait behind a single reconnaissance step.
+- Add depends_on only for a real data, artifact, or ordering dependency."#
+        ),
+        _ => "Execution profile: SERIAL. Produce the shortest dependency chain that safely completes the goal.".into(),
+    }
+}
+
 /// Resolve which model a step should run with, given role overrides + allowlist.
 pub fn resolve_step_model(
     mode: &GoalMode,
@@ -250,10 +302,12 @@ pub fn resolve_step_model(
         "reviewer" => mode.role_models.reviewer.clone(),
         _ => None,
     };
-    // Role override wins when set (Advanced section is explicit).
-    let candidate = role
-        .or(step_model)
-        .or_else(|| mode.allowed_models.first().cloned());
+    // Role override wins when set (Advanced section is explicit). Do NOT
+    // auto-pin `allowed_models[0]` here — that forced every step through the
+    // model-override path (and previously the worktree parallel wrapper) even
+    // when the planner omitted step.model. Parent model + allowlist filter in
+    // `resolve_model_candidates` already enforces the allowlist.
+    let candidate = role.or(step_model);
     match candidate {
         Some(m)
             if !mode.allowed_models.is_empty() && !mode.allowed_models.iter().any(|a| a == &m) =>
@@ -262,6 +316,20 @@ pub fn resolve_step_model(
             mode.allowed_models.first().cloned()
         }
         other => other,
+    }
+}
+
+/// Whether a goal deploy step should run in a git worktree when concurrency > 1.
+///
+/// Read-focused agents write disjoint artifacts (e.g. `review/<id>.md`) and do
+/// not need full-tree isolation. Forcing `worktree:true` on every step wrapped
+/// each one as a one-item parallel batch and raced concurrent `git worktree add`,
+/// which aborted entire review waves (session 2026-07-15_13-46-39).
+pub fn goal_step_needs_worktree(agent: &str) -> bool {
+    match agent {
+        "scout" | "researcher" | "planner" | "reviewer" | "context-builder" | "oracle" => false,
+        // worker (and unknown/custom agents that may edit shared files)
+        _ => true,
     }
 }
 
@@ -355,6 +423,7 @@ pub fn new_goal(args: StartGoalArgs) -> Result<GoalMode, String> {
         reasoning_effort: args.reasoning_effort.unwrap_or_else(|| "medium".into()),
         deploy_after_turn: false,
         revise_feedback: None,
+        scout_findings: None,
     })
 }
 
@@ -525,9 +594,14 @@ pub fn apply_plan(
     };
 
     let mut prompts = Vec::new();
+    let scout_block = mode
+        .scout_findings
+        .as_ref()
+        .map(|s| format!("\n\n# Speculative scout findings\n{s}"))
+        .unwrap_or_default();
     for step in &plan.steps {
         let full_task = format!(
-            "# Goal\n{}\n\n# Step: {}\n{}\n\n# Validation criteria for the overall goal\n{}",
+            "# Goal\n{}\n\n# Step: {}\n{}\n\n# Validation criteria for the overall goal\n{}{}",
             mode.goal,
             step.title,
             step.task,
@@ -539,7 +613,8 @@ pub fn apply_plan(
                     .map(|v| format!("- {v}"))
                     .collect::<Vec<_>>()
                     .join("\n")
-            }
+            },
+            scout_block
         );
         prompts.push(DeployPrompt {
             step_id: step.id.clone(),
@@ -761,6 +836,7 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
         .as_ref()
         .map(|f| format!("\n\n## Revision feedback from the user\n{f}\n"))
         .unwrap_or_default();
+    let parallelism_guidance = planning_parallelism_guidance(mode);
 
     format!(
         r#"You are in GOAL MODE. Your only job this turn is to produce a structured deployment plan for subagents — do not implement the goal yourself.
@@ -776,6 +852,9 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
 - {role_line}
 - {model_conc}
 {revise}
+## Scheduling profile
+{parallelism_guidance}
+
 ## Required action
 1. Optionally use read/search tools briefly if you need repo context to plan well.
 2. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.
@@ -799,7 +878,120 @@ After goal_write_plan succeeds, briefly confirm the plan in one short paragraph.
         role_line = role_line,
         model_conc = model_conc,
         revise = revise,
+        parallelism_guidance = parallelism_guidance,
     )
+}
+
+/// Prompt for the parent wrap-up turn after deploy waves finish.
+pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
+    let mut steps = String::new();
+    for p in &mode.prompts {
+        let title = if p.title.is_empty() {
+            p.step_id.clone()
+        } else {
+            p.title.clone()
+        };
+        let summary = p
+            .summary
+            .as_deref()
+            .unwrap_or("(no summary)")
+            .trim();
+        let summary = truncate_str(summary, 1200);
+        steps.push_str(&format!(
+            "- [{status}] {title} ({agent}): {summary}\n",
+            status = p.status.as_str(),
+            title = title,
+            agent = p.agent,
+            summary = summary,
+        ));
+    }
+    if steps.is_empty() {
+        steps.push_str("(no step results)\n");
+    }
+    let plan_summary = mode
+        .plan
+        .as_ref()
+        .map(|p| p.summary.as_str())
+        .unwrap_or("(none)");
+    let failed = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Failed)
+        .count();
+    let skipped = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Skipped)
+        .count();
+    let outcome = if failed == 0 && skipped == 0 {
+        "All steps completed successfully.".to_string()
+    } else if failed == 0 {
+        format!("All runnable steps completed; {skipped} skipped.")
+    } else {
+        format!("{failed} step(s) failed; {skipped} skipped.")
+    };
+
+    format!(
+        r#"GOAL MODE — deployment finished. Your only job this turn is to report results to the user.
+
+## Goal
+{goal}
+
+## Plan summary
+{plan_summary}
+
+## Deploy outcome
+{outcome}
+
+## Step results
+{steps}
+## Instructions
+1. Write a clear completion summary for the user: what was done, what failed (if anything), and notable files/changes from the step results.
+2. If something failed, suggest the smallest next action — do not silently re-plan or re-deploy.
+3. Do not call goal_write_plan. Do not spawn more goal workers unless the user asks.
+4. Call `finish` when the summary is done."#,
+        goal = mode.goal,
+        plan_summary = plan_summary,
+        outcome = outcome,
+        steps = steps,
+    )
+}
+
+/// Mark a synthesizing goal as Done (or Failed if the wrap-up was aborted).
+pub fn finish_synthesis(mode: &mut GoalMode, cancelled: bool) {
+    if mode.phase != GoalPhase::Synthesizing {
+        return;
+    }
+    if cancelled {
+        fail_goal(mode, "goal wrap-up aborted");
+        return;
+    }
+    let failed: Vec<&str> = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Failed)
+        .map(|p| p.step_id.as_str())
+        .collect();
+    let skipped: Vec<&str> = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Skipped)
+        .map(|p| p.step_id.as_str())
+        .collect();
+    let msg = if failed.is_empty() {
+        "goal complete".to_string()
+    } else {
+        format!(
+            "goal complete with {} failed step(s){}",
+            failed.len(),
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(", {} skipped", skipped.len())
+            }
+        )
+    };
+    transition(mode, GoalPhase::Done, Some(&msg));
 }
 
 // ---------------------------------------------------------------------------
@@ -807,12 +999,19 @@ After goal_write_plan succeeds, briefly confirm the plan in one short paragraph.
 // ---------------------------------------------------------------------------
 
 /// Run deploy for the current plan. Caller must hold no goal lock across await.
-pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: CancellationToken) {
+///
+/// On success, leaves the goal in [`GoalPhase::Synthesizing`] so the caller can
+/// start a parent wrap-up turn. Returns `true` when that wrap-up should run.
+pub async fn deploy_goal(
+    st: Arc<State>,
+    client: reqwest::Client,
+    cancel: CancellationToken,
+) -> bool {
     // Snapshot config for deploy.
     let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id) = {
         let mode = st.goal.lock().await;
         if mode.plan.is_none() || mode.prompts.is_empty() {
-            return;
+            return false;
         }
         (
             mode.parent_model.clone(),
@@ -826,7 +1025,7 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
     {
         let mut mode = st.goal.lock().await;
         if mode.id != goal_id {
-            return;
+            return false;
         }
         mode.deploy_after_turn = false;
         transition(
@@ -849,7 +1048,7 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
         Err(e) => {
             let mut mode = st.goal.lock().await;
             fail_goal(&mut mode, format!("deploy ordering failed: {e}"));
-            return;
+            return false;
         }
     };
 
@@ -882,7 +1081,7 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
         if cancel.is_cancelled() {
             let mut mode = st.goal.lock().await;
             fail_goal(&mut mode, "goal cancelled");
-            return;
+            return false;
         }
 
         // Mark wave running.
@@ -973,9 +1172,22 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
                     if let Some(m) = &p.model {
                         args["model"] = json!(m);
                     }
+                    // Isolate only mutating agents when concurrency > 1. Read-
+                    // focused reviewers/scouts share the main tree (disjoint
+                    // artifact paths) — avoiding concurrent git worktree races.
+                    let workspace = st_c.cfg.read().await.workspace.clone();
+                    if global_conc > 1
+                        && goal_step_needs_worktree(&p.agent)
+                        && crate::worktree::is_git_repo(&workspace)
+                    {
+                        args["worktree"] = json!(true);
+                    }
                     let provider = st_c
                         .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
                         .await;
+                    // Single-agent execute (worktree handled inside execute when set).
+                    // Previously wrapped every step as a one-item parallel batch
+                    // whenever concurrency > 1, which raced git worktree add.
                     let outcome = crate::subagent::execute(
                         st_c, client_c, provider, parent, args, cancel_c, 0,
                     )
@@ -993,10 +1205,13 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
                     if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
                         if ok {
                             p.status = DeployStatus::Done;
-                            p.summary = Some(truncate_str(&output, 400));
+                            // Keep enough of the output for the synthesizing
+                            // turn to report real findings/errors (400 chars
+                            // was too little for review goals).
+                            p.summary = Some(truncate_str(&output, 1600));
                         } else {
                             p.status = DeployStatus::Failed;
-                            p.summary = Some(truncate_str(&output, 400));
+                            p.summary = Some(truncate_str(&output, 1600));
                             wave_failed = true;
                             any_failed = true;
                             failed_steps.insert(step_id.clone());
@@ -1029,59 +1244,120 @@ pub async fn deploy_goal(st: Arc<State>, client: reqwest::Client, cancel: Cancel
         // Do NOT fail-fast: continue to the next wave so independent steps
         // still run. Steps whose depends_on includes a failed step are
         // skipped at the top of the next wave iteration.
+
+        // Verifier loop: when the plan declares validation checks, run a
+        // reviewer after each wave that had successful steps.
+        if !cancel.is_cancelled() {
+            let validation = {
+                let mode = st.goal.lock().await;
+                mode.plan
+                    .as_ref()
+                    .map(|p| p.validation.clone())
+                    .unwrap_or_default()
+            };
+            if !validation.is_empty() && !wave_failed {
+                let checks = validation.join("\n- ");
+                let provider = st.resolve_provider_for_model(&parent_model).await;
+                let args = json!({
+                    "agent": "reviewer",
+                    "task": format!(
+                        "Verify the work just completed in this goal wave against these checks:\n- {checks}\n\nRun diagnostics if helpful. Reply VERDICT: PASS or VERDICT: FAIL with reasons."
+                    ),
+                    "context": "fresh",
+                });
+                let outcome = crate::subagent::execute(
+                    st.clone(),
+                    client.clone(),
+                    provider,
+                    parent_model.clone(),
+                    args,
+                    cancel.clone(),
+                    0,
+                )
+                .await;
+                let pass = outcome.ok
+                    && outcome
+                        .output
+                        .to_ascii_uppercase()
+                        .contains("VERDICT: PASS");
+                emit(
+                    &Event::new("goal_step_verdict")
+                        .with("ok", json!(pass))
+                        .with("output", json!(truncate_str(&outcome.output, 800))),
+                );
+                if !pass {
+                    // Mark the wave's successful steps as failed so dependents skip.
+                    let mut mode = st.goal.lock().await;
+                    for id in &wave {
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
+                            if p.status == DeployStatus::Done {
+                                p.status = DeployStatus::Failed;
+                                p.summary = Some(format!(
+                                    "verifier failed: {}",
+                                    truncate_str(&outcome.output, 200)
+                                ));
+                                failed_steps.insert(id.clone());
+                                any_failed = true;
+                            }
+                        }
+                    }
+                    mode.touch();
+                    emit_goal_state(&mode);
+                    sync_work_state_from_prompts(&st, &mode).await;
+                }
+            }
+        }
         let _ = wave_failed;
     }
 
     {
         let mut mode = st.goal.lock().await;
         if mode.id != goal_id {
-            return;
+            return false;
         }
         if cancel.is_cancelled() {
             fail_goal(&mut mode, "goal cancelled");
-        } else {
-            // All waves processed. Even if some steps failed (and their
-            // dependents were skipped), the deploy ran to completion — mark
-            // Done so the user can review failed/skipped steps and re-run
-            // them rather than the whole goal appearing aborted.
-            let failed: Vec<&str> = mode
-                .prompts
-                .iter()
-                .filter(|p| p.status == DeployStatus::Failed)
-                .map(|p| p.step_id.as_str())
-                .collect();
-            let skipped: Vec<&str> = mode
-                .prompts
-                .iter()
-                .filter(|p| p.status == DeployStatus::Skipped)
-                .map(|p| p.step_id.as_str())
-                .collect();
-            let msg = if failed.is_empty() {
-                "goal complete".to_string()
-            } else {
-                format!(
-                    "goal complete with {} failed step(s){}",
-                    failed.len(),
-                    if skipped.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", {} skipped", skipped.len())
-                    }
-                )
-            };
-            transition(&mut mode, GoalPhase::Done, Some(&msg));
+            sync_work_state_from_prompts(&st, &mode).await;
+            return false;
         }
+        // All waves processed. Even if some steps failed (and their
+        // dependents were skipped), the deploy ran to completion — enter
+        // synthesizing so the parent can report results before Done.
+        let failed_n = mode
+            .prompts
+            .iter()
+            .filter(|p| p.status == DeployStatus::Failed)
+            .count();
+        let skipped_n = mode
+            .prompts
+            .iter()
+            .filter(|p| p.status == DeployStatus::Skipped)
+            .count();
+        let msg = if failed_n == 0 {
+            "workers finished — summarizing".to_string()
+        } else {
+            format!(
+                "workers finished with {failed_n} failed step(s){} — summarizing",
+                if skipped_n == 0 {
+                    String::new()
+                } else {
+                    format!(", {skipped_n} skipped")
+                }
+            )
+        };
+        transition(&mut mode, GoalPhase::Synthesizing, Some(&msg));
         sync_work_state_from_prompts(&st, &mode).await;
     }
 
     emit(&Event::new("info").with(
         "message",
         json!(if any_failed {
-            "Goal deploy complete — some steps failed (see goal_state); independent steps continued"
+            "Goal deploy complete — some steps failed; writing completion summary…"
         } else {
-            "Goal mode complete"
+            "Goal deploy complete — writing completion summary…"
         }),
     ));
+    true
 }
 
 /// Mirror deploy prompt statuses into WorkState done/in_progress/next.
@@ -1261,12 +1537,78 @@ mod tests {
         assert!(m.is_active());
         m.phase = GoalPhase::Running;
         assert!(m.is_active());
+        m.phase = GoalPhase::Synthesizing;
+        assert!(m.is_active());
         m.phase = GoalPhase::Done;
         assert!(!m.is_active());
         m.phase = GoalPhase::Failed;
         assert!(!m.is_active());
         m.phase = GoalPhase::Idle;
         assert!(!m.is_active());
+    }
+
+    #[test]
+    fn wrapup_prompt_includes_step_results() {
+        let mut m = base_mode();
+        m.goal = "ship feature X".into();
+        m.plan = Some(GoalPlan {
+            summary: "two steps".into(),
+            steps: vec![],
+            risks: vec![],
+            validation: vec![],
+        });
+        m.prompts = vec![
+            DeployPrompt {
+                step_id: "a".into(),
+                agent: "scout".into(),
+                task: "map".into(),
+                model: None,
+                status: DeployStatus::Done,
+                run_id: None,
+                summary: Some("found auth.rs".into()),
+                title: "recon".into(),
+            },
+            DeployPrompt {
+                step_id: "b".into(),
+                agent: "worker".into(),
+                task: "impl".into(),
+                model: None,
+                status: DeployStatus::Failed,
+                run_id: None,
+                summary: Some("tests failed".into()),
+                title: "implement".into(),
+            },
+        ];
+        let p = build_wrapup_prompt(&m);
+        assert!(p.contains("ship feature X"));
+        assert!(p.contains("[done] recon (scout): found auth.rs"));
+        assert!(p.contains("[failed] implement (worker): tests failed"));
+        assert!(p.contains("Call `finish`"));
+        assert!(p.contains("1 step(s) failed"));
+    }
+
+    #[test]
+    fn finish_synthesis_marks_done() {
+        let mut m = base_mode();
+        m.phase = GoalPhase::Synthesizing;
+        m.prompts = vec![DeployPrompt {
+            step_id: "a".into(),
+            agent: "worker".into(),
+            task: "t".into(),
+            model: None,
+            status: DeployStatus::Done,
+            run_id: None,
+            summary: Some("ok".into()),
+            title: "do".into(),
+        }];
+        finish_synthesis(&mut m, false);
+        assert_eq!(m.phase, GoalPhase::Done);
+        finish_synthesis(&mut m, false); // no-op once Done
+        assert_eq!(m.phase, GoalPhase::Done);
+
+        m.phase = GoalPhase::Synthesizing;
+        finish_synthesis(&mut m, true);
+        assert_eq!(m.phase, GoalPhase::Failed);
     }
 
     fn start_args(goal: &str) -> StartGoalArgs {
@@ -1322,6 +1664,29 @@ mod tests {
         assert_eq!(m.as_deref(), Some("m1"));
         let m2 = resolve_step_model(&mode, "scout", Some("m1".into()));
         assert_eq!(m2.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn resolve_step_model_omits_when_unpinned() {
+        let mut mode = base_mode();
+        mode.allowed_models = vec!["m1".into(), "m2".into()];
+        // Allowlist alone must not force a model pin (that previously pushed
+        // every reviewer through the worktree parallel wrapper).
+        assert!(resolve_step_model(&mode, "reviewer", None).is_none());
+        assert!(resolve_step_model(&mode, "scout", None).is_none());
+    }
+
+    #[test]
+    fn goal_step_needs_worktree_skips_read_focused_agents() {
+        assert!(!goal_step_needs_worktree("reviewer"));
+        assert!(!goal_step_needs_worktree("scout"));
+        assert!(!goal_step_needs_worktree("researcher"));
+        assert!(!goal_step_needs_worktree("planner"));
+        assert!(!goal_step_needs_worktree("oracle"));
+        assert!(!goal_step_needs_worktree("context-builder"));
+        assert!(goal_step_needs_worktree("worker"));
+        assert!(goal_step_needs_worktree("delegate"));
+        assert!(goal_step_needs_worktree("custom-writer"));
     }
 
     #[test]
@@ -1447,6 +1812,35 @@ mod tests {
     }
 
     #[test]
+    fn high_concurrency_selects_ultra_parallel_profile() {
+        assert_eq!(execution_profile(1), "serial");
+        assert_eq!(execution_profile(4), "parallel");
+        assert_eq!(execution_profile(8), "ultra_parallel");
+        assert_eq!(execution_profile(32), "ultra_parallel");
+    }
+
+    #[test]
+    fn ultra_planning_prompt_demands_broad_root_fanout() {
+        let mut mode = base_mode();
+        mode.concurrency = 12;
+        mode.max_tasks = 16;
+        let prompt = planning_prompt(&mode);
+        assert!(prompt.contains("Execution profile: ULTRA PARALLEL"));
+        assert!(prompt.contains("12 available slots"));
+        assert!(prompt.contains("12 useful root steps"));
+        assert!(prompt.contains("do not put one global scout"));
+    }
+
+    #[test]
+    fn ultra_prompt_reserves_integration_slot_when_budget_equals_cap() {
+        let mut mode = base_mode();
+        mode.concurrency = 8;
+        mode.max_tasks = 8;
+        let prompt = planning_prompt(&mode);
+        assert!(prompt.contains("7 useful root steps"));
+    }
+
+    #[test]
     fn strips_disallowed_step_model() {
         let mut mode = base_mode();
         mode.allowed_models = vec!["m1".into()];
@@ -1457,8 +1851,9 @@ mod tests {
             }]
         });
         apply_plan(&mut mode, &args, &HashSet::new()).unwrap();
-        // stripped → falls back to first allowed model
-        assert_eq!(mode.prompts[0].model.as_deref(), Some("m1"));
+        // Disallowed step.model is stripped; no auto-pin to allowlist[0] —
+        // parent model + allowlist filter apply at execute time.
+        assert!(mode.prompts[0].model.is_none());
     }
 
     /// Verify the no-fail-fast skip logic: when a step fails, its dependents

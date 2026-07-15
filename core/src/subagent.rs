@@ -927,6 +927,7 @@ pub fn execute(
                     ContextKind::Fresh,
                     depth,
                     &cancel,
+                    None,
                 )
                 .await;
             }
@@ -956,7 +957,26 @@ pub fn execute(
             let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
             let context = parse_context(&args, &agent);
             let run_id = next_run_id();
-            return run_single(
+            let use_worktree = args
+                .get("worktree")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let wt_path = if use_worktree {
+                if !crate::worktree::is_git_repo(&workspace) {
+                    return Outcome::err(
+                        "worktree:true requires a git repository; use hybrid checkpoints for non-git workspaces",
+                    );
+                }
+                match crate::worktree::add_worktree(&workspace, &run_id) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return Outcome::err(format!("worktree setup failed: {e}"));
+                    }
+                }
+            } else {
+                None
+            };
+            let outcome = run_single(
                 &st,
                 &client,
                 &provider,
@@ -968,8 +988,31 @@ pub fn execute(
                 context,
                 depth,
                 &cancel,
+                wt_path.clone(),
             )
             .await;
+            if let Some(ref wt) = wt_path {
+                if outcome.ok {
+                    match crate::worktree::promote_worktree(&workspace, wt) {
+                        Ok(paths) if !paths.is_empty() => {
+                            emit(
+                                &Event::new("worktree_promoted")
+                                    .with("run_id", json!(run_id))
+                                    .with("paths", json!(paths)),
+                            );
+                        }
+                        Err(e) => {
+                            emit(&Event::new("error").with(
+                                "message",
+                                json!(format!("worktree promote failed: {e}")),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = crate::worktree::remove_worktree(&workspace, wt);
+            }
+            return outcome;
         }
 
         // Parallel run.
@@ -1037,6 +1080,7 @@ async fn run_single(
     context: ContextKind,
     depth: u32,
     cancel: &CancellationToken,
+    workspace_override: Option<std::path::PathBuf>,
 ) -> Outcome {
     let cfg = st.cfg.read().await.clone();
     let max_depth = child_max_depth(resolve_max_depth(&cfg.subagents), agent.max_subagent_depth);
@@ -1109,6 +1153,7 @@ async fn run_single(
         bridge,
         &run_cancel,
         messages,
+        workspace_override,
     ))
     .catch_unwind()
     .await
@@ -1174,6 +1219,7 @@ pub async fn run_agent(
     bridge: bool,
     cancel: &CancellationToken,
     messages: Arc<Mutex<Vec<Message>>>,
+    workspace_override: Option<std::path::PathBuf>,
 ) -> Outcome {
     emit_subagent_progress(run_id, agent, "start", "", 0, 0, 0, 0, true);
     let result = run_agent_inner(
@@ -1193,6 +1239,7 @@ pub async fn run_agent(
         bridge,
         cancel,
         messages,
+        workspace_override,
     )
     .await;
     emit_subagent_progress(run_id, agent, "done", "", 0, 0, 0, 0, result.ok);
@@ -1217,9 +1264,13 @@ async fn run_agent_inner(
     bridge: bool,
     cancel: &CancellationToken,
     messages: Arc<Mutex<Vec<Message>>>,
+    workspace_override: Option<std::path::PathBuf>,
 ) -> Outcome {
-    let workspace = st.cfg.read().await.workspace.clone();
-    let cfg = st.cfg.read().await.clone();
+    let mut cfg = st.cfg.read().await.clone();
+    if let Some(ws) = workspace_override {
+        cfg.workspace = ws;
+    }
+    let workspace = cfg.workspace.clone();
     let tool_defs = subagent_tool_defs(agent, bridge, depth, max_depth);
 
     // --- system prompt ---
@@ -2103,6 +2154,7 @@ fn resolve_model_candidates(
     st: &Arc<State>,
 ) -> Vec<String> {
     let mut cands: Vec<String> = Vec::new();
+    let has_explicit = override_model.is_some() || agent.model.is_some();
     if let Some(m) = override_model {
         cands.push(m);
     }
@@ -2142,6 +2194,32 @@ fn resolve_model_candidates(
                 return vec![m.clone()];
             }
             return vec![parent_model.to_string()];
+        }
+    }
+
+    // Task-aware routing: when no explicit pin, reorder/augment candidates by
+    // role preference against the model registry.
+    if !has_explicit {
+        if let Ok(cfg) = st.cfg.try_read() {
+            if let Some(prefer) = cfg.routing.preference_for(&agent.name) {
+                if let Ok(reg) = st.models.try_read() {
+                    let mut scored: Vec<(i32, String)> = reg
+                        .iter()
+                        .map(|m| (cfg.routing.score_model(&m.id, prefer), m.id.clone()))
+                        .filter(|(s, _)| *s > 0)
+                        .collect();
+                    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    for (_, id) in scored.into_iter().take(3) {
+                        if seen.insert(id.clone()) {
+                            // Prefer routed models ahead of parent fallback.
+                            cands.insert(0, id);
+                        }
+                    }
+                    // Re-dedup preserving new order.
+                    let mut seen2 = std::collections::HashSet::new();
+                    cands.retain(|c| seen2.insert(c.clone()));
+                }
+            }
         }
     }
     cands
@@ -2480,6 +2558,16 @@ async fn run_parallel(
         .unwrap_or(cfg.subagents.parallel_concurrency as u64)
         .max(1) as usize;
     let context = args.get("context").and_then(|v| v.as_str());
+    let use_worktree = args
+        .get("worktree")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if use_worktree && !crate::worktree::is_git_repo(&workspace) {
+        return Outcome::err(
+            "worktree:true requires a git repository; use hybrid checkpoints for non-git workspaces",
+        );
+    }
 
     // resolve agents up front (fail fast on a bad name)
     let agents = discover_agents(&workspace, &cfg.subagents);
@@ -2537,6 +2625,32 @@ async fn run_parallel(
         started,
     );
 
+    // Pre-create worktrees (fail fast before spawning).
+    let mut worktrees: Vec<Option<std::path::PathBuf>> = Vec::with_capacity(resolved.len());
+    if use_worktree {
+        for i in 0..resolved.len() {
+            let rid = format!("{}-{}", run_id, i);
+            match crate::worktree::add_worktree(&workspace, &rid) {
+                Ok(p) => worktrees.push(Some(p)),
+                Err(e) => {
+                    // Clean up any already-created worktrees.
+                    for (j, wt) in worktrees.iter().enumerate() {
+                        if let Some(p) = wt {
+                            let _ = crate::worktree::remove_worktree(
+                                &workspace,
+                                p,
+                            );
+                            let _ = j;
+                        }
+                    }
+                    return Outcome::err(format!("worktree setup failed for task {i}: {e}"));
+                }
+            }
+        }
+    } else {
+        worktrees.resize(resolved.len(), None);
+    }
+
     // run all tasks with a concurrency semaphore; collect results in order.
     // Tasks run on JoinHandles (not a channel) so a panicking task is observed
     // (JoinHandle::await -> Err(JoinError)) and reported as an error for its
@@ -2552,6 +2666,7 @@ async fn run_parallel(
         let cancelc = run_cancel.clone(); // child of parent; interrupt cancels just this batch
         let semc = sem.clone();
         let rid = format!("{}-{}", run_id, i);
+        let wt = worktrees.get(i).cloned().flatten();
         let h = tokio::spawn(async move {
             let _permit = semc.acquire().await.ok();
             run_single(
@@ -2566,6 +2681,7 @@ async fn run_parallel(
                 ctx,
                 depth,
                 &cancelc,
+                wt,
             )
             .await
         });
@@ -2583,6 +2699,33 @@ async fn run_parallel(
     }
     collected.sort_by_key(|(i, _)| *i);
     let all_ok = collected.iter().all(|(_, o)| o.ok);
+
+    // Promote successful worktrees into the main workspace, then clean up.
+    for (i, o) in &collected {
+        if let Some(wt) = worktrees.get(*i).and_then(|w| w.as_ref()) {
+            if o.ok {
+                match crate::worktree::promote_worktree(&workspace, wt) {
+                    Ok(paths) if !paths.is_empty() => {
+                        emit(
+                            &Event::new("worktree_promoted")
+                                .with("run_id", json!(format!("{}-{}", run_id, i)))
+                                .with("paths", json!(paths)),
+                        );
+                    }
+                    Err(e) => {
+                        emit(
+                            &Event::new("error").with(
+                                "message",
+                                json!(format!("worktree promote failed for task {i}: {e}")),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let _ = crate::worktree::remove_worktree(&workspace, wt);
+        }
+    }
 
     // finalize run
     let final_state = if all_ok { "completed" } else { "failed" };
@@ -2749,6 +2892,7 @@ async fn run_chain(
                 context,
                 depth,
                 &run_cancel,
+                None,
             )
             .await;
             if !o.ok {

@@ -1,7 +1,7 @@
 // Structured debug logging + metrics. Writes one JSON line per record to a
 // debug log file (if configured) and exposes counters the core/TUI can show.
 // ponytail: no tracing crate; a locked append is enough for a local harness.
-use crate::message::{ContentPart, Message};
+use crate::message::{Content, ContentPart, Message};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -82,8 +82,10 @@ impl Logger {
 /// Rough token estimate: ~4 chars per token. Good enough for compaction triggers.
 /// ponytail: no tokenizer dep; this is within ~15% for code/prose, fine for a threshold.
 pub fn estimate_tokens(text: &str) -> u64 {
-    let chars = text.chars().count() as u64;
-    chars.saturating_add(3) / 4
+    // Byte length / 4 is ~as accurate as char/4 for ASCII-heavy code and avoids
+    // a full Unicode walk on every soft-digest / compaction estimate.
+    let n = text.len() as u64;
+    n.saturating_add(3) / 4
 }
 
 /// Estimate tokens for a whole message list (serialize each message's text fields).
@@ -115,10 +117,50 @@ pub fn estimate_message_tokens(m: &Message) -> u64 {
         }
         return total + images * PER_IMAGE_TOKENS + 4;
     }
-    // Text-only message (content is a string): whole-message char/4 — the
-    // common path, unchanged from before.
-    let s = serde_json::to_string(&serde_json::to_value(m).unwrap_or_default()).unwrap_or_default();
-    estimate_tokens(&s)
+    // Text-only message: sum role framing + text fields / 4. Avoids a full
+    // serde Value round-trip on the hot soft-digest / compaction path.
+    let mut n = 8u64; // role + JSON framing overhead
+    match m {
+        Message::System { content, .. } | Message::User { content, .. } => match content {
+            Content::Text(s) => n += s.len() as u64,
+            Content::Multimodal(parts) => {
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        n += text.len() as u64;
+                    }
+                }
+            }
+        },
+        Message::Assistant {
+            content,
+            thinking,
+            tool_calls,
+            ..
+        } => {
+            if let Some(c) = content {
+                n += c.len() as u64;
+            }
+            if let Some(t) = thinking {
+                n += t.len() as u64;
+            }
+            if let Some(tcs) = tool_calls {
+                for tc in tcs {
+                    n += tc.id.len() as u64;
+                    n += tc.function.name.len() as u64;
+                    n += tc.function.arguments.len() as u64;
+                }
+            }
+        }
+        Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => {
+            n += tool_call_id.len() as u64;
+            n += content.len() as u64;
+        }
+    }
+    n.saturating_add(3) / 4
 }
 
 /// Real-usage-anchored token estimate for a whole message list.

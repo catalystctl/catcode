@@ -7,7 +7,10 @@
 // the lint here rather than obscure the call sites.
 #![allow(clippy::too_many_arguments)]
 
+mod audit;
+mod checkpoint;
 mod config;
+mod embed;
 mod fetch_tool;
 mod fsutil;
 mod git_ctx;
@@ -33,6 +36,7 @@ mod tool_cache;
 mod tools;
 mod vision;
 mod workspace;
+mod worktree;
 
 use config::{Approval, Config, PermissionRule, ResolvedProvider};
 use git_ctx::{git_context_injection, read_git_context};
@@ -368,6 +372,10 @@ pub struct PendingApproval {
     notify: Arc<Notify>,
     granted: Mutex<Option<bool>>, // Some(true)=approved, Some(false)=denied, None=awaiting
     escalated: Mutex<bool>,       // "always" was chosen → upgrade session mode
+    /// "allow_session" — add a session-scoped allow rule for this tool+args pattern.
+    allow_session: Mutex<bool>,
+    /// "allow_pattern" — optional rule_content (e.g. path glob) to persist as allow.
+    allow_pattern: Mutex<Option<String>>,
 }
 
 /// A pending `ask` tool call the user must answer before the model continues.
@@ -490,6 +498,10 @@ pub struct State {
     /// planning turn's token so cancel_goal can stop deploy without racing
     /// the turn join handle).
     pub goal_deploy_cancel: Mutex<Option<CancellationToken>>,
+    /// True while the post-deploy synthesizing wrap-up turn is the live turn.
+    /// Lets turn teardown finalize the goal even on abort/error paths without
+    /// racing the planning turn's drain against a fast deploy.
+    pub goal_wrapup_active: std::sync::atomic::AtomicBool,
     /// Intercom bus: in-process mailboxes for subagent ↔ orchestrator and
     /// subagent ↔ subagent coordination.
     pub intercom: IntercomBus,
@@ -517,6 +529,9 @@ pub struct State {
     pub enabled_deferred_tools: Mutex<std::collections::HashSet<String>>,
     /// Session-scoped `/undo` count for telemetry (`human_corrections`).
     pub undo_count: std::sync::atomic::AtomicU64,
+    /// True after an auto filesystem checkpoint has been taken for the current
+    /// turn (so we don't snapshot before every destructive tool in a wave).
+    pub auto_checkpoint_taken: std::sync::atomic::AtomicBool,
     /// Session-scoped count of `read_file` hits on `SKILL.md` (skill utilization).
     pub skill_read_count: std::sync::atomic::AtomicU64,
 }
@@ -1128,17 +1143,99 @@ async fn cancel_goal_deploy(st: &State) {
 }
 
 /// Spawn the deterministic goal deploy loop on a child cancel token.
+/// After workers finish, starts a parent synthesizing turn so the user gets a
+/// completion follow-up (the planning turn already called `finish`).
 async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
     cancel_goal_deploy(&st).await;
+    // Snapshot the main tree before parallel workers mutate it.
+    {
+        let cfg = st.cfg.read().await;
+        let _ = checkpoint::create(
+            &cfg.workspace,
+            cfg.session_file.as_deref(),
+            "auto-before-goal-deploy",
+            &[],
+            true,
+        );
+    }
     let tok = CancellationToken::new();
     *st.goal_deploy_cancel.lock().await = Some(tok.clone());
     tokio::spawn(async move {
-        goal::deploy_goal(st.clone(), client, tok.clone()).await;
+        let need_wrapup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
         // Clear cancel slot only if we still own it. A newer spawn cancels
         // this token first, so a cancelled token means the slot was replaced.
         if !tok.is_cancelled() {
             *st.goal_deploy_cancel.lock().await = None;
         }
+        if !need_wrapup || tok.is_cancelled() {
+            return;
+        }
+        let wrap = {
+            let g = st.goal.lock().await;
+            if g.phase != goal::GoalPhase::Synthesizing {
+                return;
+            }
+            (
+                goal::build_wrapup_prompt(&g),
+                g.parent_model.clone(),
+                g.reasoning_effort.clone(),
+                g.id.clone(),
+            )
+        };
+        let (prompt, model, effort, goal_id) = wrap;
+        let models = st.models.read().await;
+        let turn_model = if models.iter().any(|m| m.id == model) {
+            model
+        } else if let Some(first) = models.first() {
+            first.id.clone()
+        } else {
+            drop(models);
+            let mut g = st.goal.lock().await;
+            if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
+                goal::finish_synthesis(&mut g, false);
+                goal::sync_work_state_from_prompts(&st, &g).await;
+            }
+            emit(
+                &Event::new("error")
+                    .with("message", json!("goal wrap-up skipped: no models")),
+            );
+            return;
+        };
+        drop(models);
+        // If the user already started another turn during deploy, don't steal
+        // the session — finalize the goal with the step results already in
+        // goal_state instead of queuing a surprise wrap-up behind them.
+        let tok2 = {
+            let mut cur = st.current.lock().await;
+            if cur.is_some() {
+                drop(cur);
+                let mut g = st.goal.lock().await;
+                if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
+                    goal::finish_synthesis(&mut g, false);
+                    goal::sync_work_state_from_prompts(&st, &g).await;
+                }
+                emit(&Event::new("info").with(
+                    "message",
+                    json!("Goal deploy finished (another turn is running — see goal_state for step results)"),
+                ));
+                return;
+            }
+            let tok2 = CancellationToken::new();
+            *cur = Some(tok2.clone());
+            tok2
+        };
+        st.goal_wrapup_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = tokio::spawn(run_turn_and_drain(
+            st.clone(),
+            client.clone(),
+            turn_model,
+            prompt,
+            effort,
+            None,
+            tok2,
+        ));
+        *st.handle.lock().await = Some(handle);
     });
 }
 
@@ -1167,6 +1264,16 @@ async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, c
     if should_deploy {
         spawn_goal_deploy(st.clone(), client.clone()).await;
     }
+}
+
+/// After the post-deploy synthesizing turn ends, mark the goal Done.
+async fn maybe_finish_goal_synthesis(st: &Arc<State>, cancelled: bool) {
+    let mut g = st.goal.lock().await;
+    if g.phase != goal::GoalPhase::Synthesizing {
+        return;
+    }
+    goal::finish_synthesis(&mut g, cancelled);
+    goal::sync_work_state_from_prompts(st, &g).await;
 }
 
 /// Seed the work-state goal from a user prompt (the first substantive message).
@@ -1200,6 +1307,101 @@ async fn sync_work_state_from_todos(st: &State, args: &Value) {
     ws.sync_from_todos(todos);
     drop(ws);
     emit_work_state(st).await;
+}
+
+/// Record a file touch from a write/edit/patch/bulk_* call into the work-state
+/// recent-files list (most-recent-first, deduped, capped). Keeps the rolling
+/// summary aware of what the session has actually changed.
+async fn maybe_auto_checkpoint(st: &State) {
+    if st
+        .auto_checkpoint_taken
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let cfg = st.cfg.read().await;
+    let _ = checkpoint::create(
+        &cfg.workspace,
+        cfg.session_file.as_deref(),
+        "auto-before-destructive",
+        &[],
+        true,
+    );
+}
+
+/// Warm the tool-output cache with readonly greps/globs suggested by recent
+/// pattern-log categories and tokens from the user prompt. Cap concurrency at 2.
+async fn speculative_prefetch(st: &Arc<State>, prompt: &str) {
+    let cfg = st.cfg.read().await.clone();
+    let patterns = pattern_log::recurring_patterns(&cfg.workspace);
+    let mut globs: Vec<String> = patterns
+        .into_iter()
+        .take(4)
+        .filter_map(|(_, label)| {
+            // Labels look like "edit|core/src/*.rs" — pull the file category.
+            label.split('|').nth(1).map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty() && s != "<root>")
+        .collect();
+    // Also pull a couple of significant tokens from the prompt as grep patterns.
+    let mut greps: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|t| t.len() >= 4 && t.len() <= 40)
+        .take(3)
+        .map(|s| s.to_string())
+        .collect();
+    greps.dedup();
+    globs.dedup();
+    if greps.is_empty() && globs.is_empty() {
+        return;
+    }
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let mut handles = Vec::new();
+    for g in greps.into_iter().take(2) {
+        let stc = st.clone();
+        let cfg = cfg.clone();
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = sem.acquire().await.ok();
+            let args = json!({ "pattern": g, "head_limit": 20 });
+            let args_str = args.to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                tools::execute("grep", &args, &cfg)
+            })
+            .await
+            .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
+            if outcome.ok {
+                stc.tool_output_cache
+                    .lock()
+                    .await
+                    .store("grep", &args_str, &outcome.output);
+            }
+        }));
+    }
+    for g in globs.into_iter().take(2) {
+        let stc = st.clone();
+        let cfg = cfg.clone();
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = sem.acquire().await.ok();
+            let args = json!({ "pattern": g });
+            let args_str = args.to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                tools::execute("glob", &args, &cfg)
+            })
+            .await
+            .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
+            if outcome.ok {
+                stc.tool_output_cache
+                    .lock()
+                    .await
+                    .store("glob", &args_str, &outcome.output);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
 }
 
 /// Record a file touch from a write/edit/patch/bulk_* call into the work-state
@@ -1555,6 +1757,7 @@ async fn main() {
         work_state: Mutex::new(WorkState::default()),
         goal: Mutex::new(goal::GoalMode::default()),
         goal_deploy_cancel: Mutex::new(None),
+        goal_wrapup_active: std::sync::atomic::AtomicBool::new(false),
         intercom: IntercomBus::new(),
         subagent_runs: Mutex::new(std::collections::HashMap::new()),
         pending_oauth: Mutex::new(None),
@@ -1563,6 +1766,7 @@ async fn main() {
         tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
         enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
         undo_count: std::sync::atomic::AtomicU64::new(0),
+        auto_checkpoint_taken: std::sync::atomic::AtomicBool::new(false),
         skill_read_count: std::sync::atomic::AtomicU64::new(0),
     });
 
@@ -1801,6 +2005,23 @@ async fn main() {
                         .with("resumed_messages", json!(conv_len))
                         .with("plugins", json!(loaded_plugins))
                         .with("plugins_skipped", json!(skipped_unavailable.clone())),
+                );
+                emit(
+                    &Event::new("protocol_hello")
+                        .with("version", json!(env!("CARGO_PKG_VERSION")))
+                        .with("min_client", json!("0.2.0"))
+                        .with(
+                            "capabilities",
+                            json!([
+                                "worktree",
+                                "checkpoint",
+                                "file_change",
+                                "audit",
+                                "routing",
+                                "allow_pattern",
+                                "cost_update"
+                            ]),
+                        ),
                 );
                 if !skipped_unavailable.is_empty() {
                     let names = skipped_unavailable.join(", ");
@@ -2393,6 +2614,15 @@ async fn main() {
                 state
                     .undo_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Restore filesystem from the latest auto checkpoint (if any)
+                // BEFORE popping conversation, so the user gets both back.
+                {
+                    let cfg = state.cfg.read().await;
+                    let _ = checkpoint::restore_latest_auto(
+                        &cfg.workspace,
+                        cfg.session_file.as_deref(),
+                    );
+                }
                 // Drop the last turn: a user msg + everything after it (assistant, tool msgs).
                 let mut conv = state.conversation.lock().await;
                 // Walk back past trailing tool/assistant messages to the last user message.
@@ -2424,6 +2654,44 @@ async fn main() {
                         .with("messages", json!(visible))
                         .with("tokens_in", json!(est)),
                 );
+            }
+            Command::CreateCheckpoint { label, paths } => {
+                let cfg = state.cfg.read().await;
+                let label = label.unwrap_or_else(|| "manual".into());
+                let paths = paths.unwrap_or_default();
+                match checkpoint::create(
+                    &cfg.workspace,
+                    cfg.session_file.as_deref(),
+                    &label,
+                    &paths,
+                    false,
+                ) {
+                    Ok(m) => emit(
+                        &Event::new("info").with(
+                            "message",
+                            json!(format!("checkpoint {} created ({})", m.id, m.kind)),
+                        ),
+                    ),
+                    Err(e) => emit(&Event::new("error").with("message", json!(e))),
+                }
+            }
+            Command::ListCheckpoints => {
+                let cfg = state.cfg.read().await;
+                let index = checkpoint::index_path(cfg.session_file.as_deref(), &cfg.workspace);
+                let metas = checkpoint::list(&index);
+                emit(&Event::new("checkpoints").with("checkpoints", json!(metas)));
+            }
+            Command::RestoreCheckpoint { id } => {
+                let cfg = state.cfg.read().await;
+                match checkpoint::restore(&cfg.workspace, cfg.session_file.as_deref(), &id) {
+                    Ok(m) => emit(
+                        &Event::new("info").with(
+                            "message",
+                            json!(format!("restored checkpoint {} ({})", m.id, m.kind)),
+                        ),
+                    ),
+                    Err(e) => emit(&Event::new("error").with("message", json!(e))),
+                }
             }
             Command::Compact { instructions } => {
                 // Force compaction now, then emit a compacted event. Uses the
@@ -3153,22 +3421,28 @@ async fn main() {
                     .iter()
                     .map(|m| {
                         json!({
-                            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                            "id": m.id.clone(),
+                            "vision": m.vision || vc.has_vision(m.id.as_str()),
+                            "provider": m.provider.clone(),
+                            "cost_rank": vision::vision_cost_rank(&m.id),
                         })
                     })
                     .collect();
                 emit(
                     &Event::new("vision_config")
+                        .with("enabled", json!(vc.enabled))
                         .with("vision_models", json!(vc.vision_models.clone()))
                         .with("vision_model", json!(vc.vision_model.clone()))
                         .with("models", json!(models_json)),
                 );
             }
             Command::SetVisionConfig {
+                enabled,
                 vision_models,
                 vision_model,
             } => {
                 let vc = VisionConfig {
+                    enabled,
                     vision_models,
                     vision_model: vision_model.filter(|s| !s.is_empty()),
                 };
@@ -3180,12 +3454,16 @@ async fn main() {
                     .iter()
                     .map(|m| {
                         json!({
-                            "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                            "id": m.id.clone(),
+                            "vision": m.vision || vc.has_vision(m.id.as_str()),
+                            "provider": m.provider.clone(),
+                            "cost_rank": vision::vision_cost_rank(&m.id),
                         })
                     })
                     .collect();
                 emit(
                     &Event::new("vision_config")
+                        .with("enabled", json!(vc.enabled))
                         .with("vision_models", json!(vc.vision_models.clone()))
                         .with("vision_model", json!(vc.vision_model.clone()))
                         .with("models", json!(models_json)),
@@ -3313,6 +3591,48 @@ async fn main() {
                         } else {
                             model
                         };
+                        // Speculative scout while the planner runs (readonly recon).
+                        {
+                            let st_scout = state.clone();
+                            let client_scout = client.clone();
+                            let goal_for_scout = {
+                                let g = state.goal.lock().await;
+                                g.goal.clone()
+                            };
+                            let parent = turn_model.clone();
+                            tokio::spawn(async move {
+                                let provider =
+                                    st_scout.resolve_provider_for_model(&parent).await;
+                                let args = json!({
+                                    "agent": "scout",
+                                    "task": format!(
+                                        "Quick readonly reconnaissance for this goal (do not modify files):\n{goal_for_scout}\n\nSummarize relevant files, risks, and entry points in under 800 words."
+                                    ),
+                                    "context": "fresh",
+                                });
+                                let cancel = CancellationToken::new();
+                                let outcome = crate::subagent::execute(
+                                    st_scout.clone(),
+                                    client_scout,
+                                    provider,
+                                    parent,
+                                    args,
+                                    cancel,
+                                    0,
+                                )
+                                .await;
+                                if outcome.ok && !outcome.output.trim().is_empty() {
+                                    let mut g = st_scout.goal.lock().await;
+                                    let text: String =
+                                        outcome.output.chars().take(4000).collect();
+                                    g.scout_findings = Some(text);
+                                    emit(&Event::new("info").with(
+                                        "message",
+                                        json!("speculative scout finished — findings available for deploy"),
+                                    ));
+                                }
+                            });
+                        }
                         start_turn(&state, &client, turn_model, prompt, effort, None).await;
                     }
                     Err(e) => {
@@ -3322,6 +3642,9 @@ async fn main() {
             }
             Command::CancelGoal => {
                 cancel_goal_deploy(&state).await;
+                state
+                    .goal_wrapup_active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 // Also abort a planning turn if active.
                 if let Some(tok) = state.current.lock().await.take() {
                     tok.cancel();
@@ -3595,6 +3918,7 @@ async fn main() {
             Command::Approve {
                 request_id,
                 decision,
+                pattern,
             } => {
                 // Look up by the unique approval id (the request_id the TUI
                 // echoes back), not the tool-call id — concurrent approvals from
@@ -3607,6 +3931,26 @@ async fn main() {
                         "always" => {
                             *p.granted.lock().await = Some(true);
                             *p.escalated.lock().await = true;
+                        }
+                        "allow_session" => {
+                            *p.granted.lock().await = Some(true);
+                            *p.allow_session.lock().await = true;
+                        }
+                        "allow_pattern" => {
+                            *p.granted.lock().await = Some(true);
+                            let pat = pattern.or_else(|| {
+                                p.args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                                    .or_else(|| {
+                                        p.args
+                                            .get("command")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from)
+                                    })
+                            });
+                            *p.allow_pattern.lock().await = pat;
                         }
                         _ => *p.granted.lock().await = Some(false),
                     }
@@ -4143,7 +4487,7 @@ fn run_turn_and_drain(
         // malformed model payload hitting an unwrap/index), we still clear
         // `current` and emit error+done so the TUI never wedges on a stuck
         // "working" footer with no turn actually running.
-        let result = AssertUnwindSafe(run_turn(&st, &client, model, prompt, effort, images, tok))
+        let result = AssertUnwindSafe(run_turn(&st, &client, model, prompt, effort, images, tok.clone()))
             .catch_unwind()
             .await;
         // The turn ended for any reason — notify lifecycle plugins and release
@@ -4158,6 +4502,15 @@ fn run_turn_and_drain(
         // freed bytes in its arenas, so RSS creeps up and never falls — trim the
         // heap back to the OS once per turn to bound long-session growth.
         trim_heap();
+        // Finalize a goal wrap-up turn on every exit path (finish, natural
+        // stop, abort, panic). Flag is set only when spawn_goal_deploy starts
+        // that turn, so a fast deploy cannot race the planning turn's drain.
+        if st
+            .goal_wrapup_active
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            maybe_finish_goal_synthesis(&st, tok.is_cancelled()).await;
+        }
         if let Err(panic) = result {
             let detail = panic_payload_message(&panic);
             st.logger
@@ -4456,10 +4809,11 @@ fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
 /// Callers guard with `!reflected` (one reflection per turn).
 ///
 /// Goal mode: skip while a goal is mid-flight (planning / plan_ready /
-/// deploying / running / blocked). Planning only writes a plan — there is
-/// nothing durable to reflect on until the goal finishes. Deploy is
+/// deploying / running / synthesizing / blocked). Planning only writes a plan —
+/// there is nothing durable to reflect on until the goal finishes. Deploy is
 /// core-driven after the planning turn ends, so reflecting here would also
-/// delay `maybe_finish_goal_planning`.
+/// delay `maybe_finish_goal_planning`. The synthesizing wrap-up is itself the
+/// completion summary turn.
 async fn maybe_reflect_prompt(
     st: &Arc<State>,
     prompt: &str,
@@ -4909,6 +5263,12 @@ async fn run_turn(
     // Lifecycle hook: notify plugins a session/turn is starting. Best-effort
     // and never blocks the turn.
     dispatch_lifecycle(st, "session_start").await;
+    st.auto_checkpoint_taken
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Speculative readonly prefetch: warm tool_cache from recurring file
+    // categories (never mutates the workspace).
+    speculative_prefetch(st, &prompt).await;
 
     // If the conversation was left mid-`ask` by a prior core restart (the
     // assistant `ask` tool_call is persisted but no tool result exists),
@@ -5019,14 +5379,21 @@ async fn run_turn(
         let has_images = images.as_ref().is_some_and(|v| !v.is_empty());
         let image_count = images.as_ref().map_or(0, |v| v.len());
         let vc = st.vision.read().await.clone();
-        let models_json: Vec<Value> = st
-            .models
-            .read()
-            .await
+        let models_snapshot = st.models.read().await.clone();
+        let active_provider = models_snapshot
+            .iter()
+            .find(|m| m.id == model.as_str())
+            .map(|m| m.provider.clone())
+            .unwrap_or_default();
+        let recommended = vision::recommend_vision_model(&model, &models_snapshot, &vc);
+        let models_json: Vec<Value> = models_snapshot
             .iter()
             .map(|m| {
                 json!({
-                    "id": m.id.clone(), "vision": m.vision || vc.has_vision(m.id.as_str()),
+                    "id": m.id.clone(),
+                    "vision": m.vision || vc.has_vision(m.id.as_str()),
+                    "provider": m.provider.clone(),
+                    "cost_rank": vision::vision_cost_rank(&m.id),
                 })
             })
             .collect();
@@ -5041,82 +5408,120 @@ async fn run_turn(
             )
         };
         let original_model = model.clone();
-        for (plugin_name, config) in &st.plugin_manager.get_hook_configs("pre_turn") {
-            let turn_args = json!({
-                "model": model.clone(),
-                "has_images": has_images,
-                "image_count": image_count,
-                "models": models_json,
-                "vision_model": vc.vision_model.clone(),
-            });
-            let ctx = plugins::build_context(
-                "pre_turn",
-                "",
-                &workspace,
-                Some(&turn_args),
-                &session_id,
-                config.pass_args,
-            );
-            let result = plugins::execute_hook("pre_turn", plugin_name, config, &ctx).await;
-            if let Some(new_model) = result
-                .modify
-                .as_ref()
-                .and_then(|m| m.get("model"))
-                .and_then(|v| v.as_str())
-            {
-                if new_model != model.as_str() {
-                    let valid = st
-                        .models
-                        .read()
-                        .await
-                        .iter()
-                        .any(|m| m.id.as_str() == new_model);
-                    if valid {
-                        let why = if result.reason.is_empty() {
-                            "vision handoff".to_string()
-                        } else {
-                            result.reason.clone()
-                        };
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "vision handoff: {} → {} ({})",
-                                model, new_model, why
-                            )),
-                        ));
-                        st.logger.log("vision_handoff", json!({
-                            "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
-                        }));
-                        model = new_model.to_string();
-                    } else {
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "vision handoff ignored: '{}' is not a discovered model",
-                                new_model
-                            )),
-                        ));
-                    }
-                }
-            }
-        }
-        // No vision plugin handed off an image-bearing turn on a non-vision
-        // model. Surface it so the user knows to configure /vision (or that
-        // no vision model is available) instead of silently parsing bytes.
-        if has_images && model == original_model {
-            let current_has_vision = st
-                .models
-                .read()
-                .await
+
+        // First-class enable gate (default ON). When off, skip plugin remap and
+        // tell the user why images won't be seen.
+        if has_images && !vc.enabled {
+            let current_has_vision = models_snapshot
                 .iter()
                 .find(|m| m.id == model.as_str())
                 .map(|m| m.vision || vc.has_vision(m.id.as_str()))
                 .unwrap_or(false);
             if !current_has_vision {
-                emit(&Event::new("info").with("message", json!(format!(
-                    "image attached but '{}' lacks vision and no vision model is configured to hand off to; use /vision to set one (or select a vision model with /model)",
-                    model
-                ))));
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!(
+                        "image attached but vision handoff is disabled and '{}' lacks vision; enable it in Settings / /vision (recommended), or pick a vision model",
+                        model
+                    )),
+                ));
+            }
+        } else if has_images {
+            for (plugin_name, config) in &st.plugin_manager.get_hook_configs("pre_turn") {
+                let turn_args = json!({
+                    "model": model.clone(),
+                    "has_images": has_images,
+                    "image_count": image_count,
+                    "models": models_json,
+                    "vision_model": vc.vision_model.clone(),
+                    "enabled": vc.enabled,
+                    "provider": active_provider,
+                    "recommended_vision_model": recommended,
+                });
+                let ctx = plugins::build_context(
+                    "pre_turn",
+                    "",
+                    &workspace,
+                    Some(&turn_args),
+                    &session_id,
+                    config.pass_args,
+                );
+                let result = plugins::execute_hook("pre_turn", plugin_name, config, &ctx).await;
+                if let Some(new_model) = result
+                    .modify
+                    .as_ref()
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                {
+                    if new_model != model.as_str() {
+                        let valid = models_snapshot.iter().any(|m| m.id.as_str() == new_model);
+                        if valid {
+                            let why = if result.reason.is_empty() {
+                                "vision handoff".to_string()
+                            } else {
+                                result.reason.clone()
+                            };
+                            emit(&Event::new("info").with(
+                                "message",
+                                json!(format!(
+                                    "vision handoff: {} → {} ({})",
+                                    model, new_model, why
+                                )),
+                            ));
+                            st.logger.log(
+                                "vision_handoff",
+                                json!({
+                                    "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
+                                }),
+                            );
+                            model = new_model.to_string();
+                        } else {
+                            emit(&Event::new("info").with(
+                                "message",
+                                json!(format!(
+                                    "vision handoff ignored: '{}' is not a discovered model",
+                                    new_model
+                                )),
+                            ));
+                        }
+                    }
+                }
+            }
+            // No vision plugin handed off an image-bearing turn on a non-vision
+            // model. Prefer the Rust-ranked recommendation (works even if the
+            // plugin is missing / python3 absent), else warn.
+            if model == original_model {
+                let current_has_vision = models_snapshot
+                    .iter()
+                    .find(|m| m.id == model.as_str())
+                    .map(|m| m.vision || vc.has_vision(m.id.as_str()))
+                    .unwrap_or(false);
+                if !current_has_vision {
+                    if let Some(rec) = recommended.as_ref() {
+                        if models_snapshot.iter().any(|m| m.id.as_str() == rec.as_str()) {
+                            emit(&Event::new("info").with(
+                                "message",
+                                json!(format!(
+                                    "vision handoff: {} → {} (cheapest same-provider)",
+                                    model, rec
+                                )),
+                            ));
+                            st.logger.log(
+                                "vision_handoff",
+                                json!({
+                                    "from": model, "to": rec, "plugin": "core",
+                                    "reason": "cheapest same-provider"
+                                }),
+                            );
+                            model = rec.clone();
+                        }
+                    } else {
+                        emit(&Event::new("info").with("message", json!(format!(
+                            "image attached but '{}' lacks vision and no same-provider vision model is available to hand off to; use /vision to set one (or select a vision model with /model)",
+                            model
+                        ))));
+                    }
+                }
             }
         }
     }
@@ -5203,6 +5608,12 @@ async fn run_turn(
     }
     let mut timer = TurnTimer::new();
 
+    // Working conversation buffer for this turn: cloned once here, then kept
+    // across agentic loop iterations. Tool/assistant appends update both this
+    // buffer and `st.conversation`; we only re-sync from state after parallel
+    // waves / reflect that mutate state without going through `messages`.
+    let mut messages = st.conversation.lock().await.clone();
+
     // Idle compaction: if 60+ minutes since the last turn completed, compact the
     // conversation so the next turn starts lean. Uses the same summarize strategy
     // as the threshold path; falls back to naive drop-oldest without an api key.
@@ -5210,7 +5621,6 @@ async fn run_turn(
         let last = *st.last_turn_time.lock().await;
         let cfg = st.cfg.read().await.clone();
         if cfg.auto_compact && last.elapsed().as_secs() > 3600 {
-            let mut messages = st.conversation.lock().await.clone();
             let est = grounded_estimate(
                 &messages,
                 *st.last_real_prompt_tokens.lock().await,
@@ -5351,7 +5761,7 @@ async fn run_turn(
         // it. `auto_compact` gates every automatic history rewrite: pressure
         // digest, threshold compaction, idle compaction, and subagent reclaim.
         // When false, the user must /compact manually (or /clear).
-        let mut messages = st.conversation.lock().await.clone();
+        // `messages` is the turn-local working buffer (cloned once before the loop).
         let (model_ctx, thinking_levels, max_tokens) = st
             .models
             .read()
@@ -5676,8 +6086,9 @@ async fn run_turn(
 
         // Append + persist the finalized assistant message.
         {
+            messages.push(assistant_msg.clone());
             let mut conv = st.conversation.lock().await;
-            conv.push(assistant_msg.clone());
+            conv.clone_from(&messages);
             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
                 session::append(p, conv.last().unwrap());
             }
@@ -5842,6 +6253,7 @@ async fn run_turn(
                     // DENY rules take precedence; ALLOW rules skip the gate entirely.
                     let mut force_allow = false;
                     let mut force_deny = false;
+                    let mut force_ask = false;
                     for rule in &cfg.allow_rules {
                         if tool_matches_rule(&name, &args, rule) {
                             force_allow = true;
@@ -5852,6 +6264,14 @@ async fn run_turn(
                         for rule in &cfg.deny_rules {
                             if tool_matches_rule(&name, &args, rule) {
                                 force_deny = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !force_allow && !force_deny {
+                        for rule in &cfg.ask_rules {
+                            if tool_matches_rule(&name, &args, rule) {
+                                force_ask = true;
                                 break;
                             }
                         }
@@ -5889,6 +6309,8 @@ async fn run_turn(
                     };
                     let needs_approval = if force_allow || escalated {
                         false
+                    } else if force_ask {
+                        true
                     } else {
                         match cfg.approval {
                             Approval::Never => false,
@@ -5926,6 +6348,12 @@ async fn run_turn(
                                 return;
                             }
                         }
+                    }
+
+                    // Auto-checkpoint before the first destructive mutation in a
+                    // turn so Undo can restore the filesystem as well as chat.
+                    if kind == tools::ToolKind::Destructive {
+                        maybe_auto_checkpoint(st).await;
                     }
 
                     // Dispatch pre-execution hooks for this tool. Two phases compose:
@@ -6294,10 +6722,25 @@ async fn run_turn(
                                 _ = cancel.cancelled() => tools::Outcome::err("memory aborted"),
                             }
                         } else {
-                            tools::execute(&name, &exec_args, &cfg)
+                            let n = name.clone();
+                            let a = exec_args.clone();
+                            let c = cfg.clone();
+                            match tokio::task::spawn_blocking(move || tools::execute(&n, &a, &c))
+                                .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => tools::Outcome::err("tool task panicked"),
+                            }
                         }
                     } else {
-                        tools::execute(&name, &exec_args, &cfg)
+                        let n = name.clone();
+                        let a = exec_args.clone();
+                        let c = cfg.clone();
+                        match tokio::task::spawn_blocking(move || tools::execute(&n, &a, &c)).await
+                        {
+                            Ok(o) => o,
+                            Err(_) => tools::Outcome::err("tool task panicked"),
+                        }
                     };
 
                     // Milestone 1.1: a memory save/append/forget via the AI
@@ -6423,6 +6866,7 @@ async fn run_turn(
                             st.logger.record_turn();
                             persist_stats(st).await;
                             maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
+                            maybe_finish_goal_synthesis(st, cancel.is_cancelled()).await;
                             emit(&Event::new("done"));
                             return;
                         }
@@ -6488,8 +6932,41 @@ async fn run_turn(
                         ev = ev.with("diff", json!(d));
                     }
                     emit(&ev);
+                    if outcome.ok {
+                        if let Some(d) = &outcome.diff {
+                            if !d.is_empty() {
+                                let path = exec_args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                emit(
+                                    &Event::new("file_change")
+                                        .with("path", json!(path))
+                                        .with("unified_diff", json!(d))
+                                        .with("tool", json!(name)),
+                                );
+                            }
+                        } else if matches!(
+                            name.as_str(),
+                            "write_file" | "edit" | "patch" | "delete" | "rename" | "mkdir"
+                        ) {
+                            let path = exec_args
+                                .get("path")
+                                .or_else(|| exec_args.get("to"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !path.is_empty() {
+                                emit(
+                                    &Event::new("file_change")
+                                        .with("path", json!(path))
+                                        .with("tool", json!(name)),
+                                );
+                            }
+                        }
+                    }
                     let tool_result = Message::tool(id.clone(), &outcome.output);
                     let est = estimate_message_tokens(&tool_result);
+                    messages.push(tool_result.clone());
                     let mut conv = st.conversation.lock().await;
                     conv.push(tool_result);
                     if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -6497,6 +6974,9 @@ async fn run_turn(
                     }
                     *st.estimated_tokens.lock().await += est;
                 }
+                // Re-sync after parallel wave / any path that touched conversation
+                // without going through the working buffer.
+                messages.clone_from(&*st.conversation.lock().await);
                 // Loop back for the model to continue.
             }
             _ => {
@@ -6526,6 +7006,7 @@ async fn run_turn(
                     // Push the reflect prompt as a user message and re-stream.
                     let msg = Message::user(reflect_prompt);
                     let est = estimate_message_tokens(&msg);
+                    messages.push(msg.clone());
                     let mut conv = st.conversation.lock().await;
                     conv.push(msg);
                     if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -6546,6 +7027,7 @@ async fn run_turn(
                     st.logger.record_turn();
                     persist_stats(st).await;
                     maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
+                    maybe_finish_goal_synthesis(st, cancel.is_cancelled()).await;
                     emit(&Event::new("done"));
                     return;
                 }
@@ -6588,6 +7070,8 @@ pub(crate) async fn request_approval(
         notify: notify.clone(),
         granted: Mutex::new(None),
         escalated: Mutex::new(false),
+        allow_session: Mutex::new(false),
+        allow_pattern: Mutex::new(None),
     });
 
     st.pending
@@ -6661,6 +7145,50 @@ pub(crate) async fn request_approval(
                 .collect();
             session::save_escalations(p, &set);
         }
+    }
+    // allow_session / allow_pattern → push a PermissionRule allow for this tool.
+    let allow_session = *pending.allow_session.lock().await;
+    let allow_pattern = pending.allow_pattern.lock().await.clone();
+    if allow_session || allow_pattern.is_some() {
+        let content = allow_pattern.clone().unwrap_or_else(|| "*".into());
+        let rule = config::PermissionRule {
+            tool_name: name.to_string(),
+            rule_content: content.clone(),
+            behavior: config::PermissionBehavior::Allow,
+        };
+        st.cfg.write().await.allow_rules.push(rule);
+        emit(
+            &Event::new("approval_changed")
+                .with("mode", json!("allow_pattern"))
+                .with("tool", json!(name))
+                .with("pattern", json!(content)),
+        );
+    }
+    // Audit sidecar (opt-in).
+    {
+        let cfg = st.cfg.read().await;
+        let decision = if !granted {
+            "no"
+        } else if *pending.escalated.lock().await {
+            "always"
+        } else if allow_session {
+            "allow_session"
+        } else if allow_pattern.is_some() {
+            "allow_pattern"
+        } else {
+            "yes"
+        };
+        audit::record(
+            cfg.audit_log,
+            cfg.session_file.as_deref(),
+            &cfg.workspace,
+            name,
+            args,
+            decision,
+            "user",
+            None,
+            diff.as_deref(),
+        );
     }
     st.pending.lock().await.remove(&request_id);
     if granted {
@@ -7848,6 +8376,22 @@ async fn emit_turn_metrics(st: &State, metrics: &TurnMetrics) {
         );
     }
     emit(&ev);
+    // Cost/cache update for clients (estimated USD left null unless a price
+    // overlay is configured later — tokens + cache hits are always useful).
+    let cache_hit_pct = if metrics.tokens_in > 0 {
+        Some((metrics.cached_tokens as f64) * 100.0 / (metrics.tokens_in as f64))
+    } else {
+        None
+    };
+    emit(
+        &Event::new("cost_update")
+            .with("tokens_in", json!(metrics.tokens_in))
+            .with("tokens_out", json!(metrics.tokens_out))
+            .with("cached_tokens", json!(metrics.cached_tokens))
+            .with("cache_hit_pct", json!(cache_hit_pct))
+            .with("estimated_usd", json!(null))
+            .with("model", json!(metrics.model)),
+    );
 }
 
 /// Compact the conversation when it nears the context window.

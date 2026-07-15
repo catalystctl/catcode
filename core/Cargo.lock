@@ -70,6 +70,7 @@ name = "catalyst-code-core"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "bytes",
  "filetime",
  "futures-util",
  "libc",

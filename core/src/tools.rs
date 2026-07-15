@@ -197,7 +197,7 @@ fn definitions_uncached() -> Vec<Value> {
                         "tasks": { "type": "array", "description": "parallel tasks: each {agent, task, model?, count?}" },
                         "chain": { "type": "array", "description": "sequential steps: {agent, task, as?, parallel?, concurrency?}" },
                         "concurrency": { "type": "integer", "description": "parallel concurrency (default from config)" },
-                        "worktree": { "type": "boolean" },
+                        "worktree": { "type": "boolean", "description": "isolate each parallel task in a git worktree under .catalyst-code/worktrees/ (requires a git repo; changes are promoted on success)" },
                         "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent" },
                         "async": { "type": "boolean", "description": "background execution" },
                         "id": { "type": "string", "description": "run id for status/interrupt/resume/peek/steer" },
@@ -551,7 +551,7 @@ fn definitions_uncached() -> Vec<Value> {
                         "summary": { "type": "string", "description": "short plan summary" },
                         "steps": {
                             "type": "array",
-                            "description": "ordered deploy steps; use depends_on for sequencing and parallel_group for concurrent batches",
+                            "description": "deployment DAG; keep depends_on empty for independent work so the goal scheduler can fill its concurrency window, and use dependencies only for required ordering",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1208,6 +1208,184 @@ fn path_matches_type(path: &std::path::Path, exts: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Directory grep via `rg` when on PATH. Returns `None` to fall back to the
+/// pure-Rust walker (rg missing, spawn failure, or empty non-error).
+fn grep_via_rg(
+    pattern: &str,
+    root: &std::path::Path,
+    cfg: &Config,
+    case_insensitive: bool,
+    glob_pat: Option<&str>,
+    type_exts: Option<&[&str]>,
+    output_mode: &str,
+    head_limit: usize,
+    skip: usize,
+    context: usize,
+) -> Option<Outcome> {
+    use std::process::{Command, Stdio};
+    // Probe once: if rg isn't on PATH, skip forever for this process.
+    static RG_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let available = *RG_AVAILABLE.get_or_init(|| {
+        Command::new("rg")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if !available {
+        return None;
+    }
+
+    let mut cmd = Command::new("rg");
+    cmd.arg("--no-heading")
+        .arg("--line-number")
+        .arg("--color=never")
+        .arg("--hidden")
+        .arg("--glob")
+        .arg("!.git")
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if case_insensitive {
+        cmd.arg("-i");
+    }
+    match output_mode {
+        "files_with_matches" => {
+            cmd.arg("-l");
+        }
+        "count" => {
+            cmd.arg("--count");
+        }
+        _ => {
+            if context > 0 {
+                cmd.arg("-C").arg(context.to_string());
+            }
+        }
+    }
+    if let Some(g) = glob_pat {
+        cmd.arg("--glob").arg(g);
+    }
+    if let Some(exts) = type_exts {
+        for e in exts {
+            cmd.arg("--glob").arg(format!("*.{e}"));
+        }
+    }
+    // Collect more than a page so offset/head_limit still work client-side.
+    let collect_cap = (skip + head_limit).saturating_mul(2).max(head_limit + skip);
+    cmd.arg("--max-count")
+        .arg(collect_cap.to_string())
+        .arg("--")
+        .arg(pattern)
+        .arg(".");
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+    // rg exits 1 when no matches — still a successful search.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rel_prefix = |path: &str| -> String {
+        let p = root.join(path);
+        p.strip_prefix(&cfg.workspace)
+            .unwrap_or(&p)
+            .display()
+            .to_string()
+    };
+
+    match output_mode {
+        "files_with_matches" => {
+            let mut files: Vec<String> = stdout
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| rel_prefix(l.trim()))
+                .collect();
+            files.sort();
+            files.dedup();
+            let total = files.len();
+            let start = skip.min(total);
+            let end = (start + head_limit).min(total);
+            let more = end < total;
+            let mut s = files[start..end].join("\n");
+            if more {
+                s.push_str(&format!(
+                    "\n...[{} file cap reached; pass offset={} to continue]",
+                    head_limit,
+                    skip + (end - start)
+                ));
+            }
+            Some(Outcome::ok(s))
+        }
+        "count" => {
+            let mut lines: Vec<(String, usize)> = Vec::new();
+            for line in stdout.lines().filter(|l| !l.is_empty()) {
+                // path:count
+                if let Some((path, n)) = line.rsplit_once(':') {
+                    if let Ok(c) = n.parse::<usize>() {
+                        lines.push((rel_prefix(path), c));
+                    }
+                }
+            }
+            let total_files = lines.len();
+            let start = skip.min(total_files);
+            let end = (start + head_limit).min(total_files);
+            let more = end < total_files;
+            let mut out_lines = Vec::new();
+            let mut total = 0usize;
+            for (rel, n) in &lines[start..end] {
+                total += n;
+                out_lines.push(format!("{rel}:{n}"));
+            }
+            let mut s = out_lines.join("\n");
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!("# total: {total}"));
+            if more {
+                s.push_str(&format!(
+                    "\n...[{} file cap reached; pass offset={} to continue]",
+                    head_limit,
+                    skip + (end - start)
+                ));
+            }
+            Some(Outcome::ok(s))
+        }
+        _ => {
+            // content: path:line:text (or context lines with -)
+            let mut records: Vec<String> = Vec::new();
+            for line in stdout.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                // Rewrite path prefix to workspace-relative.
+                if let Some((path, rest)) = line.split_once(':') {
+                    let rel = rel_prefix(path);
+                    records.push(format!("{rel}:{rest}"));
+                } else {
+                    records.push(line.to_string());
+                }
+            }
+            let total = records.len();
+            let start = skip.min(total);
+            let end = (start + head_limit).min(total);
+            let more = end < total;
+            let mut s = records[start..end].join("\n");
+            if more {
+                s.push_str(&format!(
+                    "\n...[{} match cap reached; pass offset={} to continue]",
+                    head_limit,
+                    skip + (end - start)
+                ));
+            }
+            Some(Outcome::ok(s))
+        }
+    }
+}
+
 #[allow(clippy::needless_range_loop)]
 fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
     let case_insensitive = args
@@ -1266,8 +1444,27 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         }
     };
 
-    // Single-file path: search just that file.
+    // Single-file path: search just that file (pure Rust — no rg spawn).
     let single_file = root.is_file();
+
+    // Directory search: prefer ripgrep when available (gitignore, binary skip,
+    // parallelism). Fall back to the pure-Rust walker when rg is missing.
+    if !single_file {
+        if let Some(out) = grep_via_rg(
+            pattern,
+            &root,
+            cfg,
+            case_insensitive,
+            glob_pat,
+            type_exts,
+            output_mode,
+            head_limit,
+            skip,
+            context,
+        ) {
+            return out;
+        }
+    }
 
     // Records of every match: (rel_path, line_index_0based, matched_line).
     let mut records: Vec<(String, usize, String)> = Vec::new();

@@ -9,10 +9,30 @@ use crate::config::{ProviderKind, ResolvedProvider};
 use crate::logging::{estimate_tokens, TurnTimer};
 use crate::message::{self, Message};
 use crate::protocol::{emit, Event, ModelInfo};
+use bytes::BytesMut;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Append SSE bytes and split out complete lines without `String::drain`
+/// (which shifts the remainder on every line).
+fn sse_take_lines(buf: &mut BytesMut, chunk: &[u8], lines: &mut Vec<String>) {
+    buf.extend_from_slice(chunk);
+    loop {
+        let nl = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => i,
+            None => break,
+        };
+        let mut line_bytes = buf.split_to(nl + 1);
+        line_bytes.truncate(line_bytes.len() - 1); // drop \n
+        if line_bytes.last() == Some(&b'\r') {
+            line_bytes.truncate(line_bytes.len() - 1);
+        }
+        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        lines.push(line);
+    }
+}
 
 #[allow(dead_code)]
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
@@ -3125,6 +3145,206 @@ fn token_count(v: &Value) -> Option<u64> {
     None
 }
 
+/// Detect the provider failure mode where a model writes a DSML function call
+/// into hidden reasoning instead of returning structured `tool_calls`.
+///
+/// Keep this deliberately narrow: reasoning is untrusted model output and must
+/// never become executable merely because it resembles a tool invocation. The
+/// caller uses this only to reject/retry an otherwise empty completion.
+fn reasoning_contains_dsml_tool_call(reasoning: &str) -> bool {
+    let lower = reasoning.to_ascii_lowercase();
+    lower.contains("<｜dsml｜invoke")
+        || lower.contains("<|dsml|invoke")
+        || lower.contains("dsml｜tool_calls")
+        || lower.contains("dsml|tool_calls")
+}
+
+/// Add a one-shot recovery instruction without persisting it in conversation
+/// history. Inserting a system message at the front is accepted by the broadest
+/// set of OpenAI-compatible providers and leaves the original user turn intact.
+fn add_structured_tool_call_recovery_instruction(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    messages.insert(
+        0,
+        json!({
+            "role": "system",
+            "content": "Protocol recovery: your previous response had no visible assistant content and no structured tool call. Continue the task; do not end with reasoning alone. If a tool is needed, return it through the API's structured tool_calls field. If the task is complete, return a visible final response and use the finish tool when available. Do not write DSML, XML, or tool-call syntax in normal content."
+        }),
+    );
+}
+
+fn parse_dsml_tag_attributes(
+    tag: &str,
+    expected_kind: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(mut rest) = tag.strip_prefix(expected_kind) else {
+        return Err(format!("expected DSML {expected_kind} tag"));
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return Err(format!("invalid DSML {expected_kind} tag"));
+    }
+    let mut attrs = serde_json::Map::new();
+    while !rest.trim_start().is_empty() {
+        rest = rest.trim_start();
+        let Some(eq) = rest.find('=') else {
+            return Err(format!("invalid DSML {expected_kind} attribute"));
+        };
+        let key = &rest[..eq];
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("invalid DSML {expected_kind} attribute name"));
+        }
+        rest = &rest[eq + 1..];
+        let Some(quoted) = rest.strip_prefix('"') else {
+            return Err(format!("DSML {expected_kind} attributes must be quoted"));
+        };
+        let Some(end_quote) = quoted.find('"') else {
+            return Err(format!("unterminated DSML {expected_kind} attribute"));
+        };
+        if attrs
+            .insert(key.to_string(), json!(&quoted[..end_quote]))
+            .is_some()
+        {
+            return Err(format!("duplicate DSML {expected_kind} attribute '{key}'"));
+        }
+        rest = &quoted[end_quote + 1..];
+    }
+    Ok(attrs)
+}
+
+fn recovered_dsml_call_id(index: usize) -> String {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("call_dsml_{nanos:x}_{sequence:x}_{index:x}")
+}
+
+/// Recover the model's DSML wire format into ordinary, untrusted structured
+/// calls. The returned calls still go through the normal JSON parsing, tool
+/// implementation validation, approval gates, sandbox, and dispatch path.
+fn parse_reasoning_dsml_tool_calls(
+    reasoning: &str,
+    registered_tools: &[Value],
+) -> Result<Option<Vec<ToolAccum>>, String> {
+    if !reasoning_contains_dsml_tool_call(reasoning) {
+        return Ok(None);
+    }
+
+    // Some model templates use ASCII bars while others use full-width bars.
+    let normalized = reasoning.replace("|DSML|", "｜DSML｜");
+    const WRAPPER_OPEN: &str = "<｜DSML｜tool_calls>";
+    const WRAPPER_CLOSE: &str = "</｜DSML｜tool_calls>";
+    const INVOKE_OPEN: &str = "<｜DSML｜invoke";
+    const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
+    const PARAM_OPEN: &str = "<｜DSML｜parameter";
+    const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
+
+    let start = normalized
+        .rfind(WRAPPER_OPEN)
+        .ok_or_else(|| "missing DSML tool_calls opening tag".to_string())?;
+    let after_open = &normalized[start + WRAPPER_OPEN.len()..];
+    let close = after_open
+        .find(WRAPPER_CLOSE)
+        .ok_or_else(|| "missing DSML tool_calls closing tag".to_string())?;
+    if !after_open[close + WRAPPER_CLOSE.len()..].trim().is_empty() {
+        return Err("unexpected text after DSML tool_calls".into());
+    }
+    let mut body = &after_open[..close];
+    let mut calls = Vec::new();
+
+    while !body.trim_start().is_empty() {
+        body = body.trim_start();
+        if !body.starts_with(INVOKE_OPEN) {
+            return Err("unexpected content inside DSML tool_calls".into());
+        }
+        let open_end = body
+            .find('>')
+            .ok_or_else(|| "unterminated DSML invoke tag".to_string())?;
+        let invoke_tag = &body["<｜DSML｜".len()..open_end];
+        let mut invoke_attrs = parse_dsml_tag_attributes(invoke_tag, "invoke")?;
+        if invoke_attrs.len() != 1 {
+            return Err("DSML invoke must contain only a name attribute".into());
+        }
+        let name = invoke_attrs
+            .remove("name")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "DSML invoke has no valid tool name".to_string())?;
+        let registered = registered_tools.iter().any(|tool| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some(name.as_str())
+        });
+        if !registered {
+            return Err(format!("DSML requested unavailable tool '{name}'"));
+        }
+
+        let after_invoke_open = &body[open_end + 1..];
+        let invoke_close = after_invoke_open
+            .find(INVOKE_CLOSE)
+            .ok_or_else(|| "missing DSML invoke closing tag".to_string())?;
+        let mut params_text = &after_invoke_open[..invoke_close];
+        let mut args = serde_json::Map::new();
+        while !params_text.trim_start().is_empty() {
+            params_text = params_text.trim_start();
+            if !params_text.starts_with(PARAM_OPEN) {
+                return Err("unexpected content inside DSML invoke".into());
+            }
+            let param_open_end = params_text
+                .find('>')
+                .ok_or_else(|| "unterminated DSML parameter tag".to_string())?;
+            let param_tag = &params_text["<｜DSML｜".len()..param_open_end];
+            let mut param_attrs = parse_dsml_tag_attributes(param_tag, "parameter")?;
+            if param_attrs.len() != 2 {
+                return Err("DSML parameter requires only name and string attributes".into());
+            }
+            let param_name = param_attrs
+                .remove("name")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "DSML parameter has no valid name".to_string())?;
+            let string_mode = param_attrs
+                .remove("string")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .ok_or_else(|| "DSML parameter has no string mode".to_string())?;
+            let after_param_open = &params_text[param_open_end + 1..];
+            let param_close = after_param_open
+                .find(PARAM_CLOSE)
+                .ok_or_else(|| "missing DSML parameter closing tag".to_string())?;
+            let raw_value = &after_param_open[..param_close];
+            let value = match string_mode.as_str() {
+                "true" => Value::String(raw_value.to_string()),
+                "false" => serde_json::from_str(raw_value)
+                    .map_err(|e| format!("invalid JSON in DSML parameter '{param_name}': {e}"))?,
+                _ => return Err("DSML parameter string mode must be true or false".into()),
+            };
+            if args.insert(param_name.clone(), value).is_some() {
+                return Err(format!("duplicate DSML parameter '{param_name}'"));
+            }
+            params_text = &after_param_open[param_close + PARAM_CLOSE.len()..];
+        }
+
+        if calls.len() >= 32 {
+            return Err("too many recovered DSML tool calls".into());
+        }
+        calls.push(ToolAccum {
+            id: recovered_dsml_call_id(calls.len()),
+            name,
+            args: Value::Object(args).to_string(),
+        });
+        body = &after_invoke_open[invoke_close + INVOKE_CLOSE.len()..];
+    }
+    if calls.is_empty() {
+        return Err("DSML tool_calls wrapper contained no invocations".into());
+    }
+    Ok(Some(calls))
+}
+
 /// One streamed assistant turn. Emits `thinking`/`delta`/`tool_call` events as it goes.
 /// Retries the initial POST on 429/5xx with exponential backoff (honors Retry-After).
 /// Returns the finalized assistant message, finish_reason, and (in/out) token counts.
@@ -3248,7 +3468,8 @@ async fn stream_turn_codex(
     let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
     let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = BytesMut::new();
+    let mut sse_lines: Vec<String> = Vec::new();
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut calls: Vec<ToolAccum> = Vec::new();
@@ -3265,10 +3486,9 @@ async fn stream_turn_codex(
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| format!("stream read: {}", fmt_chain(&e)))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim().to_string();
-            buf.drain(..=nl);
+        sse_lines.clear();
+        sse_take_lines(&mut buf, &chunk, &mut sse_lines);
+        for line in sse_lines.drain(..) {
             let data = line
                 .strip_prefix("data: ")
                 .or_else(|| line.strip_prefix("data:"));
@@ -3514,14 +3734,42 @@ async fn stream_turn_openai(
     let api_key = provider.api_key.as_deref().unwrap_or("");
     // Convert Messages → OpenAI-shaped JSON for the wire.
     let openai_messages = Message::to_openai_messages(messages);
+    // Stable tool-def ordering helps provider prefix caches across turns.
+    let mut tools_sorted = tools.to_vec();
+    tools_sorted.sort_by(|a, b| {
+        let na = a
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let nb = b
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        na.cmp(nb)
+    });
     let mut body = json!({
         "model": model,
         "messages": openai_messages,
-        "tools": tools,
+        "tools": tools_sorted,
         "tool_choice": "auto",
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    // Structured plan: when goal_write_plan is in the tool list (planning
+    // phase), force that tool so the plan schema is respected.
+    if tools_sorted.iter().any(|t| {
+        t.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            == Some("goal_write_plan")
+    }) {
+        body["tool_choice"] = json!({
+            "type": "function",
+            "function": { "name": "goal_write_plan" }
+        });
+    }
     if umans {
         // Resolve the requested effort against the model's advertised thinking
         // levels: clamp to the closest supported level when the model constrains
@@ -3557,6 +3805,11 @@ async fn stream_turn_openai(
     // prefix-cache hits and diagnose busts — the request shape is already stable,
     // this just makes the hit visible.
     let mut cached_tokens: u64 = 0;
+    // A malformed reasoning-only DSML call is an upstream protocol violation,
+    // not an executable tool call. Retry it once with an explicit wire-format
+    // reminder; a repeated violation becomes a visible error instead of a
+    // silent, content-empty assistant completion.
+    let mut protocol_retried = false;
     // Per-chunk idle timeout: if no bytes arrive for this long mid-stream, abort.
     // Configurable because reasoning models can think >60s before the first token.
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
@@ -3575,7 +3828,8 @@ async fn stream_turn_openai(
         attempt += 1;
         let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = BytesMut::new();
+        let mut sse_lines: Vec<String> = Vec::new();
         // P2-3: accumulator for a JSON object split across several `data:`
         // lines (some OpenAI-compatible servers do this). A complete object
         // parses on the first line, so the common path is unchanged; only a
@@ -3600,13 +3854,12 @@ async fn stream_turn_openai(
                     break;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            sse_lines.clear();
+            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
 
             // Process complete SSE frames. A frame may span multiple `data:` lines that
             // must be concatenated before parsing (some OpenAI-compatible servers split).
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in sse_lines.drain(..) {
                 if line.is_empty() {
                     // Blank line = event boundary: drop any half-accumulated frame.
                     pending.clear();
@@ -3786,6 +4039,61 @@ async fn stream_turn_openai(
         }
 
         if err.is_none() {
+            if content.trim().is_empty() && tool_calls.is_empty() {
+                let protocol_issue = match parse_reasoning_dsml_tool_calls(
+                    &reasoning,
+                    &tools_sorted,
+                ) {
+                    Ok(Some(recovered)) => {
+                        tool_calls = recovered;
+                        finish_reason = "tool_calls".into();
+                        // Do not replay the malformed channel content on the
+                        // next provider request. The recovered structured call
+                        // is the canonical persisted representation.
+                        reasoning.clear();
+                        if !quiet {
+                            emit(&Event::new("info").with(
+                                "message",
+                                json!("recovered a provider tool call from reasoning DSML; applying normal validation and approval checks"),
+                            ));
+                        }
+                        None
+                    }
+                    Ok(None) if reasoning.trim().is_empty() => {
+                        Some("an entirely empty completion".to_string())
+                    }
+                    Ok(None) => Some("a reasoning-only completion".to_string()),
+                    Err(parse_error) => Some(format!(
+                        "invalid reasoning DSML that could not be validated: {parse_error}"
+                    )),
+                };
+                if let Some(issue) = protocol_issue {
+                    if protocol_retried {
+                        return Err(format!(
+                            "provider returned {issue}; retry also produced no usable assistant response"
+                        ));
+                    }
+                    protocol_retried = true;
+                    if !quiet {
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "provider returned {issue}; retrying once and requiring either a structured tool call or visible response"
+                            )),
+                        ));
+                    }
+                    add_structured_tool_call_recovery_instruction(&mut body);
+                    content.clear();
+                    reasoning.clear();
+                    tool_calls.clear();
+                    finish_reason.clear();
+                    tokens_in = 0;
+                    tokens_out = 0;
+                    cached_tokens = 0;
+                    timer.call_first_token = None;
+                    continue;
+                }
+            }
             break; // stream completed cleanly
         }
         let msg = err.unwrap();
@@ -4164,7 +4472,8 @@ async fn stream_turn_gemini(
         let resp =
             send_with_retry(client, &url, api_key, &provider.headers, &request, cancel).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = BytesMut::new();
+        let mut sse_lines: Vec<String> = Vec::new();
         let mut pending = String::new();
         let mut err: Option<String> = None;
 
@@ -4184,11 +4493,10 @@ async fn stream_turn_gemini(
                     break;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            sse_lines.clear();
+            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
 
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in sse_lines.drain(..) {
                 if line.is_empty() || line.starts_with(':') {
                     pending.clear();
                     continue;
@@ -4497,7 +4805,18 @@ async fn send_with_retry(
         } else {
             headers
         };
-        let mut req = client.post(url).bearer_auth(api_key).json(body);
+        // Ask gateways and reverse proxies to pass SSE through as it arrives.
+        // `identity` is especially important for compatibility endpoints:
+        // compression middleware commonly buffers several small token events
+        // before producing one compressed output chunk, which looks like fake
+        // streaming to callers even though the upstream is emitting deltas.
+        let mut req = client
+            .post(url)
+            .bearer_auth(api_key)
+            .header("accept", "text/event-stream")
+            .header("accept-encoding", "identity")
+            .header("cache-control", "no-cache")
+            .json(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -4996,6 +5315,9 @@ async fn send_anthropic_request(
         let mut req = client
             .post(url)
             .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("accept", "text/event-stream")
+            .header("accept-encoding", "identity")
+            .header("cache-control", "no-cache")
             .header("content-type", "application/json")
             .json(body);
         if provider.oauth {
@@ -5109,7 +5431,8 @@ async fn stream_turn_anthropic(
         attempt += 1;
         let resp = send_anthropic_request(client, &url, provider, &body, cancel).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = BytesMut::new();
+        let mut sse_lines: Vec<String> = Vec::new();
         let mut cur_event = String::new();
         let mut pending = String::new();
         let mut emitted = false;
@@ -5134,13 +5457,12 @@ async fn stream_turn_anthropic(
                     break;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            sse_lines.clear();
+            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
 
             // Process complete SSE frames. Anthropic frames pair an `event:`
             // line with a `data:` line; the event type drives dispatch.
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in sse_lines.drain(..) {
                 if line.is_empty() {
                     pending.clear();
                     cur_event.clear();
@@ -5173,7 +5495,17 @@ async fn stream_turn_anthropic(
                     Err(_) => continue, // wait for more `data:` lines to complete the frame
                 };
 
-                match cur_event.as_str() {
+                // Anthropic's first-party stream includes an `event:` line, but
+                // a number of Messages-compatible gateways emit data-only SSE
+                // and carry the same discriminator in the JSON `type` field.
+                // Accept both forms so those endpoints stream progressively
+                // instead of silently accumulating an empty final response.
+                let event_type = if cur_event.is_empty() {
+                    obj.get("type").and_then(Value::as_str).unwrap_or("")
+                } else {
+                    cur_event.as_str()
+                };
+                match event_type {
                     "message_start" => {
                         if let Some(u) = obj.get("message").and_then(|m| m.get("usage")) {
                             if let Some(p) = u.get("input_tokens").and_then(token_count) {
@@ -5552,6 +5884,65 @@ fn anthropic_fallback_models() -> Vec<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_reasoning_only_dsml_tool_calls_narrowly() {
+        assert!(reasoning_contains_dsml_tool_call(
+            "<｜DSML｜invoke name=\"edit\">... </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        ));
+        assert!(reasoning_contains_dsml_tool_call(
+            "<|DSML|invoke name=\"bash\">"
+        ));
+        assert!(!reasoning_contains_dsml_tool_call(
+            "I should use the structured tool_calls field next."
+        ));
+        assert!(!reasoning_contains_dsml_tool_call(
+            "DSML must never be written instead of tool_calls."
+        ));
+        assert!(!reasoning_contains_dsml_tool_call("ordinary reasoning"));
+    }
+
+    #[test]
+    fn dsml_recovery_rejects_unknown_tools_and_invalid_json() {
+        let registered = vec![json!({"function": {"name": "edit"}})];
+        let unknown = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="bash"></｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+        assert!(parse_reasoning_dsml_tool_calls(unknown, &registered)
+            .err()
+            .unwrap()
+            .contains("unavailable tool 'bash'"));
+
+        let invalid_json = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="edit">
+<｜DSML｜parameter name="edits" string="false">not-json</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+        assert!(parse_reasoning_dsml_tool_calls(invalid_json, &registered)
+            .err()
+            .unwrap()
+            .contains("invalid JSON"));
+    }
+
+    #[test]
+    fn recovery_instruction_is_request_local_and_prepend_only() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "original"},
+                {"role": "user", "content": "fix it"}
+            ]
+        });
+        add_structured_tool_call_recovery_instruction(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("structured tool_calls"));
+        assert_eq!(messages[1]["content"], "original");
+        assert_eq!(messages[2]["content"], "fix it");
+    }
 
     #[test]
     fn is_opencode_go_matches_zen_go_path() {
@@ -6846,6 +7237,325 @@ mod tests {
             headers: Vec::new(),
             oauth: false,
         }
+    }
+
+    async fn mock_openai_sse_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let h = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut requests = Vec::new();
+            for response_body in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while find_header_end(&buf).is_none() {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let header_end = find_header_end(&buf).unwrap_or(buf.len());
+                let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                let content_len = header_str
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let body_start = header_end.saturating_add(4);
+                while buf.len().saturating_sub(body_start) < content_len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let request_body = &buf[body_start..body_start.saturating_add(content_len)];
+                requests.push(serde_json::from_slice(request_body).unwrap());
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                sock.write_all(response.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            requests
+        });
+        (base, h)
+    }
+
+    #[tokio::test]
+    async fn valid_reasoning_dsml_becomes_a_structured_call() {
+        let dsml = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"reasoning_content": r#"I need to edit the file.
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="edit">
+<｜DSML｜parameter name="edits" string="false">[{"search":"old","replace":"new"}]</｜DSML｜parameter>
+<｜DSML｜parameter name="path" string="true">core/src/config.rs</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#},
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base, server) = mock_openai_sse_server(vec![dsml]).await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "edit", "parameters": {"type": "object"}}
+        })];
+        let result = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("fix it")],
+            &tools,
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("valid DSML should recover into the normal tool-call path");
+
+        let calls = result.0["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["name"], "edit");
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "core/src/config.rs");
+        assert_eq!(args["edits"][0]["replace"], "new");
+        assert!(result.0.get("reasoning_content").is_none());
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1, "valid DSML should not need a retry");
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_completion_retries_once_and_continues() {
+        let reasoning_only = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"reasoning_content": "The last test failed; I need to fix the assertion.\n</work-state>"},
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let continued = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"content": "I found the failed assertion and will correct it."},
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base, server) = mock_openai_sse_server(vec![reasoning_only, continued]).await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("fix it")],
+            &[],
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("reasoning-only completion should recover on one retry");
+        assert_eq!(
+            result.0["content"],
+            "I found the failed assertion and will correct it."
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("do not end with reasoning alone"));
+    }
+
+    #[tokio::test]
+    async fn repeated_reasoning_only_completion_is_a_visible_error() {
+        let reasoning_only = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"reasoning_content": "status only\n</work-state>"},
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base, server) =
+            mock_openai_sse_server(vec![reasoning_only.clone(), reasoning_only]).await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let error = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("fix it")],
+            &[],
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect_err("repeated reasoning-only output must not silently complete");
+        assert!(error.contains("reasoning-only completion"));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_malformed_reasoning_tool_call_is_a_visible_error() {
+        let malformed = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"reasoning_content": "<｜DSML｜invoke name=\"bash\">\n</｜DSML｜tool_calls>"},
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base, server) =
+            mock_openai_sse_server(vec![malformed.clone(), malformed]).await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let error = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("fix it")],
+            &[],
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect_err("a repeated protocol violation must not silently complete");
+        assert!(error.contains("invalid reasoning DSML"));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sse_lines_are_released_before_the_blank_event_boundary() {
+        let mut buf = BytesMut::new();
+        let mut lines = Vec::new();
+
+        // A network read can end immediately after the data line. The parser
+        // must release that delta now, not wait for a later transport chunk
+        // containing the blank SSE event delimiter.
+        sse_take_lines(
+            &mut buf,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n",
+            &mut lines,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"one\""));
+
+        lines.clear();
+        sse_take_lines(&mut buf, b"\ndata: part", &mut lines);
+        assert_eq!(lines, vec![String::new()]);
+        assert_eq!(&buf[..], b"data: part");
+
+        lines.clear();
+        sse_take_lines(&mut buf, b"ial\n", &mut lines);
+        assert_eq!(lines, vec!["data: partial"]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_compat_stream_accepts_data_only_sse() {
+        let response = [
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 7 } }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "hello " }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "world" }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 2 }
+            }),
+            json!({ "type": "message_stop" }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let (base, server) = mock_openai_sse_server(vec![response]).await;
+        let provider = ResolvedProvider {
+            name: "anthropic-compat-mock".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            headers: Vec::new(),
+            oauth: false,
+        };
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_anthropic(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("say hello")],
+            &[],
+            "none",
+            &[],
+            1024,
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("data-only Anthropic SSE should stream successfully");
+
+        assert_eq!(result.0["content"], "hello world");
+        assert_eq!(result.1, "stop");
+        assert_eq!(result.2, 7);
+        assert_eq!(result.3, 2);
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0]["stream"], true);
     }
 
     #[tokio::test]

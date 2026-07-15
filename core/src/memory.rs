@@ -1025,6 +1025,64 @@ fn build_relevant_tail(memories: &[MemoryEntry], prompt: &str) -> String {
     if live.is_empty() {
         return String::new();
     }
+
+    // Prefer embedding retrieval when synonym-miss rate is elevated.
+    let prefer_embed = {
+        let (misses, hits) = crate::memory_recall::rolling_synonym_counts();
+        crate::embed::should_prefer_embeddings(misses, hits)
+    };
+    if prefer_embed {
+        // Ensure index is warm for live memories.
+        // Workspace is inferred from the first memory path's grandparent hash dir —
+        // callers always pass workspace-scoped memories; fall back to tf·idf if
+        // we can't locate the store.
+        if let Some(ws_hint) = live.first().and_then(|m| m.path.parent()) {
+            // Index lives under ~/.config/.../memory/<hash>/; we don't have the
+            // workspace Path here, so use hashing over name+desc+content keyed by
+            // stem and search against an in-memory sketch for this call.
+            let q = crate::embed::hash_embed(prompt);
+            let mut scored: Vec<(&MemoryEntry, f32)> = live
+                .iter()
+                .copied()
+                .map(|m| {
+                    let text = format!("{} {} {}", m.name, m.description, m.content);
+                    let v = crate::embed::hash_embed(&text);
+                    (m, crate::embed::cosine(&q, &v))
+                })
+                .filter(|(_, s)| *s > 0.05)
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let _ = ws_hint;
+            if !scored.is_empty() {
+                scored.truncate(RELEVANT_MAX_ENTRIES);
+                let mut out = String::from(
+                    "[RELEVANT MEMORIES] — embedding-sketch matches for this turn (transient).\n",
+                );
+                for (m, _score) in &scored {
+                    let blurb = catalog_blurb(m);
+                    out.push_str(&format!(
+                        "- **{}** ({}, {}){}\n",
+                        m.name,
+                        if m.mem_type.is_empty() {
+                            "note"
+                        } else {
+                            m.mem_type.as_str()
+                        },
+                        m.scope.as_str(),
+                        if blurb.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {blurb}")
+                        }
+                    ));
+                }
+                if out.len() > 1 {
+                    return out;
+                }
+            }
+        }
+    }
+
     // Always-on semantic retrieval: tf·idf-weighted cosine over significant
     // tokens, plus a keyword bonus for exact name/description token hits.
     // This is the local Milestone-4 stand-in (no external embedding model): it

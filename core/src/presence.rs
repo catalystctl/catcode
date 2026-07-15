@@ -251,4 +251,47 @@ mod tests {
         assert!(!file.exists(), "stale presence file should be reaped");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn unix_now_is_reasonable() {
+        let t = unix_now();
+        assert!(t > 1_700_000_000, "unix_now must be post-2023: {t}");
+    }
+
+    #[test]
+    fn presence_dir_returns_some_for_temp_dir() {
+        let dir = std::env::temp_dir();
+        let pdir = presence_dir(&dir);
+        assert!(pdir.is_some(), "presence_dir should succeed for a valid path");
+        assert!(pdir.unwrap().to_string_lossy().contains("presence"));
+    }
+
+    #[test]
+    fn presence_file_uses_pid_in_name() {
+        let dir = std::env::temp_dir();
+        let f = presence_file(&dir, 42);
+        assert!(f.is_some());
+        let name = f.unwrap().file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name, "42.json");
+    }
+
+    #[test]
+    fn clear_presence_for_nonexistent_file_does_not_panic() {
+        // PID that has never written → clear should be a no-op, not panic.
+        let dir = std::env::temp_dir().join(format!("catcode-pres-nonex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        clear_presence(&dir, 99999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_peers_empty_dir() {
+        let dir = std::env::temp_dir().join(format!("catcode-pres-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let peers = read_peers(&dir, 1);
+        assert!(peers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

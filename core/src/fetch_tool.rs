@@ -216,32 +216,58 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Shared network egress policy for HTTP tools (fetch, web_search) and the
+/// documented relationship with bash `--no-network` / sandbox.
+///
+/// Bash isolation (`unshare -n` / firejail) is separate: it only wraps the
+/// shell. This policy is what HTTP tools consult so `--no-network` cannot be
+/// bypassed via `fetch` unless `fetch_allowlist` is explicitly populated.
+#[derive(Clone, Debug)]
+pub struct NetworkPolicy {
+    pub no_network: bool,
+    pub allowlist: Vec<String>,
+}
+
+impl NetworkPolicy {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            no_network: cfg.no_network,
+            allowlist: cfg.fetch_allowlist.clone(),
+        }
+    }
+
+    pub fn check(&self, label: &str, url: &str) -> Option<String> {
+        // Reuse the same rules as egress_check without requiring a full Config.
+        let (_scheme, host) = match parse_http_host(url) {
+            Some(v) => v,
+            None => return Some(format!("{label}: url must be an absolute http(s) URL")),
+        };
+        if self.no_network && self.allowlist.is_empty() {
+            return Some(format!(
+                "{label}: network egress is disabled (--no-network) and no fetch_allowlist is configured; populate fetch_allowlist to opt specific hosts in for {label} while keeping bash offline"
+            ));
+        }
+        if !host_allowed(&host, &self.allowlist) {
+            if self.allowlist.is_empty() {
+                return Some(format!(
+                    "{label}: host '{host}' is a private/loopback/link-local address and is blocked by default (empty fetch_allowlist); add it to fetch_allowlist to explicitly opt in"
+                ));
+            }
+            return Some(format!(
+                "{label}: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it",
+                self.allowlist.len()
+            ));
+        }
+        None
+    }
+}
+
 /// Shared egress decision for HTTP tools (fetch, web_search). Returns
 /// Some(err_msg) if the request must be denied per --no-network /
 /// fetch_allowlist, else None. Reused by web_search so it honors the SAME
 /// security model as fetch (no surprise bypass of --no-network).
 pub(crate) fn egress_check(label: &str, url: &str, cfg: &Config) -> Option<String> {
-    let (_scheme, host) = match parse_http_host(url) {
-        Some(v) => v,
-        None => return Some(format!("{label}: url must be an absolute http(s) URL")),
-    };
-    if cfg.no_network && cfg.fetch_allowlist.is_empty() {
-        return Some(format!(
-            "{label}: network egress is disabled (--no-network) and no fetch_allowlist is configured; populate fetch_allowlist to opt specific hosts in for {label} while keeping bash offline"
-        ));
-    }
-    if !host_allowed(&host, &cfg.fetch_allowlist) {
-        if cfg.fetch_allowlist.is_empty() {
-            return Some(format!(
-                "{label}: host '{host}' is a private/loopback/link-local address and is blocked by default (empty fetch_allowlist); add it to fetch_allowlist to explicitly opt in"
-            ));
-        }
-        return Some(format!(
-            "{label}: host '{host}' is not in the allowlist ({} pattern(s) configured); add it to fetch_allowlist to permit it",
-            cfg.fetch_allowlist.len()
-        ));
-    }
-    None
+    NetworkPolicy::from_config(cfg).check(label, url)
 }
 
 /// Very light HTML-to-text: drop script/style blocks, strip tags, collapse

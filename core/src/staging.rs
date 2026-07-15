@@ -325,7 +325,7 @@ project.
     │   ├── pi-subagents/      # orchestrator delegation playbook (opt-in via /skill)
     │   └── plugin-authoring/  # full plugin contract (opt-in via /skill)
     ├── plugins/
-    │   └── vision-handoff/# routes image turns to a vision-capable model
+    │   └── vision-handoff/# cheapest same-provider vision handoff (default ON)
     ├── README.md          # this file
     └── .staged            # staging schema version marker (do not edit)
 

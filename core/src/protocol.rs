@@ -2,6 +2,11 @@
 // TUI -> Core commands (stdin), Core -> TUI events (stdout).
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+fn default_vision_enabled() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ModelInfo {
     pub id: String,
@@ -55,13 +60,13 @@ pub enum Command {
     /// fresh `models` event. Unknown names are ignored (stays on current).
     #[serde(rename = "set_provider")]
     SetProvider { name: String },
-    /// List the built-in first-party provider presets (OpenAI/Codex, Gemini,
-    /// Anthropic). Emits a `provider_presets` event so the TUI/web can render a
+    /// List the built-in first-party provider presets (Umans, OpenCode Go,
+    /// OpenRouter). Emits a `provider_presets` event so the TUI/web can render a
     /// one-click "login" picker. Each entry carries whether a key or OAuth
     /// token is already stored from a prior explicit `/login`.
     #[serde(rename = "list_provider_presets")]
     ListProviderPresets,
-    /// Log in to a first-party provider (`openai` | `gemini` | `anthropic` | `xai` | …):
+    /// Log in to a first-party provider (`umans` | `opencode-go` | `openrouter`):
     /// create the provider config, set its API key, persist, and re-aggregate
     /// models so the provider's models appear in `/models` alongside any others
     /// already logged in. Requires an explicit `api_key` paste (env vars are not
@@ -123,8 +128,23 @@ pub enum Command {
     #[serde(rename = "clear")]
     Clear,
     /// Drop the last turn (user prompt + its assistant reply + tool calls/results).
+    /// Also restores the latest auto filesystem checkpoint when one exists.
     #[serde(rename = "undo")]
     Undo,
+    /// Create a hybrid filesystem checkpoint (git stash ref or file snapshot).
+    #[serde(rename = "create_checkpoint")]
+    CreateCheckpoint {
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        paths: Option<Vec<String>>,
+    },
+    /// List known checkpoints for this session/workspace.
+    #[serde(rename = "list_checkpoints")]
+    ListCheckpoints,
+    /// Restore a checkpoint by id (filesystem only; conversation unchanged).
+    #[serde(rename = "restore_checkpoint")]
+    RestoreCheckpoint { id: String },
     /// Force a context compaction now (regardless of the threshold). Optional
     /// `instructions` override `compact_instructions` for this call only (e.g.
     /// `/compact Focus on code samples and API usage`); empty/absent falls back
@@ -174,12 +194,15 @@ pub enum Command {
         #[serde(default)]
         model: Option<String>,
     },
-    /// Approve a pending tool call. decision: "yes" | "no" | "always".
-    /// "always" upgrades the session approval mode so subsequent same-tool calls skip the gate.
+    /// Approve a pending tool call. decision: "yes" | "no" | "always" |
+    /// "allow_session" | "allow_pattern". Optional `pattern` supplies the
+    /// path/command glob for `allow_pattern` (defaults to the tool's path arg).
     #[serde(rename = "approve")]
     Approve {
         request_id: String,
         decision: String,
+        #[serde(default)]
+        pattern: Option<String>,
     },
     /// Change the approval mode at runtime: "never" | "destructive" | "always".
     #[serde(rename = "set_approval")]
@@ -279,16 +302,22 @@ pub enum Command {
         #[serde(default)]
         password: Option<String>,
     },
-    /// Get the current vision-handoff configuration (curated vision-capable
-    /// models + preferred target). Emits a `vision_config` event.
+    /// Get the current vision-handoff configuration (enabled flag, curated
+    /// vision-capable models + preferred target). Emits a `vision_config` event.
     #[serde(rename = "get_vision_config")]
     GetVisionConfig,
     /// Set the vision-handoff configuration and persist it to
-    /// .catalyst-code/vision.json. `vision_model` is the preferred handoff
-    /// target; an empty string / null means "pick dynamically". Emits a
+    /// .catalyst-code/vision.json. `enabled` defaults true when omitted
+    /// (recommended ON). `vision_model` is the preferred handoff target; an
+    /// empty string / null means "cheapest same-provider". Emits a
     /// `vision_config` event with the new state.
     #[serde(rename = "set_vision_config")]
     SetVisionConfig {
+        /// When omitted, leave the previous `enabled` value unchanged on merge
+        /// paths; the command handler treats absent as `Some(true)` only when
+        /// constructing a full replace — see main.rs (defaults to true).
+        #[serde(default = "default_vision_enabled")]
+        enabled: bool,
         #[serde(default)]
         vision_models: Vec<String>,
         #[serde(default)]
