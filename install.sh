@@ -38,6 +38,8 @@
 #                         on macOS)
 #   --port <n>            web service port      (default: 49283)
 #   --host <h>            web bind host         (default: 0.0.0.0)
+#   --skip-service        install web files only (do not write/start systemd/launchd)
+#   --force-web-service   replace a non-installer-managed catalyst-code-web unit
 #   --log-file <path>     write a log here      (default: ~/catalyst-code-install.log)
 #   --no-log              disable logging
 #   --no-color           disable ANSI colors
@@ -71,6 +73,8 @@ ACTION="install"
 DRY_RUN=false
 WITH_WEB=false
 BUILD_FROM_SOURCE=false
+SKIP_SERVICE=false
+FORCE_WEB_SERVICE=false
 VERSION_OVERRIDE=""
 BASE_URL_OVERRIDE=""
 WEB_DIR_OVERRIDE=""
@@ -268,6 +272,8 @@ parse_args() {
       --status)             ACTION="status" ;;
       --dry-run)            DRY_RUN=true ;;
       --with-web)           WITH_WEB=true ;;
+      --skip-service)       SKIP_SERVICE=true ;;
+      --force-web-service)  FORCE_WEB_SERVICE=true ;;
       --build-from-source)  BUILD_FROM_SOURCE=true; METHOD="source" ;;
       --version)            [[ $# -ge 2 ]] || die "--version requires a value"; VERSION_OVERRIDE="$2"; shift ;;
       --base-url)           [[ $# -ge 2 ]] || die "--base-url requires a URL"; BASE_URL_OVERRIDE="$2"; shift ;;
@@ -318,19 +324,32 @@ ensure_sudo() {
   fi
 }
 
-# ── runtime detection (bun vs node, for RUNNING the web) ─────
+# ── runtime detection ────────────────────────────────────────
+# mode=run   (default): prefer Node to execute the prebuilt start.js
+# mode=build: prefer bun/npm for `install` / `run build` (source path)
 detect_runtime() {
-  if have bun; then
-    RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
-  elif have node; then
-    RUNTIME="node"; RT_BIN="$(command -v node)"; RT="node"
-  elif have npm; then
-    RUNTIME="npm"; RT_BIN="$(command -v npm)"; RT="npm"
-    have node || die "node not found (npm requires it)"
+  local mode="${1:-run}"
+  if [[ "$mode" == "build" ]]; then
+    if have bun; then
+      RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
+    elif have npm; then
+      RUNTIME="npm"; RT_BIN="$(command -v npm)"; RT="npm"
+      have node || die "node not found (npm requires it)"
+    else
+      die "neither bun nor npm found — install one to BUILD the web frontend (https://bun.sh or https://nodejs.org)"
+    fi
   else
-    die "neither bun nor node found — install one to run the web frontend (https://bun.sh or https://nodejs.org)"
+    # Prefer Node for the prebuilt Next standalone server; native addons
+    # (node-pty, better-sqlite3) are more reliable under Node than Bun.
+    if have node; then
+      RUNTIME="node"; RT_BIN="$(command -v node)"; RT="node"
+    elif have bun; then
+      RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
+    else
+      die "neither node nor bun found — install one to run the web frontend (https://nodejs.org or https://bun.sh)"
+    fi
   fi
-  log_ok "Web runtime: $RUNTIME ($RT_BIN)"
+  log_ok "Web runtime ($mode): $RUNTIME ($RT_BIN)"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -443,24 +462,143 @@ install_bins_download() {
 
 # Download + extract the prebuilt web bundle and wire the service.
 install_web_download() {
-  detect_runtime
+  detect_runtime run
+  resolve_web_dir
+  # Refuse early — before downloading a large tarball or touching WEB_DIR —
+  # when a custom unit would be overwritten.
+  if ! $SKIP_SERVICE; then
+    protect_existing_web_service
+  fi
   local web_asset="catcode-web-${VER}.tar.gz"
   fetch_asset "$web_asset"
-  resolve_web_dir
   run_root "Creating $WEB_DIR" mkdir -p "$WEB_DIR"
   # Clean stale contents so an update doesn't leave old chunks.
+  # Must run as root — default WEB_DIR is /opt/... and is root-owned.
   if ! $DRY_RUN; then
-    find "$WEB_DIR" -mindepth 1 -delete 2>/dev/null || true
+    run_root "Clearing $WEB_DIR" bash -c "find \"$WEB_DIR\" -mindepth 1 -delete"
   fi
   run_root "Extracting web bundle -> $WEB_DIR" tar xzf "$TMPDIR_SELF/$web_asset" -C "$WEB_DIR"
   if ! $DRY_RUN; then
-    [[ -f "$WEB_DIR/start.js" ]] || die "web bundle missing start.js (extraction failed?)"
+    # Service runs as INSTALL_USER; make the tree readable/writable for sqlite etc.
+    if [[ -n "${INSTALL_USER:-}" && "$INSTALL_USER" != "root" ]]; then
+      run_root "Setting ownership of $WEB_DIR to $INSTALL_USER" chown -R "$INSTALL_USER:" "$WEB_DIR"
+    fi
+    # Always stamp the installed release commit into version.json (UI + /api/version).
+    write_web_version_json "$WEB_DIR" "$VER" "release"
+    validate_web_bundle "$WEB_DIR"
+  fi
+  if $SKIP_SERVICE; then
+    log_info "Skipping web service install (--skip-service)"
+    return 0
   fi
   install_web_service_download
 }
 
+# Write version.json so the web UI knows which git commit this install is.
+# commit: short SHA / release tag; source: release|source|dev
+write_web_version_json() {
+  local dir="$1"
+  local commit="$2"
+  local source="${3:-release}"
+  local commit_full="$commit"
+  local dirty="false"
+  local built_at
+  built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # When installing from a live checkout, prefer the full SHA + dirty bit.
+  if [[ -n "${REPO_DIR:-}" && -d "${REPO_DIR}/.git" ]]; then
+    commit_full="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "$commit")"
+    if [[ -z "$commit" || "$commit" == "unknown" ]]; then
+      commit="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo "$commit")"
+    fi
+    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)" ]]; then
+      dirty="true"
+    fi
+  fi
+  local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
+  cat >"$tmp" <<EOF
+{
+  "commit": "${commit}",
+  "commitFull": "${commit_full}",
+  "dirty": ${dirty},
+  "builtAt": "${built_at}",
+  "source": "${source}"
+}
+EOF
+  if $DRY_RUN; then
+    log_info "[dry-run] would write version.json -> $dir (commit=$commit source=$source)"
+    return 0
+  fi
+  run_root "Writing version.json (commit $commit)" install -m 0644 "$tmp" "$dir/version.json"
+  if [[ -d "$dir/.next" ]]; then
+    run_root "Writing .next/version.json" install -m 0644 "$tmp" "$dir/.next/version.json"
+  fi
+  if [[ -n "${INSTALL_USER:-}" && "$INSTALL_USER" != "root" ]]; then
+    run_root "Owning version.json" chown "$INSTALL_USER:" "$dir/version.json" 2>/dev/null || true
+    [[ -f "$dir/.next/version.json" ]] && run_root "Owning .next/version.json" chown "$INSTALL_USER:" "$dir/.next/version.json" 2>/dev/null || true
+  fi
+  log_ok "Web version: $commit ($source)"
+}
+
+# Refuse to ship/start a broken web tarball (e.g. unflattened monorepo standalone).
+validate_web_bundle() {
+  local dir="$1"
+  [[ -f "$dir/start.js" ]] || die "web bundle missing start.js (extraction failed?)"
+  [[ -f "$dir/server.js" ]] || die "web bundle missing server.js"
+  [[ -f "$dir/package.json" ]] || die "web bundle missing package.json (incomplete release artifact)"
+  [[ -f "$dir/.next/BUILD_ID" ]] || die "web bundle missing .next/BUILD_ID (incomplete release artifact)"
+  [[ -f "$dir/version.json" ]] || die "web bundle missing version.json (git commit not embedded — rebuild with current release-web.sh)"
+  if [[ -f "$dir/web/server.js" || -d "$dir/web/node_modules" ]]; then
+    die "web bundle has nested web/ layout — this release artifact was packed incorrectly.
+  Re-run with a newer release (after release-web.sh flatten fix), or build locally with
+  ./release-web.sh and pass --base-url / --version pointing at that artifact."
+  fi
+  local req
+  for req in next ws node-pty better-sqlite3 better-auth; do
+    [[ -f "$dir/node_modules/$req/package.json" ]] || \
+      die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start).
+  Use a newer catcode-web-*.tar.gz built by current release-web.sh."
+  done
+  if have node; then
+    if ! ( cd "$dir" && node --input-type=module -e 'await import("next")' >/dev/null 2>&1 ); then
+      die "web bundle cannot resolve 'next' from $dir (module layout broken)"
+    fi
+  fi
+  log_ok "Web bundle looks runnable ($dir)"
+}
+
+# True when an existing unit/plist looks like one written by this installer.
+web_unit_is_installer_managed() {
+  local unit="$1"
+  [[ -f "$unit" ]] || return 1
+  grep -q 'Managed-by: install.sh' "$unit" 2>/dev/null && return 0
+  # Download path + source path both set CATCODE_CORE; custom run-web.sh units do not.
+  grep -q 'Environment=CATCODE_CORE=' "$unit" 2>/dev/null
+}
+
+protect_existing_web_service() {
+  $FORCE_WEB_SERVICE && return 0
+  $SKIP_SERVICE && return 0
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    [[ -f "$plist" ]] || return 0
+    if web_unit_is_installer_managed "$plist"; then return 0; fi
+    die "Refusing to overwrite existing launchd agent $plist (not managed by install.sh).
+  Keep your current web setup, or pass --force-web-service to replace it,
+  or --skip-service to install files only."
+  fi
+  local unit="/etc/systemd/system/$UNIT_NAME"
+  [[ -f "$unit" ]] || return 0
+  if web_unit_is_installer_managed "$unit"; then return 0; fi
+  die "Refusing to overwrite existing $unit (not managed by install.sh).
+  Your current web service looks custom (e.g. scripts/run-web.sh). Options:
+    • keep it: omit --with-web / --add-web
+    • replace it: pass --force-web-service
+    • files only: pass --skip-service (writes the web bundle, leaves the unit alone)"
+}
+
 # systemd unit (Linux) — runs the prebuilt standalone server (node start.js).
 install_web_systemd_download() {
+  protect_existing_web_service
   local unit_dir="/etc/systemd/system"
   local unit="$unit_dir/$UNIT_NAME"
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
@@ -483,6 +621,7 @@ Restart=on-failure
 RestartSec=3
 # NOTE: runs the prebuilt Next.js standalone server. For public exposure, put
 # a reverse proxy (caddy/nginx) with TLS in front and bind --host 127.0.0.1.
+# Managed-by: install.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -501,6 +640,7 @@ EOF
 
 # launchd agent (macOS) — runs the prebuilt standalone server (node start.js).
 install_web_launchd_download() {
+  protect_existing_web_service
   local agents_dir="$HOME/Library/LaunchAgents"
   local plist="$agents_dir/${LAUNCHD_LABEL}.plist"
   local log_dir="$HOME/Library/Logs"
@@ -606,6 +746,11 @@ do_install_download() {
   log_info "Platform: $OS_TAG/$ARCH"
   log_info "Prefix:   $PREFIX"
   $WITH_WEB && log_info "Web:      $UNIT_NAME on :$PORT ($HOST)"
+
+  # Bail before touching binaries when --with-web would clobber a custom unit.
+  if $WITH_WEB && ! $SKIP_SERVICE; then
+    protect_existing_web_service
+  fi
 
   phase "Installing catcode (prebuilt — no compile)"
   install_bins_download
@@ -736,7 +881,7 @@ install_bins_source() {
 }
 
 build_web_source() {
-  detect_runtime
+  detect_runtime build
   run_step --cwd "$REPO_DIR/sdk" "Installing SDK deps ($RT)" $RT install \
     || die "SDK dependency install failed"
   run_step --cwd "$REPO_DIR/sdk" "Building SDK (tsc)" $RT run build \
@@ -744,11 +889,14 @@ build_web_source() {
   run_step --cwd "$REPO_DIR/web" "Installing web deps ($RT)" $RT install \
     || die "web dependency install failed"
   run_step --cwd "$REPO_DIR/web" "Building web (next build)" \
-    env NEXT_TELEMETRY_DISABLED=1 $RT run build \
+    env NEXT_TELEMETRY_DISABLED=1 CATCODE_VERSION_SOURCE=source $RT run build \
     || die "web build failed (next build)"
+  # Stamp version.json into the web working dir (systemd WorkingDirectory).
+  write_web_version_json "$REPO_DIR/web" "${VERSION_DETECTED:-unknown}" "source"
 }
 
 install_web_systemd_source() {
+  protect_existing_web_service
   local unit_dir="/etc/systemd/system"
   local unit="$unit_dir/$UNIT_NAME"
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
@@ -769,6 +917,7 @@ Environment=CATCODE_CORE=$PREFIX/catcode-core
 ExecStart=$exec_start
 Restart=on-failure
 RestartSec=3
+# Managed-by: install.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -786,6 +935,7 @@ EOF
 }
 
 install_web_launchd_source() {
+  protect_existing_web_service
   local agents_dir="$HOME/Library/LaunchAgents"
   local plist="$agents_dir/${LAUNCHD_LABEL}.plist"
   local log_dir="$HOME/Library/Logs"
@@ -843,6 +993,10 @@ EOF
 }
 
 install_web_service_source() {
+  if $SKIP_SERVICE; then
+    log_info "Skipping web service install (--skip-service)"
+    return 0
+  fi
   if [[ "$PLATFORM" == "Darwin" ]]; then
     install_web_launchd_source
   else
@@ -935,6 +1089,12 @@ do_update_source() {
 
 # ── state file ───────────────────────────────────────────────
 save_state() {
+  # --skip-service is a files-only / side-install path; do not rewrite the
+  # system installer.state (would clobber a real install's prefix/version).
+  if $SKIP_SERVICE; then
+    log_info "Skipping installer state write (--skip-service)"
+    return 0
+  fi
   local f="$STATE_FILE"
   local tmp; tmp="$(mktemp -p "$TMPDIR_SELF")"
   local web_flag="no"; $WITH_WEB && web_flag="yes"
@@ -1044,6 +1204,9 @@ do_add_web() {
     log_warn "web service is already installed — reinstalling it"
   fi
   WITH_WEB=true
+  if ! $SKIP_SERVICE; then
+    protect_existing_web_service
+  fi
   if [[ "${METHOD:-download}" == "source" ]]; then
     do_add_web_source
   else
@@ -1177,8 +1340,13 @@ summary_install() {
   if $WITH_WEB; then
     local svc_id="$UNIT_NAME"
     [[ "$PLATFORM" == "Darwin" ]] && svc_id="$LAUNCHD_LABEL (launchd)"
-    web_line="http://${HOST}:${PORT}  (running as $svc_id)"
-    svc_line="service:   $svc_id  (enabled, auto-restart)"
+    if $SKIP_SERVICE; then
+      web_line="${WEB_DIR:-<web-dir>}  (files only — service not started)"
+      svc_line="service:   skipped (--skip-service)"
+    else
+      web_line="http://${HOST}:${PORT}  (running as $svc_id)"
+      svc_line="service:   $svc_id  (enabled, auto-restart)"
+    fi
   fi
   print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" \
     "tui:       $PREFIX/catcode" \
@@ -1189,7 +1357,7 @@ summary_install() {
     "uninstall: bash install.sh --uninstall" \
     "log:       ${LOG_FILE:-<disabled>}"
   log_info "Run the TUI with:  catcode"
-  if $WITH_WEB; then
+  if $WITH_WEB && ! $SKIP_SERVICE; then
     if [[ "$PLATFORM" == "Darwin" ]]; then
       log_info "Web service logs:  tail -f $HOME/Library/Logs/catalyst-code-web.log"
     else
@@ -1199,6 +1367,8 @@ summary_install() {
     if [[ "$HOST" != "127.0.0.1" ]]; then
       log_warn "Bound to $HOST — put a TLS reverse proxy in front for public use."
     fi
+  elif $WITH_WEB && $SKIP_SERVICE; then
+    log_info "Start the web manually:  cd ${WEB_DIR:-<web-dir>} && PORT=$PORT HOSTNAME=$HOST CATCODE_CORE=$PREFIX/catcode-core node start.js"
   fi
 }
 

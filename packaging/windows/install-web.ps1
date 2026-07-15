@@ -89,11 +89,13 @@ function Die($t) { Write-Host "`n  error: $t" -ForegroundColor Red; exit 1 }
 
 # --- detect bun or node (to RUN the web) -----------------------------------
 function Detect-Runtime {
-    $bun = Get-Command bun -ErrorAction SilentlyContinue
-    if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
+    # Prefer Node for the prebuilt Next standalone server; native addons are
+    # more reliable under Node than Bun.
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) { $script:RT = 'node'; $script:RTExe = $node.Source; return }
-    Die 'neither bun nor node found — install one to RUN the web frontend (https://bun.sh or https://nodejs.org)'
+    $bun = Get-Command bun -ErrorAction SilentlyContinue
+    if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
+    Die 'neither node nor bun found — install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
 }
 
 # --- resolve release version + base URL ------------------------------------
@@ -183,6 +185,36 @@ function Ensure-CoreExe {
 }
 
 # --- extract the prebuilt web bundle ---------------------------------------
+function Assert-WebBundle {
+    param([string]$Dir)
+    $startJs = Join-Path $Dir 'start.js'
+    if (-not (Test-Path -LiteralPath $startJs)) { Die "web bundle missing start.js (extraction failed?)" }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'server.js'))) { Die 'web bundle missing server.js' }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'package.json'))) {
+        Die 'web bundle missing package.json (incomplete release artifact)'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir '.next\BUILD_ID'))) {
+        Die 'web bundle missing .next/BUILD_ID (incomplete release artifact)'
+    }
+    if ((Test-Path -LiteralPath (Join-Path $Dir 'web\server.js')) -or
+        (Test-Path -LiteralPath (Join-Path $Dir 'web\node_modules'))) {
+        Die @"
+web bundle has nested web/ layout — this release artifact was packed incorrectly.
+  Use a newer catcode-web-*.tar.gz built by current release-web.sh.
+"@
+    }
+    foreach ($req in @('next', 'ws', 'node-pty', 'better-sqlite3', 'better-auth')) {
+        $pkg = Join-Path $Dir "node_modules\$req\package.json"
+        if (-not (Test-Path -LiteralPath $pkg)) {
+            Die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start)."
+        }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'version.json'))) {
+        Die 'web bundle missing version.json (git commit not embedded)'
+    }
+    Write-Ok "Web bundle looks runnable ($Dir)"
+}
+
 function Install-WebBundle {
     $tgz = Get-Asset "catcode-web-$($script:Ver).tar.gz"
     if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
@@ -193,9 +225,33 @@ function Install-WebBundle {
     Write-Info "Extracting web bundle -> $WebDir ..."
     & tar -xzf $tgz -C $WebDir
     if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
-    $startJs = Join-Path $WebDir 'start.js'
-    if (-not (Test-Path -LiteralPath $startJs)) { Die "web bundle missing start.js (extraction failed?)" }
+    Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
+    Assert-WebBundle -Dir $WebDir
     Write-Ok "Web bundle extracted to $WebDir"
+}
+
+function Write-WebVersionJson {
+    param(
+        [string]$Dir,
+        [string]$Commit,
+        [string]$Source = 'release'
+    )
+    $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $payload = [ordered]@{
+        commit     = $Commit
+        commitFull = $Commit
+        dirty      = $false
+        builtAt    = $builtAt
+        source     = $Source
+    }
+    $json = $payload | ConvertTo-Json
+    $path = Join-Path $Dir 'version.json'
+    Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+    $nextDir = Join-Path $Dir '.next'
+    if (Test-Path -LiteralPath $nextDir) {
+        Set-Content -LiteralPath (Join-Path $nextDir 'version.json') -Value $json -Encoding UTF8
+    }
+    Write-Ok "Web version: $Commit ($Source)"
 }
 
 # --- NSSM service -----------------------------------------------------------

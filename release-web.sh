@@ -73,7 +73,15 @@ echo "[5/5] assembling ${OUT}..."
 STAGE="dist/.web-stage-${VERSION}"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 
-cp -a "web/.next/standalone/." "$STAGE/"
+# With outputFileTracingRoot set to the monorepo root, Next nests the app under
+# standalone/web/. Older/single-package builds put it directly at standalone/.
+# In both cases flatten the actual app root so server.js, .next, node_modules,
+# and package.json share the directory that `node start.js` runs from.
+if [[ -f web/.next/standalone/web/server.js ]]; then
+  cp -a "web/.next/standalone/web/." "$STAGE/"
+else
+  cp -a "web/.next/standalone/." "$STAGE/"
+fi
 mkdir -p "$STAGE/.next/static"
 cp -a "web/.next/static/." "$STAGE/.next/static/"
 # public/ is optional (empty in some setups); copy if present.
@@ -86,23 +94,123 @@ fi
 # handling PLUS the /api/terminal WebSocket. Pure-JS, single file.
 cp -f "web/.server-bundle.js" "$STAGE/server.js"
 rm -f "web/.server-bundle.js"
-# ws is NOT traced into the standalone node_modules (the custom server lives
-# outside the Next app graph) — copy it in so the terminal WS works. The rest
-# (next, better-sqlite3, kysely, better-auth, @catalyst-code/coding-agent) ARE
-# traced via the app routes + serverExternalPackages. (Contract §7.4.)
-if [[ ! -d "$STAGE/node_modules/ws" ]]; then
-  mkdir -p "$STAGE/node_modules/ws"
-  cp -a "web/node_modules/ws/." "$STAGE/node_modules/ws/"
-fi
+# The custom server is built outside Next's route graph, so packages marked
+# external above are not reliably included by standalone tracing. Copy each
+# external package and its complete runtime dependency closure. This also
+# dereferences the workspace SDK symlink; an absolute monorepo symlink would be
+# broken once the tarball is installed elsewhere.
+COPIED_RUNTIME_PACKAGES=()
+copy_runtime_package() {
+  local pkg="$1" src dest dep copied
+  for copied in "${COPIED_RUNTIME_PACKAGES[@]}"; do
+    [[ "$copied" == "$pkg" ]] && return
+  done
+  COPIED_RUNTIME_PACKAGES+=("$pkg")
+  src="web/node_modules/$pkg"
+  [[ -f "$src/package.json" ]] || {
+    echo "error: runtime package $pkg is missing from web/node_modules" >&2
+    exit 1
+  }
+  dest="$STAGE/node_modules/$pkg"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -aL "$src/." "$dest/"
 
-# node-pty is external to esbuild because it loads an OS-native .node binding.
-# Include the package (and its small build-time/runtime support dependency) so
-# the shipped WebSocket server has a real PTY, not pipe-based line mode.
-for pkg in node-pty node-addon-api; do
-  rm -rf "$STAGE/node_modules/$pkg"
-  mkdir -p "$STAGE/node_modules/$pkg"
-  cp -a "web/node_modules/$pkg/." "$STAGE/node_modules/$pkg/"
+  while IFS= read -r dep; do
+    if [[ -n "$dep" && -f "web/node_modules/$dep/package.json" ]]; then
+      copy_runtime_package "$dep"
+    fi
+  done < <(node -e '
+    const fs = require("node:fs");
+    const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const deps = { ...pkg.dependencies, ...pkg.optionalDependencies };
+    process.stdout.write(Object.keys(deps).join("\n") + "\n");
+  ' "$src/package.json")
+}
+
+for pkg in \
+  next ws node-pty node-addon-api better-sqlite3 kysely \
+  better-auth @better-auth/passkey @catalyst-code/coding-agent; do
+  copy_runtime_package "$pkg"
 done
+
+# npm installs optional native packages for more than one libc/architecture in
+# some environments (notably Next SWC and sharp). A release bundle is already
+# host-specific because of node-pty, so keep only packages compatible with the
+# build host. This avoids shipping both glibc and musl binaries in one artifact.
+node - "$STAGE/node_modules" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = process.argv[2];
+const libc = process.platform === "linux"
+  ? (process.report?.getReport()?.header?.glibcVersionRuntime ? "glibc" : "musl")
+  : undefined;
+
+function matches(values, actual) {
+  if (!Array.isArray(values) || values.length === 0 || !actual) return true;
+  if (values.includes(`!${actual}`)) return false;
+  const positive = values.filter((value) => !value.startsWith("!"));
+  return positive.length === 0 || positive.includes(actual);
+}
+
+const names = [];
+for (const entry of fs.readdirSync(root)) {
+  const full = path.join(root, entry);
+  if (!fs.statSync(full).isDirectory()) continue;
+  if (entry.startsWith("@")) {
+    for (const child of fs.readdirSync(full)) names.push(`${entry}/${child}`);
+  } else {
+    names.push(entry);
+  }
+}
+
+for (const name of names) {
+  const dir = path.join(root, name);
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+    if (!matches(pkg.os, process.platform) ||
+        !matches(pkg.cpu, process.arch) ||
+        !matches(pkg.libc, libc)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      process.stdout.write(`[prune] incompatible native package: ${name}\n`);
+    }
+  } catch {
+    // Leave packages without readable manifests untouched.
+  }
+}
+NODE
+
+# SWC compiles/transforms application code during `next build`. This bundle
+# contains the completed standalone build, so the production server does not
+# invoke the compiler. Keeping the 100+ MB native addon only duplicates a
+# build-time tool in every desktop install.
+rm -rf "$STAGE/node_modules/@next"/swc-*
+
+# Source maps are useful while developing but are not loaded by the production
+# server. Next and its compiled dependencies account for most of these files.
+find "$STAGE" -type f -name '*.map' -delete
+
+# Next can omit the root package.json when outputFileTracingRoot points above
+# web/. Keep an explicit ESM runtime manifest for `node start.js` and native
+# production dependency tooling.
+node -e '
+  const fs = require("node:fs");
+  const stage = process.argv[1];
+  const versionOf = (name) => JSON.parse(
+    fs.readFileSync(`web/node_modules/${name}/package.json`, "utf8")
+  ).version;
+  fs.writeFileSync(`${stage}/package.json`, JSON.stringify({
+    name: "catcode-web-runtime",
+    version: "0.0.0",
+    private: true,
+    type: "module",
+    dependencies: {
+      "better-sqlite3": versionOf("better-sqlite3"),
+      "node-pty": versionOf("node-pty")
+    }
+  }, null, 2) + "\n");
+' "$STAGE"
 
 # Sanity: the entrypoint must exist.
 [[ -f "$STAGE/server.js" ]] || { echo "error: $STAGE/server.js missing — standalone build failed?" >&2; exit 1; }
@@ -120,6 +228,53 @@ process.env.HOSTNAME = process.env.HOSTNAME || "0.0.0.0";
 process.env.NODE_ENV = process.env.NODE_ENV || "production";
 import("./server.js");
 EOF
+
+# Embed the release git commit so the web UI can show version / update status
+# without needing a .git checkout on the install host.
+COMMIT_FULL="$(git rev-parse HEAD 2>/dev/null || true)"
+COMMIT_SHORT="${VERSION}"
+if [[ -n "$COMMIT_FULL" && "$COMMIT_FULL" == "${VERSION}"* ]]; then
+  : # VERSION already matches this commit's short SHA
+elif [[ -n "$COMMIT_FULL" ]]; then
+  COMMIT_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo "$VERSION")"
+fi
+DIRTY=false
+if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then DIRTY=true; fi
+cat >"$STAGE/version.json" <<EOF
+{
+  "commit": "${COMMIT_SHORT}",
+  "commitFull": "${COMMIT_FULL:-$COMMIT_SHORT}",
+  "dirty": ${DIRTY},
+  "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "source": "release"
+}
+EOF
+# Keep a copy under .next as well (API also probes there for source installs).
+mkdir -p "$STAGE/.next"
+cp -f "$STAGE/version.json" "$STAGE/.next/version.json"
+
+# Fail closed if the monorepo flatten left a nested app root — installers run
+# `node start.js` from the archive root and resolve packages from ./node_modules.
+if [[ -f "$STAGE/web/server.js" || -d "$STAGE/web/node_modules" ]]; then
+  echo "error: staged bundle still has nested web/ — flatten failed (standalone layout changed?)" >&2
+  exit 1
+fi
+[[ -f "$STAGE/package.json" ]] || { echo "error: staged bundle missing package.json" >&2; exit 1; }
+[[ -f "$STAGE/.next/BUILD_ID" ]] || { echo "error: staged bundle missing .next/BUILD_ID" >&2; exit 1; }
+[[ -f "$STAGE/version.json" ]] || { echo "error: staged bundle missing version.json" >&2; exit 1; }
+for req in next ws node-pty better-sqlite3 kysely better-auth @better-auth/passkey @catalyst-code/coding-agent; do
+  [[ -f "$STAGE/node_modules/$req/package.json" ]] || {
+    echo "error: staged bundle missing node_modules/$req (custom server cannot start)" >&2
+    exit 1
+  }
+done
+# Resolve the custom server's critical imports the same way install hosts will.
+(
+  cd "$STAGE"
+  node --input-type=module -e 'await Promise.all(["next","ws","better-sqlite3","better-auth","@catalyst-code/coding-agent"].map((m)=>import(m))); console.log("runtime imports OK")'
+) || { echo "error: staged bundle failed module resolution smoke test" >&2; exit 1; }
+
+echo "==> version.json commit=${COMMIT_SHORT} dirty=${DIRTY}"
 
 # Tar from INSIDE the stage so the archive root is clean (server.js at top).
 ( cd "$STAGE" && tar czf "../$(basename "$OUT")" . )
