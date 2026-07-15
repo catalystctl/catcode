@@ -34,10 +34,10 @@ import { useFocusTrap } from "@/lib/use-focus-trap";
 import { SparkIcon, ShieldIcon, SendIcon } from "./icons";
 
 const EXAMPLES = [
-  "Explain the architecture of this codebase.",
-  "Find and fix any obvious bugs in the core.",
-  "Write a unit test for the path-confinement logic.",
-  "Summarize the most recent changes.",
+  { label: "Build", detail: "Create a feature", prompt: "Build a useful feature for this project. First inspect the existing patterns, then implement and test it." },
+  { label: "Debug", detail: "Track down a problem", prompt: "Find and fix an important bug in this workspace. Explain the cause and verify the fix." },
+  { label: "Explain", detail: "Understand the code", prompt: "Explain the architecture of this codebase and identify the most important entry points." },
+  { label: "Review", detail: "Improve recent work", prompt: "Review the recent changes for correctness, usability, and maintainability. Fix any clear issues you find." },
 ];
 
 /** Parse `agent "task"` / `agent 'task'` / `agent bare-task` pairs from slash args. */
@@ -81,7 +81,7 @@ function lsSet(k: string, v: string): void {
 }
 
 export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean }) {
-  const { openSettings } = useIdeContext();
+  const { openSettings, ide } = useIdeContext();
   const { state } = agent;
   const { confirm, prompt, dialog } = useAppDialog();
   const dialogApi = useRef({ confirm, prompt });
@@ -89,6 +89,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     dialogApi.current = { confirm, prompt };
   }, [confirm, prompt]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [restoredDrawerWorkspace, setRestoredDrawerWorkspace] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
   const [keyDismissed, setKeyDismissed] = useState(false);
@@ -105,6 +106,29 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   // made the theme button's server/client markup disagree in light mode.
   const [theme, setTheme] = useState<string>("dark");
   const themeMountedRef = useRef(false);
+
+  useEffect(() => {
+    const workspace = state.workspace;
+    if (!workspace) return;
+    try {
+      setSidebarOpen(localStorage.getItem(`catalyst:chat-drawer:${encodeURIComponent(workspace)}`) === "open");
+    } catch {
+      setSidebarOpen(false);
+    }
+    setRestoredDrawerWorkspace(workspace);
+  }, [state.workspace]);
+
+  useEffect(() => {
+    if (!state.workspace || restoredDrawerWorkspace !== state.workspace) return;
+    try {
+      localStorage.setItem(
+        `catalyst:chat-drawer:${encodeURIComponent(state.workspace)}`,
+        sidebarOpen ? "open" : "closed",
+      );
+    } catch {
+      // Storage may be unavailable; drawer behavior remains functional.
+    }
+  }, [restoredDrawerWorkspace, sidebarOpen, state.workspace]);
 
   // Refs so the edit/regenerate/command callbacks can stay stable (empty deps)
   // — this keeps <Message> memoized: only the streaming message re-renders on
@@ -544,8 +568,21 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const needKey = state.ready != null && state.authed === false && !keyDismissed;
   const currentModel = state.models.find((m) => m.id === state.selectedModel) ?? state.models[0];
   const modelLabel = currentModel?.name ?? currentModel?.id ?? "no model";
+  const currentSession = state.sessions.find((session) => {
+    const current = state.currentSessionFile;
+    return !!current && (
+      current === session.path ||
+      current === session.name ||
+      current.endsWith("/" + session.name) ||
+      current.endsWith("\\" + session.name)
+    );
+  });
+  const currentSessionTitle = currentSession
+    ? currentSession.title || basename(currentSession.name) || currentSession.name
+    : undefined;
   const empty = state.messages.length === 0;
   const switching = state.switching;
+  const activeFile = ide.state.openTabs.find((tab) => tab.id === ide.state.activeTabId && tab.kind === "file")?.target ?? null;
 
   return (
     <div className={`chat-panel relative flex min-h-0 min-w-0 ${docked ? "h-full" : "h-[100dvh]"} w-full overflow-hidden bg-ink-950 bg-grid text-ink-100`}>
@@ -554,6 +591,8 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         switching={switching}
+        workspace={state.workspace}
+        streamingSessionFile={state.streaming ? state.currentSessionFile : null}
         sessions={state.sessions}
         currentSessionFile={state.currentSessionFile}
         stats={state.stats}
@@ -597,10 +636,12 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           thinkingLevel={state.thinkingLevel}
           approvalMode={state.approvalMode}
           metrics={state.metrics}
+          cost={state.cost}
           umansConc={state.umansConc}
           streaming={state.streaming}
           retrying={state.retrying}
           sessionFile={state.currentSessionFile}
+          sessionTitle={currentSessionTitle}
           switching={switching}
           theme={theme}
           onMenuClick={() => setSidebarOpen(true)}
@@ -612,6 +653,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         />
 
         {state.workState && <WorkStatePanel ws={state.workState} />}
+        {state.streaming && <AgentActivity compact={!!docked} activity={state.workState?.in_progress[0]} hasWorkState={!!state.workState} />}
 
         {/* Messages */}
         <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto">
@@ -720,6 +762,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                   state.goalMode
                 )
               }
+              adaptive={!!docked}
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
@@ -774,6 +817,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           modelLabel={modelLabel}
           images={images}
           workspace={state.workspace}
+          activeFile={activeFile}
           onAddImage={onAddImage}
           onRemoveImage={onRemoveImage}
           onPrompt={sendPrompt}
@@ -822,11 +866,17 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           stats={state.stats}
           context={state.contextBreakdown}
           usage={state.usageSnapshot}
+          cost={state.cost}
+          checkpoints={state.checkpoints}
+          protocolHello={state.protocolHello}
           onRefresh={() => {
             void agent.stats();
             void agent.context();
             void agent.usage(agent.state.selectedModel ?? undefined);
+            void agent.listCheckpoints();
           }}
+          onCreateCheckpoint={() => void agent.createCheckpoint()}
+          onRestoreCheckpoint={(id) => void agent.restoreCheckpoint(id)}
           onClose={() => setModal(null)}
         />
       )}
@@ -878,6 +928,7 @@ function EmptyState({
   switching,
   canSend,
   compact,
+  adaptive,
   onPick,
 }: {
   workspace: string;
@@ -885,50 +936,66 @@ function EmptyState({
   switching: boolean;
   canSend: boolean;
   compact?: boolean;
+  adaptive?: boolean;
   onPick: (t: string) => void;
 }) {
   return (
     <div
-      className={`flex flex-col items-center justify-center px-6 text-center ${
-        compact ? "min-h-0 py-6" : "h-full py-10"
+      className={`flex flex-col items-center justify-center text-center ${
+        adaptive ? "min-h-full px-4 py-5" : "px-6"
+      } ${
+        compact ? "min-h-0 py-6" : adaptive ? "" : "h-full py-10"
       }`}
     >
-      <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-accent to-accent-deep text-3xl font-bold text-white shadow-glow">
+      <div className={`${adaptive ? "mb-3 h-10 w-10 rounded-xl text-xl" : "mb-5 h-16 w-16 rounded-2xl text-3xl"} flex items-center justify-center bg-gradient-to-br from-accent to-accent-deep font-bold text-white shadow-glow`}>
         c
       </div>
-      <h1 className="text-2xl font-semibold tracking-tight text-ink-100">Catalyst Code</h1>
-      <p className="mt-2 max-w-md text-[14px] text-ink-400">
+      <h1 className={`${adaptive ? "text-base" : "text-2xl"} font-semibold tracking-tight text-ink-100`}>{adaptive ? "What should we work on?" : "Catalyst Code"}</h1>
+      <p className={`${adaptive ? "mt-1 text-[11px]" : "mt-2 text-[14px]"} max-w-md text-ink-400`}>
         {switching ? (
           "Loading session…"
         ) : (
           <>
-            An agentic coding companion running on{" "}
+            {adaptive ? "Working in " : "An agentic coding companion running on "}
             <span className="font-mono text-accent-soft">
               {basename(workspace) || workspace || "this workspace"}
             </span>
-            .{connected ? " Ask it to build, debug, explore, or explain." : " Connecting…"}
+            .{connected && !adaptive ? " Ask it to build, debug, explore, or explain." : !connected ? " Connecting…" : ""}
           </>
         )}
       </p>
       {!switching && (
-        <div className="mt-7 grid w-full max-w-lg gap-2">
+        <div className={`${adaptive ? "mt-4 grid-cols-2 gap-1.5" : "mt-7 gap-2"} grid w-full max-w-lg`}>
           {EXAMPLES.map((ex) => (
             <button
-              key={ex}
+              key={ex.label}
               disabled={!canSend}
               onClick={() => {
                 if (!canSend) return;
-                onPick(ex);
+                onPick(ex.prompt);
               }}
-              className="group flex items-center gap-3 rounded-xl border border-ink-800 bg-ink-900/40 px-4 py-3 text-left text-[13px] text-ink-300 transition-all hover:border-accent/40 hover:bg-ink-850 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-ink-800 disabled:hover:bg-ink-900/40 disabled:hover:text-ink-300"
+              className={`group flex items-center rounded-xl border border-ink-800 bg-ink-900/40 text-left text-ink-300 transition-all hover:border-accent/40 hover:bg-ink-850 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 ${adaptive ? "gap-2 px-2.5 py-2" : "gap-3 px-4 py-3 text-[13px]"}`}
             >
-              <SparkIcon width={14} height={14} className="shrink-0 text-ink-500 group-hover:text-accent-soft" />
-              <span className="flex-1">{ex}</span>
-              <SendIcon width={13} height={13} className="shrink-0 text-ink-600 group-hover:text-accent-soft" />
+              <SparkIcon width={adaptive ? 12 : 14} height={adaptive ? 12 : 14} className="shrink-0 text-ink-500 group-hover:text-accent-soft" />
+              <span className="min-w-0 flex-1"><span className="block font-medium text-ink-200">{ex.label}</span>{!adaptive && <span className="mt-0.5 block text-[11px] text-ink-500">{ex.detail}</span>}</span>
+              {!adaptive && <SendIcon width={13} height={13} className="shrink-0 text-ink-600 group-hover:text-accent-soft" />}
             </button>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function AgentActivity({ compact, activity, hasWorkState }: { compact: boolean; activity?: string; hasWorkState: boolean }) {
+  const label = activity?.trim() || (hasWorkState ? "Working through the plan" : "Understanding your request");
+  return (
+    <div className={`mx-auto flex w-full max-w-3xl items-center gap-2 px-4 py-1.5 text-[10px] text-ink-500 ${compact ? "border-b border-ink-900/60" : "sm:px-6"}`} role="status" aria-live="polite">
+      <span className="relative flex h-2 w-2 shrink-0"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-40" /><span className="relative inline-flex h-2 w-2 rounded-full bg-accent" /></span>
+      <span className="truncate text-ink-400">{label}</span>
+      <span className="ml-auto hidden items-center gap-1.5 text-ink-600 sm:flex" aria-label="Agent activity stages">
+        <span className="text-accent-soft">Understand</span><span>→</span><span className={hasWorkState ? "text-accent-soft" : ""}>Work</span><span>→</span><span>Respond</span>
+      </span>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
 import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
 import { IdeContext, useIdeContext } from "@/lib/ide-context";
@@ -8,6 +8,7 @@ import { useIsMobile } from "@/lib/use-media-query";
 import { ChatInner } from "@/components/chat";
 import type {
   DockPosition,
+  FileEntry,
   GitStatus,
   MovablePanelId,
 } from "@/lib/types";
@@ -20,6 +21,8 @@ import {
   PANELS,
 } from "./panel-registry";
 import { ActivityBar } from "./activity-bar";
+import { CommandPalette, type PaletteItem } from "./command-palette";
+import { PanelHeader, panelTabClass } from "./panel-header";
 import { ProjectSwitcher } from "./project-switcher";
 import { ResizeHandle } from "./resize-handle";
 import { SettingsModal } from "@/components/settings";
@@ -47,13 +50,17 @@ type MobileView = "files" | "editor" | "chat" | "git" | "terminal" | "preview";
 
 export function IdeShell() {
   const agent = useAgent();
-  const ide = useIde();
   const workspace = agent.state.workspace;
+  const ide = useIde(workspace);
   const isMobile = useIsMobile();
   const [dragging, setDragging] = useState<MovablePanelId | null>(null);
   const [mobileView, setMobileView] = useState<MobileView>("chat");
   const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteFiles, setPaletteFiles] = useState<FileEntry[]>([]);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [focusMode, setFocusMode] = useState(false);
   const openSettings = useCallback(() => {
     setProjectSwitcherOpen(false);
     setSettingsOpen(true);
@@ -68,6 +75,65 @@ export function IdeShell() {
     () => ({ workspace, ide, openSettings }),
     [workspace, ide, openSettings],
   );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+      }
+      if (event.key === "Escape" && focusMode && !paletteOpen) setFocusMode(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [focusMode, paletteOpen]);
+
+  useEffect(() => {
+    if (!paletteOpen || !workspace) {
+      setPaletteFiles([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void fetch(`/api/files?q=${encodeURIComponent(paletteQuery)}&workspace=${encodeURIComponent(workspace)}`, {
+        signal: controller.signal,
+      })
+        .then((response) => response.ok ? response.json() : { files: [] })
+        .then((data: { files?: FileEntry[] }) => {
+          if (!controller.signal.aborted) setPaletteFiles(data.files ?? []);
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setPaletteFiles([]);
+        });
+    }, 140);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [paletteOpen, paletteQuery, workspace]);
+
+  const paletteItems = useMemo<PaletteItem[]>(() => {
+    const panels: Array<[MovablePanelId | "explorer", string]> = [
+      ["explorer", "Explorer"], ["chat", "AI Chat"], ["terminal", "Terminal"],
+      ["git", "Source Control"], ["preview", "Preview"],
+    ];
+    return [
+      { id: "command:new-chat", label: "New chat", detail: "Start a fresh conversation", group: "Commands", keywords: "session", run: () => void agent.newSession() },
+      ...(!isMobile ? [{ id: "command:focus", label: focusMode ? "Exit focus mode" : "Enter focus mode", detail: "Toggle distraction-free editing", group: "Commands" as const, keywords: "zen", run: () => setFocusMode((on) => !on) }] : []),
+      { id: "command:settings", label: "Open settings", group: "Commands", run: openSettings },
+      { id: "command:projects", label: "Switch project…", group: "Commands", run: openProjects },
+      { id: "command:chat-main", label: "Open chat in editor area", detail: "Give the conversation the main workspace", group: "Commands", keywords: "expand maximize", run: () => ide.movePanel("chat", "main") },
+      { id: "command:chat-right", label: "Dock chat on the right", detail: "Return chat to the side panel", group: "Commands", keywords: "restore copilot", run: () => ide.movePanel("chat", "right") },
+      ...paletteFiles
+        .filter((file) => !ide.state.openTabs.some((tab) => tab.target === file.path))
+        .map((file) => ({ id: `workspace-file:${file.path}`, label: file.name || file.path.split("/").pop() || file.path, detail: file.path, group: "Files" as const, run: () => ide.openFile(file.path) })),
+      ...ide.state.openTabs.map((tab) => ({ id: `file:${tab.id}`, label: tab.label, detail: tab.target, group: "Files" as const, run: () => ide.setActiveTab(tab.id) })),
+      ...panels.map(([id, label]) => ({ id: `panel:${id}`, label: `Show ${label}`, detail: "Open or focus panel", group: "Panels" as const, run: () => id === "explorer" ? ide.selectExplorer() : ide.showDockPanel(id) })),
+      ...agent.state.sessions.map((session) => ({ id: `chat:${session.path ?? session.name}`, label: session.title || session.name, detail: `${session.messages ?? 0} messages`, group: "Chats" as const, run: () => void agent.loadSession(session.path ?? session.name) })),
+      ...agent.state.projects.map((project) => ({ id: `project:${project.path}`, label: project.name, detail: project.path, group: "Projects" as const, run: () => void agent.switchWorkspace(project.path) })),
+      ...agent.state.models.map((model) => ({ id: `model:${model.id}`, label: model.name || model.id, detail: model.provider ? `${model.provider} · ${model.id}` : model.id, group: "Models" as const, run: () => agent.setModel(model.id) })),
+    ];
+  }, [agent, focusMode, ide, isMobile, openProjects, openSettings, paletteFiles]);
 
   // When a file is opened from the explorer on mobile, jump to the editor.
   useEffect(() => {
@@ -128,12 +194,13 @@ export function IdeShell() {
           />
         ) : (
           <div className="relative flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
-            <ActivityBar
+            {!focusMode && <ActivityBar
               onOpenProjects={openProjects}
               onOpenSettings={openSettings}
-            />
+              onOpenCommands={() => setPaletteOpen(true)}
+            />}
 
-          {!ide.state.sidebarCollapsed && (
+          {!focusMode && !ide.state.sidebarCollapsed && (
             <>
               <PrimarySidebar
                 workspace={workspace}
@@ -158,6 +225,7 @@ export function IdeShell() {
                   onDragStart={setDragging}
                   onDragEnd={() => setDragging(null)}
                 />
+                <EditorBreadcrumbs />
                 <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
                   {activeMainPanel(ide) ? (
                     <PanelContent
@@ -171,7 +239,7 @@ export function IdeShell() {
                 </div>
               </main>
 
-              {hasVisibleDock(ide, "right") && (
+              {!focusMode && hasVisibleDock(ide, "right") && (
                 <ResizeHandle
                   orientation="x"
                   invert
@@ -187,10 +255,11 @@ export function IdeShell() {
                 agent={agent}
                 onDragStart={setDragging}
                 onDragEnd={() => setDragging(null)}
+                visuallyHidden={focusMode}
               />
             </div>
 
-            {hasVisibleDock(ide, "bottom") && (
+            {!focusMode && hasVisibleDock(ide, "bottom") && (
               <ResizeHandle
                 orientation="y"
                 invert
@@ -206,16 +275,25 @@ export function IdeShell() {
               agent={agent}
               onDragStart={setDragging}
               onDragEnd={() => setDragging(null)}
+              visuallyHidden={focusMode}
             />
 
-            <StatusBar
+            {!focusMode && <StatusBar
               connected={agent.connected}
               workspace={workspace}
               git={ide.state.gitStatus}
-            />
+              onGit={() => ide.showDockPanel("git")}
+              onWorkspace={openProjects}
+              onConnection={agent.reconnect}
+            />}
           </div>
 
             {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
+            {focusMode && (
+              <button type="button" onClick={() => setFocusMode(false)} className="absolute bottom-3 left-3 z-40 rounded-md border border-ink-700 bg-ink-900/90 px-2.5 py-1.5 text-[11px] text-ink-400 shadow-lg hover:text-ink-100" title="Exit focus mode (Esc)">
+                Exit focus mode
+              </button>
+            )}
           </div>
         )}
 
@@ -247,13 +325,14 @@ export function IdeShell() {
             onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
             onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
             visionConfig={agent.state.visionConfig}
-            onSetVisionConfig={(visionModel, visionModels) =>
-              void agent.setVisionConfig(visionModel, visionModels)
+            onSetVisionConfig={(visionModel, visionModels, enabled) =>
+              void agent.setVisionConfig(visionModel, visionModels, enabled)
             }
             onRefreshVision={() => void agent.getVisionConfig()}
             onClose={() => setSettingsOpen(false)}
           />
         )}
+        <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onQueryChange={setPaletteQuery} />
       </>
     </IdeContext.Provider>
   );
@@ -313,7 +392,7 @@ function MobileShell({
           />
         )}
         <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
-          {mobileView === "files" && <FileTree />}
+          {mobileView === "files" && <FileTree refreshToken={agent.state.fileChangeSeq} />}
           {mobileView === "editor" && (
             <MainContent workspace={workspace} onOpenPreview={() => onSelectView("preview")} />
           )}
@@ -491,11 +570,21 @@ function PrimarySidebar({
       style={{ width: ide.state.sidebarWidth }}
       className="flex shrink-0 flex-col border-r border-ink-800 bg-ink-925"
     >
-      <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800">
+      <PanelHeader trailing={(
+        <button
+          type="button"
+          onClick={ide.toggleSidebar}
+          title="Collapse sidebar"
+          aria-label="Collapse sidebar"
+          className="h-full px-2 text-ink-500 hover:bg-ink-850 hover:text-ink-100"
+        >
+          <ChevronRight width={14} height={14} />
+        </button>
+      )}>
         <button
           type="button"
           onClick={ide.selectExplorer}
-          className={`shrink-0 border-r border-ink-800 px-3 text-[11px] font-semibold uppercase tracking-wide ${active === null ? "bg-ink-950 text-ink-200" : "text-ink-500 hover:bg-ink-900"}`}
+          className={`${panelTabClass(active === null)} shrink-0 text-[11px] font-semibold uppercase tracking-wide`}
         >
           Explorer
         </button>
@@ -516,7 +605,7 @@ function PrimarySidebar({
             }}
             onDragEnd={onDragEnd}
             onClick={() => ide.selectDockPanel("left", panel)}
-            className={`group flex min-w-0 items-center gap-1.5 border-r border-ink-800 px-2 text-xs ${active === panel ? "bg-ink-950 text-ink-100" : "text-ink-400 hover:bg-ink-900"}`}
+            className={`${panelTabClass(active === panel)} px-2`}
             title={`Drag ${LABELS[panel]} to another dock`}
           >
             <span className="cursor-grab select-none text-ink-600">⠿</span>
@@ -535,18 +624,9 @@ function PrimarySidebar({
             </span>
           </button>
         ))}
-        <button
-          type="button"
-          onClick={ide.toggleSidebar}
-          title="Collapse sidebar"
-          aria-label="Collapse sidebar"
-          className="ml-auto shrink-0 px-2 text-ink-500 hover:text-ink-100"
-        >
-          <ChevronRight width={14} height={14} />
-        </button>
-      </div>
+      </PanelHeader>
       <div className="min-h-0 flex-1 overflow-hidden">
-        {active ? <PanelContent panel={active} workspace={workspace} agent={agent} /> : <FileTree />}
+        {active ? <PanelContent panel={active} workspace={workspace} agent={agent} /> : <FileTree refreshToken={agent.state.fileChangeSeq} />}
       </div>
     </aside>
   );
@@ -573,12 +653,14 @@ function DockAt({
   agent,
   onDragStart,
   onDragEnd,
+  visuallyHidden = false,
 }: {
   position: DockPosition;
   workspace: string;
   agent: ReturnType<typeof useAgent>;
   onDragStart: (panel: MovablePanelId) => void;
   onDragEnd: () => void;
+  visuallyHidden?: boolean;
 }) {
   const { ide } = useIdeContext();
   const panels = MOVABLE.filter(
@@ -601,10 +683,10 @@ function DockAt({
   return (
     <section
       style={style}
-      className={`flex min-h-0 min-w-0 shrink-0 flex-col overflow-hidden border-ink-800 bg-ink-950 ${border} ${position === "main" ? "h-full w-full" : ""}`}
+      className={`${visuallyHidden ? "hidden" : "flex"} min-h-0 min-w-0 shrink-0 flex-col overflow-hidden border-ink-800 bg-ink-950 ${border} ${position === "main" ? "h-full w-full" : ""}`}
       aria-label={`${position} dock`}
     >
-      <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800 bg-ink-925">
+      <PanelHeader>
         {panels.map((panel) => (
           <button
             key={panel}
@@ -623,9 +705,7 @@ function DockAt({
             onDragEnd={onDragEnd}
             onClick={() => ide.selectDockPanel(position, panel)}
             title={`Drag ${LABELS[panel]} to another dock`}
-            className={`group flex min-w-0 items-center gap-2 border-r border-ink-800 px-3 text-xs ${
-              panel === active ? "bg-ink-950 text-ink-100" : "text-ink-400 hover:bg-ink-900"
-            }`}
+            className={`${panelTabClass(panel === active)} gap-2`}
           >
             <span className="cursor-grab select-none text-ink-600 group-active:cursor-grabbing">⠿</span>
             <span className="truncate">{LABELS[panel]}</span>
@@ -646,7 +726,7 @@ function DockAt({
             </span>
           </button>
         ))}
-      </div>
+      </PanelHeader>
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
         <PanelContent panel={active} workspace={workspace} agent={agent} />
       </div>
@@ -689,14 +769,20 @@ function DockDropOverlay({
   panel: MovablePanelId;
   onDrop: (position: DockPosition, payload?: string) => void;
 }) {
+  // The full-screen layer MUST capture pointer events. Gaps with
+  // pointer-events-none let events fall through to Ghostty's WebGL canvas
+  // (and iframes), which cancels HTML5 drag mid-gesture — so the terminal
+  // looked "undraggable" while chat/git still worked.
+  const allowDrag = (event: DragEvent) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  };
   const target = (position: DockPosition, classes: string) => (
     <div
-      onDragOver={(event) => {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-      }}
+      onDragOver={allowDrag}
       onDrop={(event) => {
         event.preventDefault();
+        event.stopPropagation();
         const payload =
           event.dataTransfer.getData("application/x-catalyst-panel") ||
           event.dataTransfer.getData("text/plain");
@@ -708,11 +794,19 @@ function DockDropOverlay({
     </div>
   );
   return (
-    <div className="pointer-events-none absolute inset-0 z-50 bg-black/20">
-      {target("left", "pointer-events-auto bottom-24 left-16 top-16 w-[18%]")}
-      {target("right", "pointer-events-auto bottom-24 right-4 top-16 w-[18%]")}
-      {target("bottom", "pointer-events-auto bottom-8 left-[22%] right-[22%] h-[22%]")}
-      {target("main", "pointer-events-auto bottom-[28%] left-[28%] right-[28%] top-[22%]")}
+    <div
+      className="absolute inset-0 z-50 bg-black/20"
+      onDragOver={allowDrag}
+      onDrop={(event) => {
+        // Dropping on the dimmed backdrop (not a dock target) is a no-op;
+        // preventDefault so the browser doesn't navigate on text/plain.
+        event.preventDefault();
+      }}
+    >
+      {target("left", "bottom-24 left-16 top-16 w-[18%]")}
+      {target("right", "bottom-24 right-4 top-16 w-[18%]")}
+      {target("bottom", "bottom-8 left-[22%] right-[22%] h-[22%]")}
+      {target("main", "bottom-[28%] left-[28%] right-[28%] top-[22%]")}
     </div>
   );
 }
@@ -731,7 +825,7 @@ function TabStrip({
   );
   const activePanel = activeMainPanel(ide);
   return (
-    <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800 bg-ink-925">
+    <PanelHeader>
       {openTabs.length === 0 && panelTabs.length === 0 && <span className="flex items-center px-3 text-xs text-ink-600">No open editors</span>}
       {openTabs.map((tab) => {
         const active = activePanel === null && tab.id === activeTabId;
@@ -741,7 +835,7 @@ function TabStrip({
             type="button"
             onClick={() => ide.setActiveTab(tab.id)}
             title={tab.target}
-            className={`group flex items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${active ? "bg-ink-950 text-ink-100" : "text-ink-400 hover:bg-ink-900"}`}
+            className={panelTabClass(active)}
           >
             <FileIcon width={13} height={13} className="shrink-0 text-ink-500" />
             <span className="max-w-[12rem] truncate">{tab.label}</span>
@@ -779,7 +873,7 @@ function TabStrip({
           onDragEnd={onDragEnd}
           onClick={() => ide.selectDockPanel("main", panel)}
           title={`Drag ${LABELS[panel]} to another dock`}
-          className={`group flex min-w-0 items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${activePanel === panel ? "bg-ink-950 text-ink-100" : "text-ink-400 hover:bg-ink-900"}`}
+          className={panelTabClass(activePanel === panel)}
         >
           <span className="cursor-grab select-none text-ink-600">⠿</span>
           <span className="truncate">{LABELS[panel]}</span>
@@ -797,7 +891,7 @@ function TabStrip({
           </span>
         </button>
       ))}
-    </div>
+    </PanelHeader>
   );
 }
 
@@ -822,25 +916,78 @@ function MainContent({
   return null;
 }
 
+function EditorBreadcrumbs() {
+  const { ide } = useIdeContext();
+  if (activeMainPanel(ide)) return null;
+  const tab = ide.state.openTabs.find((item) => item.id === ide.state.activeTabId);
+  if (!tab || tab.kind !== "file") return null;
+  const parts = tab.target.split(/[\\/]/).filter(Boolean);
+  return (
+    <div className="flex h-7 shrink-0 items-center gap-1 overflow-x-auto border-b border-ink-850 bg-ink-950 px-3 text-[11px] text-ink-500" aria-label="File breadcrumb" title={tab.target}>
+      {parts.map((part, index) => (
+        <span key={`${part}:${index}`} className="flex shrink-0 items-center gap-1">
+          {index > 0 ? <ChevronRight width={11} height={11} className="text-ink-700" /> : null}
+          {index === parts.length - 1 ? <FileIcon width={12} height={12} className="text-accent-soft" /> : null}
+          <span className={index === parts.length - 1 ? "font-medium text-ink-300" : ""}>{part}</span>
+        </span>
+      ))}
+      {tab.dirty ? <span className="ml-1 text-amber-300" title="Unsaved changes">●</span> : null}
+    </div>
+  );
+}
+
 function StatusBar({
   connected,
   workspace,
   git,
   compact = false,
+  onGit,
+  onWorkspace,
+  onConnection,
 }: {
   connected: boolean;
   workspace: string;
   git: GitStatus | null;
   compact?: boolean;
+  onGit?: () => void;
+  onWorkspace?: () => void;
+  onConnection?: () => void;
 }) {
   const branch = git?.branch;
   const changes = git?.entries.length ?? 0;
   const wsName = workspace ? workspace.split(/[\\/]/).pop() ?? workspace : "—";
+  const [versionLabel, setVersionLabel] = useState<string | null>(null);
+  const [versionTitle, setVersionTitle] = useState("Version");
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/version", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          ok?: boolean;
+          commit?: string;
+          dirty?: boolean;
+          statusLabel?: string;
+        };
+        if (cancelled || !data?.ok || !data.commit) return;
+        setVersionLabel(`${data.commit}${data.dirty ? "*" : ""}`);
+        setVersionTitle(data.statusLabel ? `Catalyst Code · ${data.statusLabel}` : "Catalyst Code version");
+      } catch {
+        /* ignore — status bar is best-effort */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="flex h-6 shrink-0 items-center justify-between gap-2 border-t border-ink-700 bg-ink-900 px-2 text-[11px] text-ink-300">
       <div className="flex min-w-0 items-center gap-2 overflow-hidden">
         {branch ? (
-          <span className="flex min-w-0 items-center gap-1 whitespace-nowrap">
+          <button type="button" onClick={onGit} disabled={!onGit} title="Open Source Control" className="flex min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 hover:bg-ink-800 disabled:pointer-events-none">
             <GitBranchIcon width={12} height={12} className="shrink-0 text-accent" />
             <span className="truncate">{branch}</span>
             {!compact && (
@@ -848,18 +995,23 @@ function StatusBar({
                 · {changes} {changes === 1 ? "change" : "changes"}
               </span>
             )}
-          </span>
+          </button>
         ) : (
           <span className="text-ink-500">no git</span>
         )}
       </div>
       <div className="flex min-w-0 shrink items-center gap-2 sm:gap-3">
-        <span className={connected ? "text-emerald-400" : "text-amber-300"}>
+        {versionLabel && (
+          <span className="hidden font-mono text-[10px] text-ink-500 sm:inline" title={versionTitle}>
+            {versionLabel}
+          </span>
+        )}
+        <button type="button" onClick={onConnection} disabled={!onConnection} title={connected ? "Reconnect" : "Try reconnecting"} className={`${connected ? "text-emerald-400" : "text-amber-300"} rounded px-1 hover:bg-ink-800 disabled:pointer-events-none`}>
           {compact ? (connected ? "●" : "○") : connected ? "● connected" : "● reconnecting…"}
-        </span>
-        <span className={`truncate text-ink-400 ${compact ? "max-w-[6rem]" : "max-w-[20rem]"}`} title={workspace}>
+        </button>
+        <button type="button" onClick={onWorkspace} disabled={!onWorkspace} className={`truncate rounded px-1 text-ink-400 hover:bg-ink-800 hover:text-ink-200 disabled:pointer-events-none ${compact ? "max-w-[6rem]" : "max-w-[20rem]"}`} title={onWorkspace ? `Switch project · ${workspace}` : workspace}>
           {wsName}
-        </span>
+        </button>
       </div>
     </div>
   );

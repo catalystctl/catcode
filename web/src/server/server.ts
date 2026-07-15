@@ -14,12 +14,13 @@
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import { type Duplex } from "node:stream";
 import { parse } from "node:url";
-import { normalize, join, relative, sep } from "node:path";
+import { normalize, join, relative, resolve, sep } from "node:path";
 import next from "next";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { getSession } from "../lib/auth";
+import { loadProjects } from "../lib/projects";
 import { getBridge } from "./core-bridge";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -82,12 +83,16 @@ function fail(ws: WebSocket, message: string): void {
 }
 
 const MAX_SCROLLBACK_BYTES = 2 * 1024 * 1024;
-const DETACHED_TTL_MS = 30 * 60 * 1000;
+// Exited shells are kept briefly so a refresh can still show the exit banner.
+// Live PTYs are NEVER reaped on detach — they survive hard refresh until the
+// user hits × (terminate) or the web process restarts.
+const EXITED_TTL_MS = 5 * 60 * 1000;
 
 interface TerminalProcess {
   key: string;
   id: string;
   ownerId: string;
+  workspace: string;
   pty: IPty | null;
   clients: Set<WebSocket>;
   scrollback: string;
@@ -97,8 +102,8 @@ interface TerminalProcess {
 
 const terminals = new Map<string, TerminalProcess>();
 
-function terminalKey(ownerId: string, sessionId: string): string {
-  return `${ownerId}:${sessionId}`;
+function terminalKey(ownerId: string, workspace: string, sessionId: string): string {
+  return `${ownerId}:${workspace}:${sessionId}`;
 }
 
 function validSessionId(value: unknown): value is string {
@@ -107,6 +112,27 @@ function validSessionId(value: unknown): value is string {
 
 function clampDimension(value: number | undefined, fallback: number, max: number): number {
   return Number.isFinite(value) ? Math.max(2, Math.min(max, Math.floor(value!))) : fallback;
+}
+
+/** Resolve a client workspace root to an allowlisted project path. */
+function authorizedWorkspace(candidate: string | undefined): string {
+  const fallback = getBridge().getDefaultWorkspace();
+  if (!candidate || typeof candidate !== "string") return fallback;
+  const requested = resolve(candidate);
+  const allowed = [fallback, ...loadProjects().map((project) => project.path)].map((workspace) =>
+    resolve(workspace),
+  );
+  if (!allowed.includes(requested)) {
+    throw new Error("unauthorized workspace");
+  }
+  return requested;
+}
+
+function findOwnedTerminal(ownerId: string, sessionId: string): TerminalProcess | undefined {
+  for (const session of terminals.values()) {
+    if (session.ownerId === ownerId && session.id === sessionId) return session;
+  }
+  return undefined;
 }
 
 function broadcast(session: TerminalProcess, msg: Record<string, unknown>): void {
@@ -125,20 +151,20 @@ function destroyTerminal(session: TerminalProcess): void {
   session.clients.clear();
 }
 
-function scheduleDetachedCleanup(session: TerminalProcess): void {
-  if (terminals.get(session.key) !== session || session.clients.size || session.cleanupTimer) return;
-  session.cleanupTimer = setTimeout(() => destroyTerminal(session), DETACHED_TTL_MS);
+function scheduleExitedCleanup(session: TerminalProcess): void {
+  if (terminals.get(session.key) !== session || session.pty || session.clients.size || session.cleanupTimer) {
+    return;
+  }
+  session.cleanupTimer = setTimeout(() => destroyTerminal(session), EXITED_TTL_MS);
   session.cleanupTimer.unref?.();
 }
 
 function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
   let workspace: string;
   try {
-    // The terminal always runs in the configured workspace. A client-provided
-    // `workspace` root is intentionally NOT honoured — it would let an
-    // authenticated client point the shell at an arbitrary directory. Only the
-    // `cwd` (workspace-relative, confined below) is respected.
-    workspace = getBridge().getDefaultWorkspace();
+    // Prefer the client project workspace when it is an allowlisted path so
+    // terminals are per-project. Fall back to the process default otherwise.
+    workspace = authorizedWorkspace(msg.workspace);
   } catch (err) {
     throw new Error(`no workspace configured: ${String(err)}`);
   }
@@ -167,11 +193,12 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
     LINES: String(rows),
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 
-  const key = terminalKey(ownerId, msg.sessionId);
+  const key = terminalKey(ownerId, workspace, msg.sessionId);
   const terminal: TerminalProcess = {
     key,
     id: msg.sessionId,
     ownerId,
+    workspace,
     pty: null,
     clients: new Set(),
     scrollback: "",
@@ -190,14 +217,14 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
     terminal.exitCode = exitCode ?? (signal ? 128 + signal : 0);
     terminal.pty = null;
     broadcast(terminal, { type: "exit", code: terminal.exitCode });
-    scheduleDetachedCleanup(terminal);
+    scheduleExitedCleanup(terminal);
   });
   terminals.set(key, terminal);
   return terminal;
 }
 
-// Per-connection handler. PTYs live independently of sockets so switching
-// panels or reloading the browser detaches and later replays buffered output.
+// Per-connection handler. Live PTYs outlive sockets so panel switches and hard
+// refreshes detach/reattach with scrollback replay until × or server restart.
 function handleTerminal(ws: WebSocket, ownerId: string): void {
   let attached: TerminalProcess | null = null;
 
@@ -212,7 +239,7 @@ function handleTerminal(ws: WebSocket, ownerId: string): void {
     if (!attached) {
       if (msg.type === "terminate") {
         if (!validSessionId(msg.sessionId)) { fail(ws, "invalid terminal session ID"); return; }
-        const existing = terminals.get(terminalKey(ownerId, msg.sessionId));
+        const existing = findOwnedTerminal(ownerId, msg.sessionId);
         if (existing) destroyTerminal(existing);
         else { send(ws, { type: "terminated" }); ws.close(); }
         return;
@@ -221,7 +248,14 @@ function handleTerminal(ws: WebSocket, ownerId: string): void {
         fail(ws, 'expected a valid {type:"open", sessionId} message');
         return;
       }
-      const key = terminalKey(ownerId, msg.sessionId);
+      let workspace: string;
+      try {
+        workspace = authorizedWorkspace(msg.workspace);
+      } catch (err) {
+        fail(ws, `failed to open terminal: ${String(err)}`);
+        return;
+      }
+      const key = terminalKey(ownerId, workspace, msg.sessionId);
       try {
         attached = terminals.get(key) ?? createTerminal(ownerId, msg);
       } catch (err) {
@@ -261,7 +295,8 @@ function handleTerminal(ws: WebSocket, ownerId: string): void {
   const cleanup = (): void => {
     if (!attached) return;
     attached.clients.delete(ws);
-    scheduleDetachedCleanup(attached);
+    // Live shells stay running with no TTL. Only exited shells are reaped.
+    if (!attached.pty) scheduleExitedCleanup(attached);
     attached = null;
   };
   ws.on("close", cleanup);

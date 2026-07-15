@@ -3,9 +3,11 @@
 // Client-only IDE layout/panel state. This NEVER touches the core reducer,
 // AgentState, or the SSE snapshot — it is a completely separate state slice so
 // the web-event-fieldname-mismatch + snapshot round-trip contracts stay intact.
-// Layout prefs persist to localStorage; transient runtime state (tabs, terminals,
-// gitStatus, preview) is in-memory only. The hook does no I/O: components own
-// their own fetch/WS lifecycle and call back into the hook to set state.
+// Layout prefs and terminal session metadata persist to localStorage (scoped
+// per project/workspace). File tabs, gitStatus, and preview stay in-memory.
+// Server-side PTYs outlive the browser tab; the client only stores ids so a
+// hard refresh can reattach. The hook does no I/O: components own their own
+// fetch/WS lifecycle and call back into the hook to set state.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
@@ -23,6 +25,10 @@ import { disposeEditorModel } from "./editor-model-registry";
 
 const STORAGE_KEY = "catcode:ide-layout";
 
+function storageKey(workspace?: string): string {
+  return workspace ? `${STORAGE_KEY}:${encodeURIComponent(workspace)}` : STORAGE_KEY;
+}
+
 /** Keys persisted across reloads (the rest is in-memory only). */
 const PERSISTED: (keyof IdeLayoutState)[] = [
   "activePanel",
@@ -37,7 +43,38 @@ const PERSISTED: (keyof IdeLayoutState)[] = [
   "activeDockPanels",
   "leftDockWidth",
   "expandedDirs",
+  // Terminal tabs are per-project and reattach to server PTYs after refresh.
+  "terminals",
+  "activeTerminalId",
 ];
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function sanitizeTerminals(value: unknown): TerminalSession[] {
+  if (!Array.isArray(value)) return [];
+  const out: TerminalSession[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const raw = item as Partial<TerminalSession>;
+    if (typeof raw.id !== "string" || !SESSION_ID_RE.test(raw.id)) continue;
+    // Dead shells are not restored — a refresh after exit should not spawn a
+    // replacement PTY under the old tab. Live ones reattach to the server.
+    if (raw.alive === false || typeof raw.exitCode === "number") continue;
+    out.push({
+      id: raw.id,
+      title: typeof raw.title === "string" && raw.title.trim() ? raw.title : `Terminal ${out.length + 1}`,
+      cwd: typeof raw.cwd === "string" ? raw.cwd : "",
+      alive: true,
+      exitCode: null,
+    });
+  }
+  return out;
+}
+
+function sanitizeActiveTerminalId(value: unknown, terminals: TerminalSession[]): string | null {
+  if (typeof value !== "string" || !SESSION_ID_RE.test(value)) return null;
+  return terminals.some((t) => t.id === value) ? value : (terminals[terminals.length - 1]?.id ?? null);
+}
 
 const DEFAULTS: IdeLayoutState = {
   activePanel: "explorer",
@@ -60,17 +97,26 @@ const DEFAULTS: IdeLayoutState = {
   expandedDirs: [],
 };
 
-function loadPersisted(): Partial<IdeLayoutState> {
+function loadPersisted(key: string): Partial<IdeLayoutState> {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    // The unscoped value is a migration fallback for existing installations.
+    const raw = window.localStorage.getItem(key) ??
+      (key !== STORAGE_KEY ? window.localStorage.getItem(STORAGE_KEY) : null);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return {};
     const out: Partial<IdeLayoutState> = {};
     for (const k of PERSISTED) {
+      if (k === "terminals" || k === "activeTerminalId") continue;
       if (k in parsed) (out as Record<string, unknown>)[k] = parsed[k];
     }
+    const terminals = sanitizeTerminals((parsed as IdeLayoutState).terminals);
+    out.terminals = terminals;
+    out.activeTerminalId = sanitizeActiveTerminalId(
+      (parsed as IdeLayoutState).activeTerminalId,
+      terminals,
+    );
     return out;
   } catch {
     return {};
@@ -124,32 +170,53 @@ export interface IdeApi {
   isExpanded: (path: string) => boolean;
 }
 
-export function useIde(): IdeApi {
+export function useIde(workspace?: string): IdeApi {
   // The server and the client's hydration pass must render the same layout.
   // Restore local preferences only after hydration; reading localStorage in the
   // useState initializer makes the client render saved values while the server
   // renders DEFAULTS, which causes React to discard the entire IDE shell.
   const [state, setState] = useState<IdeLayoutState>(DEFAULTS);
-  const [layoutRestored, setLayoutRestored] = useState(false);
+  const key = storageKey(workspace);
+  const [restoredKey, setRestoredKey] = useState<string | null>(null);
 
   useEffect(() => {
-    setState((current) => ({ ...current, ...loadPersisted() }));
-    setLayoutRestored(true);
-  }, []);
+    // Layout + terminal tabs are scoped per project key. File tabs, git, and
+    // preview reset so they never silently point at the previous workspace.
+    const loaded = loadPersisted(key);
+    setState({ ...DEFAULTS, ...loaded });
+    setRestoredKey(key);
+  }, [key]);
 
   // Persist the persisted subset whenever it changes.
   useEffect(() => {
     // Do not write DEFAULTS before the restoration effect has had a chance to
     // read the user's saved layout.
-    if (!layoutRestored || typeof window === "undefined") return;
+    if (restoredKey !== key || typeof window === "undefined") return;
     try {
       const slice: Record<string, unknown> = {};
-      for (const k of PERSISTED) slice[k] = state[k];
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(slice));
+      for (const k of PERSISTED) {
+        if (k === "terminals") {
+          // Only durable live sessions — exited tabs are ephemeral UI state.
+          slice.terminals = state.terminals.filter((t) => t.alive && t.exitCode == null);
+          continue;
+        }
+        if (k === "activeTerminalId") {
+          const live = (slice.terminals as TerminalSession[] | undefined) ??
+            state.terminals.filter((t) => t.alive && t.exitCode == null);
+          const active = state.activeTerminalId;
+          slice.activeTerminalId =
+            active && live.some((t) => t.id === active)
+              ? active
+              : (live[live.length - 1]?.id ?? null);
+          continue;
+        }
+        slice[k] = state[k];
+      }
+      window.localStorage.setItem(key, JSON.stringify(slice));
     } catch {
       /* ignore quota / private-mode errors */
     }
-  }, [layoutRestored, state]);
+  }, [key, restoredKey, state]);
 
   // Mirror state into a ref so runCommand can read current session state without
   // a stale closure (and without mutating refs inside the setState updater, which
@@ -222,15 +289,35 @@ export function useIde(): IdeApi {
   }, []);
 
   const movePanel = useCallback((panel: MovablePanelId, position: DockPosition) => {
-    setState((s) => ({
-      ...s,
-      panelLocations: { ...s.panelLocations, [panel]: position },
-      panelVisibility: { ...s.panelVisibility, [panel]: true },
-      copilotVisible: panel === "chat" ? true : s.copilotVisible,
-      bottomPanelVisible: panel === "terminal" && position === "bottom" ? true : s.bottomPanelVisible,
-      sidebarCollapsed: position === "left" ? false : s.sidebarCollapsed,
-      activeDockPanels: { ...s.activeDockPanels, [position]: panel },
-    }));
+    setState((s) => {
+      const prev = s.panelLocations[panel];
+      const activeDockPanels: IdeLayoutState["activeDockPanels"] = {
+        ...s.activeDockPanels,
+        [position]: panel,
+      };
+      // Clear the old dock's active pointer when this panel leaves it.
+      if (prev !== position && activeDockPanels[prev] === panel) {
+        const remaining =
+          (["chat", "terminal", "git", "preview"] as const).find(
+            (p) => p !== panel && s.panelVisibility[p] && s.panelLocations[p] === prev,
+          ) ?? null;
+        activeDockPanels[prev] = remaining;
+      }
+      const bottomPanelVisible = (["chat", "terminal", "git", "preview"] as const).some((p) => {
+        const loc = p === panel ? position : s.panelLocations[p];
+        const visible = p === panel ? true : s.panelVisibility[p];
+        return visible && loc === "bottom";
+      });
+      return {
+        ...s,
+        panelLocations: { ...s.panelLocations, [panel]: position },
+        panelVisibility: { ...s.panelVisibility, [panel]: true },
+        copilotVisible: panel === "chat" ? true : s.copilotVisible,
+        bottomPanelVisible,
+        sidebarCollapsed: position === "left" ? false : s.sidebarCollapsed,
+        activeDockPanels,
+      };
+    });
   }, []);
 
   const toggleDockPanel = useCallback((panel: MovablePanelId) => {

@@ -3,7 +3,14 @@
 // DiagnosticsModal — dedicated panel for /stats, /context, and /usage payloads
 // instead of toast-only truncation.
 
-import type { ContextBreakdown, Stats, UsageSnapshot } from "@/lib/types";
+import type {
+  CheckpointInfo,
+  ContextBreakdown,
+  CostUpdate,
+  ProtocolHello,
+  Stats,
+  UsageSnapshot,
+} from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
@@ -13,11 +20,27 @@ interface Props {
   stats: Stats | null;
   context: ContextBreakdown | null;
   usage: UsageSnapshot | null;
+  cost?: CostUpdate | null;
+  checkpoints?: CheckpointInfo[];
+  protocolHello?: ProtocolHello | null;
   onRefresh: () => void;
+  onCreateCheckpoint?: () => void;
+  onRestoreCheckpoint?: (id: string) => void;
   onClose: () => void;
 }
 
-export function DiagnosticsModal({ stats, context, usage, onRefresh, onClose }: Props) {
+export function DiagnosticsModal({
+  stats,
+  context,
+  usage,
+  cost,
+  checkpoints = [],
+  protocolHello,
+  onRefresh,
+  onCreateCheckpoint,
+  onRestoreCheckpoint,
+  onClose,
+}: Props) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
 
@@ -39,7 +62,7 @@ export function DiagnosticsModal({ stats, context, usage, onRefresh, onClose }: 
             <button
               onClick={onRefresh}
               className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
-              title="Refresh stats, context, and usage"
+              title="Refresh stats, context, usage, and checkpoints"
               aria-label="Refresh"
             >
               <RefreshIcon width={15} height={15} />
@@ -70,6 +93,95 @@ export function DiagnosticsModal({ stats, context, usage, onRefresh, onClose }: 
               <Empty>No stats yet — send a turn or hit refresh.</Empty>
             )}
           </section>
+
+          <section>
+            <SectionTitle>Cost</SectionTitle>
+            {cost ? (
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3 font-mono text-[11px]">
+                {cost.estimated_usd != null && (
+                  <Stat
+                    label="est. USD"
+                    value={`$${cost.estimated_usd.toFixed(cost.estimated_usd < 0.01 ? 4 : 3)}`}
+                  />
+                )}
+                {cost.tokens_in != null && (
+                  <Stat label="tokens in" value={formatTokens(cost.tokens_in)} />
+                )}
+                {cost.tokens_out != null && (
+                  <Stat label="tokens out" value={formatTokens(cost.tokens_out)} />
+                )}
+                {cost.cached_tokens != null && (
+                  <Stat label="cached" value={formatTokens(cost.cached_tokens)} />
+                )}
+                {cost.cache_hit_pct != null && (
+                  <Stat label="cache hit" value={`${Math.round(cost.cache_hit_pct)}%`} />
+                )}
+                {cost.model && <Stat label="model" value={cost.model} />}
+              </div>
+            ) : (
+              <Empty>No cost_update yet — complete a turn to see estimates.</Empty>
+            )}
+          </section>
+
+          <section>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <SectionTitle>Checkpoints</SectionTitle>
+              {onCreateCheckpoint && (
+                <button
+                  type="button"
+                  onClick={onCreateCheckpoint}
+                  className="rounded-md border border-ink-700 px-2 py-0.5 text-[10px] text-ink-300 hover:border-ink-500 hover:text-ink-100"
+                >
+                  Create
+                </button>
+              )}
+            </div>
+            {checkpoints.length > 0 ? (
+              <div className="space-y-1.5 rounded-xl border border-ink-800 bg-ink-925/40 p-2">
+                {checkpoints.slice(0, 12).map((c) => (
+                  <div
+                    key={String(c.id)}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-1.5 text-[11px]"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-medium text-ink-200">
+                        {String(c.label || c.id)}
+                      </div>
+                      <div className="font-mono text-[10px] text-ink-500">
+                        {String(c.kind ?? "checkpoint")}
+                        {c.auto ? " · auto" : ""}
+                      </div>
+                    </div>
+                    {onRestoreCheckpoint && (
+                      <button
+                        type="button"
+                        onClick={() => onRestoreCheckpoint(String(c.id))}
+                        className="shrink-0 rounded-md border border-ink-700 px-2 py-0.5 text-[10px] text-ink-300 hover:border-accent/40 hover:text-accent-soft"
+                      >
+                        Restore
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <Empty>No checkpoints yet.</Empty>
+            )}
+          </section>
+
+          {protocolHello && (
+            <section>
+              <SectionTitle>Protocol</SectionTitle>
+              <div className="rounded-xl border border-ink-800 bg-ink-925/40 p-3 font-mono text-[11px] text-ink-400">
+                <div>v{protocolHello.version}</div>
+                {protocolHello.capabilities.length > 0 && (
+                  <div className="mt-1 text-[10px] text-ink-500">
+                    {protocolHello.capabilities.join(", ")}
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
 
           <section>
             <SectionTitle>Context breakdown</SectionTitle>

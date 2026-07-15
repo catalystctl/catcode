@@ -2,9 +2,23 @@
 //
 // The core speaks newline-delimited JSON over stdio. The server bridge forwards
 // raw core events to the browser over SSE, and accepts raw core commands via
-// POST. This file is the single source of truth for those shapes (a typed subset
-// of core/src/protocol.rs + the event payloads constructed in main.rs/provider.rs),
-// plus the UI message model the reducer assembles from the event stream.
+// POST. Wire-level event payloads are sourced from the SDK (@catalyst-code/coding-agent)'s
+// typed event catalog (core-events.ts / core-process.ts); the UI message model
+// is assembled by the reducer from the event stream.
+//
+// This file is imported by BOTH server and browser code — use ONLY `import type`
+// (no runtime SDK imports).
+
+import type {
+  ApprovalRequestEvent,
+  CostUpdateEvent,
+  FileChangeEvent,
+  MetricsEvent,
+  ProtocolHelloEvent,
+  SudoRequestEvent,
+  WorktreeReadyEvent,
+} from "@catalyst-code/coding-agent";
+import type { ReadyPayload as SDKReadyPayload } from "@catalyst-code/coding-agent";
 
 // ─── Core wire types ────────────────────────────────────────────────────────
 
@@ -38,18 +52,10 @@ export interface ProviderPreset {
   supportsOauth?: boolean;
 }
 
-export interface ReadyPayload {
+export interface ReadyPayload extends SDKReadyPayload {
   type: "ready";
   models: ModelInfo[];
-  authed: boolean;
-  workspace: string;
-  approval: string; // "never" | "destructive" | "always"
-  base_url: string;
-  provider: string;
-  providerKind: string;
-  providers: string[];
   providerPresets?: ProviderPreset[];
-  bash_timeout_secs: number;
   /** When true, the core auto-compacts context on thresholds / idle. */
   auto_compact?: boolean;
   /** Configured fractions; runtime thresholds may be lower when response
@@ -59,7 +65,6 @@ export interface ReadyPayload {
   /** Bash hard sandbox: `"none"` | `"firejail"` | `"seatbelt"`. */
   sandbox?: string;
   plugins_skipped?: string[];
-  resumed_messages: number;
 }
 
 /** A discoverable subagent (builtin / user / project) from `agents` events. */
@@ -110,25 +115,12 @@ export interface UsageSnapshot {
   }>;
 }
 
-export interface ApprovalRequest {
-  request_id: string;
-  tool: string;
-  args: string;
-  diff?: string;
-}
+export type ApprovalRequest = Omit<ApprovalRequestEvent, "type">;
 
-export interface Metrics {
-  ttft_ms?: number;
-  elapsed_ms?: number;
-  tokens_in?: number; // mid-stream = live context; final = in+out (use prompt_tokens)
-  prompt_tokens?: number; // final: true input
-  tokens_out?: number;
-  cached_tokens?: number;
-  tps?: number;
-  /** Mid-stream estimate from the core (`tps_est`); mapped to `tps` in the reducer. */
-  tps_est?: number;
-  model?: string;
-}
+/** Stream + final-turn metrics. Mid-stream: `tokens_in` = live context;
+ *  final = `elapsed_ms`/`prompt_tokens` present (true input).
+ *  `tps_est` (mid-stream estimate) is mapped to `tps` in the reducer. */
+export type Metrics = Omit<MetricsEvent, "type">;
 
 /** Live, account-wide Umans concurrency usage from the gateway's `/v1/usage`
  *  endpoint, polled every few seconds by the core (independent of turns) so the
@@ -156,7 +148,35 @@ export interface SessionEntry {
   messages?: number;
   /** True when this is the currently-active session. */
   current?: boolean;
+  /** Pinned in the session picker. */
+  pinned?: boolean;
 }
+
+/** Cumulative / turn cost from core `cost_update` events. */
+export type CostUpdate = Omit<CostUpdateEvent, "type">;
+
+export type ProtocolHello = Omit<ProtocolHelloEvent, "type">;
+
+export interface CheckpointInfo {
+  id: string;
+  label?: string;
+  kind?: string;
+  auto?: boolean;
+  paths?: string[];
+  created_at?: number;
+  [key: string]: unknown;
+}
+
+export type WorktreeInfo = Omit<WorktreeReadyEvent, "type">;
+
+export type FileChangeRecord = Omit<FileChangeEvent, "type"> & { ts: number };
+
+export type ApproveDecision =
+  | "yes"
+  | "no"
+  | "always"
+  | "allow_session"
+  | "allow_pattern";
 
 export interface Stats {
   type: "stats";
@@ -251,10 +271,7 @@ export interface AskPrompt {
 
 /** A pending sudo_request: the agent wants to run a bash command that invokes
  *  `sudo`. The user must approve (with a password) or decline. */
-export interface SudoPrompt {
-  request_id: string;
-  command: string;
-}
+export type SudoPrompt = Omit<SudoRequestEvent, "type">;
 
 /** A log entry for intercom/subagent activity (kept recent, capped). */
 export interface IntercomEntry {
@@ -308,6 +325,8 @@ export interface SubagentRunView {
 
 /** Vision-handoff configuration (curated vision-capable models + target). */
 export interface VisionConfig {
+  /** Auto handoff on image turns (default true / recommended ON). */
+  enabled: boolean;
   vision_models: string[];
   vision_model: string | null;
 }
@@ -410,6 +429,43 @@ export type CoreEvent =
       exclude_from_context?: boolean;
     }
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
+  | {
+      type: "protocol_hello";
+      version: string;
+      min_client: string;
+      capabilities: string[];
+    }
+  | {
+      type: "file_change";
+      path: string;
+      unified_diff?: string;
+      tool: string;
+      agent_id?: string;
+      run_id?: string;
+    }
+  | {
+      type: "checkpoint_created";
+      id: string;
+      label: string;
+      kind: string;
+      auto?: boolean;
+      paths?: string[];
+    }
+  | { type: "checkpoint_restored"; id: string; kind: string }
+  | { type: "checkpoints"; checkpoints: CheckpointInfo[] }
+  | { type: "worktree_ready"; run_id: string; path: string; branch?: string }
+  | { type: "worktree_cleaned"; path: string }
+  | { type: "worktree_promoted"; run_id: string; paths: string[] }
+  | { type: "audit"; tool: string; decision: string; actor: string }
+  | ({ type: "cost_update" } & CostUpdate)
+  | { type: "goal_step_verdict"; ok: boolean; output: string }
+  | { type: "search_key_set"; provider: string; has_key: boolean }
+  | { type: "plugin_commands"; commands: unknown[] }
+  | { type: "plugin_status"; plugin: string; text: string }
+  | { type: "session_changed"; path: string; new?: boolean }
+  | { type: "session_change_failed"; path: string; message: string }
+  | { type: "session_deleted"; path: string }
+  | { type: "session_pinned"; path: string; pinned: boolean }
   | { type: "ask_request"; request_id: string; questions: AskQuestion[] }
   | { type: "sudo_request"; request_id: string; command: string }
   | { type: "metrics" } & Metrics
@@ -468,7 +524,7 @@ export type CoreEvent =
   | { type: "plugin_disabled"; name: string; ok?: boolean }
   | { type: "plugin_error"; name?: string; message: string }
   // ── Vision ──
-  | { type: "vision_config"; vision_models: string[]; vision_model: string | null }
+  | { type: "vision_config"; enabled?: boolean; vision_models: string[]; vision_model: string | null }
   // ── Projects / workspace ──
   | { type: "projects"; projects: ProjectEntry[] }
   | { type: "workspace_changed"; workspace: string; projects: ProjectEntry[] }
@@ -510,8 +566,17 @@ export type CoreCommand =
   | { type: "compact"; instructions?: string }
   | { type: "context" }
   | { type: "usage"; model?: string }
-  | { type: "approve"; request_id: string; decision: "yes" | "no" | "always" }
+  | {
+      type: "approve";
+      request_id: string;
+      decision: ApproveDecision;
+      pattern?: string;
+    }
   | { type: "set_approval"; mode: "never" | "destructive" | "always" }
+  | { type: "create_checkpoint"; label?: string; paths?: string[] }
+  | { type: "list_checkpoints" }
+  | { type: "restore_checkpoint"; id: string }
+  | { type: "pin_session"; path: string; pinned: boolean }
   | { type: "set_key"; api_key: string; provider?: string }
   | { type: "set_search_key"; provider: string; api_key: string }
   | { type: "set_provider"; name: string }
@@ -547,7 +612,12 @@ export type CoreCommand =
   | { type: "list_agents" }
   // ── Vision ──
   | { type: "get_vision_config" }
-  | { type: "set_vision_config"; vision_models?: string[]; vision_model?: string | null }
+  | {
+      type: "set_vision_config";
+      enabled?: boolean;
+      vision_models?: string[];
+      vision_model?: string | null;
+    }
   // ── Projects / workspace ──
   | { type: "switch_workspace"; path: string }
   | { type: "rename_session"; name: string; title: string }
@@ -707,7 +777,7 @@ export interface AgentState {
   workspace: string;
   /** Known workspace projects (for the project picker). */
   projects: ProjectEntry[];
-  /** First-party provider presets (OpenAI/Codex, Gemini, Anthropic) from the
+  /** First-party provider presets (Umans, OpenCode Go, OpenRouter) from the
    * core, used by the /login + /logout pickers. */
   providerPresets: ProviderPreset[];
   selectedModel: string | null;
@@ -749,6 +819,24 @@ export interface AgentState {
   goalMode: GoalModeState | null;
   /** Last structured plan from `goal_plan` (for plan-ready review). */
   goalPlan: GoalPlan | null;
+  /** Protocol capabilities handshake from `protocol_hello`. */
+  protocolHello: ProtocolHello | null;
+  /** Latest `cost_update` totals (session-scoped estimate). */
+  cost: CostUpdate | null;
+  /** Known hybrid checkpoints from `checkpoints` / create events. */
+  checkpoints: CheckpointInfo[];
+  /** Monotonic counter bumped on every `file_change` (IDE refresh signal). */
+  fileChangeSeq: number;
+  /** Recent agent file mutations (newest first, capped). */
+  recentFileChanges: FileChangeRecord[];
+  /** Active parallel-subagent worktrees. */
+  worktrees: WorktreeInfo[];
+  /** Slash commands contributed by plugins. */
+  pluginCommands: unknown[];
+  /** Search-provider API key presence (`provider` → has_key). */
+  searchKeys: Record<string, boolean>;
+  /** Last goal wave verifier result. */
+  lastGoalVerdict: { ok: boolean; output: string } | null;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;
   /** True when the core has a one-deep follow-up/steer queued behind the live turn. */
@@ -876,7 +964,9 @@ export interface GitRemote {
   pushUrl: string;
 }
 
-/** A live, persistent PTY session rendered by Ghostty in the browser. */
+/** A live, persistent PTY session rendered by Ghostty in the browser.
+ *  Session metadata is persisted per project; the server PTY survives refresh
+ *  until the user closes the tab or the web process restarts. */
 export interface TerminalSession {
   /** Client-generated id (e.g. "term_<ts>_<n>"). */
   id: string;

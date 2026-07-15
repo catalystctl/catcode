@@ -44,6 +44,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
   const [modelConcurrency, setModelConcurrency] = useState<Record<string, number>>({});
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  const executionProfile = concurrency >= 8 ? "Ultra parallel" : concurrency > 1 ? "Parallel" : "Serial";
 
   const providerOpts = useMemo(() => {
     if (providers.length > 0) return providers;
@@ -179,7 +180,11 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                 min={1}
                 max={32}
                 value={concurrency}
-                onChange={(e) => setConcurrency(Number(e.target.value) || 1)}
+                onChange={(e) => {
+                  const next = Math.max(1, Math.min(32, Number(e.target.value) || 1));
+                  setConcurrency(next);
+                  setMaxTasks((current) => Math.max(current, next));
+                }}
                 className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
               />
             </label>
@@ -197,6 +202,12 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
               />
             </label>
           </div>
+          <p className="-mt-1 text-[11px] text-ink-500">
+            Execution profile: <span className="font-medium text-ink-300">{executionProfile}</span>
+            {concurrency >= 8
+              ? " — plans are shaped to fill a wide concurrency window."
+              : " — independent plan steps run concurrently."}
+          </p>
 
           <div>
             <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-ink-500">

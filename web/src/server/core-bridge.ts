@@ -20,8 +20,8 @@
 // full yes/no/always approval control and direct session/model/stats commands.
 
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, dirname, relative, normalize, sep } from "node:path";
+import { resolveCoreBinary, configDir } from "@catalyst-code/coding-agent";
 import type { AgentState, CoreCommand, CoreEvent, ProjectEntry, ReadyPayload } from "@/lib/types";
 import { loadTitles, setTitle } from "@/lib/session-titles";
 import { loadProjects, touchProject, removeProject } from "@/lib/projects";
@@ -33,10 +33,13 @@ interface CoreRoot {
   root: string;
 }
 
-/** 64-bit FNV-1a hash (matches the Go TUI's fnv64a). Returns a hex string. */
+// SDK-GAP: fnv64aHex / sessionsDirFor / newSessionFilename exist in the SDK
+// (sdk/src/config.ts) but are NOT exported from the public barrel (index.ts).
+// The SDK's SessionManager uses them internally. Keep local copies until the
+// SDK promotes these helpers to the public API surface.
+
+/** 64-bit FNV-1a hash (matches SDK + Go TUI + Rust core). */
 function fnv64aHex(s: string): string {
-  // FNV-1a operates on bytes. The TUI hashes the UTF-8 of the cwd path; use the
-  // same byte representation so session dirs align across TUI and web.
   const bytes = Buffer.from(s, "utf8");
   let h = BigInt("0xcbf29ce484222325");
   const prime = BigInt("0x100000001b3");
@@ -48,11 +51,10 @@ function fnv64aHex(s: string): string {
   return h.toString(16);
 }
 
-/** The per-workspace session directory (mirrors the TUI's sessionsDir()). */
+/** The per-workspace session directory (mirrors the TUI's sessionsDir()).
+ *  Uses the SDK's configDir() so the path is identical to the SDK/TUI. */
 export function sessionsDir(workspace: string): string {
-  const home = homedir() || ".";
-  const cfg = join(home, ".config", "catalyst-code", "sessions");
-  return join(cfg, fnv64aHex(workspace));
+  return join(configDir(), "sessions", fnv64aHex(workspace));
 }
 
 function pad(n: number, l = 2): string {
@@ -94,10 +96,18 @@ export function resolveSessionFile(workspace: string): string {
   return freshSessionFile(workspace);
 }
 
-/** Walk up from cwd to find the built core binary; return its repo root too. */
+/** Resolve the core binary and repo root for the default workspace.
+ *  Uses the SDK's resolveCoreBinary (handles CATCODE_CORE env, dev paths, PATH)
+ *  with a walk-up fallback for the common dev layout where the web server cwd
+ *  is a subdirectory of the repo root (e.g. web/). */
 function resolveCore(): CoreRoot {
-  const env = process.env.CATCODE_CORE;
-  if (env && env.trim()) return { binary: env.trim(), root: process.cwd() };
+  const sdkBinary = resolveCoreBinary();
+  // If the SDK resolved to an actual on-disk file, use it.
+  if (existsSync(sdkBinary)) {
+    return { binary: sdkBinary, root: process.cwd() };
+  }
+  // Fallback: walk up from cwd looking for core/target/release/{core,catcode-core}.
+  // This catches the dev case where cwd is web/ but the binary is at ../core/target/release/.
   const exe = process.platform === "win32" ? ".exe" : "";
   const names = [`core${exe}`, `catcode-core${exe}`];
   let dir = process.cwd();
@@ -110,7 +120,7 @@ function resolveCore(): CoreRoot {
     if (parent === dir) break;
     dir = parent;
   }
-  return { binary: names[0], root: process.cwd() };
+  return { binary: sdkBinary, root: process.cwd() };
 }
 
 class HarnessBridge {

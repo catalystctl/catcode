@@ -5,10 +5,14 @@
 // Rust core. Stored per-workspace (keyed by workspace hash, same as sessions).
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { configDir } from "@catalyst-code/coding-agent";
 
-/** 64-bit FNV-1a hash (matches the Go TUI / core's sessionsDir). */
+// SDK-GAP: fnv64aHex exists in the SDK (sdk/src/config.ts) but is NOT exported from
+// the public barrel (index.ts). The SDK's SessionManager uses it internally for
+// sessionsDirFor() but neither symbol is part of the public API surface.
+// KEEP-LOCAL until the SDK promotes fnv64aHex/sessionsDirFor to public exports.
+/** 64-bit FNV-1a hash (matches SDK + Go TUI + Rust core). */
 function fnv64aHex(s: string): string {
   const bytes = Buffer.from(s, "utf8");
   let h = BigInt("0xcbf29ce484222325");
@@ -22,8 +26,7 @@ function fnv64aHex(s: string): string {
 }
 
 function titlesFile(workspace: string): string {
-  const home = homedir() || ".";
-  const cfg = join(home, ".config", "catalyst-code", "session-titles");
+  const cfg = join(configDir(), "session-titles");
   if (!existsSync(cfg)) mkdirSync(cfg, { recursive: true });
   return join(cfg, `${fnv64aHex(workspace)}.json`);
 }

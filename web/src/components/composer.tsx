@@ -40,6 +40,8 @@ interface Props {
   modelLabel: string;
   images: string[];
   workspace: string;
+  /** Active IDE file supplied as ambient context for user awareness. */
+  activeFile?: string | null;
   onAddImage: (url: string) => void;
   onRemoveImage: (i: number) => void;
   onPrompt: (text: string, images?: string[]) => void;
@@ -118,6 +120,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     modelLabel,
     images,
     workspace,
+    activeFile,
     onAddImage,
     onRemoveImage,
     onPrompt,
@@ -518,10 +521,36 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   const disabled = !connected || !canSend;
   const flyoutOpen = cmdOpen || fileOpen;
+  const referencedFiles = [...new Set(Array.from(text.matchAll(/(?:^|\s)@([^\s]+)/g), (match) => match[1]))];
+
+  const removeReference = (path: string) => {
+    setText((current) => current.replace(new RegExp(`(^|\\s)@${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$)`), "$1").replace(/ {2,}/g, " "));
+  };
 
   return (
     <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
       <div className="mx-auto max-w-3xl">
+        {(activeFile || referencedFiles.length > 0) && (
+          <div className="mb-1.5 flex min-w-0 flex-wrap items-center gap-1.5 px-1" aria-label="Prompt context">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-600">Context</span>
+            {activeFile && (
+              <button
+                type="button"
+                onClick={() => setText((current) => referencedFiles.includes(activeFile) ? current : `${current.trimEnd()}${current.trim() ? " " : ""}@${activeFile} `)}
+                className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-ink-800 bg-ink-900/70 px-2 py-0.5 text-[10px] text-ink-400 hover:border-accent/30 hover:text-ink-200"
+                title={`Active editor: ${activeFile}. Click to include it in the prompt.`}
+              >
+                <span className="text-accent-soft">●</span><span className="truncate">{activeFile}</span><span className="text-ink-600">+ include</span>
+              </button>
+            )}
+            {referencedFiles.map((path) => (
+              <span key={path} className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-accent/20 bg-accent/5 px-2 py-0.5 text-[10px] text-accent-soft" title={`Referenced file: ${path}`}>
+                <span className="truncate">@{path}</span>
+                <button type="button" onClick={() => removeReference(path)} className="text-ink-500 hover:text-ink-100" aria-label={`Remove ${path} from prompt context`}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
         <div className="relative">
           {/* Flyout (positioned above the input box) */}
           {cmdOpen && (

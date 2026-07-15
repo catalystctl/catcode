@@ -15,16 +15,36 @@
 // Both confined via confinePath (mirrors api/files/route.ts). No secret filtering
 // (§4.2/§8.5: the user edits their own workspace — VSCode parity, you can edit
 // .env). Reads are capped at 5 MiB so binaries aren't loaded into the editor.
-import { readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve, sep } from "node:path";
 import { getSession } from "@/lib/auth";
 import { resolveWorkspace, confinePath } from "@/server/workspace";
 import { detectLanguage } from "@/lib/lang";
+import { getBridge } from "@/server/core-bridge";
+import { loadProjects } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5 MiB
+
+function authorizedWorkspace(candidate: string): string {
+  const requested = resolve(candidate);
+  const allowed = [getBridge().getDefaultWorkspace(), ...loadProjects().map((project) => project.path)]
+    .map((workspace) => resolve(workspace));
+  if (!allowed.includes(requested)) throw new Error("unauthorized workspace");
+  return requested;
+}
+
+function mutationPath(workspace: string, rel: string, existing: boolean): string {
+  const abs = confinePath(workspace, rel);
+  if (resolve(abs) === resolve(workspace)) throw new Error("workspace root is protected");
+  const realWorkspace = realpathSync(workspace);
+  const realTarget = existing ? realpathSync(abs) : realpathSync(dirname(abs));
+  const confined = relative(realWorkspace, realTarget);
+  if (confined === ".." || confined.startsWith(`..${sep}`)) throw new Error("path outside workspace");
+  return abs;
+}
 
 export async function GET(req: Request) {
   if (!(await getSession(req.headers)))
@@ -85,16 +105,22 @@ export async function PUT(req: Request) {
     return Response.json({ error: "invalid body" }, { status: 400 });
 
   // Workspace: explicit body field, else ?workspace= query, else default.
-  const workspace =
-    (typeof body.workspace === "string" && body.workspace) ||
-    new URL(req.url).searchParams.get("workspace") ||
-    resolveWorkspace(req);
+  let workspace: string;
+  try {
+    workspace = authorizedWorkspace(
+      (typeof body.workspace === "string" && body.workspace) ||
+      new URL(req.url).searchParams.get("workspace") ||
+      resolveWorkspace(req),
+    );
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
 
   let abs: string;
   try {
-    abs = confinePath(workspace, rel);
+    abs = mutationPath(workspace, rel, true);
   } catch {
-    return Response.json({ error: "path outside workspace" }, { status: 400 });
+    return Response.json({ error: "file not found or path outside workspace" }, { status: 400 });
   }
 
   try {
@@ -111,4 +137,80 @@ export async function PUT(req: Request) {
     /* fall back to byte length */
   }
   return Response.json({ ok: true, path: rel, size });
+}
+
+/** Create a file or directory without overwriting an existing entry. */
+export async function POST(req: Request) {
+  if (!(await getSession(req.headers)))
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  let body: { path?: unknown; workspace?: unknown; kind?: unknown };
+  try { body = await req.json(); } catch { return Response.json({ error: "invalid body" }, { status: 400 }); }
+  if (typeof body.path !== "string" || !body.path.trim())
+    return Response.json({ error: "invalid body" }, { status: 400 });
+  let workspace: string;
+  try {
+    workspace = authorizedWorkspace(typeof body.workspace === "string" && body.workspace ? body.workspace : resolveWorkspace(req));
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
+  let abs: string;
+  try { abs = mutationPath(workspace, body.path, false); } catch { return Response.json({ error: "path outside workspace" }, { status: 400 }); }
+  if (existsSync(abs)) return Response.json({ error: "already exists" }, { status: 409 });
+  try {
+    if (body.kind === "file") closeSync(openSync(abs, "wx"));
+    else mkdirSync(abs, { recursive: false });
+  } catch (e) {
+    return Response.json({ error: `create failed: ${(e as Error).message}` }, { status: 500 });
+  }
+  return Response.json({ ok: true, path: body.path });
+}
+
+/** Rename a workspace file or directory. Existing destinations are never overwritten. */
+export async function PATCH(req: Request) {
+  if (!(await getSession(req.headers)))
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  let body: { path?: unknown; newPath?: unknown; workspace?: unknown };
+  try { body = await req.json(); } catch { return Response.json({ error: "invalid body" }, { status: 400 }); }
+  if (typeof body.path !== "string" || !body.path.trim() || typeof body.newPath !== "string" || !body.newPath.trim())
+    return Response.json({ error: "invalid body" }, { status: 400 });
+  let workspace: string;
+  try {
+    workspace = authorizedWorkspace(typeof body.workspace === "string" && body.workspace ? body.workspace : resolveWorkspace(req));
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
+  let abs: string;
+  let nextAbs: string;
+  try {
+    abs = mutationPath(workspace, body.path, true);
+    nextAbs = mutationPath(workspace, body.newPath, false);
+  } catch { return Response.json({ error: "path outside workspace" }, { status: 400 }); }
+  if (!existsSync(abs)) return Response.json({ error: "not found" }, { status: 404 });
+  if (existsSync(nextAbs)) return Response.json({ error: "already exists" }, { status: 409 });
+  try { renameSync(abs, nextAbs); } catch (e) {
+    return Response.json({ error: `rename failed: ${(e as Error).message}` }, { status: 500 });
+  }
+  return Response.json({ ok: true, path: body.newPath });
+}
+
+/** Permanently remove a workspace file or directory. Root deletion is rejected. */
+export async function DELETE(req: Request) {
+  if (!(await getSession(req.headers)))
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  const url = new URL(req.url);
+  const rel = url.searchParams.get("path") ?? "";
+  let workspace: string;
+  try {
+    workspace = authorizedWorkspace(url.searchParams.get("workspace") || resolveWorkspace(req));
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
+  if (!rel.trim()) return Response.json({ error: "invalid path" }, { status: 400 });
+  let abs: string;
+  try { abs = mutationPath(workspace, rel, true); } catch { return Response.json({ error: "path outside workspace" }, { status: 400 }); }
+  if (!existsSync(abs)) return Response.json({ error: "not found" }, { status: 404 });
+  try { rmSync(abs, { recursive: true, force: false }); } catch (e) {
+    return Response.json({ error: `delete failed: ${(e as Error).message}` }, { status: 500 });
+  }
+  return Response.json({ ok: true, path: rel });
 }

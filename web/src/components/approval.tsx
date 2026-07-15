@@ -6,7 +6,7 @@
 // click does NOT deny — the user may be reading a diff / using the sidebar.
 
 import { useCallback, useEffect, useMemo } from "react";
-import type { ApprovalRequest } from "@/lib/types";
+import type { ApprovalRequest, ApproveDecision } from "@/lib/types";
 import { isDangerousTool, toolIcon } from "@/lib/format";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, ShieldIcon } from "./icons";
@@ -14,7 +14,7 @@ import { Diff } from "./diff";
 
 interface Props {
   approval: ApprovalRequest;
-  onApprove: (decision: "yes" | "no" | "always") => void;
+  onApprove: (decision: ApproveDecision, opts?: { pattern?: string }) => void;
 }
 
 export function Approval({ approval, onApprove }: Props) {
@@ -82,6 +82,12 @@ export function Approval({ approval, onApprove }: Props) {
             className="flex items-center gap-1.5 rounded-lg border border-success/30 bg-success/10 px-3.5 py-1.5 text-[13px] font-medium text-success transition-colors hover:bg-success/20"
           >
             <ShieldIcon width={13} height={13} /> Always allow {approval.tool}
+          </button>
+          <button
+            onClick={() => onApprove("allow_session")}
+            className="flex items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-3.5 py-1.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20"
+          >
+            Allow for session
           </button>
           <button
             onClick={onDeny}

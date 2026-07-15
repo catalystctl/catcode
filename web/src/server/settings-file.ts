@@ -1,10 +1,16 @@
 // Shared read/write for ~/.config/catalyst-code/settings.json — the same file
 // the TUI owns. Web must spawn cores with the persisted approval (and write it
 // back on set_approval) so the gate doesn't silently reset to "destructive".
+//
+// Path derived from the SDK's configDir() so the directory resolves identically
+// to the SDK, TUI, and Rust core. Field names match the TUI's on-disk JSON keys
+// (model, base_url, provider, approval); SDK-style names (defaultModel,
+// defaultProvider) are also tried as fallbacks so the web reads correctly
+// regardless of which component wrote the file last.
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { configDir } from "@catalyst-code/coding-agent";
 
 export type ApprovalMode = "never" | "destructive" | "always";
 
@@ -17,7 +23,7 @@ export interface HarnessSettings {
 }
 
 function settingsPath(): string {
-  return join(homedir() || ".", ".config", "catalyst-code", "settings.json");
+  return join(configDir(), "settings.json");
 }
 
 function asApproval(v: unknown): ApprovalMode | undefined {
@@ -34,9 +40,14 @@ export function loadSettings(): HarnessSettings {
     const raw = readFileSync(path, "utf8");
     const s = JSON.parse(raw) as Record<string, unknown>;
     const out: HarnessSettings = {};
+    // Read TUI field names first; fall back to SDK-style names (defaultModel / defaultProvider)
+    // so the web is compatible with whichever component wrote settings.json last.
     if (typeof s.model === "string" && s.model) out.model = s.model;
+    else if (typeof s.defaultModel === "string" && s.defaultModel) out.model = s.defaultModel;
     if (typeof s.base_url === "string" && s.base_url) out.baseUrl = s.base_url;
     if (typeof s.provider === "string" && s.provider) out.provider = s.provider;
+    else if (typeof s.defaultProvider === "string" && s.defaultProvider) out.provider = s.defaultProvider;
+    else if (typeof s.active_provider === "string" && s.active_provider) out.provider = s.active_provider;
     const approval = asApproval(s.approval);
     if (approval) out.approval = approval;
     return out;

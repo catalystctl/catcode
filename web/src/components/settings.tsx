@@ -13,6 +13,7 @@ import { useFocusTrap } from "@/lib/use-focus-trap";
 import { CheckIcon, XIcon, BrainIcon, ShieldIcon, BoltIcon } from "./icons";
 import { ModelPicker } from "./model-picker";
 import { AccountSecurity } from "./account-security";
+import { VersionInfoPanel } from "./version-info";
 
 interface Props {
   ready: ReadyPayload | null;
@@ -29,7 +30,11 @@ interface Props {
   onSetAutoCompact: (on: boolean) => void;
   onSetSandbox: (mode: "none" | "firejail" | "seatbelt") => void;
   visionConfig: VisionConfig | null;
-  onSetVisionConfig: (vision_model: string | null, vision_models: string[]) => void;
+  onSetVisionConfig: (
+    vision_model: string | null,
+    vision_models: string[],
+    enabled?: boolean,
+  ) => void;
   onRefreshVision?: () => void;
   onClose: () => void;
 }
@@ -78,14 +83,17 @@ export function SettingsModal(props: Props) {
     [props.visionConfig?.vision_models],
   );
   const preferredId = props.visionConfig?.vision_model ?? null;
+  const enabledFromConfig = props.visionConfig?.enabled !== false;
 
   const [draftCurated, setDraftCurated] = useState<string[]>(() => curatedIds);
   const [draftPreferred, setDraftPreferred] = useState<string | null>(() => preferredId);
+  const [draftEnabled, setDraftEnabled] = useState(enabledFromConfig);
 
   useEffect(() => {
     setDraftCurated(curatedIds);
     setDraftPreferred(preferredId);
-  }, [curatedIds, preferredId]);
+    setDraftEnabled(enabledFromConfig);
+  }, [curatedIds, preferredId, enabledFromConfig]);
 
   useEffect(() => {
     props.onRefreshVision?.();
@@ -122,7 +130,7 @@ export function SettingsModal(props: Props) {
       draftPreferred && draftCurated.includes(draftPreferred)
         ? draftPreferred
         : draftCurated[0] ?? null;
-    props.onSetVisionConfig(preferred, draftCurated);
+    props.onSetVisionConfig(preferred, draftCurated, draftEnabled);
   };
 
   return (
@@ -156,6 +164,13 @@ export function SettingsModal(props: Props) {
               <ColumnLabel>Account &amp; security</ColumnLabel>
               <Panel>
                 <AccountSecurity />
+              </Panel>
+            </div>
+
+            <div>
+              <ColumnLabel>Version</ColumnLabel>
+              <Panel>
+                <VersionInfoPanel />
               </Panel>
             </div>
 
@@ -326,12 +341,33 @@ export function SettingsModal(props: Props) {
             <div>
               <ColumnLabel>Vision handoff</ColumnLabel>
               <Panel>
+                <p className="mb-3 text-[12px] leading-relaxed text-ink-400">
+                  When your coding model can&apos;t see images, we route that turn to the cheapest
+                  vision model on the same provider. Recommended ON.
+                </p>
+                <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-2">
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-medium text-ink-100">
+                      Auto vision handoff
+                      <span className="ml-1.5 text-[10px] font-normal uppercase tracking-wide text-accent-soft">
+                        recommended
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-ink-500">Same-provider · cheapest first</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={draftEnabled}
+                    onChange={(e) => setDraftEnabled(e.target.checked)}
+                    className="accent-[var(--accent)]"
+                  />
+                </label>
                 {visionCandidates.length === 0 ? (
                   <p className="text-[12px] text-ink-500">
                     No vision-capable models discovered yet.
                   </p>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className={`space-y-1.5 ${draftEnabled ? "" : "opacity-50"}`}>
                     {visionCandidates.map((m) => {
                       const included = draftCurated.includes(m.id);
                       const preferred = draftPreferred === m.id;

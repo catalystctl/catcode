@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { reduce, initialState } from "./reducer";
-import type { AgentState, CoreCommand, CoreEvent, ModelInfo } from "./types";
+import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, ModelInfo } from "./types";
 
 // ponytail: localStorage persistence for UI preferences (model/thinking/approval).
 // try/catch guards SSR + disabled-storage; failing silently is fine.
@@ -49,7 +49,7 @@ export interface AgentApi {
   abort: () => Promise<void>;
   /** Drop a queued follow-up/steer without aborting the running turn. */
   clearQueue: () => Promise<void>;
-  approve: (decision: "yes" | "no" | "always") => Promise<void>;
+  approve: (decision: ApproveDecision, opts?: { pattern?: string }) => Promise<void>;
   setKey: (key: string) => Promise<void>;
   setProvider: (name: string) => Promise<void>;
   login: (preset: string, key?: string) => Promise<void>;
@@ -116,7 +116,11 @@ export interface AgentApi {
   goalStatus: () => Promise<void>;
   // ── Vision ──
   getVisionConfig: () => Promise<void>;
-  setVisionConfig: (vision_model: string | null, vision_models?: string[]) => Promise<void>;
+  setVisionConfig: (
+    vision_model: string | null,
+    vision_models?: string[],
+    enabled?: boolean,
+  ) => Promise<void>;
   // ── Config ──
   setConfig: (key: string, value: string | number | boolean) => Promise<void>;
   // ── Memory extras ──
@@ -129,6 +133,11 @@ export interface AgentApi {
   removeProject: (path: string) => Promise<void>;
   // ── Session lifecycle ──
   deleteSession: (path: string) => Promise<void>;
+  pinSession: (path: string, pinned: boolean) => Promise<void>;
+  // ── Checkpoints ──
+  createCheckpoint: (label?: string, paths?: string[]) => Promise<void>;
+  listCheckpoints: () => Promise<void>;
+  restoreCheckpoint: (id: string) => Promise<void>;
   // ── Connection ──
   reconnect: () => void;
   // ── Utility ──
@@ -472,13 +481,18 @@ export function useAgent(): AgentApi {
   const clearQueue = useCallback(() => send({ type: "clear_queue" }), [send]);
 
   const approve = useCallback(
-    async (decision: "yes" | "no" | "always") => {
+    async (decision: ApproveDecision, opts?: { pattern?: string }) => {
       const s = stateRef.current;
       const req = s.pendingApproval;
       if (!req) return;
       const sessionAtClick = s.currentSessionFile;
       setState((st) => ({ ...st, pendingApproval: null }));
-      const r = await post({ type: "approve", request_id: req.request_id, decision });
+      const r = await post({
+        type: "approve",
+        request_id: req.request_id,
+        decision,
+        ...(opts?.pattern ? { pattern: opts.pattern } : {}),
+      });
       if (r.ok === false || r.error) {
         // Restore only if still on the same session (don't poison a switch).
         setState((st) => {
@@ -998,8 +1012,13 @@ export function useAgent(): AgentApi {
   // ── Vision ──
   const getVisionConfig = useCallback(() => send({ type: "get_vision_config" }), [send]);
   const setVisionConfig = useCallback(
-    (vision_model: string | null, vision_models?: string[]) =>
-      send({ type: "set_vision_config", vision_model, vision_models }),
+    (vision_model: string | null, vision_models?: string[], enabled?: boolean) =>
+      send({
+        type: "set_vision_config",
+        vision_model,
+        vision_models,
+        enabled: enabled ?? true,
+      }),
     [send],
   );
 
@@ -1051,6 +1070,22 @@ export function useAgent(): AgentApi {
       }
     },
     [post, switchToSession],
+  );
+  const pinSession = useCallback(
+    (path: string, pinned: boolean) => send({ type: "pin_session", path, pinned }),
+    [send],
+  );
+
+  // ── Checkpoints ──
+  const createCheckpoint = useCallback(
+    (label?: string, paths?: string[]) =>
+      send({ type: "create_checkpoint", ...(label ? { label } : {}), ...(paths ? { paths } : {}) }),
+    [send],
+  );
+  const listCheckpoints = useCallback(() => send({ type: "list_checkpoints" }), [send]);
+  const restoreCheckpoint = useCallback(
+    (id: string) => send({ type: "restore_checkpoint", id }),
+    [send],
   );
 
   // ── Connection ──
@@ -1178,6 +1213,10 @@ export function useAgent(): AgentApi {
       addProject,
       removeProject,
       deleteSession,
+      pinSession,
+      createCheckpoint,
+      listCheckpoints,
+      restoreCheckpoint,
       reconnect,
       copyLastReply,
       exportTranscript,

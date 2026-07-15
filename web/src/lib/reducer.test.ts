@@ -599,6 +599,58 @@ describe("goal_state idle clears plan", () => {
   });
 });
 
+describe("goal deployment streaming lifecycle", () => {
+  const goalState = (phase: string, autoDeploy = true) =>
+    ({
+      type: "goal_state",
+      id: "g1",
+      goal: "ship it",
+      phase,
+      concurrency: 2,
+      max_tasks: 4,
+      allowed_models: [],
+      allowed_providers: [],
+      auto_deploy: autoDeploy,
+      prompts: [],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "model",
+    }) as AgentEvent;
+
+  test("planning done stays live while an auto-deploy plan is handed off", () => {
+    let s = reduce(initialState, { type: "_user", text: "ship it" });
+    s = reduce(s, goalState("plan_ready", true));
+    s = reduce(s, { type: "done" });
+    expect(s.streaming).toBe(true);
+  });
+
+  test("deploying re-arms streaming even when it arrives after planning done", () => {
+    let s = reduce(initialState, { type: "done" });
+    expect(s.streaming).toBe(false);
+    s = reduce(s, goalState("deploying"));
+    expect(s.streaming).toBe(true);
+    s = reduce(s, goalState("running"));
+    expect(s.streaming).toBe(true);
+  });
+
+  test("manual plan review and terminal goal phases are idle", () => {
+    let s = reduce(initialState, { type: "_user", text: "ship it" });
+    s = reduce(s, goalState("plan_ready", false));
+    s = reduce(s, { type: "done" });
+    expect(s.streaming).toBe(false);
+
+    s = reduce(s, goalState("deploying"));
+    expect(s.streaming).toBe(true);
+    s = reduce(s, goalState("synthesizing"));
+    expect(s.streaming).toBe(true);
+    s = reduce(s, { type: "done" });
+    expect(s.streaming).toBe(true);
+    s = reduce(s, goalState("done"));
+    expect(s.streaming).toBe(false);
+  });
+});
+
 describe("undo local + pendingUndo reset", () => {
   test("_undo_local trims last turn and sets pendingUndo", () => {
     let s = reduce(initialState, { type: "_user", text: "one" });
@@ -634,5 +686,99 @@ describe("undo local + pendingUndo reset", () => {
     const afterSecond = reduce(afterFirst, { type: "_undo_local" });
     expect(afterSecond.messages.length).toBe(afterFirst.messages.length);
     expect(afterSecond.pendingUndo).toBe(true);
+  });
+});
+
+describe("core protocol events", () => {
+  test("cost_update stores session cost", () => {
+    const s = ev({
+      type: "cost_update",
+      tokens_in: 100,
+      tokens_out: 40,
+      estimated_usd: 0.0123,
+      model: "glm-5.2",
+    });
+    expect(s.cost?.estimated_usd).toBe(0.0123);
+    expect(s.cost?.tokens_in).toBe(100);
+  });
+
+  test("file_change bumps seq and records path", () => {
+    const s = ev({
+      type: "file_change",
+      path: "src/a.ts",
+      tool: "edit",
+    });
+    expect(s.fileChangeSeq).toBe(1);
+    expect(s.recentFileChanges[0]?.path).toBe("src/a.ts");
+  });
+
+  test("checkpoint_created + checkpoints list", () => {
+    let s = ev({
+      type: "checkpoint_created",
+      id: "cp1",
+      label: "manual",
+      kind: "file",
+      auto: false,
+    });
+    expect(s.checkpoints[0]?.id).toBe("cp1");
+    expect(s.toasts.some((t) => t.message.includes("Checkpoint"))).toBe(true);
+    s = reduce(s, {
+      type: "checkpoints",
+      checkpoints: [{ id: "cp2", label: "other", kind: "git" }],
+    });
+    expect(s.checkpoints).toHaveLength(1);
+    expect(s.checkpoints[0].id).toBe("cp2");
+  });
+
+  test("protocol_hello stores capabilities", () => {
+    const s = ev({
+      type: "protocol_hello",
+      version: "1",
+      min_client: "1",
+      capabilities: ["checkpoints", "worktrees"],
+    });
+    expect(s.protocolHello?.capabilities).toContain("checkpoints");
+  });
+
+  test("goal_step_verdict toasts and stores result", () => {
+    const s = ev({ type: "goal_step_verdict", ok: false, output: "tests failed" });
+    expect(s.lastGoalVerdict?.ok).toBe(false);
+    expect(s.toasts.some((t) => t.kind === "error")).toBe(true);
+  });
+
+  test("session_pinned updates session list", () => {
+    let s = reduce(initialState, {
+      type: "sessions",
+      sessions: [{ name: "a.jsonl", mtime: 1, path: "/tmp/a.jsonl" }],
+      files: [],
+    });
+    s = reduce(s, { type: "session_pinned", path: "/tmp/a.jsonl", pinned: true });
+    expect(s.sessions[0].pinned).toBe(true);
+  });
+});
+
+describe("CORE_EVENT_TYPES coverage", () => {
+  test("reducer has an explicit case for every SDK core event type", async () => {
+    const { CORE_EVENT_TYPES } = await import("@catalyst-code/coding-agent");
+    const src = await Bun.file(new URL("./reducer.ts", import.meta.url)).text();
+    const cases = new Set(
+      [...src.matchAll(/case\s+"([a-z0-9_]+)":/g)].map((m) => m[1]),
+    );
+    // Every event the SDK catalog knows about must be handled.
+    const missing = CORE_EVENT_TYPES.filter((t) => !cases.has(t));
+    expect(missing).toEqual([]);
+  });
+
+  test("every reducer-handled core event is in the SDK catalog (or documented as a gap)", async () => {
+    const { CORE_EVENT_TYPES } = await import("@catalyst-code/coding-agent");
+    const sdkSet: Set<string> = new Set(CORE_EVENT_TYPES);
+    const src = await Bun.file(new URL("./reducer.ts", import.meta.url)).text();
+    const allCases = [...src.matchAll(/case\s+"([a-z0-9_]+)":/g)].map((m) => m[1]);
+    // Synthetic events (underscore-prefixed) are not core wire events.
+    const coreEvents = allCases.filter((c) => !c.startsWith("_"));
+    // Bridge-generated events (not core wire events); correctly absent from CORE_EVENT_TYPES.
+    const bridgeEvents = new Set(["projects", "workspace_changed"]);
+    const extra = coreEvents.filter((c) => !sdkSet.has(c) && !bridgeEvents.has(c));
+    expect(extra).toEqual([]);
   });
 });

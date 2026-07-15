@@ -15,6 +15,20 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
 type MonacoApi = typeof Monaco;
 
+function Breadcrumbs({ path }: { path: string }) {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  return (
+    <nav aria-label="File breadcrumb" className="flex h-7 shrink-0 items-center gap-1 overflow-hidden border-b border-ink-900/80 bg-ink-950 px-3 text-[10px] text-ink-500">
+      {parts.map((part, index) => (
+        <span key={`${part}-${index}`} className="flex min-w-0 items-center gap-1">
+          {index > 0 && <span aria-hidden className="text-ink-700">›</span>}
+          <span className={`truncate ${index === parts.length - 1 ? "text-ink-300" : ""}`}>{part}</span>
+        </span>
+      ))}
+    </nav>
+  );
+}
+
 function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
   const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
   return monaco.Uri.from({
@@ -221,19 +235,23 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
 
   if (isImage) {
     return (
-      <div className="relative flex h-full items-center justify-center overflow-auto bg-ink-950 p-4">
-        <img
-          src={`/api/preview?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`}
-          alt={tab.label}
-          className="max-h-full max-w-full object-contain"
-        />
-        <div className="absolute right-3 top-2 z-20">{previewButton}</div>
+      <div className="relative flex h-full flex-col bg-ink-950">
+        <Breadcrumbs path={tab.target} />
+        <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
+          <img
+            src={`/api/preview?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`}
+            alt={tab.label}
+            className="max-h-full max-w-full object-contain"
+          />
+          <div className="absolute right-3 top-2 z-20">{previewButton}</div>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="relative flex h-full flex-col bg-ink-950">
+      <Breadcrumbs path={tab.target} />
       <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" aria-label={`Editor for ${tab.label}`} />
       {loading ? (
         <div className="absolute inset-0 flex items-center justify-center bg-ink-950 text-sm text-ink-500">
@@ -245,14 +263,14 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
           {error}
         </div>
       ) : null}
-      <div className="absolute right-3 top-2 z-20 flex items-center gap-2">
+      <div className="absolute right-3 top-8 z-20 flex items-center gap-2">
         {saving ? (
           <div className="rounded bg-ink-800/80 px-2 py-0.5 text-[11px] text-ink-300">Saving…</div>
         ) : null}
         {previewButton}
       </div>
       {tab.dirty ? (
-        <div className="absolute left-3 top-2 z-20 text-[11px] text-amber-300" title="Unsaved changes">
+        <div className="absolute left-3 top-8 z-20 text-[11px] text-amber-300" title="Unsaved changes">
           ●
         </div>
       ) : null}

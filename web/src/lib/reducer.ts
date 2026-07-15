@@ -8,12 +8,12 @@
 // the next delta starts a fresh assistant message (multi-step agent turns);
 // tool_result matches its tool call by id.
 
+import type { CoreEventType } from "@catalyst-code/coding-agent";
 import type {
   AgentEvent,
   AgentState,
   AssistantMsg,
   BashMsg,
-  CoreEvent,
   IntercomEntry,
   ReadyPayload,
   SubagentChatItem,
@@ -63,6 +63,15 @@ export const initialState: AgentState = {
   workState: null,
   goalMode: null,
   goalPlan: null,
+  protocolHello: null,
+  cost: null,
+  checkpoints: [],
+  fileChangeSeq: 0,
+  recentFileChanges: [],
+  worktrees: [],
+  pluginCommands: [],
+  searchKeys: {},
+  lastGoalVerdict: null,
   switching: false,
   followUpQueued: false,
   pendingUndo: false,
@@ -192,6 +201,21 @@ function finishTurn(state: AgentState): AgentState {
     pendingSudo: null,
     pendingIntercom: null,
   };
+}
+
+/** Goal deployment outlives the planning model turn. During that hand-off the
+ * core emits the planning turn's `done`, but the session is still doing live
+ * work. Keep the global working/streaming state armed until the goal reaches a
+ * terminal phase. `plan_ready` only counts when auto-deploy is enabled; manual
+ * review must return the composer to idle while it waits for the user. */
+function goalKeepsStreaming(goal: AgentState["goalMode"]): boolean {
+  if (!goal) return false;
+  return (
+    goal.phase === "deploying" ||
+    goal.phase === "running" ||
+    goal.phase === "synthesizing" ||
+    (goal.phase === "plan_ready" && goal.auto_deploy)
+  );
 }
 
 /** Drop the last user message and everything after it (assistant/tool/bash). */
@@ -770,8 +794,10 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         subagentRuns: {},
         metrics: null,
       };
-    case "done":
-      return finishTurn(state);
+    case "done": {
+      const finished = finishTurn(state);
+      return goalKeepsStreaming(state.goalMode) ? { ...finished, streaming: true } : finished;
+    }
     case "aborted":
       return finishTurn(state);
     case "error": {
@@ -966,7 +992,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
 
     // ── Vision ──
     case "vision_config":
-      return { ...state, visionConfig: { vision_models: ev.vision_models ?? [], vision_model: ev.vision_model ?? null } };
+      return {
+        ...state,
+        visionConfig: {
+          enabled: ev.enabled !== false,
+          vision_models: ev.vision_models ?? [],
+          vision_model: ev.vision_model ?? null,
+        },
+      };
 
     // ── Projects / workspace ──
     case "projects":
@@ -1094,25 +1127,28 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       if (!ev.id || ev.phase === "idle") {
         return { ...state, goalMode: null, goalPlan: null };
       }
+      const goalMode = {
+        id: ev.id,
+        goal: ev.goal,
+        phase: ev.phase,
+        concurrency: ev.concurrency,
+        max_tasks: ev.max_tasks,
+        allowed_models: ev.allowed_models ?? [],
+        allowed_providers: ev.allowed_providers ?? [],
+        auto_deploy: ev.auto_deploy,
+        role_models: ev.role_models,
+        model_concurrency: ev.model_concurrency,
+        prompts: ev.prompts ?? [],
+        active_run_ids: ev.active_run_ids ?? [],
+        version: ev.version,
+        error: ev.error ?? null,
+        parent_model: ev.parent_model ?? "",
+      };
+      const terminal = ev.phase === "done" || ev.phase === "failed";
       return {
         ...state,
-        goalMode: {
-          id: ev.id,
-          goal: ev.goal,
-          phase: ev.phase,
-          concurrency: ev.concurrency,
-          max_tasks: ev.max_tasks,
-          allowed_models: ev.allowed_models ?? [],
-          allowed_providers: ev.allowed_providers ?? [],
-          auto_deploy: ev.auto_deploy,
-          role_models: ev.role_models,
-          model_concurrency: ev.model_concurrency,
-          prompts: ev.prompts ?? [],
-          active_run_ids: ev.active_run_ids ?? [],
-          version: ev.version,
-          error: ev.error ?? null,
-          parent_model: ev.parent_model ?? "",
-        },
+        goalMode,
+        streaming: goalKeepsStreaming(goalMode) ? true : terminal ? false : state.streaming,
       };
     }
     case "goal_plan":
@@ -1136,11 +1172,206 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         toasts: pushToast(state.toasts, "info", msg),
       };
     }
+    case "goal_step_verdict": {
+      const ok = !!ev.ok;
+      const snippet = String(ev.output ?? "").trim().slice(0, 160);
+      return {
+        ...state,
+        lastGoalVerdict: { ok, output: String(ev.output ?? "") },
+        toasts: pushToast(
+          state.toasts,
+          ok ? "success" : "error",
+          ok
+            ? `Verifier passed${snippet ? `: ${snippet}` : ""}`
+            : `Verifier failed${snippet ? `: ${snippet}` : ""}`,
+        ),
+      };
+    }
+    case "protocol_hello":
+      return {
+        ...state,
+        protocolHello: {
+          version: String(ev.version ?? ""),
+          min_client: String(ev.min_client ?? ""),
+          capabilities: Array.isArray(ev.capabilities)
+            ? ev.capabilities.map(String)
+            : [],
+        },
+      };
+    case "file_change": {
+      const path = String(ev.path ?? "");
+      if (!path) return { ...state, fileChangeSeq: state.fileChangeSeq + 1 };
+      const record = {
+        path,
+        tool: String(ev.tool ?? ""),
+        unified_diff: ev.unified_diff ? String(ev.unified_diff) : undefined,
+        agent_id: ev.agent_id ? String(ev.agent_id) : undefined,
+        run_id: ev.run_id ? String(ev.run_id) : undefined,
+        ts: Date.now(),
+      };
+      const recent = [record, ...state.recentFileChanges.filter((c) => c.path !== path)].slice(
+        0,
+        40,
+      );
+      return {
+        ...state,
+        fileChangeSeq: state.fileChangeSeq + 1,
+        recentFileChanges: recent,
+      };
+    }
+    case "checkpoint_created": {
+      const entry = {
+        id: String(ev.id ?? ""),
+        label: String(ev.label ?? ""),
+        kind: String(ev.kind ?? ""),
+        auto: !!ev.auto,
+        paths: Array.isArray(ev.paths) ? ev.paths.map(String) : undefined,
+      };
+      const checkpoints = [
+        entry,
+        ...state.checkpoints.filter((c) => String(c.id) !== entry.id),
+      ].slice(0, 50);
+      const label = entry.label || entry.id;
+      return {
+        ...state,
+        checkpoints,
+        toasts: entry.auto
+          ? state.toasts
+          : pushToast(state.toasts, "success", `Checkpoint saved: ${label}`),
+      };
+    }
+    case "checkpoint_restored":
+      return {
+        ...state,
+        fileChangeSeq: state.fileChangeSeq + 1,
+        toasts: pushToast(
+          state.toasts,
+          "success",
+          `Restored checkpoint ${String(ev.id ?? "")}`,
+        ),
+      };
+    case "checkpoints":
+      return {
+        ...state,
+        checkpoints: Array.isArray(ev.checkpoints) ? (ev.checkpoints as typeof state.checkpoints) : [],
+      };
+    case "worktree_ready": {
+      const runId = String(ev.run_id ?? "");
+      const path = String(ev.path ?? "");
+      const branch = ev.branch ? String(ev.branch) : undefined;
+      const worktrees = [
+        { run_id: runId, path, branch },
+        ...state.worktrees.filter((w) => w.path !== path && w.run_id !== runId),
+      ];
+      return {
+        ...state,
+        worktrees,
+        toasts: pushToast(state.toasts, "info", `Worktree ready: ${path}`),
+      };
+    }
+    case "worktree_cleaned": {
+      const path = String(ev.path ?? "");
+      return {
+        ...state,
+        worktrees: state.worktrees.filter((w) => w.path !== path),
+      };
+    }
+    case "worktree_promoted": {
+      const runId = String(ev.run_id ?? "");
+      return {
+        ...state,
+        worktrees: state.worktrees.filter((w) => w.run_id !== runId),
+        fileChangeSeq: state.fileChangeSeq + 1,
+        toasts: pushToast(state.toasts, "success", `Promoted worktree for ${runId}`),
+      };
+    }
+    case "audit":
+      // Decision log is for operators/sidecar; avoid toast spam on every gate.
+      return state;
+    case "cost_update":
+      return {
+        ...state,
+        cost: {
+          tokens_in: typeof ev.tokens_in === "number" ? ev.tokens_in : state.cost?.tokens_in,
+          tokens_out: typeof ev.tokens_out === "number" ? ev.tokens_out : state.cost?.tokens_out,
+          cached_tokens:
+            typeof ev.cached_tokens === "number" ? ev.cached_tokens : state.cost?.cached_tokens,
+          cache_hit_pct:
+            ev.cache_hit_pct !== undefined ? ev.cache_hit_pct : state.cost?.cache_hit_pct,
+          estimated_usd:
+            ev.estimated_usd !== undefined ? ev.estimated_usd : state.cost?.estimated_usd,
+          model: typeof ev.model === "string" ? ev.model : state.cost?.model,
+        },
+      };
+    case "search_key_set":
+      return {
+        ...state,
+        searchKeys: {
+          ...state.searchKeys,
+          [String(ev.provider ?? "")]: !!ev.has_key,
+        },
+      };
+    case "plugin_commands":
+      return {
+        ...state,
+        pluginCommands: Array.isArray(ev.commands) ? ev.commands : [],
+      };
+    case "plugin_status":
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `${String(ev.plugin ?? "plugin")}: ${String(ev.text ?? "")}`,
+        ),
+      };
+    case "session_changed":
+      return {
+        ...state,
+        currentSessionFile: String(ev.path ?? state.currentSessionFile ?? ""),
+      };
+    case "session_change_failed":
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "error",
+          String(ev.message ?? `Failed to change session ${ev.path ?? ""}`),
+        ),
+      };
+    case "session_deleted": {
+      const path = String(ev.path ?? "");
+      return {
+        ...state,
+        sessions: state.sessions.filter((s) => (s.path ?? s.name) !== path && s.name !== path),
+        toasts: pushToast(state.toasts, "info", `Deleted session ${path}`),
+      };
+    }
+    case "session_pinned": {
+      const path = String(ev.path ?? "");
+      const pinned = !!ev.pinned;
+      return {
+        ...state,
+        sessions: state.sessions.map((s) =>
+          (s.path ?? s.name) === path || s.name === path ? { ...s, pinned } : s,
+        ),
+      };
+    }
 
     default:
       return state;
   }
 }
 
-// Re-exported for the bridge to narrow CoreEvent typing.
-export type { CoreEvent };
+// Compile-time anchor: `CoreEventType` from the SDK is the authoritative
+// catalog of every known core wire-event `type` string. The exhaustive
+// switch in `reduce()` covers all 78 entries; the test in reducer.test.ts
+// cross-checks against the SDK's `CORE_EVENT_TYPES` at runtime.
+//
+// Two bridge-generated events handled here that are NOT core wire events
+// (and correctly absent from CORE_EVENT_TYPES):
+//   - "projects"           (emitted by core-bridge.ts on project list/switch)
+//   - "workspace_changed"  (emitted by core-bridge.ts on workspace switch)
+//
+// This import is type-only — zero runtime cost, browser-safe.
+export type { CoreEventType };

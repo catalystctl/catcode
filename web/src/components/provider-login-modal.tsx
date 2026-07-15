@@ -1,7 +1,8 @@
 "use client";
 
-// ProviderLoginModal — pick a first-party provider preset and either start
-// OAuth or paste an API key. Replaces the numbered window.prompt /login flow.
+// ProviderLoginModal — pick a first-party provider preset (Umans, OpenCode Go,
+// OpenRouter) or a plugin OAuth provider and either start OAuth or paste an
+// API key. Replaces the numbered window.prompt /login flow.
 
 import { useState } from "react";
 import type { ProviderPreset } from "@/lib/types";

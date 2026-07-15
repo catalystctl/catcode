@@ -12,7 +12,26 @@ Browser ──SSE──▶ /api/stream ──▶ HarnessBridge ──stdio JSONL
 Browser ──POST─▶ /api/command ─▶ HarnessBridge ─▶ (stdin)
 ```
 
-## Run
+## Install
+
+The release installer downloads the prebuilt web bundle, installs the core, and
+starts a background service. It does not compile the project.
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install-web.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/packaging/windows/install-web.ps1)))
+```
+
+Open `http://localhost:49283` after installation.
+
+## Develop locally
 
 ```bash
 cd web

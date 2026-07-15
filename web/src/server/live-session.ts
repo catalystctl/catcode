@@ -17,7 +17,7 @@
 // list, project list, custom titles) are shared across siblings and surfaced
 // back to the owning HarnessBridge via callbacks.
 
-import { CoreProcess } from "@catalyst-code/coding-agent";
+import { CoreProcess, CORE_EVENT_TYPES, isKnownCoreEventType } from "@catalyst-code/coding-agent";
 import { reduce, initialState } from "@/lib/reducer";
 import type { AgentEvent, AgentState, CoreCommand, CoreEvent, ReadyPayload } from "@/lib/types";
 import { loadTitles } from "@/lib/session-titles";
@@ -155,12 +155,13 @@ export class LiveSession {
 
     // Populate the UI immediately (per-session models/plugins/memories/vision +
     // the workspace session list + stats carrying the session_file).
-    core.send({ type: "list_sessions" } as unknown as CoreCommand);
-    core.send({ type: "stats" } as unknown as CoreCommand);
-    core.send({ type: "list_memory" } as unknown as CoreCommand);
-    core.send({ type: "list_plugins" } as unknown as CoreCommand);
-    core.send({ type: "get_vision_config" } as unknown as CoreCommand);
-    core.send({ type: "list_skills" } as unknown as CoreCommand);
+    this.core.send({ type: "list_sessions" } as unknown as CoreCommand);
+    this.core.send({ type: "stats" } as unknown as CoreCommand);
+    this.core.send({ type: "list_memory" } as unknown as CoreCommand);
+    this.core.send({ type: "list_plugins" } as unknown as CoreCommand);
+    this.core.send({ type: "get_vision_config" } as unknown as CoreCommand);
+    this.core.send({ type: "list_skills" } as unknown as CoreCommand);
+    this.core.send({ type: "list_checkpoints" } as unknown as CoreCommand);
 
     if (!this.crashCheck) {
       this.crashCheck = setInterval(() => this.checkAlive(), 5000);
@@ -207,6 +208,17 @@ export class LiveSession {
 
   private onCoreEvent(ev: CoreEvent): void {
     this.lastActivity = Date.now();
+
+    // Validate the event type against the SDK's known-core-event catalog.
+    // Unknown types are still reduced (the reducer has a passthrough default)
+    // but a server-side warning helps catch core→web drift before it breaks the
+    // UI silently. Synthetic events (inject()) don't flow through this path.
+    if (!isKnownCoreEventType(ev.type)) {
+      console.warn(
+        `[LiveSession] unknown core event type: "${ev.type}"`,
+        `(known: ${CORE_EVENT_TYPES.length} types)`,
+      );
+    }
 
     // `sessions` is workspace-level: re-broadcast to every live sibling so all
     // views of this workspace stay in sync (the originator already reduced it).
