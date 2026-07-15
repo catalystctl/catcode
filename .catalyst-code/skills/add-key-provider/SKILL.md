@@ -151,13 +151,15 @@ client-version params (Codex sends `?client_version=0.0.0`), add it in the
 discovery + `stream_turn` request builders. `ResolvedProvider.oauth` flag exists
 for the Anthropic `anthropic-beta: oauth` header variant.
 
-## Step 4 — Preset (optional, for first-party providers)
+## Step 4 — Preset (first-party keepers only)
 
-If this is a vendor you want in the `/login` picker as a one-click option (not a
-one-off), add a `ProviderPreset` to the `PROVIDER_PRESETS` const array
-(`config.rs:373`): id, label, kind, base_url, api_key_env, alt_envs, description.
-If it serves two protocols, also add the expansion in `preset_provider_configs`
-(config.rs:496, the OpenCode-Go branch is the template).
+In-tree `/login` presets are limited to **Umans**, **OpenCode Go**, and
+**OpenRouter**. Do **not** add other vendors to `PROVIDER_PRESETS` — ship them as
+plugins (`plugin.json` provider / `oauth` block, or a user config entry).
+
+If you are extending one of the three keepers (e.g. OpenCode Go dual-protocol
+expansion), edit the existing `ProviderPreset` / `preset_provider_configs` branch
+in `config.rs`. For a new vendor, follow the plugin-authoring skill instead.
 
 ## Worked examples
 

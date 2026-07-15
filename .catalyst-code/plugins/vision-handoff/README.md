@@ -1,36 +1,58 @@
 # vision-handoff plugin
 
-Hands an image-bearing turn off to a vision-capable model when the active model
-can't handle vision.
+Hands an image-bearing turn off to a **cheapest same-provider** vision-capable
+model when the active model can't handle vision. Recommended **ON** by default
+(`enabled` in `.catalyst-code/vision.json`).
 
 ## How it works
 
 The harness core fires a `pre_turn` hook after building the user message
 (including any attached images) and before the first model request. This
-plugin's `pre_turn` hook receives the active `model`, whether the turn has
-images (`has_images` / `image_count`), and the discovered `models` list (each
-with a `vision` flag). If the turn has images and the active model lacks
-vision, it returns `modify: { "model": "<vision-model-id>" }` and the core swaps
-the model for that turn (validating the id against discovered models).
+plugin's `pre_turn` hook receives:
 
-`pre_turn` is **advisory**: a broken hook never blocks the turn — it just means
-no handoff happens.
+- `model`, `has_images` / `image_count`
+- `models` (each with `vision`, `provider`, `cost_rank`)
+- `enabled` (first-class toggle; default true)
+- `vision_model` (optional preferred pin)
+- `recommended_vision_model` (core-ranked cheapest same-provider candidate)
 
-## Configuration (environment variables)
+If the turn has images, handoff is enabled, and the active model lacks vision,
+it returns `modify: { "model": "<vision-model-id>" }` and the core swaps the
+model for that turn. If the plugin is missing/`python3` absent, the **core
+still applies** `recommended_vision_model` as a fallback.
 
-- `VISION_MODEL=<id>` — pin a single target model to hand off to (highest
-  priority). Use this when you always want a specific vision model.
-- `VISION_MODELS=a,b,c` — comma-separated model ids that support vision. This
-  declares vision capability for models whose `/models/info` endpoint doesn't
-  advertise a `capabilities.vision` flag, and also seeds the dynamic pick.
+`pre_turn` is **advisory**: a broken hook never blocks the turn.
 
-### Precedence when choosing a vision model
+## Configuration
 
-1. `VISION_MODEL` (if set and a known model)
-2. the first model flagged `vision: true` by the endpoint
-3. the first `VISION_MODELS` entry that's a known model
+Persisted in `.catalyst-code/vision.json` (Settings / `/vision`):
 
-If none of those yield a model, the turn stays on the active model (no handoff).
+```json
+{
+  "enabled": true,
+  "vision_model": null,
+  "vision_models": []
+}
+```
+
+- `enabled` — auto handoff (default **true**, recommended ON).
+- `vision_model` — pin a preferred target (overrides cheapest pick).
+- `vision_models` — curated ids treated as vision-capable (merged with endpoint flags).
+
+### Environment overrides
+
+- `VISION_MODEL=<id>` — pin a target (highest priority after preferred config).
+- `VISION_MODELS=a,b,c` — declare vision capability / seed fallbacks.
+
+### Selection precedence
+
+1. Preferred `vision_model` from config (if known)
+2. `VISION_MODEL` env
+3. Core `recommended_vision_model` (cheapest same-provider)
+4. Local cheapest same-provider among `vision: true`
+5. First `VISION_MODELS` entry
+
+Never crosses providers for the automatic cheapest pick (preferred pin may).
 
 ## Triggering it
 
@@ -45,11 +67,9 @@ Attach an image and the handoff triggers automatically:
 
 ## Requirements
 
-- `python3` on `PATH` (the hook is `hooks/pre_turn.py`). If absent, the hook
-  fails to spawn and the turn proceeds with the original model (graceful).
+- `python3` on `PATH` for the hook script (optional — core fallback still works).
 
 ## Loading
 
-The core scans `.catalyst-code/plugins` at startup, so **restart the TUI**
-after adding this plugin. Verify with `/plugin-config` (it should list
-`vision-handoff`), then press enter on a plugin to toggle it on or off.
+The core scans `.catalyst-code/plugins` at startup / stages the plugin into
+`~/.catalyst-code/` on first run. Toggle via Settings or `/plugin-config`.

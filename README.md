@@ -72,9 +72,9 @@ subagents. You can drive it from the terminal, the browser, or your own code.
 
 Key highlights:
 
-* **Multi-provider, no lock-in** — one `/login` picker for Umans, OpenAI, Gemini, xAI,
-  and Anthropic. Be logged into several at once; any model you pick routes that
-  turn to its endpoint. API keys in core; subscription OAuth via plugins.
+* **Multi-provider, no lock-in** — one `/login` picker for Umans, OpenCode Go,
+  and OpenRouter. Be logged into several at once; any model you pick routes that
+  turn to its endpoint. Other vendors ship as plugins (API key and/or OAuth).
 * **Human-in-the-loop safety** — destructive tools (`bash`, `write_file`,
   `edit`, …) require consent under the default `destructive` mode. Restricted
   paths (`.env`, `.git`, `.ssh`) are gated for reads *and* writes. Optional Linux
@@ -121,22 +121,29 @@ Get up and running in under a minute — no clone, no compiler.
 
 ### Installation
 
-The recommended way is a one-line pipe — **no clone, no download, no compiler**.
-The installer pulls prebuilt binaries straight from GitHub Releases.
+The recommended setup is the web app. It is a one-line install with **no clone
+and no compiler**; the installer downloads a prebuilt bundle and configures a
+background service.
 
 **Linux & macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install-web.sh | bash
+```
+
+Then open `http://localhost:49283`. Pass service options after `bash -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install-web.sh | bash -s -- --port 8080 --host 127.0.0.1
+```
+
+The terminal-only install remains available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.sh | bash
 ```
 
-Including the web frontend:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.sh | bash -s -- --with-web
-```
-
-Then run `catcode` from any folder to work on that project. Other options:
+Other options:
 
 ```bash
 ... | bash -s -- --version 0.2.0   # pin a release
@@ -149,7 +156,7 @@ Then run `catcode` from any folder to work on that project. Other options:
 
 | Option | Default | Description |
 |:---|:---|:---|
-| `--with-web` | off | Also download + install the web frontend service |
+| `--with-web` | off | Also install the web frontend (automatically set by `install-web.sh`) |
 | `--version <v>` | latest | Pin a release (e.g. `0.2.0` or `v0.2.0`) |
 | `--base-url <url>` | GitHub Releases | Download from a mirror instead of GitHub |
 | `--build-from-source` | off | Compile locally (cargo + go + next build) instead of downloading |
@@ -164,22 +171,22 @@ Then run `catcode` from any folder to work on that project. Other options:
 
 </details>
 
-**Windows:**
+**Windows web app:**
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/packaging/windows/install-web.ps1)))
+```
+
+This installs the core and prebuilt web bundle, then runs it through NSSM when
+available or a login Scheduled Task. To install only the terminal app instead:
 
 ```powershell
 irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex
 ```
 
-Including the web frontend (pass arguments via the scriptblock form, since `iex`
-cannot forward parameters):
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1))) -WithWeb
-```
-
 No admin, no compiler. Open a NEW PowerShell window (so PATH reloads) and run
-`catcode`. Other options: `-Version`, `-BaseUrl`, `-Port`, `-BindHost`,
-`-WebDir`, `-Update`, `-Uninstall`, `-DryRun` (see `install.ps1 -Help`).
+`catcode`. Web installer options include `-Version`, `-BaseUrl`, `-Port`,
+`-BindHost`, `-WebDir`, and `-Uninstall`.
 
 <details>
 <summary><strong>Windows alternatives (MSI / standalone .exe)</strong></summary>
@@ -235,7 +242,9 @@ In the TUI:
 * `/goal` — goal mode: multi-field modal for a high-level objective, concurrency,
   and model/provider allowlists. The core plans (`goal_write_plan`) then deploys
   subagents under those caps. `/cancel-goal` aborts. Optional “review plan before
-  deploy” stops at plan-ready for approve/revise.
+  deploy” stops at plan-ready for approve/revise. Concurrency 8+ automatically
+  uses the ultra-parallel planning profile: broad independent fan-out first,
+  with chains retained only for real dependencies.
 * type a prompt to chat. `/help` lists every command.
 * `!command` runs bash and adds the output to model context; `!!command` runs without adding it (PI-compatible).
 
@@ -271,9 +280,9 @@ Set `CATCODE_CORE=<path>` if the core isn't found automatically (it searches
 ## Providers and Login
 
 `/login` opens a picker of the bundled presets. You can be logged into several
-at once; `/model` lists every provider's models (tagged `[umans]`, `[openai]`,
-`[gemini]`, `[anthropic]`), and any model you pick routes that turn to its
-endpoint.
+at once; `/model` lists every provider's models (tagged `[umans]`,
+`[opencode-go]`, `[openrouter]`, …), and any model you pick routes that turn to
+its endpoint. Everything else is a plugin.
 
 <details>
 <summary><strong>Provider presets</strong></summary>
@@ -281,11 +290,8 @@ endpoint.
 | Preset | Wire | Endpoint | Key env var |
 |:---|:---|:---|:---|
 | **Umans (GLM-5.2)** | OpenAI | `api.code.umans.ai/v1` | `UMANS_API_KEY` |
-| **OpenAI (Codex)** | OpenAI | `chatgpt.com/backend-api/codex` | `OPENAI_API_KEY` |
-| **Google Gemini** | OpenAI (compat shim) | `generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) |
-| **Anthropic Claude** | Anthropic | `api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
-| **xAI Grok** | OpenAI | `api.x.ai/v1` | `XAI_API_KEY` |
 | **OpenCode Go** | OpenAI + Anthropic | `opencode.ai/zen/go/v1` | `OPENCODE_GO_API_KEY` |
+| **OpenRouter** | OpenAI | `openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 
 Keys are persisted per-provider (the env-var *name* is stored when a key came
 from the environment, so the secret never lands in a config file).
@@ -336,17 +342,21 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 src/main.rs       entry, State, turn loop, approval gate, compaction, ask
 src/provider.rs   OpenAI/Anthropic streaming, retry/backoff, model discovery, sanitize
 src/subagent.rs   subagent execution (single/parallel/chain), forked context, depth cap
+src/worktree.rs   git worktree isolation + promote for parallel agents
+src/checkpoint.rs hybrid FS checkpoints (git stash ref or file snapshot)
+src/audit.rs      optional security audit sidecar
+src/embed.rs      hashing-sketch memory recall (Milestone 4)
 src/intercom.rs   peer intercom bus (contact_supervisor / intercom ask/receive/reply)
 src/plugins.rs    plugin manager + hooks (pre_*/post_*/lifecycle/pre_turn)
 src/protocol.rs   wire types (Command / Event) + line emit
-src/config.rs     CLI + env + JSON config, approval modes, providers
+src/config.rs     CLI + env + JSON config, approval modes, providers, routing
 src/workspace.rs   path confinement (absolute/.. /symlink rejection)
 src/tools.rs      tool schemas + classification + execution
 src/session.rs    append-only JSONL session persistence
 src/memory.rs     persistent memory store (injected into the system prompt)
 src/git_ctx.rs    git status/branch context for the system prompt
 src/vision.rs     vision model config + image attachment
-src/fetch_tool.rs HTTP fetch tool (read-only, egress-controlled)
+src/fetch_tool.rs HTTP fetch tool (read-only, egress-controlled NetworkPolicy)
 src/oauth.rs      Plugin OAuth plumbing (loopback, enrich, PendingOauth)
 src/logging.rs    JSONL debug log + token estimation
 src/staging.rs    global default-file staging (~/.catalyst-code/)
@@ -387,15 +397,21 @@ peers over an in-process intercom bus.
 
 ## Roadmap
 
-- [x] Multi-provider login (Umans, OpenAI, Gemini, Anthropic, xAI)
+- [x] Multi-provider login (Umans, OpenCode Go, OpenRouter)
 - [x] Subagents + intercom bus
 - [x] Plugin system (hooks + custom tools, no MCP)
-- [x] xAI Grok SuperGrok / X Premium+ OAuth (device-code, no API key)
+- [x] Plugin OAuth providers (ChatGPT, SuperGrok, …)
 - [x] Plugin slash commands, notify/status, and `/plugin-reload`
-- [x] Local provider presets (Ollama, LM Studio)
 - [x] macOS seatbelt sandbox mode (Windows remains denylist-only)
+- [x] Git worktree isolation for parallel subagents + shadow promote
+- [x] Hybrid filesystem checkpoints + Undo restores disk
+- [x] `file_change` / `protocol_hello` / richer approvals / audit sidecar
+- [x] Task-aware model routing by agent role
+- [x] Goal speculative scout + verifier loop
+- [x] Embedding-sketch memory recall + speculative readonly prefetch
 - [ ] Broader plugin / skill ecosystem (catalog + more reference plugins)
-- [ ] Additional OAuth / gateway presets as demand appears
+- [ ] Additional gateway / OAuth providers as plugins as demand appears
+- [ ] MCP compatibility as a **plugin adapter** (core stays MCP-free)
 
 See the [open issues](https://github.com/catalystctl/catcode/issues) for a full
 list of proposed features (and known issues).
@@ -443,7 +459,7 @@ line. This is the integration point for alternative frontends:
 
 ```json
 {"type":"init"}
-{"type":"login","preset":"openai","api_key":"sk-..."}
+{"type":"login","preset":"umans","api_key":"sk-..."}
 {"type":"send","prompt":"...","model":"umans-glm-5.2","reasoning_effort":"high"}
 {"type":"steer","prompt":"..."}
 {"type":"approve","request_id":"<id>","decision":"yes|no|always"}
