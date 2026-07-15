@@ -80,6 +80,18 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		prevPhase = s.goalState.Phase
 	}
 	s.goalState = snap
+	// Keep the footer busy while deploy / workers / wrap-up are still live
+	// (the planning turn's `done` would otherwise clear busy too early).
+	switch m.Phase {
+	case "deploying", "running", "synthesizing":
+		s.busy = true
+	case "plan_ready":
+		if m.AutoDeploy {
+			s.busy = true
+		}
+	case "failed":
+		s.busy = false
+	}
 	// Open plan review when we first land on plan_ready with review mode.
 	if m.Phase == "plan_ready" && prevPhase != "plan_ready" && !m.AutoDeploy {
 		s.openGoalPlanReview()
@@ -90,6 +102,21 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 	if m.Phase == "done" {
 		s.logSuccess("goal complete")
 	}
+}
+
+// goalKeepsBusy mirrors the web reducer's goalKeepsStreaming: goal deploy and
+// the post-deploy synthesizing turn outlive the planning model's `done`.
+func (s *session) goalKeepsBusy() bool {
+	if s.goalState == nil {
+		return false
+	}
+	switch s.goalState.Phase {
+	case "deploying", "running", "synthesizing":
+		return true
+	case "plan_ready":
+		return s.goalState.AutoDeploy
+	}
+	return false
 }
 
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
@@ -394,6 +421,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.finalizeInFlight("")
 			s.layout()
 			s.logInfo("continuing queued turn…")
+		} else if s.goalKeepsBusy() {
+			// Planning (or an earlier wave) ended, but goal deploy / synthesizing
+			// is still live — keep the working footer until the goal completes.
+			s.cur = nil
+			s.finalizeInFlight("")
+			s.layout()
 		} else {
 			s.busy = false
 			s.turnCount++
@@ -853,6 +886,33 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "goal_state":
 		s.applyGoalState(ev.Raw)
+	case "protocol_hello":
+		// Capabilities handshake — log once for operators / headless.
+		if caps := ev.get("capabilities"); caps != "" {
+			s.logInfo("protocol capabilities: " + caps)
+		} else if ver := ev.get("version"); ver != "" {
+			s.logInfo("protocol hello v" + ver)
+		}
+	case "file_change":
+		if p := ev.get("path"); p != "" {
+			s.logInfo("file_change: " + p)
+		}
+	case "checkpoint_created":
+		s.logInfo(fmt.Sprintf("checkpoint %s created", ev.get("id")))
+	case "checkpoint_restored":
+		s.logInfo(fmt.Sprintf("checkpoint %s restored", ev.get("id")))
+	case "checkpoints":
+		// List payload — no UI yet; ignore quietly.
+	case "worktree_ready":
+		s.logInfo(fmt.Sprintf("worktree ready: %s", ev.get("path")))
+	case "worktree_cleaned":
+		// Quiet — cleanup noise.
+	case "worktree_promoted":
+		s.logInfo(fmt.Sprintf("worktree promoted: %s", ev.get("run_id")))
+	case "audit":
+		// Opt-in sidecar; quiet in TUI.
+	case "cost_update":
+		// Footer already shows tokens via metrics.
 	case "goal_plan":
 		var raw struct {
 			Summary    string           `json:"summary"`
@@ -1011,6 +1071,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				var v string
 				_ = json.Unmarshal(raw, &v)
 				s.visionModel = v
+			}
+			// Missing enabled → recommended ON.
+			s.visionEnabled = true
+			if raw, ok := m["enabled"]; ok {
+				var en bool
+				if json.Unmarshal(raw, &en) == nil {
+					s.visionEnabled = en
+				}
 			}
 			if s.pendingVisionPicker {
 				s.pendingVisionPicker = false

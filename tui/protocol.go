@@ -40,8 +40,8 @@ type intercomPrompt struct {
 	message   string
 }
 
-// providerPreset is a built-in first-party provider template (OpenAI/Codex,
-// Gemini, Anthropic) advertised by the core via the `provider_presets` event
+// providerPreset is a built-in first-party provider template (Umans, OpenCode
+// Go, OpenRouter) advertised by the core via the `provider_presets` event
 // (and embedded in `ready`). The /login + /logout pickers use HasKey/Configured/
 // LoggedIn to show the right action and prompt for a key when none is set.
 type providerPreset struct {

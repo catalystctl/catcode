@@ -78,12 +78,13 @@ type goalDraft struct {
 
 const (
 	goalFieldGoal = iota
+	goalFieldProfile // Serial / Parallel / Ultra preset
 	goalFieldConcurrency
 	goalFieldMaxTasks
+	goalFieldReview // deploy mode: auto vs review-first
 	goalFieldProviders
 	goalFieldModels
-	goalFieldReview
-	goalFieldAdvanced // checkbox — expand advanced role/model limits
+	goalFieldAdvanced // expand advanced role/model limits
 	goalFieldPlanner
 	goalFieldWorker
 	goalFieldReviewer
@@ -95,11 +96,12 @@ const (
 func goalVisibleFields(advanced bool) []int {
 	base := []int{
 		goalFieldGoal,
+		goalFieldProfile,
 		goalFieldConcurrency,
 		goalFieldMaxTasks,
+		goalFieldReview,
 		goalFieldProviders,
 		goalFieldModels,
-		goalFieldReview,
 		goalFieldAdvanced,
 	}
 	if advanced {
@@ -111,6 +113,97 @@ func goalVisibleFields(advanced bool) []int {
 		)
 	}
 	return append(base, goalFieldStart)
+}
+
+// goalRunProfiles are named concurrency presets shown in the Run section.
+var goalRunProfiles = []struct {
+	Name string
+	Conc int
+	Max  int // suggested max_tasks floor when picking the preset
+}{
+	{"Serial", 1, 4},
+	{"Parallel", 4, 8},
+	{"Ultra", 8, 16},
+}
+
+func goalProfileIndex(concurrency int) int {
+	switch {
+	case concurrency >= 8:
+		return 2
+	case concurrency > 1:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func goalApplyProfile(d *goalDraft, idx int) {
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(goalRunProfiles) {
+		idx = len(goalRunProfiles) - 1
+	}
+	p := goalRunProfiles[idx]
+	d.concurrency = p.Conc
+	if d.maxTasks < p.Max {
+		d.maxTasks = p.Max
+	}
+}
+
+func goalCycleProfile(d *goalDraft, delta int) {
+	n := len(goalRunProfiles)
+	idx := (goalProfileIndex(d.concurrency) + delta%n + n) % n
+	goalApplyProfile(d, idx)
+}
+
+// goalSegment renders a ●/○ segmented control for the focused row.
+func goalSegment(options []string, selected int, focused bool) string {
+	parts := make([]string, 0, len(options))
+	for i, opt := range options {
+		label := "○ " + opt
+		if i == selected {
+			label = "● " + opt
+			if focused {
+				parts = append(parts, accentStyle.Render(label))
+			} else {
+				parts = append(parts, successStyle.Render(label))
+			}
+			continue
+		}
+		parts = append(parts, dimStyle.Render(label))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func goalSummaryLine(d goalDraft) string {
+	profile := goalRunProfiles[goalProfileIndex(d.concurrency)].Name
+	deploy := "auto-deploy"
+	if d.reviewBeforeDeploy {
+		deploy = "review plan first"
+	}
+	scope := "all models"
+	nProv, nMod := 0, 0
+	for _, on := range d.allowedProviders {
+		if on {
+			nProv++
+		}
+	}
+	for _, on := range d.allowedModels {
+		if on {
+			nMod++
+		}
+	}
+	switch {
+	case nProv > 0 && nMod > 0:
+		scope = fmt.Sprintf("%d providers · %d models", nProv, nMod)
+	case nProv > 0:
+		scope = fmt.Sprintf("%d providers", nProv)
+	case nMod > 0:
+		scope = fmt.Sprintf("%d models", nMod)
+	}
+	return fmt.Sprintf("Plan → %s · %s · %d agents · ≤%d tasks · %s",
+		deploy, strings.ToLower(profile), d.concurrency, d.maxTasks, scope)
 }
 
 func goalFieldIndex(fields []int, field int) int {
@@ -505,7 +598,7 @@ func (s *session) openGoalModal(prefill string) {
 		d.editing = true
 		ti := textinput.New()
 		ti.Prompt = ""
-		ti.Placeholder = "describe the goal to plan & deploy…"
+		ti.Placeholder = "What should the harness plan and deploy?"
 		ti.Focus()
 		s.modal.editBuf = ti
 		s.modal.editing = true
@@ -615,7 +708,7 @@ func (s *session) requestVisionPicker() {
 }
 
 // openLoginPicker opens the /login picker. It lists the first-party presets
-// (OpenAI/Codex, Gemini, Anthropic) plus any other configured providers, so
+// (Umans, OpenCode Go, OpenRouter) plus any plugin/configured providers, so
 // the user can log in to one or switch to an already-logged-in one. Logging in
 // to a preset whose key is in the env just sends `login`; one with no key
 // prompts the user to paste a key inline, then sends `login {preset,api_key}`.
@@ -788,10 +881,10 @@ func (s *session) visionItems() []listItem {
 	return items
 }
 
-// saveVisionConfig persists the current vision config (curated set + preferred
-// target) to the core, which writes .catalyst-code/vision.json and echoes a
-// vision_config event that re-syncs the TUI state. Empty vision_model => the
-// core treats it as None (pick dynamically).
+// saveVisionConfig persists the current vision config (enabled + curated set +
+// preferred target) to the core, which writes .catalyst-code/vision.json and
+// echoes a vision_config event that re-syncs the TUI state. Empty vision_model
+// => cheapest same-provider pick.
 func (s *session) saveVisionConfig() {
 	vm := make([]string, 0, len(s.visionModels))
 	for id, on := range s.visionModels {
@@ -801,20 +894,23 @@ func (s *session) saveVisionConfig() {
 	}
 	s.sendCore(map[string]any{
 		"type":          "set_vision_config",
+		"enabled":       s.visionEnabled,
 		"vision_models": vm,
 		"vision_model":  s.visionModel,
 	})
 }
 
-// handleVisionKey drives the vision picker: space toggles vision-capable for
-// the highlighted model, enter sets/clears the preferred handoff target (★).
-// Both live-persist via saveVisionConfig; the modal stays open. Filter typing
-// works like the other list modals.
+// handleVisionKey drives the vision picker: `e` toggles auto handoff (recommended
+// ON), space toggles vision-capable for the highlighted model, enter sets/clears
+// the preferred handoff target (★). Both live-persist via saveVisionConfig.
 func (s *session) handleVisionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	items := s.visionItems()
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
 	switch {
+	case msg.String() == "e" || msg.String() == "E":
+		s.visionEnabled = !s.visionEnabled
+		s.saveVisionConfig()
 	case msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
 		if n > 0 {
 			s.modal.cursor = (s.modal.cursor - 1 + n) % n
@@ -1495,7 +1591,7 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			d.goal = strings.TrimSpace(s.modal.editBuf.Value())
 			d.editing = false
 			s.modal.editing = false
-			d.field = goalFieldConcurrency
+			d.field = goalFieldProfile
 			return s, nil
 		}
 		var cmd tea.Cmd
@@ -1525,6 +1621,8 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		d.listCursor = 0
 	case key == "left":
 		switch d.field {
+		case goalFieldProfile:
+			goalCycleProfile(d, -1)
 		case goalFieldConcurrency:
 			if d.concurrency > 1 {
 				d.concurrency--
@@ -1533,6 +1631,8 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if d.maxTasks > 1 {
 				d.maxTasks--
 			}
+		case goalFieldReview:
+			d.reviewBeforeDeploy = false
 		case goalFieldPlanner:
 			d.plannerModel = s.cycleGoalRoleModel(d.plannerModel, -1)
 		case goalFieldWorker:
@@ -1544,14 +1644,21 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case key == "right":
 		switch d.field {
+		case goalFieldProfile:
+			goalCycleProfile(d, 1)
 		case goalFieldConcurrency:
-			if d.concurrency < d.maxTasks {
+			if d.concurrency < 32 {
 				d.concurrency++
+				if d.maxTasks < d.concurrency {
+					d.maxTasks = d.concurrency
+				}
 			}
 		case goalFieldMaxTasks:
 			if d.maxTasks < 64 {
 				d.maxTasks++
 			}
+		case goalFieldReview:
+			d.reviewBeforeDeploy = true
 		case goalFieldPlanner:
 			d.plannerModel = s.cycleGoalRoleModel(d.plannerModel, 1)
 		case goalFieldWorker:
@@ -1563,6 +1670,8 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case key == " " || key == "space":
 		switch d.field {
+		case goalFieldProfile:
+			goalCycleProfile(d, 1)
 		case goalFieldProviders:
 			s.toggleGoalProvider(d.listCursor)
 		case goalFieldModels:
@@ -1583,11 +1692,13 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			s.modal.editing = true
 			ti := textinput.New()
 			ti.Prompt = ""
-			ti.Placeholder = "describe the goal to plan & deploy…"
+			ti.Placeholder = "What should the harness plan and deploy?"
 			ti.SetValue(d.goal)
 			ti.CursorEnd()
 			ti.Focus()
 			s.modal.editBuf = ti
+		case goalFieldProfile:
+			goalCycleProfile(d, 1)
 		case goalFieldReview:
 			d.reviewBeforeDeploy = !d.reviewBeforeDeploy
 		case goalFieldAdvanced:
@@ -1606,8 +1717,10 @@ func (s *session) handleGoalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return s, s.submitGoalModal()
 		case goalFieldConcurrency:
 			d.concurrency++
-			if d.concurrency > d.maxTasks {
+			if d.concurrency > 32 {
 				d.concurrency = 1
+			} else if d.maxTasks < d.concurrency {
+				d.maxTasks = d.concurrency
 			}
 		case goalFieldMaxTasks:
 			d.maxTasks++
@@ -3024,7 +3137,13 @@ func (s *session) renderModalBody() string {
 	case modalLogout:
 		return s.renderListModal("Log out", s.logoutItems(), true)
 	case modalVision:
-		return s.renderListModal("Vision Models", s.visionItems(), true)
+		title := "Vision Handoff"
+		if s.visionEnabled {
+			title = "Vision Handoff · ON (recommended)"
+		} else {
+			title = "Vision Handoff · OFF"
+		}
+		return s.renderListModal(title, s.visionItems(), true)
 	case modalSettings:
 		return s.renderListModal("Settings", s.settingsHubItems(), true)
 	case modalApproval:
@@ -3080,43 +3199,130 @@ func (s *session) renderModalBody() string {
 func (s *session) renderGoalModal() string {
 	w := s.modalWidth(78)
 	d := s.goalDraft
+	inner := max(1, w-4)
+
 	row := func(idx int, label, value string) string {
 		marker := "  "
-		style := dimStyle
+		labelStyle := dimStyle
 		if d.field == idx {
 			marker = "▸ "
-			style = accentStyle
+			labelStyle = accentStyle
 		}
-		return style.Render(marker+label) + " " + baseStyle.Render(value)
+		pad := 14
+		if runes := []rune(label); len(runes) > pad {
+			pad = len(runes)
+		}
+		lbl := fmt.Sprintf("%-*s", pad, label)
+		if value == "" {
+			return labelStyle.Render(marker + lbl)
+		}
+		return labelStyle.Render(marker+lbl) + " " + value
 	}
+	section := func(title string) string {
+		rule := strings.Repeat("─", max(1, inner-len([]rune(title))-3))
+		return dimStyle.Render("  "+title+" "+rule)
+	}
+
 	var lines []string
 	lines = append(lines, accentStyle.Render("◆ Goal Mode"))
-	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
+	lines = append(lines, dimStyle.Render("  Plan with a planner, then deploy worker subagents"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", inner)))
 
+	// ── Goal (hero) ──────────────────────────────────────────────────────
 	goalVal := d.goal
-	if d.editing && d.field == goalFieldGoal {
+	editingGoal := d.editing && d.field == goalFieldGoal
+	if editingGoal {
 		goalVal = s.modal.editBuf.Value()
-		if goalVal == "" {
-			goalVal = s.modal.editBuf.Placeholder
+	}
+	goalMarker := "  "
+	goalLabelStyle := dimStyle
+	if d.field == goalFieldGoal {
+		goalMarker = "▸ "
+		goalLabelStyle = accentStyle
+	}
+	lines = append(lines, goalLabelStyle.Render(goalMarker+"Goal"))
+	if editingGoal {
+		shown := goalVal
+		if shown == "" {
+			shown = s.modal.editBuf.Placeholder
+			lines = append(lines, "    "+placeholderStyle.Render(shown))
+		} else {
+			for _, line := range wrapUsageText(shown, max(1, inner-4)) {
+				lines = append(lines, "    "+accentStyle.Render(line))
+			}
+		}
+		lines = append(lines, dimStyle.Render("    enter confirm · esc keep"))
+	} else if strings.TrimSpace(goalVal) == "" {
+		lines = append(lines, "    "+placeholderStyle.Render("enter to describe what you want accomplished"))
+	} else {
+		for _, line := range wrapUsageText(goalVal, max(1, inner-4)) {
+			lines = append(lines, "    "+baseStyle.Render(line))
 		}
 	}
-	if goalVal == "" {
-		goalVal = "(empty — enter to edit)"
-	}
-	// Truncate long goals for the form view.
-	if len([]rune(goalVal)) > w-14 {
-		goalVal = string([]rune(goalVal)[:w-15]) + "…"
-	}
-	lines = append(lines, row(goalFieldGoal, "Goal", goalVal))
-	lines = append(lines, row(goalFieldConcurrency, "Concurrency", fmt.Sprintf("%d  (←/→)", d.concurrency)))
-	lines = append(lines, row(goalFieldMaxTasks, "Max tasks", fmt.Sprintf("%d  (←/→)", d.maxTasks)))
 	if s.modal.loadError != "" {
 		lines = append(lines, errStyle.Render("  ✗ "+s.modal.loadError))
 	}
 
-	// Providers multi-select
+	// ── Run ──────────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Run"))
+	profileNames := make([]string, len(goalRunProfiles))
+	for i, p := range goalRunProfiles {
+		profileNames[i] = p.Name
+	}
+	lines = append(lines, row(
+		goalFieldProfile,
+		"Profile",
+		goalSegment(profileNames, goalProfileIndex(d.concurrency), d.field == goalFieldProfile),
+	))
+	profileHint := "one agent at a time"
+	switch goalProfileIndex(d.concurrency) {
+	case 1:
+		profileHint = "independent steps run together"
+	case 2:
+		profileHint = "wide fan-out planning"
+	}
+	if d.field == goalFieldProfile {
+		lines = append(lines, dimStyle.Render("    "+profileHint+" · ←/→ cycle"))
+	}
+	lines = append(lines, row(
+		goalFieldConcurrency,
+		"Agents",
+		baseStyle.Render(fmt.Sprintf("%d concurrent", d.concurrency))+dimStyle.Render("  ←/→"),
+	))
+	lines = append(lines, row(
+		goalFieldMaxTasks,
+		"Max tasks",
+		baseStyle.Render(fmt.Sprintf("%d", d.maxTasks))+dimStyle.Render("  ←/→"),
+	))
+
+	// ── Deploy ───────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Deploy"))
+	deploySel := 0
+	if d.reviewBeforeDeploy {
+		deploySel = 1
+	}
+	lines = append(lines, row(
+		goalFieldReview,
+		"After plan",
+		goalSegment([]string{"Auto-deploy", "Review first"}, deploySel, d.field == goalFieldReview),
+	))
+	if d.field == goalFieldReview {
+		hint := "deploy workers as soon as the plan is ready"
+		if d.reviewBeforeDeploy {
+			hint = "pause for approve / revise before deploy"
+		}
+		lines = append(lines, dimStyle.Render("    "+hint))
+	}
+
+	// ── Scope ────────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Scope"))
+	lines = append(lines, dimStyle.Render("  empty selection = unrestricted"))
+
 	provs := s.goalProviderOptions()
-	provLabel := "all"
+	provLabel := dimStyle.Render("all")
 	if len(d.allowedProviders) > 0 {
 		var sel []string
 		for _, p := range provs {
@@ -3124,33 +3330,40 @@ func (s *session) renderGoalModal() string {
 				sel = append(sel, p)
 			}
 		}
-		if len(sel) == 0 {
-			provLabel = "all"
-		} else {
-			provLabel = strings.Join(sel, ", ")
+		if len(sel) > 0 {
+			joined := strings.Join(sel, ", ")
+			if lipgloss.Width(joined) > inner-20 {
+				joined = fmt.Sprintf("%d selected", len(sel))
+			}
+			provLabel = successStyle.Render(joined)
 		}
 	}
-	lines = append(lines, row(goalFieldProviders, "Providers", provLabel+"  (space toggle)"))
+	lines = append(lines, row(goalFieldProviders, "Providers", provLabel))
 	if d.field == goalFieldProviders {
 		if len(provs) == 0 {
 			lines = append(lines, dimStyle.Render("    (no providers logged in)"))
 		}
 		for i, p := range provs {
 			mark := " "
+			style := dimStyle
 			if d.allowedProviders[p] {
 				mark = "✓"
+				style = successStyle
 			}
 			cur := "  "
 			if i == d.listCursor {
 				cur = "▸ "
+				style = accentStyle
 			}
-			lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, p)))
+			lines = append(lines, style.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, p)))
+		}
+		if len(provs) > 0 {
+			lines = append(lines, dimStyle.Render("    space toggle · ↑↓ move"))
 		}
 	}
 
-	// Models multi-select
 	mods := s.goalModelOptions()
-	modLabel := "all"
+	modLabel := dimStyle.Render("all")
 	if len(d.allowedModels) > 0 {
 		var sel []string
 		for _, m := range mods {
@@ -3159,15 +3372,15 @@ func (s *session) renderGoalModal() string {
 			}
 		}
 		if len(sel) > 0 {
-			modLabel = strings.Join(sel, ", ")
-			if len(modLabel) > w-20 {
-				modLabel = fmt.Sprintf("%d selected", len(sel))
+			joined := strings.Join(sel, ", ")
+			if lipgloss.Width(joined) > inner-20 {
+				joined = fmt.Sprintf("%d selected", len(sel))
 			}
+			modLabel = successStyle.Render(joined)
 		}
 	}
-	lines = append(lines, row(goalFieldModels, "Models", modLabel+"  (space toggle)"))
+	lines = append(lines, row(goalFieldModels, "Models", modLabel))
 	if d.field == goalFieldModels {
-		// Show a window of models around the cursor.
 		start := d.listCursor - 3
 		if start < 0 {
 			start = 0
@@ -3182,43 +3395,50 @@ func (s *session) renderGoalModal() string {
 		for i := start; i < end; i++ {
 			m := mods[i]
 			mark := " "
+			style := dimStyle
 			if d.allowedModels[m] {
 				mark = "✓"
+				style = successStyle
 			}
 			cur := "  "
 			if i == d.listCursor {
 				cur = "▸ "
+				style = accentStyle
 			}
-			lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, m)))
+			lines = append(lines, style.Render(fmt.Sprintf("  %s[%s] %s", cur, mark, m)))
+		}
+		if len(mods) > 0 {
+			more := ""
+			if len(mods) > end-start {
+				more = fmt.Sprintf(" · %d/%d", d.listCursor+1, len(mods))
+			}
+			lines = append(lines, dimStyle.Render("    space toggle · ↑↓ move"+more))
 		}
 	}
 
-	review := "off — deploy after plan"
-	if d.reviewBeforeDeploy {
-		review = "on — wait for approval"
-	}
-	lines = append(lines, row(goalFieldReview, "Review plan", review+"  (space)"))
-
-	advLabel := "off"
+	// ── Advanced ─────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	advVal := dimStyle.Render("off")
 	if d.advanced {
-		advLabel = "on"
+		advVal = successStyle.Render("on") + dimStyle.Render("  role models & per-model caps")
+	} else {
+		advVal = dimStyle.Render("off") + dimStyle.Render("  · space to expand")
 	}
-	lines = append(lines, row(goalFieldAdvanced, "Advanced", advLabel+"  (space) — role models & per-model concurrency"))
+	lines = append(lines, row(goalFieldAdvanced, "Advanced", advVal))
 
 	if d.advanced {
 		roleVal := func(m string) string {
 			if m == "" {
-				return "(default)"
+				return dimStyle.Render("(default)")
 			}
-			return m
+			return baseStyle.Render(m)
 		}
-		lines = append(lines, row(goalFieldPlanner, "  Planner model", roleVal(d.plannerModel)+"  (←/→)"))
-		lines = append(lines, row(goalFieldWorker, "  Worker model", roleVal(d.workerModel)+"  (←/→)"))
-		lines = append(lines, row(goalFieldReviewer, "  Reviewer model", roleVal(d.reviewerModel)+"  (←/→)"))
+		lines = append(lines, row(goalFieldPlanner, "Planner", roleVal(d.plannerModel)+dimStyle.Render("  ←/→")))
+		lines = append(lines, row(goalFieldWorker, "Worker", roleVal(d.workerModel)+dimStyle.Render("  ←/→")))
+		lines = append(lines, row(goalFieldReviewer, "Reviewer", roleVal(d.reviewerModel)+dimStyle.Render("  ←/→")))
 
-		// Per-model concurrency list
 		concOpts := s.goalModelConcOptions()
-		lines = append(lines, row(goalFieldModelConc, "  Model concurrency", "←/→ adjust · empty = global"))
+		lines = append(lines, row(goalFieldModelConc, "Model caps", dimStyle.Render("←/→ adjust · unset = global")))
 		if d.field == goalFieldModelConc {
 			if len(concOpts) == 0 {
 				lines = append(lines, dimStyle.Render("    (no models)"))
@@ -3234,29 +3454,39 @@ func (s *session) renderGoalModal() string {
 			for i := start; i < end; i++ {
 				id := concOpts[i]
 				cap := d.concurrency
+				overridden := false
 				if v, ok := d.modelConcurrency[id]; ok && v > 0 {
 					cap = v
+					overridden = true
 				}
 				cur := "  "
+				style := dimStyle
 				if i == d.listCursor {
 					cur = "▸ "
+					style = accentStyle
 				}
-				lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s%s  %d/%d", cur, id, cap, d.concurrency)))
+				val := fmt.Sprintf("%d/%d", cap, d.concurrency)
+				if overridden {
+					val = successStyle.Render(val)
+				} else {
+					val = dimStyle.Render(val)
+				}
+				lines = append(lines, style.Render(fmt.Sprintf("  %s%s  ", cur, id))+val)
 			}
 		}
 	}
 
+	// ── Footer / CTA ─────────────────────────────────────────────────────
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", inner)))
+	lines = append(lines, "  "+dimStyle.Render(goalSummaryLine(d)))
 	startLabel := "Start goal"
 	if d.field == goalFieldStart {
-		lines = append(lines, accentStyle.Render("▸ ▶ "+startLabel+"  (enter)"))
+		lines = append(lines, accentStyle.Render("▸ ▶ "+startLabel)+dimStyle.Render("  enter"))
 	} else {
 		lines = append(lines, dimStyle.Render("  ▶ "+startLabel))
 	}
+	lines = append(lines, dimStyle.Render("  ↑↓ fields · ←/→ adjust · space toggle · ctrl+enter submit · esc"))
 
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  ↑↓ fields · space toggle · ←/→ cycle · ctrl+enter submit · esc cancel"))
-	// Keep the active field (or active row within a multi-select) visible on
-	// short terminals. Title/separator and footer remain anchored.
 	focusLine := 2
 	for i, line := range lines {
 		if strings.Contains(line, "▸") {
@@ -3264,7 +3494,8 @@ func (s *session) renderGoalModal() string {
 		}
 	}
 	maxBody := s.height - 2 // modalBox border rows
-	lines = focusWindow(lines, focusLine, maxBody, 2, 2)
+	// Keep title + subtitle + rule as head chrome; summary + CTA + hints as tail.
+	lines = focusWindow(lines, focusLine, maxBody, 3, 3)
 	return modalBox(w, strings.Join(lines, "\n"))
 }
 
@@ -3556,7 +3787,7 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		footer = "  ↑↓ select · enter load · ^R rename · ^P pin · ^D delete · esc close"
 	}
 	if s.modal.kind == modalVision {
-		footer = "  ↑↓ navigate · space toggle vision · enter set target · esc close"
+		footer = "  ↑↓ navigate · e toggle handoff · space mark vision · enter prefer · esc close"
 	}
 	lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	body := strings.Join(lines, "\n")

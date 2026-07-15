@@ -126,7 +126,8 @@ type session struct {
 	streamRefreshPending     bool
 	coreStartGen             uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
 	visionModels             map[string]bool // user-curated vision-capable model ids (drives /vision)
-	visionModel              string          // preferred handoff target ("" = pick dynamically)
+	visionModel              string          // preferred handoff target ("" = cheapest same-provider)
+	visionEnabled            bool            // auto handoff (default true / recommended ON)
 	pendingVisionPicker      bool            // open the vision picker once the config arrives
 	pendingPluginInstallPath string          // path/URL awaiting scope pick (modalPluginInstallScope)
 
@@ -245,6 +246,7 @@ func initialSession() *session {
 	}
 	s.coreAutoCompact = s.settings.AutoCompact
 	s.visionModels = map[string]bool{}
+	s.visionEnabled = true
 
 	s.input = textinput.New()
 	s.input.Placeholder = "Chat with the agent…  (/ commands · ? help)"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -207,6 +208,41 @@ func TestGoalModalPrefillAndSubmit(t *testing.T) {
 	}
 	if !s.busy {
 		t.Fatal("start_goal should mark session busy")
+	}
+}
+
+func TestGoalModalProfileAndLayout(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 40
+	s.models = []modelInfo{{ID: "m1", Provider: "openai"}, {ID: "m2", Provider: "openai"}}
+	s.providers = []string{"openai"}
+	s.openGoalModal("ship the release")
+
+	body := stripANSI(s.renderGoalModal())
+	for _, want := range []string{"Goal Mode", "Run", "Deploy", "Scope", "Profile", "After plan", "Start goal", "auto-deploy"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in goal modal:\n%s", want, body)
+		}
+	}
+
+	s.goalDraft.field = goalFieldProfile
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if s.goalDraft.concurrency != 8 {
+		t.Fatalf("Ultra profile concurrency=%d, want 8", s.goalDraft.concurrency)
+	}
+	if s.goalDraft.maxTasks < 16 {
+		t.Fatalf("Ultra profile should raise max tasks, got %d", s.goalDraft.maxTasks)
+	}
+
+	s.goalDraft.field = goalFieldReview
+	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if !s.goalDraft.reviewBeforeDeploy {
+		t.Fatal("right on After plan should select Review first")
+	}
+	body = stripANSI(s.renderGoalModal())
+	if !strings.Contains(body, "review plan first") {
+		t.Fatalf("summary should reflect review mode:\n%s", body)
 	}
 }
 
