@@ -101,7 +101,7 @@ func TestGoalStepCompleteEventPersists(t *testing.T) {
 	s := initialSession()
 	s.ready = true
 	raw, _ := json.Marshal(map[string]any{
-		"type": "goal_step_complete",
+		"type":    "goal_step_complete",
 		"step_id": "2", "title": "verify", "agent": "reviewer",
 		"ok": true, "status": "done", "summary": "All checks passed.",
 	})
@@ -211,11 +211,80 @@ func TestGoalHeaderShowsPhase(t *testing.T) {
 	}
 }
 
+func TestGoalPlanReadyAutoDeployShowsProgress(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.busy = true
+	s.goalState = &goalStateSnap{
+		ID: "g1", Phase: "plan_ready", AutoDeploy: true, Goal: "ship",
+		Prompts: []goalPromptSnap{
+			{StepID: "1", Title: "impl", Agent: "worker", Status: "pending"},
+		},
+	}
+	if !goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
+		t.Fatal("plan_ready+AutoDeploy should show progress panel")
+	}
+	if goalShowsProgressPanel("plan_ready", false) {
+		t.Fatal("plan_ready without AutoDeploy must not show progress panel")
+	}
+	panel := stripANSI(s.renderGoalProgressPanel(s.width))
+	if panel == "" {
+		t.Fatal("expected non-empty progress panel for plan_ready+AutoDeploy")
+	}
+	if !strings.Contains(panel, "goal · starting") {
+		t.Fatalf("expected starting header, got:\n%s", panel)
+	}
+	if !strings.Contains(panel, "impl") {
+		t.Fatalf("expected step in panel, got:\n%s", panel)
+	}
+	head := stripANSI(s.renderHeader())
+	if !strings.Contains(head, "goal · starting") {
+		t.Fatalf("header missing starting label: %q", head)
+	}
+}
+
+func TestGoalCompleteDedupe(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	// Simulate both paths that used to double-fire "goal complete".
+	s.goalState = &goalStateSnap{ID: "g1", Phase: "synthesizing", Goal: "ship"}
+	phase, _ := json.Marshal(map[string]any{
+		"type": "goal_phase", "from": "synthesizing", "to": "done",
+	})
+	s.handleCoreEvent(&coreEvent{Type: "goal_phase", Raw: phase})
+	n := 0
+	for _, ttext := range blockTexts(s) {
+		if strings.Contains(ttext, "goal complete") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 lasting goal complete after goal_phase, got %d in %v", n, blockTexts(s))
+	}
+	done, _ := json.Marshal(map[string]any{
+		"type": "goal_state", "id": "g1", "goal": "ship", "phase": "done",
+		"prompts": []map[string]any{
+			{"step_id": "1", "title": "a", "agent": "worker", "status": "done", "summary": "ok"},
+		},
+	})
+	s.handleCoreEvent(&coreEvent{Type: "goal_state", Raw: done})
+	n = 0
+	for _, ttext := range blockTexts(s) {
+		if strings.Contains(ttext, "goal complete") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected still 1 lasting goal complete after goal_state, got %d in %v", n, blockTexts(s))
+	}
+}
+
 func TestGoalInfoDeployPersists(t *testing.T) {
 	s := initialSession()
 	s.ready = true
 	raw, _ := json.Marshal(map[string]any{
-		"type": "info",
+		"type":    "info",
 		"message": "Goal deploy complete — writing completion summary…",
 	})
 	s.handleCoreEvent(&coreEvent{Type: "info", Raw: raw})

@@ -247,9 +247,11 @@ const (
 // classify() so a glance at the header reveals whether the call mutates state.
 func toolKindOf(name string) toolKindT {
 	switch name {
+	// Mirror core/src/tools.rs classify() ReadOnly set exactly.
 	case "read_file", "list_dir", "grep", "glob", "bulk_read", "todo_read",
 		"diagnostics", "finish", "contact_supervisor", "intercom",
-		"git_status", "git_diff", "git_log", "memory":
+		"git_status", "git_diff", "git_log", "memory",
+		"web_search", "ask", "load_tools", "goal_write_plan", "workspace_activity":
 		return kindReadOnly
 	default:
 		return kindDestructive
@@ -282,10 +284,14 @@ func toolIcon(name string) string {
 		return "☑"
 	case "diagnostics":
 		return "⊕"
-	case "fetch":
+	case "fetch", "web_search":
 		return "↬"
 	case "memory":
 		return "❖"
+	case "delete", "rename", "mkdir":
+		return "✎"
+	case "ask", "load_tools", "workspace_activity", "goal_write_plan", "test_env":
+		return "▸"
 	case "subagent", "spawn":
 		return "◈"
 	case "finish":

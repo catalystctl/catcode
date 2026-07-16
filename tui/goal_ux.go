@@ -12,13 +12,26 @@ import (
 // transcript cards (panel may show a shorter one-line preview).
 const goalDisplaySummaryCap = 800
 
-func goalPhaseShowsProgress(phase string) bool {
+// goalShowsProgressPanel is true while the pinned goal progress panel should
+// render. plan_ready only counts when auto-deploy is armed (parity with web).
+func goalShowsProgressPanel(phase string, autoDeploy bool) bool {
 	switch phase {
 	case "deploying", "running", "synthesizing", "done", "failed":
 		return true
+	case "plan_ready":
+		return autoDeploy
 	default:
 		return false
 	}
+}
+
+// goalProgressPhaseLabel is the short phase shown in headers/panels.
+// plan_ready+autoDeploy renders as "starting" (parity with web).
+func goalProgressPhaseLabel(phase string, autoDeploy bool) string {
+	if phase == "plan_ready" && autoDeploy {
+		return "starting"
+	}
+	return phase
 }
 
 func goalTerminalStatus(status string) bool {
@@ -146,6 +159,17 @@ func (s *session) persistGoalLifecycle(text string) {
 	s.logPersist(blkInfo, t)
 }
 
+// announceGoalComplete writes the single lasting "goal complete" line + toast.
+// Both goal_state(done) and goal_phase→done call this; the flag dedupes.
+func (s *session) announceGoalComplete() {
+	if s.goalCompleteLogged {
+		return
+	}
+	s.goalCompleteLogged = true
+	s.persistGoalLifecycle("goal complete")
+	s.logSuccess("goal complete")
+}
+
 func goalStatusBadge(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "done":
@@ -163,14 +187,15 @@ func goalStatusBadge(status string) string {
 
 // renderGoalProgressPanel lists goal steps with status during deploy / wrap-up.
 func (s *session) renderGoalProgressPanel(w int) string {
-	if s.goalState == nil || !goalPhaseShowsProgress(s.goalState.Phase) {
+	if s.goalState == nil || !goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 		return ""
 	}
 	if w < 20 || s.height < 10 {
 		return ""
 	}
 	settled, total := s.goalProgressCounts()
-	header := fmt.Sprintf("goal · %s · %d/%d", s.goalState.Phase, settled, total)
+	phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
+	header := fmt.Sprintf("goal · %s · %d/%d", phaseLabel, settled, total)
 	var rows []string
 	rows = append(rows, accentStyle.Render("◈ ")+boldBaseStyle.Render(header))
 	maxRows := min(6, max(2, s.height/4))

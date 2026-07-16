@@ -164,9 +164,10 @@ func (s *session) renderHeader() string {
 	case s.coreLifecycle == coreFailed:
 		state = "core down"
 	case s.busy:
-		if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 			settled, total := s.goalProgressCounts()
-			state = fmt.Sprintf("goal · %s · %d/%d", s.goalState.Phase, settled, total)
+			phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
+			state = fmt.Sprintf("goal · %s · %d/%d", phaseLabel, settled, total)
 		} else {
 			state = "working"
 		}
@@ -1282,18 +1283,20 @@ func (s *session) renderActivityShelf() string {
 		return s.renderQueueBanner()
 	}
 	if len(s.todos) == 0 && len(s.subProgress) == 0 {
-		if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 			settled, total := s.goalProgressCounts()
+			phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
 			return accentStyle.Render("◈ ") +
-				baseStyle.Render(fmt.Sprintf("Goal %s · %d/%d steps", s.goalState.Phase, settled, total))
+				baseStyle.Render(fmt.Sprintf("Goal %s · %d/%d steps", phaseLabel, settled, total))
 		}
 		return ""
 	}
 	done, _, running := countTodoStatuses(s.todos)
 	parts := make([]string, 0, 3)
-	if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+	if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 		settled, total := s.goalProgressCounts()
-		parts = append(parts, fmt.Sprintf("Goal %s · %d/%d", s.goalState.Phase, settled, total))
+		phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
+		parts = append(parts, fmt.Sprintf("Goal %s · %d/%d", phaseLabel, settled, total))
 	}
 	if len(s.subProgress) > 0 {
 		parts = append(parts, fmt.Sprintf("Subagents %d active", len(s.subProgress)))

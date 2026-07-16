@@ -58,6 +58,7 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		s.goalPlan = nil
 		s.goalStepLogged = nil
 		s.goalLastLife = ""
+		s.goalCompleteLogged = false
 		return
 	}
 	snap := &goalStateSnap{
@@ -123,8 +124,7 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		s.persistGoalLifecycle("goal failed: " + m.Error)
 	}
 	if m.Phase == "done" && prevPhase != "done" {
-		s.persistGoalLifecycle("goal complete")
-		s.logSuccess("goal complete")
+		s.announceGoalComplete()
 	}
 	if m.Phase == "synthesizing" && prevPhase != "synthesizing" {
 		s.persistGoalLifecycle("Workers finished — writing completion summary…")
@@ -719,7 +719,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			// During goal deploy, lasting finals come from goal_state /
 			// goal_step_complete. Outside goal mode, persist a one-liner so
 			// manual subagent runs are not toast-only.
-			if agent != "" && (s.goalState == nil || !goalPhaseShowsProgress(s.goalState.Phase)) {
+			if agent != "" && (s.goalState == nil || !goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy)) {
 				if ok {
 					s.logPersist(blkSuccess, fmt.Sprintf("✓ subagent %s finished", agent))
 				} else {
@@ -1007,8 +1007,10 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			line = fmt.Sprintf("goal %s → %s%s", from, to, extras)
 		}
 		// Persist lifecycle transitions so deploy is never toast-only dark.
+		// "done" is owned by announceGoalComplete (also called from applyGoalState)
+		// so we do not persist the verbose transition line or double-toast.
 		switch to {
-		case "deploying", "running", "synthesizing", "done", "failed":
+		case "deploying", "running", "synthesizing", "failed":
 			if to == "synthesizing" && msg == "" {
 				line = "Workers finished — writing completion summary…"
 				if extras != "" {
@@ -1016,13 +1018,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 			s.persistGoalLifecycle(line)
-			if to == "done" {
-				s.busy = false
-				s.logSuccess("goal complete")
-			} else if to == "failed" {
+			if to == "failed" {
 				s.busy = false
 				s.logWarn(line)
 			}
+		case "done":
+			s.busy = false
+			s.announceGoalComplete()
 		default:
 			s.logInfo(line)
 		}
