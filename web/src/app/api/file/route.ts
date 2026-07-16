@@ -152,8 +152,9 @@ export async function POST(req: Request) {
   try { body = await req.json(); } catch { return Response.json({ error: "invalid body" }, { status: 400 }); }
   if (typeof body.path !== "string" || !body.path.trim())
     return Response.json({ error: "invalid body" }, { status: 400 });
-  if (body.kind !== "file" && body.kind !== "dir")
+  if (body.kind !== "file" && body.kind !== "dir" && body.kind !== "folder")
     return Response.json({ error: "kind must be \"file\" or \"dir\"" }, { status: 400 });
+  const kind = body.kind === "folder" ? "dir" : body.kind;
   let workspace: string;
   try {
     workspace = authorizedWorkspace(typeof body.workspace === "string" && body.workspace ? body.workspace : resolveWorkspace(req));
@@ -164,7 +165,7 @@ export async function POST(req: Request) {
   try { abs = mutationPath(workspace, body.path, false); } catch { return Response.json({ error: "path outside workspace" }, { status: 400 }); }
   if (existsSync(abs)) return Response.json({ error: "already exists" }, { status: 409 });
   try {
-    if (body.kind === "file") closeSync(openSync(abs, "wx"));
+    if (kind === "file") closeSync(openSync(abs, "wx"));
     else mkdirSync(abs, { recursive: false });
   } catch (e) {
     return Response.json({ error: `create failed: ${(e as Error).message}` }, { status: 500 });

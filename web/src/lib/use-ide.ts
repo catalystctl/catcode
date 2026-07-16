@@ -157,6 +157,8 @@ export interface IdeApi {
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
   markDirty: (id: string, dirty: boolean) => void;
+  /** Remap open file tabs after a rename/move (updates id/target/label + activeTabId). */
+  remapFileTabs: (oldPath: string, newPath: string) => void;
   /** Open a file change as a Monaco DiffEditor tab in the main work area. */
   openDiff: (path: string, opts?: { staged?: boolean }) => void;
   /** Open a commit/stash unified patch in the main work area. */
@@ -177,6 +179,14 @@ export interface IdeApi {
   setPreview: (p: PreviewState) => void;
   // ── tree ──
   toggleDir: (path: string) => void;
+  /** Ensure a directory is expanded (no-op if already open). */
+  expandDir: (path: string) => void;
+  /** Collapse every expanded directory. */
+  collapseAllDirs: () => void;
+  /** Drop expansion keys for a path and its descendants (after delete). */
+  pruneExpandedDirs: (path: string) => void;
+  /** Remap expansion keys after a rename/move. */
+  remapExpandedDirs: (oldPath: string, newPath: string) => void;
   isExpanded: (path: string) => boolean;
   // ── shell chrome (IDE vs chat-only) ──
   setUiMode: (mode: "ide" | "chat") => void;
@@ -536,6 +546,33 @@ export function useIde(workspace?: string): IdeApi {
     }));
   }, []);
 
+  const remapFileTabs = useCallback((oldPath: string, newPath: string) => {
+    if (!oldPath || !newPath || oldPath === newPath) return;
+    const affected = stateRef.current.openTabs.filter(
+      (t) => t.kind === "file" && (t.target === oldPath || t.target.startsWith(oldPath + "/")),
+    );
+    for (const tab of affected) disposeEditorModel(tab.id);
+    setState((prev) => {
+      const openTabs = prev.openTabs.map((t) => {
+        if (t.kind !== "file") return t;
+        if (t.target === oldPath) {
+          return { ...t, id: newPath, target: newPath, label: basename(newPath) };
+        }
+        if (t.target.startsWith(oldPath + "/")) {
+          const next = newPath + t.target.slice(oldPath.length);
+          return { ...t, id: next, target: next, label: basename(next) };
+        }
+        return t;
+      });
+      let activeTabId = prev.activeTabId;
+      if (activeTabId === oldPath) activeTabId = newPath;
+      else if (activeTabId && activeTabId.startsWith(oldPath + "/")) {
+        activeTabId = newPath + activeTabId.slice(oldPath.length);
+      }
+      return { ...prev, openTabs, activeTabId };
+    });
+  }, []);
+
   const newTerminal = useCallback((cwd?: string) => {
     const id = `term_${Date.now()}_${++termSeq.current}`;
     setState((s) => {
@@ -650,6 +687,35 @@ export function useIde(workspace?: string): IdeApi {
     });
   }, []);
 
+  const expandDir = useCallback((path: string) => {
+    setState((s) =>
+      s.expandedDirs.includes(path) ? s : { ...s, expandedDirs: [...s.expandedDirs, path] },
+    );
+  }, []);
+
+  const collapseAllDirs = useCallback(() => {
+    setState((s) => (s.expandedDirs.length === 0 ? s : { ...s, expandedDirs: [] }));
+  }, []);
+
+  const pruneExpandedDirs = useCallback((path: string) => {
+    setState((s) => ({
+      ...s,
+      expandedDirs: s.expandedDirs.filter((p) => p !== path && !p.startsWith(path + "/")),
+    }));
+  }, []);
+
+  const remapExpandedDirs = useCallback((oldPath: string, newPath: string) => {
+    if (!oldPath || !newPath || oldPath === newPath) return;
+    setState((s) => ({
+      ...s,
+      expandedDirs: s.expandedDirs.map((p) => {
+        if (p === oldPath) return newPath;
+        if (p.startsWith(oldPath + "/")) return newPath + p.slice(oldPath.length);
+        return p;
+      }),
+    }));
+  }, []);
+
   const isExpanded = useCallback(
     (path: string) => state.expandedDirs.includes(path),
     [state.expandedDirs],
@@ -696,6 +762,7 @@ export function useIde(workspace?: string): IdeApi {
       closeTab,
       setActiveTab,
       markDirty,
+      remapFileTabs,
       newTerminal,
       runCommand,
       closeTerminal,
@@ -705,6 +772,10 @@ export function useIde(workspace?: string): IdeApi {
       refreshGit,
       setPreview,
       toggleDir,
+      expandDir,
+      collapseAllDirs,
+      pruneExpandedDirs,
+      remapExpandedDirs,
       isExpanded,
       setUiMode,
       toggleUiMode,
@@ -736,6 +807,7 @@ export function useIde(workspace?: string): IdeApi {
       closeTab,
       setActiveTab,
       markDirty,
+      remapFileTabs,
       newTerminal,
       runCommand,
       closeTerminal,
@@ -745,6 +817,10 @@ export function useIde(workspace?: string): IdeApi {
       refreshGit,
       setPreview,
       toggleDir,
+      expandDir,
+      collapseAllDirs,
+      pruneExpandedDirs,
+      remapExpandedDirs,
     ],
   );
 }

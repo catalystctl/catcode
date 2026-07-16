@@ -151,6 +151,16 @@ export function IdeShell() {
   }, [focusMode, paletteOpen]);
 
   useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!ide.state.openTabs.some((tab) => tab.dirty)) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [ide.state.openTabs]);
+
+  useEffect(() => {
     if (!paletteOpen || !workspace) {
       setPaletteFiles([]);
       return;
@@ -1165,13 +1175,37 @@ function EditorBreadcrumbs() {
   const parts = tab.target.split(/[\\/]/).filter(Boolean);
   return (
     <div className="flex h-7 shrink-0 items-center gap-1 overflow-x-auto border-b border-ink-850 bg-ink-950 px-3 text-[11px] text-ink-500" aria-label="File breadcrumb" title={tab.target}>
-      {parts.map((part, index) => (
-        <span key={`${part}:${index}`} className="flex shrink-0 items-center gap-1">
-          {index > 0 ? <ChevronRight width={11} height={11} className="text-ink-700" /> : null}
-          {index === parts.length - 1 ? <FileIcon width={12} height={12} className="text-accent-soft" /> : null}
-          <span className={index === parts.length - 1 ? "font-medium text-ink-300" : ""}>{part}</span>
-        </span>
-      ))}
+      {parts.map((part, index) => {
+        const path = parts.slice(0, index + 1).join("/");
+        const isLast = index === parts.length - 1;
+        return (
+          <span key={`${part}:${index}`} className="flex shrink-0 items-center gap-1">
+            {index > 0 ? <ChevronRight width={11} height={11} className="text-ink-700" /> : null}
+            {isLast ? <FileIcon width={12} height={12} className="text-accent-soft" /> : null}
+            {isLast ? (
+              <span className="font-medium text-ink-300">{part}</span>
+            ) : (
+              <button
+                type="button"
+                title={`Reveal ${path}`}
+                className="rounded px-0.5 hover:bg-ink-800 hover:text-ink-200"
+                onClick={() => {
+                  ide.selectExplorer();
+                  ide.expandDir(path);
+                  // Expanding ancestors so the folder is visible in the tree.
+                  let acc = "";
+                  for (const segment of parts.slice(0, index + 1)) {
+                    acc = acc ? `${acc}/${segment}` : segment;
+                    ide.expandDir(acc);
+                  }
+                }}
+              >
+                {part}
+              </button>
+            )}
+          </span>
+        );
+      })}
       {tab.dirty ? <span className="ml-1 text-warning" title="Unsaved changes">●</span> : null}
     </div>
   );

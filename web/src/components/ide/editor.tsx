@@ -15,6 +15,9 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
 type MonacoApi = typeof Monaco;
 
+/** Last disk/saved snapshot per workspace path — survives editor remounts. */
+const lastSavedByPath = new Map<string, string>();
+
 function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
   const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
   return monaco.Uri.from({
@@ -80,6 +83,7 @@ export function Editor({
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const contentRef = useRef("");
+  const savedRef = useRef("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -99,6 +103,8 @@ export function Editor({
         body: JSON.stringify({ path: tab.target, content: contentRef.current, workspace }),
       });
       if (!response.ok) throw new Error(`Failed to save (${response.status})`);
+      savedRef.current = contentRef.current;
+      lastSavedByPath.set(tab.target, contentRef.current);
       markDirty(tab.id, false);
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -162,7 +168,14 @@ export function Editor({
             resolveLanguage(monaco, tab.target, tab.language),
             uri,
           );
+          savedRef.current = model.getValue();
+          lastSavedByPath.set(tab.target, savedRef.current);
           markDirty(tab.id, false);
+        } else {
+          savedRef.current = tab.dirty
+            ? (lastSavedByPath.get(tab.target) ?? model.getValue())
+            : model.getValue();
+          if (!tab.dirty) lastSavedByPath.set(tab.target, savedRef.current);
         }
 
         registerEditorModel(tab.id, () => {
@@ -203,7 +216,7 @@ export function Editor({
 
         changeSubscription = model.onDidChangeContent(() => {
           contentRef.current = model.getValue();
-          markDirty(tab.id, true);
+          markDirty(tab.id, contentRef.current !== savedRef.current);
         });
         saveAction = editor.addAction({
           id: "catalyst.save-file",
@@ -279,6 +292,8 @@ export function Editor({
           () => null,
         );
         contentRef.current = next;
+        savedRef.current = next;
+        lastSavedByPath.set(tab.target, next);
         markDirty(tab.id, false);
         setDiskChanged(false);
       } catch {
