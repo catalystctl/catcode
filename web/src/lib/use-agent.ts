@@ -256,6 +256,7 @@ export function useAgent(): AgentApi {
             s.pendingUndo && snap.messages.length > s.messages.length;
           return {
             ...snap,
+            goalStepFinals: snap.goalStepFinals ?? {},
             pendingUndo: undoInFlight || snap.pendingUndo,
             messages: undoInFlight ? s.messages : snap.messages,
             thinkingLevel: t ?? snap.thinkingLevel,
@@ -1002,7 +1003,10 @@ export function useAgent(): AgentApi {
     [post, effortFor],
   );
   const cancelGoal = useCallback(() => fire({ type: "cancel_goal" }), [fire]);
-  const approveGoalPlan = useCallback(() => fire({ type: "approve_goal_plan" }), [fire]);
+  const approveGoalPlan = useCallback(() => {
+    setState((s) => reduce(s, { type: "_goal_approve_optimistic" }));
+    return fire({ type: "approve_goal_plan" });
+  }, [fire]);
   const goalStatus = useCallback(() => fire({ type: "goal_status" }), [fire]);
   const reviseGoal = useCallback(
     async (feedback: string) => {

@@ -25,6 +25,8 @@ export interface IdeContextValue {
   ide: IdeApi;
   /** Opens application settings from any IDE panel or command surface. */
   openSettings: () => void;
+  /** Opens the project/workspace switcher (chat-only chrome needs this too). */
+  openProjects: () => void;
   /** Append text (and optional image) to the docked chat composer. */
   attachToChat: AttachToChatFn;
   /** ChatInner registers its composer bridge here on mount. */

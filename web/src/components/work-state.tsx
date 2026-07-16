@@ -13,6 +13,8 @@
 // text belonging to the content area — a status line, not a toolbar. The goal
 // is the hero (brightest, largest); doing/next demote to quiet chips; raw
 // `last_activity` (a bare tool-call string) is intentionally not surfaced.
+// After a goal completes, completed steps stay in `done` so the feed does not
+// go empty when in_progress/next clear.
 
 import type { WorkState as WorkStateData } from "@/lib/types";
 
@@ -20,13 +22,21 @@ interface Props {
   ws: WorkStateData;
 }
 
-function Chip({ children, tone }: { children: React.ReactNode; tone?: "active" | "next" }) {
+function Chip({
+  children,
+  tone,
+}: {
+  children: React.ReactNode;
+  tone?: "active" | "next" | "done";
+}) {
   // Tinted badges, no borders — calmer than the old outlined chips and on-system
   // with the settings panel's `bg-accent/15` accent badges.
   const cls =
     tone === "active"
       ? "bg-accent/10 text-accent-soft"
-      : "bg-ink-800/50 text-ink-500";
+      : tone === "done"
+        ? "bg-success/10 text-success"
+        : "bg-ink-800/50 text-ink-500";
   return (
     <li
       className={`flex max-w-[200px] items-center gap-1 truncate rounded px-1.5 py-0.5 text-[11px] leading-none ${cls}`}
@@ -38,33 +48,66 @@ function Chip({ children, tone }: { children: React.ReactNode; tone?: "active" |
 }
 
 export function WorkStatePanel({ ws }: Props) {
+  // Keep the feed after a goal completes: completed steps live in `done`, and
+  // in_progress/next go empty — without counting `done`, the strip vanishes.
   const hasContent =
-    ws.goal ||
+    !!ws.goal ||
+    ws.done.length > 0 ||
     ws.in_progress.length > 0 ||
     ws.next.length > 0 ||
     ws.recent_files.length > 0;
   if (!hasContent) return null;
 
+  const goalComplete =
+    ws.done.length > 0 &&
+    ws.in_progress.length === 0 &&
+    ws.next.length === 0;
+  const doneCap = goalComplete ? 6 : 3;
+
   return (
     <div className="mx-auto max-w-3xl px-4 sm:px-6">
       {/* A single faint hairline anchors the line as a status strip without the
           heavy boxed surface that made it read as a second header. */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-ink-900/60 pb-2.5 pt-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-ink-900/50 pb-2 pt-2.5">
         {/* goal — the hero. One accent dot, no label. */}
         {ws.goal && (
           <div className="flex min-w-0 items-center gap-2">
-            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent/80" aria-hidden />
-            <span className="truncate text-[13px] text-ink-200" title={ws.goal}>
+            <span
+              className={`h-1.5 w-1.5 shrink-0 rounded-full ${goalComplete ? "bg-success/80" : "bg-accent/80"}`}
+              aria-hidden
+            />
+            <span className="truncate text-[13px] font-medium leading-snug text-ink-100" title={ws.goal}>
               {ws.goal}
             </span>
+            {goalComplete && (
+              <span className="shrink-0 font-mono text-[10px] uppercase tracking-wide text-success">
+                done
+              </span>
+            )}
           </div>
+        )}
+
+        {/* done — completed steps stay visible after the goal finishes. */}
+        {ws.done.length > 0 && (
+          <ul className="flex min-w-0 flex-wrap items-center gap-1">
+            {ws.done.slice(0, doneCap).map((s, i) => (
+              <Chip key={`done-${i}`} tone="done">
+                {s}
+              </Chip>
+            ))}
+            {ws.done.length > doneCap && (
+              <li className="self-center text-[11px] text-ink-600">
+                +{ws.done.length - doneCap}
+              </li>
+            )}
+          </ul>
         )}
 
         {/* doing — live progress, accent-tinted chips. */}
         {ws.in_progress.length > 0 && (
           <ul className="flex min-w-0 flex-wrap items-center gap-1">
             {ws.in_progress.slice(0, 4).map((s, i) => (
-              <Chip key={i} tone="active">
+              <Chip key={`doing-${i}`} tone="active">
                 {s}
               </Chip>
             ))}
@@ -82,7 +125,7 @@ export function WorkStatePanel({ ws }: Props) {
             </span>
             <ul className="flex flex-wrap items-center gap-1">
               {ws.next.slice(0, 4).map((s, i) => (
-                <Chip key={i}>{s}</Chip>
+                <Chip key={`next-${i}`}>{s}</Chip>
               ))}
               {ws.next.length > 4 && (
                 <li className="self-center text-[11px] text-ink-600">+{ws.next.length - 4}</li>

@@ -9,6 +9,8 @@ import { BrainIcon, ChevronRight } from "./icons";
 export function Thinking({ text, active }: { text: string; active?: boolean }) {
   const [open, setOpen] = useState(false);
   const autoOpenedRef = useRef(false);
+  const userToggledRef = useRef(false);
+  const wasActiveRef = useRef(!!active);
   // Default open once when reasoning text arrives during an active stream.
   useEffect(() => {
     if (active && text && !autoOpenedRef.current) {
@@ -16,6 +18,13 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
       autoOpenedRef.current = true;
     }
   }, [active, text]);
+  // Collapse when the stream ends unless the user manually opened/kept it open.
+  useEffect(() => {
+    if (wasActiveRef.current && !active && !userToggledRef.current) {
+      setOpen(false);
+    }
+    wasActiveRef.current = !!active;
+  }, [active]);
 
   if (!text && !active) return null;
   const showShimmer = active && !text;
@@ -23,7 +32,10 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
   return (
     <div className="my-2">
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          userToggledRef.current = true;
+          setOpen((o) => !o);
+        }}
         aria-expanded={open}
         className="flex items-center gap-2 text-[12px] text-ink-400 transition-colors hover:text-ink-200"
       >

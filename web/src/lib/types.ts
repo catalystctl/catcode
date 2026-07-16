@@ -459,6 +459,17 @@ export type CoreEvent =
   | { type: "audit"; tool: string; decision: string; actor: string }
   | ({ type: "cost_update" } & CostUpdate)
   | { type: "goal_step_verdict"; ok: boolean; output: string }
+  | {
+      type: "goal_step_complete";
+      step_id: string;
+      title?: string;
+      agent?: string;
+      ok?: boolean;
+      status?: string;
+      summary?: string;
+      run_id?: string;
+    }
+  | { type: "goal_completion_summary"; text?: string; summary?: string }
   | { type: "search_key_set"; provider: string; has_key: boolean }
   | { type: "plugin_commands"; commands: unknown[] }
   | { type: "plugin_status"; plugin: string; text: string }
@@ -550,7 +561,7 @@ export type CoreEvent =
   // ── Goal mode ──
   | ({ type: "goal_state" } & GoalModeState)
   | ({ type: "goal_plan" } & GoalPlan)
-  | { type: "goal_phase"; from: string; to: string; message?: string }
+  | { type: "goal_phase"; from: string; to: string; message?: string; wave?: number; step_count?: number; done_count?: number }
   // ── Skills ──
   | { type: "skills"; skills: SkillInfo[] };
 
@@ -665,7 +676,8 @@ export type SyntheticEvent =
   // A custom session title was set/removed (web-layer rename overlay).
   | { type: "_session_title"; name: string; title: string }
   /** Client-side undo: drop the last turn locally; next `reset` keeps messages. */
-  | { type: "_undo_local" };
+  | { type: "_undo_local" }
+  | { type: "_goal_approve_optimistic" };
 
 export type AgentEvent = CoreEvent | SyntheticEvent;
 
@@ -737,7 +749,22 @@ export interface BashMsg {
   ts: number;
 }
 
-export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg;
+/** Lasting goal-progress card in the transcript (not toast-only). */
+export interface GoalMsg {
+  id: string;
+  role: "goal";
+  kind: "step_complete" | "phase" | "completion_summary" | "verdict";
+  title: string;
+  text: string;
+  ok?: boolean;
+  stepId?: string;
+  status?: string;
+  agent?: string;
+  runId?: string;
+  ts: number;
+}
+
+export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg | GoalMsg;
 
 export interface Toast {
   id: string;
@@ -837,6 +864,20 @@ export interface AgentState {
   searchKeys: Record<string, boolean>;
   /** Last goal wave verifier result. */
   lastGoalVerdict: { ok: boolean; output: string } | null;
+  /** Per-step finals keyed by step_id — durable for GoalProgressPanel. */
+  goalStepFinals: Record<
+    string,
+    {
+      stepId: string;
+      title: string;
+      agent: string;
+      ok: boolean;
+      status: string;
+      summary: string;
+      runId?: string;
+      ts: number;
+    }
+  >;
   /** True while the bridge is (re)spawning the core after a workspace switch. */
   switching: boolean;
   /** True when the core has a one-deep follow-up/steer queued behind the live turn. */
@@ -1048,4 +1089,6 @@ export interface IdeLayoutState {
   preview: PreviewState;
   /** File-tree expanded directory paths (set, persisted across reloads). */
   expandedDirs: string[];
+  /** Shell chrome mode. Distinct from ephemeral focusMode (editor zen). */
+  uiMode: "ide" | "chat";
 }

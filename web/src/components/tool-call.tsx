@@ -4,19 +4,28 @@
 // (syntax-highlighted JSON) + the execution result (mono, scrollable, with an
 // optional diff pane). Shows a spinner while awaiting the result.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { UIToolCall } from "@/lib/types";
 import { isDangerousTool, prettyArgs, toolIcon, truncate } from "@/lib/format";
 import { ChevronRight, CheckIcon, XIcon, CopyIcon } from "./icons";
 import { Diff } from "./diff";
 
 export function ToolCallCard({ tc }: { tc: UIToolCall }) {
-  const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const danger = isDangerousTool(tc.name);
   const running = !tc.result;
   const ok = tc.result?.ok;
   const unknown = tc.result?.unknown;
+  const isError = !!tc.result && !ok && !unknown;
+  const [open, setOpen] = useState(running || isError);
+  const [copied, setCopied] = useState(false);
+  const userToggledRef = useRef(false);
+  const danger = isDangerousTool(tc.name);
+
+  // Auto-expand while running; keep errors expanded; collapse successes unless user toggled.
+  useEffect(() => {
+    if (userToggledRef.current) return;
+    if (running || isError) setOpen(true);
+    else setOpen(false);
+  }, [running, isError]);
 
   const copy = () => {
     navigator.clipboard?.writeText(tc.result?.output ?? "").then(
@@ -31,7 +40,10 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   return (
     <div className="my-1.5 overflow-hidden rounded-lg border border-ink-800 bg-ink-925/40">
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          userToggledRef.current = true;
+          setOpen((o) => !o);
+        }}
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-ink-850/60"
       >
@@ -101,7 +113,8 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
                   ok || unknown ? "text-ink-200" : "text-danger"
                 }`}
               >
-                {tc.result.output || "(no output)"}
+                {tc.result.output ||
+                  (tc.name === "finish" ? "This turn has finished" : "(no output)")}
               </pre>
             </div>
           )}

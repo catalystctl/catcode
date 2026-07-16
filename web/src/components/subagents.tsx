@@ -151,6 +151,8 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
   const argStr = item.args ? prettyArgs(item.args) : "";
   const showArgs = argStr && argStr !== "{}";
   const out = item.result ?? "";
+  const displayOut =
+    out || (!pending && name === "finish" ? "This turn has finished" : "");
 
   return (
     <div className="mt-3 rounded-lg border border-ink-800 bg-ink-950/40">
@@ -195,9 +197,9 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
           <code>{argStr}</code>
         </pre>
       )}
-      {out && (
+      {displayOut && (
         <pre className="mx-3 mb-3 mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded border border-ink-800 bg-ink-950 p-2 text-[11.5px] leading-relaxed text-ink-400">
-          <code>{out}</code>
+          <code>{displayOut}</code>
         </pre>
       )}
     </div>
@@ -233,6 +235,16 @@ function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }
         </div>
         {run.task && (
           <p className="mt-1.5 line-clamp-2 text-[12px] leading-relaxed text-ink-300">{run.task}</p>
+        )}
+        {run.state !== "running" && run.summary && (
+          <div className="mt-2 rounded-lg border border-ink-800 bg-ink-950/60 px-2.5 py-2">
+            <div className="font-mono text-[10px] uppercase tracking-wide text-ink-500">
+              final
+            </div>
+            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed text-ink-200">
+              {run.summary}
+            </pre>
+          </div>
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">

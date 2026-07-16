@@ -49,13 +49,13 @@ export function CommandPalette({ open, items, onClose, onQueryChange }: {
     item.run();
   };
   return (
-    <div className="fixed inset-0 z-[90] flex justify-center bg-black/55 px-4 pt-[12vh] backdrop-blur-[2px]" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-[90] flex justify-center bg-black/55 px-4 pt-[12vh] backdrop-blur-[2px] animate-fade-in" onMouseDown={onClose}>
       <div
         ref={trapRef}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
-        className="flex h-fit max-h-[min(34rem,72vh)] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-700 bg-ink-925 shadow-2xl"
+        className="flex h-fit max-h-[min(34rem,72vh)] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-700 bg-ink-925 shadow-2xl shadow-black/50"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <label className="flex h-12 shrink-0 items-center gap-3 border-b border-ink-800 px-4">
@@ -90,7 +90,7 @@ export function CommandPalette({ open, items, onClose, onQueryChange }: {
               aria-selected={selected === index}
               onMouseEnter={() => setSelected(index)}
               onClick={() => choose(item)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${selected === index ? "bg-accent/15 text-ink-100" : "text-ink-300 hover:bg-ink-850"}`}
+              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors ${selected === index ? "bg-accent/15 text-ink-100" : "text-ink-300 hover:bg-ink-850"}`}
             >
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm">{item.label}</span>

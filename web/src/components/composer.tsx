@@ -343,6 +343,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   }, []);
 
   const submit = useCallback(() => {
+    if (hitlOpen) return;
     const t = text.trim();
     if (!t && images.length === 0) return;
     if (!connected) return;
@@ -397,15 +398,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     onPrompt(t, imgs);
     setText("");
     closeFlyouts();
-  }, [text, images, connected, canSend, onCommand, onPrompt, onSkill, onBash, closeFlyouts]);
+  }, [text, images, connected, canSend, onCommand, onPrompt, onSkill, onBash, closeFlyouts, hitlOpen]);
 
   const submitSteer = useCallback(() => {
+    if (hitlOpen) return;
     const t = text.trim();
     if (!t || !streaming) return;
     onSteer(t);
     setText("");
     closeFlyouts();
-  }, [text, streaming, onSteer, closeFlyouts]);
+  }, [text, streaming, onSteer, closeFlyouts, hitlOpen]);
 
   // Run a command from the flyout by action key.
   const runCommand = useCallback(
@@ -551,7 +553,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const trimmed = text.trim();
   const isSlashOrBang = trimmed.startsWith("/") || trimmed.startsWith("!");
   // Slash/bang commands work without a selected model; normal prompts need canSend.
-  const disabled = !connected || (!canSend && !isSlashOrBang);
+  const disabled = hitlOpen || !connected || (!canSend && !isSlashOrBang);
   const flyoutOpen = cmdOpen || fileOpen;
   const referencedFiles = [...new Set(Array.from(text.matchAll(/(?:^|\s)@([^\s]+)/g), (match) => match[1]))];
 
@@ -561,7 +563,33 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   return (
     <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
-      <div className="mx-auto max-w-3xl">
+      <div className={`mx-auto ${compact ? "max-w-none" : "max-w-3xl"}`}>
+        {hitlOpen && (
+          <p className="mb-1.5 px-1 text-[11px] text-accent-soft" role="status">
+            Answer the request above to continue
+          </p>
+        )}
+        {followUpQueued && (
+          <div className="mb-1.5 flex items-center gap-1.5 px-1">
+            <span
+              className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[11px] font-medium text-accent-soft"
+              title="A follow-up is queued for after this turn"
+            >
+              queued
+              {onClearQueue && (
+                <button
+                  type="button"
+                  onClick={onClearQueue}
+                  className="ml-0.5 text-ink-400 hover:text-ink-100"
+                  title="Clear queue (Esc)"
+                  aria-label="Clear queued follow-up"
+                >
+                  ×
+                </button>
+              )}
+            </span>
+          </div>
+        )}
         {(activeFile || referencedFiles.length > 0) && (
           <div className="mb-1.5 flex min-w-0 flex-wrap items-center gap-1.5 px-1" aria-label="Prompt context">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-600">Context</span>
@@ -647,7 +675,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                   <>
                     <button
                       onClick={submit}
-                      disabled={!connected || (!canSend && !(text.trim().startsWith("/") || text.trim().startsWith("!")))}
+                      disabled={hitlOpen || !connected || (!canSend && !(text.trim().startsWith("/") || text.trim().startsWith("!")))}
                       className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
                       title="Queue follow-up (Enter)"
                     >
@@ -655,7 +683,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                     </button>
                     <button
                       onClick={submitSteer}
-                      disabled={!connected || !canSend}
+                      disabled={hitlOpen || !connected || !canSend}
                       className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3.5 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
                       title="Steer in-flight turn (Ctrl+Enter)"
                     >
@@ -688,27 +716,6 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             <span className="font-mono">{modelLabel}</span>
             <span className="text-ink-600">·</span>
             <span>think: {thinkingLevel}</span>
-            {followUpQueued && (
-              <>
-                <span className="text-ink-600">·</span>
-                <span
-                  className="inline-flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent-soft"
-                  title="A follow-up is queued for after this turn"
-                >
-                  queued
-                  {onClearQueue && (
-                    <button
-                      type="button"
-                      onClick={onClearQueue}
-                      className="ml-0.5 text-ink-400 hover:text-ink-100"
-                      title="Clear queue (Esc)"
-                    >
-                      ×
-                    </button>
-                  )}
-                </span>
-              </>
-            )}
             {flyoutOpen && (
               <>
                 <span className="text-ink-600">·</span>

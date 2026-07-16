@@ -5,7 +5,7 @@
 // auto-scroll, the empty-state hero, the API-key overlay, theme toggle,
 // message edit/regenerate, transcript export, and the slash-command dispatch.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAgent, type AgentApi } from "@/lib/use-agent";
 import { useIdeContext } from "@/lib/ide-context";
 import { basename } from "@/lib/format";
@@ -24,14 +24,14 @@ import { SubagentsPanel } from "./subagents";
 import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
 import { HelpModal } from "./help-modal";
-import { GoalModal, GoalPlanBanner, GoalStatusChip } from "./goal-modal";
+import { GoalModal, GoalPlanBanner, GoalProgressPanel } from "./goal-modal";
 import { ProviderLoginModal } from "./provider-login-modal";
 import { DiagnosticsModal } from "./diagnostics-modal";
 import { ErrorBoundary } from "./error-boundary";
 import { AppDialogHost, useAppDialog } from "./app-dialog";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { SparkIcon, ShieldIcon, SendIcon } from "./icons";
+import { SparkIcon, ShieldIcon, SendIcon, BrandMark } from "./icons";
 
 const EXAMPLES = [
   { label: "Build", detail: "Create a feature", prompt: "Build a useful feature for this project. First inspect the existing patterns, then implement and test it." },
@@ -81,7 +81,7 @@ function lsSet(k: string, v: string): void {
 }
 
 export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean }) {
-  const { openSettings, ide, registerAttachToChat } = useIdeContext();
+  const { openSettings, openProjects, ide, registerAttachToChat } = useIdeContext();
   const { state } = agent;
   const { confirm, prompt, dialog } = useAppDialog();
   const dialogApi = useRef({ confirm, prompt });
@@ -159,7 +159,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
       return;
     }
     document.documentElement.setAttribute("data-theme", theme);
-    lsSet("umans:theme", theme);
+    lsSet("catalyst:theme", theme);
   }, [theme]);
 
   // Re-fetch goal status once the core is ready (covers reconnect / mid-goal resume).
@@ -181,11 +181,23 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
 
   // Stick to bottom while streaming / new messages — exclude HITL gates so
   // they don't fight the user by yanking the viewport to the end.
+  // streamTick tracks in-message deltas (tokens / tool args) that don't change array identity.
+  const streamTick = useMemo(() => {
+    const last = state.messages[state.messages.length - 1];
+    if (!last || last.role !== "assistant") return 0;
+    const tools = last.toolCalls ?? [];
+    let toolWeight = tools.length * 1000;
+    for (const tc of tools) {
+      toolWeight += (tc.argString?.length ?? 0) + (tc.result?.output?.length ?? 0);
+    }
+    return (last.text?.length ?? 0) + (last.thinking?.length ?? 0) + toolWeight;
+  }, [state.messages]);
+
   useEffect(() => {
     if (!autoScroll) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [state.messages, state.goalMode, state.goalPlan, autoScroll]);
+  }, [state.messages, state.goalMode, state.goalPlan, autoScroll, streamTick]);
 
   // When a HITL gate appears: stop stick-to-bottom and bring the gate into view.
   useEffect(() => {
@@ -661,7 +673,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         }
       />
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="relative flex min-w-0 flex-1 flex-col">
         <Header
           compact={docked}
           connected={agent.connected}
@@ -686,16 +698,22 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onSetApproval={agent.setApproval}
           onReconnect={agent.reconnect}
           onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          onOpenIde={!docked ? () => ide.setUiMode("ide") : undefined}
+          onOpenSettings={!docked ? openSettings : undefined}
+          onOpenProjects={!docked ? openProjects : undefined}
         />
 
         {state.workState && <WorkStatePanel ws={state.workState} />}
-        {state.streaming && <AgentActivity compact={!!docked} activity={state.workState?.in_progress[0]} hasWorkState={!!state.workState} />}
+        {state.streaming && !state.workState && (
+          <AgentActivity compact={!!docked} activity={undefined} hasWorkState={false} />
+        )}
 
         {/* Messages */}
-        <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto">
+        <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto">
           {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
           {!switching && (
-            <div ref={hitlGateRef} className="mx-auto max-w-3xl">
+            <div ref={hitlGateRef} className={`mx-auto ${docked ? "max-w-none" : "max-w-3xl"}`}>
               {state.pendingApproval && (
                 <div className="mx-4 mb-2 mt-3 sm:mx-6">
                   <Approval approval={state.pendingApproval} onApprove={agent.approve} />
@@ -770,11 +788,11 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 )}
               {state.goalMode &&
                 state.goalMode.phase !== "idle" &&
-                state.goalMode.phase !== "plan_ready" && (
+                (state.goalMode.phase !== "plan_ready" ||
+                  state.goalMode.auto_deploy) && (
                   <div className="mx-4 mb-2 mt-3 sm:mx-6">
-                    <GoalStatusChip
-                      phase={state.goalMode.phase}
-                      goal={state.goalMode.goal}
+                    <GoalProgressPanel
+                      goalMode={state.goalMode}
                       onCancel={() => void agent.cancelGoal()}
                     />
                   </div>
@@ -802,12 +820,13 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
-            <div className="mx-auto max-w-3xl py-4">
+            <div className={`mx-auto py-4 ${docked ? "max-w-none" : "max-w-3xl"}`}>
               <ErrorBoundary label="message list">
                 {state.messages.map((m, i) => (
                   <Message
                     key={m.id}
                     m={m}
+                    compact={!!docked}
                     canEdit={i === lastUserIdx && !state.streaming}
                     canRegenerate={i === lastAssistantIdx && !state.streaming}
                     onEditUser={onEditUser}
@@ -819,14 +838,16 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
             </div>
           )}
 
+        </div>
           {!autoScroll && !empty && !switching && (
             <button
+              type="button"
               onClick={() => {
                 setAutoScroll(true);
                 const el = scrollRef.current;
                 if (el) el.scrollTop = el.scrollHeight;
               }}
-              className="sticky bottom-3 z-10 mx-auto flex items-center gap-1.5 rounded-full border border-ink-700 bg-ink-900/90 px-3 py-1.5 text-[12px] text-ink-200 shadow-lg backdrop-blur hover:bg-ink-850"
+              className="pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-accent/40 bg-ink-900/95 px-3.5 py-1.5 text-[12px] font-medium text-ink-100 shadow-lg shadow-black/40 backdrop-blur hover:border-accent/60 hover:bg-ink-850"
             >
               ↓ Jump to latest
             </button>
@@ -867,7 +888,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         />
       </div>
 
-      <Toasts toasts={state.toasts} onDismiss={agent.dismissToast} />
+      <Toasts toasts={state.toasts} onDismiss={agent.dismissToast} docked={!!docked} />
       <AppDialogHost dialog={dialog} />
 
       {modal === "memory" && (
@@ -977,14 +998,14 @@ function EmptyState({
 }) {
   return (
     <div
-      className={`flex flex-col items-center justify-center text-center ${
+      className={`chat-empty-hero flex flex-col items-center justify-center text-center ${
         adaptive ? "min-h-full px-4 py-5" : "px-6"
       } ${
         compact ? "min-h-0 py-6" : adaptive ? "" : "h-full py-10"
       }`}
     >
-      <div className={`${adaptive ? "mb-3 h-10 w-10 rounded-xl text-xl" : "mb-5 h-16 w-16 rounded-2xl text-3xl"} flex items-center justify-center bg-gradient-to-br from-accent to-accent-deep font-bold text-white shadow-glow`}>
-        c
+      <div className={`${adaptive ? "mb-3" : "mb-5"}`}>
+        <BrandMark size={adaptive ? 40 : 64} className={adaptive ? "rounded-xl" : "rounded-2xl"} />
       </div>
       <h1 className={`${adaptive ? "text-base" : "text-2xl"} font-semibold tracking-tight text-ink-100`}>{adaptive ? "What should we work on?" : "Catalyst Code"}</h1>
       <p className={`${adaptive ? "mt-1 text-[11px]" : "mt-2 text-[14px]"} max-w-md text-ink-400`}>
@@ -1000,7 +1021,7 @@ function EmptyState({
           </>
         )}
       </p>
-      {!switching && (
+      {!switching && !(adaptive && compact) && (
         <div className={`${adaptive ? "mt-4 grid-cols-2 gap-1.5" : "mt-7 gap-2"} grid w-full max-w-lg`}>
           {EXAMPLES.map((ex) => (
             <button

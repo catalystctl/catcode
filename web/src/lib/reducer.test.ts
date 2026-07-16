@@ -740,10 +740,258 @@ describe("core protocol events", () => {
     expect(s.protocolHello?.capabilities).toContain("checkpoints");
   });
 
-  test("goal_step_verdict toasts and stores result", () => {
+  test("goal_step_verdict toasts, stores result, and lasting line", () => {
     const s = ev({ type: "goal_step_verdict", ok: false, output: "tests failed" });
     expect(s.lastGoalVerdict?.ok).toBe(false);
     expect(s.toasts.some((t) => t.kind === "error")).toBe(true);
+    expect(s.messages.some((m) => m.role === "goal" && m.kind === "verdict")).toBe(true);
+  });
+
+  test("goal_step_complete appends lasting message and stores final", () => {
+    const s = ev({
+      type: "goal_step_complete",
+      step_id: "s1",
+      title: "Implement X",
+      agent: "worker",
+      ok: true,
+      status: "done",
+      summary: "Implemented X cleanly.",
+      run_id: "r1",
+    });
+    expect(s.goalStepFinals.s1?.summary).toContain("Implemented X");
+    const card = s.messages.find((m) => m.role === "goal" && m.kind === "step_complete");
+    expect(card).toBeTruthy();
+    if (card && card.role === "goal") {
+      expect(card.text).toContain("Implemented X");
+      expect(card.stepId).toBe("s1");
+    }
+  });
+
+  test("goal_step_complete dedupes when goal_state also reports the step", () => {
+    let s = ev({
+      type: "goal_step_complete",
+      step_id: "s1",
+      title: "A",
+      agent: "worker",
+      ok: true,
+      status: "done",
+      summary: "done via event",
+    });
+    s = reduce(s, {
+      type: "goal_state",
+      id: "g1",
+      goal: "ship it",
+      phase: "running",
+      concurrency: 2,
+      max_tasks: 8,
+      allowed_models: [],
+      allowed_providers: [],
+      auto_deploy: true,
+      prompts: [
+        {
+          step_id: "s1",
+          agent: "worker",
+          title: "A",
+          task: "do A",
+          status: "done",
+          summary: "done via event",
+        },
+      ],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+    } as never);
+    const cards = s.messages.filter((m) => m.role === "goal" && m.kind === "step_complete");
+    expect(cards).toHaveLength(1);
+  });
+
+  test("goal_state backfills lasting step card when discrete event missing", () => {
+    const s = reduce(initialState, {
+      type: "goal_state",
+      id: "g1",
+      goal: "ship it",
+      phase: "running",
+      concurrency: 2,
+      max_tasks: 8,
+      allowed_models: [],
+      allowed_providers: [],
+      auto_deploy: true,
+      prompts: [
+        {
+          step_id: "s2",
+          agent: "reviewer",
+          title: "Review",
+          task: "review",
+          status: "done",
+          summary: "Looks good",
+        },
+      ],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+    } as never);
+    expect(s.goalStepFinals.s2?.summary).toBe("Looks good");
+    expect(s.messages.some((m) => m.role === "goal" && m.kind === "step_complete")).toBe(true);
+  });
+
+  test("goal_phase synthesizing adds lasting bridge line", () => {
+    const s = ev({
+      type: "goal_phase",
+      from: "running",
+      to: "synthesizing",
+      message: "writing completion summary",
+    });
+    expect(s.toasts.some((t) => t.message.includes("synthesizing"))).toBe(true);
+    const phaseCard = s.messages.find((m) => m.role === "goal" && m.kind === "phase");
+    expect(phaseCard).toBeTruthy();
+    if (phaseCard && phaseCard.role === "goal") {
+      expect(phaseCard.title).toContain("synthesizing");
+    }
+  });
+
+  test("goal_completion_summary injects lasting completion card", () => {
+    const s = ev({
+      type: "goal_completion_summary",
+      text: "All steps succeeded.\n- A: ok",
+    });
+    const card = s.messages.find((m) => m.role === "goal" && m.kind === "completion_summary");
+    expect(card).toBeTruthy();
+    if (card && card.role === "goal") {
+      expect(card.text).toContain("All steps succeeded");
+    }
+  });
+
+  test("goal_completion_summary empty uses goal stub not step stub", () => {
+    const s = ev({ type: "goal_completion_summary", text: "" });
+    const card = s.messages.find((m) => m.role === "goal" && m.kind === "completion_summary");
+    expect(card).toBeTruthy();
+    if (card && card.role === "goal") {
+      expect(card.text).toContain("Goal finished");
+      expect(card.text).not.toContain("step finished");
+    }
+  });
+
+  test("goal_step_complete verifier remap appends failed update card", () => {
+    let s = ev({
+      type: "goal_step_complete",
+      step_id: "s1",
+      title: "Implement X",
+      agent: "worker",
+      ok: true,
+      status: "done",
+      summary: "Implemented X",
+      run_id: "r1",
+    });
+    s = reduce(s, {
+      type: "goal_step_complete",
+      step_id: "s1",
+      title: "Implement X",
+      agent: "worker",
+      ok: false,
+      status: "failed",
+      summary: "verifier failed: tests red",
+      run_id: "r1",
+    } as never);
+    const cards = s.messages.filter((m) => m.role === "goal" && m.kind === "step_complete");
+    expect(cards.length).toBe(2);
+    const last = cards[cards.length - 1];
+    expect(last && last.role === "goal" && last.status).toBe("failed");
+    expect(last && last.role === "goal" && last.ok).toBe(false);
+    expect(s.goalStepFinals.s1?.status).toBe("failed");
+  });
+
+  test("goal deploy info lines become lasting goal messages", () => {
+    const s = ev({
+      type: "info",
+      message: "Goal plan approved — deploying (snapshotting workspace…)",
+    });
+    expect(s.toasts.some((t) => t.message.includes("approved"))).toBe(true);
+    expect(
+      s.messages.some(
+        (m) => m.role === "goal" && m.kind === "phase" && m.text.includes("approved"),
+      ),
+    ).toBe(true);
+  });
+
+  test("_goal_approve_optimistic arms auto_deploy and lasting card", () => {
+    let s = reduce(initialState, {
+      type: "goal_state",
+      id: "g1",
+      goal: "ship it",
+      phase: "plan_ready",
+      concurrency: 2,
+      max_tasks: 8,
+      allowed_models: [],
+      allowed_providers: [],
+      auto_deploy: false,
+      prompts: [],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+    } as never);
+    s = reduce(s, { type: "_goal_approve_optimistic" });
+    expect(s.goalMode?.auto_deploy).toBe(true);
+    expect(s.streaming).toBe(true);
+    expect(
+      s.messages.some(
+        (m) => m.role === "goal" && String(m.text).includes("Plan approved"),
+      ),
+    ).toBe(true);
+  });
+
+  test("subagent_done injects final summary into run transcript when empty", () => {
+    let s = reduce(initialState, {
+      type: "subagent_start",
+      run_id: "run-a",
+      mode: "single",
+      agent: "worker",
+      task: "do work",
+      started_at: 1,
+    } as never);
+    s = reduce(s, {
+      type: "subagent_done",
+      run_id: "run-a",
+      state: "completed",
+      summary: "Finished the task.",
+      ended_at: 2,
+    } as never);
+    const run = s.subagentRuns["run-a"];
+    expect(run.summary).toBe("Finished the task.");
+    expect(
+      run.items.some((it) => it.kind === "message" && String(it.content).includes("Finished")),
+    ).toBe(true);
+  });
+
+  test("finish tool_result keeps non-empty FINISH_MESSAGE", () => {
+    let s = reduce(initialState, { type: "_user", text: "hi" } as never);
+    s = reduce(s, { type: "delta", text: "working" } as never);
+    s = reduce(s, {
+      type: "tool_call",
+      id: "tc1",
+      name: "finish",
+      args: "{}",
+    } as never);
+    s = reduce(s, {
+      type: "tool_result",
+      id: "tc1",
+      ok: true,
+      output: "This turn has finished",
+    } as never);
+    const withFinish = s.messages.some((m) => {
+      if (m.role === "assistant") {
+        return m.toolCalls.some(
+          (tc) => tc.name === "finish" && (tc.result?.output ?? "").includes("finished"),
+        );
+      }
+      if (m.role === "tool") {
+        return m.toolName === "finish" && m.output.includes("finished");
+      }
+      return false;
+    });
+    expect(withFinish).toBe(true);
   });
 
   test("session_pinned updates session list", () => {

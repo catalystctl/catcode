@@ -261,3 +261,38 @@ export const FileIcon = (p: P) => (
     <path d="M14 2v6h6" />
   </svg>
 );
+
+/** Compact brand mark — lowercase "c" in a rounded tile. */
+export function BrandMark({
+  size = 20,
+  className = "",
+}: {
+  size?: number;
+  className?: string;
+}) {
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center justify-center rounded-md bg-accent/10 font-display font-semibold text-accent-soft ring-1 ring-accent/25 ${className}`}
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.58) }}
+      aria-hidden
+    >
+      c
+    </span>
+  );
+}
+
+/** Layout toggle — IDE panes (for activity bar / palette). */
+export const LayoutIdeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="3" y="3" width="7" height="18" rx="1" />
+    <rect x="12" y="3" width="9" height="8" rx="1" />
+    <rect x="12" y="13" width="9" height="8" rx="1" />
+  </svg>
+);
+
+/** Layout toggle — chat-focused (message bubble). */
+export const LayoutChatIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+  </svg>
+);

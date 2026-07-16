@@ -19,6 +19,8 @@ import {
   FolderIcon,
   MenuIcon,
   RefreshIcon,
+  LayoutIdeIcon,
+  BoltIcon,
 } from "./icons";
 
 interface Props {
@@ -48,6 +50,12 @@ interface Props {
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
   onReconnect?: () => void;
   onToggleTheme?: () => void;
+  /** When chat-only: open full IDE chrome without remounting the agent. */
+  onOpenIde?: () => void;
+  /** Chat-only: open Settings (activity bar is hidden in this mode). */
+  onOpenSettings?: () => void;
+  /** Chat-only: open project switcher (activity bar is hidden in this mode). */
+  onOpenProjects?: () => void;
 }
 
 const ALL_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
@@ -247,6 +255,45 @@ export function Header(props: Props) {
                   </button>
                 ))}
               </div>
+              {props.onOpenIde && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    props.onOpenIde?.();
+                    setConfigOpen(false);
+                  }}
+                  className="mt-2 flex w-full items-center gap-2 border-t border-ink-800 px-2 pt-2 text-[11px] text-ink-300 hover:text-ink-100"
+                >
+                  <LayoutIdeIcon width={13} height={13} className="text-accent-soft" />
+                  Open IDE
+                </button>
+              )}
+              {props.onOpenProjects && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    props.onOpenProjects?.();
+                    setConfigOpen(false);
+                  }}
+                  className="mt-2 flex w-full items-center gap-2 border-t border-ink-800 px-2 pt-2 text-[11px] text-ink-300 hover:text-ink-100"
+                >
+                  <FolderIcon width={13} height={13} className="text-accent-soft" />
+                  Switch project
+                </button>
+              )}
+              {props.onOpenSettings && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    props.onOpenSettings?.();
+                    setConfigOpen(false);
+                  }}
+                  className="mt-2 flex w-full items-center gap-2 border-t border-ink-800 px-2 pt-2 text-[11px] text-ink-300 hover:text-ink-100"
+                >
+                  <BoltIcon width={13} height={13} className="text-accent-soft" />
+                  Settings
+                </button>
+              )}
               {props.onToggleTheme && (
                 <button role="menuitem" onClick={props.onToggleTheme} className="mt-2 flex w-full items-center justify-between border-t border-ink-800 px-2 pt-2 text-[11px] text-ink-300 hover:text-ink-100">
                   <span>Appearance</span><span className="capitalize text-ink-500">{props.theme ?? "dark"}</span>
@@ -278,6 +325,40 @@ export function Header(props: Props) {
               </span>
             )}
           </div>
+        )}
+        {props.onOpenIde && (
+          <button
+            type="button"
+            onClick={props.onOpenIde}
+            className="flex items-center gap-1.5 rounded-md border border-ink-700/70 bg-ink-900/70 px-2 py-1.5 text-[11px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850 hover:text-ink-100"
+            title="Open IDE layout"
+            aria-label="Open IDE layout"
+          >
+            <LayoutIdeIcon width={13} height={13} className="text-accent-soft" />
+            <span className="hidden sm:inline">Open IDE</span>
+          </button>
+        )}
+        {props.onOpenProjects && (
+          <button
+            type="button"
+            onClick={props.onOpenProjects}
+            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
+            title="Switch project"
+            aria-label="Switch project"
+          >
+            <FolderIcon width={14} height={14} />
+          </button>
+        )}
+        {props.onOpenSettings && (
+          <button
+            type="button"
+            onClick={props.onOpenSettings}
+            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
+            title="Settings"
+            aria-label="Settings"
+          >
+            <BoltIcon width={14} height={14} />
+          </button>
         )}
         {/* Theme toggle */}
         {props.onToggleTheme && !props.compact && (

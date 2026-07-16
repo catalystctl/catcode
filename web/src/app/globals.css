@@ -152,6 +152,43 @@ body {
   animation: caret-blink 1.1s steps(1) infinite;
 }
 
+/* Ensure raw CSS animations resolve even when Tailwind utilities are tree-shaken. */
+@keyframes caret-blink {
+  0%, 70%, 100% { opacity: 1; }
+  20%, 50% { opacity: 0; }
+}
+@keyframes fade-in {
+  0% { opacity: 0; transform: translateY(4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* Chat panel stacking — absolute toasts / flyouts anchor inside the panel. */
+.chat-panel {
+  position: relative;
+  isolation: isolate;
+}
+.chat-panel .chat-toasts {
+  position: absolute;
+  z-index: 40;
+}
+
+/* Shared motion tokens for soft chrome transitions (layout toggle / docks). */
+:root {
+  --motion-fast: 120ms;
+  --motion-med: 180ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+.chrome-fade {
+  transition:
+    opacity var(--motion-med) var(--ease-out),
+    transform var(--motion-med) var(--ease-out);
+}
+
+/* Empty-state hero atmosphere (full-bleed chat); keep sparse. */
+.chat-empty-hero {
+  animation: fade-in 0.28s var(--ease-out);
+}
+
 /* ── Subtle grid backdrop for the app shell ─────────────────────────────── */
 .bg-grid {
   background-image:
@@ -200,11 +237,15 @@ body {
   .animate-ping,
   .animate-bounce,
   .animate-pulse,
-  .animate-caret-blink {
+  .animate-caret-blink,
+  .chat-empty-hero {
     animation: none !important;
   }
   .stream-caret::after {
     animation: none;
+  }
+  .chrome-fade {
+    transition: none !important;
   }
 }
 

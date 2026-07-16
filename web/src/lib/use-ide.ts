@@ -46,6 +46,7 @@ const PERSISTED: (keyof IdeLayoutState)[] = [
   // Terminal tabs are per-project and reattach to server PTYs after refresh.
   "terminals",
   "activeTerminalId",
+  "uiMode",
 ];
 
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -95,6 +96,7 @@ const DEFAULTS: IdeLayoutState = {
   gitStatus: null,
   preview: { kind: "none", target: "" },
   expandedDirs: [],
+  uiMode: "ide",
 };
 
 function loadPersisted(key: string): Partial<IdeLayoutState> {
@@ -117,6 +119,10 @@ function loadPersisted(key: string): Partial<IdeLayoutState> {
       (parsed as IdeLayoutState).activeTerminalId,
       terminals,
     );
+    // Invalid / missing uiMode falls through to DEFAULTS via shallow merge.
+    if (out.uiMode !== "ide" && out.uiMode !== "chat") {
+      delete out.uiMode;
+    }
     return out;
   } catch {
     return {};
@@ -168,6 +174,9 @@ export interface IdeApi {
   // ── tree ──
   toggleDir: (path: string) => void;
   isExpanded: (path: string) => boolean;
+  // ── shell chrome (IDE vs chat-only) ──
+  setUiMode: (mode: "ide" | "chat") => void;
+  toggleUiMode: () => void;
 }
 
 export function useIde(workspace?: string): IdeApi {
@@ -583,6 +592,15 @@ export function useIde(workspace?: string): IdeApi {
     [state.expandedDirs],
   );
 
+  const setUiMode = useCallback((mode: "ide" | "chat") => {
+    if (mode !== "ide" && mode !== "chat") return;
+    setState((s) => (s.uiMode === mode ? s : { ...s, uiMode: mode }));
+  }, []);
+
+  const toggleUiMode = useCallback(() => {
+    setState((s) => ({ ...s, uiMode: s.uiMode === "chat" ? "ide" : "chat" }));
+  }, []);
+
   // Memoize the returned api object so its identity is stable across renders
   // unless the state (or a state-derived callback) actually changed. The panels
   // (editor.tsx, git-panel.tsx) list `ide` in their useEffect deps; without this,
@@ -623,10 +641,14 @@ export function useIde(workspace?: string): IdeApi {
       setPreview,
       toggleDir,
       isExpanded,
+      setUiMode,
+      toggleUiMode,
     }),
     [
       state,
       isExpanded,
+      setUiMode,
+      toggleUiMode,
       setActivePanel,
       togglePanel,
       toggleSidebar,

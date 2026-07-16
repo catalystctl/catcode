@@ -9,7 +9,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AskPrompt, AskQuestion } from "@/lib/types";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { CheckIcon, SendIcon, XIcon, PencilIcon } from "./icons";
+import { CheckIcon, HelpIcon, SendIcon, XIcon, PencilIcon } from "./icons";
 
 interface Props {
   prompt: AskPrompt;
@@ -117,7 +117,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
       aria-label="Agent questions"
     >
       <div className="flex items-center gap-2 border-b border-accent/15 px-4 py-2.5">
-        <span className="text-[15px] leading-none">❓</span>
+        <HelpIcon width={15} height={15} className="shrink-0 text-accent-soft" aria-hidden />
         <span className="text-sm font-semibold text-ink-100">
           {prompt.questions.length === 1
             ? "The agent has a question"

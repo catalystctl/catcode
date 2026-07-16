@@ -7,7 +7,7 @@
 // toggles copilotVisible — the Chat dock itself is hosted by IdeShell, not here.
 
 import { useIdeContext } from "@/lib/ide-context";
-import { BoltIcon, FolderIcon, SearchIcon, SparkIcon } from "@/components/icons";
+import { BoltIcon, FolderIcon, SearchIcon, SparkIcon, LayoutChatIcon } from "@/components/icons";
 import { PANELS, PANEL_ORDER } from "./panel-registry";
 import type { IdePanelId } from "@/lib/types";
 
@@ -78,6 +78,16 @@ export function ActivityBar({
       })}
 
       <div className="flex-1" />
+
+      <button
+        type="button"
+        title="Chat layout"
+        aria-label="Switch to chat-only layout"
+        onClick={() => ide.setUiMode("chat")}
+        className="flex h-10 w-10 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800/60 hover:text-ink-200"
+      >
+        <LayoutChatIcon width={20} height={20} />
+      </button>
 
       <button
         type="button"

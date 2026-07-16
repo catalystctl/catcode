@@ -11,12 +11,25 @@ import { CheckIcon, XIcon, WarningIcon } from "./icons";
 
 const TTL = 5000;
 
-export function Toasts({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: string) => void }) {
+export function Toasts({
+  toasts,
+  onDismiss,
+  docked,
+}: {
+  toasts: Toast[];
+  onDismiss: (id: string) => void;
+  /** When true, anchor inside `.chat-panel` instead of the viewport. */
+  docked?: boolean;
+}) {
   return (
     <div
       role="status"
       aria-live="polite"
-      className="pointer-events-none fixed bottom-[calc(6.5rem+env(safe-area-inset-bottom))] left-3 right-3 z-40 flex max-w-sm flex-col gap-2 sm:bottom-24 sm:left-auto sm:right-4 sm:w-80"
+      className={
+        docked
+          ? "chat-toasts pointer-events-none absolute bottom-[4.75rem] left-2 right-2 z-40 flex max-w-sm flex-col gap-2 sm:left-auto sm:right-2 sm:w-72"
+          : "chat-toasts pointer-events-none fixed bottom-[calc(6.5rem+env(safe-area-inset-bottom))] left-3 right-3 z-40 flex max-w-sm flex-col gap-2 sm:bottom-24 sm:left-auto sm:right-4 sm:w-80"
+      }
     >
       {toasts.map((t) => (
         <ToastItem key={t.id} toast={t} onDismiss={onDismiss} />

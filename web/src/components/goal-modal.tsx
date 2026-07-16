@@ -4,7 +4,11 @@
 // concurrency + model/provider allowlists. Advanced: role models + per-model caps.
 
 import { useMemo, useState } from "react";
-import type { ModelInfo, ProviderPreset } from "@/lib/types";
+import type {
+  GoalModeState,
+  ModelInfo,
+  ProviderPreset,
+} from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
@@ -429,6 +433,91 @@ export function GoalPlanBanner({
   );
 }
 
+/** Live goal deploy progress: phase, counts, per-step status + summary. */
+export function GoalProgressPanel({
+  goalMode,
+  onCancel,
+}: {
+  goalMode: GoalModeState;
+  onCancel?: () => void;
+}) {
+  const phase = goalMode.phase;
+  // Show during plan_ready only when auto_deploy is armed (approve / auto path),
+  // so the panel covers the checkpoint→first-wave gap (C1 / M1).
+  if (!phase || phase === "idle") return null;
+  if (phase === "plan_ready" && !goalMode.auto_deploy) return null;
+  const prompts = goalMode.prompts ?? [];
+  const done = prompts.filter((p) =>
+    ["done", "failed", "skipped"].includes(String(p.status).toLowerCase()),
+  ).length;
+  const running = prompts.filter((p) =>
+    ["running", "in_progress", "active"].includes(String(p.status).toLowerCase()),
+  ).length;
+  const short =
+    goalMode.goal.length > 64 ? goalMode.goal.slice(0, 63) + "..." : goalMode.goal;
+
+  const statusClass = (status: string) => {
+    const s = status.toLowerCase();
+    if (s === "failed") return "text-danger";
+    if (s === "done") return "text-success";
+    if (s === "skipped") return "text-ink-500";
+    if (s === "running" || s === "in_progress" || s === "active") return "text-warning";
+    return "text-ink-400";
+  };
+
+  return (
+    <div className="rounded-lg border border-ink-800 bg-ink-925/70 px-3 py-2.5 text-[12px]">
+      <div className="flex items-center gap-2">
+        <span className="font-mono uppercase tracking-wide text-accent-soft">
+          {phase === "plan_ready" && goalMode.auto_deploy ? "starting" : phase}
+        </span>
+        <span className="text-ink-500">
+          {done}/{prompts.length || "?"}
+          {running > 0 ? ` · ${running} running` : ""}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-ink-300">{short}</span>
+        {onCancel && phase !== "failed" && phase !== "done" && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="shrink-0 text-ink-500 hover:text-rose-400"
+          >
+            cancel
+          </button>
+        )}
+      </div>
+      {prompts.length > 0 && (
+        <ul className="mt-2 max-h-48 space-y-1.5 overflow-y-auto border-t border-ink-800/80 pt-2">
+          {prompts.map((p) => {
+            const summary = (p.summary ?? "").trim();
+            const blurb =
+              summary.length > 120 ? summary.slice(0, 119) + "..." : summary;
+            return (
+              <li key={p.step_id} className="leading-snug">
+                <div className="flex items-baseline gap-2">
+                  <span
+                    className={`shrink-0 font-mono text-[10px] uppercase ${statusClass(p.status)}`}
+                  >
+                    {p.status || "pending"}
+                  </span>
+                  <span className="min-w-0 truncate text-ink-200">
+                    <span className="text-ink-500">[{p.agent}]</span> {p.title}
+                  </span>
+                </div>
+                {blurb && (
+                  <div className="ml-[4.5rem] mt-0.5 line-clamp-2 text-[11px] text-ink-500">
+                    {blurb}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** Compact status chip for an active goal. */
 export function GoalStatusChip({
   phase,
@@ -439,13 +528,13 @@ export function GoalStatusChip({
   goal: string;
   onCancel?: () => void;
 }) {
-  if (!phase || phase === "idle" || phase === "done") return null;
+  if (!phase || phase === "idle") return null;
   const short = goal.length > 48 ? goal.slice(0, 47) + "…" : goal;
   return (
     <div className="flex items-center gap-2 rounded-lg border border-ink-800 bg-ink-925/60 px-2.5 py-1 text-[11px]">
       <span className="font-mono uppercase tracking-wide text-accent-soft">{phase}</span>
       <span className="truncate text-ink-300">{short}</span>
-      {onCancel && phase !== "failed" && (
+      {onCancel && phase !== "failed" && phase !== "done" && (
         <button
           type="button"
           onClick={onCancel}

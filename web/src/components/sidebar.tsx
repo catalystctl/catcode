@@ -179,8 +179,10 @@ export function Sidebar(props: Props) {
         suppressHydrationWarning
         className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-[19rem] max-w-[88%] flex-col border-r border-ink-800/80 bg-ink-925/98 shadow-2xl shadow-black/30 backdrop-blur-xl transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto lg:shadow-none"} ${
           props.open
-            ? "translate-x-0"
-            : "-translate-x-full pointer-events-none lg:pointer-events-auto"
+            ? "translate-x-0 pointer-events-auto"
+            : props.embedded
+              ? "-translate-x-full pointer-events-none"
+              : "-translate-x-full pointer-events-none lg:pointer-events-auto"
         }`}
       >
         {/* ── Sessions header ── */}

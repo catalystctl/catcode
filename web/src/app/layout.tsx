@@ -30,7 +30,7 @@ export default function RootLayout({
       <head>
         <script
           dangerouslySetInnerHTML={{
-            __html: `try{var t=localStorage.getItem('umans:theme')||'dark';document.documentElement.setAttribute('data-theme',t)}catch(e){}`,
+            __html: `try{var t=localStorage.getItem('catalyst:theme')||localStorage.getItem('umans:theme')||'dark';if(t!=='dark'&&t!=='light')t='dark';document.documentElement.setAttribute('data-theme',t);try{localStorage.setItem('catalyst:theme',t)}catch(e2){}}catch(e){}`,
           }}
         />
       </head>

@@ -20,6 +20,8 @@ import {
   UserIcon,
   CompactIcon,
   HelpIcon,
+  LayoutIdeIcon,
+  LayoutChatIcon,
 } from "./icons";
 import { ModelPicker } from "./model-picker";
 import { AccountSecurity } from "./account-security";
@@ -47,9 +49,12 @@ interface Props {
   ) => void;
   onRefreshVision?: () => void;
   onClose: () => void;
+  /** Shell chrome mode (IDE vs chat-only). */
+  uiMode?: "ide" | "chat";
+  onSetUiMode?: (mode: "ide" | "chat") => void;
 }
 
-type SectionId = "model" | "agent" | "safety" | "vision" | "account" | "about";
+type SectionId = "appearance" | "model" | "agent" | "safety" | "vision" | "account" | "about";
 
 const SECTIONS: Array<{
   id: SectionId;
@@ -57,6 +62,7 @@ const SECTIONS: Array<{
   hint: string;
   icon: (p: { width?: number; height?: number; className?: string }) => ReactNode;
 }> = [
+  { id: "appearance", label: "Appearance", hint: "Layout & chrome", icon: LayoutIdeIcon },
   { id: "model", label: "Model", hint: "Default model & thinking", icon: ModelIcon },
   { id: "agent", label: "Agent", hint: "Timeouts & compaction", icon: CompactIcon },
   { id: "safety", label: "Safety", hint: "Approvals & sandbox", icon: ShieldIcon },
@@ -333,6 +339,60 @@ export function SettingsModal(props: Props) {
 
           {/* Section body */}
           <div className="min-h-0 flex-1 overflow-y-auto p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-5">
+            {section === "appearance" && (
+              <div className="space-y-5">
+                <SectionHeading
+                  title="Appearance"
+                  desc="Choose full IDE chrome or a chat-only layout. Your conversation stays the same."
+                />
+                <div>
+                  <FieldLabel>Layout</FieldLabel>
+                  <Card>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {(
+                        [
+                          {
+                            id: "ide" as const,
+                            label: "IDE layout",
+                            hint: "Explorer, editor, docks, and docked chat",
+                            Icon: LayoutIdeIcon,
+                          },
+                          {
+                            id: "chat" as const,
+                            label: "Chat only",
+                            hint: "Messages and composer without IDE chrome",
+                            Icon: LayoutChatIcon,
+                          },
+                        ] as const
+                      ).map(({ id, label, hint, Icon }) => {
+                        const active = (props.uiMode ?? "ide") === id;
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            disabled={!props.onSetUiMode}
+                            onClick={() => props.onSetUiMode?.(id)}
+                            aria-pressed={active}
+                            className={`flex items-start gap-3 rounded-xl border px-3 py-3 text-left transition-colors ${
+                              active
+                                ? "border-accent/50 bg-accent/15 text-ink-100"
+                                : "border-ink-800 bg-ink-900/60 text-ink-300 hover:border-ink-700 hover:bg-ink-850"
+                            } disabled:cursor-not-allowed disabled:opacity-50`}
+                          >
+                            <Icon width={18} height={18} className="mt-0.5 shrink-0 text-accent-soft" />
+                            <span className="min-w-0">
+                              <span className="block text-[13px] font-medium">{label}</span>
+                              <span className="mt-0.5 block text-[11px] text-ink-500">{hint}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </Card>
+                </div>
+              </div>
+            )}
+
             {section === "model" && (
               <div className="flex h-full min-h-0 flex-col gap-5">
                 <SectionHeading

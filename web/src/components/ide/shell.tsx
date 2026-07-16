@@ -82,6 +82,13 @@ export function IdeShell() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [focusMode, setFocusMode] = useState(false);
 
+  const chatOnly = ide.state.uiMode === "chat";
+
+  // Chat-only clears editor zen; Esc must not exit uiMode === "chat".
+  useEffect(() => {
+    if (chatOnly && focusMode) setFocusMode(false);
+  }, [chatOnly, focusMode]);
+
   // flushSync so DockDropOverlay is pointer-interactive before the browser
   // fires the next dragover — otherwise Ghostty/iframes cancel the gesture.
   const beginPanelDrag = useCallback((panel: MovablePanelId) => {
@@ -125,8 +132,8 @@ export function IdeShell() {
     attachToChatRef.current = fn ?? (() => {});
   }, []);
   const ctx = useMemo(
-    () => ({ workspace, ide, openSettings, attachToChat, registerAttachToChat }),
-    [workspace, ide, openSettings, attachToChat, registerAttachToChat],
+    () => ({ workspace, ide, openSettings, openProjects, attachToChat, registerAttachToChat }),
+    [workspace, ide, openSettings, openProjects, attachToChat, registerAttachToChat],
   );
 
   useEffect(() => {
@@ -166,27 +173,97 @@ export function IdeShell() {
   }, [paletteOpen, paletteQuery, workspace]);
 
   const paletteItems = useMemo<PaletteItem[]>(() => {
+    const ensureIde = () => {
+      if (ide.state.uiMode !== "ide") ide.setUiMode("ide");
+    };
     const panels: Array<[MovablePanelId | "explorer", string]> = [
       ["explorer", "Explorer"], ["chat", "AI Chat"], ["terminal", "Terminal"],
       ["git", "Source Control"], ["preview", "Preview"], ["screen", "Screen"],
     ];
     return [
       { id: "command:new-chat", label: "New chat", detail: "Start a fresh conversation", group: "Commands", keywords: "session", run: () => void agent.newSession() },
-      ...(!isMobile ? [{ id: "command:focus", label: focusMode ? "Exit focus mode" : "Enter focus mode", detail: "Toggle distraction-free editing", group: "Commands" as const, keywords: "zen", run: () => setFocusMode((on) => !on) }] : []),
+      {
+        id: "command:ui-mode",
+        label: chatOnly ? "Switch to IDE layout" : "Switch to chat-only layout",
+        detail: chatOnly
+          ? "Show explorer, editor, docks, and status chrome"
+          : "Hide IDE chrome; keep this conversation full-bleed",
+        group: "Commands",
+        keywords: "layout chrome chat ide",
+        run: () => ide.setUiMode(chatOnly ? "ide" : "chat"),
+      },
+      ...(!isMobile && !chatOnly
+        ? [{
+            id: "command:focus",
+            label: focusMode ? "Exit focus mode" : "Focus editor",
+            detail: "Distraction-free editing (keeps the editor; Esc exits)",
+            group: "Commands" as const,
+            keywords: "zen focus",
+            run: () => setFocusMode((on) => !on),
+          }]
+        : []),
       { id: "command:settings", label: "Open settings", group: "Commands", run: openSettings },
       { id: "command:projects", label: "Switch project…", group: "Commands", run: openProjects },
-      { id: "command:chat-main", label: "Open chat in editor area", detail: "Give the conversation the main workspace", group: "Commands", keywords: "expand maximize", run: () => ide.movePanel("chat", "main") },
-      { id: "command:chat-right", label: "Dock chat on the right", detail: "Return chat to the side panel", group: "Commands", keywords: "restore copilot", run: () => ide.movePanel("chat", "right") },
+      {
+        id: "command:chat-main",
+        label: "Open chat in editor area",
+        detail: "Give the conversation the main workspace",
+        group: "Commands",
+        keywords: "expand maximize",
+        run: () => {
+          ensureIde();
+          ide.movePanel("chat", "main");
+        },
+      },
+      {
+        id: "command:chat-right",
+        label: "Dock chat on the right",
+        detail: "Return chat to the side panel",
+        group: "Commands",
+        keywords: "restore copilot",
+        run: () => {
+          ensureIde();
+          ide.movePanel("chat", "right");
+        },
+      },
       ...paletteFiles
         .filter((file) => !ide.state.openTabs.some((tab) => tab.target === file.path))
-        .map((file) => ({ id: `workspace-file:${file.path}`, label: file.name || file.path.split("/").pop() || file.path, detail: file.path, group: "Files" as const, run: () => ide.openFile(file.path) })),
-      ...ide.state.openTabs.map((tab) => ({ id: `file:${tab.id}`, label: tab.label, detail: tab.target, group: "Files" as const, run: () => ide.setActiveTab(tab.id) })),
-      ...panels.map(([id, label]) => ({ id: `panel:${id}`, label: `Show ${label}`, detail: "Open or focus panel", group: "Panels" as const, run: () => id === "explorer" ? ide.selectExplorer() : ide.showDockPanel(id) })),
+        .map((file) => ({
+          id: `workspace-file:${file.path}`,
+          label: file.name || file.path.split("/").pop() || file.path,
+          detail: file.path,
+          group: "Files" as const,
+          run: () => {
+            ensureIde();
+            ide.openFile(file.path);
+          },
+        })),
+      ...ide.state.openTabs.map((tab) => ({
+        id: `file:${tab.id}`,
+        label: tab.label,
+        detail: tab.target,
+        group: "Files" as const,
+        run: () => {
+          ensureIde();
+          ide.setActiveTab(tab.id);
+        },
+      })),
+      ...panels.map(([id, label]) => ({
+        id: `panel:${id}`,
+        label: `Show ${label}`,
+        detail: "Open or focus panel",
+        group: "Panels" as const,
+        run: () => {
+          ensureIde();
+          if (id === "explorer") ide.selectExplorer();
+          else ide.showDockPanel(id);
+        },
+      })),
       ...agent.state.sessions.map((session) => ({ id: `chat:${session.path ?? session.name}`, label: session.title || session.name, detail: `${session.messages ?? 0} messages`, group: "Chats" as const, run: () => void agent.loadSession(session.path ?? session.name) })),
       ...agent.state.projects.map((project) => ({ id: `project:${project.path}`, label: project.name, detail: project.path, group: "Projects" as const, run: () => void agent.switchWorkspace(project.path) })),
       ...agent.state.models.map((model) => ({ id: `model:${model.id}`, label: model.name || model.id, detail: model.provider ? `${model.provider} · ${model.id}` : model.id, group: "Models" as const, run: () => agent.setModel(model.id) })),
     ];
-  }, [agent, focusMode, ide, isMobile, openProjects, openSettings, paletteFiles]);
+  }, [agent, chatOnly, focusMode, ide, isMobile, openProjects, openSettings, paletteFiles]);
 
   // When a file is opened from the explorer on mobile, jump to the editor.
   useEffect(() => {
@@ -235,7 +312,11 @@ export function IdeShell() {
   return (
     <IdeContext.Provider value={ctx}>
       <>
-        {isMobile ? (
+        {chatOnly ? (
+          <div className="flex h-[100dvh] w-full overflow-hidden bg-ink-950 text-ink-100">
+            <ChatInner agent={agent} docked={false} />
+          </div>
+        ) : isMobile ? (
           <MobileShell
             workspace={workspace}
             agent={agent}
@@ -389,6 +470,8 @@ export function IdeShell() {
             }
             onRefreshVision={() => void agent.getVisionConfig()}
             onClose={() => setSettingsOpen(false)}
+            uiMode={ide.state.uiMode}
+            onSetUiMode={ide.setUiMode}
           />
         )}
         <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onQueryChange={setPaletteQuery} />

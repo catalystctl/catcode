@@ -14,6 +14,8 @@ import type {
   AgentState,
   AssistantMsg,
   BashMsg,
+  GoalMsg,
+  GoalPrompt,
   IntercomEntry,
   ReadyPayload,
   SubagentChatItem,
@@ -72,6 +74,7 @@ export const initialState: AgentState = {
   pluginCommands: [],
   searchKeys: {},
   lastGoalVerdict: null,
+  goalStepFinals: {},
   switching: false,
   followUpQueued: false,
   pendingUndo: false,
@@ -216,6 +219,148 @@ function goalKeepsStreaming(goal: AgentState["goalMode"]): boolean {
     goal.phase === "synthesizing" ||
     (goal.phase === "plan_ready" && goal.auto_deploy)
   );
+}
+
+const GOAL_TERMINAL_STATUSES = new Set(["done", "failed", "skipped"]);
+const GOAL_LASTING_PHASES = new Set([
+  "deploying",
+  "running",
+  "synthesizing",
+  "done",
+  "failed",
+]);
+
+function isGoalTerminalStatus(status: string): boolean {
+  return GOAL_TERMINAL_STATUSES.has(String(status ?? "").toLowerCase());
+}
+
+function truncateGoalSummary(text: string, max = 800): string {
+  const t = String(text ?? "").trim();
+  if (!t) return "(step finished with no written summary)";
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+function storeGoalStepFinal(
+  state: AgentState,
+  final: AgentState["goalStepFinals"][string],
+): AgentState {
+  return {
+    ...state,
+    goalStepFinals: { ...(state.goalStepFinals ?? {}), [final.stepId]: final },
+  };
+}
+
+function appendGoalMsg(
+  state: AgentState,
+  partial: Omit<GoalMsg, "id" | "role" | "ts">,
+): AgentState {
+  const msg: GoalMsg = {
+    id: newId("g"),
+    role: "goal",
+    ts: Date.now(),
+    ...partial,
+  };
+  return { ...state, messages: [...state.messages, msg] };
+}
+
+/** Find existing lasting step card (if any). */
+function findGoalStepCard(
+  messages: UIMessage[],
+  stepId: string,
+): GoalMsg | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "goal" && m.kind === "step_complete" && m.stepId === stepId) {
+      return m;
+    }
+  }
+  return undefined;
+}
+
+/** Record a lasting step-complete card + durable final store (deduped by step_id).
+ *  On verifier remap (done→failed), append an update card when status/ok changed (H1). */
+function ingestGoalStepFinal(
+  state: AgentState,
+  opts: {
+    stepId: string;
+    title?: string;
+    agent?: string;
+    ok?: boolean;
+    status?: string;
+    summary?: string;
+    runId?: string;
+  },
+): AgentState {
+  const stepId = String(opts.stepId ?? "").trim();
+  if (!stepId) return state;
+  const status = String(opts.status ?? (opts.ok === false ? "failed" : "done")).toLowerCase();
+  const summary = truncateGoalSummary(opts.summary ?? "");
+  const title = String(opts.title ?? stepId).trim() || stepId;
+  const agent = String(opts.agent ?? "").trim();
+  const ok =
+    opts.ok !== undefined
+      ? !!opts.ok
+      : !(status === "failed" || status === "skipped");
+  const runId = opts.runId ? String(opts.runId) : undefined;
+  let next = storeGoalStepFinal(state, {
+    stepId,
+    title,
+    agent,
+    ok,
+    status,
+    summary,
+    runId,
+    ts: Date.now(),
+  });
+  const existing = findGoalStepCard(next.messages, stepId);
+  const badge = status === "failed" ? "failed" : status === "skipped" ? "skipped" : "done";
+  if (existing) {
+    const prevStatus = String(existing.status ?? "").toLowerCase();
+    const prevOk = existing.ok;
+    // Verifier remap / status change: append an update card (TUI fingerprint parity).
+    if (prevStatus === badge && prevOk === ok) return next;
+    return appendGoalMsg(next, {
+      kind: "step_complete",
+      title: agent ? `[${agent}] ${title}` : title,
+      text: summary,
+      ok,
+      stepId,
+      status: badge,
+      agent: agent || undefined,
+      runId: runId ?? existing.runId,
+    });
+  }
+  return appendGoalMsg(next, {
+    kind: "step_complete",
+    title: agent ? `[${agent}] ${title}` : title,
+    text: summary,
+    ok,
+    stepId,
+    status: badge,
+    agent: agent || undefined,
+    runId,
+  });
+}
+
+/** Backfill step finals from goal_state.prompts when discrete events are absent. */
+function ingestPromptFinalsFromGoalState(
+  state: AgentState,
+  prompts: GoalPrompt[],
+): AgentState {
+  let next = state;
+  for (const p of prompts) {
+    if (!isGoalTerminalStatus(p.status ?? "")) continue;
+    next = ingestGoalStepFinal(next, {
+      stepId: p.step_id,
+      title: p.title,
+      agent: p.agent,
+      ok: !["failed", "skipped"].includes(String(p.status).toLowerCase()),
+      status: p.status,
+      summary: p.summary ?? undefined,
+      runId: p.run_id ?? undefined,
+    });
+  }
+  return next;
 }
 
 /** Drop the last user message and everything after it (assistant/tool/bash). */
@@ -447,6 +592,23 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, toasts: state.toasts.filter((t) => t.id !== ev.id) };
     case "_set_switching":
       return { ...state, switching: ev.switching };
+    case "_goal_approve_optimistic": {
+      if (!state.goalMode || state.goalMode.phase !== "plan_ready") return state;
+      const goalMode = { ...state.goalMode, auto_deploy: true };
+      let next: AgentState = {
+        ...state,
+        goalMode,
+        streaming: true,
+      };
+      next = appendGoalMsg(next, {
+        kind: "phase",
+        title: "Goal · deploying",
+        text: "Plan approved — deploying…",
+        ok: true,
+        status: "deploying",
+      });
+      return next;
+    }
     case "_undo_local": {
       // Optimistic undo: trim the last turn; the core `reset` that follows must
       // NOT wipe the remaining transcript (see `pendingUndo` on `reset`).
@@ -776,6 +938,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           workState: null,
           goalMode: null,
           goalPlan: null,
+          goalStepFinals: {},
         };
       }
       return {
@@ -793,6 +956,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         workState: null,
         goalMode: null,
         goalPlan: null,
+        goalStepFinals: {},
         subagentRuns: {},
         metrics: null,
       };
@@ -825,6 +989,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         retrying: false,
         goalMode: coreDead ? null : state.goalMode,
         goalPlan: coreDead ? null : state.goalPlan,
+        goalStepFinals: coreDead ? {} : state.goalStepFinals,
         toasts: pushToast(state.toasts, "error", msg),
       };
     }
@@ -835,11 +1000,27 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       if (msg.includes("queue cleared") || msg.includes("queue already empty")) {
         followUpQueued = false;
       }
-      return {
+      let next: AgentState = {
         ...state,
         followUpQueued,
         toasts: pushToast(state.toasts, "info", ev.message),
       };
+      // Parity with TUI: persist goal deploy bridge lines (not toast-only).
+      if (
+        msg.includes("goal deploy") ||
+        msg.includes("goal plan approved") ||
+        msg.includes("writing completion summary") ||
+        msg.includes("snapshotting workspace")
+      ) {
+        next = appendGoalMsg(next, {
+          kind: "phase",
+          title: "Goal · progress",
+          text: ev.message,
+          ok: true,
+          status: state.goalMode?.phase ?? "deploying",
+        });
+      }
+      return next;
     }
     case "steer":
       return state;
@@ -950,15 +1131,41 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         }
         return { ...r, items };
       });
-    case "subagent_done":
+    case "subagent_done": {
+      const runState = String(ev.state ?? "completed");
+      const summaryRaw = String(ev.summary ?? "").trim();
+      const summary =
+        summaryRaw ||
+        (runState === "failed"
+          ? "(step failed with no summary)"
+          : "(step finished with no written summary)");
       return pruneTerminalRuns(
-        upsertRun(state, ev.run_id, (r) => ({
-          ...r,
-          state: ev.state ?? r.state,
-          summary: ev.summary ?? r.summary,
-          endedAt: ev.ended_at ?? r.endedAt,
-        })),
+        upsertRun(state, ev.run_id, (r) => {
+          const items = [...r.items];
+          const hasAssistantText = items.some(
+            (it) =>
+              it.kind === "message" &&
+              it.role === "assistant" &&
+              String(it.content ?? "").trim(),
+          );
+          if (!hasAssistantText) {
+            items.push({
+              id: newId("sm"),
+              kind: "message",
+              role: "assistant",
+              content: summary,
+            });
+          }
+          return {
+            ...r,
+            state: runState || r.state,
+            summary: summaryRaw || r.summary || summary,
+            endedAt: ev.ended_at ?? r.endedAt,
+            items,
+          };
+        }),
       );
+    }
 
     // ── Memory ──
     case "memory_list":
@@ -1028,6 +1235,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         workState: null,
         goalMode: null,
         goalPlan: null,
+        goalStepFinals: {},
         subagentRuns: {},
         metrics: null,
       };
@@ -1127,7 +1335,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     case "goal_state": {
       if (!ev.id || ev.phase === "idle") {
-        return { ...state, goalMode: null, goalPlan: null };
+        return { ...state, goalMode: null, goalPlan: null, goalStepFinals: {} };
       }
       const goalMode = {
         id: ev.id,
@@ -1147,11 +1355,15 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         parent_model: ev.parent_model ?? "",
       };
       const terminal = ev.phase === "done" || ev.phase === "failed";
-      return {
+      let next: AgentState = {
         ...state,
         goalMode,
         streaming: goalKeepsStreaming(goalMode) ? true : terminal ? false : state.streaming,
       };
+      // Belt-and-suspenders: lasting step cards from prompts when core has not
+      // (yet) emitted goal_step_complete.
+      next = ingestPromptFinalsFromGoalState(next, goalMode.prompts);
+      return next;
     }
     case "goal_plan":
       return {
@@ -1166,20 +1378,65 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         },
       };
     case "goal_phase": {
-      const msg = ev.message
-        ? `Goal ${ev.from} → ${ev.to}: ${ev.message}`
-        : `Goal ${ev.from} → ${ev.to}`;
-      return {
+      const from = String(ev.from ?? "");
+      const to = String(ev.to ?? "");
+      const detail = String(ev.message ?? "").trim();
+      const counts =
+        typeof ev.done_count === "number" && typeof ev.step_count === "number"
+          ? ` (${ev.done_count}/${ev.step_count})`
+          : "";
+      const wave =
+        typeof ev.wave === "number" ? ` · wave ${ev.wave}` : "";
+      const msg = detail
+        ? `Goal ${from} → ${to}${wave}${counts}: ${detail}`
+        : `Goal ${from} → ${to}${wave}${counts}`;
+      let next: AgentState = {
         ...state,
         toasts: pushToast(state.toasts, "info", msg),
       };
+      if (GOAL_LASTING_PHASES.has(to)) {
+        next = appendGoalMsg(next, {
+          kind: "phase",
+          title: `Goal · ${to}${wave}${counts}`,
+          text: detail || msg,
+          status: to,
+          ok: to !== "failed",
+        });
+      }
+      return next;
+    }
+    case "goal_step_complete": {
+      return ingestGoalStepFinal(state, {
+        stepId: String(ev.step_id ?? ""),
+        title: ev.title != null ? String(ev.title) : undefined,
+        agent: ev.agent != null ? String(ev.agent) : undefined,
+        ok: ev.ok,
+        status: ev.status != null ? String(ev.status) : undefined,
+        summary: ev.summary != null ? String(ev.summary) : undefined,
+        runId: ev.run_id != null ? String(ev.run_id) : undefined,
+      });
+    }
+    case "goal_completion_summary": {
+      const raw = String(ev.text ?? ev.summary ?? "").trim();
+      const text = truncateGoalSummary(
+        raw || "Goal finished (no completion summary provided).",
+        8000,
+      );
+      return appendGoalMsg(state, {
+        kind: "completion_summary",
+        title: "Goal complete",
+        text,
+        ok: true,
+        status: "done",
+      });
     }
     case "goal_step_verdict": {
       const ok = !!ev.ok;
-      const snippet = String(ev.output ?? "").trim().slice(0, 160);
-      return {
+      const output = String(ev.output ?? "");
+      const snippet = output.trim().slice(0, 160);
+      let next: AgentState = {
         ...state,
-        lastGoalVerdict: { ok, output: String(ev.output ?? "") },
+        lastGoalVerdict: { ok, output },
         toasts: pushToast(
           state.toasts,
           ok ? "success" : "error",
@@ -1188,6 +1445,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
             : `Verifier failed${snippet ? `: ${snippet}` : ""}`,
         ),
       };
+      next = appendGoalMsg(next, {
+        kind: "verdict",
+        title: ok ? "Verifier passed" : "Verifier failed",
+        text: truncateGoalSummary(output || (ok ? "passed" : "failed")),
+        ok,
+        status: ok ? "done" : "failed",
+      });
+      return next;
     }
     case "protocol_hello":
       return {

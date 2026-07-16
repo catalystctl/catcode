@@ -150,7 +150,7 @@ export function ResizeHandle({
       aria-valuenow={Math.round(size)}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}
-      className={`group relative z-20 shrink-0 touch-none select-none bg-ink-800 transition-colors hover:bg-accent/60 focus:bg-accent/60 focus:outline-none ${
+      className={`group relative z-20 shrink-0 touch-none select-none bg-ink-800 transition-colors hover:bg-accent/50 focus-visible:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/40 ${
         isX ? "w-px cursor-col-resize" : "h-px cursor-row-resize"
       }`}
     >

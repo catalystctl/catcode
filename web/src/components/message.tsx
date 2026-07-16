@@ -9,12 +9,12 @@ import { memo, useState, useEffect, useRef } from "react";
 import type { ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AssistantMsg, BashMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
+import type { AssistantMsg, BashMsg, GoalMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { Markdown } from "./markdown";
 import { Thinking } from "./thinking";
 import { ToolCallCard } from "./tool-call";
-import { DotIcon, CopyIcon, CheckIcon, PencilIcon, RefreshIcon } from "./icons";
+import { DotIcon, CopyIcon, CheckIcon, PencilIcon, RefreshIcon, BrandMark } from "./icons";
 
 // Lightweight streaming markdown: while the assistant is still producing tokens
 // we render markdown WITHOUT rehype-highlight (re-highlighting every code block
@@ -62,10 +62,12 @@ function UserMessage({
   m,
   canEdit,
   onEdit,
+  compact,
 }: {
   m: UserMsg;
   canEdit?: boolean;
   onEdit?: (text: string, images?: string[]) => void;
+  compact?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.text);
@@ -92,7 +94,7 @@ function UserMessage({
   };
 
   return (
-    <div className="group flex justify-end px-4 py-2 sm:px-6">
+    <div className={`group flex justify-end py-2 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
       <div className="relative max-w-[min(85%,28rem)] sm:max-w-[85%]">
         {editing ? (
           <div className="rounded-2xl rounded-tr-sm border border-accent/40 bg-ink-800/70 p-2">
@@ -150,7 +152,13 @@ function UserMessage({
             )}
           </>
         )}
-        <div className="absolute -left-9 top-1.5 flex gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+        <div
+          className={
+            compact
+              ? "mt-1 flex justify-end gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
+              : "absolute -left-9 top-1.5 flex gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
+          }
+        >
           <CopyBtn text={m.text} />
           {canEdit && onEdit && !editing && (
             <button
@@ -172,17 +180,17 @@ function AssistantMessage({
   m,
   canRegenerate,
   onRegenerate,
+  compact,
 }: {
   m: AssistantMsg;
   canRegenerate?: boolean;
   onRegenerate?: () => void;
+  compact?: boolean;
 }) {
   return (
-    <div className="group px-4 py-2 sm:px-6">
+    <div className={`group py-2 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
       <div className="flex items-center gap-2 pb-1">
-        <span className="flex h-5 w-5 items-center justify-center rounded-md bg-accent/15 text-[11px] font-semibold text-accent-soft">
-          u
-        </span>
+        <BrandMark size={20} />
         <span className="text-[12px] font-medium text-ink-300">assistant</span>
         {m.model && <span className="font-mono text-[11px] text-ink-500">{m.model}</span>}
         {m.streaming && (
@@ -282,29 +290,68 @@ function BashMessage({ m }: { m: BashMsg }) {
   );
 }
 
+function GoalMessage({ m }: { m: GoalMsg }) {
+  const tone =
+    m.ok === false || m.status === "failed"
+      ? "border-danger/40 text-danger"
+      : m.status === "skipped"
+        ? "border-ink-700 text-ink-400"
+        : m.kind === "phase"
+          ? "border-accent/30 text-accent-soft"
+          : "border-success/40 text-success";
+  const kindLabel =
+    m.kind === "step_complete"
+      ? "step"
+      : m.kind === "completion_summary"
+        ? "summary"
+        : m.kind === "verdict"
+          ? "verdict"
+          : "phase";
+  return (
+    <div className="px-4 py-1.5 sm:px-6">
+      <div className={`ml-0 rounded-lg border bg-ink-925/50 px-3 py-2 sm:ml-7 ${tone}`}>
+        <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide">
+          <span>goal · {kindLabel}</span>
+          {m.status && <span className="text-ink-500">{m.status}</span>}
+        </div>
+        <div className="mt-0.5 text-[13px] font-medium text-ink-100">{m.title}</div>
+        {m.text && (
+          <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed text-ink-300">
+            {m.text}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export const Message = memo(function Message({
   m,
   onEditUser,
   onRegenerate,
   canEdit,
   canRegenerate,
+  compact,
 }: {
   m: UIMessage;
   onEditUser?: (text: string, images?: string[]) => void;
   onRegenerate?: () => void;
   canEdit?: boolean;
   canRegenerate?: boolean;
+  compact?: boolean;
 }) {
   if (m.role === "user")
-    return <UserMessage m={m} canEdit={canEdit} onEdit={onEditUser} />;
+    return <UserMessage m={m} canEdit={canEdit} onEdit={onEditUser} compact={compact} />;
   if (m.role === "assistant")
     return (
       <AssistantMessage
         m={m}
         canRegenerate={canRegenerate}
         onRegenerate={onRegenerate}
+        compact={compact}
       />
     );
   if (m.role === "bash") return <BashMessage m={m} />;
+  if (m.role === "goal") return <GoalMessage m={m} />;
   return <ToolMessage m={m} />;
 });

@@ -39,7 +39,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
 
   if (items.length === 0) {
     return (
-      <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-xl border border-ink-700 bg-ink-900 p-2 text-[12px] text-ink-500 shadow-2xl shadow-black/40 animate-fade-in">
+      <div className="absolute bottom-full left-0 right-0 z-40 mb-1.5 max-h-64 overflow-auto rounded-xl border border-ink-700/90 bg-ink-900/95 p-2.5 text-[12px] text-ink-500 shadow-2xl shadow-black/40 backdrop-blur-sm animate-fade-in">
         {emptyHint ?? "No matches"}
       </div>
     );
@@ -48,7 +48,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
   return (
     <div
       ref={listRef}
-      className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-xl border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40 animate-fade-in"
+      className="absolute bottom-full left-0 right-0 z-40 mb-1.5 max-h-64 overflow-auto rounded-xl border border-ink-700/90 bg-ink-900/95 p-1 shadow-2xl shadow-black/40 backdrop-blur-sm animate-fade-in"
       role="listbox"
     >
       {items.map((item, i) => (
@@ -73,7 +73,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
               {item.label}
             </div>
             {item.desc && (
-              <div className="truncate text-[10px] text-ink-500">{item.desc}</div>
+              <div className="truncate text-[10.5px] leading-snug text-ink-500">{item.desc}</div>
             )}
           </div>
           {item.badge && (
