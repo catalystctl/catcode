@@ -1692,6 +1692,20 @@ async fn main() {
         .build()
         .expect("client");
 
+    // Load plugins before initial model discovery. Plugin OAuth credentials are
+    // durable, and their token action may also start a provider sidecar (Cursor
+    // does this). Discovering with `None` here meant the saved provider was
+    // restored as active but omitted from the first model snapshot until the
+    // user ran /login again or manually switched providers.
+    let plugin_manager = PluginManager::new_with_global_plugins(
+        cfg.plugin_dir.clone(),
+        cfg.workspace.clone(),
+        cfg.trust_project_plugins,
+    );
+    for name in &cfg.plugins_disabled {
+        let _ = plugin_manager.disable(name);
+    }
+
     // Discover models up front. In the multi-login model, models are aggregated
     // across all logged-in providers (configured + key available) so `/models`
     // can mix providers. At init there are no runtime keys yet beyond the
@@ -1703,7 +1717,7 @@ async fn main() {
         &init_keys,
         cfg.active_provider.as_deref(),
         &client,
-        None,
+        Some(&plugin_manager),
     )
     .await;
     let logger = Logger::new(cfg.debug_log.as_deref());
@@ -1743,11 +1757,6 @@ async fn main() {
             _ => None,
         })
         .collect();
-    // Pre-clone values State::new needs before `cfg` is moved into the lock.
-    let plugin_dir = cfg.plugin_dir.clone();
-    let pm_workspace = cfg.workspace.clone();
-    let trust_project = cfg.trust_project_plugins;
-
     // Ensure the session file exists (header only) so the active session is
     // always listed by `list_sessions`, even before the first message lands.
     if let Some(p) = cfg.session_file.as_ref() {
@@ -1777,11 +1786,7 @@ async fn main() {
         escalated_kinds: Mutex::new(init_escalations),
         queued: Mutex::new(None),
         pending_bash: Mutex::new(Vec::new()),
-        plugin_manager: PluginManager::new_with_global_plugins(
-            plugin_dir,
-            pm_workspace,
-            trust_project,
-        ),
+        plugin_manager,
         vision: RwLock::new(vision_cfg),
         last_turn_time: Mutex::new(std::time::Instant::now()),
         estimated_tokens: Mutex::new(init_est),
@@ -1805,14 +1810,6 @@ async fn main() {
         auto_checkpoint_taken: std::sync::atomic::AtomicBool::new(false),
         skill_read_count: std::sync::atomic::AtomicU64::new(0),
     });
-
-    // Apply disabled plugin list from config.
-    {
-        let cfg = state.cfg.read().await;
-        for name in &cfg.plugins_disabled {
-            let _ = state.plugin_manager.disable(name);
-        }
-    }
 
     // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
     // (read from settings.json by Config::load). A key set via `/login` or the
