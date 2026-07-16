@@ -359,6 +359,8 @@ function Do-Uninstall {
     }
     if (Test-Path $WrapperPath) { Remove-Item $WrapperPath -Force; Write-Ok "Removed wrapper $WrapperPath" }
     if (Test-Path -LiteralPath $WebDir) { Remove-Item -LiteralPath $WebDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Ok "Removed web bundle $WebDir" }
+    $statePath = Join-Path $DataDir 'installer.state'
+    if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force; Write-Ok "Removed $statePath" }
     if (-not $removed) { Write-Warn2 'No service or task found to remove (already clean?)' }
     Write-Host ''
     Write-Host '  Web service removed. catcode/catcode-core were left installed.' -ForegroundColor Green
@@ -397,11 +399,50 @@ Write-Host "  port:    $Port   host: $BindHost" -ForegroundColor DarkGray
 
 if (-not (Install-NssmService)) { Install-Task }
 
+# Persist installer state so `catcode --update` can find + refresh this web install.
+function Save-InstallerState {
+    param([string]$ServiceKind)
+    if (-not (Test-Path -LiteralPath $DataDir)) {
+        New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+    }
+    $prefix = Split-Path -Parent $CoreExe
+    if (-not $prefix) { $prefix = $InstallDir }
+    $statePath = Join-Path $DataDir 'installer.state'
+    $ver = if ($script:Ver) { $script:Ver } else { 'unknown' }
+    $method = if ($BuildFromSource) { 'source' } else { 'download' }
+    $lines = @(
+        '# Catalyst Code installer state — written by install-web.ps1',
+        '# (shell-sourcable; consumed by catcode --update)',
+        "METHOD=`"$method`"",
+        "REPO_DIR=`"$RepoDir`"",
+        "PREFIX=`"$prefix`"",
+        "PORT=`"$Port`"",
+        "HOST=`"$BindHost`"",
+        "RUNTIME=`"$RT`"",
+        "WEB_DIR=`"$WebDir`"",
+        "WEB_INSTALLED=`"yes`"",
+        "UNIT_NAME=`"$SvcName`"",
+        "SERVICE_KIND=`"$ServiceKind`"",
+        "VERSION=`"$ver`"",
+        "INSTALLED_AT=`"$((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))`""
+    )
+    Set-Content -LiteralPath $statePath -Value ($lines -join "`r`n") -Encoding UTF8
+    Write-Ok "Recorded install state -> $statePath"
+}
+
+$serviceKind = 'schtasks'
+$nssmCheck = Get-Command nssm -ErrorAction SilentlyContinue
+if ($nssmCheck) {
+    & $nssmCheck.Source status $SvcName *> $null 2>&1
+    if ($LASTEXITCODE -eq 0) { $serviceKind = 'nssm' }
+}
+Save-InstallerState -ServiceKind $serviceKind
+
 $access = if ($BindHost -eq '0.0.0.0') { 'all interfaces' } else { $BindHost }
 Write-Host ''
 Write-Host "  Done. Web frontend running at http://localhost:$Port ($access)" -ForegroundColor Green
 Write-Host "  logs:   $LogPath"
-Write-Host "  update: re-run this script (it re-downloads + restarts)"
+Write-Host "  update: catcode --update   (or re-run this script)"
 Write-Host "  stop:   nssm stop $SvcName  (or:  schtasks /end /tn $TaskName)"
 Write-Host '  auth:   ensure a key/login exists (~/.config/catalyst-code/settings.json) or set UMANS_API_KEY.'
 if ($BindHost -ne '127.0.0.1') {

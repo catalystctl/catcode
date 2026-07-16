@@ -1351,7 +1351,7 @@ summary_install() {
     "core:      $PREFIX/catcode-core" \
     "web:       $web_line" \
     "$svc_line" \
-    "update:    bash install.sh --update" \
+    "update:    catcode --update  (or bash install.sh --update)" \
     "uninstall: bash install.sh --uninstall" \
     "log:       ${LOG_FILE:-<disabled>}"
   log_info "Run the TUI with:  catcode"
@@ -1400,7 +1400,7 @@ summary_add_web() {
     "core:      $PREFIX/catcode-core" \
     "web:       http://${HOST}:${PORT}  (running as $svc_id)" \
     "service:   $svc_id  (enabled, auto-restart)" \
-    "update:    bash install.sh --update" \
+    "update:    catcode --update  (or bash install.sh --update)" \
     "uninstall: bash install.sh --uninstall"
   if [[ "$PLATFORM" == "Darwin" ]]; then
     log_info "Web service logs:  tail -f $HOME/Library/Logs/catalyst-code-web.log"

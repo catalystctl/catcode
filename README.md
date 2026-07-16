@@ -165,11 +165,15 @@ Other options:
 | `--port <n>` | `49283` | Web service port |
 | `--host <h>` | `0.0.0.0` | Web bind host |
 | `--repo <url>` | — | Clone `<url>` first, then install from it |
-| `--update` | — | Re-download latest + reinstall (+ restart the service) |
+| `--update` | — | Re-download latest + reinstall CLI, core, and web if installed (+ restart the service) |
 | `--uninstall` | — | Stop + remove binaries, service, and state |
 | `--dry-run` | off | Print the plan, execute nothing |
 
 </details>
+
+**Updating**
+
+Use `catcode --update` to refresh the CLI. When the web frontend was installed (`install.sh --with-web` on Linux/macOS, or `install-web.ps1` on Windows), that command also refreshes `catcode-core` and the web bundle, then restarts the service (systemd / launchd / NSSM / Scheduled Task). `bash install.sh --update` (Unix) or re-running `install-web.ps1` (Windows) does the same. From the web UI: Settings → About → **Update CLI + frontend**.
 
 **Windows web app:**
 

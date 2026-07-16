@@ -290,14 +290,16 @@ func printUsage() {
 
 Usage:
   catcode                       start the interactive TUI
-  catcode --update              update to the latest GitHub release
+  catcode --update              update CLI (+ web frontend if installed)
   catcode --check-update        report whether an update is available
   catcode --version, -v         print the current version
   catcode --help, -h            show this help
 
 The version is the git commit short SHA of the build. Run ` + "`catcode --update`" + `
 to fetch the matching platform binary from github.com/` + githubRepo + ` and
-atomically replace this executable.
+atomically replace this executable. If the web frontend was installed
+(via install.sh --with-web), the same command also refreshes catcode-core
+and the web bundle, then restarts the service.
 `)
 }
 
@@ -315,9 +317,16 @@ func runCheckUpdate() int {
 		fmt.Println("Run `catcode --update` to install it.")
 	case rel.TagName == coreVersion:
 		fmt.Printf("catcode %s — up to date\n", coreVersion)
+		if webDir, _, ok := detectWebInstall(); ok {
+			if cur := readWebCommit(webDir); cur != "" && !commitsMatch(cur, rel.TagName) {
+				fmt.Printf("Web frontend at %s is behind %s — run `catcode --update`\n", cur, rel.TagName)
+			} else if cur != "" {
+				fmt.Printf("Web frontend %s — up to date\n", cur)
+			}
+		}
 	default:
 		fmt.Printf("Update available: %s  (you're on %s)\n", rel.TagName, coreVersion)
-		fmt.Println("Run `catcode --update` to install it.")
+		fmt.Println("Run `catcode --update` to install it (CLI + web if installed).")
 	}
 	return 0
 }
@@ -575,7 +584,11 @@ func runUpdate() int {
 	}
 
 	if coreVersion != "dev" && rel.TagName == coreVersion {
-		fmt.Printf("Already up to date (%s).\n", coreVersion)
+		fmt.Printf("CLI already up to date (%s).\n", coreVersion)
+		if _, err := updateCompanionComponents(rel); err != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ companion update failed: %v\n", err)
+			return 1
+		}
 		return 0
 	}
 	if coreVersion == "dev" {
@@ -655,6 +668,13 @@ func runUpdate() int {
 	}
 
 	fmt.Printf("  ✓ updated catcode → %s\n", rel.TagName)
+
+	if _, err := updateCompanionComponents(rel); err != nil {
+		fmt.Fprintf(os.Stderr, "  ✗ companion update failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "    CLI binary was updated; fix the error above and re-run.\n")
+		return 1
+	}
+
 	fmt.Println("Relaunch catcode to use the new version.")
 	return 0
 }
