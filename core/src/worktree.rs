@@ -7,6 +7,10 @@
 //!
 //! All add/remove calls are serialized: concurrent `git worktree add` races on
 //! `.git` locks and can fail spuriously (observed as uniform goal-step failures).
+//!
+//! Goal waves: `promote_worktree` copies wt→main; the next wave's `add_worktree`
+//! checks out HEAD only, so call `seed_worktree_from_main` (main→wt) so dependents
+//! see uncommitted promoted files from prior waves.
 
 use crate::protocol::{emit, Event};
 use serde_json::json;
@@ -143,39 +147,60 @@ fn remove_worktree_locked(workspace: &Path, wt_path: &Path) -> Result<(), String
 
 /// Copy changed tracked+untracked files from a worktree back into the main
 /// workspace (shadow promote). Skips `.git` and `.catalyst-code`.
+/// Also removes from main any tracked paths deleted in the worktree vs HEAD
+/// (`git diff --diff-filter=D`). Does **not** full-mirror-delete (would wipe
+/// sibling promotions on concurrent waves).
 pub fn promote_worktree(main_ws: &Path, wt_path: &Path) -> Result<Vec<String>, String> {
     let mut promoted = Vec::new();
-    promote_dir(main_ws, wt_path, wt_path, &mut promoted)?;
+    copy_tree_diff(wt_path, main_ws, wt_path, &mut promoted)?;
+    sync_git_deletions(wt_path, main_ws, &mut promoted)?;
     Ok(promoted)
 }
 
-fn promote_dir(
-    main_ws: &Path,
-    wt_root: &Path,
+/// After `add_worktree` (checkout HEAD only), mirror main's working tree into
+/// the new worktree so dependent goal steps see prior-wave output — including
+/// deletions (full mirror under skip rules). Memory: promote is wt→main; seed
+/// is main→wt — without seed, next-wave workers miss uncommitted promotes.
+pub fn seed_worktree_from_main(main_ws: &Path, wt_path: &Path) -> Result<Vec<String>, String> {
+    let mut seeded = Vec::new();
+    copy_tree_diff(main_ws, wt_path, main_ws, &mut seeded)?;
+    // Full mirror deletes: drop wt paths that no longer exist on main.
+    remove_dest_missing_from_src(main_ws, wt_path, wt_path, &mut seeded)?;
+    Ok(seeded)
+}
+
+fn should_skip_name(name: &str) -> bool {
+    name == ".git" || name == ".catalyst-code"
+}
+
+/// Recursively copy files under `dir` (within `src_root`) into `dest_root` when
+/// content differs or the dest file is missing. Skips `.git` and `.catalyst-code`.
+fn copy_tree_diff(
+    src_root: &Path,
+    dest_root: &Path,
     dir: &Path,
-    promoted: &mut Vec<String>,
+    out_paths: &mut Vec<String>,
 ) -> Result<(), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     for ent in rd.flatten() {
         let p = ent.path();
         let name = ent.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == ".git" || name_s == ".catalyst-code" {
+        if should_skip_name(&name_s) {
             continue;
         }
         let rel = p
-            .strip_prefix(wt_root)
+            .strip_prefix(src_root)
             .map_err(|_| "strip prefix".to_string())?;
-        let dest = main_ws.join(rel);
+        let dest = dest_root.join(rel);
         let ft = ent.file_type().map_err(|e| e.to_string())?;
         if ft.is_dir() {
             std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-            promote_dir(main_ws, wt_root, &p, promoted)?;
+            copy_tree_diff(src_root, dest_root, &p, out_paths)?;
         } else if ft.is_file() {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            // Only copy if content differs (or dest missing).
             let src_bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
             let same = std::fs::read(&dest)
                 .ok()
@@ -183,9 +208,90 @@ fn promote_dir(
                 .unwrap_or(false);
             if !same {
                 std::fs::write(&dest, &src_bytes).map_err(|e| e.to_string())?;
-                promoted.push(rel.display().to_string());
+                out_paths.push(rel.display().to_string());
             }
         }
+    }
+    Ok(())
+}
+
+/// Remove paths under `dest_dir` that have no counterpart under `src_root`.
+/// Used by seed to full-mirror main→worktree (including deletions).
+fn remove_dest_missing_from_src(
+    src_root: &Path,
+    dest_root: &Path,
+    dest_dir: &Path,
+    out_paths: &mut Vec<String>,
+) -> Result<(), String> {
+    let rd = match std::fs::read_dir(dest_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read {}: {e}", dest_dir.display())),
+    };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let name = ent.file_name();
+        let name_s = name.to_string_lossy();
+        if should_skip_name(&name_s) {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(dest_root)
+            .map_err(|_| "strip prefix".to_string())?;
+        let src = src_root.join(rel);
+        let ft = ent.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
+            remove_dest_missing_from_src(src_root, dest_root, &p, out_paths)?;
+            if src.is_dir() {
+                continue;
+            }
+            if std::fs::read_dir(&p)
+                .map(|mut i| i.next().is_none())
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(&p);
+                out_paths.push(format!("deleted:{}", rel.display()));
+            } else if !src.exists() {
+                std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+                out_paths.push(format!("deleted:{}", rel.display()));
+            }
+        } else if ft.is_file() && !src.exists() {
+            std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+            out_paths.push(format!("deleted:{}", rel.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Apply tracked deletions from `src_repo` (vs HEAD) onto `dest_root`.
+/// Safe for promote under concurrency — only paths the worktree deleted.
+fn sync_git_deletions(
+    src_repo: &Path,
+    dest_root: &Path,
+    out_paths: &mut Vec<String>,
+) -> Result<(), String> {
+    if !is_git_repo(src_repo) {
+        return Ok(());
+    }
+    let out = match git_out(src_repo, &["diff", "--name-only", "--diff-filter=D", "HEAD"]) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    for line in out.lines() {
+        let rel = line.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        let dest = dest_root.join(rel);
+        if !dest.exists() {
+            continue;
+        }
+        if dest.is_dir() {
+            std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::remove_file(&dest).map_err(|e| e.to_string())?;
+        }
+        out_paths.push(format!("deleted:{rel}"));
     }
     Ok(())
 }
@@ -241,6 +347,188 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&main);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn seed_worktree_from_main_copies_uncommitted_files() {
+        // promote copies wt→main; add_worktree checks out HEAD only — seed must
+        // bring uncommitted main files into the new worktree for dependent waves.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let main = std::env::temp_dir().join(format!("catcode-seed-main-{stamp}"));
+        let _ = std::fs::remove_dir_all(&main);
+        std::fs::create_dir_all(&main).unwrap();
+
+        // Init a real git repo with committed file A.
+        for (args, msg) in [
+            (vec!["init"], "init"),
+            (vec!["config", "user.email", "test@example.com"], "email"),
+            (vec!["config", "user.name", "test"], "name"),
+        ] {
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&main)
+                .status()
+                .unwrap_or_else(|e| panic!("{msg}: {e}"));
+            assert!(st.success(), "git {msg} failed");
+        }
+        // Detach from any template/default branch naming quirks.
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "main"])
+            .current_dir(&main)
+            .status();
+        std::fs::write(main.join("A.txt"), b"committed").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "A.txt"])
+                .current_dir(&main)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "add A"])
+                .current_dir(&main)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // Dirty uncommitted file B in main (simulates prior-wave promote).
+        std::fs::write(main.join("B.txt"), b"promoted dirty").unwrap();
+
+        let wt = add_worktree(&main, &format!("seed-{stamp}")).unwrap();
+        // Fresh worktree has A (from HEAD) but not dirty B until seeded.
+        assert!(wt.join("A.txt").exists());
+        assert!(
+            !wt.join("B.txt").exists(),
+            "add_worktree alone must not see uncommitted B"
+        );
+
+        let seeded = seed_worktree_from_main(&main, &wt).unwrap();
+        assert!(seeded.iter().any(|p| p.contains("B.txt")), "{seeded:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("B.txt")).unwrap(),
+            "promoted dirty"
+        );
+
+        let _ = remove_worktree(&main, &wt);
+        let _ = std::fs::remove_dir_all(&main);
+    }
+
+    #[test]
+    fn seed_worktree_from_main_removes_deleted_files() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let main = std::env::temp_dir().join(format!("catcode-seed-del-main-{stamp}"));
+        let _ = std::fs::remove_dir_all(&main);
+        std::fs::create_dir_all(&main).unwrap();
+
+        for (args, msg) in [
+            (vec!["init"], "init"),
+            (vec!["config", "user.email", "test@example.com"], "email"),
+            (vec!["config", "user.name", "test"], "name"),
+        ] {
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&main)
+                .status()
+                .unwrap_or_else(|e| panic!("{msg}: {e}"));
+            assert!(st.success(), "git {msg} failed");
+        }
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "main"])
+            .current_dir(&main)
+            .status();
+        std::fs::write(main.join("A.txt"), b"committed").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "A.txt"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "add A"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+
+        // Simulate prior-wave deletion on main (still present at HEAD).
+        std::fs::remove_file(main.join("A.txt")).unwrap();
+
+        let wt = add_worktree(&main, &format!("seed-del-{stamp}")).unwrap();
+        assert!(wt.join("A.txt").exists(), "fresh wt still has HEAD A.txt");
+
+        let seeded = seed_worktree_from_main(&main, &wt).unwrap();
+        assert!(!wt.join("A.txt").exists(), "seed must delete A.txt from wt");
+        assert!(
+            seeded.iter().any(|p| p.contains("deleted:A.txt")),
+            "expected deleted:A.txt in {seeded:?}"
+        );
+
+        let _ = remove_worktree(&main, &wt);
+        let _ = std::fs::remove_dir_all(&main);
+    }
+
+    #[test]
+    fn promote_worktree_removes_tracked_deletions() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let main = std::env::temp_dir().join(format!("catcode-promote-del-main-{stamp}"));
+        let _ = std::fs::remove_dir_all(&main);
+        std::fs::create_dir_all(&main).unwrap();
+
+        for (args, msg) in [
+            (vec!["init"], "init"),
+            (vec!["config", "user.email", "test@example.com"], "email"),
+            (vec!["config", "user.name", "test"], "name"),
+        ] {
+            let st = Command::new("git")
+                .args(&args)
+                .current_dir(&main)
+                .status()
+                .unwrap_or_else(|e| panic!("{msg}: {e}"));
+            assert!(st.success(), "git {msg} failed");
+        }
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "main"])
+            .current_dir(&main)
+            .status();
+        std::fs::write(main.join("A.txt"), b"committed").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "A.txt"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "add A"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+
+        let wt = add_worktree(&main, &format!("promote-del-{stamp}")).unwrap();
+        assert!(wt.join("A.txt").exists());
+        std::fs::remove_file(wt.join("A.txt")).unwrap();
+
+        let promoted = promote_worktree(&main, &wt).unwrap();
+        assert!(!main.join("A.txt").exists(), "promote must delete A.txt on main");
+        assert!(
+            promoted.iter().any(|p| p.contains("deleted:A.txt")),
+            "expected deleted:A.txt in {promoted:?}"
+        );
+
+        let _ = remove_worktree(&main, &wt);
+        let _ = std::fs::remove_dir_all(&main);
     }
 
     #[test]

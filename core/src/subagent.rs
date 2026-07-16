@@ -704,28 +704,48 @@ pub fn child_max_depth(parent: u32, agent: Option<u32>) -> u32 {
 
 fn all_tool_names() -> &'static [&'static str] {
     &[
+        // FS / search / shell
         "read_file",
         "edit",
         "write_file",
+        "delete",
+        "rename",
+        "mkdir",
         "list_dir",
         "grep",
         "glob",
         "bash",
+        "patch",
+        // Bulk
         "bulk",
         "bulk_read",
         "bulk_write",
         "bulk_edit",
+        // Planning / control
         "todo_write",
         "todo_read",
+        "goal_write_plan",
         "finish",
-        "patch",
+        "ask",
+        "load_tools",
+        // Quality / web
         "diagnostics",
         "fetch",
         "web_search",
+        // Git / workspace
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_add",
+        "git_commit",
+        "workspace_activity",
+        // Agents / env
         "subagent",
+        "spawn",
         "contact_supervisor",
         "intercom",
         "memory",
+        "test_env",
     ]
 }
 
@@ -973,7 +993,24 @@ pub fn execute(
                     );
                 }
                 match crate::worktree::add_worktree(&workspace, &run_id) {
-                    Ok(p) => Some(p),
+                    Ok(p) => {
+                        match crate::worktree::seed_worktree_from_main(&workspace, &p) {
+                            Ok(paths) => {
+                                if !paths.is_empty() {
+                                    emit(
+                                        &Event::new("worktree_seeded")
+                                            .with("run_id", json!(&run_id))
+                                            .with("paths", json!(paths)),
+                                    );
+                                }
+                                Some(p)
+                            }
+                            Err(e) => {
+                                let _ = crate::worktree::remove_worktree(&workspace, &p);
+                                return Outcome::err(format!("worktree seed failed: {e}"));
+                            }
+                        }
+                    }
                     Err(e) => {
                         return Outcome::err(format!("worktree setup failed: {e}"));
                     }
@@ -2678,7 +2715,29 @@ async fn run_parallel(
         for i in 0..resolved.len() {
             let rid = format!("{}-{}", run_id, i);
             match crate::worktree::add_worktree(&workspace, &rid) {
-                Ok(p) => worktrees.push(Some(p)),
+                Ok(p) => {
+                    match crate::worktree::seed_worktree_from_main(&workspace, &p) {
+                        Ok(paths) => {
+                            if !paths.is_empty() {
+                                emit(
+                                    &Event::new("worktree_seeded")
+                                        .with("run_id", json!(&rid))
+                                        .with("paths", json!(paths)),
+                                );
+                            }
+                            worktrees.push(Some(p));
+                        }
+                        Err(e) => {
+                            let _ = crate::worktree::remove_worktree(&workspace, &p);
+                            for wt in worktrees.iter().flatten() {
+                                let _ = crate::worktree::remove_worktree(&workspace, wt);
+                            }
+                            return Outcome::err(format!(
+                                "worktree seed failed for task {i}: {e}"
+                            ));
+                        }
+                    }
+                }
                 Err(e) => {
                     // Clean up any already-created worktrees.
                     for (j, wt) in worktrees.iter().enumerate() {
