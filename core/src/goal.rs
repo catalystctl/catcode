@@ -334,6 +334,10 @@ pub fn goal_step_needs_worktree(agent: &str) -> bool {
     }
 }
 
+fn should_validate_goal_after_wave(wave_idx: usize, wave_count: usize) -> bool {
+    wave_count > 0 && wave_idx + 1 == wave_count
+}
+
 // ---------------------------------------------------------------------------
 // Construction / validation
 // ---------------------------------------------------------------------------
@@ -1003,12 +1007,14 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
 
 ## Required action
 1. Optionally use read/search tools briefly if you need repo context to plan well.
-2. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.
+2. Before goal_write_plan, if high-impact unknowns remain (scope boundaries, success criteria, hard constraints, irreversible/destructive actions), call `ask` ONCE with 1–3 focused questions. Skip low-stakes style/preference questions. If the goal is already clear, go straight to goal_write_plan.
+3. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.
 
 ## Plan quality rules
 - Prefer scout/context-builder before worker when the codebase area is unknown.
 - Prefer independent steps that can run in parallel (same parallel_group, empty depends_on).
 - Use depends_on when a step needs a prior step's output.
+- Dependent steps receive prior steps' promoted files in worktrees when concurrency>1; still write durable artifacts to files; tasks stay self-contained.
 - Each step.task must be a self-contained prompt the subagent can execute without this chat.
 - Use agents: scout, researcher, planner, worker, reviewer, context-builder, oracle, delegate (or custom agents).
 - Prefer agents planner / worker / reviewer when they match the work so role model pins apply.
@@ -1260,6 +1266,7 @@ pub async fn deploy_goal(
         .map(|s| (s.id.clone(), s.depends_on.clone()))
         .collect();
 
+    let wave_count = waves.len();
     for (wave_idx, wave) in waves.into_iter().enumerate() {
         if cancel.is_cancelled() {
             let mut mode = st.goal.lock().await;
@@ -1267,46 +1274,9 @@ pub async fn deploy_goal(
             return false;
         }
 
-        // Mark wave running + emit progress (even when already Running).
-        {
-            let mut mode = st.goal.lock().await;
-            for id in &wave {
-                if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
-                    p.status = DeployStatus::Running;
-                }
-            }
-            let from = mode.phase.clone();
-            let step_count = mode.prompts.len();
-            let done_count = mode
-                .prompts
-                .iter()
-                .filter(|p| {
-                    matches!(
-                        p.status,
-                        DeployStatus::Done | DeployStatus::Failed | DeployStatus::Skipped
-                    )
-                })
-                .count();
-            if from != GoalPhase::Running {
-                mode.phase = GoalPhase::Running;
-            }
-            mode.touch();
-            let msg = format!("wave {} — subagents running", wave_idx + 1);
-            emit_goal_phase_progress(
-                &from,
-                &GoalPhase::Running,
-                Some(&msg),
-                Some(wave_idx + 1),
-                Some(step_count),
-                Some(done_count),
-            );
-            emit_goal_state(&mode);
-            sync_work_state_from_prompts(&st, &mode).await;
-        }
-
-        // Collect wave tasks, skipping steps whose dependencies failed or
-        // were themselves skipped (transitive skip: if B was skipped because
-        // A failed, anything depending on B must also be skipped).
+        // Skip cascade first while steps are still Pending (never flash
+        // Running→Skipped). Transitive: if B was skipped because A failed,
+        // anything depending on B must also be skipped.
         let mut wave_prompts: Vec<DeployPrompt> = Vec::new();
         for id in &wave {
             if let Some(deps) = deps_by_id.get(id) {
@@ -1349,6 +1319,40 @@ pub async fn deploy_goal(
                 wave_prompts.push(p.clone());
             }
         }
+
+        // Emit phase Running / wave progress after skip handling. Steps stay
+        // Pending until they acquire a concurrency slot (marked Running then).
+        {
+            let mut mode = st.goal.lock().await;
+            let from = mode.phase.clone();
+            let step_count = mode.prompts.len();
+            let done_count = mode
+                .prompts
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        DeployStatus::Done | DeployStatus::Failed | DeployStatus::Skipped
+                    )
+                })
+                .count();
+            if from != GoalPhase::Running {
+                mode.phase = GoalPhase::Running;
+            }
+            mode.touch();
+            let msg = format!("wave {} — dispatching steps", wave_idx + 1);
+            emit_goal_phase_progress(
+                &from,
+                &GoalPhase::Running,
+                Some(&msg),
+                Some(wave_idx + 1),
+                Some(step_count),
+                Some(done_count),
+            );
+            emit_goal_state(&mode);
+            sync_work_state_from_prompts(&st, &mode).await;
+        }
+
         if wave_prompts.is_empty() {
             continue;
         }
@@ -1416,6 +1420,19 @@ pub async fn deploy_goal(
                     };
                     if cancel_c.is_cancelled() {
                         return (step_id, false, "cancelled".into(), Some(run_id_task));
+                    }
+                    // Mark Running only after acquiring a concurrency slot so
+                    // queued steps stay Pending (no Running→Skipped flash).
+                    {
+                        let mut mode = st_c.goal.lock().await;
+                        if let Some(prompt) =
+                            mode.prompts.iter_mut().find(|x| x.step_id == step_id)
+                        {
+                            prompt.status = DeployStatus::Running;
+                        }
+                        mode.touch();
+                        emit_goal_state(&mode);
+                        sync_work_state_from_prompts(&st_c, &mode).await;
                     }
                     let mut args = json!({
                         "agent": p.agent,
@@ -1564,9 +1581,12 @@ pub async fn deploy_goal(
         // still run. Steps whose depends_on includes a failed step are
         // skipped at the top of the next wave iteration.
 
-        // Verifier loop: when the plan declares validation checks, run a
-        // reviewer after each wave that had successful steps.
-        if !cancel.is_cancelled() {
+        // The plan's validation criteria describe the completed goal, not an
+        // intermediate dependency wave. Running them after (for example)
+        // Phase A can only produce a false failure for work intentionally
+        // scheduled in later phases, which then poisons the dependency graph.
+        // Validate once, after the final wave has run.
+        if !cancel.is_cancelled() && should_validate_goal_after_wave(wave_idx, wave_count) {
             let validation = {
                 let mode = st.goal.lock().await;
                 mode.plan
@@ -1580,7 +1600,7 @@ pub async fn deploy_goal(
                 let args = json!({
                     "agent": "reviewer",
                     "task": format!(
-                        "Verify the work just completed in this goal wave against these checks:\n- {checks}\n\nRun diagnostics if helpful. Reply VERDICT: PASS or VERDICT: FAIL with reasons."
+                        "Verify the completed goal against these checks:\n- {checks}\n\nRun diagnostics if helpful. Reply VERDICT: PASS or VERDICT: FAIL with reasons."
                     ),
                     "context": "fresh",
                 });
@@ -1594,18 +1614,32 @@ pub async fn deploy_goal(
                     0,
                 )
                 .await;
-                let pass = outcome.ok
-                    && outcome
-                        .output
-                        .to_ascii_uppercase()
-                        .contains("VERDICT: PASS");
+                let pass = outcome
+                    .output
+                    .to_ascii_uppercase()
+                    .contains("VERDICT: PASS");
                 emit(
                     &Event::new("goal_step_verdict")
-                        .with("ok", json!(pass))
+                        .with("ok", json!(outcome.ok && pass))
+                        .with("provider_ok", json!(outcome.ok))
                         .with("output", json!(truncate_str(&outcome.output, 800))),
                 );
-                if !pass {
-                    // Mark the wave's successful steps as failed so dependents skip.
+                if !outcome.ok {
+                    // A provider/transport failure says nothing about whether
+                    // the completed work passed validation. Surface it for the
+                    // wrap-up without rewriting successful step state.
+                    any_failed = true;
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "goal validation could not run: {}",
+                            truncate_str(&outcome.output, 800)
+                        )),
+                    ));
+                } else if !pass {
+                    // An explicit completed-goal validation failure belongs to
+                    // the terminal wave. There are no later dependencies to
+                    // cascade-skip at this point.
                     let mut mode = st.goal.lock().await;
                     let mut completed: Vec<(String, String, String, Option<String>, String)> =
                         Vec::new();
@@ -2187,6 +2221,15 @@ mod tests {
     }
 
     #[test]
+    fn whole_goal_validation_runs_only_after_the_terminal_wave() {
+        assert!(!should_validate_goal_after_wave(0, 4));
+        assert!(!should_validate_goal_after_wave(1, 4));
+        assert!(!should_validate_goal_after_wave(2, 4));
+        assert!(should_validate_goal_after_wave(3, 4));
+        assert!(!should_validate_goal_after_wave(0, 0));
+    }
+
+    #[test]
     fn apply_plan_happy_path_auto_deploy() {
         let mut mode = base_mode();
         let args = json!({
@@ -2326,6 +2369,18 @@ mod tests {
         assert!(prompt.contains("12 available slots"));
         assert!(prompt.contains("12 useful root steps"));
         assert!(prompt.contains("do not put one global scout"));
+    }
+
+    #[test]
+    fn planning_prompt_asks_before_write_for_high_impact_unknowns() {
+        let mode = base_mode();
+        let prompt = planning_prompt(&mode);
+        assert!(prompt.contains("call `ask` ONCE"));
+        assert!(prompt.contains("high-impact unknowns"));
+        assert!(prompt.contains("Skip low-stakes style/preference"));
+        assert!(prompt.contains("promoted files in worktrees"));
+        // goal_write_plan remains the terminal planning action.
+        assert!(prompt.contains("goal_write_plan` tool EXACTLY ONCE"));
     }
 
     #[test]
