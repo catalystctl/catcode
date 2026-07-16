@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Catalyst Code installer for Windows — TUI + optional web service.
+    Catalyst Code installer for Windows - TUI + optional web service.
 
 .DESCRIPTION
     DEFAULT: download the prebuilt standalone catcode.exe (Rust core embedded)
-    from GitHub Releases and put it on your user PATH — no compiler, no admin.
+    from GitHub Releases and put it on your user PATH - no compiler, no admin.
     With -WithWeb, also download catcode-core.exe + the prebuilt web bundle and
     install the web frontend as a Windows Service (NSSM) or a logon Scheduled
     Task (web install is inlined in this script - same as install.sh --with-web).
 
-    No download needed — pipe it straight from the web:
+    No download needed - pipe it straight from the web:
         irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1 | iex
 
     Run with no parameters in an interactive terminal to get a menu
@@ -101,7 +101,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # speed up Invoke-WebRequest on large .exe
 
-# ── constants + env-derived defaults (resolved in the body so a missing ──
+# -- constants + env-derived defaults (resolved in the body so a missing --
 # LOCALAPPDATA never crashes param binding; on Windows it is always set for
 # user sessions, but SYSTEM/service accounts may lack it).
 $Repo                = 'catalystctl/catcode'
@@ -120,7 +120,7 @@ if (-not $WebDir)     { $WebDir     = Join-Path $DataDir 'web' }
 # from the recorded install state).
 $script:WithWeb = [bool]$WithWeb
 
-# ── helpers ──────────────────────────────────────────────────
+# -- helpers --------------------------------------------------
 function W-Info($t) { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Cyan } }
 function W-Ok($t)   { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Green } }
 function W-Warn($t){ if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Yellow } }
@@ -132,7 +132,7 @@ function Die($t)   { Write-Host "`n  error: $t" -ForegroundColor Red; throw "ins
 
 # Native exes (schtasks/sc/nssm) write expected failures to stderr. With
 # $ErrorActionPreference=Stop, PowerShell turns that into a terminating
-# NativeCommandError even when redirected — so "task not found" on first
+# NativeCommandError even when redirected - so "task not found" on first
 # install aborts the script. Run them under Continue and use $LASTEXITCODE.
 function Invoke-Native {
     param(
@@ -151,7 +151,7 @@ function Invoke-Native {
 
 function Show-Help {
     $usage = @"
-  Catalyst Code — installer for Windows
+  Catalyst Code - installer for Windows
 
   Usage:
     pwsh -ExecutionPolicy Bypass -File .\install.ps1 [options]
@@ -178,7 +178,7 @@ function Show-Help {
     Write-Host $usage
 }
 
-# ── release resolution + asset download (mirrors install.sh) ─
+# -- release resolution + asset download (mirrors install.sh) -
 # Strip a leading "v" from a tag for the version string used in asset names.
 # Unlike Substring(1), this leaves commit-SHA tags (e.g. "1c08256") intact.
 function Get-VerFromTag {
@@ -190,7 +190,7 @@ function Get-VerFromTag {
 function Resolve-Release {
     if ($Version) {
         # Accept "0.2.0" (-> v0.2.0 semver tag), "v0.2.0" (as-is), or a commit
-        # SHA like "1c08256" (as-is — SHA tags have no leading v). Only prepend v
+        # SHA like "1c08256" (as-is - SHA tags have no leading v). Only prepend v
         # for bare semver (digits.digits), never for hex SHAs.
         $script:Tag = $Version
         if ($script:Tag -match '^[0-9]+\.[0-9]+' -and -not $script:Tag.StartsWith('v')) {
@@ -242,7 +242,7 @@ function Get-Asset {
     return $dest
 }
 
-# ── PATH management ─────────────────────────────────────────
+# -- PATH management -----------------------------------------
 function Add-ToPath {
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $path) { $path = '' }
@@ -258,7 +258,7 @@ function Add-ToPath {
     if ($env:Path -notlike "*$InstallDir*") { $env:Path = "$env:Path;$InstallDir" }
 }
 
-# ── TUI install (download standalone catcode.exe) ────────────
+# -- TUI install (download standalone catcode.exe) ------------
 function Install-Tui {
     if (-not (Test-Path -LiteralPath $InstallDir)) {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -270,7 +270,7 @@ function Install-Tui {
     Add-ToPath
 }
 
-# ── separate core binary for the web service's CATCODE_CORE ──
+# -- separate core binary for the web service's CATCODE_CORE --
 function Install-CoreForWeb {
     $coreAsset = "catcode-core-$($script:Ver)-windows-$Arch.exe"
     $src = Get-Asset $coreAsset
@@ -294,7 +294,7 @@ function Detect-Runtime {
     if ($node) { $script:RT = 'node'; $script:RTExe = $node.Source; return }
     $bun = Get-Command bun -ErrorAction SilentlyContinue
     if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
-    Die 'neither node nor bun found — install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
+    Die 'neither node nor bun found - install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
 }
 
 # --- resolve release version + base URL ------------------------------------
@@ -314,14 +314,14 @@ function Assert-WebBundle {
     if ((Test-Path -LiteralPath (Join-Path $Dir 'web\server.js')) -or
         (Test-Path -LiteralPath (Join-Path $Dir 'web\node_modules'))) {
         Die @"
-web bundle has nested web/ layout — this release artifact was packed incorrectly.
+web bundle has nested web/ layout - this release artifact was packed incorrectly.
   Use a newer catcode-web-*.tar.gz built by current release-web.sh.
 "@
     }
     foreach ($req in @('next', 'ws', 'node-pty', 'better-sqlite3', 'better-auth')) {
         $pkg = Join-Path $Dir "node_modules\$req\package.json"
         if (-not (Test-Path -LiteralPath $pkg)) {
-            Die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start)."
+            Die "web bundle missing node_modules/$req - incomplete release artifact (custom server cannot start)."
         }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $Dir 'version.json'))) {
@@ -388,7 +388,7 @@ function Install-NssmService {
     & $nssm set $SvcName AppRestartDelay 3000 *> $null
     & $nssm set $SvcName Start 'SERVICE_AUTO_START' *> $null
     & $nssm start $SvcName *> $null
-    if ($LASTEXITCODE -ne 0) { Die "nssm start failed — check: nssm get $SvcName AppStdout ; Get-Content $LogPath" }
+    if ($LASTEXITCODE -ne 0) { Die "nssm start failed - check: nssm get $SvcName AppStdout ; Get-Content $LogPath" }
     W-Ok "Service '$SvcName' installed and started (NSSM, auto-start at boot)"
     return $true
 }
@@ -414,11 +414,11 @@ function Write-Wrapper {
 }
 
 function Install-Task {
-    W-Info 'NSSM not found — installing as a Scheduled Task at logon...'
+    W-Info 'NSSM not found - installing as a Scheduled Task at logon...'
     W-Warn 'Note: a Scheduled Task runs only while a user is logged in.'
     W-Warn '      For a true boot-time service, install NSSM (https://nssm.cc) and re-run.'
     Write-Wrapper
-    # /query fails with "file not found" when the task is absent — expected on first install.
+    # /query fails with "file not found" when the task is absent - expected on first install.
     if ((Invoke-Native schtasks /query /tn $TaskName) -eq 0) {
         [void](Invoke-Native schtasks /delete /tn $TaskName /f)
     }
@@ -495,7 +495,7 @@ function Uninstall-WebService {
 }
 
 
-# ── install state ────────────────────────────────────────────
+# -- install state --------------------------------------------
 function Save-State([bool]$WebInstalled) {
     $installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $webFlag = if ($WebInstalled) { 'yes' } else { 'no' }
@@ -554,16 +554,16 @@ function Load-State {
     }
 }
 
-# ── summaries ────────────────────────────────────────────────
+# -- summaries ------------------------------------------------
 function Summary-Install {
-    $webLine = if ($script:WithWeb) { "http://${BindHost}:$Port  (service: NSSM or Scheduled Task)" } else { '(not installed — re-run with -WithWeb)' }
+    $webLine = if ($script:WithWeb) { "http://${BindHost}:$Port  (service: NSSM or Scheduled Task)" } else { '(not installed - re-run with -WithWeb)' }
     Write-Host ''
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
-    Write-Host '  ✓  Installed  Catalyst Code  v' -NoNewline -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
+    Write-Host '  OK  Installed  Catalyst Code  v' -NoNewline -ForegroundColor Green
     Write-Host "$($script:Ver)" -ForegroundColor Green
     Write-Host "    binary:  $InstallDir\catcode.exe" -ForegroundColor Green
     Write-Host "    web:     $webLine" -ForegroundColor Green
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host ''
     Write-Host '  Open a NEW PowerShell window (so PATH reloads) and run:' -ForegroundColor Green
     Write-Host '    catcode' -ForegroundColor Yellow
@@ -575,24 +575,24 @@ function Summary-Install {
 
 function Summary-Update {
     Write-Host ''
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
-    Write-Host '  ✓  Updated  Catalyst Code  v' -NoNewline -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
+    Write-Host '  OK  Updated  Catalyst Code  v' -NoNewline -ForegroundColor Green
     Write-Host "$($script:Ver)" -ForegroundColor Green
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
 }
 
 function Summary-Uninstall {
     Write-Host ''
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
-    Write-Host '  ✓  Removed  Catalyst Code' -ForegroundColor Green
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
+    Write-Host '  OK  Removed  Catalyst Code' -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host '  Open a NEW PowerShell window for a clean PATH.' -ForegroundColor DarkGray
 }
 
-# ── actions ───────────────────────────────────────────────────
+# -- actions ---------------------------------------------------
 function Do-Install {
     Write-Host ''
-    Write-Host '  Catalyst Code — installer (Windows)' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - installer (Windows)' -ForegroundColor Cyan
     Write-Host '  mode: download (prebuilt, no compile)' -ForegroundColor DarkGray
     Resolve-Release
     Write-Host "  version: $($script:Ver)   base: $($script:Base)" -ForegroundColor DarkGray
@@ -621,9 +621,9 @@ function Do-Install {
 
 function Do-Update {
     Write-Host ''
-    Write-Host '  Catalyst Code — update' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - update' -ForegroundColor Cyan
     $st = Load-State
-    if (-not $st) { Die "no previous install found at $StateFile — run install.ps1 first." }
+    if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first." }
     W-Info "Previous install: v$($st.version) (web: $($st.with_web))"
 
     Resolve-Release
@@ -649,10 +649,10 @@ function Do-Update {
 
 function Do-Uninstall {
     Write-Host ''
-    Write-Host '  Catalyst Code — uninstall' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - uninstall' -ForegroundColor Cyan
     $st = Load-State
     if ($st) { W-Info "Found previous install (v$($st.version), web: $($st.with_web))" }
-    else     { W-Warn "no state file at $StateFile — attempting default paths" }
+    else     { W-Warn "no state file at $StateFile - attempting default paths" }
 
     if ($DryRun) {
         W-Info '[dry-run] would remove the web service + catcode.exe + catcode-core.exe + state'
@@ -679,7 +679,7 @@ function Show-Menu {
     $st = Load-State
     $status = if ($st) { "v$($st.version) (web: $($st.with_web))" } else { 'not installed' }
     Write-Host ''
-    Write-Host '  Catalyst Code — installer menu' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - installer menu' -ForegroundColor Cyan
     Write-Host "  platform: Windows    status: $status" -ForegroundColor DarkGray
     while ($true) {
         Write-Host ''
@@ -695,7 +695,7 @@ function Show-Menu {
         Write-Host '    0  Exit'
         Write-Host ''
         $choice = Read-Host '  Select [0-7]'
-        if ([string]::IsNullOrWhiteSpace($choice)) { return 'install' }  # stdin closed → default
+        if ([string]::IsNullOrWhiteSpace($choice)) { return 'install' }  # stdin closed -> default
         switch ($choice) {
             '1' { return 'install' }
             '2' { $script:WithWeb = $true; return 'install' }
@@ -705,17 +705,17 @@ function Show-Menu {
             '6' { return 'uninstall' }
             '7' { return 'status' }
             '0' { Write-Host '  Bye.' -ForegroundColor DarkGray; return 'exit' }
-            default { Write-Host '  invalid choice — try again' -ForegroundColor Yellow }
+            default { Write-Host '  invalid choice - try again' -ForegroundColor Yellow }
         }
     }
 }
 
 function Do-AddWeb {
     Write-Host ''
-    Write-Host '  Catalyst Code — add web service' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - add web service' -ForegroundColor Cyan
     $st = Load-State
-    if (-not $st) { Die "no previous install found at $StateFile — run install.ps1 first to install catcode." }
-    if ($st.with_web -eq 'yes') { W-Warn 'web service is already installed — reinstalling it' }
+    if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first to install catcode." }
+    if ($st.with_web -eq 'yes') { W-Warn 'web service is already installed - reinstalling it' }
     $script:WithWeb = $true
     # pin to the installed version unless one was explicitly given
     if (-not $Version) { $Version = $st.version }
@@ -735,9 +735,9 @@ function Do-AddWeb {
 
 function Do-Reinstall {
     Write-Host ''
-    Write-Host '  Catalyst Code — reinstall' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - reinstall' -ForegroundColor Cyan
     $st = Load-State
-    if (-not $st) { Die "no previous install found at $StateFile — run install.ps1 first." }
+    if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first." }
     W-Info "Reinstalling v$($st.version) (web: $($st.with_web))"
     if (-not $Version) { $Version = $st.version }
     if ($st.with_web -eq 'yes') { $script:WithWeb = $true }
@@ -746,7 +746,7 @@ function Do-Reinstall {
 
 function Do-Status {
     Write-Host ''
-    Write-Host '  Catalyst Code — status' -ForegroundColor Cyan
+    Write-Host '  Catalyst Code - status' -ForegroundColor Cyan
     $st = Load-State
     if (-not $st) {
         W-Warn "no previous install found at $StateFile"
@@ -768,16 +768,16 @@ function Do-Status {
 
 function Summary-AddWeb {
     Write-Host ''
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
-    Write-Host '  ✓  Web service added  Catalyst Code  v' -NoNewline -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
+    Write-Host '  OK  Web service added  Catalyst Code  v' -NoNewline -ForegroundColor Green
     Write-Host "$($script:Ver)" -ForegroundColor Green
     Write-Host "    core:  $InstallDir\catcode-core.exe" -ForegroundColor Green
     Write-Host "    web:   http://localhost:$Port" -ForegroundColor Green
-    Write-Host '  ────────────────────────────────────────────' -ForegroundColor Green
+    Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host "  logs:  $env:LOCALAPPDATA\catalyst-code\catalyst-code-web.log" -ForegroundColor DarkGray
 }
 
-# ── main ─────────────────────────────────────────────────────
+# -- main -----------------------------------------------------
 # Determine whether the user passed any explicit option. If nothing was
 # requested and we're in an interactive terminal, show the menu; otherwise
 # run the implied action directly (preserves CI / `irm | iex` automation).
@@ -785,7 +785,7 @@ $canMenu = $false
 try { $canMenu = (-not [Console]::IsInputRedirected) -and [Environment]::UserInteractive } catch {}
 
 # Show the interactive menu only when NO parameters were passed (and we're in a
-# real terminal). Any explicit option — even -WithWeb or -Version — runs the
+# real terminal). Any explicit option - even -WithWeb or -Version - runs the
 # implied action directly, preserving CI / scripted use. $PSBoundParameters
 # reflects what the caller actually passed, unaffected by the default
 # resolution that happens earlier in the script.
