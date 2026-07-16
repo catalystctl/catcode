@@ -496,11 +496,16 @@ pub(crate) fn discover_skills(workspace: &Path) -> Vec<(String, String, String)>
 /// access) can read global skills under ~/.catalyst-code/skills that the
 /// read_file tool cannot reach (it rejects absolute / `..` paths).
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct SkillEntry {
     pub name: String,
     pub description: String,
     pub location: String,
     pub body: String,
+    /// Optional skill stage from frontmatter (candidate|trusted|needs_revision|deprecated).
+    pub stage: String,
+    /// Optional version from frontmatter.
+    pub version: String,
 }
 
 /// Like `discover_skills` but also returns the parsed SKILL.md body (frontmatter
@@ -543,11 +548,15 @@ pub(crate) fn discover_skills_full(workspace: &Path) -> Vec<SkillEntry> {
                     continue;
                 }
                 let desc = fm.get("description").cloned().unwrap_or_default();
+                let stage = fm.get("stage").cloned().unwrap_or_default();
+                let version = fm.get("version").cloned().unwrap_or_default();
                 out.push(SkillEntry {
                     name,
                     description: desc,
                     location: skill_md.display().to_string(),
                     body,
+                    stage,
+                    version,
                 });
             }
         }
@@ -1406,6 +1415,17 @@ async fn run_agent_inner(
     // recall tracking in `memory_recall::begin_turn`.
     if !task.trim().is_empty() {
         let mut tail = crate::memory::relevant_tail_for_subagent(&workspace, task);
+        // Role-specific learning context (spec §20).
+        let role = crate::context_pack::ContextRole::parse(agent.name.as_str());
+        let pack = crate::context_pack::build_context_pack_for(&workspace, task, role);
+        if !pack.is_empty() {
+            if tail.is_empty() {
+                tail = pack;
+            } else {
+                tail.push_str("\n\n");
+                tail.push_str(&pack);
+            }
+        }
         if let Some(h) = relevant_skill_hint(&workspace, task) {
             if tail.is_empty() {
                 tail = h;

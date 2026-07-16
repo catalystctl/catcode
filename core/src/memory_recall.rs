@@ -358,6 +358,16 @@ mod tests {
             importance: crate::memory::Importance::Normal,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: crate::memory::MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         }
     }
 

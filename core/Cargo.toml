@@ -23,6 +23,18 @@ rand = "0.8"
 libc = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 bytes = "1"
+wry = { version = "0.53", optional = true }
+tao = { version = "0.34", optional = true }
+# Linux screenshot: WebKitGTK get_snapshot → cairo PNG (versions aligned with wry 0.53).
+webkit2gtk = { version = "2.0.1", optional = true }
+cairo = { version = "0.18", package = "cairo-rs", optional = true, features = ["png"] }
+gtk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+gio = { version = "0.18", optional = true }
+
+[features]
+default = []
+native-browser = ["dep:wry", "dep:tao", "dep:webkit2gtk", "dep:cairo", "dep:gio", "dep:gtk", "dep:glib"]
 
 [dev-dependencies]
 filetime = "0.2"

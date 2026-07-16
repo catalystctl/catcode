@@ -128,6 +128,8 @@ impl Scope {
     pub fn parse(s: &str) -> Scope {
         match s.trim().to_lowercase().as_str() {
             "global" | "user" => Scope::Global,
+            // Spec §4 uses "project"; keep "workspace" as the historical alias.
+            "project" | "workspace" | "local" => Scope::Workspace,
             _ => Scope::Workspace,
         }
     }
@@ -160,6 +162,59 @@ impl Importance {
     }
 }
 
+/// Memory verification / lifecycle status (schema v2). Legacy files without
+/// `status:` are treated as [`MemoryStatus::Verified`] so they keep ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MemoryStatus {
+    Candidate,
+    #[default]
+    Verified,
+    NeedsVerification,
+    Stale,
+    Deprecated,
+    Rejected,
+}
+
+impl MemoryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Verified => "verified",
+            Self::NeedsVerification => "needs_verification",
+            Self::Stale => "stale",
+            Self::Deprecated => "deprecated",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(s: &str) -> MemoryStatus {
+        match s.trim().to_lowercase().as_str() {
+            "candidate" => Self::Candidate,
+            "needs_verification" | "needs-verification" => Self::NeedsVerification,
+            "stale" => Self::Stale,
+            "deprecated" => Self::Deprecated,
+            "rejected" => Self::Rejected,
+            _ => Self::Verified,
+        }
+    }
+
+    /// Candidate/stale rank below verified; deprecated/rejected are not positive guidance.
+    pub fn is_positive_guidance(self) -> bool {
+        !matches!(self, Self::Deprecated | Self::Rejected)
+    }
+
+    /// Retrieval rank boost relative to verified (1.0).
+    pub fn rank_multiplier(self) -> f32 {
+        match self {
+            Self::Verified => 1.0,
+            Self::NeedsVerification => 0.7,
+            Self::Candidate => 0.55,
+            Self::Stale => 0.4,
+            Self::Deprecated | Self::Rejected => 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryEntry {
     pub name: String,
@@ -182,6 +237,28 @@ pub struct MemoryEntry {
     /// Name/id of the memory that supersedes this one (frontmatter
     /// `superseded_by`), set when a new memory `replaces` this one.
     pub superseded_by: Option<String>,
+    /// Optional schema version (frontmatter `schema_version`). Absent on
+    /// legacy files; treated as 1. Schema 2 adds status/confidence/evidence.
+    pub schema_version: u32,
+    /// Learning status (frontmatter `status:`). Defaults to `verified` for
+    /// legacy files so existing memories keep ranking.
+    pub status: MemoryStatus,
+    /// Confidence in `0.0..=1.0` (frontmatter `confidence:`).
+    pub confidence: f32,
+    /// Supporting evidence count (frontmatter `support_count:`).
+    pub support_count: u32,
+    /// Contradiction count (frontmatter `contradiction_count:`).
+    pub contradiction_count: u32,
+    /// Unix seconds when last verified against code (optional).
+    pub last_verified_at: Option<u64>,
+    /// Commit short-SHA when last verified (optional).
+    pub last_verified_commit: Option<String>,
+    /// Referenced relative file paths (frontmatter list under `references.files`).
+    pub ref_files: Vec<String>,
+    /// Referenced symbol names.
+    pub ref_symbols: Vec<String>,
+    /// Linked episode ids (evidence).
+    pub evidence_episodes: Vec<String>,
 }
 
 /// Standing-prompt catalog caps. Bodies are NOT injected — only name/type/scope
@@ -737,11 +814,55 @@ fn write_memory_file(
         String::new()
     };
     let sup_line = match &e.superseded_by {
-        Some(s) if !s.trim().is_empty() => format!("superseded_by: {}\n", s),
+        Some(s) if !s.trim().is_empty() => format!("superseded_by: {s}\n"),
         _ => String::new(),
     };
+    // Schema v2 optional fields — only emit when non-default so legacy-shaped
+    // files stay compact and old readers ignore unknown keys safely.
+    let mut v2 = String::new();
+    if e.schema_version >= 2
+        || e.status != MemoryStatus::Verified
+        || (e.confidence - 1.0).abs() > f32::EPSILON
+        || e.support_count > 0
+        || e.contradiction_count > 0
+        || e.last_verified_at.is_some()
+        || e.last_verified_commit.is_some()
+        || !e.ref_files.is_empty()
+        || !e.ref_symbols.is_empty()
+        || !e.evidence_episodes.is_empty()
+    {
+        v2.push_str(&format!("schema_version: {}\n", e.schema_version.max(2)));
+        if e.status != MemoryStatus::Verified {
+            v2.push_str(&format!("status: {}\n", e.status.as_str()));
+        }
+        if (e.confidence - 1.0).abs() > f32::EPSILON {
+            v2.push_str(&format!("confidence: {:.2}\n", e.confidence));
+        }
+        if e.support_count > 0 {
+            v2.push_str(&format!("support_count: {}\n", e.support_count));
+        }
+        if e.contradiction_count > 0 {
+            v2.push_str(&format!("contradiction_count: {}\n", e.contradiction_count));
+        }
+        if let Some(t) = e.last_verified_at {
+            v2.push_str(&format!("last_verified_at: {t}\n"));
+        }
+        if let Some(ref c) = e.last_verified_commit {
+            v2.push_str(&format!("last_verified_commit: {c}\n"));
+        }
+        if !e.ref_files.is_empty() {
+            v2.push_str("files: ");
+            v2.push_str(&e.ref_files.join(", "));
+            v2.push('\n');
+        }
+        if !e.ref_symbols.is_empty() {
+            v2.push_str("symbols: ");
+            v2.push_str(&e.ref_symbols.join(", "));
+            v2.push('\n');
+        }
+    }
     let body = format!(
-        "---\nname: {}\ndescription: {}\ntype: {}\n{pin_line}{importance_line}{dep_line}{sup_line}---\n{}",
+        "---\nname: {}\ndescription: {}\ntype: {}\n{pin_line}{importance_line}{dep_line}{sup_line}{v2}---\n{}",
         e.name, description, e.mem_type, content
     );
     atomic_write(path, &body)
@@ -817,6 +938,8 @@ pub fn mark_memory_deprecated(
     let entry = parse_memory_file(&path).ok_or_else(|| format!("memory '{id}' is unreadable"))?;
     let mut new_entry = entry.clone();
     new_entry.deprecated = true;
+    new_entry.status = MemoryStatus::Deprecated;
+    new_entry.schema_version = new_entry.schema_version.max(2);
     new_entry.superseded_by = superseded_by
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1287,16 +1410,75 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     let mut importance = Importance::Normal;
     let mut deprecated = false;
     let mut superseded_by: Option<String> = None;
+    let mut schema_version: u32 = 1;
+    let mut status = MemoryStatus::Verified;
+    let mut confidence: f32 = 1.0;
+    let mut support_count: u32 = 0;
+    let mut contradiction_count: u32 = 0;
+    let mut last_verified_at: Option<u64> = None;
+    let mut last_verified_commit: Option<String> = None;
+    let mut ref_files: Vec<String> = Vec::new();
+    let mut ref_symbols: Vec<String> = Vec::new();
+    let mut evidence_episodes: Vec<String> = Vec::new();
+    // Lightweight list parsing: `files: a, b` or repeated `file: path` keys.
+    let mut in_refs_files = false;
+    let mut in_refs_symbols = false;
+    let mut in_evidence_eps = false;
 
     for line in fm_block.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        // YAML list item under a previously opened section.
+        if let Some(item) = line.strip_prefix("- ") {
+            let item = item.trim().trim_matches('"').trim_matches('\'').to_string();
+            if item.is_empty() {
+                continue;
+            }
+            if in_refs_files {
+                ref_files.push(item);
+            } else if in_refs_symbols {
+                ref_symbols.push(item);
+            } else if in_evidence_eps {
+                evidence_episodes.push(item);
+            }
+            continue;
+        }
         let (key, val) = match line.split_once(':') {
             Some((k, v)) => (k.trim().to_lowercase(), v.trim().to_string()),
             None => continue,
         };
+        // Nested section headers (value empty) toggle list collectors.
+        if val.is_empty() {
+            match key.as_str() {
+                "files" | "references.files" => {
+                    in_refs_files = true;
+                    in_refs_symbols = false;
+                    in_evidence_eps = false;
+                }
+                "symbols" | "references.symbols" => {
+                    in_refs_files = false;
+                    in_refs_symbols = true;
+                    in_evidence_eps = false;
+                }
+                "episodes" | "evidence.episodes" => {
+                    in_refs_files = false;
+                    in_refs_symbols = false;
+                    in_evidence_eps = true;
+                }
+                "references" | "evidence" => {
+                    in_refs_files = false;
+                    in_refs_symbols = false;
+                    in_evidence_eps = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        in_refs_files = false;
+        in_refs_symbols = false;
+        in_evidence_eps = false;
         match key.as_str() {
             "name" => name = val,
             "description" => description = val,
@@ -1315,6 +1497,31 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
                     Some(val)
                 };
             }
+            "schema_version" => {
+                schema_version = val.parse().unwrap_or(1);
+            }
+            "status" => status = MemoryStatus::parse(&val),
+            "confidence" => {
+                confidence = val.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
+            }
+            "support_count" => {
+                support_count = val.parse().unwrap_or(0);
+            }
+            "contradiction_count" => {
+                contradiction_count = val.parse().unwrap_or(0);
+            }
+            "last_verified_at" => {
+                last_verified_at = val.parse().ok();
+            }
+            "last_verified_commit" => {
+                last_verified_commit = if val.is_empty() { None } else { Some(val) };
+            }
+            "files" | "ref_files" => {
+                ref_files.extend(val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            }
+            "symbols" | "ref_symbols" => {
+                ref_symbols.extend(val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            }
             _ => {}
         }
     }
@@ -1326,6 +1533,13 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     // Types that are almost always worth keeping in the standing catalog.
     if !pinned {
         pinned = is_pinned_type(&mem_type) || importance == Importance::High;
+    }
+    // Frontmatter `deprecated: true` aligns with status=deprecated.
+    if deprecated && status == MemoryStatus::Verified {
+        status = MemoryStatus::Deprecated;
+    }
+    if status == MemoryStatus::Deprecated || status == MemoryStatus::Rejected {
+        deprecated = true;
     }
 
     Some(MemoryEntry {
@@ -1342,6 +1556,16 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         importance,
         deprecated,
         superseded_by,
+        schema_version,
+        status,
+        confidence,
+        support_count,
+        contradiction_count,
+        last_verified_at,
+        last_verified_commit,
+        ref_files,
+        ref_symbols,
+        evidence_episodes,
     })
 }
 
@@ -1722,6 +1946,16 @@ mod tests {
             importance: Importance::Normal,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         assert!(is_name_relevant(&e, "write a strict TypeScript component"));
         assert!(is_name_relevant(&e, "use enums in this file"));
@@ -1743,6 +1977,16 @@ mod tests {
             importance: Importance::Normal,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         assert!(!is_name_relevant(&e, "the quick brown fox"));
         assert!(!is_name_relevant(&e, "this and that"));
@@ -1841,6 +2085,16 @@ mod tests {
                 importance: Importance::Normal,
                 deprecated: false,
                 superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
             });
         }
         memories.push(MemoryEntry {
@@ -1854,6 +2108,16 @@ mod tests {
             importance: Importance::High,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         });
         let injection = build_catalog(&memories);
         assert!(injection.contains("[MEMORY CATALOG]"));
@@ -1887,6 +2151,16 @@ mod tests {
             importance: Importance::High,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         assert!(
             !significant_tokens("implement all").contains(&"all".to_string()),
@@ -1913,6 +2187,16 @@ mod tests {
             importance: Importance::Normal,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let noise = MemoryEntry {
             name: "ship-policy".into(),
@@ -1925,6 +2209,16 @@ mod tests {
             importance: Importance::High,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let memories = vec![noise.clone(), real.clone()];
         let tail = build_injection(&memories, "what is our self learning system");
@@ -1951,6 +2245,16 @@ mod tests {
             importance: Importance::High,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let dead = MemoryEntry {
             name: "cursor-provider-old".into(),
@@ -1963,6 +2267,16 @@ mod tests {
             importance: Importance::High,
             deprecated: true,
             superseded_by: Some("cursor-provider".into()),
+            schema_version: 1,
+            status: MemoryStatus::Deprecated,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let catalog = build_catalog(&[live.clone(), dead.clone()]);
         assert!(catalog.contains("cursor-provider"));
@@ -2111,6 +2425,36 @@ mod tests {
         assert_eq!(entries[0].description, "some desc");
         assert_eq!(entries[0].mem_type, "user");
         assert_eq!(entries[0].content, "Here is the body.\nMultiline.\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_schema_v2_optional_fields() {
+        let root = tmp_root();
+        let ws = fake_workspace("fm2");
+        let store = test_store(&root);
+        let dir = store.dir(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let md = "---\nname: provider-arch\ndescription: key providers in config\ntype: architecture\nschema_version: 2\nstatus: needs_verification\nconfidence: 0.80\nsupport_count: 3\nfiles: core/src/provider.rs, core/src/plugins.rs\nsymbols: ProviderConfig\n---\nBody stays readable.\n";
+        std::fs::write(dir.join("provider-arch.md"), md).unwrap();
+
+        let entries = store.scan(&ws);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.schema_version, 2);
+        assert_eq!(e.status, MemoryStatus::NeedsVerification);
+        assert!((e.confidence - 0.80).abs() < 0.001);
+        assert_eq!(e.support_count, 3);
+        assert_eq!(e.ref_files.len(), 2);
+        assert_eq!(e.ref_symbols, vec!["ProviderConfig".to_string()]);
+        // Legacy files without v2 fields still default safely.
+        let md1 = "---\nname: legacy\ndescription: old\ntype: note\n---\nold body\n";
+        std::fs::write(dir.join("legacy.md"), md1).unwrap();
+        let entries = store.scan(&ws);
+        let legacy = entries.iter().find(|m| m.name == "legacy").unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.status, MemoryStatus::Verified);
+        assert!((legacy.confidence - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]

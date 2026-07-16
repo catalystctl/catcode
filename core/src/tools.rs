@@ -37,10 +37,11 @@ pub fn classify(name: &str) -> ToolKind {
     match name {
         "read_file" | "list_dir" | "grep" | "glob" | "bulk_read" | "todo_read" | "diagnostics"
         | "finish" | "contact_supervisor" | "intercom" | "git_status" | "git_diff" | "git_log"
-        | "memory" | "goal_write_plan" | "load_tools" => ToolKind::ReadOnly,
+        | "memory" | "knowledge" | "goal_write_plan" | "load_tools" => ToolKind::ReadOnly,
         "web_search" => ToolKind::ReadOnly,
         "ask" => ToolKind::ReadOnly,
         "workspace_activity" => ToolKind::ReadOnly,
+        n if crate::browser::is_browser_readonly(n) => ToolKind::ReadOnly,
         // delete/rename/mkdir mutate the tree — always gated under Destructive.
         _ => ToolKind::Destructive,
     }
@@ -120,6 +121,7 @@ pub fn is_core_tool(name: &str) -> bool {
             | "todo_read"
             | "finish"
             | "memory"
+            | "knowledge"
             | "ask"
             | "load_tools"
             | "subagent"
@@ -151,6 +153,24 @@ pub fn deferred_tool_names() -> &'static [&'static str] {
         "git_commit",
         "spawn",
         "test_env",
+        "browser_create",
+        "browser_close",
+        "browser_list_sessions",
+        "browser_navigate",
+        "browser_back",
+        "browser_reload",
+        "browser_snapshot",
+        "browser_find",
+        "browser_click",
+        "browser_fill",
+        "browser_type",
+        "browser_press",
+        "browser_scroll",
+        "browser_wait",
+        "browser_evaluate",
+        "browser_screenshot",
+        "browser_show",
+        "browser_hide",
     ]
 }
 
@@ -190,7 +210,7 @@ pub fn definitions() -> Vec<Value> {
 }
 
 fn definitions_uncached() -> Vec<Value> {
-    vec![
+    let mut defs = vec![
         json!({
             "type": "function",
             "function": {
@@ -752,7 +772,26 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
-        json!({
+                json!({
+            "type": "function",
+            "function": {
+                "name": "knowledge",
+                "description": "Read-only codebase intelligence queries (offline). Actions: context (task context pack), search (hybrid memory rank), symbol, related (imports/coupling/memories), tests, episodes, preferences, rejected, coverage, explain (why a memory ranked).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["context", "search", "symbol", "related", "tests", "episodes", "preferences", "rejected", "coverage", "explain"], "description": "knowledge query kind" },
+                        "query": { "type": "string", "description": "search/context prompt text" },
+                        "prompt": { "type": "string", "description": "alias of query for context" },
+                        "path": { "type": "string", "description": "related/tests: workspace-relative path" },
+                        "name": { "type": "string", "description": "symbol/explain: symbol or memory name" },
+                        "limit": { "type": "integer", "description": "max results (default varies by action)" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+json!({
             "type": "function",
             "function": {
                 "name": "spawn",
@@ -806,14 +845,14 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "load_tools",
-                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, test_env. (goal_write_plan is planning-phase only — not loadable.)",
+                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk, browser. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, test_env, browser_*. (goal_write_plan is planning-phase only — not loadable.)",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "tools": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "tool names or groups (all|git|web|bulk)"
+                            "description": "tool names or groups (all|git|web|bulk|browser)"
                         },
                         "tool": { "type": "string", "description": "single tool name or group" }
                     }
@@ -848,7 +887,9 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+    defs.extend(crate::browser::definitions());
+    defs
 }
 
 /// Outcome of a tool call. For bash we need a future with timeout+kill, so
@@ -879,6 +920,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "diagnostics" => Outcome::err("diagnostics must be dispatched through execute_diagnostics (async)"),
         "fetch" => Outcome::err("fetch must be dispatched through execute_fetch (async)"),
         "web_search" => Outcome::err("web_search must be dispatched through execute_web_search (async)"),
+        name if crate::browser::is_browser_tool(name) => Outcome::err("browser tools must be dispatched through execute_browser (async)"),
         "spawn" | "subagent" => Outcome::err("subagent must be dispatched through execute_subagent (async)"),
         "contact_supervisor" | "intercom" => Outcome::err("intercom tools must be dispatched through execute_intercom (async, subagent context only)"),
         "ask" => Outcome::err("ask must be dispatched through request_ask (async, orchestrator loop only)"),
@@ -909,6 +951,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_add" => git_add(args, cfg),
         "git_commit" => git_commit(args, cfg),
         "memory" => memory_tool(args, cfg),
+        "knowledge" => knowledge_tool(args, cfg),
         "goal_write_plan" => Outcome::err(
             "goal_write_plan must be dispatched through handle_goal_write_plan (async, goal mode only)",
         ),
@@ -4039,6 +4082,22 @@ fn git_commit(args: &Value, cfg: &Config) -> Outcome {
 
 // ---- memory tool (agent-callable wrapper over crate::memory) ----
 
+
+fn knowledge_tool(args: &Value, cfg: &Config) -> Outcome {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if action.is_empty() {
+        return Outcome::err("knowledge requires action");
+    }
+    match crate::knowledge_tool::dispatch(action, args, &cfg.workspace) {
+        Ok(s) => Outcome::ok(s),
+        Err(e) => Outcome::err(e),
+    }
+}
+
 fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
     use crate::memory::{Importance, Scope};
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -4227,16 +4286,25 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     format!(": {blurb}")
                 };
                 let dep = if m.deprecated { " [DEPRECATED]" } else { "" };
+                let stale = match m.status {
+                    crate::memory::MemoryStatus::NeedsVerification | crate::memory::MemoryStatus::Stale => " [STALE]",
+                    crate::memory::MemoryStatus::Candidate => " [CANDIDATE]",
+                    crate::memory::MemoryStatus::Rejected => " [REJECTED]",
+                    _ => "",
+                };
                 out.push_str(&format!(
-                    "- {} [id: {}] ({}, {}, {}){}{}
+                    "- {} [id: {}] ({}, {}, {}, status={}, conf={:.2}){}{}{}
 ",
                     m.name,
                     id,
                     m.mem_type,
                     m.scope.as_str(),
                     m.importance.as_str(),
+                    m.status.as_str(),
+                    m.confidence,
                     desc,
-                    dep
+                    dep,
+                    stale
                 ));
             }
             Outcome::ok(out.trim_end().to_string())
@@ -4278,8 +4346,24 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                     } else {
                         String::new()
                     };
+                    let meta = format!(
+                        "status={} conf={:.2} schema_v={} refs_files={} refs_symbols={}",
+                        m.status.as_str(),
+                        m.confidence,
+                        m.schema_version,
+                        m.ref_files.len(),
+                        m.ref_symbols.len(),
+                    );
+                    let verified = m
+                        .last_verified_at
+                        .map(|ts| format!(" last_verified_at={ts}"))
+                        .unwrap_or_default();
                     Outcome::ok(format!(
-                        "{banner}# {} [id: {}] ({}, {}, {})\n{}\n\n{}",
+                        "{banner}# {} [id: {}] ({}, {}, {})
+{meta}{verified}
+{}
+
+{}",
                         m.name,
                         id,
                         m.mem_type,
@@ -4288,7 +4372,7 @@ fn memory_tool(args: &Value, cfg: &Config) -> Outcome {
                         if m.description.is_empty() {
                             "(no description)".to_string()
                         } else {
-                            m.description
+                            m.description.clone()
                         },
                         m.content.trim_end()
                     ))

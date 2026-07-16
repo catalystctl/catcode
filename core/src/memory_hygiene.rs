@@ -722,7 +722,7 @@ pub fn gate_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{save_memory_scoped, Importance, Scope};
+    use crate::memory::{save_memory_scoped, Importance, MemoryStatus, Scope};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[cfg(test)]
@@ -781,6 +781,16 @@ mod tests {
             importance: Importance::High,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let v = evaluate_write(
             "indent",
@@ -815,6 +825,16 @@ mod tests {
             importance: Importance::Normal,
             deprecated: false,
             superseded_by: None,
+            schema_version: 1,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
         };
         let v = evaluate_write(
             "rules",

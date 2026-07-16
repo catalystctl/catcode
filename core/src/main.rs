@@ -8,30 +8,48 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
+mod browser;
 mod checkpoint;
+mod change_coupling;
+mod codebase_index;
 mod config;
+mod context_pack;
+mod coverage_ledger;
 mod embed;
+mod episodes;
+mod failure_atlas;
 mod fetch_tool;
 mod fsutil;
 mod git_ctx;
 mod goal;
 mod intercom;
+mod knowledge_tool;
+mod learning_activations;
+mod learning_proposals;
+mod learning_retrieval;
+mod learning_store;
 mod logging;
 mod memory;
 mod memory_hygiene;
 mod memory_recall;
+mod memory_staleness;
 mod message;
 mod models_dev;
 mod oauth;
 mod pattern_log;
 mod plugins;
+mod preferences;
 mod presence;
+mod project_identity;
+mod rejected_approaches;
 mod protocol;
 mod provider;
 mod search_tool;
 mod session;
+mod skill_metrics;
 mod staging;
 mod subagent;
+mod task_fingerprint;
 mod test_env;
 mod tool_cache;
 mod tools;
@@ -78,7 +96,7 @@ Judgment (tool schemas own the mechanics):
 - Read/search before changing; prefer the smallest correct edit; verify with a command.
 - Prefer edit over write_file for targeted changes; prefer grep/glob (scoped) before full reads; page with offset/limit.
 - Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; for complex logic write a script and run it.
-- Use load_tools for deferred tools (git_*, fetch, web_search, bulk_*, diagnostics, spawn, …) only when needed.
+- Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed (see Deferred tools below).
 - Paths are workspace-relative; absolute paths and ".." are rejected.
 Be concise. When done, summarize in two lines.
 
@@ -112,6 +130,21 @@ const PROVIDER_GUIDE: &str = r#"## Adding model providers
 2. **OAuth/subscription login** (browser/device-code, no plain key — e.g. Grok, ChatGPT) → PLUGIN. A plugin's `plugin.json` declares an `oauth` block (`provider_id`, `kind`, `base_url`, `token_path`, `script` handling login/complete/token/clear actions, JSON in/out). The harness resolves the bearer token at turn time and lists the provider in `/login`. Skill `plugin-authoring` has the full schema + script contract; `docs/examples/plugins/grok-oauth/` is a device-code example.
 Rule: plain API key → config; login flow → plugin."#;
 
+/// Deferred load_tools groups — always injected so the agent knows secondary
+/// capabilities exist without an opt-in skill. Keep lean: groups + when-to-load;
+/// full tool schemas arrive only after load_tools. When adding a new deferred
+/// group (e.g. browser), list it here AND in handle_load_tools / load_tools schema.
+const DEFERRED_TOOLS_GUIDE: &str = r#"## Deferred tools
+
+Secondary tools are not in the default schema. Call `load_tools` with a **group** or tool name when the task needs them:
+- `git` — status/diff/log/add/commit
+- `web` — fetch, web_search
+- `bulk` — bulk, bulk_read, bulk_write, bulk_edit
+- `browser` — native WRY browser (create/navigate/snapshot/click/…); requires core built with `native-browser`
+- by name — diagnostics, spawn, workspace_activity, test_env
+- `all` — every loadable deferred tool
+`goal_write_plan` is /goal planning-phase only (not loadable)."#;
+
 /// Cap standing skill-manifest size so a large skills/ tree does not bloat the
 /// prefix cache. Remaining skills stay discoverable via list_dir / `/skill:`.
 const SKILL_MANIFEST_MAX: usize = 12;
@@ -129,8 +162,8 @@ const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in PowerShell
 const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in bash. For complex logic write a script with write_file and run `bash script.sh`.";
 
 /// Build the full system prompt by appending git context, memory context,
-/// the plugins pointer, and the provider-onboarding guide (full manuals live
-/// in the `plugin-authoring` / `add-key-provider` skills).
+/// the plugins pointer, the provider-onboarding guide, and the deferred-tools
+/// group list (full manuals live in opt-in skills).
 /// When `memory_provider` is set, standing-prompt memories come from that
 /// plugin instead of the built-in markdown store.
 pub fn build_system_prompt(
@@ -152,6 +185,26 @@ pub fn build_system_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(&git_context_injection(&git));
     }
+    // Stable project identity + learning dir bootstrap (fail-open).
+    {
+        let ident = project_identity::resolve_project_identity(workspace);
+        let _ = learning_store::ensure_project_learning(
+            &ident.id,
+            ident.remote.as_deref(),
+            Some(&ident.workspace_hash),
+        );
+        prompt.push_str("\n\n");
+        prompt.push_str(&format!(
+            "Project identity: `{}` (workspace hash `{}`{}). Learning data is scoped to this project id so path moves keep memories and episodes.",
+            ident.id,
+            ident.workspace_hash,
+            ident
+                .remote
+                .as_ref()
+                .map(|r| format!(", remote `{r}`"))
+                .unwrap_or_default()
+        ));
+    }
     let mem = match memory_provider {
         Some(cfg) => plugins::memory_provider_inject(cfg, &workspace.display().to_string(), ""),
         None => memory_injection(workspace, ""),
@@ -164,6 +217,8 @@ pub fn build_system_prompt(
     prompt.push_str(PLUGIN_DOCS);
     prompt.push_str("\n\n");
     prompt.push_str(PROVIDER_GUIDE);
+    prompt.push_str("\n\n");
+    prompt.push_str(DEFERRED_TOOLS_GUIDE);
     // Parent-only: stub + capped skill manifest. Subagents never receive these
     // (they'd wrongly think they are the orchestrator).
     if with_skill {
@@ -4448,6 +4503,21 @@ async fn start_turn(
     effort: String,
     images: Option<Vec<String>>,
 ) {
+    // Living codebase index: refresh once per turn-start window (throttled
+    // inside codebase_index). Fail-open — never block the turn on index I/O.
+    {
+        let ws = state.cfg.read().await.workspace.clone();
+        let (project_id, _f, _s) = codebase_index::ensure_index(&ws);
+        // Best-effort git coupling refresh (capped internally).
+        let _ = change_coupling::refresh_coupling(&ws, &project_id);
+        // Coverage ledger rebuild (fail-open, cheap relative to indexing).
+        let _ = coverage_ledger::rebuild_coverage(&ws, &project_id);
+    }
+    // Explicit preference capture from the user prompt (spec §12.1).
+    {
+        let ws = state.cfg.read().await.workspace.clone();
+        let _ = learning_proposals::maybe_capture_explicit_preference(&ws, &prompt);
+    }
     let already = state.current.lock().await.is_some();
     if already {
         let mut q = state.queued.lock().await;
@@ -4867,17 +4937,63 @@ async fn maybe_reflect_prompt(
         }
     }
     let cfg = st.cfg.read().await;
-    if !cfg.auto_reflect {
-        return None;
-    }
-    if turn_tool_calls < cfg.auto_reflect_min_tool_calls {
+    let min_tools = cfg.auto_reflect_min_tool_calls;
+    let auto_reflect = cfg.auto_reflect;
+    let workspace = cfg.workspace.clone();
+    drop(cfg);
+    if turn_tool_calls < min_tools {
         return None;
     }
     if is_learning_turn(prompt) {
         return None;
     }
-    let workspace = cfg.workspace.clone();
-    drop(cfg);
+
+    // Coding-episode capture (fail-open). Independent of the auto_reflect
+    // toggle so learning storage still accumulates when reflection is off.
+    {
+        let outcome = if shape_tools.iter().any(|t| t == "bash") {
+            // Tests may have run; without parsing output treat as unverified.
+            episodes::EpisodeOutcome::SuccessUnverified
+        } else if shape_tools.iter().any(|t| {
+            matches!(t.as_str(), "edit" | "write_file" | "patch" | "bulk_edit" | "bulk_write")
+        }) {
+            episodes::EpisodeOutcome::SuccessUnverified
+        } else {
+            episodes::EpisodeOutcome::Unknown
+        };
+        let model = st.last_model.lock().await.clone();
+        let tin = *st.tokens_in.lock().await;
+        let tout = *st.tokens_out.lock().await;
+        let _ = episodes::record_turn_episode(
+            &workspace,
+            prompt,
+            shape_tools,
+            shape_files, // categories; fingerprint treats them as path-like
+            &[],
+            outcome,
+            0,
+            model.as_deref(),
+            Some(tin),
+            Some(tout),
+            None,
+        );
+        // Staleness: mark memories whose ref_files overlap changed categories.
+        let _ = memory_staleness::invalidate_for_paths(&workspace, shape_files);
+        // Learning proposals from episode digest (validated; no secrets).
+        for prop in learning_proposals::proposals_from_episode_digest(
+            prompt.lines().next().unwrap_or(prompt),
+            shape_files,
+            &[],
+            &[],
+        ) {
+            let _ = learning_proposals::validate_and_apply(&workspace, &prop);
+        }
+    }
+
+    // Pattern log + reflect nudge still gated on auto_reflect.
+    if !auto_reflect {
+        return None;
+    }
     let sig = pattern_log::shape_signature(shape_tools, shape_files);
     let label = prompt.lines().next().unwrap_or(prompt);
     pattern_log::append_pattern(&workspace, &sig, label);
@@ -4971,7 +5087,7 @@ async fn run_parallel_readonly_wave(
             let msg = if tools::is_deferred_tool(&name) {
                 format!(
                     "tool '{name}' is deferred and not enabled this session. \
-                     Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, all), \
+                     Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, browser, all), \
                      then retry the call."
                 )
             } else {
@@ -6021,7 +6137,28 @@ async fn run_turn(
         let mut tail = mem_tail;
         if !last_user.trim().is_empty() {
             let ws = st.cfg.read().await.workspace.clone();
+            let pack = context_pack::build_context_pack(&ws, &last_user);
+            if !pack.is_empty() {
+                if tail.is_empty() {
+                    tail = pack;
+                } else {
+                    tail.push_str("\n\n");
+                    tail.push_str(&pack);
+                }
+            }
             if let Some(h) = subagent::relevant_skill_hint(&ws, &last_user) {
+                // Utility signal: skill was retrieved (not yet proven followed).
+                if let Some(start) = h.find(char::from_u32(39).unwrap()) {
+                    if let Some(end) = h[start + 1..].find(char::from_u32(39).unwrap()) {
+                        let name = &h[start + 1..start + 1 + end];
+                        if !name.is_empty() {
+                            let _ = skill_metrics::record_outcome(
+                                name,
+                                skill_metrics::OutcomeKind::Success,
+                            );
+                        }
+                    }
+                }
                 if tail.is_empty() {
                     tail = h;
                 } else {
@@ -6242,7 +6379,7 @@ async fn run_turn(
                         let msg = if tools::is_deferred_tool(&name) {
                             format!(
                                 "tool '{name}' is deferred and not enabled this session. \
-                                 Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, all), \
+                                 Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, browser, all), \
                                  then retry the call."
                             )
                         } else {
@@ -6693,6 +6830,11 @@ async fn run_turn(
                         tokio::select! {
                             o = tools::execute_test_env(&exec_args, &cfg) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("test_env aborted"),
+                        }
+                    } else if browser::is_browser_tool(&name) {
+                        tokio::select! {
+                            o = browser::execute_browser(&name, &exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("browser tool aborted"),
                         }
                     } else if name == "spawn" || name == "subagent" {
                         // When goal mode is active, cap concurrency on parallel
@@ -8339,6 +8481,11 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
                     expanded.push(g.into());
                 }
             }
+            "browser" => {
+                for g in crate::browser::MVP_TOOL_NAMES {
+                    expanded.push((*g).to_string());
+                }
+            }
             other => expanded.push(other.to_string()),
         }
     }
@@ -8346,7 +8493,7 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
     expanded.dedup();
     if expanded.is_empty() {
         return tools::Outcome::ok(format!(
-            "No tools requested. Deferred tools: {}. Groups: all, git, web, bulk. Core tools are already available.",
+            "No tools requested. Deferred tools: {}. Groups: all, git, web, bulk, browser. Core tools are already available.",
             tools::deferred_tool_names().join(", ")
         ));
     }
@@ -8927,9 +9074,18 @@ mod system_prompt_slim_tests {
         let fixed = SYSTEM_PROMPT_BASE.len()
             + PLUGIN_DOCS.len()
             + SUBAGENT_ORCHESTRATOR_STUB.len()
-            + PROVIDER_GUIDE.len();
+            + PROVIDER_GUIDE.len()
+            + DEFERRED_TOOLS_GUIDE.len();
         assert!(
-            fixed < 4_500,
+            prompt.contains("## Deferred tools"),
+            "deferred tools guide must be in the standing prompt"
+        );
+        assert!(
+            prompt.contains("`git`"),
+            "deferred git group must be named in the standing prompt"
+        );
+        assert!(
+            fixed < 5_000,
             "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"
         );
         let _ = std::fs::remove_dir_all(&ws);
