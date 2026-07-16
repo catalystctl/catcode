@@ -7,7 +7,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export interface ProjectEntry {
   /** Absolute workspace path. */
@@ -74,7 +74,7 @@ export function removeProject(path: string): ProjectEntry[] {
 }
 
 function resolveAbs(p: string): string {
-  // Normalise but keep relative-to-cwd resolution for the server process.
+  // Resolve to an absolute path (relative paths are against process.cwd()).
   if (!p) return process.cwd();
-  return p;
+  return resolve(p);
 }

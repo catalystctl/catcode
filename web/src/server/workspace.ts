@@ -2,14 +2,43 @@
 // inline guard in api/files/route.ts so every new fs/git/preview/terminal route
 // confines paths identically. Pure Node — no React, no core bridge events.
 
-import { normalize, join, relative, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { normalize, join, relative, resolve, sep } from "node:path";
 import { getBridge } from "@/server/core-bridge";
+import { loadProjects } from "@/lib/projects";
 
 /** Resolve the workspace for a request: explicit ?workspace=, else default. */
 export function resolveWorkspace(req: Request): string {
   const url = new URL(req.url);
   const w = url.searchParams.get("workspace");
   return w ?? getBridge().getDefaultWorkspace();
+}
+
+/**
+ * Resolve a client workspace root to an allowlisted project path.
+ * Allowed: the bridge default workspace + every path in loadProjects().
+ */
+export function authorizeWorkspaceOrThrow(candidate: string): string {
+  const requested = resolve(candidate);
+  const allowed = [getBridge().getDefaultWorkspace(), ...loadProjects().map((project) => project.path)]
+    .map((workspace) => resolve(workspace));
+  if (!allowed.includes(requested)) throw new Error("unauthorized workspace");
+  return requested;
+}
+
+/** Alias — same allowlist check as authorizeWorkspaceOrThrow. */
+export const authorizedWorkspace = authorizeWorkspaceOrThrow;
+
+/**
+ * Resolve workspace from an explicit value, else ?workspace=, else default,
+ * then authorize against the allowlist.
+ */
+export function resolveAuthorizedWorkspace(req: Request, explicit?: string | null): string {
+  const candidate =
+    (typeof explicit === "string" && explicit) ||
+    new URL(req.url).searchParams.get("workspace") ||
+    getBridge().getDefaultWorkspace();
+  return authorizeWorkspaceOrThrow(candidate);
 }
 
 /**
@@ -20,10 +49,27 @@ export function resolveWorkspace(req: Request): string {
 export function confinePath(workspace: string, rel: string): string {
   const abs = normalize(join(workspace, rel));
   const r = relative(workspace, abs);
-  if (r.startsWith("..") || r.includes(`..${sep}`)) {
+  if (r === ".." || r.startsWith(`..${sep}`)) {
     throw new Error("path outside workspace");
   }
   return abs;
+}
+
+/**
+ * Like confinePath, but when the target exists, realpath it and ensure the
+ * resolved path stays under realpath(workspace). Prevents symlink escapes.
+ * Returns the real path when the file exists; otherwise the confined abs path.
+ */
+export function confinePathReal(workspace: string, rel: string): string {
+  const abs = confinePath(workspace, rel);
+  if (!existsSync(abs)) return abs;
+  const realWorkspace = realpathSync(workspace);
+  const realTarget = realpathSync(abs);
+  const confined = relative(realWorkspace, realTarget);
+  if (confined === ".." || confined.startsWith(`..${sep}`)) {
+    throw new Error("path outside workspace");
+  }
+  return realTarget;
 }
 
 /** Reused from api/files/route.ts — secret-ish filenames/extensions. */

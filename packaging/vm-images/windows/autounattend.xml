@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  autounattend.xml — Windows 11 IoT Enterprise LTSC 2024
+  Fully unattended install for an ephemeral test VM (QEMU/KVM + swtpm).
+
+  Goal: boot the install ISO → wipe disk → install LTSC → create a local admin
+  (testuser) → auto-logon → run debloat.ps1 (specialize=SYSTEM, oobe=user) →
+  shut down. The resulting qcow2 is the "base" image; clones boot straight to a
+  debloated, logged-in desktop via AutoLogon (~20-30s).
+
+  This file is placed at the ROOT of the "provision" ISO (auto-detected by setup).
+  debloat.ps1 is delivered via the $OEM$ folder on the same ISO
+  ($OEM$/$$/Setup/Scripts/debloat.ps1 → C:\Windows\Setup\Scripts\debloat.ps1).
+
+  No product key is embedded (eval/keyless install selects the LTSC image from
+  the install.wim index). To pin the IoT Enterprise LTSC edition on a UUP-built
+  ISO, drop the published KMS client setup key into product-key.txt and build.sh
+  injects it via <ProductKey> below (search for PRODUCTKEY_PLACEHOLDER).
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <!-- ============================ windowsPE pass ============================ -->
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <CreatePartitions>
+            <!-- EFI System Partition -->
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Size>100</Size>
+              <Type>EFI</Type>
+            </CreatePartition>
+            <!-- Microsoft Reserved Partition -->
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Size>16</Size>
+              <Type>MSR</Type>
+            </CreatePartition>
+            <!-- Windows partition (rest of disk) -->
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Extend>true</Extend>
+              <Type>Primary</Type>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <!-- Index 1 is the LTSC edition in both eval and UUP-built wims.
+                   If the wim has multiple indexes, build.sh can override this. -->
+              <Value>1</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>testuser</FullName>
+        <Organization>catalyst</Organization>
+        <!-- PRODUCTKEY_PLACEHOLDER: build.sh injects <ProductKey> here if
+             product-key.txt is present (genuine IoT LTSC edition pinning).
+             Absent = keyless/eval install (image index selects edition). -->
+      </UserData>
+
+      <RunSynchronous>
+        <!-- Win11 setup checks: TPM 2.0, Secure Boot, >=4GB RAM, >=64GB disk.
+             swtpm satisfies TPM; the bypasses below are a fallback so the build
+             still succeeds if swtpm is unavailable. They are harmless when swtpm
+             is present (the checks already pass). -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Bypass Win11 TPM/SecureBoot/RAM/Storage checks (swtpm fallback)</Description>
+          <Path>reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f &amp;&amp; reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f &amp;&amp; reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f &amp;&amp; reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+
+        <!-- Load virtio storage (viostor) + net (netkvm) + balloon + vioscsi
+             drivers from the virtio-win ISO so setup sees the disk and NIC.
+             Scans drive letters because the virtio ISO's letter is dynamic. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Load virtio-win drivers (viostor/netkvm/balloon/vioscsi)</Description>
+          <Path>cmd /c "for %i in (C D E F G H I J K) do @if exist %i:\viostor\w11\amd64\viostor.inf (drvload %i:\viostor\w11\amd64\viostor.inf &amp; drvload %i:\NetKVM\w11\amd64\netkvm.inf &amp; drvload %i:\Balloon\w11\amd64\balloon.inf &amp; drvload %i:\vioscsi\w11\amd64\vioscsi.inf) &gt;nul 2&gt;&amp;1"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- =========================== specialize pass =========================== -->
+  <!-- Runs as SYSTEM (no UAC): Appx/DISM/services/telemetry/OpenSSH install. -->
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <ComputerName>TESTVM</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-Security-SPP"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SkipAutoActivation>true</SkipAutoActivation>
+    </component>
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Debloat + OpenSSH setup (SYSTEM phase)</Description>
+          <Path>powerShell -ExecutionPolicy Bypass -NoProfile -NonInteractive -File C:\Windows\Setup\Scripts\debloat.ps1 -Phase Specialize</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- =========================== oobeSystem pass =========================== -->
+  <!-- Runs as the auto-logged-in testuser (admin): SSH key, finalize, shutdown. -->
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Password>
+              <Value>CatcodeTest2024!</Value>
+              <PlainText>true</PlainText>
+            </Password>
+            <DisplayName>testuser</DisplayName>
+            <Group>Administrators</Group>
+            <Name>testuser</Name>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Password>
+          <Value>CatcodeTest2024!</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Username>testuser</Username>
+        <Enabled>true</Enabled>
+        <LogonCount>999</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>SSH key + finalize + shutdown (OOBE phase)</Description>
+          <CommandLine>powerShell -ExecutionPolicy Bypass -NoProfile -NonInteractive -File C:\Windows\Setup\Scripts\debloat.ps1 -Phase Oobe</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+
+</unattend>

@@ -81,7 +81,7 @@ function lsSet(k: string, v: string): void {
 }
 
 export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean }) {
-  const { openSettings, ide } = useIdeContext();
+  const { openSettings, ide, registerAttachToChat } = useIdeContext();
   const { state } = agent;
   const { confirm, prompt, dialog } = useAppDialog();
   const dialogApi = useRef({ confirm, prompt });
@@ -176,22 +176,43 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     setModal("diagnostics");
   }, []);
 
-  // Auto-scroll to the bottom while streaming / when HITL gates appear,
-  // unless the user scrolled up.
+  const hitlGateRef = useRef<HTMLDivElement>(null);
+  const hadHitlGateRef = useRef(false);
+
+  // Stick to bottom while streaming / new messages — exclude HITL gates so
+  // they don't fight the user by yanking the viewport to the end.
   useEffect(() => {
     if (!autoScroll) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
+  }, [state.messages, state.goalMode, state.goalPlan, autoScroll]);
+
+  // When a HITL gate appears: stop stick-to-bottom and bring the gate into view.
+  useEffect(() => {
+    const hasGate = !!(
+      state.pendingApproval ||
+      state.pendingAsk ||
+      state.pendingSudo ||
+      state.pendingIntercom ||
+      state.pendingOauth ||
+      (state.goalMode &&
+        state.goalMode.phase === "plan_ready" &&
+        !state.goalMode.auto_deploy)
+    );
+    if (hasGate && !hadHitlGateRef.current) {
+      setAutoScroll(false);
+      requestAnimationFrame(() => {
+        hitlGateRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
+    }
+    hadHitlGateRef.current = hasGate;
   }, [
-    state.messages,
     state.pendingApproval,
     state.pendingAsk,
     state.pendingSudo,
     state.pendingIntercom,
     state.pendingOauth,
     state.goalMode,
-    state.goalPlan,
-    autoScroll,
   ]);
 
   const onScroll = () => {
@@ -517,9 +538,21 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const onAddImage = (url: string) => setImages((prev) => [...prev, url]);
   const onRemoveImage = (i: number) => setImages((prev) => prev.filter((_, idx) => idx !== i));
   const sendPrompt = async (text: string, imgs?: string[]) => {
+    const snapshot = imgs?.length ? imgs : images.length ? [...images] : undefined;
     setImages([]);
-    await agent.prompt(text, imgs);
+    const ok = await agent.prompt(text, snapshot);
+    if (!ok && snapshot?.length) setImages(snapshot);
   };
+
+  // Preview (and other IDE panels) attach context into the composer via IdeContext.
+  useEffect(() => {
+    registerAttachToChat((payload) => {
+      if (payload.text) composerRef.current?.append(payload.text);
+      if (payload.image) setImages((prev) => [...prev, payload.image!]);
+      composerRef.current?.focus();
+    });
+    return () => registerAttachToChat(null);
+  }, [registerAttachToChat]);
 
   const submitKey = async () => {
     if (!keyInput.trim()) return;
@@ -531,10 +564,10 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
 
   // ── Edit a user message: undo the last turn, then re-send the edited text ──
   // Stable (empty deps) via refs so <Message> memo isn't defeated.
-  const onEditUser = useCallback((newText: string) => {
+  const onEditUser = useCallback((newText: string, imgs?: string[]) => {
     const a = agentRef.current;
     void a.undo().then((ok) => {
-      if (ok) void a.prompt(newText);
+      if (ok) void a.prompt(newText, imgs);
     });
   }, []);
 
@@ -542,15 +575,18 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     const a = agentRef.current;
     const msgs = msgsRef.current;
     let lastUserText = "";
+    let lastUserImages: string[] | undefined;
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === "user") {
-        lastUserText = (msgs[i] as { text: string }).text;
+        const u = msgs[i] as { text: string; images?: string[] };
+        lastUserText = u.text;
+        lastUserImages = u.images;
         break;
       }
     }
     if (lastUserText) {
       void a.undo().then((ok) => {
-        if (ok) void a.prompt(lastUserText);
+        if (ok) void a.prompt(lastUserText, lastUserImages);
       });
     }
   }, []);
@@ -659,7 +695,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto">
           {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
           {!switching && (
-            <div className="mx-auto max-w-3xl">
+            <div ref={hitlGateRef} className="mx-auto max-w-3xl">
               {state.pendingApproval && (
                 <div className="mx-4 mb-2 mt-3 sm:mx-6">
                   <Approval approval={state.pendingApproval} onApprove={agent.approve} />
@@ -790,7 +826,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 const el = scrollRef.current;
                 if (el) el.scrollTop = el.scrollHeight;
               }}
-              className="sticky bottom-3 left-1/2 z-10 mx-auto flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-ink-700 bg-ink-900/90 px-3 py-1.5 text-[12px] text-ink-200 shadow-lg backdrop-blur hover:bg-ink-850"
+              className="sticky bottom-3 z-10 mx-auto flex items-center gap-1.5 rounded-full border border-ink-700 bg-ink-900/90 px-3 py-1.5 text-[12px] text-ink-200 shadow-lg backdrop-blur hover:bg-ink-850"
             >
               ↓ Jump to latest
             </button>

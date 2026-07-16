@@ -40,10 +40,10 @@ function pickPreferredModel(models: ModelInfo[]): string | null {
 export interface AgentApi {
   state: AgentState;
   connected: boolean;
-  /** Forward any core command (optimistic for send/steer). */
-  send: (cmd: CoreCommand) => Promise<void>;
-  prompt: (text: string, images?: string[]) => Promise<void>;
-  steer: (text: string) => Promise<void>;
+  /** Forward any core command (optimistic for send/steer). Returns false on failure. */
+  send: (cmd: CoreCommand) => Promise<boolean>;
+  prompt: (text: string, images?: string[]) => Promise<boolean>;
+  steer: (text: string) => Promise<boolean>;
   /** PI-compatible bang bash (`!cmd` / `!!cmd`). */
   userBash: (command: string, excludeFromContext?: boolean) => Promise<void>;
   abort: () => Promise<void>;
@@ -387,7 +387,7 @@ export function useAgent(): AgentApi {
   );
 
   const send = useCallback(
-    async (cmd: CoreCommand) => {
+    async (cmd: CoreCommand): Promise<boolean> => {
       const optimistic = cmd.type === "send" || cmd.type === "steer";
       if (optimistic) {
         setState((s) =>
@@ -396,6 +396,7 @@ export function useAgent(): AgentApi {
             text: cmd.prompt,
             model: cmd.model,
             steer: cmd.type === "steer",
+            ...(cmd.type === "send" && cmd.images?.length ? { images: cmd.images } : {}),
           }),
         );
       }
@@ -421,7 +422,9 @@ export function useAgent(): AgentApi {
             },
           );
         });
+        return false;
       }
+      return true;
     },
     [post],
   );
@@ -442,26 +445,26 @@ export function useAgent(): AgentApi {
   }, []);
 
   const prompt = useCallback(
-    async (text: string, images?: string[]) => {
+    async (text: string, images?: string[]): Promise<boolean> => {
       const s = stateRef.current;
       const model = s.selectedModel ?? s.models[0]?.id ?? "";
       const cmd: CoreCommand = { type: "send", prompt: text, model };
       const eff = effortFor(s.thinkingLevel);
       if (eff) cmd.reasoning_effort = eff;
       if (images?.length) cmd.images = images;
-      await send(cmd);
+      return send(cmd);
     },
     [send, effortFor],
   );
 
   const steer = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<boolean> => {
       const s = stateRef.current;
       const model = s.selectedModel ?? s.models[0]?.id ?? "";
       const cmd: CoreCommand = { type: "steer", prompt: text, model };
       const eff = effortFor(s.thinkingLevel);
       if (eff) cmd.reasoning_effort = eff;
-      await send(cmd);
+      return send(cmd);
     },
     [send, effortFor],
   );
@@ -477,8 +480,17 @@ export function useAgent(): AgentApi {
     [send],
   );
 
-  const abort = useCallback(() => send({ type: "abort" }), [send]);
-  const clearQueue = useCallback(() => send({ type: "clear_queue" }), [send]);
+  const abort = useCallback(async (): Promise<void> => {
+    await send({ type: "abort" });
+  }, [send]);
+  const clearQueue = useCallback(async (): Promise<void> => {
+    await send({ type: "clear_queue" });
+  }, [send]);
+
+  /** Fire-and-forget wrapper so AgentApi void methods don't leak Promise<boolean>. */
+  const fire = useCallback(async (cmd: CoreCommand): Promise<void> => {
+    await send(cmd);
+  }, [send]);
 
   const approve = useCallback(
     async (decision: ApproveDecision, opts?: { pattern?: string }) => {
@@ -565,9 +577,9 @@ export function useAgent(): AgentApi {
   }, []);
 
   const setApproval = useCallback(
-    (mode: "never" | "destructive" | "always") => {
+    async (mode: "never" | "destructive" | "always") => {
       lsSet("umans:approval", mode);
-      return send({ type: "set_approval", mode });
+      await send({ type: "set_approval", mode });
     },
     [send],
   );
@@ -587,11 +599,11 @@ export function useAgent(): AgentApi {
     },
     [switchToSession],
   );
-  const listSessions = useCallback(() => send({ type: "list_sessions" }), [send]);
+  const listSessions = useCallback(() => fire({ type: "list_sessions" }), [fire]);
   const compact = useCallback(
     (instructions?: string) =>
-      send({ type: "compact", ...(instructions ? { instructions } : {}) }),
-    [send],
+      fire({ type: "compact", ...(instructions ? { instructions } : {}) }),
+    [fire],
   );
   const wipeLocalTranscript = useCallback(() => {
     setState((s) => ({
@@ -642,8 +654,8 @@ export function useAgent(): AgentApi {
     wipeLocalTranscript();
     await send({ type: "reset" });
   }, [send, wipeLocalTranscript]);
-  const stats = useCallback(() => send({ type: "stats" }), [send]);
-  const context = useCallback(() => send({ type: "context" }), [send]);
+  const stats = useCallback(() => fire({ type: "stats" }), [fire]);
+  const context = useCallback(() => fire({ type: "context" }), [fire]);
 
   const dismissToast = useCallback((id: string) => {
     setState((s) => reduce(s, { type: "_dismiss_toast", id }));
@@ -857,7 +869,7 @@ export function useAgent(): AgentApi {
     },
     [send, post],
   );
-  const listMemory = useCallback(() => send({ type: "list_memory" }), [send]);
+  const listMemory = useCallback(() => fire({ type: "list_memory" }), [fire]);
   const forgetMemory = useCallback(
     async (id: string) => {
       await send({ type: "forget_memory", id });
@@ -895,12 +907,12 @@ export function useAgent(): AgentApi {
     },
     [send, post],
   );
-  const listPlugins = useCallback(() => send({ type: "list_plugins" }), [send]);
-  const listAgents = useCallback(() => send({ type: "list_agents" }), [send]);
-  const refreshMemory = useCallback(() => send({ type: "refresh_memory" }), [send]);
+  const listPlugins = useCallback(() => fire({ type: "list_plugins" }), [fire]);
+  const listAgents = useCallback(() => fire({ type: "list_agents" }), [fire]);
+  const refreshMemory = useCallback(() => fire({ type: "refresh_memory" }), [fire]);
 
   // ── Skills ──
-  const listSkills = useCallback(() => send({ type: "list_skills" }), [send]);
+  const listSkills = useCallback(() => fire({ type: "list_skills" }), [fire]);
   const applySkill = useCallback(
     async (name: string, task?: string) => {
       const s = stateRef.current;
@@ -989,9 +1001,9 @@ export function useAgent(): AgentApi {
     },
     [post, effortFor],
   );
-  const cancelGoal = useCallback(() => send({ type: "cancel_goal" }), [send]);
-  const approveGoalPlan = useCallback(() => send({ type: "approve_goal_plan" }), [send]);
-  const goalStatus = useCallback(() => send({ type: "goal_status" }), [send]);
+  const cancelGoal = useCallback(() => fire({ type: "cancel_goal" }), [fire]);
+  const approveGoalPlan = useCallback(() => fire({ type: "approve_goal_plan" }), [fire]);
+  const goalStatus = useCallback(() => fire({ type: "goal_status" }), [fire]);
   const reviseGoal = useCallback(
     async (feedback: string) => {
       const s = stateRef.current;
@@ -1010,28 +1022,28 @@ export function useAgent(): AgentApi {
   );
 
   // ── Vision ──
-  const getVisionConfig = useCallback(() => send({ type: "get_vision_config" }), [send]);
+  const getVisionConfig = useCallback(() => fire({ type: "get_vision_config" }), [fire]);
   const setVisionConfig = useCallback(
     (vision_model: string | null, vision_models?: string[], enabled?: boolean) =>
-      send({
+      fire({
         type: "set_vision_config",
         vision_model,
         vision_models,
         enabled: enabled ?? true,
       }),
-    [send],
+    [fire],
   );
 
   // ── Usage ──
   const usage = useCallback(
-    (model?: string) => send({ type: "usage", ...(model ? { model } : {}) }),
-    [send],
+    (model?: string) => fire({ type: "usage", ...(model ? { model } : {}) }),
+    [fire],
   );
 
   // ── Config ──
   const setConfig = useCallback(
-    (key: string, value: string | number | boolean) => send({ type: "set_config", key, value }),
-    [send],
+    (key: string, value: string | number | boolean) => fire({ type: "set_config", key, value }),
+    [fire],
   );
 
   // ── Projects / workspace ──
@@ -1047,14 +1059,14 @@ export function useAgent(): AgentApi {
     [post, switchToSession],
   );
   const renameSession = useCallback(
-    (name: string, title: string) => send({ type: "rename_session", name, title }),
-    [send],
+    (name: string, title: string) => fire({ type: "rename_session", name, title }),
+    [fire],
   );
-  const listProjects = useCallback(() => send({ type: "list_projects" }), [send]);
-  const addProject = useCallback((path: string) => send({ type: "add_project", path }), [send]);
+  const listProjects = useCallback(() => fire({ type: "list_projects" }), [fire]);
+  const addProject = useCallback((path: string) => fire({ type: "add_project", path }), [fire]);
   const removeProject = useCallback(
-    (path: string) => send({ type: "remove_project", path }),
-    [send],
+    (path: string) => fire({ type: "remove_project", path }),
+    [fire],
   );
 
   // ── Session lifecycle ──
@@ -1072,20 +1084,20 @@ export function useAgent(): AgentApi {
     [post, switchToSession],
   );
   const pinSession = useCallback(
-    (path: string, pinned: boolean) => send({ type: "pin_session", path, pinned }),
-    [send],
+    (path: string, pinned: boolean) => fire({ type: "pin_session", path, pinned }),
+    [fire],
   );
 
   // ── Checkpoints ──
   const createCheckpoint = useCallback(
     (label?: string, paths?: string[]) =>
-      send({ type: "create_checkpoint", ...(label ? { label } : {}), ...(paths ? { paths } : {}) }),
-    [send],
+      fire({ type: "create_checkpoint", ...(label ? { label } : {}), ...(paths ? { paths } : {}) }),
+    [fire],
   );
-  const listCheckpoints = useCallback(() => send({ type: "list_checkpoints" }), [send]);
+  const listCheckpoints = useCallback(() => fire({ type: "list_checkpoints" }), [fire]);
   const restoreCheckpoint = useCallback(
-    (id: string) => send({ type: "restore_checkpoint", id }),
-    [send],
+    (id: string) => fire({ type: "restore_checkpoint", id }),
+    [fire],
   );
 
   // ── Connection ──

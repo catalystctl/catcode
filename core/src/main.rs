@@ -29,6 +29,7 @@ mod presence;
 mod protocol;
 mod provider;
 mod search_tool;
+mod test_env;
 mod session;
 mod staging;
 mod subagent;
@@ -97,6 +98,20 @@ Modes: single; fork (`context:"fork"`); parallel (`tasks` + `concurrency`); chai
 Children escalate with `contact_supervisor` — answer `need_decision` promptly. Manage runs with peek / steer / interrupt / resume / status.
 Before non-trivial multi-agent work, apply `/skill:pi-subagents` for the full playbook."#;
 
+/// How to add a model provider — config (API-key) vs plugin (OAuth). Always
+/// injected (like PLUGIN_DOCS) so the agent recognizes "add provider X" as a
+/// supported task in any workspace, even without the opt-in skills present.
+/// Full schemas/edge cases live in the `add-key-provider` and `plugin-authoring`
+/// skills; this is the actionable minimum.
+const PROVIDER_GUIDE: &str = r#"## Adding model providers
+
+"Add/connect provider X" → two no-recompile paths, pick by auth type:
+1. **API-key auth, OpenAI/Anthropic-compatible** → CONFIG. Add a `providers` entry to `~/.config/catalyst-code/config.json`:
+   `{"providers":[{"name":"x","kind":"openai","base_url":"https://api.x.com/v1","api_key_env":"X_API_KEY"}],"activeProvider":"x"}`
+   `kind` sets wire+auth (`openai`→/chat/completions+Bearer; `anthropic`→/messages+`x-api-key`) + discovery. `api_key_env` (env var NAME, preferred) or `api_key` (literal). Models auto-discover via /models; non-standard discovery (custom fields/404) needs a code branch in `core/src/provider.rs` — skill `add-key-provider` has the config-vs-code decision tree.
+2. **OAuth/subscription login** (browser/device-code, no plain key — e.g. Grok, ChatGPT) → PLUGIN. A plugin's `plugin.json` declares an `oauth` block (`provider_id`, `kind`, `base_url`, `token_path`, `script` handling login/complete/token/clear actions, JSON in/out). The harness resolves the bearer token at turn time and lists the provider in `/login`. Skill `plugin-authoring` has the full schema + script contract; `docs/examples/plugins/grok-oauth/` is a device-code example.
+Rule: plain API key → config; login flow → plugin."#;
+
 /// Cap standing skill-manifest size so a large skills/ tree does not bloat the
 /// prefix cache. Remaining skills stay discoverable via list_dir / `/skill:`.
 const SKILL_MANIFEST_MAX: usize = 12;
@@ -114,8 +129,8 @@ const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in PowerShell
 const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in bash. For complex logic write a script with write_file and run `bash script.sh`.";
 
 /// Build the full system prompt by appending git context, memory context,
-/// and a short plugins pointer (full plugin authoring lives in the
-/// `plugin-authoring` skill).
+/// the plugins pointer, and the provider-onboarding guide (full manuals live
+/// in the `plugin-authoring` / `add-key-provider` skills).
 /// When `memory_provider` is set, standing-prompt memories come from that
 /// plugin instead of the built-in markdown store.
 pub fn build_system_prompt(
@@ -147,6 +162,8 @@ pub fn build_system_prompt(
     }
     prompt.push_str("\n\n");
     prompt.push_str(PLUGIN_DOCS);
+    prompt.push_str("\n\n");
+    prompt.push_str(PROVIDER_GUIDE);
     // Parent-only: stub + capped skill manifest. Subagents never receive these
     // (they'd wrongly think they are the orchestrator).
     if with_skill {
@@ -6653,6 +6670,11 @@ async fn run_turn(
                             o = tools::execute_diagnostics(&exec_args, &cfg) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("diagnostics aborted"),
                         }
+                    } else if name == "test_env" {
+                        tokio::select! {
+                            o = tools::execute_test_env(&exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("test_env aborted"),
+                        }
                     } else if name == "spawn" || name == "subagent" {
                         // When goal mode is active, cap concurrency on parallel
                         // fan-out to the goal's limit (defense in depth).
@@ -8861,9 +8883,10 @@ mod system_prompt_slim_tests {
         );
         // Fixed prefix pieces (base + plugin pointer + stub) stay small even
         // when the developer's real global memories inflate the full prompt.
-        let fixed = SYSTEM_PROMPT_BASE.len() + PLUGIN_DOCS.len() + SUBAGENT_ORCHESTRATOR_STUB.len();
+        let fixed = SYSTEM_PROMPT_BASE.len() + PLUGIN_DOCS.len()
+            + SUBAGENT_ORCHESTRATOR_STUB.len() + PROVIDER_GUIDE.len();
         assert!(
-            fixed < 3_500,
+            fixed < 4_500,
             "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"
         );
         let _ = std::fs::remove_dir_all(&ws);

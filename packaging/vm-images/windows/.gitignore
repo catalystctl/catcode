@@ -1,0 +1,16 @@
+# Never commit built images or downloaded ISOs (licensing + size).
+*.qcow2
+*.qcow
+*.iso
+*.vfd
+*.img
+
+# Optional per-host product key (licensing — do not redistribute).
+product-key.txt
+
+# UUP build artifacts.
+uup-build/
+known.json
+get.json
+conv.tgz
+converter/

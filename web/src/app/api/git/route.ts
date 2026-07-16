@@ -14,11 +14,17 @@
 // and paths are not logged at all).
 
 import { execFile } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { getSession } from "@/lib/auth";
-import { resolveWorkspace, confinePath } from "@/server/workspace";
+import {
+  confinePath,
+  resolveAuthorizedWorkspace,
+} from "@/server/workspace";
 import type {
   GitBranch,
   GitCommit,
+  GitOperation,
   GitRemote,
   GitStash,
   GitStatus,
@@ -143,6 +149,33 @@ function statusFromCode(code: string): GitStatusEntry["status"] {
   return "modified";
 }
 
+async function detectOperations(workspace: string): Promise<GitOperation[]> {
+  const ops: GitOperation[] = [];
+  const checks: Array<[string, GitOperation]> = [
+    ["MERGE_HEAD", "merge"],
+    ["REBASE_HEAD", "rebase"],
+    ["CHERRY_PICK_HEAD", "cherry-pick"],
+    ["REVERT_HEAD", "revert"],
+  ];
+  await Promise.all(
+    checks.map(async ([ref, name]) => {
+      const r = await runGit(workspace, ["rev-parse", "-q", "--verify", ref]);
+      if (r.code === 0 && !ops.includes(name)) ops.push(name);
+    }),
+  );
+  // Some rebases expose dirs without REBASE_HEAD yet.
+  const [mergePath, applyPath] = await Promise.all([
+    runGit(workspace, ["rev-parse", "--git-path", "rebase-merge"]),
+    runGit(workspace, ["rev-parse", "--git-path", "rebase-apply"]),
+  ]);
+  for (const pathRes of [mergePath, applyPath]) {
+    const p = pathRes.stdout.trim();
+    const abs = p ? (isAbsolute(p) ? p : resolve(workspace, p)) : "";
+    if (abs && existsSync(abs) && !ops.includes("rebase")) ops.push("rebase");
+  }
+  return ops;
+}
+
 /** Build the full GitStatus for a workspace (status + HEAD commit). */
 async function buildStatus(workspace: string): Promise<GitStatus> {
   const statusRes = await runGit(workspace, [
@@ -152,7 +185,15 @@ async function buildStatus(workspace: string): Promise<GitStatus> {
   ]);
   if (statusRes.code !== 0) {
     if (isNotARepo(statusRes.stderr)) {
-      return { branch: "", ahead: 0, behind: 0, entries: [], head: null, bare: true };
+      return {
+        branch: "",
+        ahead: 0,
+        behind: 0,
+        entries: [],
+        head: null,
+        bare: true,
+        operations: [],
+      };
     }
     throw new Error(
       statusRes.stderr.trim() ||
@@ -162,34 +203,43 @@ async function buildStatus(workspace: string): Promise<GitStatus> {
   }
   const { branch, ahead, behind, entries } = parsePorcelain(statusRes.stdout);
 
-  const [headRes, upstreamRes, branchesRes, commitsRes, stashesRes, tagsRes, remotesRes] =
-    await Promise.all([
-      runGit(workspace, ["log", "-1", "--format=%h%x09%s%x09%an%x09%ct"]),
-      runGit(workspace, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]),
-      runGit(workspace, [
-        "for-each-ref",
-        "--sort=-committerdate",
-        "--format=%(refname:short)%00%(objectname:short)%00%(HEAD)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(refname)",
-        "refs/heads",
-        "refs/remotes",
-      ]),
-      runGit(workspace, [
-        "log",
-        "--all",
-        "-n",
-        "100",
-        "--date-order",
-        "--format=%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%ct%x1f%D%x1e",
-      ]),
-      runGit(workspace, ["stash", "list", "--format=%gd%x1f%H%x1f%s%x1f%ct%x1e"]),
-      runGit(workspace, [
-        "for-each-ref",
-        "--sort=-creatordate",
-        "--format=%(refname:short)%00%(objectname:short)%00%(subject)",
-        "refs/tags",
-      ]),
-      runGit(workspace, ["remote", "-v"]),
-    ]);
+  const [
+    headRes,
+    upstreamRes,
+    branchesRes,
+    commitsRes,
+    stashesRes,
+    tagsRes,
+    remotesRes,
+    operations,
+  ] = await Promise.all([
+    runGit(workspace, ["log", "-1", "--format=%h%x09%s%x09%an%x09%ct"]),
+    runGit(workspace, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]),
+    runGit(workspace, [
+      "for-each-ref",
+      "--sort=-committerdate",
+      "--format=%(refname:short)%00%(objectname:short)%00%(HEAD)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(refname)",
+      "refs/heads",
+      "refs/remotes",
+    ]),
+    runGit(workspace, [
+      "log",
+      "--all",
+      "-n",
+      "100",
+      "--date-order",
+      "--format=%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ae%x1f%ct%x1f%D%x1e",
+    ]),
+    runGit(workspace, ["stash", "list", "--format=%gd%x1f%H%x1f%s%x1f%ct%x1e"]),
+    runGit(workspace, [
+      "for-each-ref",
+      "--sort=-creatordate",
+      "--format=%(refname:short)%00%(objectname:short)%00%(subject)",
+      "refs/tags",
+    ]),
+    runGit(workspace, ["remote", "-v"]),
+    detectOperations(workspace),
+  ]);
 
   let head: GitStatus["head"] = null;
   if (headRes.code === 0 && headRes.stdout.trim()) {
@@ -215,6 +265,7 @@ async function buildStatus(workspace: string): Promise<GitStatus> {
     stashes: parseStashes(stashesRes.stdout),
     tags: parseTags(tagsRes.stdout),
     remotes: parseRemotes(remotesRes.stdout),
+    operations,
   };
 }
 
@@ -289,6 +340,12 @@ function requireMessage(m: unknown): string {
   return m;
 }
 
+function optionalMessage(m: unknown): string | null {
+  if (typeof m !== "string") return null;
+  const trimmed = m.trim();
+  return trimmed || null;
+}
+
 function requireBranch(b: unknown): string {
   if (typeof b !== "string" || !b) throw new Error("missing branch");
   // Sane ref name only (no leading option-injection, no shell metacharacters —
@@ -311,7 +368,18 @@ function requireUrl(value: unknown): string {
   if (typeof value !== "string" || !value.trim() || value.startsWith("-")) {
     throw new Error("invalid remote URL");
   }
-  return value.trim();
+  const url = value.trim();
+  // Block git "ext::" / "fd::" helpers and other non-URL schemes that can RCE.
+  if (/^(ext|fd|hg|bzr):/i.test(url) || url.includes("::")) {
+    throw new Error("unsupported remote URL scheme");
+  }
+  if (
+    /^(https?:\/\/|git:\/\/|ssh:\/\/|git@)/i.test(url) ||
+    /^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:/.test(url)
+  ) {
+    return url;
+  }
+  throw new Error("invalid remote URL");
 }
 
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
@@ -332,23 +400,33 @@ function argsForAction(
       return ["add", "-A"];
     case "unstageAll":
       return ["reset", "-q"];
-    case "commit":
+    case "commit": {
+      const amend = body.amend === true;
+      const msg = optionalMessage(body.message);
+      if (!amend && !msg) throw new Error("missing commit message");
       return [
         "commit",
-        ...(body.amend === true ? ["--amend"] : []),
+        ...(amend ? ["--amend"] : []),
         ...(body.signoff === true ? ["--signoff"] : []),
         ...(body.noVerify === true ? ["--no-verify"] : []),
-        "-m",
-        requireMessage(body.message),
+        ...(msg ? ["-m", msg] : ["--no-edit"]),
       ];
+    }
     case "pull":
       return ["pull", oneOf(body.mode, ["--rebase", "--no-rebase", "--ff-only"] as const, "--no-rebase"), "--no-edit"];
     case "push":
-      return ["push", ...(body.forceWithLease === true ? ["--force-with-lease"] : []), ...(body.setUpstream === true ? ["--set-upstream", requireRef(body.remote ?? "origin", "remote"), requireBranch(body.branch)] : [])];
+      return [
+        "push",
+        ...(body.forceWithLease === true ? ["--force-with-lease"] : []),
+        ...(body.tags === true ? ["--tags"] : []),
+        ...(body.setUpstream === true
+          ? ["--set-upstream", requireRef(body.remote ?? "origin", "remote"), requireBranch(body.branch)]
+          : []),
+      ];
     case "fetch":
       return ["fetch", ...(body.all === true ? ["--all"] : []), ...(body.prune === true ? ["--prune"] : [])];
     case "checkout":
-      return ["checkout", requireBranch(body.branch)];
+      return ["checkout", requireRef(body.branch, "ref")];
     case "discard":
       return ["restore", "--", requirePath(body.path)];
     case "discardAll":
@@ -405,6 +483,9 @@ function argsForAction(
       return ["branch", "--unset-upstream", requireBranch(body.branch)];
     case "init":
       return ["init"];
+    case "ignore":
+      // Handled specially in POST (appends to .gitignore).
+      return [];
     default:
       return null;
   }
@@ -414,9 +495,67 @@ export async function GET(req: Request) {
   if (!(await getSession(req.headers))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  const workspace = resolveWorkspace(req);
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(req);
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
   const url = new URL(req.url);
   const diffPath = url.searchParams.get("diff");
+  const commitOid = url.searchParams.get("commit");
+  const stashRef = url.searchParams.get("stash");
+
+  // Commit detail: unified patch for one commit.
+  if (commitOid !== null) {
+    try {
+      const oid = requireRef(commitOid, "commit");
+      const r = await runGit(workspace, [
+        "show",
+        "--format=fuller",
+        "--stat",
+        "--patch",
+        "--find-renames",
+        oid,
+      ]);
+      if (r.code !== 0) {
+        return Response.json(
+          { error: `git failed: ${r.stderr.trim() || r.stdout.trim()}` },
+          { status: 502 },
+        );
+      }
+      let patch = r.stdout;
+      if (patch.length > MAX_DIFF) {
+        patch = patch.slice(0, MAX_DIFF) + "\n... (patch truncated)";
+      }
+      return Response.json({ patch });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  // Stash patch preview.
+  if (stashRef !== null) {
+    try {
+      const ref = requireRef(stashRef, "stash");
+      const r = await runGit(workspace, ["stash", "show", "-p", "--stat", ref]);
+      if (r.code !== 0) {
+        return Response.json(
+          { error: `git failed: ${r.stderr.trim() || r.stdout.trim()}` },
+          { status: 502 },
+        );
+      }
+      let patch = r.stdout;
+      if (patch.length > MAX_DIFF) {
+        patch = patch.slice(0, MAX_DIFF) + "\n... (patch truncated)";
+      }
+      return Response.json({ patch });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  }
 
   // Diff mode: return the unified diff for one path (task-driven extension).
   if (diffPath !== null) {
@@ -458,6 +597,26 @@ export async function GET(req: Request) {
   }
 }
 
+function appendGitignore(workspace: string, relPath: string): void {
+  const absIgnore = join(workspace, ".gitignore");
+  const line = relPath.replace(/\\/g, "/");
+  if (!line || line.includes("\n") || line.includes("\0")) {
+    throw new Error("invalid ignore path");
+  }
+  let existing = "";
+  if (existsSync(absIgnore)) {
+    existing = readFileSync(absIgnore, "utf8");
+    const lines = existing.split(/\r?\n/);
+    if (lines.some((l) => l.trim() === line)) return;
+    if (existing.length > 0 && !existing.endsWith("\n")) {
+      appendFileSync(absIgnore, "\n");
+    }
+  } else {
+    writeFileSync(absIgnore, "", "utf8");
+  }
+  appendFileSync(absIgnore, `${line}\n`);
+}
+
 export async function POST(req: Request) {
   if (!(await getSession(req.headers))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -469,9 +628,15 @@ export async function POST(req: Request) {
     body = {};
   }
   const action = typeof body.action === "string" ? body.action : "";
-  const workspace =
-    (typeof body.workspace === "string" && body.workspace) ||
-    resolveWorkspace(req);
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(
+      req,
+      typeof body.workspace === "string" ? body.workspace : null,
+    );
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
 
   let args: string[] | null;
   try {
@@ -485,10 +650,10 @@ export async function POST(req: Request) {
     return Response.json({ error: "unknown action" }, { status: 400 });
   }
 
-  // Confine any path-bearing action's path (stage/unstage/discard) so a crafted
-  // relative path cannot escape the workspace. confinePath throws on escape.
+  // Confine any path-bearing action's path (stage/unstage/discard/ignore) so a
+  // crafted relative path cannot escape the workspace.
   try {
-    if (action === "stage" || action === "unstage" || action === "discard") {
+    if (action === "stage" || action === "unstage" || action === "discard" || action === "ignore") {
       const rel = body.path as string;
       confinePath(workspace, rel);
     }
@@ -497,14 +662,34 @@ export async function POST(req: Request) {
     return Response.json({ error: msg }, { status: 400 });
   }
 
-  const r = await runGit(workspace, args);
-  if (r.code !== 0) {
-    return Response.json(
-      {
-        error: `git failed: ${r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`}`,
-      },
-      { status: 502 },
-    );
+  if (action === "ignore") {
+    try {
+      const rel = requirePath(body.path);
+      confinePath(workspace, rel);
+      appendGitignore(workspace, rel);
+      const stageIgnore = await runGit(workspace, ["add", "--", ".gitignore"]);
+      if (stageIgnore.code !== 0) {
+        return Response.json(
+          {
+            error: `git failed: ${stageIgnore.stderr.trim() || stageIgnore.stdout.trim() || `exit ${stageIgnore.code}`}`,
+          },
+          { status: 502 },
+        );
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return Response.json({ error: msg }, { status: 400 });
+    }
+  } else {
+    const r = await runGit(workspace, args);
+    if (r.code !== 0) {
+      return Response.json(
+        {
+          error: `git failed: ${r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`}`,
+        },
+        { status: 502 },
+      );
+    }
   }
 
   // Re-run status so the UI updates atomically after every successful action.

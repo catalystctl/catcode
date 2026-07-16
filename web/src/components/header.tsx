@@ -50,20 +50,24 @@ interface Props {
   onToggleTheme?: () => void;
 }
 
-const ALL_LEVELS = ["off", "low", "medium", "high"];
+const ALL_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function Header(props: Props) {
   const [modelOpen, setModelOpen] = useState(false);
   const [thinkOpen, setThinkOpen] = useState(false);
   const [approvOpen, setApprovOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const modelRef = useOutsideClose(() => setModelOpen(false));
-  const thinkRef = useOutsideClose(() => setThinkOpen(false));
-  const approvRef = useOutsideClose(() => setApprovOpen(false));
-  const configRef = useOutsideClose(() => setConfigOpen(false));
+  const modelRef = useOutsideClose(() => setModelOpen(false), modelOpen);
+  const thinkRef = useOutsideClose(() => setThinkOpen(false), thinkOpen);
+  const approvRef = useOutsideClose(() => setApprovOpen(false), approvOpen);
+  const configRef = useOutsideClose(() => setConfigOpen(false), configOpen);
 
   const current = props.models.find((m) => m.id === props.selectedModel) ?? props.models[0];
-  const levels = current?.thinking_levels?.length ? current.thinking_levels : ALL_LEVELS;
+  // Prefer the model's advertised thinking_levels (includes xhigh/max when supported).
+  const levels =
+    current?.thinking_levels && current.thinking_levels.length > 0
+      ? current.thinking_levels
+      : ALL_LEVELS;
   const effLevels = current?.reasoning ? levels : ["off"];
 
   const m = props.metrics;

@@ -55,7 +55,7 @@ changes to the chat reducer or `AgentState`.
 | Explorer | `file-tree.tsx` (sidebar) + `editor.tsx` (CodeMirror 6, main) | `/api/tree`, `/api/file` |
 | Source Control | `git-panel.tsx` (sidebar + main) | `/api/git` |
 | Terminal | `terminal.tsx` (Ghostty WASM, bottom panel) | `/api/terminal` (WebSocket + node-pty) |
-| Preview | `preview.tsx` (iframe, main) | `/api/preview` |
+| Preview | `preview.tsx` (iframe, main) | `/api/preview`, `/api/dev-proxy` |
 
 All panel components live in `web/src/components/ide/` and are registered in
 `panel-registry.ts`. Heavy panels (editor, terminal, preview) are loaded via
@@ -90,7 +90,8 @@ live in `web/src/server/workspace.ts`.
 | `/api/file` | PUT | Write a file (path + content) |
 | `/api/git` | GET | Status, upstream, branches, recent history, stashes, tags, and remotes |
 | `/api/git` | POST | Changes, commits, sync, branches, history, stashes, tags, remotes, and recovery actions |
-| `/api/preview` | GET | Serve a workspace file for iframe preview (safe Content-Type) |
+| `/api/preview` | GET | Serve a workspace file for iframe preview (safe Content-Type; HTML gets inspect inject) |
+| `/api/dev-proxy/<port>/…` | * | Auth-gated loopback reverse proxy to `127.0.0.1:<port>` for remote Preview |
 | `/api/terminal` | WS | Interactive shell (see below) |
 
 ## Custom server & WebSocket terminal

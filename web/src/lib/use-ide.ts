@@ -21,7 +21,7 @@ import type {
   MovablePanelId,
 } from "./types";
 import { basename, detectLanguage } from "./lang";
-import { disposeEditorModel } from "./editor-model-registry";
+import { disposeAllEditorModels, disposeEditorModel } from "./editor-model-registry";
 
 const STORAGE_KEY = "catcode:ide-layout";
 
@@ -86,8 +86,8 @@ const DEFAULTS: IdeLayoutState = {
   bottomPanelVisible: false,
   copilotVisible: true,
   copilotWidth: 440,
-  panelLocations: { chat: "right", terminal: "bottom", git: "left", preview: "main" },
-  panelVisibility: { chat: true, terminal: false, git: false, preview: false },
+  panelLocations: { chat: "right", terminal: "bottom", git: "left", preview: "main", screen: "main" },
+  panelVisibility: { chat: true, terminal: false, git: false, preview: false, screen: false },
   activeDockPanels: { left: null, right: "chat", bottom: null, main: null },
   leftDockWidth: 360,
   terminals: [],
@@ -182,40 +182,55 @@ export function useIde(workspace?: string): IdeApi {
   useEffect(() => {
     // Layout + terminal tabs are scoped per project key. File tabs, git, and
     // preview reset so they never silently point at the previous workspace.
+    // Drop Monaco models from the previous workspace before swapping layout.
+    disposeAllEditorModels();
     const loaded = loadPersisted(key);
-    setState({ ...DEFAULTS, ...loaded });
+    setState({
+      ...DEFAULTS,
+      ...loaded,
+      // Shallow-merge nested maps so missing keys (e.g. newer "screen") fall
+      // back to DEFAULTS instead of staying undefined after a partial persist.
+      panelLocations: { ...DEFAULTS.panelLocations, ...(loaded.panelLocations ?? {}) },
+      panelVisibility: { ...DEFAULTS.panelVisibility, ...(loaded.panelVisibility ?? {}) },
+      activeDockPanels: { ...DEFAULTS.activeDockPanels, ...(loaded.activeDockPanels ?? {}) },
+    });
     setRestoredKey(key);
   }, [key]);
 
-  // Persist the persisted subset whenever it changes.
+  // Persist the persisted subset whenever it changes. Debounce so continuous
+  // resize drags don't sync-write localStorage on every pointermove (jank +
+  // missed events on slower machines).
   useEffect(() => {
     // Do not write DEFAULTS before the restoration effect has had a chance to
     // read the user's saved layout.
     if (restoredKey !== key || typeof window === "undefined") return;
-    try {
-      const slice: Record<string, unknown> = {};
-      for (const k of PERSISTED) {
-        if (k === "terminals") {
-          // Only durable live sessions — exited tabs are ephemeral UI state.
-          slice.terminals = state.terminals.filter((t) => t.alive && t.exitCode == null);
-          continue;
+    const timer = window.setTimeout(() => {
+      try {
+        const slice: Record<string, unknown> = {};
+        for (const k of PERSISTED) {
+          if (k === "terminals") {
+            // Only durable live sessions — exited tabs are ephemeral UI state.
+            slice.terminals = state.terminals.filter((t) => t.alive && t.exitCode == null);
+            continue;
+          }
+          if (k === "activeTerminalId") {
+            const live = (slice.terminals as TerminalSession[] | undefined) ??
+              state.terminals.filter((t) => t.alive && t.exitCode == null);
+            const active = state.activeTerminalId;
+            slice.activeTerminalId =
+              active && live.some((t) => t.id === active)
+                ? active
+                : (live[live.length - 1]?.id ?? null);
+            continue;
+          }
+          slice[k] = state[k];
         }
-        if (k === "activeTerminalId") {
-          const live = (slice.terminals as TerminalSession[] | undefined) ??
-            state.terminals.filter((t) => t.alive && t.exitCode == null);
-          const active = state.activeTerminalId;
-          slice.activeTerminalId =
-            active && live.some((t) => t.id === active)
-              ? active
-              : (live[live.length - 1]?.id ?? null);
-          continue;
-        }
-        slice[k] = state[k];
+        window.localStorage.setItem(key, JSON.stringify(slice));
+      } catch {
+        /* ignore quota / private-mode errors */
       }
-      window.localStorage.setItem(key, JSON.stringify(slice));
-    } catch {
-      /* ignore quota / private-mode errors */
-    }
+    }, 200);
+    return () => window.clearTimeout(timer);
   }, [key, restoredKey, state]);
 
   // Mirror state into a ref so runCommand can read current session state without
@@ -253,7 +268,7 @@ export function useIde(workspace?: string): IdeApi {
   }, []);
 
   const setBottomPanelHeight = useCallback((px: number) => {
-    setState((s) => ({ ...s, bottomPanelHeight: clamp(px, 0, 800) }));
+    setState((s) => ({ ...s, bottomPanelHeight: clamp(px, 120, 800) }));
   }, []);
 
   const toggleBottomPanel = useCallback(() => {
@@ -296,14 +311,15 @@ export function useIde(workspace?: string): IdeApi {
         [position]: panel,
       };
       // Clear the old dock's active pointer when this panel leaves it.
+      const movablePanels = Object.keys(s.panelLocations) as MovablePanelId[];
       if (prev !== position && activeDockPanels[prev] === panel) {
         const remaining =
-          (["chat", "terminal", "git", "preview"] as const).find(
+          movablePanels.find(
             (p) => p !== panel && s.panelVisibility[p] && s.panelLocations[p] === prev,
           ) ?? null;
         activeDockPanels[prev] = remaining;
       }
-      const bottomPanelVisible = (["chat", "terminal", "git", "preview"] as const).some((p) => {
+      const bottomPanelVisible = movablePanels.some((p) => {
         const loc = p === panel ? position : s.panelLocations[p];
         const visible = p === panel ? true : s.panelVisibility[p];
         return visible && loc === "bottom";

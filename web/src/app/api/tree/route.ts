@@ -13,7 +13,11 @@
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getSession } from "@/lib/auth";
-import { resolveWorkspace, confinePath, SKIP_DIRS } from "@/server/workspace";
+import {
+  confinePathReal,
+  resolveAuthorizedWorkspace,
+  SKIP_DIRS,
+} from "@/server/workspace";
 import type { FileNode } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -27,12 +31,17 @@ export async function GET(req: Request) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
 
   const url = new URL(req.url);
-  const workspace = resolveWorkspace(req);
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(req);
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
   const rel = url.searchParams.get("path") ?? "";
 
   let abs: string;
   try {
-    abs = confinePath(workspace, rel);
+    abs = confinePathReal(workspace, rel);
   } catch {
     return Response.json({ error: "path outside workspace" }, { status: 400 });
   }
@@ -40,9 +49,15 @@ export async function GET(req: Request) {
   let entries: import("node:fs").Dirent[];
   try {
     entries = readdirSync(abs, { withFileTypes: true });
-  } catch {
-    // Not a directory, or unreadable — treat as an empty tree node set.
-    return Response.json({ nodes: [] });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT")
+      return Response.json({ error: "not found" }, { status: 404 });
+    if (code === "ENOTDIR")
+      return Response.json({ error: "not a directory" }, { status: 400 });
+    if (code === "EACCES" || code === "EPERM")
+      return Response.json({ error: "permission denied" }, { status: 403 });
+    return Response.json({ error: "unreadable" }, { status: 500 });
   }
 
   const nodes: FileNode[] = [];

@@ -46,7 +46,11 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
       <p className="flex-1 break-words text-[12px] leading-snug text-ink-200 sm:break-normal">
         {toast.message}
       </p>
-      <button onClick={() => onDismiss(toast.id)} className="shrink-0 text-ink-500 hover:text-ink-100">
+      <button
+        onClick={() => onDismiss(toast.id)}
+        aria-label="Dismiss notification"
+        className="shrink-0 text-ink-500 hover:text-ink-100"
+      >
         <XIcon width={13} height={13} />
       </button>
     </div>

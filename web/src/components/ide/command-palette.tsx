@@ -71,14 +71,20 @@ export function CommandPalette({ open, items, onClose, onQueryChange }: {
               if (event.key === "Enter") { event.preventDefault(); choose(results[selected]); }
             }}
             placeholder="Search commands, files, chats, projects, and models…"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={true}
+            aria-controls="command-palette-listbox"
+            aria-activedescendant={results[selected] ? `palette-option-${results[selected].id}` : undefined}
             className="min-w-0 flex-1 bg-transparent text-sm text-ink-100 outline-none placeholder:text-ink-600"
           />
           <kbd className="rounded border border-ink-700 bg-ink-850 px-1.5 py-0.5 text-[10px] text-ink-500">Esc</kbd>
         </label>
-        <div className="overflow-y-auto p-2" role="listbox">
+        <div className="overflow-y-auto p-2" role="listbox" id="command-palette-listbox">
           {results.length ? results.map((item, index) => (
             <button
               key={item.id}
+              id={`palette-option-${item.id}`}
               type="button"
               role="option"
               aria-selected={selected === index}

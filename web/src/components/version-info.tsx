@@ -63,10 +63,8 @@ export function VersionInfoPanel() {
     <div>
       <div className="flex items-start justify-between gap-2">
         <div>
-          <div className="text-[11px] font-medium uppercase tracking-wider text-ink-500">
-            About
-          </div>
-          <div className="mt-0.5 text-[13px] font-medium text-ink-100">Catalyst Code</div>
+          <div className="text-[13px] font-medium text-ink-100">Catalyst Code</div>
+          <div className="mt-0.5 text-[11px] text-ink-500">Running build vs latest release</div>
         </div>
         <button
           type="button"

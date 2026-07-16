@@ -654,7 +654,7 @@ export type CoreCommand =
 export type SyntheticEvent =
   // A user message was sent (added optimistically by the client; tracked by the
   // bridge for snapshot hydration). `model` records the model used for the turn.
-  | { type: "_user"; text: string; model?: string; steer?: boolean }
+  | { type: "_user"; text: string; model?: string; steer?: boolean; images?: string[] }
   // The selected model / thinking level changed in the UI.
   | { type: "_select_model"; id: string }
   | { type: "_set_thinking"; level: string }
@@ -858,10 +858,10 @@ export type ServerToClient = CoreEvent | SnapshotEvent;
 // NEVER reduced into AgentState / never sent over SSE.
 
 /** A panel the IDE shell can show. "copilot" is handled separately (the dock). */
-export type IdePanelId = "explorer" | "git" | "terminal" | "preview";
+export type IdePanelId = "explorer" | "git" | "terminal" | "preview" | "screen";
 
 /** Panels that can be moved between IDE dock zones. */
-export type MovablePanelId = "chat" | "git" | "terminal" | "preview";
+export type MovablePanelId = "chat" | "git" | "terminal" | "preview" | "screen";
 
 /** A drop target around (or in place of) the fixed editor work area. */
 export type DockPosition = "left" | "right" | "bottom" | "main";
@@ -896,6 +896,9 @@ export interface GitStatusEntry {
   staged: boolean;
 }
 
+/** In-progress Git operations the panel can continue or abort. */
+export type GitOperation = "merge" | "rebase" | "cherry-pick" | "revert";
+
 /** Aggregate git state for the git panel + status bar. */
 export interface GitStatus {
   /** Current branch name, or "HEAD (detached)". */
@@ -922,6 +925,8 @@ export interface GitStatus {
   tags?: GitTag[];
   /** Configured remotes and their fetch/push URLs. */
   remotes?: GitRemote[];
+  /** Active merge/rebase/cherry-pick/revert operations (if any). */
+  operations?: GitOperation[];
 }
 
 export interface GitBranch {

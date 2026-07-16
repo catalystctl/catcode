@@ -423,12 +423,14 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
   switch (ev.type) {
     // ── Synthetic events ──
     case "_user": {
+      const imgs = ev.images?.length ? ev.images : undefined;
       const msg: UIMessage = {
         id: newId("u"),
         role: "user",
         text: ev.text,
         ts: Date.now(),
         steer: ev.steer,
+        ...(imgs ? { images: imgs } : {}),
       };
       return {
         ...state,
@@ -1200,7 +1202,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     case "file_change": {
       const path = String(ev.path ?? "");
-      if (!path) return { ...state, fileChangeSeq: state.fileChangeSeq + 1 };
+      if (!path) return { ...state, fileChangeSeq: state.fileChangeSeq + 1, recentFileChanges: [] };
       const record = {
         path,
         tool: String(ev.tool ?? ""),
@@ -1244,6 +1246,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return {
         ...state,
         fileChangeSeq: state.fileChangeSeq + 1,
+        recentFileChanges: [],
         toasts: pushToast(
           state.toasts,
           "success",
@@ -1282,6 +1285,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         worktrees: state.worktrees.filter((w) => w.run_id !== runId),
         fileChangeSeq: state.fileChangeSeq + 1,
+        recentFileChanges: [],
         toasts: pushToast(state.toasts, "success", `Promoted worktree for ${runId}`),
       };
     }

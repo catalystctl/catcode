@@ -504,12 +504,10 @@ write_web_version_json() {
   local dirty="false"
   local built_at
   built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # When installing from a live checkout, prefer the full SHA + dirty bit.
+  # When installing from a live checkout, prefer the real git SHA + dirty bit.
   if [[ -n "${REPO_DIR:-}" && -d "${REPO_DIR}/.git" ]]; then
     commit_full="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "$commit")"
-    if [[ -z "$commit" || "$commit" == "unknown" ]]; then
-      commit="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo "$commit")"
-    fi
+    commit="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo "$commit")"
     if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)" ]]; then
       dirty="true"
     fi

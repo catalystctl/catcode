@@ -479,7 +479,23 @@ GET /api/preview?path=<rel>&workspace=<abs>
 ```
 - Serves workspace static files (`.html`, `.htm`, `.svg`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.pdf`, `.txt`, `.json`, `.css`, `.js`) with correct `Content-Type` + `Content-Disposition: inline`.
 - **Secret files are blocked** (`isSecretFile` → 403). Preview is for content the user wants rendered, never credentials.
-- v1 serves files only. Proxying a dev-server URL (`?url=`) is a documented future enhancement (note in §9); for now `PreviewState.kind === "url"` opens the URL directly in the `<iframe src>` client-side (no server proxy).
+- Loopback URLs (`localhost` / `127.0.0.1` / `::1`) are rewritten by the Preview panel to `/api/dev-proxy/<port>/…`, which reverse-proxies to `127.0.0.1:<port>` (auth-gated, SSRF-safe). Non-loopback URLs still load directly in the iframe. HTML from the proxy and workspace `.html` inject an element-inspect bootstrap for Preview → chat.
+
+### 4.4b `/api/dev-proxy/<port>/[...path]` — loopback reverse proxy
+
+```
+ANY /api/dev-proxy/<port>/[...path]
+→ upstream http://127.0.0.1:<port>/[...path]
+→ 401 { error: "unauthorized" }
+→ 400 { error: "invalid port" }
+→ 502 { error: "dev-proxy: cannot reach …" }
+```
+
+- Auth via `getSession`. Upstream host is always `127.0.0.1` (never user-controlled) to prevent SSRF.
+- Rewrites loopback `Location` redirects onto `/api/dev-proxy/<port>/…`.
+- Strips `X-Frame-Options` / CSP so the Preview iframe can embed the page.
+- HTML responses: inject `<base href>` + element-inspect script (`web/src/server/preview-inject.ts`).
+- WebSocket/HMR upgrades are not proxied in v1.
 
 ### 4.5 `WS /api/terminal` — terminal over WebSocket
 
@@ -543,8 +559,9 @@ export function GitPanel({ compact }: { compact?: boolean }): JSX.Element;
 ```ts
 export function Preview({ target }: { target?: string }): JSX.Element;
 ```
-- Renders an `<iframe>`. `src` = `/api/preview?path=<rel>&workspace=<abs>` for `kind:"file"`; `target` directly for `kind:"url"`.
-- Address bar (input + reload + open-in-new-tab). Back/forward via iframe history (best-effort).
+- Renders an `<iframe>`. `src` = `/api/preview?path=<rel>&workspace=<abs>` for `kind:"file"`; loopback `kind:"url"` → `/api/dev-proxy/<port>/…`; other URLs use `target` directly.
+- Address bar (input + reload + open-in-new-tab + **select element**). Back/forward via local history.
+- Inspect mode: posts selected DOM descriptors into the chat composer via `IdeContext.attachToChat` (works for proxied localhost + workspace HTML).
 - If `ide.state.preview.kind === "none"`: empty state with "open a file to preview" + URL input.
 
 ---
@@ -712,7 +729,7 @@ If compiling/shipping the custom server destabilizes the release, fall back to a
 
 ## 8. Security Rules
 
-1. **Auth on every route.** `getSession(req.headers)` → 401 if null. Applies to `/api/tree`, `/api/file` (GET+PUT), `/api/git` (GET+POST), `/api/preview`, and the `/api/terminal` WS upgrade. No anonymous access.
+1. **Auth on every route.** `getSession(req.headers)` → 401 if null. Applies to `/api/tree`, `/api/file` (GET+PUT), `/api/git` (GET+POST), `/api/preview`, `/api/dev-proxy`, and the `/api/terminal` WS upgrade. No anonymous access.
 2. **Workspace confinement on every path.** Use `confinePath(workspace, rel)` (§4.6) — `normalize`+`join`+`relative`+`..` check, identical to `api/files/route.ts:80-85`. Reject `..` traversal with 400. This is the hard validation criterion.
 3. **Terminal spawns only within the workspace cwd.** The `open` envelope's `cwd` is confined via `confinePath`; default `cwd = workspace`. The shell's `cwd` can never escape the workspace. `child_process.spawn(shell, args, { cwd })` — never `shell:true`, never `sh -c` with interpolated input.
 4. **Writes require auth + confinement.** `PUT /api/file` and `POST /api/git` (commit/checkout/discard) require `getSession` + `confinePath`. Git actions use `execFile` with arg arrays (no shell injection).
@@ -742,11 +759,11 @@ If compiling/shipping the custom server destabilizes the release, fall back to a
 - **File explorer/editor:** tree lists workspace root (one level, lazy expand); clicking a file opens an editor tab; editing + Ctrl/Cmd+S persists via `PUT /api/file` (dirty flag clears); `..` in path → 400.
 - **Terminal:** new terminal opens a WS shell in the workspace cwd; typed commands (`ls`, `git status`, `echo hi`) echo output; closing the tab kills the shell; unauthenticated WS → 401.
 - **Git:** `GET /api/git` shows branch + changes; stage/unstage/commit/pull/push work; status bar shows `branch ↑ahead ↓behind`; non-repo → "initialize" CTA.
-- **Preview:** opening an `.html` file renders it in the iframe via `/api/preview`; secret file (`.env`) → 403; URL preview loads external URL in iframe.
+- **Preview:** opening an `.html` file renders it in the iframe via `/api/preview`; secret file (`.env`) → 403; loopback URL preview loads via `/api/dev-proxy/<port>`; external URL preview loads the URL in the iframe; inspect mode posts selected elements into the chat composer.
 
 ### 9.3 Known limitations (documented, not blockers)
 - Terminal has no full PTY (no `vim`/`nano`/TUI apps, no raw-mode resize) — `child_process.spawn` is used to keep the release cross-platform pure-JS. `node-pty` is a future enhancement that would require per-platform tarballs.
-- Preview does not proxy dev-server URLs server-side (v1 serves workspace files + client-side iframe URLs only).
+- Preview `/api/dev-proxy` does not forward WebSocket/HMR upgrades (page load works; live reload may not). Element inspect requires proxied localhost or workspace HTML (arbitrary external origins cannot be instrumented).
 - Tabs/terminals do not persist across reload (in-memory only) — matches VSCode's opt-in "restore".
 
 ---

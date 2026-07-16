@@ -12,3 +12,10 @@ export function disposeEditorModel(tabId: string): void {
   disposers.get(tabId)?.();
   disposers.delete(tabId);
 }
+
+export function disposeAllEditorModels(): void {
+  for (const dispose of disposers.values()) {
+    dispose();
+  }
+  disposers.clear();
+}

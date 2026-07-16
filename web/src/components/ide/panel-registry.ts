@@ -12,12 +12,13 @@
 // IdeContext and carry no heavy deps).
 
 import dynamic from "next/dynamic";
-import type { ComponentType } from "react";
+import { createElement, type ComponentType } from "react";
 import {
   FolderIcon,
   GitBranchIcon,
   TerminalIcon,
   GlobeIcon,
+  MonitorIcon,
 } from "@/components/icons";
 import type { IdePanelId } from "@/lib/types";
 
@@ -25,13 +26,35 @@ import type { IdePanelId } from "@/lib/types";
 import { FileTree } from "./file-tree";
 import { GitPanel } from "./git-panel";
 
+// Keep this file .ts (no JSX) — createElement avoids a .tsx rename.
+const PanelLoading = () =>
+  createElement(
+    "div",
+    { className: "flex h-full items-center justify-center text-xs text-ink-500" },
+    "Loading…",
+  );
+
 // Heavy panels — dynamic, client-only.
-const Editor = dynamic(() => import("./editor").then((m) => m.Editor), { ssr: false });
-const Terminal = dynamic(() => import("./terminal").then((m) => m.Terminal), { ssr: false });
+const Editor = dynamic(() => import("./editor").then((m) => m.Editor), {
+  ssr: false,
+  loading: PanelLoading,
+});
+const Terminal = dynamic(() => import("./terminal").then((m) => m.Terminal), {
+  ssr: false,
+  loading: PanelLoading,
+});
 const TerminalPanel = dynamic(() => import("./terminal").then((m) => m.TerminalPanel), {
   ssr: false,
+  loading: PanelLoading,
 });
-const Preview = dynamic(() => import("./preview").then((m) => m.Preview), { ssr: false });
+const Preview = dynamic(() => import("./preview").then((m) => m.Preview), {
+  ssr: false,
+  loading: PanelLoading,
+});
+const Screen = dynamic(() => import("./screen-panel").then((m) => m.Screen), {
+  ssr: false,
+  loading: PanelLoading,
+});
 
 export type IconProps = { width?: number; height?: number; className?: string };
 
@@ -47,10 +70,11 @@ export const PANELS: Record<IdePanelId, PanelDescriptor> = {
   git: { id: "git", label: "Source Control", icon: GitBranchIcon },
   terminal: { id: "terminal", label: "Terminal", icon: TerminalIcon },
   preview: { id: "preview", label: "Preview", icon: GlobeIcon },
+  screen: { id: "screen", label: "Screen", icon: MonitorIcon },
 };
 
 /** Order the activity bar renders the panel icons (copilot is appended after). */
-export const PANEL_ORDER: IdePanelId[] = ["explorer", "git", "terminal", "preview"];
+export const PANEL_ORDER: IdePanelId[] = ["explorer", "git", "terminal", "preview", "screen"];
 
 // Re-export the panel components so the shell imports everything from here.
-export { FileTree, GitPanel, Editor, Terminal, TerminalPanel, Preview };
+export { FileTree, GitPanel, Editor, Terminal, TerminalPanel, Preview, Screen };

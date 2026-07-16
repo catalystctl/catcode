@@ -3,11 +3,20 @@
 // Thinking — a collapsible reasoning block. While the assistant is streaming
 // and has produced thinking but no text yet, show an animated "thinking" state.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BrainIcon, ChevronRight } from "./icons";
 
 export function Thinking({ text, active }: { text: string; active?: boolean }) {
   const [open, setOpen] = useState(false);
+  const autoOpenedRef = useRef(false);
+  // Default open once when reasoning text arrives during an active stream.
+  useEffect(() => {
+    if (active && text && !autoOpenedRef.current) {
+      setOpen(true);
+      autoOpenedRef.current = true;
+    }
+  }, [active, text]);
+
   if (!text && !active) return null;
   const showShimmer = active && !text;
 
@@ -15,6 +24,7 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
     <div className="my-2">
       <button
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex items-center gap-2 text-[12px] text-ink-400 transition-colors hover:text-ink-200"
       >
         <ChevronRight

@@ -293,6 +293,7 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
             type="button"
             onClick={() => beginCreate("file")}
             title="New file"
+            aria-label="New file"
             className="rounded p-1 text-ink-400 hover:bg-ink-800 hover:text-ink-100"
           >
             <PlusIcon width={14} height={14} />
@@ -304,6 +305,7 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
             type="button"
             onClick={refresh}
             title="Refresh"
+            aria-label="Refresh"
             className="rounded p-1 text-ink-400 hover:bg-ink-800 hover:text-ink-100"
           >
             <RefreshIcon width={14} height={14} />
@@ -334,7 +336,7 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
             }}
             placeholder={createKind === "folder" ? "folder name" : "filename.ext"}
             aria-label={`New ${createKind} name`}
-            className="w-full rounded bg-ink-900 px-2 py-1 text-[13px] text-ink-100 outline-none ring-1 ring-ink-700 focus:ring-ink-500"
+            className="w-full rounded bg-ink-900 px-2 py-1 text-[13px] text-ink-100 outline-none ring-1 ring-ink-700 focus:ring-accent/50"
           />
         </div>
       ) : null}

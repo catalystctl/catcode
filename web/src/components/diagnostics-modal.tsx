@@ -14,6 +14,7 @@ import type {
 import { formatTokens } from "@/lib/format";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { HistoryIcon, RefreshIcon, XIcon } from "./icons";
 
 interface Props {
@@ -43,6 +44,7 @@ export function DiagnosticsModal({
 }: Props) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
 
   return (
     <div className="modal-backdrop">

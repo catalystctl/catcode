@@ -81,7 +81,7 @@ Look at the **sample model-discovery JSON** from step 0.4:
 
 ## Step 2 — Config-only path (Shapes A/B/C)
 
-Add a `providers` entry to `~/.config/catalyst-code/settings.json` (user-owned,
+Add a `providers` entry to `~/.config/catalyst-code/config.json` (user-owned,
 0600). Minimal shape (mirrors `parse_provider` in `config.rs`):
 
 ```jsonc

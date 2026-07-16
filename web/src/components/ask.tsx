@@ -76,8 +76,10 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
       (q) => (q.required ?? true) && !(answers[q.id]?.trim()),
     );
     if (missing.length > 0) {
-      // Surface the first missing required question without submitting.
-      const el = document.getElementById(`ask-${missing[0].id}`);
+      const id = missing[0].id;
+      // Prefer the actual input; fall back to the question container (tabIndex=-1).
+      const input = document.getElementById(`ask-input-${id}`);
+      const el = input ?? document.getElementById(`ask-${id}`);
       el?.focus();
       el?.scrollIntoView({ block: "center" });
       return;
@@ -102,6 +104,9 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
   };
 
   let textFocusedAssigned = false;
+  const hasTextField = prompt.questions.some(
+    (q) => q.type === "text" || custom[q.id],
+  );
 
   return (
     <div
@@ -133,11 +138,20 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
             const req = q.required ?? true;
             const isCustom = custom[q.id];
             const isText = q.type === "text" || isCustom;
+            const inputId = `ask-input-${q.id}`;
             const assignRef =
               isText && !textFocusedAssigned ? (textFocusedAssigned = true) : false;
             return (
-              <div key={q.id} id={`ask-${q.id}`} className="space-y-1.5">
-                <label className="flex items-start gap-1 text-[13px] font-medium text-ink-100">
+              <div
+                key={q.id}
+                id={`ask-${q.id}`}
+                tabIndex={-1}
+                className="space-y-1.5 outline-none"
+              >
+                <label
+                  htmlFor={isText ? inputId : undefined}
+                  className="flex items-start gap-1 text-[13px] font-medium text-ink-100"
+                >
                   <span className="flex-1">{q.prompt}</span>
                   {req && <span className="text-danger">*</span>}
                   {!req && (
@@ -186,6 +200,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
 
                 {isText && (
                   <input
+                    id={inputId}
                     ref={assignRef ? firstTextRef : undefined}
                     type="text"
                     value={answers[q.id] ?? ""}
@@ -223,8 +238,17 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
           <XIcon width={14} height={14} /> Skip
         </button>
         <span className="ml-auto hidden text-[11px] text-ink-600 sm:inline">
-          <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}
-          submit ·{" "}
+          {hasTextField ? (
+            <>
+              <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}
+              submit ·{" "}
+            </>
+          ) : (
+            <>
+              <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd>{" "}
+              submit ·{" "}
+            </>
+          )}
           <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
           skip
         </span>

@@ -3,67 +3,19 @@
 // the query. Server-side only — the browser has no direct fs access. Confined to
 // the bridge's workspace root so a crafted path can't escape.
 
-import { readdirSync, statSync } from "node:fs";
-import { join, relative, normalize, sep } from "node:path";
-import { getBridge } from "@/server/core-bridge";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { getSession } from "@/lib/auth";
 import type { FileEntry } from "@/lib/types";
+import {
+  confinePathReal,
+  resolveAuthorizedWorkspace,
+  SKIP_DIRS,
+  isSecretFile,
+} from "@/server/workspace";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-/** Directories that are almost never useful to @-mention and are slow to walk. */
-const SKIP = new Set([
-  "node_modules",
-  ".git",
-  ".next",
-  ".svn",
-  ".hg",
-  "dist",
-  "build",
-  "target",
-  ".cache",
-  ".turbo",
-  "coverage",
-  ".nuxt",
-  ".output",
-  "__pycache__",
-  ".venv",
-  "venv",
-  ".idea",
-  ".vscode",
-  ".ssh",
-  ".aws",
-  ".gnupg",
-  ".kube",
-  ".docker",
-]);
-
-/** Secret-ish filenames / extensions that must never appear in @-mention results. */
-const SKIP_FILES = /\.(env|pem|key|p12|pfx|crt|cer)$/i;
-const SKIP_FILE_NAMES = new Set([
-  ".env",
-  ".env.local",
-  ".env.development",
-  ".env.production",
-  ".env.test",
-  "credentials.json",
-  "credentials",
-  "id_rsa",
-  "id_ed25519",
-  "id_ecdsa",
-  "id_dsa",
-  "id_rsa.pub",
-  "known_hosts",
-  "authorized_keys",
-]);
-
-function shouldSkipFile(name: string): boolean {
-  if (SKIP_FILE_NAMES.has(name)) return true;
-  if (name.startsWith(".env")) return true;
-  if (SKIP_FILES.test(name)) return true;
-  return false;
-}
 
 const MAX_DEPTH = 8;
 const MAX_RESULTS = 50;
@@ -71,24 +23,44 @@ const MAX_RESULTS = 50;
 export async function GET(req: Request) {
   if (!(await getSession(req.headers)))
     return Response.json({ error: "unauthorized" }, { status: 401 });
-  const bridge = getBridge();
+
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(req);
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
+
   const url = new URL(req.url);
-  const workspace = url.searchParams.get("workspace") ?? bridge.getDefaultWorkspace();
   const q = (url.searchParams.get("q") ?? "").toLowerCase().trim();
   const base = url.searchParams.get("path") ?? "";
 
-  // Confine the base path to the workspace.
-  const root = normalize(join(workspace, base));
-  const rel = relative(workspace, root);
-  if (rel.startsWith("..") || rel.includes(`..${sep}`)) {
+  // Confine the base path to the workspace (realpath when it exists).
+  let root: string;
+  let realWorkspace: string;
+  try {
+    root = confinePathReal(workspace, base);
+    realWorkspace = realpathSync(workspace);
+  } catch {
     return Response.json({ error: "path outside workspace" }, { status: 400 });
   }
 
   const results: FileEntry[] = [];
   const seen = new Set<string>();
 
+  function underWorkspace(abs: string): boolean {
+    try {
+      const real = realpathSync(abs);
+      const r = relative(realWorkspace, real);
+      return r !== ".." && !r.startsWith(`..${sep}`);
+    } catch {
+      return false;
+    }
+  }
+
   function walk(dir: string, depth: number) {
     if (results.length >= MAX_RESULTS || depth > MAX_DEPTH) return;
+    if (!underWorkspace(dir)) return;
     let entries: string[];
     try {
       entries = readdirSync(dir);
@@ -97,23 +69,24 @@ export async function GET(req: Request) {
     }
     for (const name of entries) {
       if (results.length >= MAX_RESULTS) return;
-      if (name.startsWith(".") && SKIP.has(name)) continue;
+      if (name.startsWith(".") && SKIP_DIRS.has(name)) continue;
       const full = join(dir, name);
       let st;
       try {
-        st = statSync(full);
+        st = lstatSync(full);
       } catch {
         continue;
       }
+      // Do not follow symlink directories out of the workspace.
+      if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) {
-        if (SKIP.has(name)) continue;
+        if (SKIP_DIRS.has(name)) continue;
         walk(full, depth + 1);
-      } else {
-        if (shouldSkipFile(name)) continue;
+      } else if (st.isFile()) {
+        if (isSecretFile(name)) continue;
         const filePath = relative(workspace, full).replace(/\\/g, "/");
         if (seen.has(filePath)) continue;
         seen.add(filePath);
-        // Match against the full relative path or just the filename.
         if (!q || filePath.toLowerCase().includes(q) || name.toLowerCase().includes(q)) {
           results.push({ path: filePath, name, dir: false });
         }

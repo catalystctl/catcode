@@ -7,6 +7,7 @@ import { useMemo, useState } from "react";
 import type { ModelInfo, ProviderPreset } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { XIcon } from "./icons";
 
 export interface GoalStartOpts {
@@ -44,6 +45,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
   const [modelConcurrency, setModelConcurrency] = useState<Record<string, number>>({});
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
   const executionProfile = concurrency >= 8 ? "Ultra parallel" : concurrency > 1 ? "Parallel" : "Serial";
 
   const providerOpts = useMemo(() => {
@@ -197,7 +199,11 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                 min={1}
                 max={64}
                 value={maxTasks}
-                onChange={(e) => setMaxTasks(Number(e.target.value) || 1)}
+                onChange={(e) => {
+                  const next = Math.max(1, Math.min(64, Number(e.target.value) || 1));
+                  setMaxTasks(next);
+                  setConcurrency((current) => Math.min(current, next));
+                }}
                 className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
               />
             </label>

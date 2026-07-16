@@ -196,6 +196,16 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .composer-inflight { animation: none; }
+  .animate-fade-in,
+  .animate-ping,
+  .animate-bounce,
+  .animate-pulse,
+  .animate-caret-blink {
+    animation: none !important;
+  }
+  .stream-caret::after {
+    animation: none;
+  }
 }
 
 /* ── Markdown prose ──────────────────────────────────────────────────────── */
@@ -548,10 +558,14 @@ body {
   font-size: 0.9rem;
   font-weight: 600;
   color: rgb(var(--ink-950));
-  transition: opacity 0.15s, background 0.15s;
+  transition: opacity 0.15s, background 0.15s, box-shadow 0.15s;
 }
 .auth-btn-primary:hover:not(:disabled) {
   background: rgb(var(--accent-soft));
+}
+.auth-btn-primary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.15);
 }
 .auth-btn-primary:disabled {
   opacity: 0.5;
@@ -566,11 +580,16 @@ body {
   font-size: 0.9rem;
   font-weight: 500;
   color: rgb(var(--ink-200));
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
 }
 .auth-btn-ghost:hover:not(:disabled) {
   border-color: rgb(var(--ink-500));
   background: rgb(var(--ink-850) / 0.5);
+}
+.auth-btn-ghost:focus-visible {
+  outline: none;
+  border-color: rgb(var(--accent));
+  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.15);
 }
 .auth-btn-ghost:disabled {
   opacity: 0.5;
@@ -625,4 +644,14 @@ body {
   .modal-sheet-auto {
     margin-top: 0;
   }
+}
+
+/* While dragging panels or resizing splits, disable pointer hit-testing on
+   embeds that would otherwise swallow events (iframes, Ghostty WebGL canvas)
+   and cancel HTML5 DnD or stall pointermove mid-gesture. */
+body.catalyst-panel-dragging iframe,
+body.catalyst-panel-dragging canvas,
+body.catalyst-resizing iframe,
+body.catalyst-resizing canvas {
+  pointer-events: none !important;
 }

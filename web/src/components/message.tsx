@@ -65,7 +65,7 @@ function UserMessage({
 }: {
   m: UserMsg;
   canEdit?: boolean;
-  onEdit?: (text: string) => void;
+  onEdit?: (text: string, images?: string[]) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.text);
@@ -87,7 +87,7 @@ function UserMessage({
 
   const commit = () => {
     const t = draft.trim();
-    if (t && t !== m.text && onEdit) onEdit(t);
+    if (t && t !== m.text && onEdit) onEdit(t, m.images);
     setEditing(false);
   };
 
@@ -128,6 +128,19 @@ function UserMessage({
         ) : (
           <>
             <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-ink-700/60 bg-ink-800/70 px-4 py-2.5 text-[14px] leading-relaxed text-ink-100">
+              {m.images && m.images.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {m.images.map((src, i) => (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      key={i}
+                      src={src}
+                      alt={`attachment ${i + 1}`}
+                      className="h-16 w-16 rounded-md border border-ink-700/80 object-cover"
+                    />
+                  ))}
+                </div>
+              )}
               {m.text}
             </div>
             {m.steer && (
@@ -137,7 +150,7 @@ function UserMessage({
             )}
           </>
         )}
-        <div className="absolute -left-9 top-1.5 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <div className="absolute -left-9 top-1.5 flex gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100">
           <CopyBtn text={m.text} />
           {canEdit && onEdit && !editing && (
             <button
@@ -177,7 +190,7 @@ function AssistantMessage({
             <DotIcon className="animate-pulse" /> streaming
           </span>
         )}
-        <span className="ml-auto flex items-center gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+        <span className="ml-auto flex items-center gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100">
           {canRegenerate && onRegenerate && !m.streaming && (
             <button
               onClick={onRegenerate}
@@ -277,7 +290,7 @@ export const Message = memo(function Message({
   canRegenerate,
 }: {
   m: UIMessage;
-  onEditUser?: (text: string) => void;
+  onEditUser?: (text: string, images?: string[]) => void;
   onRegenerate?: () => void;
   canEdit?: boolean;
   canRegenerate?: boolean;

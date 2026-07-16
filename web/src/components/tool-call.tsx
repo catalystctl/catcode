@@ -32,6 +32,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
     <div className="my-1.5 overflow-hidden rounded-lg border border-ink-800 bg-ink-925/40">
       <button
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-ink-850/60"
       >
         <ChevronRight

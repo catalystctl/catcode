@@ -4,7 +4,9 @@
 // Each call site mounts <AppDialogHost dialog={…} /> and awaits confirm()/prompt().
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { XIcon } from "./icons";
 
@@ -73,8 +75,8 @@ export function useAppDialog(): AppDialogApi {
 
 export function AppDialogHost({ dialog }: { dialog: DialogState }) {
   if (!dialog) return null;
-  if (dialog.kind === "confirm") {
-    return (
+  const content =
+    dialog.kind === "confirm" ? (
       <ConfirmView
         title={dialog.title}
         message={dialog.message}
@@ -88,23 +90,23 @@ export function AppDialogHost({ dialog }: { dialog: DialogState }) {
           dialog.resolve(false);
         }}
       />
+    ) : (
+      <PromptView
+        title={dialog.title}
+        message={dialog.message}
+        placeholder={dialog.placeholder}
+        defaultValue={dialog.defaultValue}
+        confirmLabel={dialog.confirmLabel}
+        cancelLabel={dialog.cancelLabel}
+        password={dialog.password}
+        multiline={dialog.multiline}
+        required={dialog.required}
+        onSubmit={(v) => dialog.resolve(v)}
+        onCancel={() => dialog.resolve(null)}
+      />
     );
-  }
-  return (
-    <PromptView
-      title={dialog.title}
-      message={dialog.message}
-      placeholder={dialog.placeholder}
-      defaultValue={dialog.defaultValue}
-      confirmLabel={dialog.confirmLabel}
-      cancelLabel={dialog.cancelLabel}
-      password={dialog.password}
-      multiline={dialog.multiline}
-      required={dialog.required}
-      onSubmit={(v) => dialog.resolve(v)}
-      onCancel={() => dialog.resolve(null)}
-    />
-  );
+  if (typeof document === "undefined") return content;
+  return createPortal(content, document.body);
 }
 
 function ConfirmView({
@@ -125,21 +127,16 @@ function ConfirmView({
   };
   const closeRef = useOutsideClose(() => finish(false));
   const trapRef = useFocusTrap<HTMLDivElement>();
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        finish(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useBodyScrollLock();
 
   return (
-    <div className="modal-backdrop z-[60]">
+    <div
+      className="modal-backdrop z-[60]"
+      onMouseDown={(e) => {
+        e.stopPropagation();
+        finish(false);
+      }}
+    >
       <div
         ref={mergeRefs(closeRef, trapRef)}
         className="modal-sheet modal-sheet-auto max-w-md"
@@ -147,6 +144,7 @@ function ConfirmView({
         aria-modal="true"
         aria-labelledby="app-dialog-title"
         aria-describedby="app-dialog-desc"
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 border-b border-ink-800/80 px-5 py-3.5">
           <h2 id="app-dialog-title" className="text-[15px] font-semibold text-ink-100">
@@ -165,13 +163,14 @@ function ConfirmView({
         </p>
         <div className="flex justify-end gap-2 border-t border-ink-800/80 px-5 py-3">
           <button
+            autoFocus={!!danger}
             onClick={() => finish(false)}
             className="rounded-lg border border-ink-700 px-3.5 py-1.5 text-[12px] font-medium text-ink-300 hover:bg-ink-850"
           >
             {cancelLabel}
           </button>
           <button
-            autoFocus
+            autoFocus={!danger}
             onClick={() => finish(true)}
             className={`rounded-lg px-3.5 py-1.5 text-[12px] font-semibold text-white ${
               danger
@@ -211,22 +210,11 @@ function PromptView({
   };
   const closeRef = useOutsideClose(() => finish(null));
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
 
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select?.();
-  }, []);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        finish(null);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const submit = () => {
@@ -236,13 +224,20 @@ function PromptView({
   };
 
   return (
-    <div className="modal-backdrop z-[60]">
+    <div
+      className="modal-backdrop z-[60]"
+      onMouseDown={(e) => {
+        e.stopPropagation();
+        finish(null);
+      }}
+    >
       <div
         ref={mergeRefs(closeRef, trapRef)}
         className="modal-sheet modal-sheet-auto max-w-md"
         role="dialog"
         aria-modal="true"
         aria-labelledby="app-prompt-title"
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 border-b border-ink-800/80 px-5 py-3.5">
           <h2 id="app-prompt-title" className="text-[15px] font-semibold text-ink-100">

@@ -8,6 +8,7 @@
 import { useState } from "react";
 import type { MemoryEntry } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { AppDialogHost, useAppDialog } from "./app-dialog";
 import {
@@ -129,8 +130,9 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
   const [tags, setTags] = useState("");
   const [scope, setScope] = useState<"workspace" | "global">("workspace");
   const { confirm, dialog } = useAppDialog();
-  const closeRef = useOutsideClose(onClose);
+  const closeRef = useOutsideClose(onClose, dialog == null);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
 
   const save = () => {
     const t = text.trim();
@@ -191,6 +193,7 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
               <button
                 onClick={onClose}
                 className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                aria-label="Close"
               >
                 <XIcon width={16} height={16} />
               </button>

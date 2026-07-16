@@ -44,7 +44,7 @@ interface Props {
   activeFile?: string | null;
   onAddImage: (url: string) => void;
   onRemoveImage: (i: number) => void;
-  onPrompt: (text: string, images?: string[]) => void;
+  onPrompt: (text: string, images?: string[]) => void | Promise<void>;
   onSteer: (text: string) => void;
   onAbort: () => void;
   onClearQueue?: () => void;
@@ -63,6 +63,8 @@ export interface ComposerHandle {
   focus: () => void;
   /** Replace the textarea value with `text` and focus it (for /run etc.). */
   insert: (text: string) => void;
+  /** Append `text` to the current draft (with a separating newline if needed). */
+  append: (text: string) => void;
   /** Open the image-attachment file picker. */
   openAttach: () => void;
 }
@@ -161,6 +163,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const [fileOpen, setFileOpen] = useState(false);
   const mentionRef = useRef<{ start: number; query: string } | null>(null);
   const fetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restoredDraftImgsRef = useRef(false);
 
   // ── Imperative handle (stable — only refs/setState are touched) ──
   useImperativeHandle(
@@ -183,6 +186,21 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           el.setSelectionRange(end, end);
         });
       },
+      append: (t: string) => {
+        if (!t) return;
+        setText((prev) => {
+          if (!prev) return t;
+          const sep = prev.endsWith("\n") || t.startsWith("\n") ? "" : "\n\n";
+          return prev + sep + t;
+        });
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          const end = el.value.length;
+          el.setSelectionRange(end, end);
+        });
+      },
       openAttach: () => attachRef.current?.pick(),
     }),
     [],
@@ -195,6 +213,9 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   useEffect(() => {
     const saved = lsGet(DRAFT_KEY);
     if (saved) setText(saved);
+    // Ref flag: Strict Mode remounts once; without this, images double-append.
+    if (restoredDraftImgsRef.current) return;
+    restoredDraftImgsRef.current = true;
     const savedImgs = lsGet(DRAFT_IMG_KEY);
     if (savedImgs) {
       try {
@@ -234,6 +255,13 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       setCmdOpen(false);
       return;
     }
+    // Prefer @-mention flyout when the caret is inside a mention.
+    const el = taRef.current;
+    const caret = el ? el.selectionStart : text.length;
+    if (detectMention(text, caret)) {
+      setCmdOpen(false);
+      return;
+    }
     // Strip the leading "/" so a partial like "/frontend" matches
     // "/skill:frontend-design" (the label Contains "frontend"), mirroring
     // filterCommands' own slash-stripping for built-in commands. Without this
@@ -258,7 +286,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     setCmdItems(filtered);
     setCmdIndex(0);
     setCmdOpen(filtered.length > 0);
-  }, [text, skills]);
+  }, [text, skills, caretTick]);
 
   // ── File-mention flyout: debounced fetch from /api/files ──
   useEffect(() => {
@@ -334,6 +362,17 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         return;
       }
     }
+    // PI-compatible bang bash: `!cmd` / `!!cmd` — works without a selected model.
+    if (onBash && t.startsWith("!")) {
+      const exclude = t.startsWith("!!");
+      const command = (exclude ? t.slice(2) : t.slice(1)).trim();
+      if (command) {
+        onBash(command, exclude);
+        setText("");
+        closeFlyouts();
+        return;
+      }
+    }
     // Match Send button: prompts/skills need a model.
     if (!canSend) return;
     // "/skill:<name> [task]" — invoke a discoverable skill. Handles both the
@@ -351,17 +390,6 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           closeFlyouts();
           return;
         }
-      }
-    }
-    // PI-compatible bang bash: `!cmd` (include in context) / `!!cmd` (exclude).
-    if (onBash && t.startsWith("!")) {
-      const exclude = t.startsWith("!!");
-      const command = (exclude ? t.slice(2) : t.slice(1)).trim();
-      if (command) {
-        onBash(command, exclude);
-        setText("");
-        closeFlyouts();
-        return;
       }
     }
     const imgs = images.length ? images : undefined;
@@ -455,28 +483,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // ── Flyout keyboard navigation (takes priority over submit) ──
-    if (cmdOpen && cmdItems.length > 0) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setCmdIndex((i) => (i + 1) % cmdItems.length);
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setCmdIndex((i) => (i - 1 + cmdItems.length) % cmdItems.length);
-        return;
-      }
-      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
-        e.preventDefault();
-        runCommand(cmdIndex);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setCmdOpen(false);
-        return;
-      }
-    }
+    // Prefer mention flyout when both could be relevant.
     if (fileOpen && fileItems.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -496,6 +503,28 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       if (e.key === "Escape") {
         e.preventDefault();
         setFileOpen(false);
+        return;
+      }
+    }
+    if (cmdOpen && cmdItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setCmdIndex((i) => (i + 1) % cmdItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setCmdIndex((i) => (i - 1 + cmdItems.length) % cmdItems.length);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        runCommand(cmdIndex);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setCmdOpen(false);
         return;
       }
     }
@@ -519,7 +548,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
   };
 
-  const disabled = !connected || !canSend;
+  const trimmed = text.trim();
+  const isSlashOrBang = trimmed.startsWith("/") || trimmed.startsWith("!");
+  // Slash/bang commands work without a selected model; normal prompts need canSend.
+  const disabled = !connected || (!canSend && !isSlashOrBang);
   const flyoutOpen = cmdOpen || fileOpen;
   const referencedFiles = [...new Set(Array.from(text.matchAll(/(?:^|\s)@([^\s]+)/g), (match) => match[1]))];
 
@@ -552,17 +584,8 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           </div>
         )}
         <div className="relative">
-          {/* Flyout (positioned above the input box) */}
-          {cmdOpen && (
-            <Flyout
-              items={cmdItems}
-              selectedIndex={cmdIndex}
-              onSelect={runCommand}
-              onHover={setCmdIndex}
-              emptyHint="No commands match"
-            />
-          )}
-          {fileOpen && (
+          {/* Flyout (positioned above the input box) — prefer mention over commands */}
+          {fileOpen ? (
             <Flyout
               items={fileItems}
               selectedIndex={fileIndex}
@@ -570,6 +593,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               onHover={setFileIndex}
               emptyHint="No files match"
             />
+          ) : (
+            cmdOpen && (
+              <Flyout
+                items={cmdItems}
+                selectedIndex={cmdIndex}
+                onSelect={runCommand}
+                onHover={setCmdIndex}
+                emptyHint="No commands match"
+              />
+            )
           )}
 
           <div
@@ -614,7 +647,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                   <>
                     <button
                       onClick={submit}
-                      disabled={!connected || !canSend}
+                      disabled={!connected || (!canSend && !(text.trim().startsWith("/") || text.trim().startsWith("!")))}
                       className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
                       title="Queue follow-up (Enter)"
                     >

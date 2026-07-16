@@ -12,9 +12,14 @@
 // it never touches the core agent loop.
 
 import { readFileSync, statSync } from "node:fs";
-import { basename, extname, join, normalize, relative, sep } from "node:path";
-import { getBridge } from "@/server/core-bridge";
+import { basename, extname } from "node:path";
 import { getSession } from "@/lib/auth";
+import { injectPreviewHelpers } from "@/server/preview-inject";
+import {
+  confinePathReal,
+  isSecretFile,
+  resolveAuthorizedWorkspace,
+} from "@/server/workspace";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -45,46 +50,32 @@ const CONTENT_TYPES: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
 };
 
-/** Secret-ish filenames / extensions that must never be served for preview. */
-const SECRET_EXT = /\.(env|pem|key|p12|pfx|crt|cer)$/i;
-const SECRET_NAMES = new Set([
-  ".env",
-  ".env.local",
-  ".env.development",
-  ".env.production",
-  ".env.test",
-  "credentials.json",
-  "credentials",
-  "id_rsa",
-  "id_ed25519",
-  "id_ecdsa",
-  "id_dsa",
-  "id_rsa.pub",
-  "known_hosts",
-  "authorized_keys",
-]);
-
-function isSecretFile(name: string): boolean {
-  if (SECRET_NAMES.has(name)) return true;
-  if (name.startsWith(".env")) return true;
-  return SECRET_EXT.test(name);
-}
+/** CSP for SVG (no scripts). HTML preview relies on the iframe sandbox +
+ *  injectPreviewHelpers inspect bootstrap, so it must allow same-document scripts. */
+const SVG_CSP = "default-src 'none'; script-src 'none'; sandbox";
+const HTML_CSP =
+  "default-src 'none'; img-src data: blob: *; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'";
 
 export async function GET(req: Request) {
   if (!(await getSession(req.headers)))
     return Response.json({ error: "unauthorized" }, { status: 401 });
 
-  const bridge = getBridge();
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(req);
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
+
   const url = new URL(req.url);
-  const workspace = url.searchParams.get("workspace") ?? bridge.getDefaultWorkspace();
   const rel = (url.searchParams.get("path") ?? "").trim();
 
   if (!rel) return Response.json({ error: "missing path" }, { status: 400 });
 
-  // Confine the path to the workspace (mirror api/files/route.ts:38-46).
-  const abs = normalize(join(workspace, rel));
-  const r = relative(workspace, abs);
-  if (r.startsWith("..") || r.includes(`..${sep}`)) {
+  let abs: string;
+  try {
+    abs = confinePathReal(workspace, rel);
+  } catch {
     return Response.json({ error: "path outside workspace" }, { status: 400 });
   }
 
@@ -116,6 +107,31 @@ export async function GET(req: Request) {
     return Response.json({ error: "file too large" }, { status: 400 });
   }
 
+  const isHtml = ext === ".html" || ext === ".htm";
+  const isSvg = ext === ".svg";
+
+  // HTML gets the inspect bootstrap so Preview can pick elements into chat.
+  // Other types are served as raw bytes.
+  if (isHtml) {
+    let text: string;
+    try {
+      text = readFileSync(abs, "utf8");
+    } catch {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+    const rewritten = injectPreviewHelpers(text, { inspect: true });
+    return new Response(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Disposition": "inline",
+        "Content-Security-Policy": HTML_CSP,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
+
   // readFileSync returns Buffer<ArrayBufferLike>, but BodyInit's BufferSource
   // requires ArrayBufferView<ArrayBuffer> (TS 5.9 lib.dom). Copy into a fresh
   // ArrayBuffer-backed Uint8Array so the body type-checks cleanly. The 5 MiB cap
@@ -129,16 +145,18 @@ export async function GET(req: Request) {
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
-  return new Response(bytes, {
-    status: 200,
-    headers: {
-      "Content-Type": contentType,
-      "Content-Disposition": "inline",
-      "Content-Length": String(bytes.byteLength),
-      // Don't let browsers cache a stale preview across edits; don't let the
-      // served bytes be re-sniffed into a different type.
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": contentType,
+    "Content-Disposition": isSvg ? "attachment" : "inline",
+    "Content-Length": String(bytes.byteLength),
+    // Don't let browsers cache a stale preview across edits; don't let the
+    // served bytes be re-sniffed into a different type.
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  };
+  if (isSvg) {
+    headers["Content-Security-Policy"] = SVG_CSP;
+  }
+
+  return new Response(bytes, { status: 200, headers });
 }

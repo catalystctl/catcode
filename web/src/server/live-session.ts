@@ -150,7 +150,20 @@ export class LiveSession {
       this.fanout({ type: "error", message: `Failed to start session: ${msg}` });
       throw err;
     }
+    // GC may have disposed this session while start() awaited — tear down the
+    // orphan core instead of wiring events into a removed LiveSession.
+    if (this.disposed) {
+      this.starting = null;
+      this.core = null;
+      try {
+        await core.dispose();
+      } catch {
+        /* best-effort */
+      }
+      throw new Error("session disposed");
+    }
     this.deadNotified = false;
+    this.starting = null;
     this.onCoreEvent(ready as unknown as CoreEvent);
 
     // Populate the UI immediately (per-session models/plugins/memories/vision +
@@ -297,6 +310,7 @@ export class LiveSession {
         text: cmd.prompt,
         model: cmd.model,
         steer: cmd.type === "steer",
+        ...(cmd.type === "send" && cmd.images?.length ? { images: cmd.images } : {}),
       });
     } else if (cmd.type === "undo") {
       // Mirror client `_undo_local` so the following core `reset` keeps the

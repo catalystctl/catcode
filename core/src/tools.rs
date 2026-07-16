@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 pub use crate::fetch_tool::execute_fetch;
 pub use crate::search_tool::execute_web_search;
+pub use crate::test_env::execute_test_env;
 
 /// Description shown to the model for the `bash` tool. OS-selected so the
 /// model emits matching syntax: PowerShell on Windows, bash on Unix. The
@@ -811,6 +812,34 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "test_env",
+                "description": "Spin up and drive ephemeral Linux containers / Windows VMs for platform-specific testing, with VNC screen access. Linux uses a Podman container (catalyst/linux-gui image); Windows uses a QEMU/KVM VM cloned from a base qcow2 (built via packaging/vm-images/windows/build.sh). Actions: create (platform linux|windows; optional image/gui/cpus/memory_mb) → returns env_id + vnc_url; exec (run a command inside the env — SSH+PTY for Windows, podman exec for Linux; ideal for TUI tests); screenshot (capture the screen to a PNG file + metadata); input (key/click/type — drive the GUI); vnc_url (live-screen websocket for the noVNC panel); destroy; list. For TUI tests use exec; for webui/GUI tests use screenshot/input or the vnc_url panel.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["create","exec","screenshot","input","vnc_url","destroy","list"] },
+                        "env_id": { "type": "string", "description": "env id (from create); required for exec/screenshot/input/vnc_url/destroy" },
+                        "platform": { "type": "string", "enum": ["linux","windows"], "description": "create only; default linux" },
+                        "image": { "type": "string", "description": "create only; container image (linux) — default catalyst/linux-gui:24.04" },
+                        "gui": { "type": "boolean", "description": "create only; start the GUI/VNC stack (default true for linux)" },
+                        "cpus": { "type": "integer", "description": "create only; Windows VM vCPUs (default 4)" },
+                        "memory_mb": { "type": "integer", "description": "create only; Windows VM RAM in MB (default 4096)" },
+                        "command": { "type": "string", "description": "exec: the command to run inside the env" },
+                        "pty": { "type": "boolean", "description": "exec: allocate a PTY (needed for TUIs on Windows; default false)" },
+                        "timeout": { "type": "integer", "description": "exec: wall-clock timeout in seconds (default 120)" },
+                        "input_type": { "type": "string", "enum": ["key","click","type"], "description": "input action type" },
+                        "keys": { "type": "array", "items": { "type": "string" }, "description": "input key: key names (Windows QKeyCode / Linux xdotool syntax)" },
+                        "x": { "type": "integer", "description": "input click: x coordinate (in the env's screen resolution)" },
+                        "y": { "type": "integer", "description": "input click: y coordinate" },
+                        "text": { "type": "string", "description": "input type: text to type" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
     ]
 }
 
@@ -874,6 +903,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
             "goal_write_plan must be dispatched through handle_goal_write_plan (async, goal mode only)",
         ),
         "bash" => Outcome::err("bash must be dispatched through execute_bash (async)"),
+        "test_env" => Outcome::err("test_env must be dispatched through execute_test_env (async)"),
         "bulk" => Outcome::err("bulk must be dispatched through execute_bulk (async)"),
         other => Outcome::err(format!("unknown tool: {other}")),
     }

@@ -8,6 +8,7 @@ import { useState } from "react";
 import type { ProviderPreset } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { CheckIcon, XIcon, ShieldIcon } from "./icons";
 
 interface Props {
@@ -33,6 +34,7 @@ export function ProviderLoginModal({
 }: Props) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
   const [selected, setSelected] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const list =
@@ -140,6 +142,7 @@ export function ProviderLoginModal({
               </label>
               <input
                 type="password"
+                autoComplete="off"
                 value={keyInput}
                 onChange={(e) => setKeyInput(e.target.value)}
                 placeholder={current.envVar || "sk-…"}

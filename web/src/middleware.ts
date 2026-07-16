@@ -24,6 +24,10 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
   if (!hasSessionCookie(req)) {
+    // API clients expect JSON 401, not an HTML login redirect.
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
     // Standalone Next builds construct req.nextUrl from their bind hostname
     // even when a reverse proxy supplies Host/X-Forwarded-Host. Prefer the
     // configured canonical origin so external users never get sent to the

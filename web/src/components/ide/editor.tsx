@@ -15,20 +15,6 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
 type MonacoApi = typeof Monaco;
 
-function Breadcrumbs({ path }: { path: string }) {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return (
-    <nav aria-label="File breadcrumb" className="flex h-7 shrink-0 items-center gap-1 overflow-hidden border-b border-ink-900/80 bg-ink-950 px-3 text-[10px] text-ink-500">
-      {parts.map((part, index) => (
-        <span key={`${part}-${index}`} className="flex min-w-0 items-center gap-1">
-          {index > 0 && <span aria-hidden className="text-ink-700">›</span>}
-          <span className={`truncate ${index === parts.length - 1 ? "text-ink-300" : ""}`}>{part}</span>
-        </span>
-      ))}
-    </nav>
-  );
-}
-
 function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
   const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
   return monaco.Uri.from({
@@ -78,7 +64,18 @@ function useMonacoTheme(enabled: boolean): void {
   }, [enabled]);
 }
 
-export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: () => void }) {
+export function Editor({
+  tab,
+  onOpenPreview,
+  refreshToken,
+  changedPaths,
+}: {
+  tab: IdeTab;
+  onOpenPreview?: () => void;
+  /** Bumps when the agent writes files — reload clean buffers from disk. */
+  refreshToken?: number;
+  changedPaths?: string[];
+}) {
   const { workspace, ide } = useIdeContext();
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -233,13 +230,73 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
     };
   }, [isImage, markDirty, tab.id, tab.language, tab.target, workspace]);
 
+  // When the agent (or another tool) writes the open file, refresh the Monaco
+  // model if the tab is clean. Dirty tabs keep local edits and show a banner.
+  const [diskChanged, setDiskChanged] = useState(false);
+  useEffect(() => {
+    setDiskChanged(false);
+  }, [tab.id]);
+
+  useEffect(() => {
+    if (refreshToken == null || refreshToken === 0) return;
+    const normalized = tab.target.replace(/\\/g, "/");
+    const hit =
+      !changedPaths?.length ||
+      changedPaths.some((p) => {
+        const c = p.replace(/\\/g, "/");
+        return c === normalized || normalized.endsWith("/" + c) || c.endsWith("/" + normalized);
+      });
+    if (!hit) return;
+    if (isImage) {
+      // Cache-bust the <img> via key on the element (see render).
+      return;
+    }
+    if (tab.dirty) {
+      setDiskChanged(true);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const monaco = await loadMonaco();
+        if (cancelled) return;
+        const uri = modelUri(monaco, workspace, tab.target);
+        const model = monaco.editor.getModel(uri);
+        if (!model || model.isDisposed()) return;
+        const response = await fetch(
+          `/api/file?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`,
+        );
+        if (!response.ok || cancelled) return;
+        const data = (await response.json()) as { content?: string };
+        const next = data.content ?? "";
+        if (model.getValue() === next) {
+          setDiskChanged(false);
+          return;
+        }
+        model.pushEditOperations(
+          [],
+          [{ range: model.getFullModelRange(), text: next }],
+          () => null,
+        );
+        contentRef.current = next;
+        markDirty(tab.id, false);
+        setDiskChanged(false);
+      } catch {
+        /* keep current buffer */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [changedPaths, isImage, markDirty, refreshToken, tab.dirty, tab.id, tab.target, workspace]);
+
   if (isImage) {
     return (
       <div className="relative flex h-full flex-col bg-ink-950">
-        <Breadcrumbs path={tab.target} />
         <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
           <img
-            src={`/api/preview?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}`}
+            key={refreshToken ?? 0}
+            src={`/api/preview?path=${encodeURIComponent(tab.target)}&workspace=${encodeURIComponent(workspace)}&t=${refreshToken ?? 0}`}
             alt={tab.label}
             className="max-h-full max-w-full object-contain"
           />
@@ -251,7 +308,6 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
 
   return (
     <div className="relative flex h-full flex-col bg-ink-950">
-      <Breadcrumbs path={tab.target} />
       <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" aria-label={`Editor for ${tab.label}`} />
       {loading ? (
         <div className="absolute inset-0 flex items-center justify-center bg-ink-950 text-sm text-ink-500">
@@ -259,8 +315,13 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
         </div>
       ) : null}
       {error ? (
-        <div className="absolute inset-x-0 top-0 z-10 border-b border-red-500/30 bg-red-950/90 px-3 py-2 text-center text-xs text-red-200">
+        <div className="absolute inset-x-0 top-0 z-10 border-b border-danger/30 bg-danger/10 px-3 py-2 text-center text-xs text-danger">
           {error}
+        </div>
+      ) : null}
+      {diskChanged && tab.dirty ? (
+        <div className="absolute inset-x-0 top-0 z-10 border-b border-warning/30 bg-warning/10 px-3 py-2 text-center text-xs text-warning">
+          File changed on disk — your unsaved edits were kept
         </div>
       ) : null}
       <div className="absolute right-3 top-8 z-20 flex items-center gap-2">
@@ -270,7 +331,7 @@ export function Editor({ tab, onOpenPreview }: { tab: IdeTab; onOpenPreview?: ()
         {previewButton}
       </div>
       {tab.dirty ? (
-        <div className="absolute left-3 top-8 z-20 text-[11px] text-amber-300" title="Unsaved changes">
+        <div className="absolute left-3 top-8 z-20 text-[11px] text-warning" title="Unsaved changes">
           ●
         </div>
       ) : null}

@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { flushSync } from "react-dom";
 import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
-import { IdeContext, useIdeContext } from "@/lib/ide-context";
+import { IdeContext, useIdeContext, type AttachToChatFn } from "@/lib/ide-context";
 import { useIsMobile } from "@/lib/use-media-query";
 import { ChatInner } from "@/components/chat";
 import type {
@@ -18,6 +19,7 @@ import {
   Editor,
   TerminalPanel,
   Preview,
+  Screen,
   PANELS,
 } from "./panel-registry";
 import { ActivityBar } from "./activity-bar";
@@ -38,13 +40,31 @@ import {
   BoltIcon,
 } from "@/components/icons";
 
-const MOVABLE: MovablePanelId[] = ["chat", "terminal", "git", "preview"];
+const MOVABLE: MovablePanelId[] = ["chat", "terminal", "git", "preview", "screen"];
 const LABELS: Record<MovablePanelId, string> = {
   chat: "AI Chat",
   terminal: "Terminal",
   git: "Source Control",
   preview: "Preview",
+  screen: "Screen",
 };
+
+const PANEL_MIME = "application/x-catalyst-panel";
+
+/** Stamp drag payload and arm the drop overlay before the next dragover. */
+function beginNativePanelDrag(event: DragEvent, panel: MovablePanelId) {
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", panel);
+  try {
+    event.dataTransfer.setData(PANEL_MIME, panel);
+  } catch {
+    // Some WebKit builds only accept standard text payloads.
+  }
+}
+
+function readPanelDragPayload(event: DragEvent): string {
+  return event.dataTransfer.getData(PANEL_MIME) || event.dataTransfer.getData("text/plain");
+}
 
 type MobileView = "files" | "editor" | "chat" | "git" | "terminal" | "preview";
 
@@ -61,6 +81,32 @@ export function IdeShell() {
   const [paletteFiles, setPaletteFiles] = useState<FileEntry[]>([]);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [focusMode, setFocusMode] = useState(false);
+
+  // flushSync so DockDropOverlay is pointer-interactive before the browser
+  // fires the next dragover — otherwise Ghostty/iframes cancel the gesture.
+  const beginPanelDrag = useCallback((panel: MovablePanelId) => {
+    document.body.classList.add("catalyst-panel-dragging");
+    flushSync(() => setDragging(panel));
+  }, []);
+  const endPanelDrag = useCallback(() => {
+    document.body.classList.remove("catalyst-panel-dragging");
+    setDragging(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      document.body.classList.remove("catalyst-panel-dragging");
+    };
+  }, []);
+
+  // Safety net: if the browser cancels DnD without dragend on the tab, clear
+  // sticky overlay state when the document-level drag ends.
+  useEffect(() => {
+    if (!dragging) return;
+    const onDocDragEnd = () => endPanelDrag();
+    document.addEventListener("dragend", onDocDragEnd);
+    return () => document.removeEventListener("dragend", onDocDragEnd);
+  }, [dragging, endPanelDrag]);
   const openSettings = useCallback(() => {
     setProjectSwitcherOpen(false);
     setSettingsOpen(true);
@@ -71,9 +117,16 @@ export function IdeShell() {
     setProjectSwitcherOpen((open) => !open);
     void agent.listProjects();
   }, [agent]);
+  const attachToChatRef = useRef<AttachToChatFn>(() => {});
+  const attachToChat = useCallback<AttachToChatFn>((payload) => {
+    attachToChatRef.current(payload);
+  }, []);
+  const registerAttachToChat = useCallback((fn: AttachToChatFn | null) => {
+    attachToChatRef.current = fn ?? (() => {});
+  }, []);
   const ctx = useMemo(
-    () => ({ workspace, ide, openSettings }),
-    [workspace, ide, openSettings],
+    () => ({ workspace, ide, openSettings, attachToChat, registerAttachToChat }),
+    [workspace, ide, openSettings, attachToChat, registerAttachToChat],
   );
 
   useEffect(() => {
@@ -115,7 +168,7 @@ export function IdeShell() {
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const panels: Array<[MovablePanelId | "explorer", string]> = [
       ["explorer", "Explorer"], ["chat", "AI Chat"], ["terminal", "Terminal"],
-      ["git", "Source Control"], ["preview", "Preview"],
+      ["git", "Source Control"], ["preview", "Preview"], ["screen", "Screen"],
     ];
     return [
       { id: "command:new-chat", label: "New chat", detail: "Start a fresh conversation", group: "Commands", keywords: "session", run: () => void agent.newSession() },
@@ -156,7 +209,7 @@ export function IdeShell() {
       ? payload as MovablePanelId
       : dragging;
     if (panel) ide.movePanel(panel, position);
-    setDragging(null);
+    endPanelDrag();
   };
 
   const selectMobileView = (view: MobileView) => {
@@ -205,8 +258,8 @@ export function IdeShell() {
               <PrimarySidebar
                 workspace={workspace}
                 agent={agent}
-                onDragStart={setDragging}
-                onDragEnd={() => setDragging(null)}
+                onDragStart={beginPanelDrag}
+                onDragEnd={endPanelDrag}
               />
               <ResizeHandle
                 orientation="x"
@@ -222,8 +275,8 @@ export function IdeShell() {
             <div className="flex min-h-0 flex-1">
               <main className="flex min-w-0 flex-1 flex-col">
                 <TabStrip
-                  onDragStart={setDragging}
-                  onDragEnd={() => setDragging(null)}
+                  onDragStart={beginPanelDrag}
+                  onDragEnd={endPanelDrag}
                 />
                 <EditorBreadcrumbs />
                 <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
@@ -234,7 +287,11 @@ export function IdeShell() {
                       agent={agent}
                     />
                   ) : (
-                    <MainContent workspace={workspace} />
+                    <MainContent
+                      workspace={workspace}
+                      refreshToken={agent.state.fileChangeSeq}
+                      changedPaths={agent.state.recentFileChanges.map((c) => c.path)}
+                    />
                   )}
                 </div>
               </main>
@@ -245,7 +302,7 @@ export function IdeShell() {
                   invert
                   size={ide.state.copilotWidth}
                   onResize={ide.setCopilotWidth}
-                  min={280}
+                  min={320}
                   max={900}
                 />
               )}
@@ -253,8 +310,8 @@ export function IdeShell() {
                 position="right"
                 workspace={workspace}
                 agent={agent}
-                onDragStart={setDragging}
-                onDragEnd={() => setDragging(null)}
+                onDragStart={beginPanelDrag}
+                onDragEnd={endPanelDrag}
                 visuallyHidden={focusMode}
               />
             </div>
@@ -273,8 +330,8 @@ export function IdeShell() {
               position="bottom"
               workspace={workspace}
               agent={agent}
-              onDragStart={setDragging}
-              onDragEnd={() => setDragging(null)}
+              onDragStart={beginPanelDrag}
+              onDragEnd={endPanelDrag}
               visuallyHidden={focusMode}
             />
 
@@ -288,7 +345,9 @@ export function IdeShell() {
             />}
           </div>
 
-            {dragging && <DockDropOverlay panel={dragging} onDrop={drop} />}
+            {/* Always mounted so enabling it is only a class flip (plus flushSync
+                on dragstart). Conditional mount races dragover against React paint. */}
+            <DockDropOverlay panel={dragging} active={dragging !== null} onDrop={drop} />
             {focusMode && (
               <button type="button" onClick={() => setFocusMode(false)} className="absolute bottom-3 left-3 z-40 rounded-md border border-ink-700 bg-ink-900/90 px-2.5 py-1.5 text-[11px] text-ink-400 shadow-lg hover:text-ink-100" title="Exit focus mode (Esc)">
                 Exit focus mode
@@ -394,7 +453,12 @@ function MobileShell({
         <div className="relative min-h-0 flex-1 overflow-hidden bg-ink-950">
           {mobileView === "files" && <FileTree refreshToken={agent.state.fileChangeSeq} />}
           {mobileView === "editor" && (
-            <MainContent workspace={workspace} onOpenPreview={() => onSelectView("preview")} />
+            <MainContent
+              workspace={workspace}
+              onOpenPreview={() => onSelectView("preview")}
+              refreshToken={agent.state.fileChangeSeq}
+              changedPaths={agent.state.recentFileChanges.map((c) => c.path)}
+            />
           )}
           {mobileView === "chat" && <ChatInner agent={agent} docked />}
           {mobileView === "git" && <GitPanel />}
@@ -424,6 +488,9 @@ function MobileShell({
         workspace={workspace}
         git={ide.state.gitStatus}
         compact
+        onGit={() => onSelectView("git")}
+        onWorkspace={onOpenProjects}
+        onConnection={agent.reconnect}
       />
       <MobileBottomNav active={mobileView} onSelect={onSelectView} />
     </div>
@@ -474,6 +541,11 @@ function MobileBottomNav({
   );
 }
 
+function confirmCloseDirtyTab(tab: { id: string; label: string; dirty?: boolean }, closeTab: (id: string) => void) {
+  if (tab.dirty && !window.confirm(`Discard unsaved changes to ${tab.label}?`)) return;
+  closeTab(tab.id);
+}
+
 function MobileTabStrip({
   showPreviewTab,
   activeView,
@@ -489,46 +561,55 @@ function MobileTabStrip({
   const { openTabs, activeTabId } = ide.state;
 
   return (
-    <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800 bg-ink-925">
+    <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-ink-800 bg-ink-925" role="tablist">
       {openTabs.length === 0 && activeView === "editor" && (
         <span className="flex items-center px-3 text-xs text-ink-600">No open editors</span>
       )}
       {openTabs.map((tab) => {
         const active = activeView === "editor" && tab.id === activeTabId;
         return (
-          <button
+          <div
             key={tab.id}
-            type="button"
+            role="tab"
+            tabIndex={0}
+            aria-selected={active}
             onClick={() => {
               ide.setActiveTab(tab.id);
               onSelectEditor();
             }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                ide.setActiveTab(tab.id);
+                onSelectEditor();
+              }
+            }}
             title={tab.target}
-            className={`group flex items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${active ? "bg-ink-950 text-ink-100" : "text-ink-400"}`}
+            className={`group flex cursor-pointer items-center gap-1.5 border-r border-ink-800 px-3 text-xs ${active ? "bg-ink-950 text-ink-100" : "text-ink-400"}`}
           >
             <FileIcon width={13} height={13} className="shrink-0 text-ink-500" />
             <span className="max-w-[10rem] truncate">{tab.label}</span>
-            {tab.dirty && <span className="text-amber-300">●</span>}
-            <span
-              role="button"
-              tabIndex={0}
+            {tab.dirty && <span className="text-warning">●</span>}
+            <button
+              type="button"
               onClick={(event) => {
+                event.preventDefault();
                 event.stopPropagation();
-                ide.closeTab(tab.id);
+                confirmCloseDirtyTab(tab, ide.closeTab);
               }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
                   event.stopPropagation();
-                  ide.closeTab(tab.id);
+                  confirmCloseDirtyTab(tab, ide.closeTab);
                 }
               }}
-              className="ml-1 text-ink-500 opacity-100 hover:text-ink-100"
+              className="ml-1 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
               aria-label={`close ${tab.label}`}
             >
               <XIcon width={12} height={12} />
-            </span>
-          </button>
+            </button>
+          </div>
         );
       })}
       {showPreviewTab && (
@@ -589,40 +670,15 @@ function PrimarySidebar({
           Explorer
         </button>
         {panels.map((panel) => (
-          <button
+          <DockPanelTab
             key={panel}
-            type="button"
-            draggable
-            onDragStart={(event) => {
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData("text/plain", panel);
-              try {
-                event.dataTransfer.setData("application/x-catalyst-panel", panel);
-              } catch {
-                // Some WebKit builds only accept standard text payloads.
-              }
-              onDragStart(panel);
-            }}
+            panel={panel}
+            active={active === panel}
+            onSelect={() => ide.selectDockPanel("left", panel)}
+            onClose={() => ide.hideDockPanel(panel)}
+            onDragStart={onDragStart}
             onDragEnd={onDragEnd}
-            onClick={() => ide.selectDockPanel("left", panel)}
-            className={`${panelTabClass(active === panel)} px-2`}
-            title={`Drag ${LABELS[panel]} to another dock`}
-          >
-            <span className="cursor-grab select-none text-ink-600">⠿</span>
-            <span className="truncate">{LABELS[panel]}</span>
-            <span
-              role="button"
-              tabIndex={0}
-              onClick={(event) => { event.stopPropagation(); ide.hideDockPanel(panel); }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") ide.hideDockPanel(panel);
-              }}
-              className="rounded p-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
-              aria-label={`Close ${LABELS[panel]}`}
-            >
-              <XIcon width={12} height={12} />
-            </span>
-          </button>
+          />
         ))}
       </PanelHeader>
       <div className="min-h-0 flex-1 overflow-hidden">
@@ -688,49 +744,92 @@ function DockAt({
     >
       <PanelHeader>
         {panels.map((panel) => (
-          <button
+          <DockPanelTab
             key={panel}
-            type="button"
-            draggable
-            onDragStart={(event) => {
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData("text/plain", panel);
-              try {
-                event.dataTransfer.setData("application/x-catalyst-panel", panel);
-              } catch {
-                // text/plain remains available as the cross-browser fallback.
-              }
-              onDragStart(panel);
-            }}
+            panel={panel}
+            active={panel === active}
+            onSelect={() => ide.selectDockPanel(position, panel)}
+            onClose={() => ide.hideDockPanel(panel)}
+            onDragStart={onDragStart}
             onDragEnd={onDragEnd}
-            onClick={() => ide.selectDockPanel(position, panel)}
-            title={`Drag ${LABELS[panel]} to another dock`}
-            className={`${panelTabClass(panel === active)} gap-2`}
-          >
-            <span className="cursor-grab select-none text-ink-600 group-active:cursor-grabbing">⠿</span>
-            <span className="truncate">{LABELS[panel]}</span>
-            <span
-              role="button"
-              tabIndex={0}
-              onClick={(event) => {
-                event.stopPropagation();
-                ide.hideDockPanel(panel);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") ide.hideDockPanel(panel);
-              }}
-              className="ml-auto rounded p-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
-              aria-label={`Close ${LABELS[panel]}`}
-            >
-              <XIcon width={12} height={12} />
-            </span>
-          </button>
+          />
         ))}
       </PanelHeader>
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
         <PanelContent panel={active} workspace={workspace} agent={agent} />
       </div>
     </section>
+  );
+}
+
+function DockPanelTab({
+  panel,
+  active,
+  onSelect,
+  onClose,
+  onDragStart,
+  onDragEnd,
+}: {
+  panel: MovablePanelId;
+  active: boolean;
+  onSelect: () => void;
+  onClose: () => void;
+  onDragStart: (panel: MovablePanelId) => void;
+  onDragEnd: () => void;
+}) {
+  return (
+    <div
+      role="tab"
+      tabIndex={0}
+      aria-selected={active}
+      draggable
+      onDragStart={(event) => {
+        beginNativePanelDrag(event, panel);
+        onDragStart(panel);
+      }}
+      onDragEnd={onDragEnd}
+      onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
+      title={`Drag ${LABELS[panel]} to another dock`}
+      className={`${panelTabClass(active)} cursor-pointer`}
+    >
+      <span className="cursor-grab select-none text-ink-600 active:cursor-grabbing" aria-hidden>
+        ⠿
+      </span>
+      <span className="truncate">{LABELS[panel]}</span>
+      <button
+        type="button"
+        draggable={false}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+        }}
+        onMouseDown={(event) => {
+          // Prevent the parent tab's HTML5 drag from starting on close clicks.
+          event.stopPropagation();
+        }}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            event.stopPropagation();
+            onClose();
+          }
+        }}
+        className="ml-auto rounded p-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+        aria-label={`Close ${LABELS[panel]}`}
+      >
+        <XIcon width={12} height={12} />
+      </button>
+    </div>
   );
 }
 
@@ -746,6 +845,7 @@ function PanelContent({
   const { ide } = useIdeContext();
   if (panel === "chat") return <ChatInner agent={agent} docked />;
   if (panel === "git") return <GitPanel />;
+  if (panel === "screen") return <Screen />;
   if (panel === "preview") {
     return <Preview workspace={workspace} preview={ide.state.preview} onPreviewChange={ide.setPreview} />;
   }
@@ -764,12 +864,14 @@ function PanelContent({
 
 function DockDropOverlay({
   panel,
+  active,
   onDrop,
 }: {
-  panel: MovablePanelId;
+  panel: MovablePanelId | null;
+  active: boolean;
   onDrop: (position: DockPosition, payload?: string) => void;
 }) {
-  // The full-screen layer MUST capture pointer events. Gaps with
+  // The full-screen layer MUST capture pointer events while active. Gaps with
   // pointer-events-none let events fall through to Ghostty's WebGL canvas
   // (and iframes), which cancels HTML5 drag mid-gesture — so the terminal
   // looked "undraggable" while chat/git still worked.
@@ -777,31 +879,36 @@ function DockDropOverlay({
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
   };
+  const label = panel ? LABELS[panel] : "panel";
   const target = (position: DockPosition, classes: string) => (
     <div
       onDragOver={allowDrag}
       onDrop={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        const payload =
-          event.dataTransfer.getData("application/x-catalyst-panel") ||
-          event.dataTransfer.getData("text/plain");
-        onDrop(position, payload);
+        onDrop(position, readPanelDragPayload(event));
       }}
       className={`absolute flex items-center justify-center rounded-xl border-2 border-dashed border-accent/70 bg-accent/15 text-xs font-semibold uppercase tracking-wider text-accent-soft shadow-2xl backdrop-blur-sm ${classes}`}
     >
-      Dock {LABELS[panel]} {position === "main" ? "in editor area" : position}
+      Dock {label} {position === "main" ? "in editor area" : position}
     </div>
   );
   return (
     <div
-      className="absolute inset-0 z-50 bg-black/20"
-      onDragOver={allowDrag}
-      onDrop={(event) => {
-        // Dropping on the dimmed backdrop (not a dock target) is a no-op;
-        // preventDefault so the browser doesn't navigate on text/plain.
-        event.preventDefault();
-      }}
+      aria-hidden={!active}
+      className={`absolute inset-0 z-50 bg-black/20 transition-opacity ${
+        active ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+      }`}
+      onDragOver={active ? allowDrag : undefined}
+      onDrop={
+        active
+          ? (event) => {
+              // Dropping on the dimmed backdrop (not a dock target) is a no-op;
+              // preventDefault so the browser doesn't navigate on text/plain.
+              event.preventDefault();
+            }
+          : undefined
+      }
     >
       {target("left", "bottom-24 left-16 top-16 w-[18%]")}
       {target("right", "bottom-24 right-4 top-16 w-[18%]")}
@@ -830,66 +937,99 @@ function TabStrip({
       {openTabs.map((tab) => {
         const active = activePanel === null && tab.id === activeTabId;
         return (
-          <button
+          <div
             key={tab.id}
-            type="button"
+            role="tab"
+            tabIndex={0}
+            aria-selected={active}
             onClick={() => ide.setActiveTab(tab.id)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                ide.setActiveTab(tab.id);
+              }
+            }}
             title={tab.target}
-            className={panelTabClass(active)}
+            className={`${panelTabClass(active)} cursor-pointer`}
           >
             <FileIcon width={13} height={13} className="shrink-0 text-ink-500" />
             <span className="max-w-[12rem] truncate">{tab.label}</span>
-            {tab.dirty && <span className="text-amber-300">●</span>}
-            <span
-              role="button"
-              tabIndex={0}
-              onClick={(event) => { event.stopPropagation(); ide.closeTab(tab.id); }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); ide.closeTab(tab.id); }
+            {tab.dirty && <span className="text-warning">●</span>}
+            <button
+              type="button"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                confirmCloseDirtyTab(tab, ide.closeTab);
               }}
-              className="ml-1 text-ink-500 opacity-0 hover:text-ink-100 group-hover:opacity-100"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  confirmCloseDirtyTab(tab, ide.closeTab);
+                }
+              }}
+              className="ml-1 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
               aria-label={`close ${tab.label}`}
             >
               <XIcon width={12} height={12} />
-            </span>
-          </button>
+            </button>
+          </div>
         );
       })}
       {panelTabs.map((panel) => (
-        <button
+        <div
           key={`panel:${panel}`}
-          type="button"
+          role="tab"
+          tabIndex={0}
+          aria-selected={activePanel === panel}
           draggable
           onDragStart={(event) => {
-            event.dataTransfer.effectAllowed = "move";
-            event.dataTransfer.setData("text/plain", panel);
-            try {
-              event.dataTransfer.setData("application/x-catalyst-panel", panel);
-            } catch {
-              // text/plain remains available as the cross-browser fallback.
-            }
+            beginNativePanelDrag(event, panel);
             onDragStart(panel);
           }}
           onDragEnd={onDragEnd}
           onClick={() => ide.selectDockPanel("main", panel)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              ide.selectDockPanel("main", panel);
+            }
+          }}
           title={`Drag ${LABELS[panel]} to another dock`}
-          className={panelTabClass(activePanel === panel)}
+          className={`${panelTabClass(activePanel === panel)} cursor-pointer`}
         >
-          <span className="cursor-grab select-none text-ink-600">⠿</span>
+          <span className="cursor-grab select-none text-ink-600 active:cursor-grabbing" aria-hidden>
+            ⠿
+          </span>
           <span className="truncate">{LABELS[panel]}</span>
-          <span
-            role="button"
-            tabIndex={0}
-            onClick={(event) => { event.stopPropagation(); ide.hideDockPanel(panel); }}
+          <button
+            type="button"
+            draggable={false}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              ide.hideDockPanel(panel);
+            }}
+            onMouseDown={(event) => {
+              event.stopPropagation();
+            }}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+            }}
             onKeyDown={(event) => {
-              if (event.key === "Enter" || event.key === " ") ide.hideDockPanel(panel);
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                ide.hideDockPanel(panel);
+              }
             }}
             className="ml-1 rounded p-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
             aria-label={`Close ${LABELS[panel]}`}
           >
             <XIcon width={12} height={12} />
-          </span>
-        </button>
+          </button>
+        </div>
       ))}
     </PanelHeader>
   );
@@ -898,9 +1038,13 @@ function TabStrip({
 function MainContent({
   workspace,
   onOpenPreview,
+  refreshToken,
+  changedPaths,
 }: {
   workspace: string;
   onOpenPreview?: () => void;
+  refreshToken?: number;
+  changedPaths?: string[];
 }) {
   const { ide } = useIdeContext();
   const tab = ide.state.openTabs.find((item) => item.id === ide.state.activeTabId) ?? null;
@@ -911,7 +1055,17 @@ function MainContent({
       </div>
     );
   }
-  if (tab.kind === "file") return <Editor tab={tab} onOpenPreview={onOpenPreview} />;
+  if (tab.kind === "file") {
+    return (
+      <Editor
+        key={tab.id}
+        tab={tab}
+        onOpenPreview={onOpenPreview}
+        refreshToken={refreshToken}
+        changedPaths={changedPaths}
+      />
+    );
+  }
   if (tab.kind === "preview") return <Preview target={tab.target} workspace={workspace} />;
   return null;
 }
@@ -931,7 +1085,7 @@ function EditorBreadcrumbs() {
           <span className={index === parts.length - 1 ? "font-medium text-ink-300" : ""}>{part}</span>
         </span>
       ))}
-      {tab.dirty ? <span className="ml-1 text-amber-300" title="Unsaved changes">●</span> : null}
+      {tab.dirty ? <span className="ml-1 text-warning" title="Unsaved changes">●</span> : null}
     </div>
   );
 }
@@ -990,10 +1144,15 @@ function StatusBar({
           <button type="button" onClick={onGit} disabled={!onGit} title="Open Source Control" className="flex min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 hover:bg-ink-800 disabled:pointer-events-none">
             <GitBranchIcon width={12} height={12} className="shrink-0 text-accent" />
             <span className="truncate">{branch}</span>
+            {(git?.ahead ?? 0) > 0 && <span className="text-success">↑{git?.ahead}</span>}
+            {(git?.behind ?? 0) > 0 && <span className="text-warning">↓{git?.behind}</span>}
             {!compact && (
               <span className="text-ink-500">
                 · {changes} {changes === 1 ? "change" : "changes"}
               </span>
+            )}
+            {(git?.operations?.length ?? 0) > 0 && (
+              <span className="text-danger">· {git?.operations?.[0]}</span>
             )}
           </button>
         ) : (
@@ -1006,7 +1165,7 @@ function StatusBar({
             {versionLabel}
           </span>
         )}
-        <button type="button" onClick={onConnection} disabled={!onConnection} title={connected ? "Reconnect" : "Try reconnecting"} className={`${connected ? "text-emerald-400" : "text-amber-300"} rounded px-1 hover:bg-ink-800 disabled:pointer-events-none`}>
+        <button type="button" onClick={onConnection} disabled={!onConnection} title={connected ? "Reconnect" : "Try reconnecting"} className={`${connected ? "text-success" : "text-warning"} rounded px-1 hover:bg-ink-800 disabled:pointer-events-none`}>
           {compact ? (connected ? "●" : "○") : connected ? "● connected" : "● reconnecting…"}
         </button>
         <button type="button" onClick={onWorkspace} disabled={!onWorkspace} className={`truncate rounded px-1 text-ink-400 hover:bg-ink-800 hover:text-ink-200 disabled:pointer-events-none ${compact ? "max-w-[6rem]" : "max-w-[20rem]"}`} title={onWorkspace ? `Switch project · ${workspace}` : workspace}>

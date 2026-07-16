@@ -107,6 +107,19 @@ export function Sidebar(props: Props) {
     }
   }, [renaming]);
 
+  // Esc closes the sidebar when open (unless renaming — that Esc cancels rename).
+  useEffect(() => {
+    if (!props.open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (renaming) return;
+      if (openMenu) return; // session menu owns this Esc
+      props.onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [props.open, renaming, openMenu, props.onClose]);
+
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return props.sessions;

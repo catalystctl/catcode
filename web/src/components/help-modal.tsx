@@ -6,6 +6,7 @@
 
 import { COMMANDS } from "@/lib/commands";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { XIcon } from "./icons";
 
@@ -25,6 +26,7 @@ const KEYBINDS: Array<[string, string]> = [
 export function HelpModal({ onClose }: { onClose: () => void }) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
   return (
     <div className="modal-backdrop">
       <div
@@ -32,13 +34,14 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
         className="modal-sheet max-w-lg"
         role="dialog"
         aria-modal="true"
-        aria-label="Help"
+        aria-labelledby="help-modal-title"
       >
         <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
-          <h2 className="text-[15px] font-semibold text-ink-100">Help & Keybindings</h2>
+          <h2 id="help-modal-title" className="text-[15px] font-semibold text-ink-100">Help & Keybindings</h2>
           <button
             onClick={onClose}
             className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            aria-label="Close"
           >
             <XIcon width={16} height={16} />
           </button>

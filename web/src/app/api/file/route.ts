@@ -18,23 +18,19 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { getSession } from "@/lib/auth";
-import { resolveWorkspace, confinePath } from "@/server/workspace";
+import {
+  authorizedWorkspace,
+  confinePath,
+  confinePathReal,
+  resolveAuthorizedWorkspace,
+  resolveWorkspace,
+} from "@/server/workspace";
 import { detectLanguage } from "@/lib/lang";
-import { getBridge } from "@/server/core-bridge";
-import { loadProjects } from "@/lib/projects";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5 MiB
-
-function authorizedWorkspace(candidate: string): string {
-  const requested = resolve(candidate);
-  const allowed = [getBridge().getDefaultWorkspace(), ...loadProjects().map((project) => project.path)]
-    .map((workspace) => resolve(workspace));
-  if (!allowed.includes(requested)) throw new Error("unauthorized workspace");
-  return requested;
-}
 
 function mutationPath(workspace: string, rel: string, existing: boolean): string {
   const abs = confinePath(workspace, rel);
@@ -51,12 +47,17 @@ export async function GET(req: Request) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
 
   const url = new URL(req.url);
-  const workspace = resolveWorkspace(req);
+  let workspace: string;
+  try {
+    workspace = resolveAuthorizedWorkspace(req);
+  } catch {
+    return Response.json({ error: "unauthorized workspace" }, { status: 403 });
+  }
   const rel = url.searchParams.get("path") ?? "";
 
   let abs: string;
   try {
-    abs = confinePath(workspace, rel);
+    abs = confinePathReal(workspace, rel);
   } catch {
     return Response.json({ error: "path outside workspace" }, { status: 400 });
   }
@@ -118,13 +119,17 @@ export async function PUT(req: Request) {
 
   let abs: string;
   try {
-    abs = mutationPath(workspace, rel, true);
+    // Resolve + confine first. Only mkdir after the parent is verified under the
+    // real workspace — never create directories before the realpath check.
+    const confined = confinePath(workspace, rel);
+    const existing = existsSync(confined);
+    abs = mutationPath(workspace, rel, existing);
+    if (!existing) mkdirSync(dirname(abs), { recursive: true });
   } catch {
     return Response.json({ error: "file not found or path outside workspace" }, { status: 400 });
   }
 
   try {
-    mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, content, "utf8");
   } catch (e) {
     return Response.json({ error: `write failed: ${(e as Error).message}` }, { status: 500 });
@@ -147,6 +152,8 @@ export async function POST(req: Request) {
   try { body = await req.json(); } catch { return Response.json({ error: "invalid body" }, { status: 400 }); }
   if (typeof body.path !== "string" || !body.path.trim())
     return Response.json({ error: "invalid body" }, { status: 400 });
+  if (body.kind !== "file" && body.kind !== "dir")
+    return Response.json({ error: "kind must be \"file\" or \"dir\"" }, { status: 400 });
   let workspace: string;
   try {
     workspace = authorizedWorkspace(typeof body.workspace === "string" && body.workspace ? body.workspace : resolveWorkspace(req));

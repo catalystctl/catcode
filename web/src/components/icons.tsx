@@ -39,6 +39,33 @@ export const ChevronRight = (p: P) => (
   </svg>
 );
 
+export const ChevronLeft = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M15 18l-6-6 6-6" />
+  </svg>
+);
+
+export const HomeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M3 10.5L12 3l9 7.5" />
+    <path d="M5 10v10h5v-6h4v6h5V10" />
+  </svg>
+);
+
+export const UserIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M20 21a8 8 0 0 0-16 0" />
+    <circle cx="12" cy="8" r="4" />
+  </svg>
+);
+
+export const EyeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
 export const CheckIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M20 6L9 17l-5-5" />
@@ -131,10 +158,20 @@ export const GlobeIcon = (p: P) => (
   </svg>
 );
 
+export const MonitorIcon = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="2" y="3" width="20" height="14" rx="2" />
+    <path d="M8 21h8M12 17v4" />
+  </svg>
+);
+
 export const CompactIcon = (p: P) => (
   <svg {...base(p)}>
-    <path d="M21 12a9 9 0 1 1-3-6.7" />
-    <path d="M21 3v5h-5" />
+    {/* Compress / minimize — arrows pointing toward center */}
+    <path d="M4 14h6v6" />
+    <path d="M20 10h-6V4" />
+    <path d="M14 10l7-7" />
+    <path d="M3 21l7-7" />
   </svg>
 );
 

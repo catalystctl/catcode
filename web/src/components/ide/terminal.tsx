@@ -237,11 +237,19 @@ export function TerminalPanel({
           <span className="px-2 py-1 text-xs text-ink-400">No terminals</span>
         )}
         {sessions.map((s) => (
-          <button
+          <div
             key={s.id}
-            type="button"
+            role="tab"
+            tabIndex={0}
+            aria-selected={s.id === activeId}
             onClick={() => onSelect(s.id)}
-            className={`group flex items-center gap-1 rounded-t px-2 py-1 text-xs ${
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelect(s.id);
+              }
+            }}
+            className={`group flex cursor-pointer items-center gap-1 rounded-t px-2 py-1 text-xs ${
               s.id === activeId
                 ? "bg-ink-950 text-ink-100"
                 : "text-ink-400 hover:bg-ink-800/50 hover:text-ink-200"
@@ -254,20 +262,28 @@ export function TerminalPanel({
                 [{s.exitCode}]
               </span>
             )}
-            <span
-              role="button"
-              tabIndex={0}
+            <button
+              type="button"
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 terminateTerminalSession(s.id);
                 onClose(s.id);
               }}
-              className="ml-1 text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  terminateTerminalSession(s.id);
+                  onClose(s.id);
+                }
+              }}
+              className="ml-1 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
               aria-label={`close ${s.title}`}
             >
               ×
-            </span>
-          </button>
+            </button>
+          </div>
         ))}
         <button
           type="button"
