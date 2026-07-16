@@ -956,7 +956,12 @@ pub fn execute(
                 .to_string();
             let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
             let context = parse_context(&args, &agent);
-            let run_id = next_run_id();
+            let run_id = args
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(next_run_id);
             let use_worktree = args
                 .get("worktree")
                 .and_then(|v| v.as_bool())
@@ -1058,6 +1063,11 @@ fn parse_context(args: &Value, agent: &AgentConfig) -> ContextKind {
 }
 
 fn next_run_id() -> String {
+    allocate_run_id()
+}
+
+/// Allocate a fresh subagent run id (also used by goal deploy so step cards can link).
+pub fn allocate_run_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(1);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -1186,7 +1196,7 @@ async fn run_single(
     if let Some(r) = runs.get_mut(run_id) {
         r.state = final_state.into();
         r.ended_at = Some(now_ms());
-        r.summary = Some(result.output.chars().take(200).collect());
+        r.summary = Some(nonempty_run_summary(&result.output));
         done_ended = r.ended_at.unwrap_or(started);
         done_summary = r.summary.clone();
     }
@@ -1593,7 +1603,7 @@ async fn run_agent_inner(
 
         let Some(calls) = assistant.tool_calls().map(|tc| tc.to_vec()) else {
             // done — finalize output
-            let text = assistant.content_text().unwrap_or("").to_string();
+            let text = finalize_subagent_text(assistant.content_text(), &sub);
             // optional output file
             if let Some(out_path) = &agent.output {
                 let p = workspace.join(out_path);
@@ -1606,7 +1616,7 @@ async fn run_agent_inner(
             return Outcome::ok(text);
         };
         if calls.is_empty() {
-            let text = assistant.content_text().unwrap_or("").to_string();
+            let text = finalize_subagent_text(assistant.content_text(), &sub);
             emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
             return Outcome::ok(text);
         }
@@ -1713,18 +1723,24 @@ async fn run_agent_inner(
                 run_start.elapsed().as_millis() as u64,
                 outcome.ok,
             );
-            emit_subagent_tool_result(
-                run_id,
-                &id,
-                &name,
-                &truncate(&outcome.output, 8000),
-                outcome.ok,
-            );
+            // finish sentinel
+            let finish = name == "finish" && outcome.ok && outcome.output == crate::tools::FINISH_SENTINEL;
+            // Map the internal sentinel to a human-readable result for the UI /
+            // conversation; the loop still exits on `finish` below.
+            let emit_output = if finish {
+                crate::tools::FINISH_MESSAGE.to_string()
+            } else {
+                truncate(&outcome.output, 8000)
+            };
+            emit_subagent_tool_result(run_id, &id, &name, &emit_output, outcome.ok);
             // Mirror main-loop cache + ingress so subagent contexts stay lean
             // (previously they pushed full tool output and only soft-compacted
             // at 90%). Key by the original call args (same as main loop).
-            let finish = name == "finish" && outcome.ok && outcome.output == "__finish__";
-            let mut model_output = outcome.output;
+            let mut model_output = if finish {
+                crate::tools::FINISH_MESSAGE.to_string()
+            } else {
+                outcome.output
+            };
             if outcome.ok && !finish {
                 // Invalidate the shared cache on tree-mutating tools, matching the
                 // main loop's `invalidates_cache`. bash is included because a
@@ -1756,7 +1772,7 @@ async fn run_agent_inner(
 
             // finish sentinel
             if finish {
-                let text = assistant.content_text().unwrap_or("").to_string();
+                let text = finalize_subagent_text(assistant.content_text(), &sub);
                 if let Some(out_path) = &agent.output {
                     let p = workspace.join(out_path);
                     if let Some(parent) = p.parent() {
@@ -2397,6 +2413,37 @@ fn emit_subagent_tool_result(run_id: &str, call_id: &str, name: &str, result: &s
             .with("result", json!(result))
             .with("ok", json!(ok)),
     );
+}
+
+/// Prefer a non-empty final summary for goal deploy / UI cards.
+fn nonempty_run_summary(output: &str) -> String {
+    let t = output.trim();
+    if t.is_empty() {
+        "(step finished with no written summary)".to_string()
+    } else {
+        t.chars().take(800).collect()
+    }
+}
+
+/// When finish (or final assistant) has empty prose, fall back to the last
+/// non-empty assistant message in the subagent history; never return "".
+fn finalize_subagent_text(current: Option<&str>, history: &[crate::message::Message]) -> String {
+    let cur = current.unwrap_or("").trim();
+    if !cur.is_empty() {
+        return cur.to_string();
+    }
+    for m in history.iter().rev() {
+        if m.role() != "assistant" {
+            continue;
+        }
+        if let Some(t) = m.content_text() {
+            let t = t.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    "(step finished with no written summary)".to_string()
 }
 
 fn emit_subagent_done(run_id: &str, state: &str, summary: Option<&str>, ended_at: u64) {
@@ -3530,5 +3577,33 @@ mod tests {
             !planner_names.contains(&"memory"),
             "planner should not have memory: {planner_names:?}"
         );
+    }
+
+    #[test]
+    fn finalize_subagent_text_falls_back_to_prior_assistant() {
+        use crate::message::Message;
+        let hist = vec![
+            Message::user("task"),
+            Message::assistant("first findings about auth.rs"),
+            Message::assistant(""), // empty finish prose
+        ];
+        let out = finalize_subagent_text(Some(""), &hist);
+        assert_eq!(out, "first findings about auth.rs");
+        let out2 = finalize_subagent_text(Some("  real summary  "), &hist);
+        assert_eq!(out2, "real summary");
+        let empty_hist: Vec<Message> = vec![Message::user("x")];
+        let stub = finalize_subagent_text(None, &empty_hist);
+        assert_eq!(stub, "(step finished with no written summary)");
+    }
+
+    #[test]
+    fn nonempty_run_summary_never_blank_and_caps_800() {
+        assert_eq!(
+            nonempty_run_summary(""),
+            "(step finished with no written summary)"
+        );
+        let long = "z".repeat(2000);
+        let s = nonempty_run_summary(&long);
+        assert_eq!(s.chars().count(), 800);
     }
 }

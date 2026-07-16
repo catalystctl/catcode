@@ -1164,20 +1164,26 @@ async fn cancel_goal_deploy(st: &State) {
 /// completion follow-up (the planning turn already called `finish`).
 async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
     cancel_goal_deploy(&st).await;
-    // Snapshot the main tree before parallel workers mutate it.
-    {
-        let cfg = st.cfg.read().await;
-        let _ = checkpoint::create(
-            &cfg.workspace,
-            cfg.session_file.as_deref(),
-            "auto-before-goal-deploy",
-            &[],
-            true,
-        );
-    }
+    // Emit before the (possibly slow) workspace snapshot so UIs leave the
+    // plan_ready dark gap immediately.
+    emit(&Event::new("info").with(
+        "message",
+        json!("Goal deploy: snapshotting workspace…"),
+    ));
     let tok = CancellationToken::new();
     *st.goal_deploy_cancel.lock().await = Some(tok.clone());
     tokio::spawn(async move {
+        // Snapshot inside the task so ApproveGoalPlan / auto-deploy return fast.
+        {
+            let cfg = st.cfg.read().await;
+            let _ = checkpoint::create(
+                &cfg.workspace,
+                cfg.session_file.as_deref(),
+                "auto-before-goal-deploy",
+                &[],
+                true,
+            );
+        }
         let need_wrapup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
         // Clear cancel slot only if we still own it. A newer spawn cancels
         // this token first, so a cancelled token means the slot was replaced.
@@ -1209,6 +1215,7 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
             drop(models);
             let mut g = st.goal.lock().await;
             if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
+                // finish_synthesis emits goal_completion_summary.
                 goal::finish_synthesis(&mut g, false);
                 goal::sync_work_state_from_prompts(&st, &g).await;
             }
@@ -1228,12 +1235,13 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
                 drop(cur);
                 let mut g = st.goal.lock().await;
                 if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
+                    // finish_synthesis emits goal_completion_summary.
                     goal::finish_synthesis(&mut g, false);
                     goal::sync_work_state_from_prompts(&st, &g).await;
                 }
                 emit(&Event::new("info").with(
                     "message",
-                    json!("Goal deploy finished (another turn is running — see goal_state for step results)"),
+                    json!("Goal deploy finished (another turn is running — see goal_completion_summary / goal_state for step results)"),
                 ));
                 return;
             }
@@ -1285,11 +1293,22 @@ async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, c
 
 /// After the post-deploy synthesizing turn ends, mark the goal Done.
 async fn maybe_finish_goal_synthesis(st: &Arc<State>, cancelled: bool) {
+    // Measure wrap-up assistant text so finish_synthesis can skip a redundant
+    // deterministic card when the model already streamed a rich summary.
+    let wrapup_chars = {
+        let conv = st.conversation.lock().await;
+        conv.iter()
+            .rev()
+            .find(|m| m.role() == "assistant")
+            .and_then(|m| m.content_text())
+            .map(|t| t.trim().chars().count())
+            .unwrap_or(0)
+    };
     let mut g = st.goal.lock().await;
     if g.phase != goal::GoalPhase::Synthesizing {
         return;
     }
-    goal::finish_synthesis(&mut g, cancelled);
+    goal::finish_synthesis_with_wrapup(&mut g, cancelled, Some(wrapup_chars));
     goal::sync_work_state_from_prompts(st, &g).await;
 }
 
@@ -3700,6 +3719,14 @@ async fn main() {
                     } else {
                         g.deploy_after_turn = false;
                         g.auto_deploy = true;
+                        // Close the approve→checkpoint dark gap: emit state +
+                        // lasting bridge before the (possibly slow) snapshot.
+                        g.touch();
+                        goal::emit_goal_state(&g);
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!("Goal plan approved — deploying (snapshotting workspace…)"),
+                        ));
                         (true, g.parent_model.clone())
                     }
                 };
@@ -6849,7 +6876,7 @@ async fn run_turn(
                     }
 
                     // finish sentinel: the model signaled completion.
-                    if name == "finish" && outcome.ok && outcome.output == "__finish__" {
+                    if name == "finish" && outcome.ok && outcome.output == tools::FINISH_SENTINEL {
                         // Auto-reflect gate: before the first `finish` exits a
                         // non-trivial turn, inject a reflection continuation (the
                         // deterministic seam SELF_LEARNING §11 deferred) instead
@@ -6879,6 +6906,29 @@ async fn run_turn(
                             // Fall through → the finish tool_result (carrying
                             // the nudge) is pushed below and the loop re-streams.
                         } else {
+                            // Emit a real tool_result so the TUI/web don't leave
+                            // the finish card empty / stuck as "[no result]".
+                            let finish_msg = tools::FINISH_MESSAGE;
+                            emit(
+                                &Event::new("tool_result")
+                                    .with("id", json!(id))
+                                    .with("ok", json!(true))
+                                    .with("output", json!(finish_msg)),
+                            );
+                            let tool_result = Message::tool(id.clone(), finish_msg);
+                            let est = estimate_message_tokens(&tool_result);
+                            messages.push(tool_result.clone());
+                            {
+                                let mut conv = st.conversation.lock().await;
+                                // Keep conversation identical to the working
+                                // buffer (clone_from, not push) so a divergent
+                                // mid-turn sync can't leave finish unpaired.
+                                conv.clone_from(&messages);
+                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                                    session::append(p, conv.last().unwrap());
+                                }
+                            }
+                            *st.estimated_tokens.lock().await += est;
                             *st.last_turn_time.lock().await = std::time::Instant::now();
                             let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
                             let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
@@ -6887,6 +6937,7 @@ async fn run_turn(
                             st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
                             st.logger.record_turn();
                             persist_stats(st).await;
+                            sync_session_file(st).await;
                             maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
                             maybe_finish_goal_synthesis(st, cancel.is_cancelled()).await;
                             emit(&Event::new("done"));

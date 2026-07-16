@@ -78,6 +78,21 @@ pub fn is_umans(base_url: &str) -> bool {
     host == "umans.ai" || host.ends_with(".umans.ai")
 }
 
+/// True only for the loopback Catalyst Cursor SDK sidecar. The dedicated path
+/// is intentional: it lets the OpenAI-compatible transport preserve streamed
+/// SDK thinking text without enabling non-standard fields for arbitrary local
+/// OpenAI servers.
+pub fn is_cursor_bridge(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let loopback = match url.host_str().unwrap_or("").to_ascii_lowercase().as_str() {
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" => true,
+        _ => false,
+    };
+    loopback && url.path().trim_end_matches('/') == "/cursor/v1"
+}
+
 /// Live account-wide concurrency usage from the Umans gateway's `/v1/usage`
 /// endpoint. `used` = the number of concurrent sessions right now (across ALL
 /// clients on this key, not just this process — the gateway tracks it), `limit`
@@ -308,6 +323,18 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
         })
         .filter(|s| !s.is_empty());
 
+    let provider_message = v
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+
+    let resets_at = v
+        .get("window")
+        .and_then(|w| w.get("resets_at"))
+        .and_then(|r| r.as_i64().or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok())));
+
     let remaining_minutes = v
         .get("window")
         .and_then(|w| w.get("remaining_minutes"))
@@ -368,7 +395,7 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
             used: req_used,
             limit: req_limit,
             unit: "requests".into(),
-            resets_at: None,
+            resets_at,
             detail: reset_detail.clone(),
         });
     }
@@ -405,7 +432,7 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
     ProviderUsage {
         available: true,
         plan,
-        message: None,
+        message: provider_message,
         windows,
     }
 }
@@ -1796,6 +1823,12 @@ async fn discover_models_openai(
                     if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
                         crate::models_dev::enrich_models(&mut listed, &dev, &provider.base_url);
                     }
+                    // Registry enrichment fills gaps (especially context/output
+                    // limits), but the provider's live catalog is authoritative
+                    // for fields it explicitly reports. Re-apply those fields
+                    // after models.dev so Cursor reasoning levels/disable flags
+                    // and vendor-published limits are not overwritten.
+                    apply_live_model_list_fields(&v, &mut listed);
                     if !listed.is_empty() {
                         write_models_cache(cache_key, &listed);
                         return listed;
@@ -2088,6 +2121,20 @@ fn parse_openai_models_list(data: &Value) -> Vec<ModelInfo> {
 /// Overlay vendor-reported fields from a `/models` list item onto curated caps.
 /// Safe no-ops when the fields are absent (vanilla OpenAI list).
 fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
+    if let Some(reasoning) = m.get("reasoning").and_then(|v| v.as_bool()) {
+        info.reasoning = reasoning;
+    }
+    if let Some(levels) = m
+        .get("reasoning_levels")
+        .or_else(|| m.get("thinking_levels"))
+        .and_then(|v| v.as_array())
+    {
+        info.thinking_levels = levels
+            .iter()
+            .filter_map(|level| level.as_str().map(str::to_string))
+            .filter(|level| !level.is_empty())
+            .collect();
+    }
     if let Some(ctx) = m
         .get("context_length")
         .or_else(|| m.get("context_window"))
@@ -2122,6 +2169,19 @@ fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
     if let Some(mods) = m.get("input_modalities").and_then(|v| v.as_array()) {
         if mods.iter().any(|x| x.as_str() == Some("image")) {
             info.vision = true;
+        }
+    }
+}
+
+fn apply_live_model_list_fields(data: &Value, models: &mut [ModelInfo]) {
+    let Some(entries) = data.get("data").and_then(|value| value.as_array()) else {
+        return;
+    };
+    for info in models {
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.get("id").and_then(|value| value.as_str()) == Some(info.id.as_str())
+        }) {
+            apply_live_model_fields(entry, info);
         }
     }
 }
@@ -3059,6 +3119,9 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Message>) -> usize {
     }
 
     // Insert synthetic tool results right after the assistant message that made each call.
+    // For `finish`, never tell the model to "re-issue" — that makes the next user
+    // turn ignore the new prompt and call finish again. Use the same completion
+    // text the live finish path emits.
     let mut inserted = 0;
     let mut i = 0;
     while i < messages.len() {
@@ -3068,22 +3131,21 @@ pub fn sanitize_orphaned_tool_calls(messages: &mut Vec<Message>) -> usize {
             i += 1;
             continue;
         }
-        let calls: Vec<String> = messages[i]
+        let calls: Vec<(String, String)> = messages[i]
             .tool_calls()
             .unwrap()
             .iter()
-            .map(|tc| tc.id.clone())
-            .filter(|id| orphaned.contains(id))
+            .filter(|tc| orphaned.contains(&tc.id))
+            .map(|tc| (tc.id.clone(), tc.function.name.clone()))
             .collect();
         let insert_at = i + 1;
-        for (k, id) in calls.iter().enumerate() {
-            messages.insert(
-                insert_at + k,
-                Message::tool(
-                    id,
-                    "[tool result was lost — this call did not complete (the turn may have been aborted or its result dropped during context compaction). Re-issue the tool call if still needed.]",
-                ),
-            );
+        for (k, (id, name)) in calls.iter().enumerate() {
+            let body = if name == "finish" {
+                crate::tools::FINISH_MESSAGE
+            } else {
+                "[tool result was lost — this call did not complete (the turn may have been aborted or its result dropped during context compaction). Re-issue the tool call if still needed.]"
+            };
+            messages.insert(insert_at + k, Message::tool(id, body));
             inserted += 1;
         }
         i = insert_at + calls.len();
@@ -3726,11 +3788,13 @@ async fn stream_turn_openai(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
-    // ponytail: reasoning_effort + reasoning_content replay are Umans-specific.
-    // Only emit them when pointed at an Umans endpoint; other OpenAI-compatible
-    // servers reject unknown fields with a 400.
+    // reasoning_effort + reasoning_content replay are supported by Umans and
+    // the loopback Cursor sidecar. Other OpenAI-compatible servers may reject
+    // these non-standard fields, so keep the capability narrowly gated.
     let base_url = &provider.base_url;
     let umans = is_umans(base_url);
+    let cursor_bridge = is_cursor_bridge(base_url);
+    let supports_reasoning_content = umans || cursor_bridge;
     let api_key = provider.api_key.as_deref().unwrap_or("");
     // Convert Messages → OpenAI-shaped JSON for the wire.
     let openai_messages = Message::to_openai_messages(messages);
@@ -3770,7 +3834,7 @@ async fn stream_turn_openai(
             "function": { "name": "goal_write_plan" }
         });
     }
-    if umans {
+    if supports_reasoning_content {
         // Resolve the requested effort against the model's advertised thinking
         // levels: clamp to the closest supported level when the model constrains
         // the set (e.g. GLM only accepts "high"). Empty levels => pass through.
@@ -4139,7 +4203,7 @@ async fn stream_turn_openai(
             json!(content)
         },
     );
-    if umans && !reasoning.is_empty() {
+    if supports_reasoning_content && !reasoning.is_empty() {
         msg.insert("reasoning_content".into(), json!(reasoning));
     }
     if !tool_calls.is_empty() {
@@ -6002,7 +6066,8 @@ mod tests {
                 "tokens_in": 1000,
                 "tokens_out": 200
             },
-            "window": { "remaining_minutes": 42 }
+            "window": { "remaining_minutes": 42, "resets_at": 1785542400 },
+            "message": "Plan ceiling is not exposed by this provider."
         });
         let u = parse_umans_usage_full(&v);
         assert!(u.available);
@@ -6012,7 +6077,12 @@ mod tests {
         let req = u.windows.iter().find(|w| w.id == "requests").unwrap();
         assert_eq!(req.used, Some(12.0));
         assert_eq!(req.limit, Some(500.0));
+        assert_eq!(req.resets_at, Some(1785542400));
         assert!(req.detail.as_deref().unwrap_or("").contains("42m"));
+        assert_eq!(
+            u.message.as_deref(),
+            Some("Plan ceiling is not exposed by this provider.")
+        );
     }
 
     #[test]
@@ -6462,6 +6532,42 @@ mod tests {
         assert!(has_result);
         assert_eq!(msgs.len(), 3);
         assert_eq!(n, 1, "should report 1 synthetic result inserted");
+        let body = msgs[2].content_text().unwrap_or("");
+        assert!(
+            body.contains("tool result was lost"),
+            "non-finish orphans keep the re-issue hint: {body}"
+        );
+    }
+
+    #[test]
+    fn sanitize_finish_orphan_does_not_ask_to_reissue() {
+        // A prior turn that called `finish` without appending a tool result
+        // must not get the generic "Re-issue" synthetic — models then ignore
+        // the next user prompt and call finish again.
+        let mut msgs: Vec<Message> = vec![
+            Message::user("summarize the repo"),
+            Message::assistant_tool_calls(vec![crate::message::ToolCall {
+                id: "fin_1".into(),
+                typ: "function".into(),
+                function: crate::message::FunctionCall {
+                    name: "finish".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            Message::user("What tools do you have available?"),
+        ];
+        let n = sanitize_orphaned_tool_calls(&mut msgs);
+        assert_eq!(n, 1);
+        let body = msgs
+            .iter()
+            .find(|m| m.is_tool() && m.tool_call_id() == Some("fin_1"))
+            .and_then(|m| m.content_text())
+            .unwrap_or("");
+        assert_eq!(body, crate::tools::FINISH_MESSAGE);
+        assert!(
+            !body.to_lowercase().contains("re-issue"),
+            "finish orphan must not encourage re-issue: {body}"
+        );
     }
 
     #[test]
@@ -6603,6 +6709,16 @@ mod tests {
     }
 
     #[test]
+    fn cursor_bridge_detection_is_loopback_and_path_scoped() {
+        assert!(is_cursor_bridge("http://127.0.0.1:8788/cursor/v1"));
+        assert!(is_cursor_bridge("http://localhost:8788/cursor/v1/"));
+        assert!(is_cursor_bridge("http://[::1]:8788/cursor/v1"));
+        assert!(!is_cursor_bridge("http://127.0.0.1:8788/v1"));
+        assert!(!is_cursor_bridge("https://cursor-bridge.example/cursor/v1"));
+        assert!(!is_cursor_bridge("not a URL"));
+    }
+
+    #[test]
     fn is_xai_endpoint_detection() {
         assert!(is_xai_endpoint("https://api.x.ai/v1"));
         assert!(is_xai_endpoint("https://api.x.ai/v1/"));
@@ -6693,6 +6809,44 @@ mod tests {
         );
         assert_eq!(info.context_window, 750_000);
         assert!(info.vision);
+    }
+
+    #[test]
+    fn apply_live_model_fields_reads_cursor_reasoning_metadata() {
+        let mut info = openai_model_caps("cursor-model", "Cursor Model");
+        apply_live_model_fields(
+            &json!({
+                "reasoning": true,
+                "reasoning_levels": ["low", "high", ""]
+            }),
+            &mut info,
+        );
+        assert!(info.reasoning);
+        assert_eq!(info.thinking_levels, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn live_model_list_metadata_wins_after_registry_enrichment() {
+        let mut models = vec![ModelInfo {
+            id: "cursor-claude".into(),
+            name: "Claude".into(),
+            reasoning: false,
+            context_window: 200_000,
+            max_tokens: 8_192,
+            ..Default::default()
+        }];
+        apply_live_model_list_fields(
+            &json!({"data": [{
+                "id": "cursor-claude",
+                "reasoning": true,
+                "reasoning_levels": ["low", "high"],
+                "context_window": 1_000_000
+            }]}),
+            &mut models,
+        );
+        assert!(models[0].reasoning);
+        assert_eq!(models[0].thinking_levels, vec!["low", "high"]);
+        assert_eq!(models[0].context_window, 1_000_000);
     }
 
     #[test]

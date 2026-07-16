@@ -427,8 +427,31 @@ impl Event {
     }
 }
 
+// Per-thread emit capture for unit tests (does not replace stdout emit).
+thread_local! {
+    static EMIT_CAPTURE: std::cell::RefCell<Option<Vec<(String, serde_json::Map<String, Value>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Begin capturing emits into an in-memory buffer (unit tests). Nested calls replace.
+pub fn begin_emit_capture() {
+    EMIT_CAPTURE.with(|c| {
+        *c.borrow_mut() = Some(Vec::new());
+    });
+}
+
+/// Stop capture and return `(kind, data)` pairs accumulated since [`begin_emit_capture`].
+pub fn end_emit_capture() -> Vec<(String, serde_json::Map<String, Value>)> {
+    EMIT_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
 /// Emit one event as a single line of JSON to stdout. Thread-safe via stdout lock.
 pub fn emit(ev: &Event) {
+    EMIT_CAPTURE.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.push((ev.kind.to_string(), ev.data.clone()));
+        }
+    });
     let mut line = serde_json::to_string(ev).unwrap_or_else(|_| "{}".into());
     line.push('\n');
     use std::io::Write;

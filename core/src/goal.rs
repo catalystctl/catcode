@@ -13,6 +13,7 @@ use crate::State;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -735,13 +736,158 @@ pub fn emit_goal_plan(mode: &GoalMode) {
 }
 
 pub fn emit_goal_phase(from: &GoalPhase, to: &GoalPhase, message: Option<&str>) {
+    emit_goal_phase_progress(from, to, message, None, None, None);
+}
+
+/// Goal phase change with optional wave/progress counts for UI continuity.
+pub fn emit_goal_phase_progress(
+    from: &GoalPhase,
+    to: &GoalPhase,
+    message: Option<&str>,
+    wave: Option<usize>,
+    step_count: Option<usize>,
+    done_count: Option<usize>,
+) {
     let mut ev = Event::new("goal_phase")
         .with("from", json!(from.as_str()))
         .with("to", json!(to.as_str()));
     if let Some(m) = message {
         ev = ev.with("message", json!(m));
     }
+    if let Some(w) = wave {
+        ev = ev.with("wave", json!(w));
+    }
+    if let Some(n) = step_count {
+        ev = ev.with("step_count", json!(n));
+    }
+    if let Some(n) = done_count {
+        ev = ev.with("done_count", json!(n));
+    }
     emit(&ev);
+}
+
+/// Ensure step summary text is never empty for UIs / wrap-up.
+pub fn nonempty_step_summary(output: &str) -> String {
+    let t = output.trim();
+    if t.is_empty() {
+        "(step finished with no written summary)".to_string()
+    } else {
+        truncate_str(t, 1600)
+    }
+}
+
+/// One-shot lasting signal when a deploy step settles (alongside `goal_state`).
+pub fn emit_goal_step_complete(
+    step_id: &str,
+    title: &str,
+    agent: &str,
+    ok: bool,
+    status: &str,
+    summary: &str,
+    run_id: Option<&str>,
+) {
+    let summary = nonempty_step_summary(summary);
+    let mut ev = Event::new("goal_step_complete")
+        .with("step_id", json!(step_id))
+        .with("title", json!(title))
+        .with("agent", json!(agent))
+        .with("ok", json!(ok))
+        .with("status", json!(status))
+        .with("summary", json!(summary));
+    if let Some(rid) = run_id {
+        if !rid.is_empty() {
+            ev = ev.with("run_id", json!(rid));
+        }
+    }
+    emit(&ev);
+}
+
+/// Lasting completion text when model wrap-up is skipped or as a bridge.
+pub fn emit_goal_completion_summary(text: &str) {
+    let text = text.trim();
+    let text = if text.is_empty() {
+        "Goal finished (no completion summary provided)."
+    } else {
+        text
+    };
+    emit(&Event::new("goal_completion_summary").with("text", json!(text)));
+}
+
+/// Deterministic multi-line report from step results (no model call).
+pub fn build_deterministic_completion_summary(mode: &GoalMode) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("# Goal complete: {}", mode.goal.trim()));
+    if let Some(plan) = &mode.plan {
+        if !plan.summary.trim().is_empty() {
+            lines.push(format!("Plan: {}", plan.summary.trim()));
+        }
+    }
+    let failed = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Failed)
+        .count();
+    let skipped = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Skipped)
+        .count();
+    let done = mode
+        .prompts
+        .iter()
+        .filter(|p| p.status == DeployStatus::Done)
+        .count();
+    lines.push(format!(
+        "Outcome: {done} done, {failed} failed, {skipped} skipped."
+    ));
+    lines.push(String::new());
+    lines.push("## Step results".into());
+    for p in &mode.prompts {
+        let title = if p.title.is_empty() {
+            p.step_id.as_str()
+        } else {
+            p.title.as_str()
+        };
+        let summary = nonempty_step_summary(p.summary.as_deref().unwrap_or(""));
+        lines.push(format!(
+            "- [{status}] {title} ({agent}): {summary}",
+            status = p.status.as_str(),
+            title = title,
+            agent = p.agent,
+            summary = summary,
+        ));
+    }
+    if mode.prompts.is_empty() {
+        lines.push("- (no step results)".into());
+    }
+    lines.join("\n")
+}
+
+/// Write full step output for wrap-up / UI drill-down. Returns workspace-relative path.
+pub fn write_step_artifact(
+    workspace: &Path,
+    goal_id: &str,
+    step_id: &str,
+    output: &str,
+) -> Option<String> {
+    if goal_id.is_empty() || step_id.is_empty() {
+        return None;
+    }
+    let dir = workspace
+        .join(".catalyst-code")
+        .join("goal-ux")
+        .join("artifacts")
+        .join(goal_id);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!("{step_id}.md"));
+    if std::fs::write(&path, output).is_err() {
+        return None;
+    }
+    Some(format!(
+        ".catalyst-code/goal-ux/artifacts/{goal_id}/{step_id}.md"
+    ))
 }
 
 pub fn transition(mode: &mut GoalMode, to: GoalPhase, message: Option<&str>) {
@@ -891,22 +1037,26 @@ pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
         } else {
             p.title.clone()
         };
-        let summary = p
-            .summary
-            .as_deref()
-            .unwrap_or("(no summary)")
-            .trim();
-        let summary = truncate_str(summary, 1200);
+        let summary = nonempty_step_summary(p.summary.as_deref().unwrap_or(""));
+        let summary = truncate_str(&summary, 1200);
+        let artifact = format!(
+            ".catalyst-code/goal-ux/artifacts/{}/{}.md",
+            mode.id, p.step_id
+        );
         steps.push_str(&format!(
-            "- [{status}] {title} ({agent}): {summary}\n",
+            "- [{status}] {title} ({agent}): {summary}
+  full output: {artifact}
+",
             status = p.status.as_str(),
             title = title,
             agent = p.agent,
             summary = summary,
+            artifact = artifact,
         ));
     }
     if steps.is_empty() {
-        steps.push_str("(no step results)\n");
+        steps.push_str("(no step results)
+");
     }
     let plan_summary = mode
         .plan
@@ -946,7 +1096,7 @@ pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
 ## Step results
 {steps}
 ## Instructions
-1. Write a clear completion summary for the user: what was done, what failed (if anything), and notable files/changes from the step results.
+1. Write a clear completion summary for the user: what was done, what failed (if anything), and notable files/changes from the step results. Read full step artifacts under `.catalyst-code/goal-ux/artifacts/` when a truncated summary is insufficient.
 2. If something failed, suggest the smallest next action — do not silently re-plan or re-deploy.
 3. Do not call goal_write_plan. Do not spawn more goal workers unless the user asks.
 4. Call `finish` when the summary is done."#,
@@ -957,8 +1107,29 @@ pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
     )
 }
 
+
+/// Minimum wrap-up assistant chars that count as a "rich" model summary.
+/// Below this we still emit the deterministic checklist so Done is never blank.
+pub const RICH_WRAPUP_MIN_CHARS: usize = 200;
+
 /// Mark a synthesizing goal as Done (or Failed if the wrap-up was aborted).
+///
+/// Emits `goal_completion_summary` with a deterministic step report when wrap-up
+/// was skipped or empty/short. When a rich model wrap-up already streamed
+/// (`wrapup_chars >= RICH_WRAPUP_MIN_CHARS`), skips the deterministic card to
+/// avoid dual Done cards (H2).
 pub fn finish_synthesis(mode: &mut GoalMode, cancelled: bool) {
+    finish_synthesis_with_wrapup(mode, cancelled, None);
+}
+
+/// Like [`finish_synthesis`], but `wrapup_chars` controls deterministic emit:
+/// - `None` — wrap-up skipped → always emit deterministic summary
+/// - `Some(n)` — emit only when `n < RICH_WRAPUP_MIN_CHARS`
+pub fn finish_synthesis_with_wrapup(
+    mode: &mut GoalMode,
+    cancelled: bool,
+    wrapup_chars: Option<usize>,
+) {
     if mode.phase != GoalPhase::Synthesizing {
         return;
     }
@@ -991,6 +1162,16 @@ pub fn finish_synthesis(mode: &mut GoalMode, cancelled: bool) {
             }
         )
     };
+    // Emit before transition so UIs paint the lasting synthesis card as the
+    // goal moves to Done (closes the dark gap after the last worker).
+    let emit_deterministic = match wrapup_chars {
+        None => true,
+        Some(n) => n < RICH_WRAPUP_MIN_CHARS,
+    };
+    if emit_deterministic {
+        let summary = build_deterministic_completion_summary(mode);
+        emit_goal_completion_summary(&summary);
+    }
     transition(mode, GoalPhase::Done, Some(&msg));
 }
 
@@ -1008,17 +1189,19 @@ pub async fn deploy_goal(
     cancel: CancellationToken,
 ) -> bool {
     // Snapshot config for deploy.
-    let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id) = {
+    let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id, workspace) = {
         let mode = st.goal.lock().await;
         if mode.plan.is_none() || mode.prompts.is_empty() {
             return false;
         }
+        let workspace = st.cfg.read().await.workspace.clone();
         (
             mode.parent_model.clone(),
             mode.concurrency,
             mode.model_concurrency.clone(),
             mode.prompts.clone(),
             mode.id.clone(),
+            workspace,
         )
     };
 
@@ -1077,14 +1260,14 @@ pub async fn deploy_goal(
         .map(|s| (s.id.clone(), s.depends_on.clone()))
         .collect();
 
-    for wave in waves {
+    for (wave_idx, wave) in waves.into_iter().enumerate() {
         if cancel.is_cancelled() {
             let mut mode = st.goal.lock().await;
             fail_goal(&mut mode, "goal cancelled");
             return false;
         }
 
-        // Mark wave running.
+        // Mark wave running + emit progress (even when already Running).
         {
             let mut mode = st.goal.lock().await;
             for id in &wave {
@@ -1092,7 +1275,32 @@ pub async fn deploy_goal(
                     p.status = DeployStatus::Running;
                 }
             }
-            transition(&mut mode, GoalPhase::Running, Some("subagents running"));
+            let from = mode.phase.clone();
+            let step_count = mode.prompts.len();
+            let done_count = mode
+                .prompts
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        DeployStatus::Done | DeployStatus::Failed | DeployStatus::Skipped
+                    )
+                })
+                .count();
+            if from != GoalPhase::Running {
+                mode.phase = GoalPhase::Running;
+            }
+            mode.touch();
+            let msg = format!("wave {} — subagents running", wave_idx + 1);
+            emit_goal_phase_progress(
+                &from,
+                &GoalPhase::Running,
+                Some(&msg),
+                Some(wave_idx + 1),
+                Some(step_count),
+                Some(done_count),
+            );
+            emit_goal_state(&mode);
             sync_work_state_from_prompts(&st, &mode).await;
         }
 
@@ -1104,12 +1312,32 @@ pub async fn deploy_goal(
             if let Some(deps) = deps_by_id.get(id) {
                 if deps.iter().any(|d| failed_steps.contains(d)) {
                     let mut mode = st.goal.lock().await;
-                    if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
-                        p.status = DeployStatus::Skipped;
-                        p.summary = Some("skipped: a dependency step failed or was skipped".into());
-                    }
+                    let skip_summary =
+                        "skipped: a dependency step failed or was skipped".to_string();
+                    let (title, agent, run_id) =
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
+                            p.status = DeployStatus::Skipped;
+                            p.summary = Some(skip_summary.clone());
+                            let title = if p.title.is_empty() {
+                                p.step_id.clone()
+                            } else {
+                                p.title.clone()
+                            };
+                            (title, p.agent.clone(), p.run_id.clone())
+                        } else {
+                            (id.clone(), String::new(), None)
+                        };
                     mode.touch();
                     emit_goal_state(&mode);
+                    emit_goal_step_complete(
+                        id,
+                        &title,
+                        &agent,
+                        false,
+                        "skipped",
+                        &skip_summary,
+                        run_id.as_deref(),
+                    );
                     sync_work_state_from_prompts(&st, &mode).await;
                     // Propagate: mark this step as unavailable so its own
                     // dependents are skipped in later waves too.
@@ -1128,7 +1356,7 @@ pub async fn deploy_goal(
         // Run each step with global + per-model concurrency caps.
         // Track step_id alongside each handle so a JoinError (panic) can still
         // mark the right step as failed.
-        let mut handles: Vec<(String, tokio::task::JoinHandle<(String, bool, String)>)> =
+        let mut handles: Vec<(String, tokio::task::JoinHandle<(String, bool, String, Option<String>)>)> =
             Vec::new();
         for p in wave_prompts {
             if cancel.is_cancelled() {
@@ -1146,28 +1374,54 @@ pub async fn deploy_goal(
             let parent = parent_model.clone();
             let step_id = p.step_id.clone();
             let step_id_outer = step_id.clone();
+            // Pre-allocate run_id so goal_state / step cards can deep-link before
+            // execute returns (C2).
+            let run_id = crate::subagent::allocate_run_id();
+            {
+                let mut mode = st.goal.lock().await;
+                if let Some(prompt) = mode.prompts.iter_mut().find(|x| x.step_id == step_id) {
+                    prompt.run_id = Some(run_id.clone());
+                }
+                if !mode.active_run_ids.iter().any(|r| r == &run_id) {
+                    mode.active_run_ids.push(run_id.clone());
+                }
+                mode.touch();
+                emit_goal_state(&mode);
+            }
+            let run_id_task = run_id.clone();
             handles.push((
                 step_id_outer,
                 tokio::spawn(async move {
                     let _g = match g_sem.acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
-                            return (step_id, false, "global concurrency semaphore closed".into());
+                            return (
+                                step_id,
+                                false,
+                                "global concurrency semaphore closed".into(),
+                                Some(run_id_task),
+                            );
                         }
                     };
                     let _m = match m_sem.acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
-                            return (step_id, false, "model concurrency semaphore closed".into());
+                            return (
+                                step_id,
+                                false,
+                                "model concurrency semaphore closed".into(),
+                                Some(run_id_task),
+                            );
                         }
                     };
                     if cancel_c.is_cancelled() {
-                        return (step_id, false, "cancelled".into());
+                        return (step_id, false, "cancelled".into(), Some(run_id_task));
                     }
                     let mut args = json!({
                         "agent": p.agent,
                         "task": p.task,
                         "context": "fresh",
+                        "run_id": run_id_task,
                     });
                     if let Some(m) = &p.model {
                         args["model"] = json!(m);
@@ -1192,7 +1446,7 @@ pub async fn deploy_goal(
                         st_c, client_c, provider, parent, args, cancel_c, 0,
                     )
                     .await;
-                    (step_id, outcome.ok, outcome.output)
+                    (step_id, outcome.ok, outcome.output, Some(run_id_task))
                 }),
             ));
         }
@@ -1200,25 +1454,63 @@ pub async fn deploy_goal(
         let mut wave_failed = false;
         for (step_id, h) in handles {
             match h.await {
-                Ok((_id, ok, output)) => {
+                Ok((_id, ok, output, joined_run_id)) => {
                     let mut mode = st.goal.lock().await;
-                    if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
-                        if ok {
-                            p.status = DeployStatus::Done;
-                            // Keep enough of the output for the synthesizing
-                            // turn to report real findings/errors (400 chars
-                            // was too little for review goals).
-                            p.summary = Some(truncate_str(&output, 1600));
+                    let summary = nonempty_step_summary(&output);
+                    let _ = write_step_artifact(&workspace, &goal_id, &step_id, &output);
+                    let (title, agent, run_id, status, clear_rid) =
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id)
+                        {
+                            if ok {
+                                p.status = DeployStatus::Done;
+                            } else {
+                                p.status = DeployStatus::Failed;
+                                wave_failed = true;
+                                any_failed = true;
+                                failed_steps.insert(step_id.clone());
+                            }
+                            p.summary = Some(summary.clone());
+                            if p.run_id.is_none() {
+                                p.run_id = joined_run_id.clone();
+                            }
+                            let clear_rid = p.run_id.clone();
+                            let title = if p.title.is_empty() {
+                                p.step_id.clone()
+                            } else {
+                                p.title.clone()
+                            };
+                            let agent = p.agent.clone();
+                            let status = p.status.as_str();
+                            let run_id = p.run_id.clone();
+                            (title, agent, run_id, status, clear_rid)
                         } else {
-                            p.status = DeployStatus::Failed;
-                            p.summary = Some(truncate_str(&output, 1600));
-                            wave_failed = true;
-                            any_failed = true;
-                            failed_steps.insert(step_id.clone());
-                        }
+                            if !ok {
+                                wave_failed = true;
+                                any_failed = true;
+                                failed_steps.insert(step_id.clone());
+                            }
+                            (
+                                step_id.clone(),
+                                String::new(),
+                                joined_run_id.clone(),
+                                if ok { "done" } else { "failed" },
+                                joined_run_id,
+                            )
+                        };
+                    if let Some(ref rid) = clear_rid {
+                        mode.active_run_ids.retain(|r| r != rid);
                     }
                     mode.touch();
                     emit_goal_state(&mode);
+                    emit_goal_step_complete(
+                        &step_id,
+                        &title,
+                        &agent,
+                        ok,
+                        status,
+                        &summary,
+                        run_id.as_deref(),
+                    );
                     sync_work_state_from_prompts(&st, &mode).await;
                 }
                 Err(e) => {
@@ -1226,12 +1518,39 @@ pub async fn deploy_goal(
                     wave_failed = true;
                     failed_steps.insert(step_id.clone());
                     let mut mode = st.goal.lock().await;
-                    if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
-                        p.status = DeployStatus::Failed;
-                        p.summary = Some(format!("task join error: {e}"));
+                    let summary = format!("task join error: {e}");
+                    let _ = write_step_artifact(&workspace, &goal_id, &step_id, &summary);
+                    let (title, agent, run_id, clear_rid) =
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id)
+                        {
+                            p.status = DeployStatus::Failed;
+                            p.summary = Some(nonempty_step_summary(&summary));
+                            let clear_rid = p.run_id.clone();
+                            let title = if p.title.is_empty() {
+                                p.step_id.clone()
+                            } else {
+                                p.title.clone()
+                            };
+                            let agent = p.agent.clone();
+                            let run_id = p.run_id.clone();
+                            (title, agent, run_id, clear_rid)
+                        } else {
+                            (step_id.clone(), String::new(), None, None)
+                        };
+                    if let Some(ref rid) = clear_rid {
+                        mode.active_run_ids.retain(|r| r != rid);
                     }
                     mode.touch();
                     emit_goal_state(&mode);
+                    emit_goal_step_complete(
+                        &step_id,
+                        &title,
+                        &agent,
+                        false,
+                        "failed",
+                        &summary,
+                        run_id.as_deref(),
+                    );
                     sync_work_state_from_prompts(&st, &mode).await;
                     emit(&Event::new("error").with(
                         "message",
@@ -1288,21 +1607,47 @@ pub async fn deploy_goal(
                 if !pass {
                     // Mark the wave's successful steps as failed so dependents skip.
                     let mut mode = st.goal.lock().await;
+                    let mut completed: Vec<(String, String, String, Option<String>, String)> =
+                        Vec::new();
                     for id in &wave {
                         if let Some(p) = mode.prompts.iter_mut().find(|p| &p.step_id == id) {
                             if p.status == DeployStatus::Done {
                                 p.status = DeployStatus::Failed;
-                                p.summary = Some(format!(
+                                let summary = nonempty_step_summary(&format!(
                                     "verifier failed: {}",
-                                    truncate_str(&outcome.output, 200)
+                                    truncate_str(&outcome.output, 800)
                                 ));
+                                p.summary = Some(summary.clone());
                                 failed_steps.insert(id.clone());
                                 any_failed = true;
+                                let title = if p.title.is_empty() {
+                                    p.step_id.clone()
+                                } else {
+                                    p.title.clone()
+                                };
+                                completed.push((
+                                    id.clone(),
+                                    title,
+                                    p.agent.clone(),
+                                    p.run_id.clone(),
+                                    summary,
+                                ));
                             }
                         }
                     }
                     mode.touch();
                     emit_goal_state(&mode);
+                    for (sid, title, agent, run_id, summary) in completed {
+                        emit_goal_step_complete(
+                            &sid,
+                            &title,
+                            &agent,
+                            false,
+                            "failed",
+                            &summary,
+                            run_id.as_deref(),
+                        );
+                    }
                     sync_work_state_from_prompts(&st, &mode).await;
                 }
             }
@@ -1375,7 +1720,7 @@ pub async fn sync_work_state_from_prompts(st: &Arc<State>, mode: &GoalMode) {
             DeployStatus::Done => done.push(label),
             DeployStatus::Running => in_progress.push(label),
             DeployStatus::Failed => done.push(format!("FAILED: {label}")),
-            DeployStatus::Skipped => {}
+            DeployStatus::Skipped => done.push(format!("skipped: {label}")),
             DeployStatus::Pending => next.push(label),
         }
     }
@@ -1585,6 +1930,102 @@ mod tests {
         assert!(p.contains("[failed] implement (worker): tests failed"));
         assert!(p.contains("Call `finish`"));
         assert!(p.contains("1 step(s) failed"));
+        assert!(p.contains(".catalyst-code/goal-ux/artifacts/"));
+    }
+
+    #[test]
+    fn nonempty_step_summary_never_blank() {
+        assert_eq!(
+            nonempty_step_summary(""),
+            "(step finished with no written summary)"
+        );
+        assert_eq!(
+            nonempty_step_summary("   "),
+            "(step finished with no written summary)"
+        );
+        assert_eq!(nonempty_step_summary("hello"), "hello");
+        let long = "x".repeat(2000);
+        let s = nonempty_step_summary(&long);
+        assert!(s.chars().count() <= 1601); // 1600 + ellipsis
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn deterministic_completion_summary_lists_steps() {
+        let mut m = base_mode();
+        m.goal = "ship feature X".into();
+        m.plan = Some(GoalPlan {
+            summary: "two steps".into(),
+            steps: vec![],
+            risks: vec![],
+            validation: vec![],
+        });
+        m.prompts = vec![
+            DeployPrompt {
+                step_id: "a".into(),
+                agent: "scout".into(),
+                task: "map".into(),
+                model: None,
+                status: DeployStatus::Done,
+                run_id: None,
+                summary: Some("found auth.rs".into()),
+                title: "recon".into(),
+            },
+            DeployPrompt {
+                step_id: "b".into(),
+                agent: "worker".into(),
+                task: "impl".into(),
+                model: None,
+                status: DeployStatus::Failed,
+                run_id: None,
+                summary: None, // empty -> stub
+                title: "implement".into(),
+            },
+        ];
+        let s = build_deterministic_completion_summary(&m);
+        assert!(s.contains("ship feature X"));
+        assert!(s.contains("1 done, 1 failed, 0 skipped"));
+        assert!(s.contains("[done] recon (scout): found auth.rs"));
+        assert!(s.contains("(step finished with no written summary)"));
+        assert!(!s.contains("(no summary)"));
+    }
+
+    #[test]
+    fn wrapup_prompt_keeps_1200_char_step_budget() {
+        let mut m = base_mode();
+        m.goal = "g".into();
+        let big = "y".repeat(3000);
+        m.prompts = vec![DeployPrompt {
+            step_id: "a".into(),
+            agent: "worker".into(),
+            task: "t".into(),
+            model: None,
+            status: DeployStatus::Done,
+            run_id: None,
+            summary: Some(big.clone()),
+            title: "do".into(),
+        }];
+        let p = build_wrapup_prompt(&m);
+        // Summary in wrap-up is truncated to 1200 (+ellipsis), not the full 3000.
+        assert!(!p.contains(&big));
+        assert!(p.contains(&("y".repeat(1200) + "…")));
+    }
+
+    #[test]
+    fn write_step_artifact_roundtrip() {
+        let dir = tempfile_dir();
+        let rel = write_step_artifact(&dir, "gid", "step1", "full output here")
+            .expect("artifact path");
+        assert_eq!(rel, ".catalyst-code/goal-ux/artifacts/gid/step1.md");
+        let body = std::fs::read_to_string(dir.join(&rel)).unwrap();
+        assert_eq!(body, "full output here");
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!("catcode-goal-artifact-{}", now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
@@ -1601,14 +2042,70 @@ mod tests {
             summary: Some("ok".into()),
             title: "do".into(),
         }];
+        crate::protocol::begin_emit_capture();
         finish_synthesis(&mut m, false);
+        let captured = crate::protocol::end_emit_capture();
         assert_eq!(m.phase, GoalPhase::Done);
+        assert!(
+            captured.iter().any(|(k, d)| {
+                k == "goal_completion_summary"
+                    && d.get("text").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+            }),
+            "finish_synthesis must emit non-empty goal_completion_summary; got {captured:?}"
+        );
         finish_synthesis(&mut m, false); // no-op once Done
         assert_eq!(m.phase, GoalPhase::Done);
 
         m.phase = GoalPhase::Synthesizing;
         finish_synthesis(&mut m, true);
         assert_eq!(m.phase, GoalPhase::Failed);
+    }
+
+    #[test]
+    fn finish_synthesis_skips_deterministic_when_wrapup_rich() {
+        let mut m = base_mode();
+        m.phase = GoalPhase::Synthesizing;
+        m.prompts = vec![DeployPrompt {
+            step_id: "a".into(),
+            agent: "worker".into(),
+            task: "t".into(),
+            model: None,
+            status: DeployStatus::Done,
+            run_id: Some("run-1".into()),
+            summary: Some("ok".into()),
+            title: "do".into(),
+        }];
+        crate::protocol::begin_emit_capture();
+        finish_synthesis_with_wrapup(&mut m, false, Some(RICH_WRAPUP_MIN_CHARS + 50));
+        let captured = crate::protocol::end_emit_capture();
+        assert_eq!(m.phase, GoalPhase::Done);
+        assert!(
+            !captured.iter().any(|(k, _)| k == "goal_completion_summary"),
+            "rich wrap-up should skip deterministic completion card; got {captured:?}"
+        );
+    }
+
+    #[test]
+    fn emit_goal_step_complete_includes_nonempty_summary_and_run_id() {
+        crate::protocol::begin_emit_capture();
+        emit_goal_step_complete(
+            "s1",
+            "Implement X",
+            "worker",
+            true,
+            "done",
+            "Implemented X cleanly.",
+            Some("run-abc"),
+        );
+        let captured = crate::protocol::end_emit_capture();
+        let ev = captured
+            .iter()
+            .find(|(k, _)| k == "goal_step_complete")
+            .expect("goal_step_complete emitted");
+        let summary = ev.1.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!summary.is_empty());
+        assert_eq!(ev.1.get("run_id").and_then(|v| v.as_str()), Some("run-abc"));
+        assert_eq!(ev.1.get("ok").and_then(|v| v.as_bool()), Some(true));
     }
 
     fn start_args(goal: &str) -> StartGoalArgs {

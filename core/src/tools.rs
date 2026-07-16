@@ -25,6 +25,13 @@ pub enum ToolKind {
     Destructive, // bash, write_file, edit — gated under Approval::Destructive
 }
 
+/// Internal sentinel returned by the `finish` tool. The orchestrator treats this
+/// as loop exit; the UI/session see [`FINISH_MESSAGE`] instead.
+pub const FINISH_SENTINEL: &str = "__finish__";
+
+/// Human-readable tool_result shown when the agent calls `finish`.
+pub const FINISH_MESSAGE: &str = "This turn has finished";
+
 /// Classify a tool by name for approval purposes.
 pub fn classify(name: &str) -> ToolKind {
     match name {
@@ -864,7 +871,9 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "read_file" => read_file(s("path"), args, cfg),
         "todo_read" => todo_read(cfg),
         "todo_write" => todo_write(args, cfg),
-        "finish" => Outcome::ok("__finish__"), // sentinel; main.rs treats as loop exit
+        // Sentinel stays internal; main.rs / subagent map it to a human-readable
+        // tool_result ("This turn has finished") before emitting to the UI.
+        "finish" => Outcome::ok(FINISH_SENTINEL),
         "patch" => apply_patch(args, cfg),
         "diagnostics" => Outcome::err("diagnostics must be dispatched through execute_diagnostics (async)"),
         "fetch" => Outcome::err("fetch must be dispatched through execute_fetch (async)"),
@@ -5232,7 +5241,7 @@ mod tests {
         let (_root, cfg) = tmp_ws();
         let o = execute("finish", &json!({}), &cfg);
         assert!(o.ok);
-        assert_eq!(o.output, "__finish__");
+        assert_eq!(o.output, FINISH_SENTINEL);
     }
 
     #[test]
