@@ -126,6 +126,25 @@ function W-Ok($t)   { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $
 function W-Warn($t){ if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Yellow } }
 function Die($t)   { Write-Host "`n  error: $t" -ForegroundColor Red; exit 1 }
 
+# Native exes (schtasks/sc/nssm) write expected failures to stderr. With
+# $ErrorActionPreference=Stop, PowerShell turns that into a terminating
+# NativeCommandError even when redirected — so "task not found" on first
+# install aborts the script. Run them under Continue and use $LASTEXITCODE.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(ValueFromRemainingArguments)][string[]]$ArgumentList
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList *> $null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Show-Help {
     $usage = @"
   Catalyst Code — installer for Windows
@@ -346,8 +365,8 @@ function Install-NssmService {
     $nssm = Get-Command nssm -ErrorAction SilentlyContinue
     if (-not $nssm) { return $false }
     $nssm = $nssm.Source
-    & $nssm stop $SvcName *> $null 2>&1
-    & $nssm remove $SvcName confirm *> $null 2>&1
+    [void](Invoke-Native $nssm stop $SvcName)
+    [void](Invoke-Native $nssm remove $SvcName confirm)
     W-Info "Installing Windows Service '$SvcName' (NSSM)..."
     & $nssm install $SvcName $RTExe (Join-Path $WebDir 'start.js') *> $null
     if ($LASTEXITCODE -ne 0) { Die "nssm install failed (exit $LASTEXITCODE)" }
@@ -390,11 +409,13 @@ function Install-Task {
     W-Warn 'Note: a Scheduled Task runs only while a user is logged in.'
     W-Warn '      For a true boot-time service, install NSSM (https://nssm.cc) and re-run.'
     Write-Wrapper
-    schtasks /query /tn $TaskName *> $null 2>&1
-    if ($LASTEXITCODE -eq 0) { schtasks /delete /tn $TaskName /f *> $null }
-    schtasks /create /tn $TaskName /tr "`"$WrapperPath`"" /sc onlogon /rl limited /f *> $null
-    if ($LASTEXITCODE -ne 0) { Die "schtasks /create failed (exit $LASTEXITCODE)" }
-    schtasks /run /tn $TaskName *> $null
+    # /query fails with "file not found" when the task is absent — expected on first install.
+    if ((Invoke-Native schtasks /query /tn $TaskName) -eq 0) {
+        [void](Invoke-Native schtasks /delete /tn $TaskName /f)
+    }
+    $ec = Invoke-Native schtasks /create /tn $TaskName /tr "`"$WrapperPath`"" /sc onlogon /rl limited /f
+    if ($ec -ne 0) { Die "schtasks /create failed (exit $ec)" }
+    [void](Invoke-Native schtasks /run /tn $TaskName)
     W-Ok "Scheduled task '$TaskName' created and started (at logon, restart-loop wrapper)"
 }
 
@@ -444,17 +465,16 @@ function Uninstall-WebService {
     $removed = $false
     if ($nssm) {
         $nssm = $nssm.Source
-        & $nssm stop $SvcName *> $null 2>&1
-        & $nssm remove $SvcName confirm *> $null 2>&1
-        if ($LASTEXITCODE -eq 0) { W-Ok "Removed Windows Service '$SvcName'"; $removed = $true }
+        [void](Invoke-Native $nssm stop $SvcName)
+        $ec = Invoke-Native $nssm remove $SvcName confirm
+        if ($ec -eq 0) { W-Ok "Removed Windows Service '$SvcName'"; $removed = $true }
     } else {
-        sc.exe stop $SvcName *> $null 2>&1
-        sc.exe delete $SvcName *> $null 2>&1
+        [void](Invoke-Native sc.exe stop $SvcName)
+        [void](Invoke-Native sc.exe delete $SvcName)
     }
-    schtasks /query /tn $TaskName *> $null 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        schtasks /end /tn $TaskName *> $null 2>&1
-        schtasks /delete /tn $TaskName /f *> $null
+    if ((Invoke-Native schtasks /query /tn $TaskName) -eq 0) {
+        [void](Invoke-Native schtasks /end /tn $TaskName)
+        [void](Invoke-Native schtasks /delete /tn $TaskName /f)
         W-Ok "Removed Scheduled Task '$TaskName'"; $removed = $true
     }
     if (Test-Path $WrapperPath) { Remove-Item $WrapperPath -Force; W-Ok "Removed wrapper $WrapperPath" }
