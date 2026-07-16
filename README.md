@@ -298,6 +298,32 @@ from the environment, so the secret never lands in a config file).
 
 </details>
 
+### Cursor-routed models with Catalyst tools
+
+The optional
+[`karutoil/catcode-cursor-provider`](https://github.com/karutoil/catcode-cursor-provider)
+plugin exposes the official Cursor SDK as an OpenAI-compatible loopback
+endpoint. Install its latest GitHub Release globally, then use the normal
+provider picker:
+
+```text
+/plugin-install karutoil/catcode-cursor-provider global
+/login cursor
+```
+
+The plugin installs its pinned SDK dependency on first login, starts the proxy
+with core, and stops it when the last owning core exits. Catalyst remains the
+agent and tool executor: its schemas, approval gate, workspace confinement, and
+tool-result messages are unchanged. Cursor-native tools are fail-closed through
+an empty decoy workspace, deny permissions/hooks, and run cancellation on any
+non-Catalyst tool event.
+
+Cursor models use standard mode by default; models that support Fast expose a
+separate `— Fast` entry in `/models`. `/usage` shows SDK-reported monthly usage
+observed by the local proxy. Cursor does not expose an individual subscription
+balance through the user Agent API, so the authoritative remaining allowance
+stays on the Cursor dashboard.
+
 ### Subscription login (OAuth) — plugins only
 
 Built-in presets are **API-key only**. ChatGPT Plus/Pro, Claude Pro/Max,
