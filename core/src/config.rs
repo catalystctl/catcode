@@ -306,11 +306,7 @@ impl RoutingConfig {
         let n = agent_name.to_ascii_lowercase();
         if self.fast_roles.iter().any(|r| r.eq_ignore_ascii_case(&n)) {
             Some("fast")
-        } else if self
-            .strong_roles
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&n))
-        {
+        } else if self.strong_roles.iter().any(|r| r.eq_ignore_ascii_case(&n)) {
             Some("strong")
         } else {
             None
@@ -737,7 +733,6 @@ pub fn save_search_keys(keys: &std::collections::HashMap<String, String>) -> std
 pub fn auto_login_env_presets(_cfg: &mut Config) -> Vec<String> {
     Vec::new()
 }
-
 
 impl Config {
     pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {
@@ -2087,7 +2082,10 @@ mod tests {
         assert_eq!(ids, vec!["umans", "opencode-go", "openrouter"]);
         for id in &ids {
             let p = find_preset(id).expect("preset exists");
-            assert!(!p.api_key_env.is_empty(), "{id} should require an API key env");
+            assert!(
+                !p.api_key_env.is_empty(),
+                "{id} should require an API key env"
+            );
         }
         let umans = find_preset("umans").unwrap();
         assert_eq!(umans.base_url, "https://api.code.umans.ai/v1");

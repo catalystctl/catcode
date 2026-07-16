@@ -60,7 +60,10 @@ pub fn save_index(workspace: &Path, index: &EmbeddingIndex) {
 /// Simple hashing sketch: bag-of-hashed-tokens into a fixed DIM vector.
 pub fn hash_embed(text: &str) -> Vec<f32> {
     let mut v = vec![0f32; DIM];
-    for tok in text.split(|c: char| !c.is_alphanumeric()).filter(|t| t.len() > 1) {
+    for tok in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 1)
+    {
         let t = tok.to_ascii_lowercase();
         let mut h: u64 = 0xcbf29ce484222325;
         for b in t.bytes() {

@@ -2583,24 +2583,22 @@ fn build_bash_command(
                             cached_path.clone()
                         } else {
                             let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
-                            let path = std::env::temp_dir()
-                                .join(format!(
-                                    "catalyst-code-sb-{:x}-{}.sb",
-                                    fxhash(&ws_key),
-                                    if cfg.no_network { "nonet" } else { "net" }
-                                ));
+                            let path = std::env::temp_dir().join(format!(
+                                "catalyst-code-sb-{:x}-{}.sb",
+                                fxhash(&ws_key),
+                                if cfg.no_network { "nonet" } else { "net" }
+                            ));
                             let _ = std::fs::write(&path, &profile);
                             cache.insert((cache_key, cfg.no_network), path.clone());
                             path
                         }
                     } else {
                         let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
-                        let path = std::env::temp_dir()
-                            .join(format!(
-                                "catalyst-code-sb-{:x}-{}.sb",
-                                fxhash(&ws_key),
-                                if cfg.no_network { "nonet" } else { "net" }
-                            ));
+                        let path = std::env::temp_dir().join(format!(
+                            "catalyst-code-sb-{:x}-{}.sb",
+                            fxhash(&ws_key),
+                            if cfg.no_network { "nonet" } else { "net" }
+                        ));
                         let _ = std::fs::write(&path, &profile);
                         cache.insert((cache_key, cfg.no_network), path.clone());
                         path

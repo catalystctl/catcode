@@ -3287,13 +3287,9 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
         // Never copy local dotenv credentials into the managed plugin
         // directory. Keep the checked-in example so plugins can still
         // document optional development configuration.
-        let dotenv_secret = name_str == ".env"
-            || (name_str.starts_with(".env.") && name_str != ".env.example");
-        if dotenv_secret
-            || PLUGIN_COPY_SKIP
-                .iter()
-                .any(|s| *s == name_str)
-        {
+        let dotenv_secret =
+            name_str == ".env" || (name_str.starts_with(".env.") && name_str != ".env.example");
+        if dotenv_secret || PLUGIN_COPY_SKIP.iter().any(|s| *s == name_str) {
             continue;
         }
         let ft = entry
@@ -3427,7 +3423,11 @@ mod tests {
         fs::write(src.path.join(".env.production"), "SECRET=two\n").unwrap();
         fs::write(src.path.join(".env.example"), "SECRET=replace_me\n").unwrap();
         fs::create_dir_all(src.path.join(".runtime")).unwrap();
-        fs::write(src.path.join(".runtime/private.log"), "secret runtime state\n").unwrap();
+        fs::write(
+            src.path.join(".runtime/private.log"),
+            "secret runtime state\n",
+        )
+        .unwrap();
 
         copy_dir(&src.path, &dst.path).unwrap();
 

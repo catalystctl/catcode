@@ -351,7 +351,10 @@ mod tests {
         let id = new_id();
         assert!(id.starts_with("cp-"), "id must start with cp-: {id}");
         let suffix = id.strip_prefix("cp-").unwrap();
-        assert!(suffix.parse::<u64>().is_ok(), "suffix must be timestamp: {suffix}");
+        assert!(
+            suffix.parse::<u64>().is_ok(),
+            "suffix must be timestamp: {suffix}"
+        );
     }
 
     #[test]

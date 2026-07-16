@@ -48,10 +48,7 @@ impl VisionConfig {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
             return Self::default();
         };
-        let enabled = v
-            .get("enabled")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(true);
+        let enabled = v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true);
         let vision_models = v
             .get("vision_models")
             .and_then(|a| a.as_array())
@@ -327,10 +324,7 @@ mod tests {
 
     #[test]
     fn recommend_none_when_no_same_provider_vision() {
-        let models = vec![
-            mi("coder", "umans", false),
-            mi("flash", "openai", true),
-        ];
+        let models = vec![mi("coder", "umans", false), mi("flash", "openai", true)];
         let vc = VisionConfig::default();
         assert!(recommend_vision_model("coder", &models, &vc).is_none());
     }

@@ -3,8 +3,8 @@
 //! Records tool decisions (approve/deny/allow_pattern), args hashes, and
 //! optional diff hashes. Gated by `Config.audit_log`.
 
-use sha2::{Digest, Sha256};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,7 +120,10 @@ mod tests {
         // Should not panic and should not create the audit file.
         record(false, None, &tmp, "write", "{}", "deny", "user", None, None);
         let default_path = tmp.join(".catalyst-code").join("audit.jsonl");
-        assert!(!default_path.exists(), "disabled record should not create file");
+        assert!(
+            !default_path.exists(),
+            "disabled record should not create file"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -333,7 +333,10 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
     let resets_at = v
         .get("window")
         .and_then(|w| w.get("resets_at"))
-        .and_then(|r| r.as_i64().or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok())));
+        .and_then(|r| {
+            r.as_i64()
+                .or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok()))
+        });
 
     let remaining_minutes = v
         .get("window")
@@ -3048,7 +3051,6 @@ pub fn is_xai_endpoint(base_url: &str) -> bool {
         .to_ascii_lowercase();
     host == "api.x.ai" || host == "x.ai" || host.ends_with(".x.ai")
 }
-
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
 /// tool result message. Context compaction can drop tool results while keeping
@@ -7608,12 +7610,8 @@ mod tests {
                 }
             })
         );
-        let (base, server) = mock_openai_sse_server(vec![
-            failure.clone(),
-            failure.clone(),
-            failure,
-        ])
-        .await;
+        let (base, server) =
+            mock_openai_sse_server(vec![failure.clone(), failure.clone(), failure]).await;
         let provider = mock_provider(base);
         let mut timer = TurnTimer::new();
         let error = stream_turn_openai(
@@ -7648,8 +7646,7 @@ mod tests {
                 }]
             })
         );
-        let (base, server) =
-            mock_openai_sse_server(vec![malformed.clone(), malformed]).await;
+        let (base, server) = mock_openai_sse_server(vec![malformed.clone(), malformed]).await;
         let provider = mock_provider(base);
         let mut timer = TurnTimer::new();
         let error = stream_turn_openai(
@@ -7840,7 +7837,13 @@ mod tests {
         for m in &models {
             eprintln!(
                 "  {} ({}) ctx={} out={} reasoning={} vision={} levels={:?}",
-                m.id, m.name, m.context_window, m.max_tokens, m.reasoning, m.vision, m.thinking_levels
+                m.id,
+                m.name,
+                m.context_window,
+                m.max_tokens,
+                m.reasoning,
+                m.vision,
+                m.thinking_levels
             );
         }
     }

@@ -1061,8 +1061,10 @@ pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
         ));
     }
     if steps.is_empty() {
-        steps.push_str("(no step results)
-");
+        steps.push_str(
+            "(no step results)
+",
+        );
     }
     let plan_summary = mode
         .plan
@@ -1112,7 +1114,6 @@ pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
         steps = steps,
     )
 }
-
 
 /// Minimum wrap-up assistant chars that count as a "rich" model summary.
 /// Below this we still emit the deterministic checklist so Done is never blank.
@@ -1360,8 +1361,10 @@ pub async fn deploy_goal(
         // Run each step with global + per-model concurrency caps.
         // Track step_id alongside each handle so a JoinError (panic) can still
         // mark the right step as failed.
-        let mut handles: Vec<(String, tokio::task::JoinHandle<(String, bool, String, Option<String>)>)> =
-            Vec::new();
+        let mut handles: Vec<(
+            String,
+            tokio::task::JoinHandle<(String, bool, String, Option<String>)>,
+        )> = Vec::new();
         for p in wave_prompts {
             if cancel.is_cancelled() {
                 break;
@@ -1425,8 +1428,7 @@ pub async fn deploy_goal(
                     // queued steps stay Pending (no Running→Skipped flash).
                     {
                         let mut mode = st_c.goal.lock().await;
-                        if let Some(prompt) =
-                            mode.prompts.iter_mut().find(|x| x.step_id == step_id)
+                        if let Some(prompt) = mode.prompts.iter_mut().find(|x| x.step_id == step_id)
                         {
                             prompt.status = DeployStatus::Running;
                         }
@@ -1476,8 +1478,7 @@ pub async fn deploy_goal(
                     let summary = nonempty_step_summary(&output);
                     let _ = write_step_artifact(&workspace, &goal_id, &step_id, &output);
                     let (title, agent, run_id, status, clear_rid) =
-                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id)
-                        {
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
                             if ok {
                                 p.status = DeployStatus::Done;
                             } else {
@@ -1538,8 +1539,7 @@ pub async fn deploy_goal(
                     let summary = format!("task join error: {e}");
                     let _ = write_step_artifact(&workspace, &goal_id, &step_id, &summary);
                     let (title, agent, run_id, clear_rid) =
-                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id)
-                        {
+                        if let Some(p) = mode.prompts.iter_mut().find(|p| p.step_id == step_id) {
                             p.status = DeployStatus::Failed;
                             p.summary = Some(nonempty_step_summary(&summary));
                             let clear_rid = p.run_id.clone();
@@ -2048,8 +2048,8 @@ mod tests {
     #[test]
     fn write_step_artifact_roundtrip() {
         let dir = tempfile_dir();
-        let rel = write_step_artifact(&dir, "gid", "step1", "full output here")
-            .expect("artifact path");
+        let rel =
+            write_step_artifact(&dir, "gid", "step1", "full output here").expect("artifact path");
         assert_eq!(rel, ".catalyst-code/goal-ux/artifacts/gid/step1.md");
         let body = std::fs::read_to_string(dir.join(&rel)).unwrap();
         assert_eq!(body, "full output here");
@@ -2083,7 +2083,10 @@ mod tests {
         assert!(
             captured.iter().any(|(k, d)| {
                 k == "goal_completion_summary"
-                    && d.get("text").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+                    && d.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
             }),
             "finish_synthesis must emit non-empty goal_completion_summary; got {captured:?}"
         );

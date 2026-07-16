@@ -29,10 +29,10 @@ mod presence;
 mod protocol;
 mod provider;
 mod search_tool;
-mod test_env;
 mod session;
 mod staging;
 mod subagent;
+mod test_env;
 mod tool_cache;
 mod tools;
 mod vision;
@@ -1166,10 +1166,7 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
     cancel_goal_deploy(&st).await;
     // Emit before the (possibly slow) workspace snapshot so UIs leave the
     // plan_ready dark gap immediately.
-    emit(&Event::new("info").with(
-        "message",
-        json!("Goal deploy: snapshotting workspace…"),
-    ));
+    emit(&Event::new("info").with("message", json!("Goal deploy: snapshotting workspace…")));
     let tok = CancellationToken::new();
     *st.goal_deploy_cancel.lock().await = Some(tok.clone());
     tokio::spawn(async move {
@@ -1219,10 +1216,7 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
                 goal::finish_synthesis(&mut g, false);
                 goal::sync_work_state_from_prompts(&st, &g).await;
             }
-            emit(
-                &Event::new("error")
-                    .with("message", json!("goal wrap-up skipped: no models")),
-            );
+            emit(&Event::new("error").with("message", json!("goal wrap-up skipped: no models")));
             return;
         };
         drop(models);
@@ -1401,11 +1395,9 @@ async fn speculative_prefetch(st: &Arc<State>, prompt: &str) {
             let _p = sem.acquire().await.ok();
             let args = json!({ "pattern": g, "head_limit": 20 });
             let args_str = args.to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                tools::execute("grep", &args, &cfg)
-            })
-            .await
-            .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
+            let outcome = tokio::task::spawn_blocking(move || tools::execute("grep", &args, &cfg))
+                .await
+                .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
             if outcome.ok {
                 stc.tool_output_cache
                     .lock()
@@ -1422,11 +1414,9 @@ async fn speculative_prefetch(st: &Arc<State>, prompt: &str) {
             let _p = sem.acquire().await.ok();
             let args = json!({ "pattern": g });
             let args_str = args.to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                tools::execute("glob", &args, &cfg)
-            })
-            .await
-            .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
+            let outcome = tokio::task::spawn_blocking(move || tools::execute("glob", &args, &cfg))
+                .await
+                .unwrap_or_else(|_| tools::Outcome::err("prefetch panicked"));
             if outcome.ok {
                 stc.tool_output_cache
                     .lock()
@@ -2699,12 +2689,10 @@ async fn main() {
                     &paths,
                     false,
                 ) {
-                    Ok(m) => emit(
-                        &Event::new("info").with(
-                            "message",
-                            json!(format!("checkpoint {} created ({})", m.id, m.kind)),
-                        ),
-                    ),
+                    Ok(m) => emit(&Event::new("info").with(
+                        "message",
+                        json!(format!("checkpoint {} created ({})", m.id, m.kind)),
+                    )),
                     Err(e) => emit(&Event::new("error").with("message", json!(e))),
                 }
             }
@@ -2717,12 +2705,10 @@ async fn main() {
             Command::RestoreCheckpoint { id } => {
                 let cfg = state.cfg.read().await;
                 match checkpoint::restore(&cfg.workspace, cfg.session_file.as_deref(), &id) {
-                    Ok(m) => emit(
-                        &Event::new("info").with(
-                            "message",
-                            json!(format!("restored checkpoint {} ({})", m.id, m.kind)),
-                        ),
-                    ),
+                    Ok(m) => emit(&Event::new("info").with(
+                        "message",
+                        json!(format!("restored checkpoint {} ({})", m.id, m.kind)),
+                    )),
                     Err(e) => emit(&Event::new("error").with("message", json!(e))),
                 }
             }
@@ -3634,8 +3620,7 @@ async fn main() {
                             };
                             let parent = turn_model.clone();
                             tokio::spawn(async move {
-                                let provider =
-                                    st_scout.resolve_provider_for_model(&parent).await;
+                                let provider = st_scout.resolve_provider_for_model(&parent).await;
                                 let args = json!({
                                     "agent": "scout",
                                     "task": format!(
@@ -3656,8 +3641,7 @@ async fn main() {
                                 .await;
                                 if outcome.ok && !outcome.output.trim().is_empty() {
                                     let mut g = st_scout.goal.lock().await;
-                                    let text: String =
-                                        outcome.output.chars().take(4000).collect();
+                                    let text: String = outcome.output.chars().take(4000).collect();
                                     g.scout_findings = Some(text);
                                     emit(&Event::new("info").with(
                                         "message",
@@ -4528,9 +4512,17 @@ fn run_turn_and_drain(
         // malformed model payload hitting an unwrap/index), we still clear
         // `current` and emit error+done so the TUI never wedges on a stuck
         // "working" footer with no turn actually running.
-        let result = AssertUnwindSafe(run_turn(&st, &client, model, prompt, effort, images, tok.clone()))
-            .catch_unwind()
-            .await;
+        let result = AssertUnwindSafe(run_turn(
+            &st,
+            &client,
+            model,
+            prompt,
+            effort,
+            images,
+            tok.clone(),
+        ))
+        .catch_unwind()
+        .await;
         // The turn ended for any reason — notify lifecycle plugins and release
         // the current-token slot unconditionally so new turns can start.
         dispatch_lifecycle(&st, "session_stop").await;
@@ -5539,7 +5531,10 @@ async fn run_turn(
                     .unwrap_or(false);
                 if !current_has_vision {
                     if let Some(rec) = recommended.as_ref() {
-                        if models_snapshot.iter().any(|m| m.id.as_str() == rec.as_str()) {
+                        if models_snapshot
+                            .iter()
+                            .any(|m| m.id.as_str() == rec.as_str())
+                        {
                             emit(&Event::new("info").with(
                                 "message",
                                 json!(format!(
@@ -7005,10 +7000,8 @@ async fn run_turn(
                     if outcome.ok {
                         if let Some(d) = &outcome.diff {
                             if !d.is_empty() {
-                                let path = exec_args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let path =
+                                    exec_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                 emit(
                                     &Event::new("file_change")
                                         .with("path", json!(path))
@@ -8931,8 +8924,10 @@ mod system_prompt_slim_tests {
         );
         // Fixed prefix pieces (base + plugin pointer + stub) stay small even
         // when the developer's real global memories inflate the full prompt.
-        let fixed = SYSTEM_PROMPT_BASE.len() + PLUGIN_DOCS.len()
-            + SUBAGENT_ORCHESTRATOR_STUB.len() + PROVIDER_GUIDE.len();
+        let fixed = SYSTEM_PROMPT_BASE.len()
+            + PLUGIN_DOCS.len()
+            + SUBAGENT_ORCHESTRATOR_STUB.len()
+            + PROVIDER_GUIDE.len();
         assert!(
             fixed < 4_500,
             "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"

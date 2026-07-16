@@ -77,7 +77,7 @@ type goalDraft struct {
 }
 
 const (
-	goalFieldGoal = iota
+	goalFieldGoal    = iota
 	goalFieldProfile // Serial / Parallel / Ultra preset
 	goalFieldConcurrency
 	goalFieldMaxTasks
@@ -3221,7 +3221,7 @@ func (s *session) renderGoalModal() string {
 	}
 	section := func(title string) string {
 		rule := strings.Repeat("─", max(1, inner-len([]rune(title))-3))
-		return dimStyle.Render("  "+title+" "+rule)
+		return dimStyle.Render("  " + title + " " + rule)
 	}
 
 	var lines []string

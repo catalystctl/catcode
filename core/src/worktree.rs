@@ -45,20 +45,14 @@ fn git_out(workspace: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("git {} failed to spawn: {e}", args.first().unwrap_or(&"")))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            err.trim()
-        ));
+        return Err(format!("git {} failed: {}", args.join(" "), err.trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Create a linked worktree for `run_id`. Returns the absolute worktree path.
 pub fn add_worktree(workspace: &Path, run_id: &str) -> Result<PathBuf, String> {
-    let _guard = WORKTREE_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = WORKTREE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     add_worktree_locked(workspace, run_id)
 }
 
@@ -70,8 +64,7 @@ fn add_worktree_locked(workspace: &Path, run_id: &str) -> Result<PathBuf, String
         );
     }
     let root = worktrees_root(workspace);
-    std::fs::create_dir_all(&root)
-        .map_err(|e| format!("create worktrees dir: {e}"))?;
+    std::fs::create_dir_all(&root).map_err(|e| format!("create worktrees dir: {e}"))?;
     // Sanitize run_id for a branch/path segment.
     let safe: String = run_id
         .chars()
@@ -117,9 +110,7 @@ fn add_worktree_locked(workspace: &Path, run_id: &str) -> Result<PathBuf, String
 
 /// Remove a linked worktree (best-effort).
 pub fn remove_worktree(workspace: &Path, wt_path: &Path) -> Result<(), String> {
-    let _guard = WORKTREE_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = WORKTREE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     remove_worktree_locked(workspace, wt_path)
 }
 
@@ -138,10 +129,7 @@ fn remove_worktree_locked(workspace: &Path, wt_path: &Path) -> Result<(), String
             .current_dir(workspace)
             .status();
     }
-    emit(
-        &Event::new("worktree_cleaned")
-            .with("path", json!(path_str)),
-    );
+    emit(&Event::new("worktree_cleaned").with("path", json!(path_str)));
     Ok(())
 }
 
@@ -273,7 +261,10 @@ fn sync_git_deletions(
     if !is_git_repo(src_repo) {
         return Ok(());
     }
-    let out = match git_out(src_repo, &["diff", "--name-only", "--diff-filter=D", "HEAD"]) {
+    let out = match git_out(
+        src_repo,
+        &["diff", "--name-only", "--diff-filter=D", "HEAD"],
+    ) {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
@@ -380,22 +371,18 @@ mod tests {
             .current_dir(&main)
             .status();
         std::fs::write(main.join("A.txt"), b"committed").unwrap();
-        assert!(
-            Command::new("git")
-                .args(["add", "A.txt"])
-                .current_dir(&main)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["commit", "-m", "add A"])
-                .current_dir(&main)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .args(["add", "A.txt"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "add A"])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
 
         // Dirty uncommitted file B in main (simulates prior-wave promote).
         std::fs::write(main.join("B.txt"), b"promoted dirty").unwrap();
@@ -521,7 +508,10 @@ mod tests {
         std::fs::remove_file(wt.join("A.txt")).unwrap();
 
         let promoted = promote_worktree(&main, &wt).unwrap();
-        assert!(!main.join("A.txt").exists(), "promote must delete A.txt on main");
+        assert!(
+            !main.join("A.txt").exists(),
+            "promote must delete A.txt on main"
+        );
         assert!(
             promoted.iter().any(|p| p.contains("deleted:A.txt")),
             "expected deleted:A.txt in {promoted:?}"

@@ -25,7 +25,9 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -763,6 +765,11 @@ async fn qmp_display_size(sock: &str) -> Option<(i64, i64)> {
 
 /// Connect, do the qmp_capabilities handshake, send one command, return its
 /// `return` object. Skips async events while waiting for the response.
+///
+/// QEMU's QMP is exposed over a Unix domain socket, so this is Unix-host only.
+/// Windows-target builds still compile the Windows-VM helpers, but QMP calls
+/// fail closed (QEMU Windows VMs are managed from Linux/macOS hosts).
+#[cfg(unix)]
 async fn qmp_exec(sock: &str, cmd: &Value) -> Result<Value, String> {
     let s = UnixStream::connect(sock)
         .await
@@ -812,6 +819,11 @@ async fn qmp_exec(sock: &str, cmd: &Value) -> Result<Value, String> {
             // else: an async event — keep reading.
         }
     }
+}
+
+#[cfg(not(unix))]
+async fn qmp_exec(_sock: &str, _cmd: &Value) -> Result<Value, String> {
+    Err("QMP over Unix sockets requires a Unix host (Linux/macOS)".into())
 }
 
 // ── vnc_url / destroy / list ───────────────────────────────────────────────
@@ -1016,15 +1028,25 @@ mod tests {
         )
         .await;
         assert!(r.ok, "exec failed: {}", r.output);
-        assert!(r.output.contains("tool-says-hi"), "exec output: {}", r.output);
+        assert!(
+            r.output.contains("tool-says-hi"),
+            "exec output: {}",
+            r.output
+        );
 
         // screenshot
         let r = execute_test_env(&json!({"action":"screenshot","env_id":id}), &cfg).await;
         assert!(r.ok, "screenshot failed: {}", r.output);
         let s: Value = serde_json::from_str(&r.output).expect("screenshot output is JSON");
         let path = s["path"].as_str().expect("path");
-        assert!(std::path::Path::new(path).exists(), "screenshot file missing: {path}");
-        assert!(s["bytes"].as_u64().unwrap_or(0) > 1000, "screenshot too small");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "screenshot file missing: {path}"
+        );
+        assert!(
+            s["bytes"].as_u64().unwrap_or(0) > 1000,
+            "screenshot too small"
+        );
         eprintln!("screenshot -> {path}");
 
         // vnc_url
@@ -1034,7 +1056,11 @@ mod tests {
         // destroy
         let r = execute_test_env(&json!({"action":"destroy","env_id":id}), &cfg).await;
         assert!(r.ok, "destroy failed: {}", r.output);
-        assert!(r.output.contains("destroyed"), "destroy output: {}", r.output);
+        assert!(
+            r.output.contains("destroyed"),
+            "destroy output: {}",
+            r.output
+        );
         guard.0.take(); // disarm: destroy already removed it
     }
 }

@@ -993,24 +993,22 @@ pub fn execute(
                     );
                 }
                 match crate::worktree::add_worktree(&workspace, &run_id) {
-                    Ok(p) => {
-                        match crate::worktree::seed_worktree_from_main(&workspace, &p) {
-                            Ok(paths) => {
-                                if !paths.is_empty() {
-                                    emit(
-                                        &Event::new("worktree_seeded")
-                                            .with("run_id", json!(&run_id))
-                                            .with("paths", json!(paths)),
-                                    );
-                                }
-                                Some(p)
+                    Ok(p) => match crate::worktree::seed_worktree_from_main(&workspace, &p) {
+                        Ok(paths) => {
+                            if !paths.is_empty() {
+                                emit(
+                                    &Event::new("worktree_seeded")
+                                        .with("run_id", json!(&run_id))
+                                        .with("paths", json!(paths)),
+                                );
                             }
-                            Err(e) => {
-                                let _ = crate::worktree::remove_worktree(&workspace, &p);
-                                return Outcome::err(format!("worktree seed failed: {e}"));
-                            }
+                            Some(p)
                         }
-                    }
+                        Err(e) => {
+                            let _ = crate::worktree::remove_worktree(&workspace, &p);
+                            return Outcome::err(format!("worktree seed failed: {e}"));
+                        }
+                    },
                     Err(e) => {
                         return Outcome::err(format!("worktree setup failed: {e}"));
                     }
@@ -1044,10 +1042,12 @@ pub fn execute(
                             );
                         }
                         Err(e) => {
-                            emit(&Event::new("error").with(
-                                "message",
-                                json!(format!("worktree promote failed: {e}")),
-                            ));
+                            emit(
+                                &Event::new("error").with(
+                                    "message",
+                                    json!(format!("worktree promote failed: {e}")),
+                                ),
+                            );
                         }
                         _ => {}
                     }
@@ -1761,7 +1761,8 @@ async fn run_agent_inner(
                 outcome.ok,
             );
             // finish sentinel
-            let finish = name == "finish" && outcome.ok && outcome.output == crate::tools::FINISH_SENTINEL;
+            let finish =
+                name == "finish" && outcome.ok && outcome.output == crate::tools::FINISH_SENTINEL;
             // Map the internal sentinel to a human-readable result for the UI /
             // conversation; the loop still exits on `finish` below.
             let emit_output = if finish {
@@ -2715,37 +2716,30 @@ async fn run_parallel(
         for i in 0..resolved.len() {
             let rid = format!("{}-{}", run_id, i);
             match crate::worktree::add_worktree(&workspace, &rid) {
-                Ok(p) => {
-                    match crate::worktree::seed_worktree_from_main(&workspace, &p) {
-                        Ok(paths) => {
-                            if !paths.is_empty() {
-                                emit(
-                                    &Event::new("worktree_seeded")
-                                        .with("run_id", json!(&rid))
-                                        .with("paths", json!(paths)),
-                                );
-                            }
-                            worktrees.push(Some(p));
+                Ok(p) => match crate::worktree::seed_worktree_from_main(&workspace, &p) {
+                    Ok(paths) => {
+                        if !paths.is_empty() {
+                            emit(
+                                &Event::new("worktree_seeded")
+                                    .with("run_id", json!(&rid))
+                                    .with("paths", json!(paths)),
+                            );
                         }
-                        Err(e) => {
-                            let _ = crate::worktree::remove_worktree(&workspace, &p);
-                            for wt in worktrees.iter().flatten() {
-                                let _ = crate::worktree::remove_worktree(&workspace, wt);
-                            }
-                            return Outcome::err(format!(
-                                "worktree seed failed for task {i}: {e}"
-                            ));
-                        }
+                        worktrees.push(Some(p));
                     }
-                }
+                    Err(e) => {
+                        let _ = crate::worktree::remove_worktree(&workspace, &p);
+                        for wt in worktrees.iter().flatten() {
+                            let _ = crate::worktree::remove_worktree(&workspace, wt);
+                        }
+                        return Outcome::err(format!("worktree seed failed for task {i}: {e}"));
+                    }
+                },
                 Err(e) => {
                     // Clean up any already-created worktrees.
                     for (j, wt) in worktrees.iter().enumerate() {
                         if let Some(p) = wt {
-                            let _ = crate::worktree::remove_worktree(
-                                &workspace,
-                                p,
-                            );
+                            let _ = crate::worktree::remove_worktree(&workspace, p);
                             let _ = j;
                         }
                     }
@@ -2819,12 +2813,10 @@ async fn run_parallel(
                         );
                     }
                     Err(e) => {
-                        emit(
-                            &Event::new("error").with(
-                                "message",
-                                json!(format!("worktree promote failed for task {i}: {e}")),
-                            ),
-                        );
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!("worktree promote failed for task {i}: {e}")),
+                        ));
                     }
                     _ => {}
                 }
