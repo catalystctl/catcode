@@ -3262,6 +3262,7 @@ const PLUGIN_COPY_SKIP: &[&str] = &[
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".runtime",
     "node_modules",
     ".DS_Store",
     ".tox",
@@ -3283,7 +3284,16 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
         let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if PLUGIN_COPY_SKIP.iter().any(|s| *s == name_str) {
+        // Never copy local dotenv credentials into the managed plugin
+        // directory. Keep the checked-in example so plugins can still
+        // document optional development configuration.
+        let dotenv_secret = name_str == ".env"
+            || (name_str.starts_with(".env.") && name_str != ".env.example");
+        if dotenv_secret
+            || PLUGIN_COPY_SKIP
+                .iter()
+                .any(|s| *s == name_str)
+        {
             continue;
         }
         let ft = entry
@@ -3406,6 +3416,25 @@ mod tests {
         assert_eq!(plugin.hooks.len(), 0);
         assert!(plugin.commands.is_empty());
         assert!(plugin.enabled);
+    }
+
+    #[test]
+    fn plugin_copy_excludes_dotenv_secrets_but_keeps_example() {
+        let src = TmpDir::new("copy_dotenv_src");
+        let dst = TmpDir::new("copy_dotenv_dst");
+        fs::write(src.path.join("plugin.json"), "{}").unwrap();
+        fs::write(src.path.join(".env"), "SECRET=one\n").unwrap();
+        fs::write(src.path.join(".env.production"), "SECRET=two\n").unwrap();
+        fs::write(src.path.join(".env.example"), "SECRET=replace_me\n").unwrap();
+        fs::create_dir_all(src.path.join(".runtime")).unwrap();
+        fs::write(src.path.join(".runtime/private.log"), "secret runtime state\n").unwrap();
+
+        copy_dir(&src.path, &dst.path).unwrap();
+
+        assert!(!dst.path.join(".env").exists());
+        assert!(!dst.path.join(".env.production").exists());
+        assert!(dst.path.join(".env.example").exists());
+        assert!(!dst.path.join(".runtime").exists());
     }
 
     #[test]
