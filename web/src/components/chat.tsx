@@ -703,24 +703,24 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onOpenProjects={!docked ? openProjects : undefined}
         />
 
-        {state.workState && <WorkStatePanel ws={state.workState} />}
+        {state.workState && <WorkStatePanel ws={state.workState} compact={!!docked} />}
         {state.streaming && !state.workState && (
           <AgentActivity compact={!!docked} activity={undefined} hasWorkState={false} />
         )}
 
-        {/* Messages */}
+        {/* Messages — flex sibling; composer stays below so it never clips */}
         <div className="relative min-h-0 flex-1">
-        <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto">
+        <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto overflow-x-hidden">
           {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
           {!switching && (
-            <div ref={hitlGateRef} className={`mx-auto ${docked ? "max-w-none" : "max-w-3xl"}`}>
+            <div ref={hitlGateRef} className={`mx-auto w-full ${docked ? "max-w-none" : "max-w-3xl"}`}>
               {state.pendingApproval && (
-                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                   <Approval approval={state.pendingApproval} onApprove={agent.approve} />
                 </div>
               )}
               {state.pendingIntercom && (
-                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                   <IntercomPrompt
                     prompt={state.pendingIntercom}
                     onReply={agent.intercomReply}
@@ -729,7 +729,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 </div>
               )}
               {state.pendingAsk && (
-                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                   <AskFlyout
                     prompt={state.pendingAsk}
                     onSubmit={(answers) => agent.askReply(answers)}
@@ -738,7 +738,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 </div>
               )}
               {state.pendingSudo && (
-                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                   <SudoPrompt
                     prompt={state.pendingSudo}
                     onApprove={(password) => agent.sudoReply(true, password)}
@@ -747,7 +747,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 </div>
               )}
               {state.pendingOauth && (
-                <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                   <OauthPromptBanner
                     prompt={state.pendingOauth}
                     onSubmit={agent.submitOauthCode}
@@ -758,7 +758,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               {state.goalMode &&
                 state.goalMode.phase === "plan_ready" &&
                 !state.goalMode.auto_deploy && (
-                  <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                     <GoalPlanBanner
                       goal={state.goalMode.goal}
                       summary={state.goalPlan?.summary}
@@ -790,7 +790,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 state.goalMode.phase !== "idle" &&
                 (state.goalMode.phase !== "plan_ready" ||
                   state.goalMode.auto_deploy) && (
-                  <div className="mx-4 mb-2 mt-3 sm:mx-6">
+                  <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                     <GoalProgressPanel
                       goalMode={state.goalMode}
                       onCancel={() => void agent.cancelGoal()}
@@ -820,7 +820,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
-            <div className={`mx-auto py-4 ${docked ? "max-w-none" : "max-w-3xl"}`}>
+            <div className={`mx-auto w-full ${docked ? "max-w-none py-3" : "max-w-3xl py-4"}`}>
               <ErrorBoundary label="message list">
                 {state.messages.map((m, i) => (
                   <Message
@@ -834,7 +834,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                   />
                 ))}
               </ErrorBoundary>
-              <div className="h-4" />
+              <div className={docked ? "h-3" : "h-4"} />
             </div>
           )}
 
@@ -847,7 +847,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 const el = scrollRef.current;
                 if (el) el.scrollTop = el.scrollHeight;
               }}
-              className="pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-accent/40 bg-ink-900/95 px-3.5 py-1.5 text-[12px] font-medium text-ink-100 shadow-lg shadow-black/40 backdrop-blur hover:border-accent/60 hover:bg-ink-850"
+              className="chat-jump-pill pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-accent/40 bg-ink-900/95 px-3.5 py-1.5 text-[12px] font-medium text-ink-100 shadow-lg shadow-black/40 backdrop-blur hover:border-accent/60 hover:bg-ink-850"
             >
               ↓ Jump to latest
             </button>
@@ -996,33 +996,57 @@ function EmptyState({
   adaptive?: boolean;
   onPick: (t: string) => void;
 }) {
+  // HITL + empty: shrink hero so approval/ask stay visible without scrolling past chrome.
+  const hitlCompact = !!compact;
+  const dockedEmpty = !!adaptive;
   return (
     <div
       className={`chat-empty-hero flex flex-col items-center justify-center text-center ${
-        adaptive ? "min-h-full px-4 py-5" : "px-6"
+        dockedEmpty
+          ? hitlCompact
+            ? "min-h-0 px-3 py-3"
+            : "min-h-full px-4 py-6"
+          : "px-6"
       } ${
-        compact ? "min-h-0 py-6" : adaptive ? "" : "h-full py-10"
+        hitlCompact && !dockedEmpty
+          ? "min-h-0 py-6"
+          : dockedEmpty
+            ? ""
+            : "h-full py-12"
       }`}
     >
-      <div className={`${adaptive ? "mb-3" : "mb-5"}`}>
-        <BrandMark size={adaptive ? 40 : 64} className={adaptive ? "rounded-xl" : "rounded-2xl"} />
+      <div className={`${dockedEmpty ? (hitlCompact ? "mb-2" : "mb-4") : "mb-6"} chat-empty-mark`}>
+        <BrandMark
+          size={dockedEmpty ? (hitlCompact ? 28 : 36) : 56}
+          className={dockedEmpty ? "rounded-xl" : "rounded-2xl shadow-glow"}
+        />
       </div>
-      <h1 className={`${adaptive ? "text-base" : "text-2xl"} font-semibold tracking-tight text-ink-100`}>{adaptive ? "What should we work on?" : "Catalyst Code"}</h1>
-      <p className={`${adaptive ? "mt-1 text-[11px]" : "mt-2 text-[14px]"} max-w-md text-ink-400`}>
+      <h1
+        className={`font-display ${
+          dockedEmpty ? (hitlCompact ? "text-sm" : "text-[15px]") : "text-[1.65rem]"
+        } font-semibold tracking-tight text-ink-100`}
+      >
+        {dockedEmpty ? "What should we work on?" : "Catalyst Code"}
+      </h1>
+      <p
+        className={`${
+          dockedEmpty ? "mt-1 max-w-xs text-[11px]" : "mt-2.5 max-w-md text-[14px]"
+        } leading-relaxed text-ink-400`}
+      >
         {switching ? (
           "Loading session…"
         ) : (
           <>
-            {adaptive ? "Working in " : "An agentic coding companion running on "}
+            {dockedEmpty ? "Working in " : "Build, debug, and explore — powered by "}
             <span className="font-mono text-accent-soft">
               {basename(workspace) || workspace || "this workspace"}
             </span>
-            .{connected && !adaptive ? " Ask it to build, debug, explore, or explain." : !connected ? " Connecting…" : ""}
+            .{connected && !dockedEmpty ? " Pick a start below, or just type." : !connected ? " Connecting…" : ""}
           </>
         )}
       </p>
-      {!switching && !(adaptive && compact) && (
-        <div className={`${adaptive ? "mt-4 grid-cols-2 gap-1.5" : "mt-7 gap-2"} grid w-full max-w-lg`}>
+      {!switching && !(dockedEmpty && hitlCompact) && (
+        <div className={`${dockedEmpty ? "mt-5 grid-cols-2 gap-1.5" : "mt-8 gap-2"} grid w-full max-w-lg`}>
           {EXAMPLES.map((ex) => (
             <button
               key={ex.label}
@@ -1031,11 +1055,11 @@ function EmptyState({
                 if (!canSend) return;
                 onPick(ex.prompt);
               }}
-              className={`group flex items-center rounded-xl border border-ink-800 bg-ink-900/40 text-left text-ink-300 transition-all hover:border-accent/40 hover:bg-ink-850 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 ${adaptive ? "gap-2 px-2.5 py-2" : "gap-3 px-4 py-3 text-[13px]"}`}
+              className={`group flex items-center rounded-xl border border-ink-800/80 bg-ink-900/30 text-left text-ink-300 transition-all duration-150 hover:border-accent/40 hover:bg-ink-850/80 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 ${dockedEmpty ? "gap-2 px-2.5 py-2" : "gap-3 px-4 py-3.5 text-[13px]"}`}
             >
-              <SparkIcon width={adaptive ? 12 : 14} height={adaptive ? 12 : 14} className="shrink-0 text-ink-500 group-hover:text-accent-soft" />
-              <span className="min-w-0 flex-1"><span className="block font-medium text-ink-200">{ex.label}</span>{!adaptive && <span className="mt-0.5 block text-[11px] text-ink-500">{ex.detail}</span>}</span>
-              {!adaptive && <SendIcon width={13} height={13} className="shrink-0 text-ink-600 group-hover:text-accent-soft" />}
+              <SparkIcon width={dockedEmpty ? 12 : 14} height={dockedEmpty ? 12 : 14} className="shrink-0 text-ink-500 transition-colors group-hover:text-accent-soft" />
+              <span className="min-w-0 flex-1"><span className="block font-medium text-ink-200">{ex.label}</span>{!dockedEmpty && <span className="mt-0.5 block text-[11px] text-ink-500">{ex.detail}</span>}</span>
+              {!dockedEmpty && <SendIcon width={13} height={13} className="shrink-0 text-ink-600 transition-colors group-hover:text-accent-soft" />}
             </button>
           ))}
         </div>
@@ -1047,12 +1071,29 @@ function EmptyState({
 function AgentActivity({ compact, activity, hasWorkState }: { compact: boolean; activity?: string; hasWorkState: boolean }) {
   const label = activity?.trim() || (hasWorkState ? "Working through the plan" : "Understanding your request");
   return (
-    <div className={`mx-auto flex w-full max-w-3xl items-center gap-2 px-4 py-1.5 text-[10px] text-ink-500 ${compact ? "border-b border-ink-900/60" : "sm:px-6"}`} role="status" aria-live="polite">
-      <span className="relative flex h-2 w-2 shrink-0"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-40" /><span className="relative inline-flex h-2 w-2 rounded-full bg-accent" /></span>
-      <span className="truncate text-ink-400">{label}</span>
-      <span className="ml-auto hidden items-center gap-1.5 text-ink-600 sm:flex" aria-label="Agent activity stages">
-        <span className="text-accent-soft">Understand</span><span>→</span><span className={hasWorkState ? "text-accent-soft" : ""}>Work</span><span>→</span><span>Respond</span>
+    <div
+      className={`mx-auto flex w-full items-center gap-2 border-b border-ink-800/80 text-[10px] text-ink-500 ${
+        compact
+          ? "max-w-none px-2 py-1"
+          : "max-w-3xl px-4 py-1.5 sm:px-6"
+      }`}
+      role="status"
+      aria-live="polite"
+    >
+      <span className="relative flex h-1.5 w-1.5 shrink-0">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-40" />
+        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-accent" />
       </span>
+      <span className="min-w-0 flex-1 truncate text-ink-400">{label}</span>
+      {!compact && (
+        <span className="ml-auto hidden items-center gap-1.5 text-ink-600 sm:flex" aria-label="Agent activity stages">
+          <span className="text-accent-soft">Understand</span>
+          <span>→</span>
+          <span className={hasWorkState ? "text-accent-soft" : ""}>Work</span>
+          <span>→</span>
+          <span>Respond</span>
+        </span>
+      )}
     </div>
   );
 }

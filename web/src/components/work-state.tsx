@@ -20,6 +20,8 @@ import type { WorkState as WorkStateData } from "@/lib/types";
 
 interface Props {
   ws: WorkStateData;
+  /** Narrow dock / IdeShell copilot — align width with transcript, denser padding. */
+  compact?: boolean;
 }
 
 function Chip({
@@ -47,7 +49,7 @@ function Chip({
   );
 }
 
-export function WorkStatePanel({ ws }: Props) {
+export function WorkStatePanel({ ws, compact }: Props) {
   // Keep the feed after a goal completes: completed steps live in `done`, and
   // in_progress/next go empty — without counting `done`, the strip vanishes.
   const hasContent =
@@ -65,10 +67,14 @@ export function WorkStatePanel({ ws }: Props) {
   const doneCap = goalComplete ? 6 : 3;
 
   return (
-    <div className="mx-auto max-w-3xl px-4 sm:px-6">
+    <div
+      className={`mx-auto w-full ${compact ? "max-w-none px-2" : "max-w-3xl px-4 sm:px-6"}`}
+    >
       {/* A single faint hairline anchors the line as a status strip without the
           heavy boxed surface that made it read as a second header. */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-ink-900/50 pb-2 pt-2.5">
+      <div
+        className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-ink-800/80 ${compact ? "gap-y-1 pb-1.5 pt-1.5" : "gap-y-1.5 pb-2 pt-2.5"}`}
+      >
         {/* goal — the hero. One accent dot, no label. */}
         {ws.goal && (
           <div className="flex min-w-0 items-center gap-2">

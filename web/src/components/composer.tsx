@@ -562,7 +562,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   };
 
   return (
-    <div className={`relative border-t border-ink-800/80 bg-ink-950/80 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
+    <div className={`relative border-t border-ink-800/60 bg-ink-950/90 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2.5 backdrop-blur-md ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
       <div className={`mx-auto ${compact ? "max-w-none" : "max-w-3xl"}`}>
         {hitlOpen && (
           <p className="mb-1.5 px-1 text-[11px] text-accent-soft" role="status">
@@ -639,10 +639,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             // attribute mismatch while preserving SSR for the composer.
             suppressHydrationWarning
             className={
-              "flex items-end gap-2 rounded-2xl p-2 shadow-lg shadow-black/20 transition-all duration-200 " +
+              "composer-shell flex flex-wrap items-end gap-1.5 rounded-2xl p-2 transition-[box-shadow,border-color] duration-200 " +
               (streaming
                 ? "composer-inflight"
-                : "border border-ink-700/70 bg-ink-900/80 focus-within:border-accent/50 focus-within:shadow-glow")
+                : "border border-ink-700/50 bg-ink-900/90 shadow-lg shadow-black/15 focus-within:border-accent/50 focus-within:shadow-glow")
             }
           >
             <ImageAttach ref={attachRef} images={images} onAdd={onAddImage} onRemove={onRemoveImage} />
@@ -667,16 +667,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                       : "Message the agent…  (/ for commands, @ for files)"
                   : "Connecting…"
               }
-              className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-[16px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50 sm:max-h-60 sm:text-[14px]"
+              className="max-h-40 min-w-[8rem] flex-1 resize-none bg-transparent px-2 py-1.5 text-[16px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50 sm:max-h-60 sm:text-[14px]"
             />
             {streaming ? (
-              <>
+              <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
                 {text.trim() && (
                   <>
                     <button
                       onClick={submit}
                       disabled={hitlOpen || !connected || (!canSend && !(text.trim().startsWith("/") || text.trim().startsWith("!")))}
-                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3.5 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
+                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
                       title="Queue follow-up (Enter)"
                     >
                       <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Queue</span>
@@ -684,7 +684,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                     <button
                       onClick={submitSteer}
                       disabled={hitlOpen || !connected || !canSend}
-                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3.5 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
+                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
                       title="Steer in-flight turn (Ctrl+Enter)"
                     >
                       {compact && <span aria-hidden="true">↗</span>}
@@ -694,16 +694,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                 )}
                 <button
                   onClick={onAbort}
-                  className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3.5 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
+                  className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
                 >
                   <StopIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Stop</span>
                 </button>
-              </>
+              </div>
             ) : (
               <button
                 onClick={submit}
                 disabled={disabled || (!text.trim() && images.length === 0)}
-                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3.5 text-[13px] font-semibold text-white transition-all hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3.5 text-[13px] font-semibold text-white transition-all hover:bg-accent-soft hover:shadow-glow disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 disabled:shadow-none"
               >
                 <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Send</span>
               </button>

@@ -38,55 +38,63 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   };
 
   return (
-    <div className="my-1.5 overflow-hidden rounded-lg border border-ink-800 bg-ink-925/40">
+    <div
+      className={`my-0.5 overflow-hidden rounded-md border transition-colors ${
+        running
+          ? "border-ink-800/50 bg-ink-925/25"
+          : isError
+            ? "border-danger/25 bg-ink-925/30"
+            : "border-ink-800/40 bg-transparent hover:bg-ink-925/30"
+      }`}
+    >
       <button
         onClick={() => {
           userToggledRef.current = true;
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-ink-850/60"
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left transition-colors hover:bg-ink-850/40"
       >
         <ChevronRight
-          width={14}
-          height={14}
-          className={`shrink-0 text-ink-500 transition-transform ${open ? "rotate-90" : ""}`}
+          width={12}
+          height={12}
+          className={`shrink-0 text-ink-600 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
         />
-        <span className="shrink-0 text-sm">{toolIcon(tc.name)}</span>
-        <span className="font-mono text-[13px] font-medium text-ink-100">{tc.name || "tool"}</span>
+        <span className="shrink-0 text-[13px] opacity-80">{toolIcon(tc.name)}</span>
+        <span className="font-mono text-[12px] font-medium text-ink-200">{tc.name || "tool"}</span>
         {danger && (
-          <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
+          <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-warning">
             destructive
           </span>
         )}
-        <span className="ml-1 truncate font-mono text-[11px] text-ink-500">
+        <span className="ml-0.5 min-w-0 flex-1 truncate font-mono text-[10px] text-ink-600">
           {truncate(tc.argString || JSON.stringify(tc.args), 64)}
         </span>
-        <span className="ml-auto flex items-center gap-1.5">
+        <span className="ml-auto flex shrink-0 items-center gap-1">
           {running ? (
-            <span className="flex items-center gap-1 text-[11px] text-accent-soft">
+            <span className="flex items-center gap-1 text-[10px] text-accent-soft">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent-soft" />
               running
             </span>
           ) : unknown ? (
-            <span className="flex items-center gap-1 text-[11px] text-ink-500">
-              <span className="h-1.5 w-1.5 rounded-full bg-ink-600" />
+            <span className="flex items-center gap-1 text-[10px] text-ink-600">
+              <span className="h-1 w-1 rounded-full bg-ink-600" />
               loaded
             </span>
           ) : ok ? (
-            <span className="flex items-center gap-1 text-[11px] text-success">
-              <CheckIcon width={12} height={12} /> ok
+            <span className="flex items-center gap-1 text-[10px] text-success">
+              <CheckIcon width={11} height={11} /> ok
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-danger">
-              <XIcon width={12} height={12} /> error
+            <span className="flex items-center gap-1 text-[10px] text-danger">
+              <XIcon width={11} height={11} /> error
             </span>
           )}
         </span>
       </button>
 
       {open && (
-        <div className="border-t border-ink-800/70 bg-ink-950">
+        <div className="border-t border-ink-800/50 bg-ink-950/80">
           {tc.argString && (
             <div className="px-3 py-2">
               <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">arguments</div>

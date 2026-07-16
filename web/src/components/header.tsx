@@ -84,7 +84,7 @@ export function Header(props: Props) {
   const approvalModes: Array<"never" | "destructive" | "always"> = ["never", "destructive", "always"];
 
   return (
-    <header className={`relative z-20 flex min-w-0 items-center gap-1.5 border-b border-ink-800/80 bg-ink-950/60 px-2 py-2 backdrop-blur ${props.compact ? "flex-wrap" : "sm:px-4"}`}>
+    <header className={`relative z-20 flex min-w-0 items-center gap-1.5 border-b border-ink-800/60 bg-ink-950/70 px-2 backdrop-blur-md ${props.compact ? "flex-wrap py-1.5" : "py-2 sm:px-4"}`}>
       {/* Mobile sidebar toggle */}
       <button
         onClick={props.onMenuClick}

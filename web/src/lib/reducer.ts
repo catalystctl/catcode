@@ -1154,6 +1154,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
               kind: "message",
               role: "assistant",
               content: summary,
+              ts: Date.now(),
             });
           }
           return {

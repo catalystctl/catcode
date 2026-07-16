@@ -94,7 +94,7 @@ function UserMessage({
   };
 
   return (
-    <div className={`group flex justify-end py-2 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
+    <div className={`group chat-msg-enter flex justify-end py-2.5 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
       <div className="relative max-w-[min(85%,28rem)] sm:max-w-[85%]">
         {editing ? (
           <div className="rounded-2xl rounded-tr-sm border border-accent/40 bg-ink-800/70 p-2">
@@ -129,7 +129,7 @@ function UserMessage({
           </div>
         ) : (
           <>
-            <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-ink-700/60 bg-ink-800/70 px-4 py-2.5 text-[14px] leading-relaxed text-ink-100">
+            <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-ink-700/40 bg-ink-850/50 px-3.5 py-2 text-[14px] leading-relaxed text-ink-100">
               {m.images && m.images.length > 0 && (
                 <div className="mb-2 flex flex-wrap gap-1.5">
                   {m.images.map((src, i) => (
@@ -188,13 +188,13 @@ function AssistantMessage({
   compact?: boolean;
 }) {
   return (
-    <div className={`group py-2 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
-      <div className="flex items-center gap-2 pb-1">
-        <BrandMark size={20} />
-        <span className="text-[12px] font-medium text-ink-300">assistant</span>
-        {m.model && <span className="font-mono text-[11px] text-ink-500">{m.model}</span>}
+    <div className={`group chat-msg-enter py-2.5 ${compact ? "px-2" : "px-4 sm:px-6"}`}>
+      <div className="flex items-center gap-2 pb-1.5">
+        <BrandMark size={compact ? 16 : 18} />
+        <span className="text-[11px] font-medium tracking-wide text-ink-400">assistant</span>
+        {m.model && <span className="font-mono text-[10px] text-ink-600">{m.model}</span>}
         {m.streaming && (
-          <span className="flex items-center gap-1 text-[11px] text-accent-soft">
+          <span className="flex items-center gap-1 text-[10px] text-accent-soft">
             <DotIcon className="animate-pulse" /> streaming
           </span>
         )}
@@ -231,14 +231,14 @@ function AssistantMessage({
           )
         )}
         {m.toolCalls.length > 0 && (
-          <div className="mt-1 space-y-0.5">
+          <div className="mt-1.5 space-y-0">
             {m.toolCalls.map((tc) => (
               <ToolCallCard key={tc.id} tc={tc} />
             ))}
           </div>
         )}
         {m.usage && (
-          <div className="mt-1.5 flex items-center gap-3 font-mono text-[10px] text-ink-500">
+          <div className="mt-2 flex items-center gap-3 font-mono text-[10px] text-ink-600">
             {m.usage.prompt_tokens != null && <span>↑ {formatTokens(m.usage.prompt_tokens)}</span>}
             {m.usage.tokens_out != null && <span>↓ {formatTokens(m.usage.tokens_out)}</span>}
             {m.usage.cached_tokens ? <span>cached {formatTokens(m.usage.cached_tokens)}</span> : null}
@@ -252,9 +252,9 @@ function AssistantMessage({
 function ToolMessage({ m }: { m: ToolMsg }) {
   return (
     <div className="px-4 py-1 sm:px-6">
-      <div className="ml-0 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2 sm:ml-7">
-        <div className="font-mono text-[11px] text-ink-400">
-          {m.toolName || "tool"} result · {m.ok ? "ok" : "error"}
+      <div className="ml-0 rounded-md border border-ink-800/50 bg-ink-925/25 px-2.5 py-1.5 sm:ml-7">
+        <div className="font-mono text-[10px] uppercase tracking-wide text-ink-500">
+          {m.toolName || "tool"} · {m.ok ? "ok" : "error"}
         </div>
         <pre
           className={`mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words text-[12px] ${
@@ -272,8 +272,8 @@ function BashMessage({ m }: { m: BashMsg }) {
   const prefix = m.excludeFromContext ? "!!" : "!";
   return (
     <div className="px-4 py-1 sm:px-6">
-      <div className="ml-0 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2 sm:ml-7">
-        <div className="font-mono text-[11px] text-ink-400">
+      <div className="ml-0 rounded-md border border-ink-800/50 bg-ink-925/25 px-2.5 py-1.5 sm:ml-7">
+        <div className="font-mono text-[10px] uppercase tracking-wide text-ink-500">
           {prefix} bash · {m.ok ? "ok" : "error"}
           {m.excludeFromContext ? " · no context" : ""}
         </div>
@@ -309,8 +309,8 @@ function GoalMessage({ m }: { m: GoalMsg }) {
           : "phase";
   return (
     <div className="px-4 py-1.5 sm:px-6">
-      <div className={`ml-0 rounded-lg border bg-ink-925/50 px-3 py-2 sm:ml-7 ${tone}`}>
-        <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide">
+      <div className={`ml-0 rounded-md border bg-ink-925/30 px-2.5 py-1.5 sm:ml-7 ${tone}`}>
+        <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wide">
           <span>goal · {kindLabel}</span>
           {m.status && <span className="text-ink-500">{m.status}</span>}
         </div>

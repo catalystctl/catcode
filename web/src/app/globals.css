@@ -186,7 +186,17 @@ body {
 
 /* Empty-state hero atmosphere (full-bleed chat); keep sparse. */
 .chat-empty-hero {
-  animation: fade-in 0.28s var(--ease-out);
+  animation: fade-in 0.32s var(--ease-out);
+}
+.chat-empty-mark {
+  animation: fade-in 0.4s var(--ease-out);
+}
+/* Soft entrance for transcript turns — one motion, not per-token noise. */
+.chat-msg-enter {
+  animation: fade-in 0.22s var(--ease-out);
+}
+.chat-jump-pill {
+  animation: fade-in 0.2s var(--ease-out);
 }
 
 /* ── Subtle grid backdrop for the app shell ─────────────────────────────── */
@@ -197,7 +207,7 @@ body {
 }
 
 /* ── Composer inflight ring ─────────────────────────────────────────────────
-   A soft, flowing violet ring drawn around the prompt input while the model is
+   A soft, flowing peach ring drawn around the prompt input while the model is
    working (streaming). Uses the double-background trick: an opaque solid fill
    clipped to the padding-box (so the interior keeps its normal bg and the
    gradient never tints the text area) layered above the animated gradient, which
@@ -238,7 +248,10 @@ body {
   .animate-bounce,
   .animate-pulse,
   .animate-caret-blink,
-  .chat-empty-hero {
+  .chat-empty-hero,
+  .chat-empty-mark,
+  .chat-msg-enter,
+  .chat-jump-pill {
     animation: none !important;
   }
   .stream-caret::after {

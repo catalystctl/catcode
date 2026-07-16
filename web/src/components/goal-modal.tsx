@@ -517,32 +517,3 @@ export function GoalProgressPanel({
     </div>
   );
 }
-
-/** Compact status chip for an active goal. */
-export function GoalStatusChip({
-  phase,
-  goal,
-  onCancel,
-}: {
-  phase: string;
-  goal: string;
-  onCancel?: () => void;
-}) {
-  if (!phase || phase === "idle") return null;
-  const short = goal.length > 48 ? goal.slice(0, 47) + "…" : goal;
-  return (
-    <div className="flex items-center gap-2 rounded-lg border border-ink-800 bg-ink-925/60 px-2.5 py-1 text-[11px]">
-      <span className="font-mono uppercase tracking-wide text-accent-soft">{phase}</span>
-      <span className="truncate text-ink-300">{short}</span>
-      {onCancel && phase !== "failed" && phase !== "done" && (
-        <button
-          type="button"
-          onClick={onCancel}
-          className="ml-auto text-ink-500 hover:text-rose-400"
-        >
-          cancel
-        </button>
-      )}
-    </div>
-  );
-}

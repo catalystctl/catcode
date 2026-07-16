@@ -30,37 +30,37 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
   const showShimmer = active && !text;
 
   return (
-    <div className="my-2">
+    <div className="my-1.5">
       <button
         onClick={() => {
           userToggledRef.current = true;
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex items-center gap-2 text-[12px] text-ink-400 transition-colors hover:text-ink-200"
+        className="flex items-center gap-1.5 rounded-md px-1 py-0.5 -ml-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-900/60 hover:text-ink-300"
       >
         <ChevronRight
-          width={12}
-          height={12}
-          className={`transition-transform ${open ? "rotate-90" : ""}`}
+          width={11}
+          height={11}
+          className={`shrink-0 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
         />
-        <BrainIcon width={13} height={13} className={showShimmer ? "text-accent-soft" : ""} />
+        <BrainIcon width={12} height={12} className={showShimmer ? "text-accent-soft" : "text-ink-500"} />
         {showShimmer ? (
-          <span className="flex items-center gap-1">
+          <span className="flex items-center gap-1 text-accent-soft">
             thinking
-            <span className="inline-flex gap-0.5">
+            <span className="inline-flex gap-0.5" aria-hidden="true">
               <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft [animation-delay:-0.3s]" />
               <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft [animation-delay:-0.15s]" />
               <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft" />
             </span>
           </span>
         ) : (
-          <span>reasoning {text ? `· ${text.length.toLocaleString()} chars` : ""}</span>
+          <span>reasoning{text ? ` · ${text.length.toLocaleString()}` : ""}</span>
         )}
       </button>
       {open && text && (
-        <div className="mt-1.5 ml-5 max-h-96 overflow-auto rounded-lg border border-ink-800/70 bg-ink-925/50 p-3">
-          <p className="whitespace-pre-wrap break-words font-mono text-[12px] italic leading-relaxed text-ink-300">
+        <div className="mt-1 ml-4 max-h-80 overflow-auto border-l border-ink-800/60 pl-3 py-1.5">
+          <p className="whitespace-pre-wrap break-words font-mono text-[11px] italic leading-relaxed text-ink-400">
             {text}
           </p>
         </div>

@@ -58,15 +58,24 @@ export function truncate(s: string, n = 80): string {
 // absent — only tools that write/execute get the destructive badge + amber
 // approval styling.
 const DANGEROUS_TOOLS = new Set([
+  // Keep in sync with tools::classify() — everything NOT ReadOnly.
   "bash",
   "write_file",
   "edit",
   "patch",
+  "delete",
+  "rename",
+  "mkdir",
+  "bulk",
   "bulk_write",
   "bulk_edit",
   "todo_write",
   "spawn",
   "subagent",
+  "fetch",
+  "git_add",
+  "git_commit",
+  "test_env",
 ]);
 
 export function isDangerousTool(name: string): boolean {
@@ -95,9 +104,21 @@ const TOOL_ICONS: Record<string, string> = {
   intercom: "💬",
   memory: "🧠",
   fetch: "🌐",
+  web_search: "🔎",
   git_status: "⎇",
   git_diff: "⎇",
   git_log: "⎇",
+  git_add: "⎇",
+  git_commit: "⎇",
+  delete: "🗑",
+  rename: "↔",
+  mkdir: "📁",
+  ask: "❓",
+  load_tools: "🧰",
+  workspace_activity: "📡",
+  goal_write_plan: "📋",
+  test_env: "🖥",
+  bulk: "📦",
 };
 
 export function toolIcon(name: string): string {
