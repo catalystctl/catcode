@@ -150,6 +150,7 @@ pub fn deferred_tool_names() -> &'static [&'static str] {
         "git_add",
         "git_commit",
         "spawn",
+        "test_env",
     ]
 }
 
@@ -805,7 +806,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "load_tools",
-                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, goal_write_plan.",
+                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, test_env. (goal_write_plan is planning-phase only — not loadable.)",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1062,30 +1063,11 @@ fn format_read_lines(out: &mut String, lines: &[String], start_idx: usize, line_
     }
 }
 
-/// Atomically write `content` to `path`: write to a sibling temp file,
-/// fsync, then rename over the target. A crash/SIGKILL/OOM mid-write can never
-/// leave the target truncated or partially written — it is either the old or
-/// the new content. Mirrors the atomicity the session layer uses; user-facing
-/// file writes (write_file/edit/patch/todo_write) route through this.
+/// Atomically write `content` to `path`: unique sibling temp, fsync, rename.
+/// Uses [`crate::fsutil::atomic_write_str`] so concurrent writers (two sessions,
+/// bulk+edit) never collide on a fixed `*.catalyst-code-tmp` name.
 fn atomic_write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp: std::path::PathBuf = {
-        let mut p = path.as_os_str().to_owned();
-        p.push(".catalyst-code-tmp");
-        std::path::PathBuf::from(p)
-    };
-    let res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    res
+    crate::fsutil::atomic_write_str(path, content)
 }
 
 fn write_file(input: &str, content: &str, cfg: &Config) -> Outcome {
@@ -1319,15 +1301,49 @@ fn grep_via_rg(
         .arg(pattern)
         .arg(".");
 
-    let output = match cmd.output() {
-        Ok(o) => o,
+    // Bound rg so a hung search can't block the tool loop forever (30s, kill child).
+    use std::io::Read;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(_) => return None,
     };
+    let out_h = child.stdout.take();
+    let t_out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        if let Some(mut r) = out_h {
+            let _ = r.read_to_end(&mut v);
+        }
+        v
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(_) => break None,
+        }
+    };
+    let stdout_bytes = t_out.join().unwrap_or_default();
+    let status = match status {
+        Some(s) => s,
+        None => {
+            return Some(Outcome::err(
+                "grep timed out after 30s (rg killed)".to_string(),
+            ));
+        }
+    };
     // rg exits 1 when no matches — still a successful search.
-    if !output.status.success() && output.status.code() != Some(1) {
+    if !status.success() && status.code() != Some(1) {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let rel_prefix = |path: &str| -> String {
         let p = root.join(path);
         p.strip_prefix(&cfg.workspace)
@@ -1400,11 +1416,21 @@ fn grep_via_rg(
                 if line.is_empty() {
                     continue;
                 }
-                // Rewrite path prefix to workspace-relative.
+                // rg -C emits `--` between non-overlapping groups; normalize to
+                // the same `...` separator the pure-Rust walker uses.
+                if line == "--" {
+                    records.push("...".to_string());
+                    continue;
+                }
+                // Rewrite path prefix to workspace-relative. Match lines use
+                // `path:lineno:text`; context lines use `path-lineno-text` (no
+                // colon) — strip a leading `./` so both forms stay consistent.
                 if let Some((path, rest)) = line.split_once(':') {
+                    let path = path.strip_prefix("./").unwrap_or(path);
                     let rel = rel_prefix(path);
                     records.push(format!("{rel}:{rest}"));
                 } else {
+                    let line = line.strip_prefix("./").unwrap_or(line);
                     records.push(line.to_string());
                 }
             }
@@ -2204,9 +2230,10 @@ pub async fn execute_bash(
             return Outcome::err(format!("bash command blocked by denylist (matched '{bad}'); use a sandbox for hard isolation"));
         }
     }
-    // Regex denylist: block commands matching regex patterns (pre-compiled at startup).
+    // Regex denylist: match against whitespace-normalized command (same as
+    // string denylist) so `curl  http://evil` can't bypass `curl\s+http`.
     for re in &cfg.bash_deny_regex_compiled {
-        if re.is_match(command) {
+        if re.is_match(&norm) {
             return Outcome::err(format!("bash command blocked by regex denylist (matched '{}'); use a sandbox for hard isolation", re.as_str()));
         }
     }
@@ -2522,8 +2549,13 @@ fn build_bash_command(
                 }
                 // Not cached or file missing — generate fresh.
                 let profile = firejail_profile(&cfg.workspace, cfg.no_network);
-                let path = std::env::temp_dir()
-                    .join(format!("catalyst-code-fj-{:x}.profile", fxhash(&ws_key)));
+                // Include no_network in the filename so a net/non-net session
+                // pair cannot overwrite each other's profile on disk.
+                let path = std::env::temp_dir().join(format!(
+                    "catalyst-code-fj-{:x}-{}.profile",
+                    fxhash(&ws_key),
+                    if cfg.no_network { "nonet" } else { "net" }
+                ));
                 let _ = std::fs::write(&path, &profile);
                 cache.insert((ws_key, cfg.no_network), path.clone());
                 let (prog, args) = shell_argv(command);
@@ -2552,7 +2584,11 @@ fn build_bash_command(
                         } else {
                             let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
                             let path = std::env::temp_dir()
-                                .join(format!("catalyst-code-sb-{:x}.sb", fxhash(&ws_key)));
+                                .join(format!(
+                                    "catalyst-code-sb-{:x}-{}.sb",
+                                    fxhash(&ws_key),
+                                    if cfg.no_network { "nonet" } else { "net" }
+                                ));
                             let _ = std::fs::write(&path, &profile);
                             cache.insert((cache_key, cfg.no_network), path.clone());
                             path
@@ -2560,7 +2596,11 @@ fn build_bash_command(
                     } else {
                         let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
                         let path = std::env::temp_dir()
-                            .join(format!("catalyst-code-sb-{:x}.sb", fxhash(&ws_key)));
+                            .join(format!(
+                                "catalyst-code-sb-{:x}-{}.sb",
+                                fxhash(&ws_key),
+                                if cfg.no_network { "nonet" } else { "net" }
+                            ));
                         let _ = std::fs::write(&path, &profile);
                         cache.insert((cache_key, cfg.no_network), path.clone());
                         path
@@ -2640,6 +2680,10 @@ fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
 
 /// macOS seatbelt (sandbox-exec) profile: allow bash + workspace R/W; optionally
 /// deny network. Keep permissive enough that coreutils and dylibs still load.
+/// Residual risk (intentional): `(allow file-read*)` lets sandboxed bash read
+/// host secrets outside the workspace; write+network confinement is the primary
+/// control. Do not mirror firejail's FHS read allowlist — it breaks
+/// Homebrew/Xcode/nix layouts on macOS.
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(workspace: &std::path::Path, no_network: bool) -> String {
     let ws = workspace.display();
@@ -3335,8 +3379,18 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
             while i < patch_lines.len() && !patch_lines[i].starts_with("@@") {
                 let pl = patch_lines[i];
                 if let Some(content) = pl.strip_prefix(' ') {
-                    // context: must match
-                    if target < lines.len() && lines[target] != content {
+                    // context: must match. Past-EOF used to silently advance
+                    // `target` and mis-apply later hunks; error instead.
+                    // Empty-file / @@ -0,0 creates only use `+` lines, so they
+                    // never hit this path.
+                    if target >= lines.len() {
+                        return Err(format!(
+                            "context past end of file at line {}: {:?}",
+                            target + 1,
+                            content
+                        ));
+                    }
+                    if lines[target] != content {
                         return Err(format!(
                             "context mismatch at line {}: expected {:?}, got {:?}",
                             target + 1,
@@ -3348,7 +3402,14 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
                     consumed_old += 1;
                 } else if let Some(content) = pl.strip_prefix('-') {
                     // removal
-                    if target < lines.len() && lines[target] == content {
+                    if target >= lines.len() {
+                        return Err(format!(
+                            "removal past end of file at line {}: {:?}",
+                            target + 1,
+                            content
+                        ));
+                    }
+                    if lines[target] == content {
                         lines.remove(target);
                     } else {
                         return Err(format!(
@@ -3369,6 +3430,8 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
                     // tools emit it as a blank context line. Validate it matches
                     // an empty source line so a stray blank can't silently
                     // advance `target` past a real line and mis-apply the hunk.
+                    // Past-EOF blank is allowed (then `+` inserts via clamp) —
+                    // see patch_blank_line_in_hunk_no_panic.
                     // It is NOT counted toward `consumed_old` — the hunk header's
                     // count covers standard ` `/`-`/`+` lines, not these blanks.
                     if target < lines.len() && !lines[target].is_empty() {
@@ -3528,10 +3591,16 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     if s.is_empty() {
         s.push_str("(no diagnostics — clean)");
     }
+    // Same 32KB smart_truncate CAP as bash — cargo/tsc/go dumps can be huge.
+    const CAP: usize = 32_768;
+    let mut output = format!("{label}\n{s}");
+    if output.len() > CAP {
+        output = smart_truncate(&output, CAP);
+    }
     // ponytail: diagnostics "ok" is true only when the checker exits 0.
     Outcome {
         ok: out.status.success(),
-        output: format!("{label}\n{s}"),
+        output,
         diff: None,
     }
 }
@@ -3740,6 +3809,15 @@ fn git_exec(cfg: &Config, subcmd: &[&str]) -> Outcome {
     };
     let stdout = t_out.join().unwrap_or_default();
     let stderr = t_err.join().unwrap_or_default();
+    // Same 32KB smart_truncate CAP as bash — git log/diff dumps can blow context.
+    const CAP: usize = 32_768;
+    let cap = |body: String| -> String {
+        if body.len() > CAP {
+            smart_truncate(&body, CAP)
+        } else {
+            body
+        }
+    };
     match status {
         Some(s) if s.success() => {
             let body = if !stdout.trim().is_empty() {
@@ -3749,7 +3827,7 @@ fn git_exec(cfg: &Config, subcmd: &[&str]) -> Outcome {
             } else {
                 String::from("(no output)")
             };
-            Outcome::ok(body)
+            Outcome::ok(cap(body))
         }
         Some(s) => {
             let body = if !stderr.trim().is_empty() {
@@ -3759,7 +3837,7 @@ fn git_exec(cfg: &Config, subcmd: &[&str]) -> Outcome {
             } else {
                 format!("git {:?} failed (exit {:?})", subcmd, s.code())
             };
-            Outcome::err(body)
+            Outcome::err(cap(body))
         }
         None => Outcome::err(format!("git {:?} timed out after 30s", subcmd)),
     }
