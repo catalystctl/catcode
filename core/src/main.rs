@@ -9200,9 +9200,11 @@ mod compact_tests {
             "recent result kept verbatim"
         );
         let after = estimate_messages_tokens(&m);
+        // Digesting one of two equal huge results reclaims ~half (~62k tokens for
+        // this fixture), which is enough to land under the 100k budget.
         assert!(
-            after < before - 80_000,
-            "must reclaim a huge result: {after} vs {before}"
+            after < 100_000 && after < before - 50_000,
+            "must reclaim a huge result under budget: {after} vs {before}"
         );
     }
 

@@ -100,8 +100,12 @@ mod tests {
         let ws = Path::new("/tmp/ws");
         let session = Path::new("/tmp/session.json");
         let p = audit_path(Some(session), ws);
-        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("audit.jsonl"));
-        assert!(p.to_string_lossy().contains("session"));
+        // set_extension("audit.jsonl") yields session.audit.jsonl; Path::extension()
+        // only returns the final suffix ("jsonl"), so assert the full file name.
+        assert_eq!(
+            p.file_name().and_then(|e| e.to_str()),
+            Some("session.audit.jsonl")
+        );
     }
 
     #[test]
