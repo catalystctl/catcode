@@ -1,0 +1,23 @@
+# catalyst/fedora-install-test:42 — clean Fedora env for install.sh e2e
+# systemd-capable so --with-web can enable/start catalyst-code-web.service
+FROM docker.io/library/fedora:42
+
+RUN dnf -y install \
+      systemd systemd-udev \
+      curl ca-certificates coreutils findutils tar gzip which sudo \
+      nodejs \
+      iproute procps-ng \
+    && dnf clean all \
+    && (cd /lib/systemd/system/sysinit.target.wants/ && for i in *; do \
+         [ "$i" = systemd-tmpfiles-setup.service ] || rm -f "$i"; done) \
+    && rm -f /lib/systemd/system/multi-user.target.wants/* \
+            /etc/systemd/system/*.wants/* \
+            /lib/systemd/system/local-fs.target.wants/* \
+            /lib/systemd/system/sockets.target.wants/*udev* \
+            /lib/systemd/system/sockets.target.wants/*initctl* \
+            /lib/systemd/system/basic.target.wants/* \
+            /lib/systemd/system/anaconda.target.wants/* \
+    && systemctl set-default multi-user.target
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

@@ -33,3 +33,29 @@ Point the tool at it: `CATALYST_TESTENV_LINUX_IMAGE=catalyst/linux-gui:24.04`
 
 The `test_env` tool maps these to random host ports and hands the agent a
 `ws://` URL for the noVNC websocket.
+
+---
+
+# catalyst/fedora-install-test — clean-env install.sh harness
+
+Systemd-capable Fedora 42 image used by `scripts/test-install-clean-env.sh` to
+validate `install.sh` in an isolated namespace (CLI-only + `--with-web`), including
+a Silverblue-like layout (`/usr` read-only; `/usr/local` + `/opt` backed by `/var`).
+
+## Build
+
+```bash
+podman build -t catalyst/fedora-install-test:42 \
+  -f packaging/vm-images/linux/Containerfile.fedora-install-test \
+  packaging/vm-images/linux
+```
+
+## Run
+
+```bash
+# Assets must exist under tmp/install-test-mirror/ (or DOWNLOAD=1 to gh-download)
+VER=352aef8 bash scripts/test-install-clean-env.sh
+```
+
+Matrices: Fedora CLI-only, Fedora `--with-web` (systemd + HTTP), Silverblue-sim
+default paths + `~/.local` user-prefix install.
