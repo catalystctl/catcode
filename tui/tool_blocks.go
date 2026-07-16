@@ -820,6 +820,21 @@ func renderMemoryBlock(b *block, w int) string {
 	return out.String()
 }
 
+// renderFinishBlock is a one-liner: the finish tool has no args worth showing,
+// so put the completion message in the header instead of an empty ({}) body.
+func renderFinishBlock(b *block, w int) string {
+	msg := strings.TrimSpace(b.output)
+	if msg == "" || msg == "[no result]" {
+		msg = "This turn has finished"
+	}
+	extra := ""
+	if !b.inFlight() {
+		extra = dimStyle.Render(truncate(msg, max(2, w-20)))
+	}
+	head, _ := renderToolHead(b, w, extra)
+	return head
+}
+
 func renderSubagentBlock(b *block, w int) string {
 	agent := b.arg("agent")
 	task := b.arg("task")

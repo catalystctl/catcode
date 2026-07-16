@@ -624,6 +624,8 @@ func (s *session) renderToolBlock(b *block, w int) string {
 		return renderSubagentBlock(b, w)
 	case "bulk":
 		return renderBulkBlock(b, w)
+	case "finish":
+		return renderFinishBlock(b, w)
 	default:
 		return renderGenericToolBlock(b, w)
 	}
@@ -784,7 +786,13 @@ func (s *session) finalizeInFlight(note string) {
 		if isInFlight(b) || (b != nil && b.kind == blkTool && b.sub && b.dur == 0) {
 			b.dur = time.Since(b.started)
 			if strings.TrimSpace(b.output) == "" {
-				b.output = note
+				if b.name == "finish" {
+					b.output = "This turn has finished"
+					b.hasOk = true
+					b.ok = true
+				} else {
+					b.output = note
+				}
 			}
 			changed = true
 		}

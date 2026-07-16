@@ -78,6 +78,7 @@ func (s *session) relayoutHeights() {
 	}
 	fixedExtra += s.mentionFlyoutHeight()
 	fixedExtra += s.activityShelfHeight() + s.oauthBannerHeight()
+	fixedExtra += s.goalProgressPanelHeight()
 	// Space left for the viewport + the active-tasks panel, leaving 1 line of
 	// slack for v2's cursed renderer (it scrolls/overlaps when the view fills
 	// the terminal exactly).
@@ -163,7 +164,12 @@ func (s *session) renderHeader() string {
 	case s.coreLifecycle == coreFailed:
 		state = "core down"
 	case s.busy:
-		state = "working"
+		if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+			settled, total := s.goalProgressCounts()
+			state = fmt.Sprintf("goal · %s · %d/%d", s.goalState.Phase, settled, total)
+		} else {
+			state = "working"
+		}
 	case s.authed:
 		state = "ready"
 	case len(s.models) > 0:
@@ -1276,10 +1282,19 @@ func (s *session) renderActivityShelf() string {
 		return s.renderQueueBanner()
 	}
 	if len(s.todos) == 0 && len(s.subProgress) == 0 {
+		if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+			settled, total := s.goalProgressCounts()
+			return accentStyle.Render("◈ ") +
+				baseStyle.Render(fmt.Sprintf("Goal %s · %d/%d steps", s.goalState.Phase, settled, total))
+		}
 		return ""
 	}
 	done, _, running := countTodoStatuses(s.todos)
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
+	if s.goalState != nil && goalPhaseShowsProgress(s.goalState.Phase) {
+		settled, total := s.goalProgressCounts()
+		parts = append(parts, fmt.Sprintf("Goal %s · %d/%d", s.goalState.Phase, settled, total))
+	}
 	if len(s.subProgress) > 0 {
 		parts = append(parts, fmt.Sprintf("Subagents %d active", len(s.subProgress)))
 	}
@@ -1439,6 +1454,9 @@ func (s *session) View() tea.View {
 		}
 		if shelf := s.renderActivityShelf(); shelf != "" {
 			parts = append(parts, shelf)
+		}
+		if gp := s.renderGoalProgressPanel(s.width); gp != "" {
+			parts = append(parts, gp)
 		}
 		if f := s.renderMentionFlyout(); f != "" {
 			parts = append(parts, f)

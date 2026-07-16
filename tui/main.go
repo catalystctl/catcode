@@ -144,9 +144,11 @@ type session struct {
 
 	// Goal mode: draft form for the multi-field /goal modal, plus the last
 	// goal_state snapshot from the core (drives status + plan-ready review).
-	goalDraft goalDraft
-	goalState *goalStateSnap
-	goalPlan  *goalPlanSnap
+	goalDraft      goalDraft
+	goalState      *goalStateSnap
+	goalPlan       *goalPlanSnap
+	goalStepLogged map[string]string // step_id → fingerprint of last persisted completion card
+	goalLastLife   string            // last persisted lifecycle line (dedupe phase+state)
 
 	settings       *settingsStore
 	keybinds       map[string]string // effective keymap (defaults + user overrides); see keybinds.go

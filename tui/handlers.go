@@ -56,6 +56,8 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 	if m.Phase == "idle" || m.ID == "" {
 		s.goalState = nil
 		s.goalPlan = nil
+		s.goalStepLogged = nil
+		s.goalLastLife = ""
 		return
 	}
 	snap := &goalStateSnap{
@@ -76,8 +78,12 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		})
 	}
 	prevPhase := ""
+	prevByID := map[string]goalPromptSnap{}
 	if s.goalState != nil {
 		prevPhase = s.goalState.Phase
+		for _, p := range s.goalState.Prompts {
+			prevByID[p.StepID] = p
+		}
 	}
 	s.goalState = snap
 	// Keep the footer busy while deploy / workers / wrap-up are still live
@@ -89,19 +95,46 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		if m.AutoDeploy {
 			s.busy = true
 		}
-	case "failed":
+	case "done", "failed", "idle":
+		// Clear the footer once the goal settles — wrap-up's `done` arrives
+		// while phase is still synthesizing (goalKeepsBusy), so this is the
+		// path that actually releases busy after a successful goal.
 		s.busy = false
 	}
 	// Open plan review when we first land on plan_ready with review mode.
 	if m.Phase == "plan_ready" && prevPhase != "plan_ready" && !m.AutoDeploy {
 		s.openGoalPlanReview()
 	}
+	// Belt-and-suspenders: persist lasting step cards when prompts become
+	// terminal (covers cores that have not yet emitted goal_step_complete).
+	for _, p := range snap.Prompts {
+		if !goalTerminalStatus(p.Status) {
+			continue
+		}
+		prev, had := prevByID[p.StepID]
+		newlyTerminal := !had || !goalTerminalStatus(prev.Status)
+		summaryGrew := strings.TrimSpace(p.Summary) != "" && p.Summary != prev.Summary
+		if newlyTerminal || summaryGrew {
+			s.persistGoalStepComplete(p.StepID, p.Title, p.Agent, p.Status, p.Summary)
+		}
+	}
 	if m.Phase == "failed" && m.Error != "" {
 		s.logError("goal failed: " + m.Error)
+		s.persistGoalLifecycle("goal failed: " + m.Error)
 	}
-	if m.Phase == "done" {
+	if m.Phase == "done" && prevPhase != "done" {
+		s.persistGoalLifecycle("goal complete")
 		s.logSuccess("goal complete")
 	}
+	if m.Phase == "synthesizing" && prevPhase != "synthesizing" {
+		s.persistGoalLifecycle("Workers finished — writing completion summary…")
+	}
+	if (m.Phase == "deploying" || m.Phase == "running") && prevPhase != m.Phase {
+		if prevPhase == "plan_ready" || prevPhase == "" || prevPhase == "planning" {
+			s.persistGoalLifecycle(fmt.Sprintf("Goal deploy running (%s)…", m.Phase))
+		}
+	}
+	s.layout()
 }
 
 // goalKeepsBusy mirrors the web reducer's goalKeepsStreaming: goal deploy and
@@ -404,7 +437,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.refresh()
 
 	case "done":
-		s.subProgress = nil
+		// Do not wipe live subagent shelf while goal deploy / synthesizing is
+		// still running — a planning-turn `done` must not blank the UI mid-goal.
+		if !s.goalKeepsBusy() {
+			s.subProgress = nil
+		}
 		// When every task is complete, dismiss the pinned tasks panel — a
 		// finished plan shouldn't linger as a permanent fixture. Done before
 		// the layout() calls below so the cleared state renders immediately.
@@ -673,6 +710,22 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "subagent_progress":
 		runID := ev.get("run_id")
 		if ev.get("phase") == "done" {
+			entry := s.findSubProgress(runID)
+			agent := ev.get("agent")
+			if agent == "" && entry != nil {
+				agent = entry.agent
+			}
+			ok := ev.get("ok") != "false"
+			// During goal deploy, lasting finals come from goal_state /
+			// goal_step_complete. Outside goal mode, persist a one-liner so
+			// manual subagent runs are not toast-only.
+			if agent != "" && (s.goalState == nil || !goalPhaseShowsProgress(s.goalState.Phase)) {
+				if ok {
+					s.logPersist(blkSuccess, fmt.Sprintf("✓ subagent %s finished", agent))
+				} else {
+					s.logPersist(blkWarn, fmt.Sprintf("✗ subagent %s finished", agent))
+				}
+			}
 			if runID != "" {
 				s.removeSubProgress(runID)
 			}
@@ -717,10 +770,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// Informational notices from the core (first-run staging, subagent
 		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
 		if msg := ev.get("message"); msg != "" {
-			s.logInfo(msg)
+			low := strings.ToLower(msg)
+			// Goal deploy bridge lines must persist — toast-only left a dark gap.
+			if strings.Contains(low, "goal deploy") ||
+				strings.Contains(low, "writing completion summary") ||
+				strings.Contains(low, "completion summary") {
+				s.persistGoalLifecycle(msg)
+			} else {
+				s.logInfo(msg)
+			}
 			// OAuth finalize messages — belt-and-suspenders if `authed` was
 			// missed so the user can type immediately after SuperGrok login.
-			low := strings.ToLower(msg)
 			if strings.Contains(low, "logged into") && strings.Contains(low, "oauth") {
 				s.authed = true
 				s.providerHasKey = true
@@ -929,14 +989,84 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "goal_phase":
 		from, to := ev.get("from"), ev.get("to")
 		msg := ev.get("message")
+		// Optional progress fields (core emit_goal_phase_progress) — keep in
+		// sync with web reducer so wave/counts are not toast-only gaps.
+		wave := ev.get("wave")
+		doneCount, stepCount := ev.get("done_count"), ev.get("step_count")
+		var extras string
+		if wave != "" {
+			extras += " · wave " + wave
+		}
+		if doneCount != "" && stepCount != "" {
+			extras += fmt.Sprintf(" (%s/%s)", doneCount, stepCount)
+		}
+		var line string
 		if msg != "" {
-			s.logInfo(fmt.Sprintf("goal %s → %s: %s", from, to, msg))
+			line = fmt.Sprintf("goal %s → %s%s: %s", from, to, extras, msg)
 		} else {
-			s.logInfo(fmt.Sprintf("goal %s → %s", from, to))
+			line = fmt.Sprintf("goal %s → %s%s", from, to, extras)
+		}
+		// Persist lifecycle transitions so deploy is never toast-only dark.
+		switch to {
+		case "deploying", "running", "synthesizing", "done", "failed":
+			if to == "synthesizing" && msg == "" {
+				line = "Workers finished — writing completion summary…"
+				if extras != "" {
+					line += extras
+				}
+			}
+			s.persistGoalLifecycle(line)
+			if to == "done" {
+				s.busy = false
+				s.logSuccess("goal complete")
+			} else if to == "failed" {
+				s.busy = false
+				s.logWarn(line)
+			}
+		default:
+			s.logInfo(line)
 		}
 		if to == "plan_ready" && s.goalState != nil && !s.goalState.AutoDeploy {
 			s.openGoalPlanReview()
 		}
+	case "goal_step_verdict":
+		ok := ev.get("ok") == "true"
+		out := truncateGoalSummary(ev.get("output"), goalDisplaySummaryCap)
+		if ok {
+			s.logPersist(blkSuccess, "goal verdict PASS\n"+out)
+		} else {
+			s.logPersist(blkWarn, "goal verdict FAIL\n"+out)
+			s.logWarn("goal step verdict failed")
+		}
+	case "goal_step_complete":
+		// Preferred one-shot signal from core (WP-C1). Defensive: tolerate
+		// missing fields until core lands the event.
+		status := ev.get("status")
+		if status == "" {
+			if ev.get("ok") == "false" {
+				status = "failed"
+			} else {
+				status = "done"
+			}
+		}
+		s.persistGoalStepComplete(
+			ev.get("step_id"),
+			ev.get("title"),
+			ev.get("agent"),
+			status,
+			ev.get("summary"),
+		)
+	case "goal_completion_summary":
+		// Emitted when wrap-up is skipped or as a deterministic Done bridge.
+		text := ev.get("text")
+		if text == "" {
+			text = ev.get("summary")
+		}
+		text = strings.TrimSpace(text)
+		if text == "" || text == "[no result]" {
+			text = "Goal finished (no completion summary provided)."
+		}
+		s.logPersist(blkSuccess, "goal completion\n"+truncateGoalSummary(text, goalDisplaySummaryCap))
 	case "memory_saved":
 		if msg := ev.get("message"); msg != "" {
 			s.logSuccess(msg)

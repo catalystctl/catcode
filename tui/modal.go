@@ -2007,6 +2007,7 @@ func (s *session) handleGoalPlanKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return s, nil
 		}
 		s.closeModal()
+		s.persistGoalLifecycle("Goal plan approved — deploying…")
 		s.logInfo("approving goal plan…")
 		s.busy = true
 		return s, nil
