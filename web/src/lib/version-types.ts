@@ -28,4 +28,8 @@ export interface VersionInfo {
   repo: string;
   commitUrl: string | null;
   latestUrl: string | null;
+  /** Present on GET /api/version — UI may offer an in-app update. */
+  canSelfUpdate?: boolean;
+  webInstallDetected?: boolean;
+  updating?: boolean;
 }

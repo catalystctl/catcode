@@ -1,4 +1,5 @@
 import { getSession } from "@/lib/auth";
+import { updateLockActive, webInstallDetected } from "@/lib/self-update";
 import { resolveVersionInfo } from "@/lib/version";
 
 export const dynamic = "force-dynamic";
@@ -11,9 +12,18 @@ export async function GET(req: Request) {
   }
   try {
     const info = await resolveVersionInfo(process.cwd());
-    return Response.json({ ok: true, ...info }, {
-      headers: { "Cache-Control": "no-store" },
-    });
+    return Response.json(
+      {
+        ok: true,
+        ...info,
+        canSelfUpdate: true,
+        webInstallDetected: webInstallDetected(),
+        updating: updateLockActive(),
+      },
+      {
+        headers: { "Cache-Control": "no-store" },
+      },
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return Response.json({ ok: false, error: message }, { status: 500 });
