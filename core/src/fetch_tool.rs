@@ -18,15 +18,24 @@ fn parse_http_host(url: &str) -> Option<(String, String)> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
+    // Strip userinfo (`user:pass@host`) before host extract. Stopping only on
+    // `/ ? # :` would treat `foo@169.254.169.254` as the host string, which
+    // bypasses IP/hostname private checks while reqwest still connects to the
+    // real host after `@` (SSRF).
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, after)) => after,
+        None => authority,
+    };
     // IPv6 literal: [::1]:8080 — host is the bracketed content.
-    let host = if let Some(rest) = rest.strip_prefix('[') {
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
         let end = rest.find(']')?;
         rest[..end].to_ascii_lowercase()
     } else {
-        let end = rest.find(&['/', '?', '#', ':'][..]).unwrap_or(rest.len());
-        rest[..end].to_ascii_lowercase()
+        let end = host_port.find(':').unwrap_or(host_port.len());
+        host_port[..end].to_ascii_lowercase()
     };
-    if host.is_empty() {
+    if host.is_empty() || host.contains('@') {
         return None;
     }
     Some((scheme, host))
@@ -58,6 +67,7 @@ fn ip_is_private(ip: IpAddr) -> bool {
                 || o[0] == 10 // private 10.0.0.0/8
                 || (o[0] == 172 && (16..=31).contains(&o[1])) // private 172.16.0.0/12
                 || (o[0] == 192 && o[1] == 168) // private 192.168.0.0/16
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
                 || o[0] == 0 // 0.0.0.0/8 (unspecified + "this network")
         }
         IpAddr::V6(v6) => {
@@ -415,6 +425,25 @@ mod tests {
             parse_http_host("http://[::1]:8080/x"),
             Some(("http".into(), "::1".into()))
         );
+        // userinfo must not become the "host" (SSRF bypass via foo@169.254…)
+        assert_eq!(
+            parse_http_host("http://foo@169.254.169.254/"),
+            Some(("http".into(), "169.254.169.254".into()))
+        );
+        assert_eq!(
+            parse_http_host("https://user:pass@example.com:443/path"),
+            Some(("https".into(), "example.com".into()))
+        );
+    }
+
+    #[test]
+    fn userinfo_cannot_bypass_private_block() {
+        assert!(!host_allowed("169.254.169.254", &[]));
+        let (_s, host) = parse_http_host("http://evil@169.254.169.254/latest").unwrap();
+        assert!(!host_allowed(&host, &[]));
+        assert!(!host_allowed("100.64.0.1", &[])); // CGNAT
+        assert!(!host_allowed("100.127.255.255", &[]));
+        assert!(host_allowed("100.128.0.1", &[])); // just outside CGNAT
     }
 
     #[test]
