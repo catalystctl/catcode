@@ -20,6 +20,8 @@ import {
   TerminalPanel,
   Preview,
   Screen,
+  DiffEditor,
+  PatchViewer,
   PANELS,
 } from "./panel-registry";
 import { ActivityBar } from "./activity-bar";
@@ -1149,6 +1151,8 @@ function MainContent({
       />
     );
   }
+  if (tab.kind === "diff") return <DiffEditor key={tab.id} tab={tab} />;
+  if (tab.kind === "patch") return <PatchViewer key={tab.id} tab={tab} />;
   if (tab.kind === "preview") return <Preview target={tab.target} workspace={workspace} />;
   return null;
 }

@@ -1036,12 +1036,12 @@ export interface PreviewState {
   query?: string;
 }
 
-/** A tab in the main work area (open file / preview / terminal-host). */
+/** A tab in the main work area (open file / preview / terminal-host / diff). */
 export interface IdeTab {
-  /** Unique id (path for files, "preview:<target>", "term:<id>"). */
+  /** Unique id (path for files, "preview:<target>", "diff:staged|working:<path>", "patch:…"). */
   id: string;
-  kind: "file" | "preview" | "terminal";
-  /** Workspace-relative path (file) or target (preview) or terminal id. */
+  kind: "file" | "preview" | "terminal" | "diff" | "patch";
+  /** Workspace-relative path (file/diff) or target (preview) or terminal id / commit oid. */
   target: string;
   /** Display label (basename for files). */
   label: string;
@@ -1049,6 +1049,13 @@ export interface IdeTab {
   dirty: boolean;
   /** Detected language id for the editor (e.g. "typescript", "markdown"). */
   language?: string;
+  /** Diff/patch metadata. */
+  diffMeta?: {
+    /** Staged (index) vs worktree for file diffs. */
+    staged?: boolean;
+    /** Commit oid or stash ref when kind is "patch". */
+    source?: "commit" | "stash" | "file";
+  };
 }
 
 /** Client-only IDE layout state. NEVER sent over SSE / never in AgentState. */

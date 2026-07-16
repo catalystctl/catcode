@@ -2,9 +2,9 @@
 // agent turn) — direct `git` CLI invocations scoped to the workspace cwd.
 //
 // GET  /api/git?workspace=<abs>                 → GitStatus
-// GET  /api/git?workspace=<abs>&diff=<rel>&staged=<0|1>  → { diff }   (task-driven
-//      extension for the panel's click→diff-view; absent in the planner contract
-//      §4.3 which only specifies status. Documented here as a minimal addition.)
+// GET  /api/git?workspace=<abs>&diff=<rel>&staged=<0|1>  → { diff }
+// GET  /api/git?workspace=<abs>&sides=<rel>&staged=<0|1> → { original, modified, path }
+//      (two-sided content for the Monaco DiffEditor in the main work area)
 // POST /api/git performs validated, user-initiated changes across files,
 // commits, sync, branches, history, stashes, tags, remotes, and recovery.
 //
@@ -65,6 +65,51 @@ function runGit(
 
 function isNotARepo(stderr: string): boolean {
   return /not a git repository/i.test(stderr);
+}
+
+/** Cap a blob/string for the DiffEditor (same budget as unified diffs). */
+function truncateBlob(text: string): string {
+  if (text.length <= MAX_DIFF) return text;
+  return text.slice(0, MAX_DIFF) + "\n... (content truncated)";
+}
+
+/** Read a git blob; missing paths return empty string (new/deleted files). */
+async function gitBlob(workspace: string, spec: string): Promise<string> {
+  const r = await runGit(workspace, ["show", "--textconv", spec]);
+  if (r.code !== 0) return "";
+  return truncateBlob(r.stdout);
+}
+
+/** Two-sided file content for Monaco DiffEditor. */
+async function readDiffSides(
+  workspace: string,
+  relPath: string,
+  staged: boolean,
+): Promise<{ path: string; original: string; modified: string; staged: boolean }> {
+  const abs = join(workspace, relPath);
+  let original = "";
+  let modified = "";
+
+  if (staged) {
+    // HEAD → index
+    original = await gitBlob(workspace, `HEAD:${relPath}`);
+    modified = await gitBlob(workspace, `:${relPath}`);
+  } else {
+    // index → worktree (fall back to HEAD when the path is not in the index)
+    original = await gitBlob(workspace, `:${relPath}`);
+    if (!original) original = await gitBlob(workspace, `HEAD:${relPath}`);
+    if (existsSync(abs)) {
+      try {
+        modified = truncateBlob(readFileSync(abs, "utf8"));
+      } catch {
+        modified = "";
+      }
+    } else {
+      modified = "";
+    }
+  }
+
+  return { path: relPath, original, modified, staged };
 }
 
 /** Parse `git status --porcelain=v2 --branch` output into GitStatus entries. */
@@ -503,6 +548,7 @@ export async function GET(req: Request) {
   }
   const url = new URL(req.url);
   const diffPath = url.searchParams.get("diff");
+  const sidesPath = url.searchParams.get("sides");
   const commitOid = url.searchParams.get("commit");
   const stashRef = url.searchParams.get("stash");
 
@@ -554,6 +600,23 @@ export async function GET(req: Request) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return Response.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  // Two-sided content for Monaco DiffEditor (original vs modified).
+  // staged=1 → HEAD vs index; staged=0 → index vs worktree.
+  if (sidesPath !== null) {
+    try {
+      confinePath(workspace, sidesPath);
+      const staged = url.searchParams.get("staged") === "1";
+      const sides = await readDiffSides(workspace, sidesPath, staged);
+      return Response.json(sides);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return Response.json(
+        { error: msg },
+        { status: msg === "path outside workspace" ? 400 : 500 },
+      );
     }
   }
 

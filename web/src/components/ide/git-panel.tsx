@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Diff } from "@/components/diff";
 import { AppDialogHost, useAppDialog } from "@/components/app-dialog";
 import {
   CheckIcon,
@@ -12,7 +11,6 @@ import {
   PlusIcon,
   RefreshIcon,
   TrashIcon,
-  XIcon,
 } from "@/components/icons";
 import { useIdeContext } from "@/lib/ide-context";
 import type {
@@ -102,9 +100,6 @@ export function GitPanel({ compact }: { compact?: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [diff, setDiff] = useState("");
-  const [diffLoading, setDiffLoading] = useState(false);
-  const [previewTitle, setPreviewTitle] = useState<string | null>(null);
 
   const refresh = useCallback(
     async (silent = false) => {
@@ -164,8 +159,6 @@ export function GitPanel({ compact }: { compact?: boolean }) {
         setError(null);
         setResult(`${actionLabel(action)} completed`);
         setSelected(null);
-        setDiff("");
-        setPreviewTitle(null);
         return true;
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Network error");
@@ -180,75 +173,31 @@ export function GitPanel({ compact }: { compact?: boolean }) {
   const fetchDiff = useCallback(
     async (entry: GitStatusEntry) => {
       setSelected(entry.path);
-      setPreviewTitle(entry.path);
-      setDiff("");
-      setDiffLoading(true);
-      try {
-        if (entry.status === "untracked") {
-          setDiff("");
-          return;
-        }
-        const response = await fetch(
-          `/api/git?workspace=${encodeURIComponent(workspace)}&diff=${encodeURIComponent(entry.path)}&staged=${entry.staged ? 1 : 0}`,
-        );
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error("Diff unavailable");
-        setDiff(typeof data.diff === "string" ? data.diff : "");
-      } catch {
-        setDiff("");
-      } finally {
-        setDiffLoading(false);
-      }
+      // Open in the main editor as a Monaco DiffEditor (unified / split / collapse).
+      ide.openDiff(entry.path, { staged: entry.staged });
+      ide.selectEditor();
     },
-    [workspace],
+    [ide],
   );
 
   const fetchCommit = useCallback(
     async (oid: string, label: string) => {
       setSelected(oid);
-      setPreviewTitle(label);
-      setDiff("");
-      setDiffLoading(true);
       setTab("history");
-      try {
-        const response = await fetch(
-          `/api/git?workspace=${encodeURIComponent(workspace)}&commit=${encodeURIComponent(oid)}`,
-        );
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Commit unavailable");
-        setDiff(typeof data.patch === "string" ? data.patch : "");
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Failed to load commit");
-        setDiff("");
-      } finally {
-        setDiffLoading(false);
-      }
+      ide.openPatch("commit", oid, label);
+      ide.selectEditor();
     },
-    [workspace],
+    [ide],
   );
 
   const fetchStash = useCallback(
     async (ref: string) => {
       setSelected(ref);
-      setPreviewTitle(ref);
-      setDiff("");
-      setDiffLoading(true);
       setTab("stashes");
-      try {
-        const response = await fetch(
-          `/api/git?workspace=${encodeURIComponent(workspace)}&stash=${encodeURIComponent(ref)}`,
-        );
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Stash unavailable");
-        setDiff(typeof data.patch === "string" ? data.patch : "");
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Failed to load stash");
-        setDiff("");
-      } finally {
-        setDiffLoading(false);
-      }
+      ide.openPatch("stash", ref, ref);
+      ide.selectEditor();
     },
-    [workspace],
+    [ide],
   );
 
   const totalChanges = status?.entries.length ?? 0;
@@ -425,61 +374,9 @@ export function GitPanel({ compact }: { compact?: boolean }) {
               )}
             </div>
 
-            {selected && previewTitle && (tab === "changes" || tab === "history" || tab === "stashes") && (
-              <PreviewPane
-                title={previewTitle}
-                loading={diffLoading}
-                diff={diff}
-                onClose={() => {
-                  setSelected(null);
-                  setDiff("");
-                  setPreviewTitle(null);
-                }}
-                onOpen={tab === "changes" ? () => ide.openFile(selected) : undefined}
-              />
-            )}
           </div>
         </>
       )}
-    </div>
-  );
-}
-
-function PreviewPane({
-  title,
-  loading,
-  diff,
-  onClose,
-  onOpen,
-}: {
-  title: string;
-  loading: boolean;
-  diff: string;
-  onClose: () => void;
-  onOpen?: () => void;
-}) {
-  return (
-    <div className="flex max-h-[42%] min-h-[8rem] flex-col border-t border-ink-800 bg-ink-950/40">
-      <div className="flex items-center gap-2 border-b border-ink-800/80 px-3 py-1.5">
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-400">{title}</span>
-        {onOpen && (
-          <button type="button" className={buttonClass} onClick={onOpen}>
-            Open
-          </button>
-        )}
-        <button type="button" className={buttonClass} onClick={onClose} aria-label="Close preview">
-          <XIcon width={12} height={12} />
-        </button>
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto px-2 py-2">
-        {loading ? (
-          <Empty>Loading…</Empty>
-        ) : diff ? (
-          <Diff diff={diff} />
-        ) : (
-          <Empty>No textual diff available. Open the file to inspect it.</Empty>
-        )}
-      </div>
     </div>
   );
 }

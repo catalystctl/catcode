@@ -157,6 +157,10 @@ export interface IdeApi {
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
   markDirty: (id: string, dirty: boolean) => void;
+  /** Open a file change as a Monaco DiffEditor tab in the main work area. */
+  openDiff: (path: string, opts?: { staged?: boolean }) => void;
+  /** Open a commit/stash unified patch in the main work area. */
+  openPatch: (source: "commit" | "stash", ref: string, label: string) => void;
   // ── terminal ──
   newTerminal: (cwd?: string) => string;
   /** Focus (or create) a terminal and queue a command for its shell stdin. The
@@ -438,6 +442,65 @@ export function useIde(workspace?: string): IdeApi {
     });
   }, []);
 
+  const openDiff = useCallback((path: string, opts?: { staged?: boolean }) => {
+    const staged = !!opts?.staged;
+    const id = `diff:${staged ? "staged" : "working"}:${path}`;
+    setState((s) => {
+      const existing = s.openTabs.find((t) => t.id === id);
+      if (existing) {
+        return {
+          ...s,
+          activeTabId: existing.id,
+          activeDockPanels: { ...s.activeDockPanels, main: null },
+        };
+      }
+      const tab: IdeTab = {
+        id,
+        kind: "diff",
+        target: path,
+        label: `${basename(path)}${staged ? " (staged)" : ""}`,
+        dirty: false,
+        language: detectLanguage(path),
+        diffMeta: { staged, source: "file" },
+      };
+      return {
+        ...s,
+        openTabs: [...s.openTabs, tab],
+        activeTabId: tab.id,
+        activeDockPanels: { ...s.activeDockPanels, main: null },
+      };
+    });
+  }, []);
+
+  const openPatch = useCallback((source: "commit" | "stash", ref: string, label: string) => {
+    const id = `patch:${source}:${ref}`;
+    setState((s) => {
+      const existing = s.openTabs.find((t) => t.id === id);
+      if (existing) {
+        return {
+          ...s,
+          activeTabId: existing.id,
+          activeDockPanels: { ...s.activeDockPanels, main: null },
+        };
+      }
+      const tab: IdeTab = {
+        id,
+        kind: "patch",
+        target: ref,
+        label: source === "commit" ? `Commit ${label}` : `Stash ${label}`,
+        dirty: false,
+        language: "diff",
+        diffMeta: { source },
+      };
+      return {
+        ...s,
+        openTabs: [...s.openTabs, tab],
+        activeTabId: tab.id,
+        activeDockPanels: { ...s.activeDockPanels, main: null },
+      };
+    });
+  }, []);
+
   const closeTab = useCallback((id: string) => {
     if (stateRef.current.openTabs.some((tab) => tab.id === id)) {
       // Let React detach the visible editor before disposing the backing model.
@@ -628,6 +691,8 @@ export function useIde(workspace?: string): IdeApi {
       selectExplorer,
       selectEditor,
       openFile,
+      openDiff,
+      openPatch,
       closeTab,
       setActiveTab,
       markDirty,
@@ -666,6 +731,8 @@ export function useIde(workspace?: string): IdeApi {
       selectExplorer,
       selectEditor,
       openFile,
+      openDiff,
+      openPatch,
       closeTab,
       setActiveTab,
       markDirty,

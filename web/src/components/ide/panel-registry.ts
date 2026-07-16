@@ -55,6 +55,14 @@ const Screen = dynamic(() => import("./screen-panel").then((m) => m.Screen), {
   ssr: false,
   loading: PanelLoading,
 });
+const DiffEditor = dynamic(() => import("./diff-editor").then((m) => m.DiffEditor), {
+  ssr: false,
+  loading: PanelLoading,
+});
+const PatchViewer = dynamic(() => import("./diff-editor").then((m) => m.PatchViewer), {
+  ssr: false,
+  loading: PanelLoading,
+});
 
 export type IconProps = { width?: number; height?: number; className?: string };
 
@@ -77,4 +85,4 @@ export const PANELS: Record<IdePanelId, PanelDescriptor> = {
 export const PANEL_ORDER: IdePanelId[] = ["explorer", "git", "terminal", "preview", "screen"];
 
 // Re-export the panel components so the shell imports everything from here.
-export { FileTree, GitPanel, Editor, Terminal, TerminalPanel, Preview, Screen };
+export { FileTree, GitPanel, Editor, Terminal, TerminalPanel, Preview, Screen, DiffEditor, PatchViewer };
