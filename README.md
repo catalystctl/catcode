@@ -173,12 +173,16 @@ Other options:
 
 **Updating**
 
-Use `catcode --update` to refresh the CLI. When the web frontend was installed (`install.sh --with-web` on Linux/macOS, or `install-web.ps1` on Windows), that command also refreshes `catcode-core` and the web bundle, then restarts the service (systemd / launchd / NSSM / Scheduled Task). `bash install.sh --update` (Unix) or re-running `install-web.ps1` (Windows) does the same. From the web UI: Settings → About → **Update CLI + frontend**.
+Use `catcode --update` to refresh the CLI. When the web frontend was installed (`install.sh --with-web` on Linux/macOS, or `install.ps1 -WithWeb` on Windows), that command also refreshes `catcode-core` and the web bundle, then restarts the service (systemd / launchd / NSSM / Scheduled Task). `bash install.sh --update` (Unix) or `install.ps1 -Update` (Windows) does the same. From the web UI: Settings → About → **Update CLI + frontend**.
 
-**Windows web app:**
+**Windows (TUI + optional web):**
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/packaging/windows/install-web.ps1)))
+# TUI only
+irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex
+
+# TUI + web service (iex cannot forward params — use the scriptblock form)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1))) -WithWeb
 ```
 
 This installs the core and prebuilt web bundle, then runs it through NSSM when

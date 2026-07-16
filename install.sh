@@ -360,7 +360,7 @@ detect_os_tag() {
   case "$PLATFORM" in
     Linux)  OS_TAG="linux" ;;
     Darwin) OS_TAG="macos" ;;
-    *)      die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1" ;;
+    *)      die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see install.ps1 (-WithWeb for the web service)" ;;
   esac
 }
 
@@ -726,7 +726,7 @@ check_deps_download() {
     die "install the dependencies above, then re-run."
   fi
   [[ "$SVC_MGR" != "unsupported" ]] \
-    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
+    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see install.ps1 (-WithWeb for the web service)"
   log_ok "Dependencies present (curl, sha256sum${WITH_WEB:+, node/bun})"
 }
 
@@ -811,7 +811,7 @@ check_deps_source() {
     die "install the dependencies above, then re-run (or drop --build-from-source to download prebuilt binaries)."
   fi
   [[ "$SVC_MGR" != "unsupported" ]] \
-    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see packaging/windows/install-web.ps1"
+    || die "install.sh supports Linux and macOS only (this is '$PLATFORM'). Windows users: see install.ps1 (-WithWeb for the web service)"
   log_ok "Dependencies present (cargo, go${WITH_WEB:+, node/bun})"
 }
 

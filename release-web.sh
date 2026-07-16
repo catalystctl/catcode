@@ -16,7 +16,7 @@
 # node-pty's packaged macOS/Windows prebuilds remain available for local use.
 # Requires Bun (https://bun.sh) or Node+npm to BUILD (on the release host),
 # and Node or Bun to RUN (on the install host). `install.sh --with-web` /
-# `install-web.ps1` download this tarball instead of building.
+# `install.ps1 -WithWeb` download this tarball instead of building.
 #
 #   ./release-web.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail

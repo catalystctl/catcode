@@ -3,7 +3,7 @@
 // Prefer `catcode --update` (updates CLI + installed web on Linux/macOS/Windows).
 // Fallbacks:
 //   - Unix: download install.sh --update
-//   - Windows: download packaging/windows/install-web.ps1 and re-run it
+//   - Windows: download install.ps1 and run -Update
 // The work is detached so a service restart mid-update does not strand the HTTP handler.
 
 import { spawn, execFileSync } from "node:child_process";
@@ -16,8 +16,9 @@ const INSTALLER_URL =
   process.env.CATCODE_INSTALLER_URL ||
   `https://raw.githubusercontent.com/${GITHUB_REPO}/refs/heads/master/install.sh`;
 const WINDOWS_INSTALLER_URL =
+  process.env.CATCODE_WINDOWS_INSTALLER_URL ||
   process.env.CATCODE_WINDOWS_WEB_INSTALLER_URL ||
-  `https://raw.githubusercontent.com/${GITHUB_REPO}/refs/heads/master/packaging/windows/install-web.ps1`;
+  `https://raw.githubusercontent.com/${GITHUB_REPO}/refs/heads/master/install.ps1`;
 
 const IS_WIN = process.platform === "win32";
 
@@ -190,14 +191,14 @@ export async function startSelfUpdate(): Promise<SelfUpdateStartResult> {
   }
 
   if (IS_WIN) {
-    const installerPath = join(LOCK_DIR, "install-web.ps1");
+    const installerPath = join(LOCK_DIR, "install.ps1");
     try {
-      await downloadText(WINDOWS_INSTALLER_URL, installerPath, "CatalystCodeWeb");
+      await downloadText(WINDOWS_INSTALLER_URL, installerPath, "Catalyst Code");
     } catch (err) {
       return {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
-        hint: "Install catcode.exe on PATH, or re-run packaging/windows/install-web.ps1",
+        hint: "Install catcode.exe on PATH, or re-run: pwsh -File install.ps1 -Update",
       };
     }
     const ps = resolvePowerShell();
@@ -208,18 +209,19 @@ export async function startSelfUpdate(): Promise<SelfUpdateStartResult> {
         "Bypass",
         "-File",
         installerPath,
+        "-Update",
       ]);
       return {
         ok: true,
         status: "started",
-        message: `Started install-web.ps1 (pid ${pid}). The page may disconnect while the service restarts.`,
+        message: `Started install.ps1 -Update (pid ${pid}). The page may disconnect while the service restarts.`,
         logPath: LOG_FILE,
       };
     } catch (err) {
       return {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
-        hint: "Re-run: pwsh -ExecutionPolicy Bypass -File packaging/windows/install-web.ps1",
+        hint: "Re-run: pwsh -ExecutionPolicy Bypass -File install.ps1 -Update",
       };
     }
   }

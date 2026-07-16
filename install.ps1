@@ -7,7 +7,7 @@
     from GitHub Releases and put it on your user PATH — no compiler, no admin.
     With -WithWeb, also download catcode-core.exe + the prebuilt web bundle and
     install the web frontend as a Windows Service (NSSM) or a logon Scheduled
-    Task (delegates to packaging/windows/install-web.ps1).
+    Task (web install is inlined in this script - same as install.sh --with-web).
 
     No download needed — pipe it straight from the web:
         irm https://raw.githubusercontent.com/catalystctl/catcode/master/install.ps1 | iex
@@ -44,10 +44,6 @@
 
 .PARAMETER WebDir
     Where to extract the web bundle. Default %LOCALAPPDATA%\catalyst-code\web.
-
-.PARAMETER WebInstallerUrl
-    URL to packaging/windows/install-web.ps1 (used only with -WithWeb when this
-    script is NOT run from a repo clone). Default: raw.githubusercontent.com master.
 
 .PARAMETER Update
     Re-download the latest release and reinstall (also restarts the web service
@@ -92,7 +88,6 @@ param(
     [int]$Port = 49283,
     [string]$BindHost = '0.0.0.0',
     [string]$WebDir = '',
-    [string]$WebInstallerUrl = '',
     [switch]$Update,
     [switch]$Uninstall,
     [switch]$AddWeb,
@@ -111,7 +106,6 @@ $ProgressPreference    = 'SilentlyContinue'   # speed up Invoke-WebRequest on la
 # user sessions, but SYSTEM/service accounts may lack it).
 $Repo                = 'catalystctl/catcode'
 $Arch                = 'x86_64'
-$DefaultWebInstaller = "https://raw.githubusercontent.com/$Repo/master/packaging/windows/install-web.ps1"
 function Resolve-LocalAppData {
     if ($env:LOCALAPPDATA) { return $env:LOCALAPPDATA }
     if ($env:USERPROFILE) { return Join-Path $env:USERPROFILE 'AppData\Local' }
@@ -121,12 +115,6 @@ $DataDir   = Join-Path (Resolve-LocalAppData) 'catalyst-code'
 $StateFile = Join-Path $DataDir 'installer.state'
 if (-not $InstallDir) { $InstallDir = Join-Path (Resolve-LocalAppData) 'Programs\catcode' }
 if (-not $WebDir)     { $WebDir     = Join-Path $DataDir 'web' }
-
-# resolve the current PowerShell executable (used to run install-web.ps1 in a
-# child process so its exits never kill this installer's flow).
-$exeName = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' }
-if ($env:OS -eq 'Windows_NT') { $exeName += '.exe' }
-$PsExe = Join-Path $PSHOME $exeName
 
 # mirror the -WithWeb switch into a script-scoped flag (so -Update can set it
 # from the recorded install state).
@@ -155,7 +143,6 @@ function Show-Help {
     -Port <n>           web service port          (default: 49283)
     -BindHost <h>       web bind host             (default: 0.0.0.0)
     -WebDir <path>      web bundle install dir    (default: %LOCALAPPDATA%\catalyst-code\web)
-    -WebInstallerUrl <url>  URL to install-web.ps1 (default: raw.githubusercontent.com master)
     -AddWeb             add the web service to an existing install
     -Update             re-download latest + reinstall (+ restart the web service)
     -Reinstall          reinstall the currently-installed version
@@ -263,60 +250,279 @@ function Install-CoreForWeb {
     W-Ok "Installed catcode-core.exe -> $InstallDir\catcode-core.exe"
 }
 
-# ── locate (or download) packaging/windows/install-web.ps1 ───
-function Resolve-WebInstaller {
-    # 1) local — run from a repo clone (install.ps1 sits at the repo root)
-    if ($PSScriptRoot) {
-        $local = Join-Path $PSScriptRoot 'packaging\windows\install-web.ps1'
-        if (Test-Path -LiteralPath $local) { return $local }
-    }
-    # 2) download from -WebInstallerUrl (default: raw master)
-    $url  = if ($WebInstallerUrl) { $WebInstallerUrl } else { $DefaultWebInstaller }
-    $dest = Join-Path $env:TEMP 'catcode-install-web.ps1'
-    W-Info "Downloading install-web.ps1 ..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-    } catch {
-        Die "could not download install-web.ps1 from $url.`n  If the repo is private, clone it and run install.ps1 from the repo root, or pass -WebInstallerUrl <mirror>."
-    }
-    return $dest
+
+# --- web service (inlined - formerly packaging/windows/install-web.ps1) ---
+$SvcName     = 'CatalystCodeWeb'
+$TaskName    = 'CatalystCodeWeb'
+$WrapperPath = Join-Path $DataDir 'run-web.cmd'
+$LogPath     = Join-Path $DataDir 'catalyst-code-web.log'
+$script:RT = $null
+$script:RTExe = $null
+
+function Detect-Runtime {
+    # Prefer Node for the prebuilt Next standalone server; native addons are
+    # more reliable under Node than Bun.
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($node) { $script:RT = 'node'; $script:RTExe = $node.Source; return }
+    $bun = Get-Command bun -ErrorAction SilentlyContinue
+    if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
+    Die 'neither node nor bun found — install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
 }
 
-# Run install-web.ps1 in a CHILD PROCESS so its exits never terminate this
-# installer's flow. Returns the child exit code.
-function Invoke-WebInstaller([switch]$DoUninstall) {
-    $webInstaller = Resolve-WebInstaller
-    if ($DoUninstall) {
-        W-Info 'Removing web service (delegating to install-web.ps1) ...'
-        & $PsExe -NoProfile -File $webInstaller -Uninstall
-        return $LASTEXITCODE
+# --- resolve release version + base URL ------------------------------------
+# Strip a leading "v" from a tag for the version string used in asset names.
+# Unlike Substring(1), this leaves commit-SHA tags (e.g. "1c08256") intact.
+function Assert-WebBundle {
+    param([string]$Dir)
+    $startJs = Join-Path $Dir 'start.js'
+    if (-not (Test-Path -LiteralPath $startJs)) { Die "web bundle missing start.js (extraction failed?)" }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'server.js'))) { Die 'web bundle missing server.js' }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'package.json'))) {
+        Die 'web bundle missing package.json (incomplete release artifact)'
     }
-    $coreExe = Join-Path $InstallDir 'catcode-core.exe'
-    W-Info 'Installing web service (delegating to install-web.ps1) ...'
-    & $PsExe -NoProfile -File $webInstaller -Port $Port -BindHost $BindHost `
-        -Version $script:Ver -BaseUrl $script:Base -WebDir $WebDir -CatcodeCore $coreExe
-    return $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir '.next\BUILD_ID'))) {
+        Die 'web bundle missing .next/BUILD_ID (incomplete release artifact)'
+    }
+    if ((Test-Path -LiteralPath (Join-Path $Dir 'web\server.js')) -or
+        (Test-Path -LiteralPath (Join-Path $Dir 'web\node_modules'))) {
+        Die @"
+web bundle has nested web/ layout — this release artifact was packed incorrectly.
+  Use a newer catcode-web-*.tar.gz built by current release-web.sh.
+"@
+    }
+    foreach ($req in @('next', 'ws', 'node-pty', 'better-sqlite3', 'better-auth')) {
+        $pkg = Join-Path $Dir "node_modules\$req\package.json"
+        if (-not (Test-Path -LiteralPath $pkg)) {
+            Die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start)."
+        }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'version.json'))) {
+        Die 'web bundle missing version.json (git commit not embedded)'
+    }
+    W-Ok "Web bundle looks runnable ($Dir)"
 }
+
+function Install-WebBundle {
+    $tgz = Get-Asset "catcode-web-$($script:Ver).tar.gz"
+    if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
+    Get-ChildItem -LiteralPath $WebDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.
+    $tar = Get-Command tar -ErrorAction SilentlyContinue
+    if (-not $tar) { Die 'tar not found (Windows 10 1803+ ships it). Extract the .tar.gz manually or install tar.' }
+    W-Info "Extracting web bundle -> $WebDir ..."
+    & tar -xzf $tgz -C $WebDir
+    if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
+    Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
+    Assert-WebBundle -Dir $WebDir
+    W-Ok "Web bundle extracted to $WebDir"
+}
+
+function Write-WebVersionJson {
+    param(
+        [string]$Dir,
+        [string]$Commit,
+        [string]$Source = 'release'
+    )
+    $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $payload = [ordered]@{
+        commit     = $Commit
+        commitFull = $Commit
+        dirty      = $false
+        builtAt    = $builtAt
+        source     = $Source
+    }
+    $json = $payload | ConvertTo-Json
+    $path = Join-Path $Dir 'version.json'
+    Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+    $nextDir = Join-Path $Dir '.next'
+    if (Test-Path -LiteralPath $nextDir) {
+        Set-Content -LiteralPath (Join-Path $nextDir 'version.json') -Value $json -Encoding UTF8
+    }
+    W-Ok "Web version: $Commit ($Source)"
+}
+
+# --- NSSM service -----------------------------------------------------------
+function Install-NssmService {
+    $nssm = Get-Command nssm -ErrorAction SilentlyContinue
+    if (-not $nssm) { return $false }
+    $nssm = $nssm.Source
+    & $nssm stop $SvcName *> $null 2>&1
+    & $nssm remove $SvcName confirm *> $null 2>&1
+    W-Info "Installing Windows Service '$SvcName' (NSSM)..."
+    & $nssm install $SvcName $RTExe (Join-Path $WebDir 'start.js') *> $null
+    if ($LASTEXITCODE -ne 0) { Die "nssm install failed (exit $LASTEXITCODE)" }
+    & $nssm set $SvcName AppDirectory $WebDir *> $null
+    & $nssm set $SvcName AppEnvironmentExtra "NODE_ENV=production" "PORT=$Port" "HOSTNAME=$BindHost" "CATCODE_CORE=$script:CoreExe" *> $null
+    & $nssm set $SvcName AppStdout $LogPath *> $null
+    & $nssm set $SvcName AppStderr $LogPath *> $null
+    & $nssm set $SvcName AppRotateFiles 1 *> $null
+    & $nssm set $SvcName AppRotateBytes 10485760 *> $null
+    & $nssm set $SvcName AppRestartDelay 3000 *> $null
+    & $nssm set $SvcName Start 'SERVICE_AUTO_START' *> $null
+    & $nssm start $SvcName *> $null
+    if ($LASTEXITCODE -ne 0) { Die "nssm start failed — check: nssm get $SvcName AppStdout ; Get-Content $LogPath" }
+    W-Ok "Service '$SvcName' installed and started (NSSM, auto-start at boot)"
+    return $true
+}
+
+# --- scheduled-task fallback (zero-dependency) ------------------------------
+function Write-Wrapper {
+    # restart-loop wrapper: re-launches `node start.js` 3s after it exits.
+    $cmd = @(
+        '@echo off',
+        "set NODE_ENV=production",
+        "set PORT=$Port",
+        "set HOSTNAME=$BindHost",
+        "set CATCODE_CORE=$script:CoreExe",
+        ':loop',
+        "cd /d `"$WebDir`"",
+        "`"$RTExe`" `"$WebDir\start.js`"",
+        'echo [%date% %time%] web exited, restarting in 3s...',
+        'timeout /t 3 /nobreak >nul',
+        'goto loop'
+    ) -join "`r`n"
+    if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($WrapperPath, $cmd)
+}
+
+function Install-Task {
+    W-Info 'NSSM not found — installing as a Scheduled Task at logon...'
+    W-Warn 'Note: a Scheduled Task runs only while a user is logged in.'
+    W-Warn '      For a true boot-time service, install NSSM (https://nssm.cc) and re-run.'
+    Write-Wrapper
+    schtasks /query /tn $TaskName *> $null 2>&1
+    if ($LASTEXITCODE -eq 0) { schtasks /delete /tn $TaskName /f *> $null }
+    schtasks /create /tn $TaskName /tr "`"$WrapperPath`"" /sc onlogon /rl limited /f *> $null
+    if ($LASTEXITCODE -ne 0) { Die "schtasks /create failed (exit $LASTEXITCODE)" }
+    schtasks /run /tn $TaskName *> $null
+    W-Ok "Scheduled task '$TaskName' created and started (at logon, restart-loop wrapper)"
+}
+
+# --- build-from-source fallback (old path) ---------------------------------
+function Build-Web-FromSource {
+    Write-Host ''
+    Write-Host 'Building web frontend from source (SDK + Next.js)' -ForegroundColor Cyan
+    $rt = $null; $rtExe = $null
+    $bun = Get-Command bun -ErrorAction SilentlyContinue
+    if ($bun) { $rt = 'bun'; $rtExe = $bun.Source }
+    else {
+        $npm = Get-Command npm -ErrorAction SilentlyContinue
+        if ($npm) { $node = Get-Command node -ErrorAction SilentlyContinue; if (-not $node) { Die 'npm found but node is not on PATH' }; $rt = 'npm'; $rtExe = $npm.Source }
+        else { Die 'neither bun nor npm found (https://bun.sh or https://nodejs.org)' }
+    }
+    W-Ok "Runtime: $rt ($rtExe)"
+    Push-Location (Join-Path $RepoDir 'sdk')
+    try { & $rtExe install *> $null; if ($LASTEXITCODE -ne 0) { Die 'SDK dep install failed' }; & $rtExe run build *> $null; if ($LASTEXITCODE -ne 0) { Die 'SDK build failed' } }
+    finally { Pop-Location }
+    Push-Location (Join-Path $RepoDir 'web')
+    try { & $rtExe install *> $null; if ($LASTEXITCODE -ne 0) { Die 'web dep install failed' }; $env:NEXT_TELEMETRY_DISABLED = '1'; & $rtExe run build; if ($LASTEXITCODE -ne 0) { Die 'web build failed' } }
+    finally { Pop-Location }
+    # source path runs `next start` from the repo web dir
+    $script:WebDir = Join-Path $RepoDir 'web'
+    $script:RT = $rt; $script:RTExe = $rtExe
+    W-Ok 'Web build complete'
+}
+
+# --- uninstall --------------------------------------------------------------
+
+function Install-WebService {
+    Detect-Runtime
+    # Script-scoped so Install-NssmService / Write-Wrapper see CATCODE_CORE.
+    $script:CoreExe = Join-Path $InstallDir 'catcode-core.exe'
+    $CoreExe = $script:CoreExe
+    if (-not (Test-Path -LiteralPath $CoreExe)) {
+        Die "catcode-core.exe missing at $CoreExe - install core first"
+    }
+    Install-WebBundle
+    if (-not (Install-NssmService)) { Install-Task }
+    W-Ok "Web frontend service ready at http://localhost:$Port"
+}
+
+function Uninstall-WebService {
+    W-Info 'Removing web service ...'
+    $nssm = Get-Command nssm -ErrorAction SilentlyContinue
+    $removed = $false
+    if ($nssm) {
+        $nssm = $nssm.Source
+        & $nssm stop $SvcName *> $null 2>&1
+        & $nssm remove $SvcName confirm *> $null 2>&1
+        if ($LASTEXITCODE -eq 0) { W-Ok "Removed Windows Service '$SvcName'"; $removed = $true }
+    } else {
+        sc.exe stop $SvcName *> $null 2>&1
+        sc.exe delete $SvcName *> $null 2>&1
+    }
+    schtasks /query /tn $TaskName *> $null 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /end /tn $TaskName *> $null 2>&1
+        schtasks /delete /tn $TaskName /f *> $null
+        W-Ok "Removed Scheduled Task '$TaskName'"; $removed = $true
+    }
+    if (Test-Path $WrapperPath) { Remove-Item $WrapperPath -Force; W-Ok "Removed wrapper $WrapperPath" }
+    if (Test-Path -LiteralPath $WebDir) {
+        Remove-Item -LiteralPath $WebDir -Recurse -Force -ErrorAction SilentlyContinue
+        W-Ok "Removed web bundle $WebDir"
+    }
+    if (-not $removed) { W-Warn 'No service or task found to remove (already clean?)' }
+}
+
 
 # ── install state ────────────────────────────────────────────
 function Save-State([bool]$WebInstalled) {
+    $installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $webFlag = if ($WebInstalled) { 'yes' } else { 'no' }
     $st = [ordered]@{
         version      = $script:Ver
-        with_web     = if ($WebInstalled) { 'yes' } else { 'no' }
+        with_web     = $webFlag
         install_dir  = $InstallDir
         web_dir      = $WebDir
         port         = $Port
         host         = $BindHost
-        installed_at = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
+        installed_at = $installedAt
     }
     if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
-    $st | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
+    $st | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $DataDir 'installer.state.json') -Encoding UTF8
+    $shellLines = @(
+        '# Catalyst Code installer state - written by install.ps1',
+        '# (shell-sourcable; consumed by catcode --update)',
+        'METHOD="download"',
+        ('PREFIX="' + $InstallDir + '"'),
+        ('PORT="' + $Port + '"'),
+        ('HOST="' + $BindHost + '"'),
+        ('WEB_DIR="' + $WebDir + '"'),
+        ('WEB_INSTALLED="' + $webFlag + '"'),
+        'UNIT_NAME="CatalystCodeWeb"',
+        ('VERSION="' + $script:Ver + '"'),
+        ('INSTALLED_AT="' + $installedAt + '"')
+    )
+    Set-Content -LiteralPath $StateFile -Value ($shellLines -join "`r`n") -Encoding UTF8
     W-Ok "Recorded install state -> $StateFile"
 }
 
 function Load-State {
     if (-not (Test-Path -LiteralPath $StateFile)) { return $null }
-    try { return (Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json) } catch { return $null }
+    $raw = Get-Content -LiteralPath $StateFile -Raw
+    try {
+        $j = $raw | ConvertFrom-Json
+        if ($null -ne $j.version -or $null -ne $j.with_web) { return $j }
+    } catch {}
+    $jsonBackup = Join-Path $DataDir 'installer.state.json'
+    if (Test-Path -LiteralPath $jsonBackup) {
+        try { return (Get-Content -LiteralPath $jsonBackup -Raw | ConvertFrom-Json) } catch {}
+    }
+    $map = @{}
+    foreach ($line in ($raw -split "`r?`n")) {
+        if ($line -match '^([A-Z_]+)="([^"]*)"') { $map[$Matches[1]] = $Matches[2] }
+    }
+    if (-not $map.ContainsKey('VERSION') -and -not $map.ContainsKey('WEB_INSTALLED')) { return $null }
+    return [pscustomobject]@{
+        version      = $map['VERSION']
+        with_web     = if ($map['WEB_INSTALLED']) { $map['WEB_INSTALLED'] } else { 'no' }
+        install_dir  = if ($map['PREFIX']) { $map['PREFIX'] } else { $InstallDir }
+        web_dir      = if ($map['WEB_DIR']) { $map['WEB_DIR'] } else { $WebDir }
+        port         = if ($map['PORT']) { [int]$map['PORT'] } else { $Port }
+        host         = if ($map['HOST']) { $map['HOST'] } else { $BindHost }
+        installed_at = $map['INSTALLED_AT']
+    }
 }
 
 # ── summaries ────────────────────────────────────────────────
@@ -375,8 +581,7 @@ function Do-Install {
         # record the TUI install first so a web failure still leaves a usable state
         Save-State $false
         Install-CoreForWeb
-        $rc = Invoke-WebInstaller
-        if ($rc -ne 0) { Die "web service install failed (install-web.ps1 exited $rc)." }
+        Install-WebService
         Save-State $true
     } else {
         W-Info 'Skipping web service (pass -WithWeb to install it)'
@@ -405,8 +610,7 @@ function Do-Update {
     if ($st.with_web -eq 'yes') {
         $script:WithWeb = $true
         Install-CoreForWeb
-        $rc = Invoke-WebInstaller
-        if ($rc -ne 0) { W-Warn "web service update returned $rc (it self-restarts on re-install)" }
+        Install-WebService
         Save-State $true
     } else {
         Save-State $false
@@ -429,8 +633,7 @@ function Do-Uninstall {
     # web service first (if it was installed)
     $hadWeb = ($st -and $st.with_web -eq 'yes')
     if ($hadWeb) {
-        $rc = Invoke-WebInstaller -DoUninstall
-        if ($rc -ne 0) { W-Warn "web uninstall returned $rc (continuing)" }
+        Uninstall-WebService
     }
 
     # binaries
@@ -496,8 +699,7 @@ function Do-AddWeb {
         return
     }
     Install-CoreForWeb
-    $rc = Invoke-WebInstaller
-    if ($rc -ne 0) { Die "web service install failed (install-web.ps1 exited $rc)." }
+    Install-WebService
     Save-State $true
     Summary-AddWeb
 }

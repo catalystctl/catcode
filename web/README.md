@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/mast
 Windows PowerShell:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/packaging/windows/install-web.ps1)))
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1))) -WithWeb
 ```
 
 Open `http://localhost:49283` after installation.
