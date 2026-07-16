@@ -59,7 +59,7 @@ if ($Uninstall) {
 } elseif ($BuildFromSource) {
     Write-Host '  error: -BuildFromSource is no longer supported via this shim.' -ForegroundColor Red
     Write-Host '  Use install.ps1 -WithWeb for the prebuilt bundle, or build from a repo checkout.' -ForegroundColor Red
-    exit 1
+    throw 'BuildFromSource is no longer supported via install-web.ps1'
 } else {
     $installDir = Join-Path $env:LOCALAPPDATA 'Programs\catcode'
     $hasTui = Test-Path -LiteralPath (Join-Path $installDir 'catcode.exe')
@@ -72,4 +72,9 @@ if ($Uninstall) {
 }
 
 & $psExe @fwd
-exit $LASTEXITCODE
+# Do NOT call exit with the child status — under irm|iex / scriptblock hosts
+# that closes the user's PowerShell window. Propagate failure via throw;
+# success falls off the end so the host shell stays open.
+if ($LASTEXITCODE -ne 0) {
+    throw "install.ps1 failed (exit $LASTEXITCODE)"
+}

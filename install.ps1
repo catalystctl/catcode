@@ -124,7 +124,11 @@ $script:WithWeb = [bool]$WithWeb
 function W-Info($t) { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Cyan } }
 function W-Ok($t)   { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Green } }
 function W-Warn($t){ if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Yellow } }
-function Die($t)   { Write-Host "`n  error: $t" -ForegroundColor Red; exit 1 }
+# Prefer throw over exit: under `irm | iex` or `& ([scriptblock]::Create(...))`,
+# exit kills the user's entire PowerShell window so they never see the error.
+# throw surfaces a red error and leaves the shell open. `pwsh -File` still
+# exits non-zero on an uncaught throw (CI/scripted use stays correct).
+function Die($t)   { Write-Host "`n  error: $t" -ForegroundColor Red; throw "install failed: $t" }
 
 # Native exes (schtasks/sc/nssm) write expected failures to stderr. With
 # $ErrorActionPreference=Stop, PowerShell turns that into a terminating
@@ -214,7 +218,12 @@ function Resolve-Release {
 function Get-Asset {
     param([string]$Name)
     $url  = "$($script:Base)/$Name"
-    $dest = Join-Path $env:TEMP $Name
+    $tmp = $env:TEMP
+    if (-not $tmp) { $tmp = $env:TMP }
+    if (-not $tmp) { $tmp = $env:TMPDIR }
+    if (-not $tmp) { $tmp = [System.IO.Path]::GetTempPath() }
+    if (-not $tmp) { Die 'no temp directory (TEMP/TMP unset)' }
+    $dest = Join-Path $tmp $Name
     W-Info "Downloading $Name ..."
     try {
         Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -695,7 +704,7 @@ function Show-Menu {
             '5' { return 'reinstall' }
             '6' { return 'uninstall' }
             '7' { return 'status' }
-            '0' { Write-Host '  Bye.' -ForegroundColor DarkGray; exit 0 }
+            '0' { Write-Host '  Bye.' -ForegroundColor DarkGray; return 'exit' }
             default { Write-Host '  invalid choice — try again' -ForegroundColor Yellow }
         }
     }
@@ -800,5 +809,6 @@ switch ($action) {
     'add-web'   { Do-AddWeb }
     'reinstall' { Do-Reinstall }
     'status'    { Do-Status }
+    'exit'      { return }
     default     { Die "unknown action: $action" }
 }
