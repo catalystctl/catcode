@@ -29,9 +29,11 @@ export const CORE_EVENT_TYPES = [
   "done",
   "error",
   "file_change",
+  "goal_completion_summary",
   "goal_phase",
   "goal_plan",
   "goal_state",
+  "goal_step_complete",
   "goal_step_verdict",
   "history",
   "http_retry",
@@ -176,6 +178,27 @@ export interface GoalStepVerdictEvent {
   output: string;
 }
 
+/** One-shot lasting signal when a deploy step settles (alongside goal_state). */
+export interface GoalStepCompleteEvent {
+  type: "goal_step_complete";
+  step_id: string;
+  title: string;
+  agent: string;
+  ok: boolean;
+  status: string;
+  summary: string;
+  run_id?: string;
+}
+
+/** Deterministic or wrap-up synthesis text when a goal finishes (esp. skipped wrap-up). */
+export interface GoalCompletionSummaryEvent {
+  type: "goal_completion_summary";
+  /** Primary payload from core (`emit_goal_completion_summary`). */
+  text: string;
+  /** Defensive alias — UIs may accept `summary` if `text` is absent. */
+  summary?: string;
+}
+
 export interface GoalStateEvent {
   type: "goal_state";
   [key: string]: unknown;
@@ -195,6 +218,9 @@ export interface GoalPhaseEvent {
   from: string;
   to: string;
   message?: string;
+  wave?: number;
+  step_count?: number;
+  done_count?: number;
 }
 
 export interface SubagentStartEvent {
@@ -271,6 +297,8 @@ export type NarrowCoreEvent =
   | AuditEvent
   | CostUpdateEvent
   | GoalStepVerdictEvent
+  | GoalStepCompleteEvent
+  | GoalCompletionSummaryEvent
   | GoalStateEvent
   | GoalPlanEvent
   | GoalPhaseEvent
