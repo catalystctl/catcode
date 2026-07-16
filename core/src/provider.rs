@@ -3902,7 +3902,7 @@ async fn stream_turn_openai(
         let mut emitted = false;
         let mut err: Option<String> = None;
 
-        loop {
+        'read_stream: loop {
             let chunk = tokio::select! {
                 c = tokio::time::timeout(idle, stream.next()) => match c {
                     Ok(x) => x,
@@ -3951,6 +3951,20 @@ async fn stream_turn_openai(
                     }
                     Err(_) => continue, // wait for more `data:` lines to complete the frame
                 };
+
+                // OpenAI-compatible gateways may report an upstream failure
+                // as an SSE error frame after the HTTP 200 stream has started.
+                // Treat that as a provider failure; otherwise a partial model
+                // response can be mistaken for a successful completion.
+                if let Some(error) = obj.get("error") {
+                    let detail = error
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| error.to_string());
+                    err = Some(format!("provider stream error: {detail}"));
+                    break 'read_stream;
+                }
 
                 // usage is sent in a final chunk with an empty choices array.
                 // usage is sent in a final chunk with an empty choices array.
@@ -7581,6 +7595,46 @@ mod tests {
         .expect_err("repeated reasoning-only output must not silently complete");
         assert!(error.contains("reasoning-only completion"));
         assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn openai_sse_error_frames_are_provider_failures() {
+        let failure = format!(
+            "data: {}\n\n",
+            json!({
+                "error": {
+                    "message": "Cursor SDK authentication failed",
+                    "type": "cursor_sdk_error"
+                }
+            })
+        );
+        let (base, server) = mock_openai_sse_server(vec![
+            failure.clone(),
+            failure.clone(),
+            failure,
+        ])
+        .await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let error = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("continue")],
+            &[],
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect_err("an SSE error object must not become a successful empty completion");
+
+        assert!(error.contains("Cursor SDK authentication failed"));
+        assert_eq!(server.await.unwrap().len(), 3);
     }
 
     #[tokio::test]
