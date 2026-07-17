@@ -167,10 +167,7 @@ mod tests {
     #[test]
     fn ambiguous_defaults_to_project() {
         assert_eq!(infer_preference_scope("prefer tabs"), Scope::Workspace);
-        assert_eq!(
-            infer_preference_scope("I always use tabs"),
-            Scope::Global
-        );
+        assert_eq!(infer_preference_scope("I always use tabs"), Scope::Global);
         assert_eq!(
             infer_preference_scope("In this repo use spaces"),
             Scope::Workspace
@@ -219,7 +216,9 @@ mod tests {
             precedence_rank("x")
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
         let pref = PreferenceRecord {
             id: "pref-tabs".into(),

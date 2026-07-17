@@ -27,6 +27,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Task-pattern + feedback writers (file lives at `core/src/task_patterns.rs`).
+#[path = "task_patterns.rs"]
+pub mod task_patterns;
+
 /// Learning store schema version written into `project.json`.
 pub const LEARNING_SCHEMA_VERSION: u32 = 1;
 
@@ -260,9 +264,8 @@ pub fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body = serde_json::to_vec_pretty(value).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"));
     crate::fsutil::atomic_write(path, &body)
 }
@@ -296,9 +299,12 @@ mod tests {
     #[test]
     fn ensure_creates_layout() {
         let root = tmp_root();
-        let _lserial = learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root.clone());
-        let paths = ensure_project_learning("project-deadbeef", Some("github.com/a/b"), Some("abc123"));
+        let paths =
+            ensure_project_learning("project-deadbeef", Some("github.com/a/b"), Some("abc123"));
         assert!(paths.root.exists());
         assert!(paths.index_dir.exists());
         assert!(paths.project_json.exists());
@@ -312,7 +318,9 @@ mod tests {
     #[test]
     fn append_jsonl_skips_bad_lines_and_caps() {
         let root = tmp_root();
-        let _lserial = learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
         let paths = ensure_project_learning("project-cap", None, None);
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -333,7 +341,9 @@ mod tests {
     fn concurrent_appends_do_not_lose_events() {
         use std::thread;
         let root = tmp_root();
-        let _lserial = learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
         let paths = ensure_project_learning("project-conc", None, None);
         #[derive(Serialize, Deserialize)]

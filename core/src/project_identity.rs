@@ -81,9 +81,7 @@ pub struct RegistryPathGuard {
 
 impl Drop for RegistryPathGuard {
     fn drop(&mut self) {
-        let mut g = REGISTRY_OVERRIDE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = REGISTRY_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
         *g = self.prev.take();
     }
 }
@@ -99,9 +97,7 @@ pub fn registry_test_serial() -> &'static std::sync::Mutex<()> {
 /// Install `path` as the registry file until the guard drops (tests).
 #[cfg(test)]
 pub fn override_registry_path(path: PathBuf) -> RegistryPathGuard {
-    let mut g = REGISTRY_OVERRIDE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut g = REGISTRY_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     let prev = g.replace(path);
     RegistryPathGuard { prev }
 }
@@ -516,7 +512,9 @@ mod tests {
 
     #[test]
     fn same_repo_new_path_same_id() {
-        let _serial = registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tmp_dir("home");
         let reg = home.join("project-registry.json");
         let _guard = override_registry_path(reg);
@@ -554,7 +552,9 @@ mod tests {
 
     #[test]
     fn unrelated_repos_do_not_merge() {
-        let _serial = registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tmp_dir("home2");
         let _guard = override_registry_path(home.join("project-registry.json"));
 
@@ -579,7 +579,9 @@ mod tests {
 
     #[test]
     fn non_git_uses_path_fallback() {
-        let _serial = registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tmp_dir("home3");
         let _guard = override_registry_path(home.join("project-registry.json"));
         let ws = tmp_dir("nongit");
@@ -594,7 +596,9 @@ mod tests {
 
     #[test]
     fn remote_url_change_does_not_auto_merge() {
-        let _serial = registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tmp_dir("home4");
         let _guard = override_registry_path(home.join("project-registry.json"));
 

@@ -384,7 +384,6 @@ pub(crate) fn ok_envelope(session_id: &str, tab_id: &str, extra: Value) -> Value
     v
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,7 +412,10 @@ mod tests {
         for n in MVP_TOOL_NAMES {
             assert!(
                 defs.iter().any(|d| {
-                    d.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) == Some(*n)
+                    d.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some(*n)
                 }),
                 "missing schema for {n}"
             );
@@ -423,10 +425,7 @@ mod tests {
     #[test]
     fn deferred_and_classify_wiring() {
         for n in MVP_TOOL_NAMES {
-            assert!(
-                crate::tools::is_deferred_tool(n),
-                "{n} must be deferred"
-            );
+            assert!(crate::tools::is_deferred_tool(n), "{n} must be deferred");
             assert!(
                 !crate::tools::is_core_tool(n),
                 "{n} must not be always-on core"
@@ -449,7 +448,10 @@ mod tests {
             })
             .collect();
         for n in MVP_TOOL_NAMES {
-            assert!(names.iter().any(|x| x == n), "{n} missing from tools::definitions");
+            assert!(
+                names.iter().any(|x| x == n),
+                "{n} missing from tools::definitions"
+            );
         }
     }
 
@@ -466,7 +468,8 @@ mod tests {
         let cfg = cfg();
         let o = execute_browser("browser_create", &json!({}), &cfg).await;
         assert!(o.ok, "{}", o.output);
-        #[cfg(not(feature = "native-browser"))]{
+        #[cfg(not(feature = "native-browser"))]
+        {
             assert!(o.output.contains("BROWSER_UNAVAILABLE"), "{}", o.output);
             let v: serde_json::Value = serde_json::from_str(&o.output).unwrap();
             assert_eq!(v["success"], false);
@@ -479,7 +482,8 @@ mod tests {
         let cfg = cfg();
         let o = execute_browser("browser_list_sessions", &json!({}), &cfg).await;
         assert!(o.ok, "{}", o.output);
-        #[cfg(not(feature = "native-browser"))]{
+        #[cfg(not(feature = "native-browser"))]
+        {
             let v: serde_json::Value = serde_json::from_str(&o.output).unwrap();
             assert_eq!(v["success"], true);
             assert_eq!(v["sessions"], json!([]));
@@ -496,18 +500,45 @@ mod tests {
             ("browser_create", json!({})),
             ("browser_close", json!({"session_id": "browser_x"})),
             ("browser_list_sessions", json!({})),
-            ("browser_navigate", json!({"session_id": "browser_x", "url": "https://example.com"})),
+            (
+                "browser_navigate",
+                json!({"session_id": "browser_x", "url": "https://example.com"}),
+            ),
             ("browser_back", json!({"session_id": "browser_x"})),
             ("browser_reload", json!({"session_id": "browser_x"})),
             ("browser_snapshot", json!({"session_id": "browser_x"})),
-            ("browser_find", json!({"session_id": "browser_x", "query": {"strategy": "text", "value": "Go"}})),
-            ("browser_click", json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1"})),
-            ("browser_fill", json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1", "text": "a"})),
-            ("browser_type", json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1", "text": "a"})),
-            ("browser_press", json!({"session_id": "browser_x", "key": "Enter"})),
-            ("browser_scroll", json!({"session_id": "browser_x", "direction": "down"})),
-            ("browser_wait", json!({"session_id": "browser_x", "condition": {"type": "timeout"}, "timeout_ms": 10})),
-            ("browser_evaluate", json!({"session_id": "browser_x", "script": "1+1"})),
+            (
+                "browser_find",
+                json!({"session_id": "browser_x", "query": {"strategy": "text", "value": "Go"}}),
+            ),
+            (
+                "browser_click",
+                json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1"}),
+            ),
+            (
+                "browser_fill",
+                json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1", "text": "a"}),
+            ),
+            (
+                "browser_type",
+                json!({"session_id": "browser_x", "snapshot_id": "snap_1", "ref": "e1", "text": "a"}),
+            ),
+            (
+                "browser_press",
+                json!({"session_id": "browser_x", "key": "Enter"}),
+            ),
+            (
+                "browser_scroll",
+                json!({"session_id": "browser_x", "direction": "down"}),
+            ),
+            (
+                "browser_wait",
+                json!({"session_id": "browser_x", "condition": {"type": "timeout"}, "timeout_ms": 10}),
+            ),
+            (
+                "browser_evaluate",
+                json!({"session_id": "browser_x", "script": "1+1"}),
+            ),
             ("browser_screenshot", json!({"session_id": "browser_x"})),
             ("browser_show", json!({"session_id": "browser_x"})),
             ("browser_hide", json!({"session_id": "browser_x"})),
@@ -515,11 +546,20 @@ mod tests {
         assert_eq!(cases.len(), MVP_TOOL_NAMES.len());
         for (name, args) in cases {
             let o = execute_browser(name, &args, &cfg).await;
-            assert!(o.ok, "{name} should return Outcome::ok with JSON: {}", o.output);
+            assert!(
+                o.ok,
+                "{name} should return Outcome::ok with JSON: {}",
+                o.output
+            );
             let v: serde_json::Value = serde_json::from_str(&o.output)
                 .unwrap_or_else(|e| panic!("{name}: not JSON ({e}): {}", o.output));
-            assert!(v.get("success").is_some() || v.get("sessions").is_some() || v.get("error").is_some(),
-                "{name}: unexpected shape {}", v);
+            assert!(
+                v.get("success").is_some()
+                    || v.get("sessions").is_some()
+                    || v.get("error").is_some(),
+                "{name}: unexpected shape {}",
+                v
+            );
         }
     }
 
@@ -531,11 +571,13 @@ mod tests {
     #[ignore = "needs native-browser feature + display (xvfb-run)"]
     #[tokio::test]
     async fn e2e_native_browser_create_navigate_close() {
-        #[cfg(not(feature = "native-browser"))]{
+        #[cfg(not(feature = "native-browser"))]
+        {
             eprintln!("skipping: rebuild with --features native-browser");
             return;
         }
-        #[cfg(feature = "native-browser")]{
+        #[cfg(feature = "native-browser")]
+        {
             let cfg = cfg();
             let create = execute_browser(
                 "browser_create",
@@ -546,7 +588,10 @@ mod tests {
             assert!(create.ok, "create: {}", create.output);
             let created: serde_json::Value = serde_json::from_str(&create.output).expect("json");
             assert_eq!(created["success"], true, "{}", create.output);
-            let sid = created["session_id"].as_str().expect("session_id").to_string();
+            let sid = created["session_id"]
+                .as_str()
+                .expect("session_id")
+                .to_string();
 
             struct Guard(String);
             impl Drop for Guard {
@@ -574,7 +619,10 @@ mod tests {
             let navv: serde_json::Value = serde_json::from_str(&nav.output).unwrap();
             assert_eq!(navv["success"], true, "{}", nav.output);
             assert!(
-                navv["url"].as_str().unwrap_or("").contains("code.catalystctl.com"),
+                navv["url"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("code.catalystctl.com"),
                 "url: {}",
                 nav.output
             );
@@ -593,14 +641,13 @@ mod tests {
             assert!(wait.ok, "wait text: {}", wait.output);
             let waitv: serde_json::Value = serde_json::from_str(&wait.output).unwrap();
             assert_eq!(waitv["success"], true, "{}", wait.output);
-            assert_eq!(waitv["approximate"], false, "wait should use real polling: {}", wait.output);
+            assert_eq!(
+                waitv["approximate"], false,
+                "wait should use real polling: {}",
+                wait.output
+            );
 
-            let snap = execute_browser(
-                "browser_snapshot",
-                &json!({"session_id": sid}),
-                &cfg,
-            )
-            .await;
+            let snap = execute_browser("browser_snapshot", &json!({"session_id": sid}), &cfg).await;
             assert!(snap.ok, "snapshot: {}", snap.output);
             let snapv: serde_json::Value = serde_json::from_str(&snap.output).unwrap();
             assert_eq!(snapv["success"], true, "{}", snap.output);
@@ -617,7 +664,11 @@ mod tests {
                 "page text missing brand: {}",
                 text.chars().take(200).collect::<String>()
             );
-            eprintln!("snapshot: {} elements, title={:?}", elements.len(), snapv.get("title"));
+            eprintln!(
+                "snapshot: {} elements, title={:?}",
+                elements.len(),
+                snapv.get("title")
+            );
 
             // Prefer a real CTA from the snapshot; fall back to browser_find.
             let mut click_ref: Option<String> = None;
@@ -655,7 +706,11 @@ mod tests {
                 assert!(
                     !matches.is_empty(),
                     "find Install should match (also snapshot had no CTA): snap_names={:?} find={}",
-                    elements.iter().filter_map(|e| e["name"].as_str()).take(15).collect::<Vec<_>>(),
+                    elements
+                        .iter()
+                        .filter_map(|e| e["name"].as_str())
+                        .take(15)
+                        .collect::<Vec<_>>(),
                     find.output
                 );
                 click_ref = Some(matches[0]["ref"].as_str().expect("ref").to_string());
@@ -676,7 +731,10 @@ mod tests {
             .await;
             assert!(find_brand.ok, "find brand: {}", find_brand.output);
             let find_brand_v: serde_json::Value = serde_json::from_str(&find_brand.output).unwrap();
-            let brand_matches = find_brand_v["matches"].as_array().cloned().unwrap_or_default();
+            let brand_matches = find_brand_v["matches"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 !brand_matches.is_empty(),
                 "find Catalyst should match tagged elements: {}",
@@ -731,29 +789,40 @@ mod tests {
             assert!(shot.ok, "screenshot: {}", shot.output);
             let shotv: serde_json::Value = serde_json::from_str(&shot.output).unwrap();
             assert_eq!(shotv["success"], true, "{}", shot.output);
-            assert!(!shot.output.contains("UNSUPPORTED"), "screenshot must work: {}", shot.output);
+            assert!(
+                !shot.output.contains("UNSUPPORTED"),
+                "screenshot must work: {}",
+                shot.output
+            );
             let rel = shotv["path"].as_str().expect("path");
             let abs = cfg.workspace.join(rel);
-            assert!(abs.is_file(), "screenshot file missing: {abs:?} output={}", shot.output);
+            assert!(
+                abs.is_file(),
+                "screenshot file missing: {abs:?} output={}",
+                shot.output
+            );
             let meta = std::fs::metadata(&abs).unwrap();
-            assert!(meta.len() > 100, "screenshot too small: {} bytes", meta.len());
+            assert!(
+                meta.len() > 100,
+                "screenshot too small: {} bytes",
+                meta.len()
+            );
             let w = shotv["width"].as_u64().unwrap_or(0);
             let h = shotv["height"].as_u64().unwrap_or(0);
             assert!(w > 0 && h > 0, "bad dimensions {w}x{h}: {}", shot.output);
             eprintln!("screenshot -> {rel} ({w}x{h}, {} bytes)", meta.len());
 
-            let close = execute_browser(
-                "browser_close",
-                &json!({"session_id": sid}),
-                &cfg,
-            )
-            .await;
+            let close = execute_browser("browser_close", &json!({"session_id": sid}), &cfg).await;
             assert!(close.ok, "close: {}", close.output);
             guard.0.clear();
 
             let list2 = execute_browser("browser_list_sessions", &json!({}), &cfg).await;
             assert!(list2.ok, "{}", list2.output);
-            assert!(!list2.output.contains(&sid), "session should be gone: {}", list2.output);
+            assert!(
+                !list2.output.contains(&sid),
+                "session should be gone: {}",
+                list2.output
+            );
         }
     }
 }

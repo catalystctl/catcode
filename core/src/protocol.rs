@@ -360,6 +360,16 @@ pub enum Command {
         /// When false, stop at plan_ready until `approve_goal_plan`.
         #[serde(default)]
         auto_deploy: Option<bool>,
+        /// Enable autonomous Control Center CEO loop (self-review + verify/replan).
+        /// Default false preserves classic single-pass `/goal`.
+        #[serde(default)]
+        ceo_mode: Option<bool>,
+        /// Cap on verify→replan cycles when `ceo_mode` (default 3).
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        /// Cap on pre-deploy plan self-review revisions when `ceo_mode` (default 2).
+        #[serde(default)]
+        max_plan_revisions: Option<u32>,
         /// Advanced: pin models for planner / worker / reviewer agents.
         #[serde(default)]
         planner_model: Option<String>,
@@ -459,4 +469,47 @@ pub fn emit(ev: &Event) {
     let mut h = stdout.lock();
     let _ = h.write_all(line.as_bytes());
     let _ = h.flush();
+}
+
+/// Pre-turn rejection the UI already treated as turn start (`busy=true`).
+/// Always pair `error` with `done` so frontends that clear busy on `done` cannot stick.
+pub fn emit_turn_rejected(message: impl AsRef<str>) {
+    emit(&Event::new("error").with("message", Value::String(message.as_ref().to_string())));
+    emit(&Event::new("done"));
+}
+
+/// Cancel path that historically emitted only `aborted`. Pair with `done` for
+/// one-shot protocol consumers (TUI clears on either; others may watch `done` only).
+pub fn emit_aborted_done() {
+    emit(&Event::new("aborted"));
+    emit(&Event::new("done"));
+}
+
+#[cfg(test)]
+mod turn_terminal_tests {
+    use super::*;
+
+    #[test]
+    fn emit_turn_rejected_pairs_error_with_done() {
+        begin_emit_capture();
+        emit_turn_rejected("unknown model: nope");
+        let got = end_emit_capture();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "error");
+        assert_eq!(
+            got[0].1.get("message").and_then(|v| v.as_str()),
+            Some("unknown model: nope")
+        );
+        assert_eq!(got[1].0, "done");
+    }
+
+    #[test]
+    fn emit_aborted_done_pairs_both() {
+        begin_emit_capture();
+        emit_aborted_done();
+        let got = end_emit_capture();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "aborted");
+        assert_eq!(got[1].0, "done");
+    }
 }

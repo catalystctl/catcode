@@ -239,11 +239,7 @@ impl EpisodeBuilder {
         elapsed_ms: Option<u64>,
         final_diff_hash: Option<String>,
     ) -> CodingEpisode {
-        let diag_classes: Vec<String> = self
-            .diagnostics
-            .iter()
-            .map(|d| d.class.clone())
-            .collect();
+        let diag_classes: Vec<String> = self.diagnostics.iter().map(|d| d.class.clone()).collect();
         let test_cmds: Vec<String> = self.tests_run.iter().map(|t| t.command.clone()).collect();
         let fp = task_fingerprint::build_fingerprint(&FingerprintInputs {
             user_intent: &self.user_intent,
@@ -310,6 +306,30 @@ pub fn persist_episode(identity: &ProjectIdentity, episode: &CodingEpisode) {
         Some(&identity.workspace_hash),
     );
     learning_store::append_jsonl(&paths.episodes, episode, MAX_EPISODES);
+    // Task-pattern + feedback aggregates (fail-open).
+    let success = matches!(
+        episode.outcome,
+        EpisodeOutcome::SuccessVerified | EpisodeOutcome::SuccessUnverified
+    );
+    learning_store::task_patterns::append_task_pattern(
+        &identity.id,
+        &episode.task_fingerprint,
+        success,
+        &episode.approach_summary,
+    );
+    if episode.undo_count > 0 || !episode.user_corrections.is_empty() {
+        learning_store::task_patterns::append_feedback(
+            &identity.id,
+            "undo",
+            &format!(
+                "{} undo(s), {} correction(s) during '{}'",
+                episode.undo_count,
+                episode.user_corrections.len(),
+                truncate(&episode.user_intent, 80)
+            ),
+            Some(&episode.id),
+        );
+    }
 }
 
 /// Load recent episodes for a project (newest last). Skips bad lines.
@@ -441,9 +461,13 @@ mod tests {
     #[test]
     fn persist_and_load_episode() {
         let home = tmp();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("project-registry.json"));
         let ws = tmp();
 
@@ -476,9 +500,13 @@ mod tests {
     #[test]
     fn undo_creates_correction_event() {
         let home = tmp();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("project-registry.json"));
         let ws = tmp();
 

@@ -81,7 +81,13 @@ pub fn record_pack_activations(
     project_id: &str,
     stage: RetrievalStage,
     episode_id: Option<&str>,
-    items: &[(/*kind*/ &str, /*id*/ &str, /*rank*/ usize, /*score*/ f32, /*tokens*/ usize)],
+    items: &[(
+        /*kind*/ &str,
+        /*id*/ &str,
+        /*rank*/ usize,
+        /*score*/ f32,
+        /*tokens*/ usize,
+    )],
 ) {
     let ts = now_secs();
     for (i, (kind, id, rank, score, tokens)) in items.iter().enumerate() {
@@ -119,18 +125,17 @@ mod tests {
         let _serial = learning_test_serial()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!(
-            "act-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
+        let root = std::env::temp_dir().join(format!("act-{}-{}", std::process::id(), now_secs()));
         let _ = std::fs::remove_dir_all(&root);
         let _g = override_learning_root(root);
         record_pack_activations(
             "project-test",
             RetrievalStage::PrePlan,
             None,
-            &[("memory", "foo", 0, 0.8, 40), ("episode", "ep-1", 1, 0.5, 20)],
+            &[
+                ("memory", "foo", 0, 0.8, 40),
+                ("episode", "ep-1", 1, 0.5, 20),
+            ],
         );
         let loaded = load_activations("project-test");
         assert_eq!(loaded.len(), 2);

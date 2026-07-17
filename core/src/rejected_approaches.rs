@@ -120,7 +120,9 @@ mod tests {
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     fn with_temp_learning<R>(f: impl FnOnce() -> R) -> R {
-        let _serial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let n = N.fetch_add(1, Ordering::SeqCst);
         let d = std::env::temp_dir().join(format!(
             "rejected-{}-{}-{}",
@@ -150,83 +152,86 @@ mod tests {
     #[test]
     fn store_and_load_global_and_project() {
         with_temp_learning(|| {
-        let global = RejectedApproach {
-            id: "rej-g1".into(),
-            scope: "global".into(),
-            task_fingerprint: sample_fp("add-provider", &["ProviderConfig"]),
-            approach: "put oauth in config.json".into(),
-            rejection_reason: "oauth belongs in plugins".into(),
-            preferred_alternative: Some("use plugin oauth".into()),
-            evidence: vec!["ep-1".into()],
-            confidence: 0.9,
-            status: LearningStatus::Verified,
-        };
-        append_rejected(None, &global);
+            let global = RejectedApproach {
+                id: "rej-g1".into(),
+                scope: "global".into(),
+                task_fingerprint: sample_fp("add-provider", &["ProviderConfig"]),
+                approach: "put oauth in config.json".into(),
+                rejection_reason: "oauth belongs in plugins".into(),
+                preferred_alternative: Some("use plugin oauth".into()),
+                evidence: vec!["ep-1".into()],
+                confidence: 0.9,
+                status: LearningStatus::Verified,
+            };
+            append_rejected(None, &global);
 
-        let project = RejectedApproach {
-            id: "rej-p1".into(),
-            scope: "project".into(),
-            task_fingerprint: sample_fp("extend-tool-schema", &["MemoryEntry"]),
-            approach: "broad refactor of tools.rs".into(),
-            rejection_reason: "user asked for minimal change".into(),
-            preferred_alternative: Some("narrow edit".into()),
-            evidence: vec!["ep-2".into()],
-            confidence: 0.85,
-            status: LearningStatus::Verified,
-        };
-        append_rejected(Some("project-abc"), &project);
+            let project = RejectedApproach {
+                id: "rej-p1".into(),
+                scope: "project".into(),
+                task_fingerprint: sample_fp("extend-tool-schema", &["MemoryEntry"]),
+                approach: "broad refactor of tools.rs".into(),
+                rejection_reason: "user asked for minimal change".into(),
+                preferred_alternative: Some("narrow edit".into()),
+                evidence: vec!["ep-2".into()],
+                confidence: 0.85,
+                status: LearningStatus::Verified,
+            };
+            append_rejected(Some("project-abc"), &project);
 
-        let g = load_rejected(None);
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0].id, "rej-g1");
+            let g = load_rejected(None);
+            assert_eq!(g.len(), 1);
+            assert_eq!(g[0].id, "rej-g1");
 
-        let p = load_rejected(Some("project-abc"));
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[0].id, "rej-p1");
-        assert!(ProjectLearningPaths::resolve("project-abc")
-            .root
-            .join("rejected-approaches.jsonl")
-            .exists());
+            let p = load_rejected(Some("project-abc"));
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0].id, "rej-p1");
+            assert!(ProjectLearningPaths::resolve("project-abc")
+                .root
+                .join("rejected-approaches.jsonl")
+                .exists());
         });
     }
 
     #[test]
     fn match_by_fingerprint() {
         with_temp_learning(|| {
-        append_rejected(
-            Some("project-match"),
-            &RejectedApproach {
-                id: "rej-match".into(),
-                scope: "project".into(),
-                task_fingerprint: sample_fp("extend-tool-schema", &["MemoryEntry", "tool_definitions"]),
-                approach: "add action without schema".into(),
-                rejection_reason: "schema must stay in sync".into(),
-                preferred_alternative: None,
-                evidence: vec!["ep-9".into()],
-                confidence: 0.88,
-                status: LearningStatus::Verified,
-            },
-        );
-        append_rejected(
-            Some("project-match"),
-            &RejectedApproach {
-                id: "rej-other".into(),
-                scope: "project".into(),
-                task_fingerprint: sample_fp("docs", &["README"]),
-                approach: "rewrite all docs".into(),
-                rejection_reason: "too broad".into(),
-                preferred_alternative: None,
-                evidence: vec![],
-                confidence: 0.7,
-                status: LearningStatus::Verified,
-            },
-        );
+            append_rejected(
+                Some("project-match"),
+                &RejectedApproach {
+                    id: "rej-match".into(),
+                    scope: "project".into(),
+                    task_fingerprint: sample_fp(
+                        "extend-tool-schema",
+                        &["MemoryEntry", "tool_definitions"],
+                    ),
+                    approach: "add action without schema".into(),
+                    rejection_reason: "schema must stay in sync".into(),
+                    preferred_alternative: None,
+                    evidence: vec!["ep-9".into()],
+                    confidence: 0.88,
+                    status: LearningStatus::Verified,
+                },
+            );
+            append_rejected(
+                Some("project-match"),
+                &RejectedApproach {
+                    id: "rej-other".into(),
+                    scope: "project".into(),
+                    task_fingerprint: sample_fp("docs", &["README"]),
+                    approach: "rewrite all docs".into(),
+                    rejection_reason: "too broad".into(),
+                    preferred_alternative: None,
+                    evidence: vec![],
+                    confidence: 0.7,
+                    status: LearningStatus::Verified,
+                },
+            );
 
-        let query = sample_fp("extend-tool-schema", &["MemoryEntry", "tool_definitions"]);
-        let hits = match_rejected(&query, Some("project-match"), 0.3, 5);
-        assert!(!hits.is_empty());
-        assert_eq!(hits[0].1.id, "rej-match");
-        assert!(hits[0].0 > 0.5);
+            let query = sample_fp("extend-tool-schema", &["MemoryEntry", "tool_definitions"]);
+            let hits = match_rejected(&query, Some("project-match"), 0.3, 5);
+            assert!(!hits.is_empty());
+            assert_eq!(hits[0].1.id, "rej-match");
+            assert!(hits[0].0 > 0.5);
         });
     }
 

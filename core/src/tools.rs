@@ -772,7 +772,7 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
-                json!({
+        json!({
             "type": "function",
             "function": {
                 "name": "knowledge",
@@ -791,7 +791,7 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
-json!({
+        json!({
             "type": "function",
             "function": {
                 "name": "spawn",
@@ -4081,7 +4081,6 @@ fn git_commit(args: &Value, cfg: &Config) -> Outcome {
 }
 
 // ---- memory tool (agent-callable wrapper over crate::memory) ----
-
 
 fn knowledge_tool(args: &Value, cfg: &Config) -> Outcome {
     let action = args

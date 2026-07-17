@@ -23,12 +23,14 @@ use tokio::process::Command;
 pub const PLUGIN_DOCS: &str = r#"## Plugins
 
 Extend the harness via `.catalyst-code/plugins/` (hooks, custom tools, OAuth,
-memory backends, system-prompt injection). Manage with the `plugin` tool or
-`/plugin-install` / `/plugin-enable` / `/plugin-disable`.
+memory backends, system-prompt injection). Manage with `/plugin-install` /
+`/plugin-enable` / `/plugin-disable` / `/plugin-reload` (or the matching
+protocol commands). There is no built-in `plugin` tool — use slash/protocol.
 
 When authoring or debugging a plugin, apply the `plugin-authoring` skill
 (`/skill:plugin-authoring`) — do not invent schema from memory. Full contract:
-hooks, tools, overrides, OAuth, and memory providers.
+hooks (incl. pre_tool/post_tool catch-alls + agent-loop hooks), tools,
+overrides, OAuth, and memory providers.
 "#;
 
 /// Valid hook point names. Plugins can register for any of these.
@@ -43,6 +45,13 @@ pub const HOOK_POINTS: &[&str] = &[
     "session_stop",
     "pre_compact",
     "pre_turn",
+    // Agent-loop hooks (PI parity): input/prompt/context/turn boundaries.
+    "pre_input",
+    "pre_agent_start",
+    "pre_context",
+    "turn_start",
+    "turn_end",
+    "session_shutdown",
     // Catch-all hooks that fire for EVERY tool call (in addition to the
     // specific pre_bash/pre_write/pre_read). They cover tools with no
     // dedicated hook (memory, todo_write, git_*, subagent, plugin tools, …)
@@ -52,6 +61,67 @@ pub const HOOK_POINTS: &[&str] = &[
     "pre_tool",
     "post_tool",
 ];
+
+/// Per-hook policy: safety rule, default timeout, and which response fields are honored.
+#[derive(Debug, Clone, Copy)]
+pub struct HookPolicy {
+    pub default_timeout_ms: u64,
+    /// What happens when the hook fails (non-zero, timeout, parse fail).
+    pub fail_mode: HookFailMode,
+    /// Whether `allow:false` is honored (pre_* style). When false, `allow` is ignored.
+    pub honor_allow: bool,
+    /// Whether `modify` keys are applied. Lifecycle hooks that only emit side effects
+    /// may still honor modify for prompt/context surgery.
+    pub honor_modify: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFailMode {
+    /// Block the operation (pre_* style).
+    Deny,
+    /// Silently skip the hook result (post_* and advisory lifecycle hooks).
+    Skip,
+}
+
+/// Policy table for every hook point. This is the single source of truth for
+/// how execute_hook reacts to failures and which response fields matter.
+///
+/// Design intent:
+/// - pre_* hooks are BLOCKING: a failure denies the operation (fail-safe).
+/// - post_* hooks are BEST-EFFORT: a failure silently skips.
+/// - lifecycle/session hooks are advisory: failures are logged but never block.
+/// - prompt/context/input surgery hooks are advisory by default so a slow/broken
+///   plugin cannot freeze or corrupt the agent loop; callers may still apply
+///   safe sub-modifies with their own validation.
+pub fn hook_policy(hook_name: &str) -> HookPolicy {
+    match hook_name {
+        "pre_bash" | "pre_write" | "pre_read" | "pre_tool" | "pre_input" => HookPolicy {
+            default_timeout_ms: DEFAULT_PRE_TIMEOUT_MS,
+            fail_mode: HookFailMode::Deny,
+            honor_allow: true,
+            honor_modify: true,
+        },
+        "post_bash" | "post_write" | "post_read" | "post_tool" => HookPolicy {
+            default_timeout_ms: DEFAULT_POST_TIMEOUT_MS,
+            fail_mode: HookFailMode::Skip,
+            honor_allow: false,
+            honor_modify: true,
+        },
+        "session_start" | "session_stop" | "pre_compact" | "pre_turn" | "session_shutdown"
+        | "pre_agent_start" | "pre_context" | "turn_start" | "turn_end" => HookPolicy {
+            default_timeout_ms: DEFAULT_POST_TIMEOUT_MS,
+            fail_mode: HookFailMode::Skip,
+            honor_allow: false,
+            honor_modify: true,
+        },
+        _ => HookPolicy {
+            default_timeout_ms: DEFAULT_POST_TIMEOUT_MS,
+            fail_mode: HookFailMode::Skip,
+            honor_allow: false,
+            honor_modify: true,
+        },
+    }
+}
 
 /// Default timeout in milliseconds for pre_* hooks (blocking — keep short).
 pub const DEFAULT_PRE_TIMEOUT_MS: u64 = 5_000;
@@ -1018,17 +1088,37 @@ impl PluginManager {
         self.plugins.read().unwrap().clone()
     }
 
+    /// Enabled plugins sorted deterministically by name.
+    fn enabled_plugins_sorted(&self) -> Vec<Plugin> {
+        let mut out: Vec<Plugin> = self
+            .plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.enabled)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     /// Get all enabled hook configs for a given hook point name.
     /// Returns a vec of (plugin_name, HookConfig) pairs so the caller can
     /// iterate and merge results.
+    ///
+    /// Plugins are returned in deterministic alphabetical order by plugin name
+    /// so multi-plugin composition is predictable and testable.
     pub fn get_hook_configs(&self, hook_name: &str) -> Vec<(String, HookConfig)> {
-        self.plugins
+        let mut out: Vec<(String, HookConfig)> = self
+            .plugins
             .read()
             .unwrap()
             .values()
             .filter(|p| p.enabled)
             .filter_map(|p| p.hooks.get(hook_name).map(|c| (p.name.clone(), c.clone())))
-            .collect()
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Cheap existence check (no config clone): does any enabled plugin register
@@ -1054,7 +1144,7 @@ impl PluginManager {
     /// built-in). Empty when no plugin declares tools.
     pub fn tool_definitions(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+        for p in self.enabled_plugins_sorted() {
             for t in &p.tools {
                 out.push(json!({
                     "type": "function",
@@ -1072,11 +1162,8 @@ impl PluginManager {
     /// Look up a plugin-declared tool's config by tool name (enabled plugins
     /// only). Returns None for built-in tools.
     pub fn tool_config(&self, name: &str) -> Option<ToolConfig> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
+        self.enabled_plugins_sorted()
+            .into_iter()
             .find_map(|p| p.tools.iter().find(|t| t.name == name).cloned())
     }
 
@@ -1084,7 +1171,7 @@ impl PluginManager {
     /// Each entry is `{name, description, plugin}`.
     pub fn command_definitions(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+        for p in self.enabled_plugins_sorted() {
             for c in &p.commands {
                 out.push(json!({
                     "name": c.name,
@@ -1100,11 +1187,8 @@ impl PluginManager {
     /// Accepts names with or without a leading `/`.
     pub fn command_config(&self, name: &str) -> Option<CommandConfig> {
         let name = name.strip_prefix('/').unwrap_or(name);
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
+        self.enabled_plugins_sorted()
+            .into_iter()
             .find_map(|p| p.commands.iter().find(|c| c.name == name).cloned())
     }
 
@@ -1173,12 +1257,9 @@ impl PluginManager {
     /// or an override — `disable_tools` is the strongest "remove a feature"
     /// lever and always wins over `override`.
     pub fn disabled_tools(&self) -> std::collections::HashSet<String> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|p| p.disable_tools.iter().cloned())
+        self.enabled_plugins_sorted()
+            .into_iter()
+            .flat_map(|p| p.disable_tools.into_iter())
             .collect()
     }
 
@@ -1188,14 +1269,11 @@ impl PluginManager {
     /// `override: true` does NOT appear here (it stays a no-op collision,
     /// built-in wins — unchanged behavior).
     pub fn overridden_tool_names(&self) -> std::collections::HashSet<String> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|p| p.tools.iter())
+        self.enabled_plugins_sorted()
+            .into_iter()
+            .flat_map(|p| p.tools.into_iter())
             .filter(|t| t.override_builtin && crate::tools::is_builtin(&t.name))
-            .map(|t| t.name.clone())
+            .map(|t| t.name)
             .collect()
     }
 
@@ -1205,9 +1283,12 @@ impl PluginManager {
     /// any. Lets a plugin inject domain rules / persona / context into the
     /// system prompt — the same surface a core edit of SYSTEM_PROMPT_BASE
     /// touches.
+    ///
+    /// Order is deterministic by plugin name so multi-plugin system prompt
+    /// composition is stable.
     pub fn system_prompt_injection(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for p in self.plugins.read().unwrap().values().filter(|p| p.enabled) {
+        for p in self.enabled_plugins_sorted() {
             let s = p.system_prompt.trim();
             if !s.is_empty() {
                 parts.push(format!("# Plugin: {} (v{})\n{}", p.name, p.version, s));
@@ -1221,15 +1302,12 @@ impl PluginManager {
     }
 
     /// The active memory provider, if any enabled plugin declares one.
-    /// First enabled plugin that declares `memory_provider` wins — only one
-    /// provider should be active; later ones are ignored.
+    /// First enabled plugin (sorted by name) that declares `memory_provider`
+    /// wins — only one provider should be active; later ones are ignored.
     pub fn memory_provider(&self) -> Option<PluginMemoryProviderConfig> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
-            .find_map(|p| p.memory_provider.clone())
+        self.enabled_plugins_sorted()
+            .into_iter()
+            .find_map(|p| p.memory_provider)
     }
 
     /// True when an enabled plugin replaces the built-in markdown memory store.
@@ -1243,28 +1321,17 @@ impl PluginManager {
     /// declares an `oauth` block). Used to populate the `/login` picker and to
     /// dispatch `/login` / `/oauth-code` / `/logout`.
     pub fn oauth_configs(&self) -> Vec<PluginOauthConfig> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
-            .filter_map(|p| p.oauth.clone())
+        self.enabled_plugins_sorted()
+            .into_iter()
+            .filter_map(|p| p.oauth)
             .collect()
     }
 
     /// Look up a plugin-declared OAuth provider by its provider_id.
     pub fn oauth_config(&self, provider_id: &str) -> Option<PluginOauthConfig> {
-        self.plugins
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.enabled)
-            .find_map(|p| {
-                p.oauth
-                    .as_ref()
-                    .filter(|o| o.provider_id == provider_id)
-                    .cloned()
-            })
+        self.enabled_plugins_sorted()
+            .into_iter()
+            .find_map(|p| p.oauth.filter(|o| o.provider_id == provider_id))
     }
 
     /// Find the plugin OAuth provider that should authenticate a resolved
@@ -1666,7 +1733,8 @@ pub async fn execute_hook(
     config: &HookConfig,
     context: &Value,
 ) -> HookResult {
-    let is_pre = hook_name.starts_with("pre_");
+    let policy = hook_policy(hook_name);
+    let is_deny = policy.fail_mode == HookFailMode::Deny;
 
     let deny = |reason: String| HookResult {
         allow: false,
@@ -1696,7 +1764,7 @@ pub async fn execute_hook(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("failed to spawn hook script {:?}: {e}", script_path);
-            return if is_pre { deny(msg) } else { skip(msg) };
+            return if is_deny { deny(msg) } else { skip(msg) };
         }
     };
 
@@ -1722,7 +1790,7 @@ pub async fn execute_hook(
                 hook_name,
                 stdin_timeout.as_millis()
             );
-            return if is_pre { deny(msg) } else { skip(msg) };
+            return if is_deny { deny(msg) } else { skip(msg) };
         }
     }
 
@@ -1739,20 +1807,20 @@ pub async fn execute_hook(
                     output.status,
                     stderr.trim()
                 );
-                return if is_pre { deny(msg) } else { skip(msg) };
+                return if is_deny { deny(msg) } else { skip(msg) };
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if stdout.is_empty() {
                 let msg = format!("hook '{}' returned empty stdout", hook_name);
-                return if is_pre { deny(msg) } else { skip(msg) };
+                return if is_deny { deny(msg) } else { skip(msg) };
             }
 
             let response: Value = match serde_json::from_str(&stdout) {
                 Ok(v) => v,
                 Err(e) => {
                     let msg = format!("hook '{}' returned invalid JSON: {e}", hook_name);
-                    return if is_pre { deny(msg) } else { skip(msg) };
+                    return if is_deny { deny(msg) } else { skip(msg) };
                 }
             };
 
@@ -1783,24 +1851,23 @@ pub async fn execute_hook(
                 None
             };
 
-            // For post hooks, we never block — "allow: false" just means
-            // the hook observed an issue, it doesn't roll back the operation.
-            let result = if !is_pre && !allow {
-                HookResult {
-                    allow: true,
-                    reason: format!("[{plugin_name}] {reason}"),
-                    modify: None,
-                    notify,
-                    status,
-                }
+            // Per-hook policy decides whether `allow`/`modify` are honored. For
+            // blocking hooks (pre_*) a deny cancels the operation; for advisory
+            // hooks (post_*, lifecycle) `allow:false` is logged as an observation
+            // but never rolls back the operation.
+            let effective_allow = if policy.honor_allow { allow } else { true };
+            let effective_reason = if !policy.honor_allow && !reason.is_empty() {
+                format!("[{plugin_name}] {reason}")
             } else {
-                HookResult {
-                    allow,
-                    reason,
-                    modify,
-                    notify,
-                    status,
-                }
+                reason
+            };
+            let effective_modify = if policy.honor_modify { modify } else { None };
+            let result = HookResult {
+                allow: effective_allow,
+                reason: effective_reason,
+                modify: effective_modify,
+                notify,
+                status,
             };
             emit_plugin_ui_side_effects(
                 plugin_name,
@@ -1811,7 +1878,7 @@ pub async fn execute_hook(
         }
         Ok(Err(e)) => {
             let msg = format!("hook '{}' wait error: {e}", hook_name);
-            if is_pre {
+            if is_deny {
                 deny(msg)
             } else {
                 skip(msg)
@@ -1822,7 +1889,7 @@ pub async fn execute_hook(
                 "hook '{}' timed out after {}ms",
                 hook_name, config.timeout_ms
             );
-            if is_pre {
+            if is_deny {
                 deny(msg)
             } else {
                 skip(msg)
@@ -2429,11 +2496,7 @@ fn parse_memory_provider_stdout(stdout: &str) -> MemoryProviderResult {
 
 /// Return the default timeout for a hook point.
 fn default_hook_timeout(hook_name: &str) -> u64 {
-    if hook_name.starts_with("pre_") {
-        DEFAULT_PRE_TIMEOUT_MS
-    } else {
-        DEFAULT_POST_TIMEOUT_MS
-    }
+    hook_policy(hook_name).default_timeout_ms
 }
 
 /// Validate a script path declared by a plugin (hook or tool): reject `..`
@@ -4408,7 +4471,14 @@ mod tests {
         assert_eq!(default_hook_timeout("pre_bash"), 5_000);
         assert_eq!(default_hook_timeout("pre_write"), 5_000);
         assert_eq!(default_hook_timeout("pre_read"), 5_000);
-        assert_eq!(default_hook_timeout("pre_compact"), 5_000);
+        assert_eq!(default_hook_timeout("pre_tool"), 5_000);
+        assert_eq!(default_hook_timeout("pre_input"), 5_000);
+        // pre_compact / pre_turn / pre_agent_start / pre_context are advisory
+        // lifecycle hooks (policy table), not blocking tool gates — 30s.
+        assert_eq!(default_hook_timeout("pre_compact"), 30_000);
+        assert_eq!(default_hook_timeout("pre_turn"), 30_000);
+        assert_eq!(default_hook_timeout("pre_agent_start"), 30_000);
+        assert_eq!(default_hook_timeout("pre_context"), 30_000);
     }
 
     #[test]
@@ -4417,6 +4487,25 @@ mod tests {
         assert_eq!(default_hook_timeout("post_write"), 30_000);
         assert_eq!(default_hook_timeout("session_start"), 30_000);
         assert_eq!(default_hook_timeout("session_stop"), 30_000);
+        assert_eq!(default_hook_timeout("session_shutdown"), 30_000);
+        assert_eq!(default_hook_timeout("turn_start"), 30_000);
+        assert_eq!(default_hook_timeout("turn_end"), 30_000);
+    }
+
+    #[test]
+    fn hook_policy_deny_vs_skip() {
+        assert_eq!(hook_policy("pre_bash").fail_mode, HookFailMode::Deny);
+        assert_eq!(hook_policy("pre_tool").fail_mode, HookFailMode::Deny);
+        assert_eq!(hook_policy("pre_input").fail_mode, HookFailMode::Deny);
+        assert!(hook_policy("pre_bash").honor_allow);
+        assert_eq!(hook_policy("post_tool").fail_mode, HookFailMode::Skip);
+        assert_eq!(hook_policy("pre_context").fail_mode, HookFailMode::Skip);
+        assert!(!hook_policy("pre_context").honor_allow);
+        assert!(hook_policy("pre_context").honor_modify);
+        assert_eq!(
+            hook_policy("session_shutdown").fail_mode,
+            HookFailMode::Skip
+        );
     }
 
     // ---- plugin-declared tools ----
@@ -4633,7 +4722,18 @@ mod tests {
     fn hook_points_include_catch_all() {
         assert!(HOOK_POINTS.contains(&"pre_tool"));
         assert!(HOOK_POINTS.contains(&"post_tool"));
-        // pre_* get the short timeout; post_* the long one.
+        assert!(HOOK_POINTS.contains(&"pre_input"));
+        assert!(HOOK_POINTS.contains(&"pre_agent_start"));
+        assert!(HOOK_POINTS.contains(&"pre_context"));
+        assert!(HOOK_POINTS.contains(&"turn_start"));
+        assert!(HOOK_POINTS.contains(&"turn_end"));
+        assert!(HOOK_POINTS.contains(&"session_shutdown"));
+        // Every HOOK_POINTS entry must have an explicit policy (no silent
+        // fallback for known points).
+        for h in HOOK_POINTS {
+            let _ = hook_policy(h);
+        }
+        // pre_tool gets the short timeout; post_tool the long one.
         assert_eq!(default_hook_timeout("pre_tool"), DEFAULT_PRE_TIMEOUT_MS);
         assert_eq!(default_hook_timeout("post_tool"), DEFAULT_POST_TIMEOUT_MS);
     }

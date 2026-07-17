@@ -2,8 +2,13 @@
 //!
 //! Scores [`MemoryEntry`] values against a prompt + [`TaskFingerprint`] using
 //! fixed weights — no embeddings API, no network. Fail-open / pure functions.
+//!
+//! Lexical signal uses BM25-lite over the candidate corpus in [`rank_memories`].
+//! Single-doc [`score_memory`] falls back to TF overlap.
 
 #![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
 
 use crate::memory::{significant_tokens, MemoryEntry, MemoryStatus, Scope};
 use crate::task_fingerprint::{fingerprint_similarity, TaskFingerprint};
@@ -22,30 +27,108 @@ const W_DIAGNOSTIC: f32 = 0.05;
 /// Project-scope applicability bonus applied after the weighted sum (clamped).
 const PROJECT_BONUS: f32 = 0.08;
 
+const BM25_K1: f32 = 1.2;
+const BM25_B: f32 = 0.75;
+
 /// Score a single memory. Returns `(score, reasons)`.
-pub fn score_memory(
-    entry: &MemoryEntry,
+///
+/// Uses TF-overlap for the lexical channel (no corpus DF). Prefer
+/// [`rank_memories`] when scoring a batch so BM25-lite applies.
+pub fn score_memory(entry: &MemoryEntry, prompt: &str, fp: &TaskFingerprint) -> (f32, Vec<String>) {
+    let prompt_tokens = tokenize_rich(prompt);
+    let mem_tokens = memory_tokens(entry);
+    let lexical = tf_overlap(&prompt_tokens, &mem_tokens);
+    score_memory_with_lexical(entry, fp, &prompt_tokens, lexical)
+}
+
+/// Rank memories for a prompt + fingerprint. Deterministic order on ties (name).
+///
+/// Builds document DF once across the batch, scores BM25-lite per memory,
+/// normalizes lexical scores by the batch max, then applies §15 weights.
+pub fn rank_memories(
+    memories: &[MemoryEntry],
     prompt: &str,
     fp: &TaskFingerprint,
+    limit: usize,
+) -> Vec<(f32, MemoryEntry, Vec<String>)> {
+    let prompt_tokens = tokenize_rich(prompt);
+    let docs: Vec<Vec<String>> = memories.iter().map(memory_tokens).collect();
+    let (df, n) = build_df(&docs);
+    let avgdl = if docs.is_empty() {
+        0.0
+    } else {
+        docs.iter().map(|d| d.len() as f32).sum::<f32>() / docs.len() as f32
+    };
+
+    let raw_bm25: Vec<f32> = docs
+        .iter()
+        .map(|doc| bm25_raw(&prompt_tokens, doc, &df, n, avgdl))
+        .collect();
+    let max_bm25 = raw_bm25.iter().copied().fold(0.0f32, f32::max);
+
+    let mut scored: Vec<(f32, MemoryEntry, Vec<String>)> = memories
+        .iter()
+        .zip(raw_bm25.iter())
+        .map(|(m, &raw)| {
+            let lexical = if max_bm25 > 1e-9 {
+                (raw / max_bm25).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (s, reasons) = score_memory_with_lexical(m, fp, &prompt_tokens, lexical);
+            (s, m.clone(), reasons)
+        })
+        .filter(|(s, _, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+/// Human-readable explanation of why a memory scored as it did.
+pub fn explain_score(entry: &MemoryEntry, prompt: &str, fp: &TaskFingerprint) -> String {
+    let (score, reasons) = score_memory(entry, prompt, fp);
+    let mut out = format!(
+        "Memory: {}\nScope: {}\nStatus: {}\nScore: {:.3}\nRetrieved because:\n",
+        entry.name,
+        match entry.scope {
+            Scope::Workspace => "PROJECT",
+            Scope::Global => "GLOBAL",
+        },
+        entry.status.as_str().to_uppercase(),
+        score
+    );
+    if reasons.is_empty() {
+        out.push_str("- (no strong signals)\n");
+    } else {
+        for r in &reasons {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    out
+}
+
+fn score_memory_with_lexical(
+    entry: &MemoryEntry,
+    fp: &TaskFingerprint,
+    prompt_tokens: &[String],
+    lexical: f32,
 ) -> (f32, Vec<String>) {
     if !entry.status.is_positive_guidance() || entry.deprecated {
         return (0.0, vec!["excluded: deprecated/rejected".into()]);
     }
 
     let mut reasons = Vec::new();
-    let prompt_tokens = tokenize_rich(prompt);
-    let mem_text = format!(
-        "{} {} {} {}",
-        entry.name, entry.description, entry.content, entry.mem_type
-    );
-    let mem_tokens = tokenize_rich(&mem_text);
 
-    let lexical = tf_overlap(&prompt_tokens, &mem_tokens);
     if lexical > 0.3 {
         reasons.push(format!("lexical relevance {lexical:.2}"));
     }
 
-    let symbol = symbol_overlap(entry, fp, &prompt_tokens);
+    let symbol = symbol_overlap(entry, fp, prompt_tokens);
     if symbol > 0.3 {
         reasons.push(format!("symbol/identifier overlap {symbol:.2}"));
     }
@@ -86,7 +169,10 @@ pub fn score_memory(
 
     let status_mul = entry.status.rank_multiplier();
     if status_mul < 1.0 {
-        reasons.push(format!("status {} (x{status_mul:.2})", entry.status.as_str()));
+        reasons.push(format!(
+            "status {} (x{status_mul:.2})",
+            entry.status.as_str()
+        ));
     } else {
         reasons.push("status verified".into());
     }
@@ -110,55 +196,64 @@ pub fn score_memory(
     (score.clamp(0.0, 1.0), reasons)
 }
 
-/// Rank memories for a prompt + fingerprint. Deterministic order on ties (name).
-pub fn rank_memories(
-    memories: &[MemoryEntry],
-    prompt: &str,
-    fp: &TaskFingerprint,
-    limit: usize,
-) -> Vec<(f32, MemoryEntry, Vec<String>)> {
-    let mut scored: Vec<(f32, MemoryEntry, Vec<String>)> = memories
-        .iter()
-        .map(|m| {
-            let (s, reasons) = score_memory(m, prompt, fp);
-            (s, m.clone(), reasons)
-        })
-        .filter(|(s, _, _)| *s > 0.0)
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
-    scored.truncate(limit);
-    scored
+fn memory_tokens(entry: &MemoryEntry) -> Vec<String> {
+    let mem_text = format!(
+        "{} {} {} {}",
+        entry.name, entry.description, entry.content, entry.mem_type
+    );
+    tokenize_rich(&mem_text)
 }
 
-/// Human-readable explanation of why a memory scored as it did.
-pub fn explain_score(
-    entry: &MemoryEntry,
-    prompt: &str,
-    fp: &TaskFingerprint,
-) -> String {
-    let (score, reasons) = score_memory(entry, prompt, fp);
-    let mut out = format!(
-        "Memory: {}\nScope: {}\nStatus: {}\nScore: {:.3}\nRetrieved because:\n",
-        entry.name,
-        match entry.scope {
-            Scope::Workspace => "PROJECT",
-            Scope::Global => "GLOBAL",
-        },
-        entry.status.as_str().to_uppercase(),
-        score
-    );
-    if reasons.is_empty() {
-        out.push_str("- (no strong signals)\n");
-    } else {
-        for r in &reasons {
-            out.push_str(&format!("- {r}\n"));
+/// Document frequency: number of docs containing each token (at least once).
+fn build_df(docs: &[Vec<String>]) -> (HashMap<String, usize>, usize) {
+    let n = docs.len();
+    let mut df: HashMap<String, usize> = HashMap::new();
+    for doc in docs {
+        let mut seen = HashSet::new();
+        for t in doc {
+            if seen.insert(t.as_str()) {
+                *df.entry(t.clone()).or_insert(0) += 1;
+            }
         }
     }
-    out
+    (df, n)
+}
+
+/// BM25-lite raw score. IDF = ln(1 + (N - df + 0.5)/(df + 0.5)), k1=1.2, b=0.75.
+fn bm25_raw(
+    query: &[String],
+    doc: &[String],
+    df: &HashMap<String, usize>,
+    n: usize,
+    avgdl: f32,
+) -> f32 {
+    if query.is_empty() || doc.is_empty() || n == 0 {
+        return 0.0;
+    }
+    let avgdl = if avgdl < 1e-6 { 1.0 } else { avgdl };
+    let mut tf: HashMap<&str, usize> = HashMap::new();
+    for t in doc {
+        *tf.entry(t.as_str()).or_insert(0) += 1;
+    }
+    let dl = doc.len() as f32;
+    let mut score = 0.0f32;
+    let mut seen_q = HashSet::new();
+    for q in query {
+        if !seen_q.insert(q.as_str()) {
+            continue;
+        }
+        let f = match tf.get(q.as_str()) {
+            Some(&c) if c > 0 => c as f32,
+            _ => continue,
+        };
+        let dfi = df.get(q.as_str()).copied().unwrap_or(0) as f32;
+        let idf = (1.0 + (n as f32 - dfi + 0.5) / (dfi + 0.5)).ln();
+        let denom = f + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl);
+        if denom > 0.0 {
+            score += idf * (f * (BM25_K1 + 1.0)) / denom;
+        }
+    }
+    score
 }
 
 fn tokenize_rich(text: &str) -> Vec<String> {
@@ -215,9 +310,9 @@ fn tf_overlap(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let set_b: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let set_b: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
     let mut hits = 0usize;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for t in a {
         if seen.insert(t.as_str()) && set_b.contains(t.as_str()) {
             hits += 1;
@@ -230,7 +325,9 @@ fn tf_overlap(a: &[String], b: &[String]) -> f32 {
 fn symbol_overlap(entry: &MemoryEntry, fp: &TaskFingerprint, prompt_tokens: &[String]) -> f32 {
     let mut symbols: Vec<String> = entry.ref_symbols.clone();
     for t in tokenize_rich(&format!("{} {}", entry.name, entry.description)) {
-        if t.chars().any(|c| c.is_ascii_uppercase()) || entry.ref_symbols.iter().any(|s| s.eq_ignore_ascii_case(&t)) {
+        if t.chars().any(|c| c.is_ascii_uppercase())
+            || entry.ref_symbols.iter().any(|s| s.eq_ignore_ascii_case(&t))
+        {
             // keep lowercase tokens from name for matching
             let _ = t;
         }
@@ -245,9 +342,9 @@ fn symbol_overlap(entry: &MemoryEntry, fp: &TaskFingerprint, prompt_tokens: &[St
     if symbols.is_empty() {
         return 0.0;
     }
-    let set_p: std::collections::HashSet<String> = pool.into_iter().collect();
+    let set_p: HashSet<String> = pool.into_iter().collect();
     let mut hits = 0usize;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for s in &symbols {
         let key = s.to_lowercase();
         if seen.insert(key.clone()) && set_p.contains(&key) {
@@ -258,10 +355,10 @@ fn symbol_overlap(entry: &MemoryEntry, fp: &TaskFingerprint, prompt_tokens: &[St
         return 0.0;
     }
     // Exact symbol match in fingerprint → strong signal.
-    let exact = fp.symbols.iter().any(|s| {
-        entry.ref_symbols.iter().any(|r| r == s)
-            || entry.name.eq_ignore_ascii_case(s)
-    });
+    let exact = fp
+        .symbols
+        .iter()
+        .any(|s| entry.ref_symbols.iter().any(|r| r == s) || entry.name.eq_ignore_ascii_case(s));
     let base = (hits as f32 / seen.len().max(1) as f32).clamp(0.0, 1.0);
     if exact {
         base.max(0.9)
@@ -316,7 +413,11 @@ fn path_overlap(entry: &MemoryEntry, fp: &TaskFingerprint) -> f32 {
         n += 1.0;
         score += jaccard_str(&cats, &fp.file_categories);
     }
-    let subs: Vec<String> = entry.ref_files.iter().filter_map(|p| path_subsystem(p)).collect();
+    let subs: Vec<String> = entry
+        .ref_files
+        .iter()
+        .filter_map(|p| path_subsystem(p))
+        .collect();
     if !subs.is_empty() && !fp.subsystems.is_empty() {
         n += 1.0;
         score += jaccard_str(&subs, &fp.subsystems);
@@ -339,8 +440,8 @@ fn jaccard_str(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() && b.is_empty() {
         return 0.0;
     }
-    let sa: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
-    let sb: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let sa: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let sb: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
     let inter = sa.intersection(&sb).count() as f32;
     let union = sa.union(&sb).count() as f32;
     if union == 0.0 {
@@ -473,7 +574,11 @@ mod tests {
         assert_eq!(ranked[0].1.name, "provider-extension-architecture");
         assert!(ranked[0].0 > ranked.last().unwrap().0 || ranked.len() == 1);
         let explain = explain_score(&ranked[0].1, "extend ProviderConfig", &fp);
-        assert!(explain.contains("ProviderConfig") || explain.contains("symbol") || explain.contains("Score:"));
+        assert!(
+            explain.contains("ProviderConfig")
+                || explain.contains("symbol")
+                || explain.contains("Score:")
+        );
     }
 
     #[test]
@@ -529,5 +634,58 @@ mod tests {
         let (sp, _) = score_memory(&project, "run cargo test assert_eq", &fp);
         let (sg, _) = score_memory(&global, "run cargo test assert_eq", &fp);
         assert!(sp > sg, "project {sp} should beat global {sg}");
+    }
+
+    #[test]
+    fn bm25_ranks_rare_exact_token_above_common_noise() {
+        let fp = TaskFingerprint {
+            intent: "fix".into(),
+            ..Default::default()
+        };
+        let rare = entry(
+            "rare-id-memory",
+            Scope::Workspace,
+            MemoryStatus::Verified,
+            &[],
+            &[],
+            "Handles UniqueSymbolXyz123 specifically.",
+        );
+        let noise_a = entry(
+            "noise-common-a",
+            Scope::Workspace,
+            MemoryStatus::Verified,
+            &[],
+            &[],
+            "Please update the module and fix the code for the user.",
+        );
+        let noise_b = entry(
+            "noise-common-b",
+            Scope::Workspace,
+            MemoryStatus::Verified,
+            &[],
+            &[],
+            "Please update the module and fix the code for the build.",
+        );
+        let noise_c = entry(
+            "noise-common-c",
+            Scope::Workspace,
+            MemoryStatus::Verified,
+            &[],
+            &[],
+            "Please update the module and fix the tests for the release.",
+        );
+        let ranked = rank_memories(
+            &[noise_a, rare, noise_b, noise_c],
+            "please fix UniqueSymbolXyz123 and update the module",
+            &fp,
+            4,
+        );
+        assert!(!ranked.is_empty());
+        assert_eq!(
+            ranked[0].1.name,
+            "rare-id-memory",
+            "rare exact token should beat common-token-only memories; got {:?}",
+            ranked.iter().map(|r| (&r.1.name, r.0)).collect::<Vec<_>>()
+        );
     }
 }

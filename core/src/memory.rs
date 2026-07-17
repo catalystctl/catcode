@@ -1517,10 +1517,18 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
                 last_verified_commit = if val.is_empty() { None } else { Some(val) };
             }
             "files" | "ref_files" => {
-                ref_files.extend(val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                ref_files.extend(
+                    val.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
             }
             "symbols" | "ref_symbols" => {
-                ref_symbols.extend(val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                ref_symbols.extend(
+                    val.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
             }
             _ => {}
         }
@@ -2085,16 +2093,16 @@ mod tests {
                 importance: Importance::Normal,
                 deprecated: false,
                 superseded_by: None,
-            schema_version: 1,
-            status: MemoryStatus::Verified,
-            confidence: 1.0,
-            support_count: 0,
-            contradiction_count: 0,
-            last_verified_at: None,
-            last_verified_commit: None,
-            ref_files: vec![],
-            ref_symbols: vec![],
-            evidence_episodes: vec![],
+                schema_version: 1,
+                status: MemoryStatus::Verified,
+                confidence: 1.0,
+                support_count: 0,
+                contradiction_count: 0,
+                last_verified_at: None,
+                last_verified_commit: None,
+                ref_files: vec![],
+                ref_symbols: vec![],
+                evidence_episodes: vec![],
             });
         }
         memories.push(MemoryEntry {

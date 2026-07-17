@@ -285,9 +285,7 @@ fn handle_cmd(rt: &mut Runtime, cmd: Cmd) {
 /// Start an evaluate_script_with_callback. On success the callback owns `reply`
 /// (via Mutex/Option — wry requires `Fn`, not `FnOnce`). On immediate failure,
 /// returns (reply, error) so the caller can reply.
-fn start_eval<
-    F: FnOnce(Value) -> Value + Send + 'static,
->(
+fn start_eval<F: FnOnce(Value) -> Value + Send + 'static>(
     rt: &mut Runtime,
     session_id: &str,
     script: String,
@@ -312,42 +310,46 @@ fn start_eval<
     let map_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(map)));
     let reply_cb = reply_slot.clone();
     let map_cb = map_slot.clone();
-    if let Err(e) = s.tab.webview.evaluate_script_with_callback(&wrapped, move |result_json| {
-        let Ok(mut reply_guard) = reply_cb.lock() else { return };
-        let Some(reply) = reply_guard.take() else { return };
-        let map = map_cb.lock().ok().and_then(|mut g| g.take());
-        let parsed: Value = serde_json::from_str(&result_json).unwrap_or_else(|_| {
-            json!({ "value": result_json, "value_type": "string" })
-        });
-        if let Some(err) = parsed.get("__cc_error").and_then(|v| v.as_str()) {
-            let code = if err.contains("ELEMENT_STALE") {
-                "ELEMENT_STALE"
-            } else {
-                "EVAL_FAILED"
+    if let Err(e) = s
+        .tab
+        .webview
+        .evaluate_script_with_callback(&wrapped, move |result_json| {
+            let Ok(mut reply_guard) = reply_cb.lock() else {
+                return;
             };
-            let mut be = BrowserError::new(code, err.to_string());
-            if code == "ELEMENT_STALE" {
-                be = be.retryable();
+            let Some(reply) = reply_guard.take() else {
+                return;
+            };
+            let map = map_cb.lock().ok().and_then(|mut g| g.take());
+            let parsed: Value = serde_json::from_str(&result_json)
+                .unwrap_or_else(|_| json!({ "value": result_json, "value_type": "string" }));
+            if let Some(err) = parsed.get("__cc_error").and_then(|v| v.as_str()) {
+                let code = if err.contains("ELEMENT_STALE") {
+                    "ELEMENT_STALE"
+                } else {
+                    "EVAL_FAILED"
+                };
+                let mut be = BrowserError::new(code, err.to_string());
+                if code == "ELEMENT_STALE" {
+                    be = be.retryable();
+                }
+                let _ = reply.send(Err(be));
+                return;
             }
-            let _ = reply.send(Err(be));
-            return;
-        }
-        let out = match map {
-            Some(f) => f(parsed),
-            None => parsed,
-        };
-        let _ = reply.send(Ok(out));
-    }) {
+            let out = match map {
+                Some(f) => f(parsed),
+                None => parsed,
+            };
+            let _ = reply.send(Ok(out));
+        })
+    {
         // Callback was never installed — recover reply from slot.
         let reply = reply_slot
             .lock()
             .ok()
             .and_then(|mut g| g.take())
             .expect("reply still in slot");
-        return Err((
-            reply,
-            BrowserError::new("EVAL_FAILED", format!("{e}")),
-        ));
+        return Err((reply, BrowserError::new("EVAL_FAILED", format!("{e}"))));
     }
     Ok(())
 }
@@ -621,17 +623,13 @@ fn set_visible(rt: &mut Runtime, session_id: &str, visible: bool) -> Result<Valu
     s.tab.window.set_visible(visible);
     s.visible = visible;
     s.last_activity = Instant::now();
-    Ok(ok_envelope(
-        &s.id,
-        &s.tab_id,
-        json!({ "visible": visible }),
-    ))
+    Ok(ok_envelope(&s.id, &s.tab_id, json!({ "visible": visible })))
 }
 
 fn session_mut<'a>(rt: &'a mut Runtime, session_id: &str) -> Result<&'a mut Session, BrowserError> {
-    rt.sessions.get_mut(session_id).ok_or_else(|| {
-        BrowserError::new("SESSION_NOT_FOUND", format!("no session {session_id}"))
-    })
+    rt.sessions
+        .get_mut(session_id)
+        .ok_or_else(|| BrowserError::new("SESSION_NOT_FOUND", format!("no session {session_id}")))
 }
 
 async fn send(build: impl FnOnce(Reply) -> Cmd) -> Result<Value, BrowserError> {
@@ -647,7 +645,10 @@ async fn send(build: impl FnOnce(Reply) -> Cmd) -> Result<Value, BrowserError> {
             "RUNTIME_CLOSED",
             "browser reply channel dropped",
         )),
-        Err(_) => Err(BrowserError::new("TIMEOUT", "browser tool timed out after 60s")),
+        Err(_) => Err(BrowserError::new(
+            "TIMEOUT",
+            "browser tool timed out after 60s",
+        )),
     }
 }
 
@@ -663,7 +664,10 @@ async fn eval_value(session_id: &str, script: String) -> Result<Value, BrowserEr
 pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, BrowserError> {
     match name {
         "browser_create" => {
-            let visible = args.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
+            let visible = args
+                .get("visible")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let width = args
                 .get("viewport")
                 .and_then(|v| v.get("width"))
@@ -715,7 +719,8 @@ pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, B
                 // Poll readyState / brief settle after navigation.
                 let _ = wait_for_script(
                     &sid,
-                    "document.readyState === 'interactive' || document.readyState === 'complete'".into(),
+                    "document.readyState === 'interactive' || document.readyState === 'complete'"
+                        .into(),
                     timeout_ms.min(15_000),
                     100,
                 )
@@ -815,9 +820,8 @@ pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, B
                         .unwrap_or(0);
                     format!(".catalyst-code/browser-screenshots/{sid}-{ts}.png")
                 });
-            let abs = crate::workspace::resolve(&cfg.workspace, &rel).map_err(|e| {
-                BrowserError::new("INVALID_ARGS", format!("screenshot path: {e}"))
-            })?;
+            let abs = crate::workspace::resolve(&cfg.workspace, &rel)
+                .map_err(|e| BrowserError::new("INVALID_ARGS", format!("screenshot path: {e}")))?;
             if let Some(parent) = abs.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -835,7 +839,7 @@ pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, B
                 obj.insert("absolute_path".into(), json!(path));
             }
             Ok(out)
-        },
+        }
 
         other => Err(BrowserError::new(
             "UNKNOWN_TOOL",
@@ -879,10 +883,7 @@ async fn find(args: &Value) -> Result<Value, BrowserError> {
     let q = args
         .get("query")
         .ok_or_else(|| BrowserError::new("INVALID_ARGS", "query is required"))?;
-    let strategy = q
-        .get("strategy")
-        .and_then(|v| v.as_str())
-        .unwrap_or("text");
+    let strategy = q.get("strategy").and_then(|v| v.as_str()).unwrap_or("text");
     let value = q
         .get("value")
         .and_then(|v| v.as_str())
@@ -912,8 +913,8 @@ async fn find(args: &Value) -> Result<Value, BrowserError> {
 
 async fn click_ref(args: &Value) -> Result<Value, BrowserError> {
     let sid = require_session_id(args)?.to_string();
-    let refr = str_arg(args, "ref")
-        .ok_or_else(|| BrowserError::new("INVALID_ARGS", "ref is required"))?;
+    let refr =
+        str_arg(args, "ref").ok_or_else(|| BrowserError::new("INVALID_ARGS", "ref is required"))?;
     let v = serde_json::to_string(refr).unwrap();
     let script = format!(
         r#"(function(){{
@@ -930,8 +931,8 @@ async fn click_ref(args: &Value) -> Result<Value, BrowserError> {
 
 async fn fill_ref(args: &Value) -> Result<Value, BrowserError> {
     let sid = require_session_id(args)?.to_string();
-    let refr = str_arg(args, "ref")
-        .ok_or_else(|| BrowserError::new("INVALID_ARGS", "ref is required"))?;
+    let refr =
+        str_arg(args, "ref").ok_or_else(|| BrowserError::new("INVALID_ARGS", "ref is required"))?;
     let text = str_arg(args, "text").unwrap_or("");
     let r = serde_json::to_string(refr).unwrap();
     let t = serde_json::to_string(text).unwrap();
@@ -954,8 +955,8 @@ async fn fill_ref(args: &Value) -> Result<Value, BrowserError> {
 
 async fn press_key(args: &Value) -> Result<Value, BrowserError> {
     let sid = require_session_id(args)?.to_string();
-    let key = str_arg(args, "key")
-        .ok_or_else(|| BrowserError::new("INVALID_ARGS", "key is required"))?;
+    let key =
+        str_arg(args, "key").ok_or_else(|| BrowserError::new("INVALID_ARGS", "key is required"))?;
     let k = serde_json::to_string(key).unwrap();
     let script = if let Some(refr) = str_arg(args, "ref") {
         let r = serde_json::to_string(refr).unwrap();
@@ -996,7 +997,8 @@ async fn scroll_page(args: &Value) -> Result<Value, BrowserError> {
         "right" => (amount, 0.0),
         _ => (0.0, amount),
     };
-    let script = format!("window.scrollBy({dx},{dy}); ({{ x: window.scrollX, y: window.scrollY }})");
+    let script =
+        format!("window.scrollBy({dx},{dy}); ({{ x: window.scrollX, y: window.scrollY }})");
     let pos = eval_value(&sid, script).await?;
     Ok(ok_envelope(
         &sid,

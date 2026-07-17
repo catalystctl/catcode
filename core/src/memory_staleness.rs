@@ -57,9 +57,8 @@ pub fn invalidate_for_paths(workspace: &Path, changed: &[String]) -> Vec<String>
 /// Restore a memory to `verified` and refresh `last_verified_at`.
 /// Searches workspace then global scope. Returns Ok(name) on success.
 pub fn verify_memory(workspace: &Path, name: &str) -> Result<String, String> {
-    let entry = memory::get_memory(workspace, name).or_else(|_| {
-        memory::get_memory_scoped(workspace, Scope::Global, name)
-    })?;
+    let entry = memory::get_memory(workspace, name)
+        .or_else(|_| memory::get_memory_scoped(workspace, Scope::Global, name))?;
     let now = now_secs();
     rewrite_status(workspace, &entry, MemoryStatus::Verified, Some(now))?;
     memory::invalidate_scan_cache();
@@ -198,14 +197,15 @@ mod tests {
     }
 
     fn write_mem(ws: &Path, name: &str, files: &str, status: &str) {
-        memory::save_memory(ws, name, "body about architecture", "architecture", "desc")
-            .unwrap();
+        memory::save_memory(ws, name, "body about architecture", "architecture", "desc").unwrap();
         memory::invalidate_scan_cache();
         let entries = scan_all_memories(ws);
-        let e = entries
-            .iter()
-            .find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("saved memory '{name}' not found; got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>()));
+        let e = entries.iter().find(|e| e.name == name).unwrap_or_else(|| {
+            panic!(
+                "saved memory '{name}' not found; got {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        });
         let body = format!(
             "---\nname: {name}\ndescription: desc\ntype: architecture\nschema_version: 2\nstatus: {status}\nfiles: {files}\n---\nbody about architecture\n"
         );
@@ -216,7 +216,12 @@ mod tests {
     #[test]
     fn overlapping_path_marks_needs_verification() {
         with_temp_store(|ws| {
-            write_mem(ws, "provider-arch", "core/src/provider.rs, core/src/plugins.rs", "verified");
+            write_mem(
+                ws,
+                "provider-arch",
+                "core/src/provider.rs, core/src/plugins.rs",
+                "verified",
+            );
             let marked = invalidate_for_paths(ws, &["core/src/provider.rs".into()]);
             assert_eq!(marked, vec!["provider-arch".to_string()]);
             let entries = scan_all_memories(ws);
@@ -240,7 +245,12 @@ mod tests {
     #[test]
     fn verify_memory_restores_verified() {
         with_temp_store(|ws| {
-            write_mem(ws, "provider-arch", "core/src/provider.rs", "needs_verification");
+            write_mem(
+                ws,
+                "provider-arch",
+                "core/src/provider.rs",
+                "needs_verification",
+            );
             let name = verify_memory(ws, "provider-arch").unwrap();
             assert_eq!(name, "provider-arch");
             let entries = scan_all_memories(ws);

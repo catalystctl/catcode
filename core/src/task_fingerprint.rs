@@ -390,6 +390,9 @@ mod tests {
             tests_run: &[],
         });
         let sim = fingerprint_similarity(&a, &b);
-        assert!(sim < 0.4, "unrelated tasks should not match strongly: {sim}");
+        assert!(
+            sim < 0.4,
+            "unrelated tasks should not match strongly: {sim}"
+        );
     }
 }

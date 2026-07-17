@@ -170,9 +170,7 @@ fn apply_stage_rules(rec: &mut SkillMetricsRecord) {
     }
 
     // Demotion from Trusted takes priority.
-    if rec.stage == SkillStage::Trusted
-        && (rec.corrected >= 2 || rec.reverted >= 1)
-    {
+    if rec.stage == SkillStage::Trusted && (rec.corrected >= 2 || rec.reverted >= 1) {
         rec.stage = SkillStage::NeedsRevision;
         return;
     }
@@ -221,7 +219,9 @@ mod tests {
     fn promotes_candidate_then_trusted() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
 
         let r1 = record_outcome("extend-memory-tool", OutcomeKind::Success);
@@ -242,7 +242,9 @@ mod tests {
     fn trusted_demotes_on_revert() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
 
         for _ in 0..3 {
@@ -260,7 +262,9 @@ mod tests {
     fn trusted_demotes_on_two_corrections() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
 
         for _ in 0..3 {
@@ -279,7 +283,9 @@ mod tests {
     fn revert_ratio_blocks_trust() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
 
         record_outcome("flaky", OutcomeKind::Success);

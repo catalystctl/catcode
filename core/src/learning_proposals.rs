@@ -44,7 +44,9 @@ fn parse_scope(s: &str) -> Scope {
 
 /// Validate and apply a proposal. Returns a human-readable result.
 pub fn validate_and_apply(workspace: &Path, proposal: &LearningProposal) -> Result<String, String> {
-    if looks_like_secret(&proposal.statement) || proposal.evidence.iter().any(|e| looks_like_secret(e)) {
+    if looks_like_secret(&proposal.statement)
+        || proposal.evidence.iter().any(|e| looks_like_secret(e))
+    {
         return Err("rejected: proposal appears to contain secrets".into());
     }
     if proposal.statement.trim().is_empty() {
@@ -351,12 +353,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!(
-            "prop-{}-{}-{}",
-            std::process::id(),
-            now_secs(),
-            n
-        ));
+        let d =
+            std::env::temp_dir().join(format!("prop-{}-{}-{}", std::process::id(), now_secs(), n));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

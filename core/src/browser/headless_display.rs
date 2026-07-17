@@ -81,12 +81,10 @@ fn start_xvfb() -> Result<DisplayInfo, String> {
     }
 
     if which("Xvfb").is_none() {
-        return Err(
-            "No DISPLAY/WAYLAND_DISPLAY and Xvfb not found on PATH. \
+        return Err("No DISPLAY/WAYLAND_DISPLAY and Xvfb not found on PATH. \
 Install `xvfb` (Debian/Ubuntu: `apt install xvfb`) or run under \
 `xvfb-run`, or export DISPLAY to a real X server."
-                .into(),
-        );
+            .into());
     }
 
     let n = find_free_display().ok_or_else(|| {

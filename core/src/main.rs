@@ -9,8 +9,8 @@
 
 mod audit;
 mod browser;
-mod checkpoint;
 mod change_coupling;
+mod checkpoint;
 mod codebase_index;
 mod config;
 mod context_pack;
@@ -22,6 +22,7 @@ mod fetch_tool;
 mod fsutil;
 mod git_ctx;
 mod goal;
+mod goal_ceo;
 mod intercom;
 mod knowledge_tool;
 mod learning_activations;
@@ -41,9 +42,9 @@ mod plugins;
 mod preferences;
 mod presence;
 mod project_identity;
-mod rejected_approaches;
 mod protocol;
 mod provider;
+mod rejected_approaches;
 mod search_tool;
 mod session;
 mod skill_metrics;
@@ -68,7 +69,7 @@ use memory::{memory_injection, relevant_memories_tail};
 #[allow(unused_imports)]
 use message::{ContentPart, FunctionCall, ImageUrl, Message, ToolCall};
 use plugins::{PluginManager, PLUGIN_DOCS};
-use protocol::{emit, Command, Event, ModelInfo};
+use protocol::{emit, emit_aborted_done, emit_turn_rejected, Command, Event, ModelInfo};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1217,14 +1218,17 @@ async fn cancel_goal_deploy(st: &State) {
 /// Spawn the deterministic goal deploy loop on a child cancel token.
 /// After workers finish, starts a parent synthesizing turn so the user gets a
 /// completion follow-up (the planning turn already called `finish`).
-async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
-    cancel_goal_deploy(&st).await;
-    // Emit before the (possibly slow) workspace snapshot so UIs leave the
-    // plan_ready dark gap immediately.
-    emit(&Event::new("info").with("message", json!("Goal deploy: snapshotting workspace…")));
-    let tok = CancellationToken::new();
-    *st.goal_deploy_cancel.lock().await = Some(tok.clone());
+///
+/// Non-async on purpose: callers inside parent-turn helpers must not `.await` this
+/// (breaks a recursive `Future: Send` cycle with `start_goal_parent_turn`).
+fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
     tokio::spawn(async move {
+        cancel_goal_deploy(&st).await;
+        // Emit before the (possibly slow) workspace snapshot so UIs leave the
+        // plan_ready dark gap immediately.
+        emit(&Event::new("info").with("message", json!("Goal deploy: snapshotting workspace…")));
+        let tok = CancellationToken::new();
+        *st.goal_deploy_cancel.lock().await = Some(tok.clone());
         // Snapshot inside the task so ApproveGoalPlan / auto-deploy return fast.
         {
             let cfg = st.cfg.read().await;
@@ -1236,91 +1240,67 @@ async fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
                 true,
             );
         }
-        let need_wrapup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
+        let need_followup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
         // Clear cancel slot only if we still own it. A newer spawn cancels
         // this token first, so a cancelled token means the slot was replaced.
         if !tok.is_cancelled() {
             *st.goal_deploy_cancel.lock().await = None;
         }
-        if !need_wrapup || tok.is_cancelled() {
+        if !need_followup || tok.is_cancelled() {
             return;
         }
-        let wrap = {
+        let phase = {
             let g = st.goal.lock().await;
-            if g.phase != goal::GoalPhase::Synthesizing {
-                return;
-            }
-            (
-                goal::build_wrapup_prompt(&g),
-                g.parent_model.clone(),
-                g.reasoning_effort.clone(),
-                g.id.clone(),
-            )
+            g.phase.clone()
         };
-        let (prompt, model, effort, goal_id) = wrap;
-        let models = st.models.read().await;
-        let turn_model = if models.iter().any(|m| m.id == model) {
-            model
-        } else if let Some(first) = models.first() {
-            first.id.clone()
-        } else {
-            drop(models);
-            let mut g = st.goal.lock().await;
-            if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
-                // finish_synthesis emits goal_completion_summary.
-                goal::finish_synthesis(&mut g, false);
-                goal::sync_work_state_from_prompts(&st, &g).await;
+        match phase {
+            goal::GoalPhase::Verifying => {
+                spawn_goal_verify(st.clone(), client.clone()).await;
             }
-            emit(&Event::new("error").with("message", json!("goal wrap-up skipped: no models")));
-            return;
-        };
-        drop(models);
-        // If the user already started another turn during deploy, don't steal
-        // the session — finalize the goal with the step results already in
-        // goal_state instead of queuing a surprise wrap-up behind them.
-        let tok2 = {
-            let mut cur = st.current.lock().await;
-            if cur.is_some() {
-                drop(cur);
-                let mut g = st.goal.lock().await;
-                if g.id == goal_id && g.phase == goal::GoalPhase::Synthesizing {
-                    // finish_synthesis emits goal_completion_summary.
-                    goal::finish_synthesis(&mut g, false);
-                    goal::sync_work_state_from_prompts(&st, &g).await;
-                }
-                emit(&Event::new("info").with(
-                    "message",
-                    json!("Goal deploy finished (another turn is running — see goal_completion_summary / goal_state for step results)"),
-                ));
-                return;
+            goal::GoalPhase::Synthesizing => {
+                let wrap = {
+                    let g = st.goal.lock().await;
+                    (
+                        goal::build_wrapup_prompt(&g),
+                        g.parent_model.clone(),
+                        g.reasoning_effort.clone(),
+                        g.id.clone(),
+                    )
+                };
+                let (prompt, model, effort, goal_id) = wrap;
+                start_goal_parent_turn(
+                    st.clone(),
+                    client.clone(),
+                    prompt,
+                    model,
+                    effort,
+                    goal_id,
+                    "wrapup",
+                )
+                .await;
             }
-            let tok2 = CancellationToken::new();
-            *cur = Some(tok2.clone());
-            tok2
-        };
-        st.goal_wrapup_active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let handle = tokio::spawn(run_turn_and_drain(
-            st.clone(),
-            client.clone(),
-            turn_model,
-            prompt,
-            effort,
-            None,
-            tok2,
-        ));
-        *st.handle.lock().await = Some(handle);
+            _ => {}
+        }
     });
 }
 
-/// After a planning turn ends: fail if no plan, or kick deploy if requested.
+/// After a planning turn ends: fail if no plan, or kick review/deploy.
 async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
-    let should_deploy = {
+    enum Next {
+        Deploy,
+        Review,
+        None,
+    }
+    let next = {
         let mut g = st.goal.lock().await;
         // Deploy path: plan was written this turn (or earlier) and auto-deploy is armed.
         if g.deploy_after_turn && g.plan.is_some() && !g.prompts.is_empty() {
             g.deploy_after_turn = false;
-            true
+            if g.ceo_mode && g.max_plan_revisions > 0 {
+                Next::Review
+            } else {
+                Next::Deploy
+            }
         } else if g.phase == goal::GoalPhase::Planning {
             if cancelled {
                 goal::fail_goal(&mut g, "planning aborted");
@@ -1330,13 +1310,202 @@ async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, c
                     "planning turn ended without goal_write_plan — re-run /goal",
                 );
             }
-            false
+            Next::None
         } else {
-            false
+            Next::None
         }
     };
-    if should_deploy {
-        spawn_goal_deploy(st.clone(), client.clone()).await;
+    match next {
+        Next::Deploy => spawn_goal_deploy(st.clone(), client.clone()),
+        // Fire-and-forget like deploy: planning finishers still hold st.current,
+        // so awaiting review here always hit the "session busy" path and skipped
+        // self-review (never deploying). Spawn so current can clear first.
+        Next::Review => spawn_goal_review(st.clone(), client.clone()),
+        Next::None => {}
+    }
+}
+
+/// Start the CEO pre-deploy self-review parent turn.
+///
+/// Non-async on purpose (same pattern as [`spawn_goal_deploy`]): callers inside
+/// parent-turn finishers must not `.await` this while `st.current` is still held.
+fn spawn_goal_review(st: Arc<State>, client: reqwest::Client) {
+    tokio::spawn(async move {
+        // Wait for the planning turn to release the session slot.
+        for _ in 0..120 {
+            if st.current.lock().await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let wrap = {
+            let mut g = st.goal.lock().await;
+            if g.plan.is_none() || g.prompts.is_empty() {
+                return;
+            }
+            // Only start review from plan_ready (fresh plan) or reviewing (retry).
+            if g.phase != goal::GoalPhase::PlanReady && g.phase != goal::GoalPhase::Reviewing {
+                return;
+            }
+            goal::transition(
+                &mut g,
+                goal::GoalPhase::Reviewing,
+                Some("CEO self-reviewing plan"),
+            );
+            (
+                goal::build_self_review_prompt(&g),
+                g.parent_model.clone(),
+                g.reasoning_effort.clone(),
+                g.id.clone(),
+            )
+        };
+        let (prompt, model, effort, goal_id) = wrap;
+        start_goal_parent_turn(st, client, prompt, model, effort, goal_id, "review").await;
+    });
+}
+
+/// Start the CEO post-deploy verify parent turn.
+async fn spawn_goal_verify(st: Arc<State>, client: reqwest::Client) {
+    let wrap = {
+        let g = st.goal.lock().await;
+        if g.phase != goal::GoalPhase::Verifying {
+            return;
+        }
+        (
+            goal::build_verify_prompt(&g),
+            g.parent_model.clone(),
+            g.reasoning_effort.clone(),
+            g.id.clone(),
+        )
+    };
+    let (prompt, model, effort, goal_id) = wrap;
+    start_goal_parent_turn(st, client, prompt, model, effort, goal_id, "verify").await;
+}
+
+/// Shared helper: start a parent orchestrator turn for review/verify/wrap-up.
+async fn start_goal_parent_turn(
+    st: Arc<State>,
+    client: reqwest::Client,
+    prompt: String,
+    model: String,
+    effort: String,
+    goal_id: String,
+    kind: &str,
+) {
+    let models = st.models.read().await;
+    let turn_model = if models.iter().any(|m| m.id == model) {
+        Some(model)
+    } else {
+        models.first().map(|m| m.id.clone())
+    };
+    drop(models);
+
+    let Some(turn_model) = turn_model else {
+        let mut g = st.goal.lock().await;
+        if g.id == goal_id {
+            match kind {
+                "review" if g.phase == goal::GoalPhase::Reviewing => {
+                    goal::fail_goal(&mut g, "plan self-review skipped: no models");
+                }
+                "verify" if g.phase == goal::GoalPhase::Verifying => {
+                    goal::fail_goal(&mut g, "goal verify skipped: no models");
+                }
+                "wrapup" if g.phase == goal::GoalPhase::Synthesizing => {
+                    goal::finish_synthesis(&mut g, false);
+                    goal::sync_work_state_from_prompts(&st, &g).await;
+                }
+                _ => {}
+            }
+        }
+        emit(
+            &Event::new("error").with("message", json!(format!("goal {kind} skipped: no models"))),
+        );
+        return;
+    };
+
+    // Wait for the session slot. Review/verify/wrap-up are spawned from finishers
+    // or deploy tasks that may still briefly hold `st.current`; never skip CEO
+    // self-review by silently accepting the plan (that left missions stuck in
+    // plan_ready with deploy_after_turn armed and nobody consuming it).
+    for _ in 0..120 {
+        if st.current.lock().await.is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    enum BusyAction {
+        FailVerify,
+        FailReview,
+        FinishWrapup,
+        Abort,
+    }
+    let busy = {
+        let mut cur = st.current.lock().await;
+        if cur.is_some() {
+            drop(cur);
+            let mut g = st.goal.lock().await;
+            if g.id != goal_id {
+                Some(BusyAction::Abort)
+            } else {
+                match kind {
+                    "review" if g.phase == goal::GoalPhase::Reviewing => {
+                        goal::fail_goal(
+                            &mut g,
+                            "plan self-review skipped: session still busy after wait",
+                        );
+                        Some(BusyAction::FailReview)
+                    }
+                    "verify" if g.phase == goal::GoalPhase::Verifying => {
+                        goal::fail_goal(&mut g, "goal verify skipped: another turn is running");
+                        Some(BusyAction::FailVerify)
+                    }
+                    "wrapup" if g.phase == goal::GoalPhase::Synthesizing => {
+                        goal::finish_synthesis(&mut g, false);
+                        Some(BusyAction::FinishWrapup)
+                    }
+                    _ => Some(BusyAction::Abort),
+                }
+            }
+        } else {
+            let tok2 = CancellationToken::new();
+            *cur = Some(tok2.clone());
+            drop(cur);
+            st.goal_wrapup_active
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let handle = tokio::spawn(run_turn_and_drain(
+                st.clone(),
+                client.clone(),
+                turn_model,
+                prompt,
+                effort,
+                None,
+                tok2,
+            ));
+            *st.handle.lock().await = Some(handle);
+            None
+        }
+    };
+
+    match busy {
+        Some(BusyAction::FailVerify)
+        | Some(BusyAction::FailReview)
+        | Some(BusyAction::FinishWrapup) => {
+            // Sync work state after releasing the goal lock (busy block above).
+            {
+                let g = st.goal.lock().await;
+                if g.id == goal_id {
+                    goal::sync_work_state_from_prompts(&st, &g).await;
+                }
+            }
+            emit(&Event::new("info").with(
+                "message",
+                json!(format!(
+                    "Goal {kind} finished without parent turn (another turn is running)"
+                )),
+            ));
+        }
+        Some(BusyAction::Abort) | None => {}
     }
 }
 
@@ -1359,6 +1528,111 @@ async fn maybe_finish_goal_synthesis(st: &Arc<State>, cancelled: bool) {
     }
     goal::finish_synthesis_with_wrapup(&mut g, cancelled, Some(wrapup_chars));
     goal::sync_work_state_from_prompts(st, &g).await;
+}
+
+/// After a CEO self-review turn ends: deploy or re-enter planning.
+async fn maybe_finish_goal_reviewing(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
+    let assistant = {
+        let conv = st.conversation.lock().await;
+        conv.iter()
+            .rev()
+            .find(|m| m.role() == "assistant")
+            .and_then(|m| m.content_text())
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    };
+    let (outcome, prompt, model, effort) = {
+        let mut g = st.goal.lock().await;
+        if g.phase != goal::GoalPhase::Reviewing {
+            return;
+        }
+        let outcome = goal::finish_reviewing(&mut g, cancelled, &assistant);
+        let next = match outcome {
+            goal::ReviewOutcome::Deploy => (outcome, None, String::new(), String::new()),
+            goal::ReviewOutcome::Replan => (
+                outcome,
+                Some(goal::planning_prompt(&g)),
+                g.parent_model.clone(),
+                g.reasoning_effort.clone(),
+            ),
+            goal::ReviewOutcome::Failed => (outcome, None, String::new(), String::new()),
+        };
+        // Snapshot for work-state sync after releasing the goal lock.
+        let mode_snapshot = g.clone();
+        drop(g);
+        goal::sync_work_state_from_prompts(st, &mode_snapshot).await;
+        next
+    };
+    match outcome {
+        goal::ReviewOutcome::Deploy => {
+            spawn_goal_deploy(st.clone(), client.clone());
+        }
+        goal::ReviewOutcome::Replan => {
+            if let Some(prompt) = prompt {
+                start_turn(st, client, model, prompt, effort, None).await;
+            }
+        }
+        goal::ReviewOutcome::Failed => {}
+    }
+}
+
+/// After a CEO verify turn ends: certify Done or replan / fail.
+async fn maybe_finish_goal_verifying(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
+    let assistant = {
+        let conv = st.conversation.lock().await;
+        conv.iter()
+            .rev()
+            .find(|m| m.role() == "assistant")
+            .and_then(|m| m.content_text())
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    };
+    let (outcome, prompt, model, effort) = {
+        let mut g = st.goal.lock().await;
+        if g.phase != goal::GoalPhase::Verifying {
+            return;
+        }
+        let outcome = goal::finish_verifying(&mut g, cancelled, &assistant);
+        let next = match outcome {
+            goal::VerifyOutcome::Replan => (
+                outcome,
+                Some(goal::planning_prompt(&g)),
+                g.parent_model.clone(),
+                g.reasoning_effort.clone(),
+            ),
+            other => (other, None, String::new(), String::new()),
+        };
+        let mode_snapshot = g.clone();
+        drop(g);
+        goal::sync_work_state_from_prompts(st, &mode_snapshot).await;
+        next
+    };
+    if matches!(outcome, goal::VerifyOutcome::Replan) {
+        if let Some(prompt) = prompt {
+            start_turn(st, client, model, prompt, effort, None).await;
+        }
+    }
+}
+
+/// Finalize goal parent turns that may end via `finish` (includes planning).
+async fn maybe_finish_goal_orchestrator_turn(
+    st: &Arc<State>,
+    client: &reqwest::Client,
+    cancelled: bool,
+) {
+    maybe_finish_goal_planning(st, client, cancelled).await;
+    maybe_finish_goal_followup_turn(st, client, cancelled).await;
+}
+
+/// Finalize review / verify / wrap-up follow-ups (safe from drain; never planning).
+async fn maybe_finish_goal_followup_turn(
+    st: &Arc<State>,
+    client: &reqwest::Client,
+    cancelled: bool,
+) {
+    maybe_finish_goal_reviewing(st, client, cancelled).await;
+    maybe_finish_goal_verifying(st, client, cancelled).await;
+    maybe_finish_goal_synthesis(st, cancelled).await;
 }
 
 /// Seed the work-state goal from a user prompt (the first substantive message).
@@ -3391,22 +3665,38 @@ async fn main() {
             }
             Command::ListPlugins => {
                 let plugins = state.plugin_manager.list();
-                let entries: Vec<Value> = plugins
+                let mut entries: Vec<Value> = plugins
                     .values()
                     .map(|p| {
-                        let hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        let mut hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        hooks.sort();
                         let scope = state.plugin_manager.scope_of_path(&p.source_path);
+                        let tools: Vec<String> = p.tools.iter().map(|t| t.name.clone()).collect();
+                        let commands: Vec<String> =
+                            p.commands.iter().map(|c| c.name.clone()).collect();
                         json!({
                             "name": p.name,
                             "version": p.version,
                             "enabled": p.enabled,
                             "description": p.description,
                             "hooks": hooks,
+                            "tools": tools,
+                            "commands": commands,
+                            "disable_tools": p.disable_tools,
+                            "has_oauth": p.oauth.is_some(),
+                            "has_memory_provider": p.memory_provider.is_some(),
+                            "has_system_prompt": !p.system_prompt.trim().is_empty(),
                             "path": p.source_path.display().to_string(),
                             "scope": scope.as_str(),
                         })
                     })
                     .collect();
+                entries.sort_by(|a, b| {
+                    a.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+                });
                 emit(&Event::new("plugins_list").with("plugins", json!(entries)));
                 let cmds = state.plugin_manager.command_definitions();
                 emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
@@ -3418,22 +3708,38 @@ async fn main() {
             Command::ReloadPlugins => {
                 let summary = state.plugin_manager.reload();
                 let plugins = state.plugin_manager.list();
-                let entries: Vec<Value> = plugins
+                let mut entries: Vec<Value> = plugins
                     .values()
                     .map(|p| {
-                        let hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        let mut hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                        hooks.sort();
                         let scope = state.plugin_manager.scope_of_path(&p.source_path);
+                        let tools: Vec<String> = p.tools.iter().map(|t| t.name.clone()).collect();
+                        let commands: Vec<String> =
+                            p.commands.iter().map(|c| c.name.clone()).collect();
                         json!({
                             "name": p.name,
                             "version": p.version,
                             "enabled": p.enabled,
                             "description": p.description,
                             "hooks": hooks,
+                            "tools": tools,
+                            "commands": commands,
+                            "disable_tools": p.disable_tools,
+                            "has_oauth": p.oauth.is_some(),
+                            "has_memory_provider": p.memory_provider.is_some(),
+                            "has_system_prompt": !p.system_prompt.trim().is_empty(),
                             "path": p.source_path.display().to_string(),
                             "scope": scope.as_str(),
                         })
                     })
                     .collect();
+                entries.sort_by(|a, b| {
+                    a.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+                });
                 emit(&Event::new("plugins_list").with("plugins", json!(entries)));
                 let cmds = state.plugin_manager.command_definitions();
                 emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
@@ -3565,10 +3871,7 @@ async fn main() {
                 let client = client.clone();
                 let models = st.models.read().await.clone();
                 if !models.iter().any(|m| m.id == model) {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("unknown model: {model}"))),
-                    );
+                    emit_turn_rejected(format!("unknown model: {model}"));
                     continue;
                 }
                 let ws = st.cfg.read().await.workspace.clone();
@@ -3577,11 +3880,8 @@ async fn main() {
                     .into_iter()
                     .find(|s| s.name.eq_ignore_ascii_case(&name));
                 let Some(skill) = skill else {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "unknown skill '{name}' — use /skill:<name> with a name from the autocomplete"
-                        )),
+                    emit_turn_rejected(format!(
+                        "unknown skill '{name}' — use /skill:<name> with a name from the autocomplete"
                     ));
                     continue;
                 };
@@ -3596,6 +3896,9 @@ async fn main() {
                 allowed_models,
                 allowed_providers,
                 auto_deploy,
+                ceo_mode,
+                max_iterations,
+                max_plan_revisions,
                 planner_model,
                 worker_model,
                 reviewer_model,
@@ -3605,10 +3908,7 @@ async fn main() {
             } => {
                 let models = state.models.read().await.clone();
                 if !models.iter().any(|m| m.id == model) {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("unknown model: {model}"))),
-                    );
+                    emit_turn_rejected(format!("unknown model: {model}"));
                     continue;
                 }
                 // Cancel any prior goal deploy.
@@ -3626,6 +3926,9 @@ async fn main() {
                     allowed_models: allowed_models.unwrap_or_default(),
                     allowed_providers: allowed_providers.unwrap_or_default(),
                     auto_deploy,
+                    ceo_mode,
+                    max_iterations,
+                    max_plan_revisions,
                     role_models: goal::RoleModels {
                         planner: planner_model,
                         worker: worker_model,
@@ -3768,7 +4071,7 @@ async fn main() {
                 };
                 if should_deploy {
                     let _ = model;
-                    spawn_goal_deploy(state.clone(), client.clone()).await;
+                    spawn_goal_deploy(state.clone(), client.clone());
                 }
             }
             Command::ReviseGoal {
@@ -3778,20 +4081,14 @@ async fn main() {
             } => {
                 let models = state.models.read().await.clone();
                 if !models.iter().any(|m| m.id == model) {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("unknown model: {model}"))),
-                    );
+                    emit_turn_rejected(format!("unknown model: {model}"));
                     continue;
                 }
                 cancel_goal_deploy(&state).await;
                 let prompt = {
                     let mut g = state.goal.lock().await;
                     if g.goal.is_empty() {
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!("no goal to revise — use start_goal first")),
-                        );
+                        emit_turn_rejected("no goal to revise — use start_goal first");
                         None
                     } else {
                         g.revise_feedback = Some(feedback);
@@ -4091,6 +4388,19 @@ async fn main() {
             Command::Abort => {
                 // Cancel the running turn AND drop any queued follow-up/steer so a
                 // single abort fully stops the loop (not just the current turn).
+                // If a goal/mission is active, also cancel deploy + fail the goal
+                // (Control Center Abort sends cancel_goal; bare Abort must match).
+                cancel_goal_deploy(&state).await;
+                state
+                    .goal_wrapup_active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                {
+                    let mut g = state.goal.lock().await;
+                    if g.is_active() {
+                        goal::fail_goal(&mut g, "cancelled by user");
+                        emit(&Event::new("info").with("message", json!("goal cancelled")));
+                    }
+                }
                 cancel_in_flight_turn(&state).await;
             }
             Command::ClearQueue => {
@@ -4120,10 +4430,7 @@ async fn main() {
                 let models = st.models.read().await.clone();
                 let valid = models.iter().any(|m| m.id == model);
                 if !valid {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("unknown model: {model}"))),
-                    );
+                    emit_turn_rejected(format!("unknown model: {model}"));
                     continue;
                 }
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
@@ -4140,10 +4447,7 @@ async fn main() {
                 let client_c = client.clone();
                 let models = st.models.read().await.clone();
                 if !models.iter().any(|m| m.id == model) {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("unknown model: {model}"))),
-                    );
+                    emit_turn_rejected(format!("unknown model: {model}"));
                     continue;
                 }
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
@@ -4184,6 +4488,9 @@ async fn main() {
     if let Some(h) = h {
         let _ = h.await;
     }
+    // P0-H3: true process/session teardown (once). Distinct from per-turn
+    // `session_stop` used by telemetry plugins.
+    dispatch_lifecycle(&state, "session_shutdown").await;
     // Clean up our presence record so peers don't see a stale session. Best
     // effort — a kill -9 / crash leaves a stale file that `read_peers` reaps
     // by mtime, so this is an optimization (instant disappearance), not a
@@ -4595,6 +4902,7 @@ fn run_turn_and_drain(
         .await;
         // The turn ended for any reason — notify lifecycle plugins and release
         // the current-token slot unconditionally so new turns can start.
+        dispatch_lifecycle(&st, "turn_end").await;
         dispatch_lifecycle(&st, "session_stop").await;
         st.current.lock().await.take();
         // Flush any `!cmd` context messages that were deferred while this turn
@@ -4612,7 +4920,9 @@ fn run_turn_and_drain(
             .goal_wrapup_active
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            maybe_finish_goal_synthesis(&st, tok.is_cancelled()).await;
+            // Review / verify / wrap-up parent turns share this flag.
+            // Do NOT run planning here — that would false-fail a replan mid-flight.
+            maybe_finish_goal_followup_turn(&st, &client, tok.is_cancelled()).await;
         }
         if let Err(panic) = result {
             let detail = panic_payload_message(&panic);
@@ -4687,6 +4997,202 @@ pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
     }
 }
 
+/// Caps for agent-loop hook `modify` payloads (P0-H1). Invalid / oversized
+/// modifies are ignored (no-op + log) so a bad plugin cannot corrupt the turn.
+const PRE_INPUT_MAX_BYTES: usize = 1_048_576;
+const PRE_CONTEXT_MAX_MESSAGES: usize = 500;
+const PRE_CONTEXT_MAX_BYTES: usize = 8 * 1_048_576;
+const SYSTEM_PROMPT_MODIFY_MAX_BYTES: usize = 100 * 1024;
+
+/// Run `pre_input` hooks over the user's text before it becomes a Message.
+/// Returns `Err(reason)` when a hook denies (honor_allow); otherwise the
+/// (possibly modified) text. Failures that Deny are surfaced to the caller.
+pub(crate) async fn run_pre_input(st: &Arc<State>, text: &str) -> Result<String, String> {
+    let configs = st.plugin_manager.get_hook_configs("pre_input");
+    if configs.is_empty() {
+        return Ok(text.to_string());
+    }
+    let (workspace, session_id) = {
+        let cfg = st.cfg.read().await;
+        (
+            cfg.workspace.display().to_string(),
+            cfg.session_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
+    let mut current = text.to_string();
+    for (plugin_name, config) in &configs {
+        let args = json!({ "text": current });
+        let ctx = plugins::build_context(
+            "pre_input",
+            "",
+            &workspace,
+            Some(&args),
+            &session_id,
+            config.pass_args,
+        );
+        let result = plugins::execute_hook("pre_input", plugin_name, config, &ctx).await;
+        if !result.allow {
+            return Err(format!(
+                "input denied by plugin '{}' pre_input: {}",
+                plugin_name, result.reason
+            ));
+        }
+        if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
+            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                if t.len() > PRE_INPUT_MAX_BYTES {
+                    eprintln!(
+                        "[plugins] pre_input modify.text from '{plugin_name}' exceeds {PRE_INPUT_MAX_BYTES} bytes; ignored"
+                    );
+                } else {
+                    current = t.to_string();
+                }
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// Run `pre_agent_start` hooks. Collects `append_system_prompt` / `system_prompt`
+/// modifies into a transient system-prompt fragment (caller pushes as a
+/// non-persisted message before the LLM call). Advisory — fail-open.
+pub(crate) async fn run_pre_agent_start(st: &Arc<State>) -> Option<String> {
+    let configs = st.plugin_manager.get_hook_configs("pre_agent_start");
+    if configs.is_empty() {
+        return None;
+    }
+    let (workspace, session_id) = {
+        let cfg = st.cfg.read().await;
+        (
+            cfg.workspace.display().to_string(),
+            cfg.session_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
+    let mut replaced: Option<String> = None;
+    let mut appends: Vec<String> = Vec::new();
+    for (plugin_name, config) in &configs {
+        let ctx = plugins::build_context(
+            "pre_agent_start",
+            "",
+            &workspace,
+            None,
+            &session_id,
+            config.pass_args,
+        );
+        let result = plugins::execute_hook("pre_agent_start", plugin_name, config, &ctx).await;
+        if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
+            if let Some(s) = obj.get("system_prompt").and_then(|v| v.as_str()) {
+                if s.len() > SYSTEM_PROMPT_MODIFY_MAX_BYTES {
+                    eprintln!(
+                        "[plugins] pre_agent_start modify.system_prompt from '{plugin_name}' exceeds cap; ignored"
+                    );
+                } else {
+                    replaced = Some(s.to_string());
+                    appends.clear();
+                }
+            }
+            if let Some(s) = obj.get("append_system_prompt").and_then(|v| v.as_str()) {
+                if s.len() > SYSTEM_PROMPT_MODIFY_MAX_BYTES {
+                    eprintln!(
+                        "[plugins] pre_agent_start modify.append_system_prompt from '{plugin_name}' exceeds cap; ignored"
+                    );
+                } else if !s.is_empty() {
+                    appends.push(format!("# Plugin: {plugin_name}\n{s}"));
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(r) = replaced {
+        out.push_str(&r);
+    }
+    if !appends.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&appends.join("\n\n"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Run `pre_context` hooks over the in-flight message list before an LLM call.
+/// Fail-open: timeout / invalid modify keeps the prior messages and logs.
+pub(crate) async fn run_pre_context(st: &Arc<State>, messages: &mut Vec<Message>) {
+    let configs = st.plugin_manager.get_hook_configs("pre_context");
+    if configs.is_empty() {
+        return;
+    }
+    let (workspace, session_id) = {
+        let cfg = st.cfg.read().await;
+        (
+            cfg.workspace.display().to_string(),
+            cfg.session_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
+    for (plugin_name, config) in &configs {
+        let Ok(serialized) = serde_json::to_value(&*messages) else {
+            eprintln!("[plugins] pre_context: failed to serialize messages; skipping");
+            return;
+        };
+        let ser_bytes = serialized.to_string().len();
+        if ser_bytes > PRE_CONTEXT_MAX_BYTES {
+            eprintln!(
+                "[plugins] pre_context: messages payload ({ser_bytes} bytes) exceeds cap; skipping hooks"
+            );
+            return;
+        }
+        let args = json!({ "messages": serialized });
+        let ctx = plugins::build_context(
+            "pre_context",
+            "",
+            &workspace,
+            Some(&args),
+            &session_id,
+            config.pass_args,
+        );
+        let result = plugins::execute_hook("pre_context", plugin_name, config, &ctx).await;
+        if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
+            if let Some(msgs_v) = obj.get("messages") {
+                let Ok(new_msgs) = serde_json::from_value::<Vec<Message>>(msgs_v.clone()) else {
+                    eprintln!(
+                        "[plugins] pre_context modify.messages from '{plugin_name}' failed schema validation; ignored"
+                    );
+                    continue;
+                };
+                if new_msgs.len() > PRE_CONTEXT_MAX_MESSAGES {
+                    eprintln!(
+                        "[plugins] pre_context modify.messages from '{plugin_name}' has {} msgs (max {PRE_CONTEXT_MAX_MESSAGES}); ignored",
+                        new_msgs.len()
+                    );
+                    continue;
+                }
+                let new_bytes = serde_json::to_string(&new_msgs)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX);
+                if new_bytes > PRE_CONTEXT_MAX_BYTES {
+                    eprintln!(
+                        "[plugins] pre_context modify.messages from '{plugin_name}' exceeds size cap; ignored"
+                    );
+                    continue;
+                }
+                *messages = new_msgs;
+            }
+        }
+    }
+}
+
 /// Run every enabled plugin's pre-execution hook for `hook_name` against a tool
 /// call, composing each hook's `modify` into `exec_args` and recording reasons
 /// into `hook_notes`. Returns `Some(deny_message)` when a hook denies the call
@@ -4695,7 +5201,9 @@ pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
 /// the catch-all `pre_tool` that fires for every tool call — giving a plugin the
 /// same per-call reach over `memory`/`todo_write`/`git_*`/`subagent`/… that a
 /// core edit of the dispatch loop has.
-async fn run_pre_hooks(
+///
+/// `pub(crate)` so subagent tool dispatch can reuse the same pipeline (P0-F3).
+pub(crate) async fn run_pre_hooks(
     st: &Arc<State>,
     cfg: &crate::config::Config,
     hook_name: &str,
@@ -4746,7 +5254,9 @@ async fn run_pre_hooks(
 /// context, or reformat. Post hooks never block (the op already ran), so
 /// `allow:false` is ignored (only its `reason` is surfaced). Used for BOTH the
 /// tool-specific post_* hook and the catch-all `post_tool`.
-async fn run_post_hooks(
+///
+/// `pub(crate)` so subagent tool dispatch can reuse the same pipeline (P0-F3).
+pub(crate) async fn run_post_hooks(
     st: &Arc<State>,
     cfg: &crate::config::Config,
     hook_name: &str,
@@ -4955,7 +5465,10 @@ async fn maybe_reflect_prompt(
             // Tests may have run; without parsing output treat as unverified.
             episodes::EpisodeOutcome::SuccessUnverified
         } else if shape_tools.iter().any(|t| {
-            matches!(t.as_str(), "edit" | "write_file" | "patch" | "bulk_edit" | "bulk_write")
+            matches!(
+                t.as_str(),
+                "edit" | "write_file" | "patch" | "bulk_edit" | "bulk_write"
+            )
         }) {
             episodes::EpisodeOutcome::SuccessUnverified
         } else {
@@ -5034,7 +5547,7 @@ async fn run_parallel_readonly_wave(
     for tc in calls {
         if cancel.is_cancelled() {
             sync_session_file(st).await;
-            emit(&Event::new("aborted"));
+            emit_aborted_done();
             return ParallelWaveResult::Aborted;
         }
         let id = tc.id.clone();
@@ -5294,7 +5807,7 @@ async fn run_parallel_readonly_wave(
             r = tools::execute_parallel_wave(&batch, &cfg) => r,
             _ = cancel.cancelled() => {
                 sync_session_file(st).await;
-                emit(&Event::new("aborted"));
+                emit_aborted_done();
                 return ParallelWaveResult::Aborted;
             }
         };
@@ -5470,6 +5983,19 @@ async fn run_turn(
             )),
         ));
     }
+    // P0-H1: pre_input — plugins may rewrite/deny user text before it becomes
+    // a conversation Message. Deny aborts the turn with an error event.
+    let user_text = match run_pre_input(st, &user_text).await {
+        Ok(t) => t,
+        Err(reason) => {
+            emit(&Event::new("error").with("message", json!(reason)));
+            emit(&Event::new("done"));
+            return;
+        }
+    };
+    // P0-H1: turn_start — advisory turn-boundary signal (distinct from vision
+    // pre_turn and from session_start).
+    dispatch_lifecycle(st, "turn_start").await;
     {
         let mut conv = st.conversation.lock().await;
         if conv.is_empty() {
@@ -5863,7 +6389,7 @@ async fn run_turn(
     loop {
         if cancel.is_cancelled() {
             sync_session_file(st).await;
-            emit(&Event::new("aborted"));
+            emit_aborted_done();
             return;
         }
         // Session token budget (hard ceiling across the whole session, not per turn).
@@ -6176,6 +6702,15 @@ async fn run_turn(
             messages.push(msg.clone());
             transient_tails += 1;
         }
+        // P0-H1: pre_agent_start — dynamic system-prompt surgery as a transient
+        // system message (not persisted). Fail-open on hook errors.
+        if let Some(dyn_prompt) = run_pre_agent_start(st).await {
+            messages.push(Message::system(dyn_prompt));
+            transient_tails += 1;
+        }
+        // P0-H1: pre_context — rewrite the message list before the LLM call.
+        // Fail-open: invalid/oversized modify keeps prior messages.
+        run_pre_context(st, &mut messages).await;
         // messages is already Vec<Message> — pass directly.
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
             match provider::stream_turn(
@@ -6310,7 +6845,7 @@ async fn run_turn(
                     // repaired by the always-run sanitizer next turn.)
                     if cancel.is_cancelled() {
                         sync_session_file(st).await;
-                        emit(&Event::new("aborted"));
+                        emit_aborted_done();
                         return;
                     }
                     let id = tc.id.clone();
@@ -6662,34 +7197,31 @@ async fn run_turn(
                                         _ => "",
                                     };
                                     if !hook_name.is_empty() {
-                                        let configs = st.plugin_manager.get_hook_configs(hook_name);
-                                        for (pn, config) in &configs {
-                                            let session_id = cfg
-                                                .session_file
-                                                .as_ref()
-                                                .map(|p| p.display().to_string())
-                                                .unwrap_or_default();
-                                            let ctx = plugins::build_context(
-                                                hook_name,
-                                                &iname,
-                                                &cfg.workspace.display().to_string(),
-                                                Some(&modified),
-                                                &session_id,
-                                                config.pass_args,
-                                            );
-                                            let r =
-                                                plugins::execute_hook(hook_name, pn, config, &ctx)
-                                                    .await;
-                                            if !r.allow {
-                                                dmsg = Some(format!(
-                                                    "denied by plugin '{}' hook '{}': {}",
-                                                    pn, hook_name, r.reason
-                                                ));
-                                                break;
-                                            }
-                                            if let Some(m) = &r.modify {
-                                                plugins::apply_modify(&mut modified, m);
-                                            }
+                                        if let Some(deny) = run_pre_hooks(
+                                            st,
+                                            &cfg,
+                                            hook_name,
+                                            &iname,
+                                            &mut modified,
+                                            &mut hook_notes,
+                                        )
+                                        .await
+                                        {
+                                            dmsg = Some(deny);
+                                        }
+                                    }
+                                    if dmsg.is_none() && iname != "finish" {
+                                        if let Some(deny) = run_pre_hooks(
+                                            st,
+                                            &cfg,
+                                            "pre_tool",
+                                            &iname,
+                                            &mut modified,
+                                            &mut hook_notes,
+                                        )
+                                        .await
+                                        {
+                                            dmsg = Some(deny);
                                         }
                                     }
                                 }
@@ -6868,11 +7400,21 @@ async fn run_turn(
                     } else if name == "load_tools" {
                         handle_load_tools(st, &exec_args, &mut tool_defs).await
                     } else if name == "ask" {
-                        // Blocking user-interaction tool: surface a flyout and
-                        // wait for the answer (or skip/abort). Validation errors
-                        // and skips return a normal Outcome; an abort ends the
-                        // turn like the approval gate does.
-                        match request_ask(st, &exec_args, &cancel).await {
+                        // CEO / Control Center autonomy: never block on the user.
+                        let ceo_active = {
+                            let g = st.goal.lock().await;
+                            g.ceo_mode && g.is_active()
+                        };
+                        if ceo_active {
+                            tools::Outcome::ok(
+                                "CEO mode is active — do not ask the user. Decide autonomously,                                  document assumptions, and continue. Do not re-call ask.".to_string(),
+                            )
+                        } else {
+                            // Blocking user-interaction tool: surface a flyout and
+                            // wait for the answer (or skip/abort). Validation errors
+                            // and skips return a normal Outcome; an abort ends the
+                            // turn like the approval gate does.
+                            match request_ask(st, &exec_args, &cancel).await {
                             AskResult::Answered { questions, answers } => {
                                 tools::Outcome::ok(format_ask_answers(&questions, &answers))
                             }
@@ -6885,6 +7427,7 @@ async fn run_turn(
                                 emit(&Event::new("done"));
                                 return;
                             }
+                        }
                         }
                     } else if name == "memory" {
                         // Route through the plugin memory_provider when one is
@@ -7072,8 +7615,8 @@ async fn run_turn(
                             st.logger.record_turn();
                             persist_stats(st).await;
                             sync_session_file(st).await;
-                            maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
-                            maybe_finish_goal_synthesis(st, cancel.is_cancelled()).await;
+                            maybe_finish_goal_orchestrator_turn(st, client, cancel.is_cancelled())
+                                .await;
                             emit(&Event::new("done"));
                             return;
                         }
@@ -7231,8 +7774,7 @@ async fn run_turn(
                     st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
                     st.logger.record_turn();
                     persist_stats(st).await;
-                    maybe_finish_goal_planning(st, client, cancel.is_cancelled()).await;
-                    maybe_finish_goal_synthesis(st, cancel.is_cancelled()).await;
+                    maybe_finish_goal_orchestrator_turn(st, client, cancel.is_cancelled()).await;
                     emit(&Event::new("done"));
                     return;
                 }
@@ -8525,9 +9067,34 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
             unknown.push(name);
             continue;
         }
+        // P0-F4: plugins' `disable_tools` wins — mid-turn load_tools must not
+        // resurrect a disabled name into the live toolset or the session set.
+        if st.plugin_manager.disabled_tools().contains(&name) {
+            unknown.push(format!("{name} (disabled by plugin — cannot load)"));
+            continue;
+        }
         enabled.insert(name.clone());
         if existing.contains(&name) {
             added.push(format!("{name} (already enabled)"));
+            continue;
+        }
+        // P0-F4: when a plugin overrides this deferred builtin, inject the
+        // plugin's declared schema — never the built-in one — so mid-turn
+        // load matches the turn-start assembly.
+        if st.plugin_manager.overridden_tool_names().contains(&name) {
+            if let Some(def) = st.plugin_manager.tool_definitions().into_iter().find(|d| {
+                d.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    == Some(name.as_str())
+            }) {
+                tool_defs.push(def);
+                added.push(format!("{name} (plugin override)"));
+                continue;
+            }
+            unknown.push(format!(
+                "{name} (overridden by plugin but no plugin schema found)"
+            ));
             continue;
         }
         if let Some(def) = all_defs.iter().find(|d| {

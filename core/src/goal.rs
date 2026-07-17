@@ -3,9 +3,14 @@
 //! `/goal` (TUI/web) sends `start_goal`. The core owns a phase machine:
 //! planning → plan_ready (optional) → deploying → running → synthesizing →
 //! done|failed.
+//!
+//! Control Center / CEO mode (`ceo_mode=true`) extends the loop:
+//! planning → reviewing (bounded revise) → deploying → running → verifying →
+//! (certified→done) | (replan→planning, iteration-capped→failed).
 //! The planning turn must call `goal_write_plan` with a structured plan;
 //! deploy runs subagents under the user's concurrency and model/provider caps.
-//! After workers finish, a parent synthesizing turn reports results to the user.
+//! After workers finish, a parent synthesizing (single-pass) or verifying
+//! (CEO) turn closes the loop without prompting the user.
 
 use crate::protocol::{emit, Event};
 use crate::tools::Outcome;
@@ -27,11 +32,17 @@ pub enum GoalPhase {
     #[default]
     Idle,
     Planning,
+    /// Parent CEO turn self-reviews the plan before deploy (CEO mode only).
+    Reviewing,
     PlanReady,
     Deploying,
     Running,
     /// Workers finished; parent turn is summarizing results for the user.
     Synthesizing,
+    /// Parent CEO turn verifies deploy artifacts against the goal (CEO mode).
+    Verifying,
+    /// Transitional: verify failed and a replan turn is starting (CEO mode).
+    Replanning,
     Blocked,
     Done,
     Failed,
@@ -42,16 +53,61 @@ impl GoalPhase {
         match self {
             GoalPhase::Idle => "idle",
             GoalPhase::Planning => "planning",
+            GoalPhase::Reviewing => "reviewing",
             GoalPhase::PlanReady => "plan_ready",
             GoalPhase::Deploying => "deploying",
             GoalPhase::Running => "running",
             GoalPhase::Synthesizing => "synthesizing",
+            GoalPhase::Verifying => "verifying",
+            GoalPhase::Replanning => "replanning",
             GoalPhase::Blocked => "blocked",
             GoalPhase::Done => "done",
             GoalPhase::Failed => "failed",
         }
     }
+
+    /// Phases where employee subagents may run without a live leader turn
+    /// answering `contact_supervisor` — auto-resolve `need_decision`.
+    pub fn auto_resolves_supervisor(&self) -> bool {
+        matches!(
+            self,
+            GoalPhase::Planning
+                | GoalPhase::Reviewing
+                | GoalPhase::Deploying
+                | GoalPhase::Running
+                | GoalPhase::Verifying
+                | GoalPhase::Replanning
+        )
+    }
 }
+
+/// Structured review / verify verdict surfaced to the UI.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GoalVerdict {
+    pub ok: bool,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence_paths: Vec<String>,
+    /// Unix epoch milliseconds when the verdict was recorded.
+    #[serde(default)]
+    pub at_ms: u64,
+}
+
+impl GoalVerdict {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "ok": self.ok,
+            "summary": self.summary,
+            "evidence_paths": self.evidence_paths,
+            "at": self.at_ms,
+        })
+    }
+}
+
+/// Default verify→replan cycles for Control Center CEO mode.
+pub const DEFAULT_CEO_MAX_ITERATIONS: u32 = 3;
+/// Default pre-deploy self-review revise budget for CEO mode.
+pub const DEFAULT_CEO_MAX_PLAN_REVISIONS: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +195,38 @@ pub struct GoalMode {
     /// When true, deploy immediately after a valid plan. When false, stop at
     /// `plan_ready` until `approve_goal_plan`.
     pub auto_deploy: bool,
+    /// When true, run the autonomous CEO loop (self-review → verify → replan).
+    /// When false, classic single-pass `/goal`: plan → deploy → synthesize → Done.
+    #[serde(default)]
+    pub ceo_mode: bool,
+    /// Verify→replan iteration counter (0 before first verify).
+    #[serde(default)]
+    pub iteration: u32,
+    /// Cap on verify→replan cycles. 0 disables replan (single-pass verify skip
+    /// when combined with `ceo_mode=false`).
+    #[serde(default)]
+    pub max_iterations: u32,
+    /// Pre-deploy self-review revise counter.
+    #[serde(default)]
+    pub plan_revision: u32,
+    /// Cap on plan self-review revisions before first deploy.
+    #[serde(default)]
+    pub max_plan_revisions: u32,
+    /// Latest plan self-review verdict (CEO mode).
+    #[serde(default)]
+    pub review_verdict: Option<GoalVerdict>,
+    /// Latest post-deploy verify verdict (CEO mode).
+    #[serde(default)]
+    pub verify_verdict: Option<GoalVerdict>,
+    /// Gaps from the latest failed verify, fed into the next replan.
+    #[serde(default)]
+    pub remaining_gaps: Vec<String>,
+    /// Self-review feedback (also mirrored into `revise_feedback` on revise).
+    #[serde(default)]
+    pub self_review_feedback: Option<String>,
+    /// True once verify certifies the goal complete.
+    #[serde(default)]
+    pub certified: bool,
     /// Advanced: preferred model per agent role (planner / worker / reviewer).
     #[serde(default)]
     pub role_models: RoleModels,
@@ -177,6 +265,16 @@ impl Default for GoalMode {
             allowed_models: Vec::new(),
             allowed_providers: Vec::new(),
             auto_deploy: true,
+            ceo_mode: false,
+            iteration: 0,
+            max_iterations: 0,
+            plan_revision: 0,
+            max_plan_revisions: 0,
+            review_verdict: None,
+            verify_verdict: None,
+            remaining_gaps: Vec::new(),
+            self_review_feedback: None,
+            certified: false,
             role_models: RoleModels::default(),
             model_concurrency: HashMap::new(),
             plan: None,
@@ -215,6 +313,17 @@ impl GoalMode {
             "allowed_models": self.allowed_models,
             "allowed_providers": self.allowed_providers,
             "auto_deploy": self.auto_deploy,
+            "ceo_mode": self.ceo_mode,
+            "mode": if self.ceo_mode { "ceo" } else { "single_pass" },
+            "iteration": self.iteration,
+            "max_iterations": self.max_iterations,
+            "plan_revision": self.plan_revision,
+            "max_plan_revisions": self.max_plan_revisions,
+            "review_verdict": self.review_verdict.as_ref().map(|v| v.to_json()),
+            "verify_verdict": self.verify_verdict.as_ref().map(|v| v.to_json()),
+            "remaining_gaps": self.remaining_gaps,
+            "self_review_feedback": self.self_review_feedback,
+            "certified": self.certified,
             "role_models": {
                 "planner": self.role_models.planner,
                 "worker": self.role_models.worker,
@@ -349,6 +458,10 @@ pub struct StartGoalArgs {
     pub allowed_models: Vec<String>,
     pub allowed_providers: Vec<String>,
     pub auto_deploy: Option<bool>,
+    /// Enable autonomous CEO loop (Control Center). Default false = classic /goal.
+    pub ceo_mode: Option<bool>,
+    pub max_iterations: Option<u32>,
+    pub max_plan_revisions: Option<u32>,
     pub role_models: RoleModels,
     pub model_concurrency: HashMap<String, u32>,
     pub model: String,
@@ -407,6 +520,24 @@ pub fn new_goal(args: StartGoalArgs) -> Result<GoalMode, String> {
     // Planning turn prefers planner role model when set.
     let parent_model = role_models.planner.clone().unwrap_or(args.model);
 
+    let ceo_mode = args.ceo_mode.unwrap_or(false);
+    let (max_iterations, max_plan_revisions) = if ceo_mode {
+        (
+            args.max_iterations
+                .unwrap_or(DEFAULT_CEO_MAX_ITERATIONS)
+                .clamp(1, 32),
+            args.max_plan_revisions
+                .unwrap_or(DEFAULT_CEO_MAX_PLAN_REVISIONS)
+                .clamp(0, 16),
+        )
+    } else {
+        // Classic single-pass: no self-review / verify-replan budgets.
+        (
+            args.max_iterations.unwrap_or(0),
+            args.max_plan_revisions.unwrap_or(0),
+        )
+    };
+
     let id = format!("goal-{}", now_ms());
     Ok(GoalMode {
         id,
@@ -417,6 +548,16 @@ pub fn new_goal(args: StartGoalArgs) -> Result<GoalMode, String> {
         allowed_models,
         allowed_providers: args.allowed_providers,
         auto_deploy: args.auto_deploy.unwrap_or(true),
+        ceo_mode,
+        iteration: 0,
+        max_iterations,
+        plan_revision: 0,
+        max_plan_revisions,
+        review_verdict: None,
+        verify_verdict: None,
+        remaining_gaps: Vec::new(),
+        self_review_feedback: None,
+        certified: false,
         role_models,
         model_concurrency,
         plan: None,
@@ -817,6 +958,191 @@ pub fn emit_goal_completion_summary(text: &str) {
     emit(&Event::new("goal_completion_summary").with("text", json!(text)));
 }
 
+/// Emit iteration budget progress for Control Center UI.
+pub fn emit_goal_iteration(mode: &GoalMode) {
+    emit(
+        &Event::new("goal_iteration")
+            .with("id", json!(mode.id))
+            .with("iteration", json!(mode.iteration))
+            .with("max_iterations", json!(mode.max_iterations))
+            .with("plan_revision", json!(mode.plan_revision))
+            .with("max_plan_revisions", json!(mode.max_plan_revisions)),
+    );
+}
+
+pub fn emit_goal_review_verdict(mode: &GoalMode, verdict: &GoalVerdict) {
+    emit(
+        &Event::new("goal_review_verdict")
+            .with("id", json!(mode.id))
+            .with("ok", json!(verdict.ok))
+            .with("summary", json!(verdict.summary))
+            .with("iteration", json!(mode.iteration))
+            .with("plan_revision", json!(mode.plan_revision))
+            .with("evidence_paths", json!(verdict.evidence_paths)),
+    );
+}
+
+pub fn emit_goal_verify_verdict(mode: &GoalMode, verdict: &GoalVerdict, gaps: &[String]) {
+    emit(
+        &Event::new("goal_verify_verdict")
+            .with("id", json!(mode.id))
+            .with("ok", json!(verdict.ok))
+            .with("summary", json!(verdict.summary))
+            .with("iteration", json!(mode.iteration))
+            .with("remaining_gaps", json!(gaps))
+            .with("evidence_paths", json!(verdict.evidence_paths)),
+    );
+}
+
+pub fn emit_goal_certified(mode: &GoalMode, summary: &str) {
+    emit(
+        &Event::new("goal_certified")
+            .with("id", json!(mode.id))
+            .with("summary", json!(summary))
+            .with("iteration", json!(mode.iteration))
+            .with("certified", json!(true)),
+    );
+}
+
+/// Parse CEO review/verify model output for structured verdicts and optional gaps.
+///
+/// Accepts wire synonyms:
+/// - pass/certify: `VERDICT: PASS` | `VERDICT: CERTIFY` | `VERDICT: CERTIFIED`
+/// - fail/revise:  `VERDICT: FAIL` | `VERDICT: REVISE` | `VERDICT: REMAINING_GAPS`
+///
+/// Fail synonyms win when both appear. Missing verdict → fail (safe default).
+pub fn parse_ceo_verdict(text: &str) -> (bool, String, Vec<String>) {
+    let upper = text.to_ascii_uppercase();
+    let fail = upper.contains("VERDICT: FAIL")
+        || upper.contains("VERDICT: REVISE")
+        || upper.contains("VERDICT: REMAINING_GAPS");
+    let pass = upper.contains("VERDICT: PASS")
+        || upper.contains("VERDICT: CERTIFY")
+        || upper.contains("VERDICT: CERTIFIED");
+    let ok = if fail { false } else { pass };
+    let mut gaps: Vec<String> = Vec::new();
+    let mut in_gaps = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("gaps:")
+            || lower.starts_with("remaining_gaps:")
+            || lower == "## fixes"
+            || lower == "## remaining gaps"
+            || lower.starts_with("## fixes")
+            || lower.starts_with("## remaining gaps")
+        {
+            in_gaps = true;
+            let rest = trimmed.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
+            if !rest.is_empty() {
+                gaps.push(rest.to_string());
+            }
+            continue;
+        }
+        if in_gaps {
+            if trimmed.is_empty() {
+                in_gaps = false;
+                continue;
+            }
+            if trimmed.starts_with("VERDICT:") || trimmed.starts_with("##") {
+                in_gaps = false;
+                continue;
+            }
+            let item = trimmed
+                .trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim();
+            if !item.is_empty() {
+                gaps.push(item.to_string());
+            }
+        }
+    }
+    let summary = {
+        let t = text.trim();
+        if t.is_empty() {
+            if ok {
+                "VERDICT: PASS".to_string()
+            } else {
+                "VERDICT: FAIL (no verdict text)".to_string()
+            }
+        } else {
+            truncate_str(t, 2000)
+        }
+    };
+    (ok, summary, gaps)
+}
+
+/// Workspace-relative path for the goal-scoped mission summary used by verify.
+pub fn mission_summary_rel_path(goal_id: &str) -> String {
+    format!(".catalyst-code/goal-ux/artifacts/{goal_id}/SUMMARY.md")
+}
+
+/// Write a goal-scoped SUMMARY.md richer than truncated prompt lines.
+/// Returns the workspace-relative path on success.
+pub fn write_mission_summary(workspace: &Path, mode: &GoalMode) -> Option<String> {
+    if mode.id.is_empty() {
+        return None;
+    }
+    let dir = workspace
+        .join(".catalyst-code")
+        .join("goal-ux")
+        .join("artifacts")
+        .join(&mode.id);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("# Mission summary: {}", mode.goal.trim()));
+    lines.push(format!("goal_id: {}", mode.id));
+    lines.push(format!(
+        "iteration: {}/{}",
+        mode.iteration, mode.max_iterations
+    ));
+    if let Some(plan) = &mode.plan {
+        lines.push(String::new());
+        lines.push(format!("## Plan\n{}", plan.summary.trim()));
+        if !plan.validation.is_empty() {
+            lines.push(String::new());
+            lines.push("## Validation criteria".into());
+            for v in &plan.validation {
+                lines.push(format!("- {v}"));
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Step evidence".into());
+    for p in &mode.prompts {
+        let title = if p.title.is_empty() {
+            p.step_id.as_str()
+        } else {
+            p.title.as_str()
+        };
+        let artifact_rel = format!(
+            ".catalyst-code/goal-ux/artifacts/{}/{}.md",
+            mode.id, p.step_id
+        );
+        let artifact_abs = workspace.join(&artifact_rel);
+        let body = std::fs::read_to_string(&artifact_abs).unwrap_or_else(|_| {
+            p.summary
+                .clone()
+                .unwrap_or_else(|| "(no step output)".into())
+        });
+        lines.push(format!(
+            "### [{status}] {title} ({agent})\npath: {artifact_rel}\n\n{body}\n",
+            status = p.status.as_str(),
+            title = title,
+            agent = p.agent,
+            artifact_rel = artifact_rel,
+            body = body,
+        ));
+    }
+    let path = dir.join("SUMMARY.md");
+    if std::fs::write(&path, lines.join("\n")).is_err() {
+        return None;
+    }
+    Some(mission_summary_rel_path(&mode.id))
+}
+
 /// Deterministic multi-line report from step results (no model call).
 pub fn build_deterministic_completion_summary(mode: &GoalMode) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -937,6 +1263,10 @@ pub fn clear_goal(mode: &mut GoalMode) {
 // ---------------------------------------------------------------------------
 
 pub fn planning_prompt(mode: &GoalMode) -> String {
+    // Control Center CEO mode: never prompt the user; use CEO planning template.
+    if mode.ceo_mode {
+        return crate::goal_ceo::ceo_planning_prompt(mode);
+    }
     let models = if mode.allowed_models.is_empty() {
         "(any available model)".to_string()
     } else {
@@ -984,9 +1314,73 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
     let revise = mode
         .revise_feedback
         .as_ref()
-        .map(|f| format!("\n\n## Revision feedback from the user\n{f}\n"))
+        .map(|f| {
+            if mode.ceo_mode {
+                format!(
+                    "
+
+## Revision feedback (autonomous CEO replan / self-review)
+{f}
+"
+                )
+            } else {
+                format!(
+                    "
+
+## Revision feedback from the user
+{f}
+"
+                )
+            }
+        })
         .unwrap_or_default();
+    let gaps_block = if mode.ceo_mode && !mode.remaining_gaps.is_empty() {
+        let list = mode
+            .remaining_gaps
+            .iter()
+            .map(|g| format!("- {g}"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        format!(
+            "
+
+## Remaining gaps from last verify (iteration {}/{})
+{list}
+Focus the new plan on closing these gaps; do not re-do certified work.
+",
+            mode.iteration,
+            mode.max_iterations,
+            list = list
+        )
+    } else {
+        String::new()
+    };
     let parallelism_guidance = planning_parallelism_guidance(mode);
+
+    let required_action = if mode.ceo_mode {
+        concat!(
+            "## Required action
+",
+            "1. Optionally use read/search tools briefly if you need repo context to plan well.
+",
+            "2. Do NOT call `ask` and do NOT wait for the user — you are the CEO; decide autonomously and document assumptions in the plan summary.
+",
+            "3. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.",
+        )
+    } else {
+        concat!(
+            "## Required action
+",
+            "1. Optionally use read/search tools briefly if you need repo context to plan well.
+",
+            "2. Before goal_write_plan, if high-impact unknowns remain (scope boundaries, success criteria, hard constraints, irreversible/destructive actions), call `ask` ONCE with 1–3 focused questions. Skip low-stakes style/preference questions. If the goal is already clear, go straight to goal_write_plan.
+",
+            "3. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.",
+        )
+    };
 
     format!(
         r#"You are in GOAL MODE. Your only job this turn is to produce a structured deployment plan for subagents — do not implement the goal yourself.
@@ -1001,14 +1395,11 @@ pub fn planning_prompt(mode: &GoalMode) -> String {
 - Allowed providers: {providers}
 - {role_line}
 - {model_conc}
-{revise}
+{revise}{gaps_block}
 ## Scheduling profile
 {parallelism_guidance}
 
-## Required action
-1. Optionally use read/search tools briefly if you need repo context to plan well.
-2. Before goal_write_plan, if high-impact unknowns remain (scope boundaries, success criteria, hard constraints, irreversible/destructive actions), call `ask` ONCE with 1–3 focused questions. Skip low-stakes style/preference questions. If the goal is already clear, go straight to goal_write_plan.
-3. Call the `goal_write_plan` tool EXACTLY ONCE with a complete plan. Do not call it partially.
+{required_action}
 
 ## Plan quality rules
 - Prefer scout/context-builder before worker when the codebase area is unknown.
@@ -1030,8 +1421,22 @@ After goal_write_plan succeeds, briefly confirm the plan in one short paragraph.
         role_line = role_line,
         model_conc = model_conc,
         revise = revise,
+        gaps_block = gaps_block,
         parallelism_guidance = parallelism_guidance,
+        required_action = required_action,
     )
+}
+
+/// Prompt for the CEO pre-deploy self-review turn.
+/// Authored in `goal_ceo` (CERTIFY/REVISE + PASS/FAIL aliases + CEO persona).
+pub fn build_self_review_prompt(mode: &GoalMode) -> String {
+    crate::goal_ceo::self_review_prompt(mode)
+}
+
+/// Prompt for the CEO post-deploy verify turn (reads mission SUMMARY.md).
+/// Authored in `goal_ceo` (CERTIFIED/REMAINING_GAPS + PASS/FAIL aliases + CEO persona).
+pub fn build_verify_prompt(mode: &GoalMode) -> String {
+    crate::goal_ceo::verify_prompt(mode)
 }
 
 /// Prompt for the parent wrap-up turn after deploy waves finish.
@@ -1182,21 +1587,201 @@ pub fn finish_synthesis_with_wrapup(
     transition(mode, GoalPhase::Done, Some(&msg));
 }
 
+/// Apply a self-review verdict. Returns what the caller should do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// Plan accepted — caller should spawn deploy.
+    Deploy,
+    /// Plan rejected with budget remaining — caller should start a planning turn.
+    Replan,
+    /// Budget exhausted or cancelled — goal already Failed.
+    Failed,
+}
+
+/// Record self-review verdict while phase == Reviewing.
+pub fn finish_reviewing(
+    mode: &mut GoalMode,
+    cancelled: bool,
+    assistant_text: &str,
+) -> ReviewOutcome {
+    if mode.phase != GoalPhase::Reviewing {
+        return ReviewOutcome::Failed;
+    }
+    if cancelled {
+        fail_goal(mode, "plan self-review aborted");
+        return ReviewOutcome::Failed;
+    }
+    let (ok, summary, gaps) = parse_ceo_verdict(assistant_text);
+    let verdict = GoalVerdict {
+        ok,
+        summary: summary.clone(),
+        evidence_paths: Vec::new(),
+        at_ms: now_ms() as u64,
+    };
+    mode.review_verdict = Some(verdict.clone());
+    mode.self_review_feedback = if ok {
+        None
+    } else {
+        Some(if gaps.is_empty() {
+            summary.clone()
+        } else {
+            gaps.join("\n")
+        })
+    };
+    mode.touch();
+    emit_goal_review_verdict(mode, &verdict);
+    emit_goal_state(mode);
+    if ok {
+        transition(
+            mode,
+            GoalPhase::PlanReady,
+            Some("self-review passed — deploying"),
+        );
+        ReviewOutcome::Deploy
+    } else if mode.plan_revision < mode.max_plan_revisions {
+        mode.plan_revision = mode.plan_revision.saturating_add(1);
+        let feedback = mode
+            .self_review_feedback
+            .clone()
+            .unwrap_or_else(|| summary.clone());
+        mode.revise_feedback = Some(feedback);
+        mode.plan = None;
+        mode.prompts.clear();
+        mode.deploy_after_turn = false;
+        emit_goal_iteration(mode);
+        transition(
+            mode,
+            GoalPhase::Planning,
+            Some("self-review failed — revising plan"),
+        );
+        ReviewOutcome::Replan
+    } else {
+        fail_goal(
+            mode,
+            format!(
+                "plan self-review budget exhausted ({}/{} revisions)",
+                mode.plan_revision, mode.max_plan_revisions
+            ),
+        );
+        ReviewOutcome::Failed
+    }
+}
+
+/// Apply a verify verdict. Returns what the caller should do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// Goal certified — already transitioned to Done.
+    Certified,
+    /// Gaps remain with budget — caller should start a planning (replan) turn.
+    Replan,
+    /// Budget exhausted or cancelled — goal already Failed.
+    Failed,
+}
+
+/// Record verify verdict while phase == Verifying.
+pub fn finish_verifying(
+    mode: &mut GoalMode,
+    cancelled: bool,
+    assistant_text: &str,
+) -> VerifyOutcome {
+    if mode.phase != GoalPhase::Verifying {
+        return VerifyOutcome::Failed;
+    }
+    if cancelled {
+        fail_goal(mode, "goal verify aborted");
+        return VerifyOutcome::Failed;
+    }
+    let (ok, summary, mut gaps) = parse_ceo_verdict(assistant_text);
+    // Never leave Verifying without either certifying or a non-empty gap list
+    // (empty FAIL would replan with blank revise_feedback and look "stuck").
+    if !ok && gaps.is_empty() {
+        let fallback = summary.trim();
+        gaps.push(if fallback.is_empty() {
+            "verify failed without enumerated gaps".to_string()
+        } else {
+            truncate_str(fallback, 500)
+        });
+    }
+    let evidence = vec![mission_summary_rel_path(&mode.id)];
+    let verdict = GoalVerdict {
+        ok,
+        summary: summary.clone(),
+        evidence_paths: evidence,
+        at_ms: now_ms() as u64,
+    };
+    mode.verify_verdict = Some(verdict.clone());
+    mode.remaining_gaps = gaps.clone();
+    mode.touch();
+    emit_goal_verify_verdict(mode, &verdict, &gaps);
+    emit_goal_state(mode);
+    if ok {
+        mode.certified = true;
+        let completion = if summary.trim().is_empty() {
+            build_deterministic_completion_summary(mode)
+        } else {
+            summary.clone()
+        };
+        emit_goal_certified(mode, &completion);
+        emit_goal_completion_summary(&completion);
+        transition(mode, GoalPhase::Done, Some("goal certified"));
+        VerifyOutcome::Certified
+    } else if mode.iteration < mode.max_iterations {
+        mode.iteration = mode.iteration.saturating_add(1);
+        let feedback = format!(
+            "Verify failed (iteration {}/{}). Remaining gaps:\n{}",
+            mode.iteration,
+            mode.max_iterations,
+            gaps.iter()
+                .map(|g| format!("- {g}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        mode.revise_feedback = Some(feedback);
+        mode.plan = None;
+        mode.prompts.clear();
+        mode.deploy_after_turn = false;
+        mode.certified = false;
+        emit_goal_iteration(mode);
+        transition(
+            mode,
+            GoalPhase::Replanning,
+            Some("verify failed — replanning gaps"),
+        );
+        transition(
+            mode,
+            GoalPhase::Planning,
+            Some("replan: writing delta plan"),
+        );
+        VerifyOutcome::Replan
+    } else {
+        fail_goal(
+            mode,
+            format!(
+                "verify budget exhausted after {} iteration(s); last gaps: {}",
+                mode.max_iterations,
+                gaps.join("; ")
+            ),
+        );
+        VerifyOutcome::Failed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deploy (via subagent::execute parallel waves)
 // ---------------------------------------------------------------------------
 
 /// Run deploy for the current plan. Caller must hold no goal lock across await.
 ///
-/// On success, leaves the goal in [`GoalPhase::Synthesizing`] so the caller can
-/// start a parent wrap-up turn. Returns `true` when that wrap-up should run.
+/// On success, leaves the goal in [`GoalPhase::Synthesizing`] (classic) or
+/// [`GoalPhase::Verifying`] (CEO mode) so the caller can start the follow-up
+/// parent turn. Returns `true` when that follow-up should run.
 pub async fn deploy_goal(
     st: Arc<State>,
     client: reqwest::Client,
     cancel: CancellationToken,
 ) -> bool {
     // Snapshot config for deploy.
-    let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id, workspace) = {
+    let (parent_model, global_conc, model_conc_map, prompts_snapshot, goal_id, workspace, ceo_mode) = {
         let mode = st.goal.lock().await;
         if mode.plan.is_none() || mode.prompts.is_empty() {
             return false;
@@ -1209,6 +1794,7 @@ pub async fn deploy_goal(
             mode.prompts.clone(),
             mode.id.clone(),
             workspace,
+            mode.ceo_mode,
         )
     };
 
@@ -1586,7 +2172,12 @@ pub async fn deploy_goal(
         // Phase A can only produce a false failure for work intentionally
         // scheduled in later phases, which then poisons the dependency graph.
         // Validate once, after the final wave has run.
-        if !cancel.is_cancelled() && should_validate_goal_after_wave(wave_idx, wave_count) {
+        // CEO mode: skip terminal-wave reviewer — Verifying phase is the
+        // authoritative certify step (avoids double-fail / double-emit).
+        if !ceo_mode
+            && !cancel.is_cancelled()
+            && should_validate_goal_after_wave(wave_idx, wave_count)
+        {
             let validation = {
                 let mode = st.goal.lock().await;
                 mode.plan
@@ -1700,8 +2291,8 @@ pub async fn deploy_goal(
             return false;
         }
         // All waves processed. Even if some steps failed (and their
-        // dependents were skipped), the deploy ran to completion — enter
-        // synthesizing so the parent can report results before Done.
+        // dependents were skipped), the deploy ran to completion.
+        // CEO mode → Verifying (artifact-rich); classic → Synthesizing wrap-up.
         let failed_n = mode
             .prompts
             .iter()
@@ -1712,11 +2303,11 @@ pub async fn deploy_goal(
             .iter()
             .filter(|p| p.status == DeployStatus::Skipped)
             .count();
-        let msg = if failed_n == 0 {
-            "workers finished — summarizing".to_string()
+        let suffix = if failed_n == 0 {
+            String::new()
         } else {
             format!(
-                "workers finished with {failed_n} failed step(s){} — summarizing",
+                " with {failed_n} failed step(s){}",
                 if skipped_n == 0 {
                     String::new()
                 } else {
@@ -1724,16 +2315,29 @@ pub async fn deploy_goal(
                 }
             )
         };
-        transition(&mut mode, GoalPhase::Synthesizing, Some(&msg));
+        if mode.ceo_mode {
+            let summary_path = write_mission_summary(&workspace, &mode);
+            let msg = format!(
+                "workers finished{suffix} — verifying against goal{}",
+                summary_path
+                    .as_ref()
+                    .map(|p| format!(" (evidence: {p})"))
+                    .unwrap_or_default()
+            );
+            transition(&mut mode, GoalPhase::Verifying, Some(&msg));
+        } else {
+            let msg = format!("workers finished{suffix} — summarizing");
+            transition(&mut mode, GoalPhase::Synthesizing, Some(&msg));
+        }
         sync_work_state_from_prompts(&st, &mode).await;
     }
 
     emit(&Event::new("info").with(
         "message",
         json!(if any_failed {
-            "Goal deploy complete — some steps failed; writing completion summary…"
+            "Goal deploy complete — some steps failed; continuing to follow-up turn…"
         } else {
-            "Goal deploy complete — writing completion summary…"
+            "Goal deploy complete — starting follow-up turn…"
         }),
     ));
     true
@@ -1917,6 +2521,12 @@ mod tests {
         m.phase = GoalPhase::Running;
         assert!(m.is_active());
         m.phase = GoalPhase::Synthesizing;
+        assert!(m.is_active());
+        m.phase = GoalPhase::Reviewing;
+        assert!(m.is_active());
+        m.phase = GoalPhase::Verifying;
+        assert!(m.is_active());
+        m.phase = GoalPhase::Replanning;
         assert!(m.is_active());
         m.phase = GoalPhase::Done;
         assert!(!m.is_active());
@@ -2153,6 +2763,9 @@ mod tests {
             allowed_models: vec![],
             allowed_providers: vec![],
             auto_deploy: None,
+            ceo_mode: None,
+            max_iterations: None,
+            max_plan_revisions: None,
             role_models: RoleModels::default(),
             model_concurrency: HashMap::new(),
             model: "m".into(),
@@ -2384,6 +2997,169 @@ mod tests {
         assert!(prompt.contains("promoted files in worktrees"));
         // goal_write_plan remains the terminal planning action.
         assert!(prompt.contains("goal_write_plan` tool EXACTLY ONCE"));
+    }
+
+    #[test]
+    fn ceo_planning_prompt_forbids_ask() {
+        let mut mode = base_mode();
+        mode.ceo_mode = true;
+        mode.max_iterations = 3;
+        mode.max_plan_revisions = 2;
+        let prompt = planning_prompt(&mode);
+        assert!(prompt.contains("Never call `ask`") || prompt.contains("Do NOT call `ask`"));
+        assert!(!prompt.contains("call `ask` ONCE"));
+    }
+
+    #[test]
+    fn parse_ceo_verdict_pass_fail_and_gaps() {
+        let (ok, _, gaps) = parse_ceo_verdict(
+            "looks good
+VERDICT: PASS
+",
+        );
+        assert!(ok);
+        assert!(gaps.is_empty());
+        let (ok, _, gaps) = parse_ceo_verdict(
+            "missing tests
+VERDICT: FAIL
+GAPS:
+- add unit tests
+- wire UI
+",
+        );
+        assert!(!ok);
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps[0].contains("unit tests"));
+    }
+
+    #[test]
+    fn finish_reviewing_deploys_or_replans() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_plan_revisions = 2;
+        m.phase = GoalPhase::Reviewing;
+        m.plan = Some(GoalPlan {
+            summary: "s".into(),
+            steps: vec![],
+            risks: vec![],
+            validation: vec![],
+        });
+        m.prompts = vec![DeployPrompt {
+            step_id: "1".into(),
+            agent: "worker".into(),
+            task: "t".into(),
+            model: None,
+            status: DeployStatus::Pending,
+            run_id: None,
+            summary: None,
+            title: "t".into(),
+        }];
+        assert_eq!(
+            finish_reviewing(&mut m, false, "VERDICT: PASS"),
+            ReviewOutcome::Deploy
+        );
+        assert_eq!(m.phase, GoalPhase::PlanReady);
+
+        m.phase = GoalPhase::Reviewing;
+        m.plan_revision = 0;
+        assert_eq!(
+            finish_reviewing(
+                &mut m,
+                false,
+                "VERDICT: FAIL
+GAPS:
+- fix deps"
+            ),
+            ReviewOutcome::Replan
+        );
+        assert_eq!(m.phase, GoalPhase::Planning);
+        assert_eq!(m.plan_revision, 1);
+        assert!(m.plan.is_none());
+    }
+
+    #[test]
+    fn finish_verifying_certifies_or_replans() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_iterations = 2;
+        m.phase = GoalPhase::Verifying;
+        assert_eq!(
+            finish_verifying(
+                &mut m,
+                false,
+                "evidence ok
+VERDICT: PASS"
+            ),
+            VerifyOutcome::Certified
+        );
+        assert!(m.certified);
+        assert_eq!(m.phase, GoalPhase::Done);
+
+        m.phase = GoalPhase::Verifying;
+        m.certified = false;
+        m.iteration = 0;
+        assert_eq!(
+            finish_verifying(
+                &mut m,
+                false,
+                "VERDICT: FAIL
+GAPS:
+- still broken"
+            ),
+            VerifyOutcome::Replan
+        );
+        assert_eq!(m.phase, GoalPhase::Planning);
+        assert_eq!(m.iteration, 1);
+        assert!(!m.remaining_gaps.is_empty());
+    }
+
+    #[test]
+    fn finish_verifying_fail_without_gaps_synthesizes_remaining_gaps() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_iterations = 2;
+        m.phase = GoalPhase::Verifying;
+        assert_eq!(
+            finish_verifying(&mut m, false, "VERDICT: FAIL\nsomething went wrong"),
+            VerifyOutcome::Replan
+        );
+        assert!(!m.remaining_gaps.is_empty());
+        assert!(m
+            .revise_feedback
+            .as_ref()
+            .unwrap()
+            .contains("Remaining gaps"));
+    }
+
+    #[test]
+    fn finish_verifying_iteration_cap_fails() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_iterations = 1;
+        m.iteration = 1; // already used the budget
+        m.phase = GoalPhase::Verifying;
+        assert_eq!(
+            finish_verifying(
+                &mut m,
+                false,
+                "VERDICT: REMAINING_GAPS\n## Remaining gaps\n- still open"
+            ),
+            VerifyOutcome::Failed
+        );
+        assert_eq!(m.phase, GoalPhase::Failed);
+        assert!(!m.certified);
+    }
+
+    #[test]
+    fn new_goal_ceo_defaults() {
+        let mut args = start_args("ship the control center feature");
+        args.ceo_mode = Some(true);
+        let mode = new_goal(args).unwrap();
+        assert!(mode.ceo_mode);
+        assert_eq!(mode.max_iterations, DEFAULT_CEO_MAX_ITERATIONS);
+        assert_eq!(mode.max_plan_revisions, DEFAULT_CEO_MAX_PLAN_REVISIONS);
+        let v = mode.to_event_value();
+        assert_eq!(v.get("mode").and_then(|x| x.as_str()), Some("ceo"));
     }
 
     #[test]

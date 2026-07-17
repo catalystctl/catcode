@@ -219,12 +219,15 @@ fn gitignore_matches(patterns: &[String], rel: &str) -> bool {
         } else if pat.contains('*') {
             // Very small glob: only trailing *
             if let Some(prefix) = pat.strip_suffix('*') {
-                if rel.starts_with(prefix) || rel.split('/').last().unwrap_or("").starts_with(prefix)
+                if rel.starts_with(prefix)
+                    || rel.split('/').last().unwrap_or("").starts_with(prefix)
                 {
                     return true;
                 }
             }
-        } else if rel == pat || rel.ends_with(&format!("/{pat}")) || rel.starts_with(&format!("{pat}/"))
+        } else if rel == pat
+            || rel.ends_with(&format!("/{pat}"))
+            || rel.starts_with(&format!("{pat}/"))
         {
             return true;
         }
@@ -287,28 +290,44 @@ fn parse_rust_decl(line: &str) -> Option<(&'static str, String, Option<String>, 
     } else {
         None
     };
-    let l = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+    let l = line
+        .trim_start_matches("pub(crate) ")
+        .trim_start_matches("pub ");
     let l = l.trim_start_matches("async ");
     if let Some(rest) = l.strip_prefix("fn ") {
         let name = rest.split('(').next()?.split('<').next()?.trim();
         if is_ident(name) {
-            return Some(("function", name.into(), vis, Some(truncate(line, 120).into())));
+            return Some((
+                "function",
+                name.into(),
+                vis,
+                Some(truncate(line, 120).into()),
+            ));
         }
     }
     if let Some(rest) = l.strip_prefix("struct ") {
-        let name = rest.split(|c: char| c == ' ' || c == '<' || c == '{').next()?.trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '<' || c == '{')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("struct", name.into(), vis, None));
         }
     }
     if let Some(rest) = l.strip_prefix("enum ") {
-        let name = rest.split(|c: char| c == ' ' || c == '<' || c == '{').next()?.trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '<' || c == '{')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("enum", name.into(), vis, None));
         }
     }
     if let Some(rest) = l.strip_prefix("trait ") {
-        let name = rest.split(|c: char| c == ' ' || c == '<' || c == '{').next()?.trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '<' || c == '{')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("trait", name.into(), vis, None));
         }
@@ -320,7 +339,12 @@ fn parse_rust_decl(line: &str) -> Option<(&'static str, String, Option<String>, 
         }
     }
     if let Some(rest) = l.strip_prefix("mod ") {
-        let name = rest.trim().trim_end_matches(';').trim().trim_end_matches('{').trim();
+        let name = rest
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_end_matches('{')
+            .trim();
         if is_ident(name) {
             return Some(("module", name.into(), vis, None));
         }
@@ -343,7 +367,12 @@ fn parse_go_decl(line: &str) -> Option<(&'static str, String, Option<String>, Op
             } else {
                 None
             };
-            return Some(("function", name.into(), vis, Some(truncate(line, 120).into())));
+            return Some((
+                "function",
+                name.into(),
+                vis,
+                Some(truncate(line, 120).into()),
+            ));
         }
     }
     if let Some(rest) = line.strip_prefix("type ") {
@@ -356,21 +385,34 @@ fn parse_go_decl(line: &str) -> Option<(&'static str, String, Option<String>, Op
 }
 
 fn parse_ts_decl(line: &str) -> Option<(&'static str, String, Option<String>, Option<String>)> {
-    let l = line.trim_start_matches("export ").trim_start_matches("declare ");
+    let l = line
+        .trim_start_matches("export ")
+        .trim_start_matches("declare ");
     if let Some(rest) = l.strip_prefix("function ") {
         let name = rest.split('(').next()?.split('<').next()?.trim();
         if is_ident(name) {
-            return Some(("function", name.into(), None, Some(truncate(line, 120).into())));
+            return Some((
+                "function",
+                name.into(),
+                None,
+                Some(truncate(line, 120).into()),
+            ));
         }
     }
     if let Some(rest) = l.strip_prefix("class ") {
-        let name = rest.split(|c: char| c == ' ' || c == '{' || c == '<').next()?.trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '{' || c == '<')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("class", name.into(), None, None));
         }
     }
     if let Some(rest) = l.strip_prefix("interface ") {
-        let name = rest.split(|c: char| c == ' ' || c == '{' || c == '<').next()?.trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '{' || c == '<')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("interface", name.into(), None, None));
         }
@@ -388,11 +430,19 @@ fn parse_python_decl(line: &str) -> Option<(&'static str, String, Option<String>
     if let Some(rest) = line.strip_prefix("def ") {
         let name = rest.split('(').next()?.trim();
         if is_ident(name) {
-            return Some(("function", name.into(), None, Some(truncate(line, 120).into())));
+            return Some((
+                "function",
+                name.into(),
+                None,
+                Some(truncate(line, 120).into()),
+            ));
         }
     }
     if let Some(rest) = line.strip_prefix("class ") {
-        let name = rest.split(|c: char| c == '(' || c == ':' || c == ' ').next()?.trim();
+        let name = rest
+            .split(|c: char| c == '(' || c == ':' || c == ' ')
+            .next()?
+            .trim();
         if is_ident(name) {
             return Some(("class", name.into(), None, None));
         }
@@ -400,7 +450,9 @@ fn parse_python_decl(line: &str) -> Option<(&'static str, String, Option<String>
     None
 }
 
-fn parse_generic_decl(line: &str) -> Option<(&'static str, String, Option<String>, Option<String>)> {
+fn parse_generic_decl(
+    line: &str,
+) -> Option<(&'static str, String, Option<String>, Option<String>)> {
     // Heading-like or identifier = patterns.
     if let Some(rest) = line.strip_prefix("# ") {
         let name = rest.trim();
@@ -433,13 +485,21 @@ fn parse_import(language: &str, line: &str) -> Option<String> {
         }
         "typescript" | "javascript" => {
             if let Some(idx) = line.find(" from ") {
-                let modname = line[idx + 6..].trim().trim_matches(';').trim_matches('"').trim_matches('\'');
+                let modname = line[idx + 6..]
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('"')
+                    .trim_matches('\'');
                 if !modname.is_empty() {
                     return Some(modname.into());
                 }
             }
             if let Some(rest) = line.strip_prefix("import ") {
-                let modname = rest.trim().trim_matches(';').trim_matches('"').trim_matches('\'');
+                let modname = rest
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('"')
+                    .trim_matches('\'');
                 if !modname.is_empty() && !modname.starts_with('{') {
                     return Some(modname.into());
                 }
@@ -475,7 +535,10 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
-fn index_one_file(workspace: &Path, abs: &Path) -> Option<(FileRecord, Vec<SymbolRecord>, Vec<RelationRecord>)> {
+fn index_one_file(
+    workspace: &Path,
+    abs: &Path,
+) -> Option<(FileRecord, Vec<SymbolRecord>, Vec<RelationRecord>)> {
     let rel = abs
         .strip_prefix(workspace)
         .unwrap_or(abs)
@@ -545,11 +608,14 @@ fn index_one_file(workspace: &Path, abs: &Path) -> Option<(FileRecord, Vec<Symbo
     ))
 }
 
-
 fn extract_config_tests_routes(
     workspace: &Path,
     files: &[FileRecord],
-) -> (Vec<ConfigKeyRecord>, Vec<TestRefRecord>, Vec<ConfigKeyRecord>) {
+) -> (
+    Vec<ConfigKeyRecord>,
+    Vec<TestRefRecord>,
+    Vec<ConfigKeyRecord>,
+) {
     let mut configs = Vec::new();
     let mut tests = Vec::new();
     let mut routes = Vec::new();
@@ -590,11 +656,7 @@ fn extract_config_tests_routes(
             if matches!(f.language.as_str(), "toml" | "json" | "yaml") {
                 if let Some((k, _)) = trimmed.split_once('=') {
                     let k = k.trim().trim_matches('\"');
-                    if !k.is_empty()
-                        && k.len() < 80
-                        && !k.starts_with('#')
-                        && !k.starts_with('[')
-                    {
+                    if !k.is_empty() && k.len() < 80 && !k.starts_with('#') && !k.starts_with('[') {
                         configs.push(ConfigKeyRecord {
                             path: f.path.clone(),
                             key: k.to_string(),
@@ -672,7 +734,11 @@ fn save_manifest(paths: &ProjectLearningPaths, m: &IndexManifest) {
 
 /// Full or incremental index refresh. Returns `(files_indexed, symbols_indexed)`.
 /// Fail-open: returns `(0,0)` on hard errors.
-pub fn refresh_index(workspace: &Path, identity: &ProjectIdentity, force_full: bool) -> (usize, usize) {
+pub fn refresh_index(
+    workspace: &Path,
+    identity: &ProjectIdentity,
+    force_full: bool,
+) -> (usize, usize) {
     let paths = learning_store::ensure_project_learning(
         &identity.id,
         identity.remote.as_deref(),
@@ -851,9 +917,13 @@ mod tests {
     fn indexes_rust_symbols_and_skips_binary() {
         let _serial = serial();
         let home = tmp();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("registry.json"));
         let ws = tmp();
         std::fs::create_dir_all(ws.join("core/src")).unwrap();
@@ -872,7 +942,10 @@ mod tests {
         assert!(syms >= 2, "expected struct+fn, got {syms}");
         let listed = list_files(&identity.id);
         assert!(listed.iter().any(|f| f.path.ends_with("lib.rs")));
-        assert!(!listed.iter().any(|f| f.path.contains("target/")), "target skipped");
+        assert!(
+            !listed.iter().any(|f| f.path.contains("target/")),
+            "target skipped"
+        );
         let foos = find_symbols(&identity.id, "Foo");
         assert_eq!(foos.len(), 1);
         assert_eq!(foos[0].kind, "struct");
@@ -884,9 +957,13 @@ mod tests {
     fn incremental_skips_unchanged_and_drops_deleted() {
         let _serial = serial();
         let home = tmp();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("registry.json"));
         let ws = tmp();
         std::fs::write(ws.join("a.rs"), "pub fn one() {}\n").unwrap();
@@ -899,7 +976,11 @@ mod tests {
         std::fs::write(ws.join("a.rs"), "pub fn one() {}\npub fn three() {}\n").unwrap();
         let (f2, s2) = refresh_index(&ws, &identity, false);
         let listed = list_files(&identity.id);
-        assert_eq!(listed.len(), 1, "deleted files must leave the index: {listed:?}");
+        assert_eq!(
+            listed.len(),
+            1,
+            "deleted files must leave the index: {listed:?}"
+        );
         assert_eq!(f2, listed.len());
         let names: Vec<_> = find_symbols(&identity.id, "two");
         assert!(names.is_empty(), "deleted file symbols must disappear");

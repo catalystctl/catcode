@@ -35,11 +35,7 @@ fn diagnostics_path(project_id: &str) -> std::path::PathBuf {
 
 /// Normalize a raw error string into a compact signature (bounded).
 pub fn compact_signature(raw: &str) -> String {
-    let mut s: String = raw
-        .lines()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let mut s: String = raw.lines().take(3).collect::<Vec<_>>().join(" | ");
     // Strip absolute paths / hex addresses for stability.
     s = s
         .chars()
@@ -151,11 +147,7 @@ mod tests {
         let _ls = learning_test_serial()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!(
-            "fail-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
+        let root = std::env::temp_dir().join(format!("fail-{}-{}", std::process::id(), now_secs()));
         let _ = std::fs::remove_dir_all(&root);
         let _g = override_learning_root(root);
         record_diagnostic("project-x", "cargo-test", "error[E0308]: mismatched types");

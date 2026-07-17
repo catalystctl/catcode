@@ -11,9 +11,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::change_coupling;
-use crate::coverage_ledger;
 use crate::codebase_index;
 use crate::context_pack;
+use crate::coverage_ledger;
 use crate::episodes;
 use crate::learning_retrieval;
 use crate::memory;
@@ -71,7 +71,8 @@ fn fingerprint_for(prompt: &str) -> task_fingerprint::TaskFingerprint {
 }
 
 fn action_context(workspace: &Path, args: &Value) -> String {
-    let prompt = arg_str(args, "prompt").unwrap_or_else(|| arg_str(args, "query").unwrap_or_default());
+    let prompt =
+        arg_str(args, "prompt").unwrap_or_else(|| arg_str(args, "query").unwrap_or_default());
     context_pack::build_context_pack(workspace, &prompt)
 }
 
@@ -303,7 +304,12 @@ fn action_coverage(workspace: &Path) -> String {
     for a in areas.iter().take(20) {
         out.push_str(&format!(
             "- {} files={} syms={} mems={} eps={} conf={:.2}\n",
-            a.area, a.indexed_files, a.indexed_symbols, a.related_memories, a.related_episodes, a.confidence
+            a.area,
+            a.indexed_files,
+            a.indexed_symbols,
+            a.related_memories,
+            a.related_episodes,
+            a.confidence
         ));
     }
     if !poor.is_empty() {
@@ -427,7 +433,9 @@ mod tests {
     fn preferences_and_coverage_with_temp_root() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
 
         preferences::append_global_preference(&PreferenceRecord {
@@ -470,7 +478,9 @@ mod tests {
     fn context_action_returns_pack() {
         let _lock = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp_root();
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = override_learning_root(root);
         let ws = tmp_root();
         std::fs::create_dir_all(&ws).unwrap();

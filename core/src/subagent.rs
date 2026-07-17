@@ -1944,8 +1944,12 @@ async fn dispatch_subagent_tool(
         }
     }
 
-    // Pre-execution plugin hooks (pre_bash/pre_write/pre_read). A hook may amend
-    // args (`modify`) or deny; deny returns the reason to the subagent model.
+    // Pre-execution plugin hooks. Two phases compose:
+    //   1. the tool-SPECIFIC pre_* hook (pre_bash/pre_write/pre_read); and
+    //   2. the catch-all `pre_tool` hook, which fires for EVERY tool call so a
+    //      plugin can audit/deny/modify any subagent tool.
+    // Each hook may amend `exec_args` or deny; a deny returns the reason to the
+    // subagent model.
     let hook_name = match name {
         "bash" => "pre_bash",
         "write_file" | "edit" => "pre_write",
@@ -1955,34 +1959,17 @@ async fn dispatch_subagent_tool(
     let mut exec_args = args.clone();
     let mut hook_notes: Vec<String> = Vec::new();
     if !hook_name.is_empty() {
-        let session_id = cfg
-            .session_file
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let workspace = cfg.workspace.display().to_string();
-        for (plugin_name, config) in &st.plugin_manager.get_hook_configs(hook_name) {
-            let ctx = crate::plugins::build_context(
-                hook_name,
-                name,
-                &workspace,
-                Some(&exec_args),
-                &session_id,
-                config.pass_args,
-            );
-            let result = crate::plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
-            if !result.allow {
-                return Outcome::err(format!(
-                    "tool call '{}' denied by plugin '{}' hook '{}': {}",
-                    name, plugin_name, hook_name, result.reason
-                ));
-            }
-            if let Some(ref modify) = result.modify {
-                crate::plugins::apply_modify(&mut exec_args, modify);
-            }
-            if !result.reason.is_empty() {
-                hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
-            }
+        if let Some(deny) =
+            crate::run_pre_hooks(&st, &cfg, hook_name, name, &mut exec_args, &mut hook_notes).await
+        {
+            return Outcome::err(deny);
+        }
+    }
+    if name != "finish" {
+        if let Some(deny) =
+            crate::run_pre_hooks(&st, &cfg, "pre_tool", name, &mut exec_args, &mut hook_notes).await
+        {
+            return Outcome::err(deny);
         }
     }
 
@@ -2034,32 +2021,31 @@ async fn dispatch_subagent_tool(
                         _ => "",
                     };
                     if !ihook.is_empty() {
-                        let session_id = cfg
-                            .session_file
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let workspace = cfg.workspace.display().to_string();
-                        for (pn, config) in &st.plugin_manager.get_hook_configs(ihook) {
-                            let ctx = crate::plugins::build_context(
-                                ihook,
-                                &iname,
-                                &workspace,
-                                Some(&modified),
-                                &session_id,
-                                config.pass_args,
-                            );
-                            let r = crate::plugins::execute_hook(ihook, pn, config, &ctx).await;
-                            if !r.allow {
-                                dmsg = Some(format!(
-                                    "denied by plugin '{}' hook '{}': {}",
-                                    pn, ihook, r.reason
-                                ));
-                                break;
-                            }
-                            if let Some(m) = &r.modify {
-                                crate::plugins::apply_modify(&mut modified, m);
-                            }
+                        if let Some(deny) = crate::run_pre_hooks(
+                            &st,
+                            &cfg,
+                            ihook,
+                            &iname,
+                            &mut modified,
+                            &mut hook_notes,
+                        )
+                        .await
+                        {
+                            dmsg = Some(deny);
+                        }
+                    }
+                    if dmsg.is_none() && iname != "finish" {
+                        if let Some(deny) = crate::run_pre_hooks(
+                            &st,
+                            &cfg,
+                            "pre_tool",
+                            &iname,
+                            &mut modified,
+                            &mut hook_notes,
+                        )
+                        .await
+                        {
+                            dmsg = Some(deny);
                         }
                     }
                 }
@@ -2127,21 +2113,21 @@ async fn dispatch_subagent_tool(
             }
         }
         "contact_supervisor" => {
-            // During a goal deploy (phase Running) there is no active leader
-            // turn to answer a need_decision — the orchestrator's turn ended
-            // after writing the plan. Blocking for the 5-min intercom timeout
-            // wastes time and the "do NOT proceed" error can cascade into a
-            // step failure. Short-circuit instead: tell the subagent to make a
-            // reasonable decision and document it, so the deploy keeps moving.
+            // During goal mode phases that spawn employees without a live
+            // leader turn answering need_decision (Planning scout, Reviewing,
+            // Deploying/Running waves, Verifying, Replanning), blocking for
+            // the 5-min intercom timeout wastes time and "do NOT proceed" can
+            // cascade into step failures. Short-circuit: proceed with best
+            // judgment and document it so the autonomous loop keeps moving.
             let reason = exec_args
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("need_decision");
-            let goal_running = {
+            let auto_resolve = {
                 let g = st.goal.lock().await;
-                g.phase == crate::goal::GoalPhase::Running
+                g.phase.auto_resolves_supervisor()
             };
-            if goal_running && reason == "need_decision" {
+            if auto_resolve && reason == "need_decision" {
                 let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 emit(
                     &Event::new("intercom_message")
@@ -2152,9 +2138,9 @@ async fn dispatch_subagent_tool(
                         .with("auto_resolved", json!(true)),
                 );
                 Outcome::ok(
-                    "No active supervisor during goal deploy — the orchestrator turn has ended. \
-                     Proceed with the most reasonable decision for the task and document it in your \
-                     final summary. Do NOT block or re-ask; continue implementing."
+                    "No active supervisor during goal orchestration — the orchestrator turn is not \
+                     waiting on intercom. Proceed with the most reasonable decision for the task and \
+                     document it in your final summary. Do NOT block or re-ask; continue implementing."
                 )
             } else {
                 execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await
@@ -2193,27 +2179,27 @@ async fn dispatch_subagent_tool(
         _ => "",
     };
     if !post_hook.is_empty() {
-        let session_id = cfg
-            .session_file
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let workspace = cfg.workspace.display().to_string();
-        for (plugin_name, config) in &st.plugin_manager.get_hook_configs(post_hook) {
-            let ctx = crate::plugins::build_context(
-                post_hook,
-                name,
-                &workspace,
-                Some(&exec_args),
-                &session_id,
-                config.pass_args,
-            );
-            let result = crate::plugins::execute_hook(post_hook, plugin_name, config, &ctx).await;
-            if !result.reason.is_empty() {
-                hook_notes.push(format!("{}/{}: {}", plugin_name, post_hook, result.reason));
-            }
-        }
+        crate::run_post_hooks(
+            &st,
+            &cfg,
+            post_hook,
+            name,
+            &exec_args,
+            &mut outcome,
+            &mut hook_notes,
+        )
+        .await;
     }
+    crate::run_post_hooks(
+        &st,
+        &cfg,
+        "post_tool",
+        name,
+        &exec_args,
+        &mut outcome,
+        &mut hook_notes,
+    )
+    .await;
     if !hook_notes.is_empty() {
         outcome.output.push_str("\n\nPlugin hooks:\n- ");
         outcome.output.push_str(&hook_notes.join("\n- "));

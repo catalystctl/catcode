@@ -87,16 +87,44 @@ pub fn build_context_pack_for(workspace: &Path, prompt: &str, role: ContextRole)
             .unwrap_or_default()
     ));
 
-    let include_arch = matches!(role, ContextRole::Full | ContextRole::Planner | ContextRole::Reviewer);
-    let include_prefs = matches!(role, ContextRole::Full | ContextRole::Planner | ContextRole::Worker);
-    let include_rejected = matches!(role, ContextRole::Full | ContextRole::Planner | ContextRole::Reviewer);
-    let include_episodes = matches!(role, ContextRole::Full | ContextRole::Scout | ContextRole::Planner);
-    let include_files = matches!(role, ContextRole::Full | ContextRole::Scout | ContextRole::Worker);
-    let include_companions = matches!(role, ContextRole::Full | ContextRole::Planner | ContextRole::Worker);
-    let include_validation = matches!(role, ContextRole::Full | ContextRole::Reviewer | ContextRole::Worker);
+    let include_arch = matches!(
+        role,
+        ContextRole::Full | ContextRole::Planner | ContextRole::Reviewer
+    );
+    let include_prefs = matches!(
+        role,
+        ContextRole::Full | ContextRole::Planner | ContextRole::Worker
+    );
+    let include_rejected = matches!(
+        role,
+        ContextRole::Full | ContextRole::Planner | ContextRole::Reviewer
+    );
+    let include_episodes = matches!(
+        role,
+        ContextRole::Full | ContextRole::Scout | ContextRole::Planner
+    );
+    let include_files = matches!(
+        role,
+        ContextRole::Full | ContextRole::Scout | ContextRole::Worker
+    );
+    let include_companions = matches!(
+        role,
+        ContextRole::Full | ContextRole::Planner | ContextRole::Worker
+    );
+    let include_validation = matches!(
+        role,
+        ContextRole::Full | ContextRole::Reviewer | ContextRole::Worker
+    );
 
     if include_arch || include_prefs {
-        append_ranked_memories(&mut out, workspace, prompt, &fp, include_arch, include_prefs);
+        append_ranked_memories(
+            &mut out,
+            workspace,
+            prompt,
+            &fp,
+            include_arch,
+            include_prefs,
+        );
     }
     if include_prefs {
         let prefs = preferences::load_global_preferences();
@@ -363,7 +391,6 @@ fn append_validation_hints(out: &mut String, identity: &ProjectIdentity, fp: &Ta
     out.push('\n');
 }
 
-
 fn looks_like_error_prompt(prompt: &str) -> bool {
     let p = prompt.to_lowercase();
     p.contains("error[")
@@ -439,11 +466,17 @@ mod tests {
     #[test]
     fn pack_is_bounded_and_labeled() {
         let home = tmp_home("ctx-pack");
-        let _serial = crate::memory::memory_test_serial().lock().unwrap_or_else(|e| e.into_inner());
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _mr = override_memory_root(home.join("memory"));
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("registry.json"));
         let ws = home.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -458,11 +491,17 @@ mod tests {
     #[test]
     fn rejected_approaches_surface_as_warnings() {
         let home = tmp_home("ctx-rej");
-        let _serial = crate::memory::memory_test_serial().lock().unwrap_or_else(|e| e.into_inner());
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _mr = override_memory_root(home.join("memory"));
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("registry.json"));
         let ws = home.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -485,7 +524,10 @@ mod tests {
             },
         );
         let matched = rejected_approaches::match_rejected(&fp, Some(&id.id), 0.2, 3);
-        assert!(!matched.is_empty(), "stored rejection must match fingerprint");
+        assert!(
+            !matched.is_empty(),
+            "stored rejection must match fingerprint"
+        );
         let pack = build_context_pack(&ws, "Extend the memory tool with a new action");
         assert!(
             pack.contains("[REJECTED APPROACH]"),
@@ -496,11 +538,17 @@ mod tests {
     #[test]
     fn scout_role_omits_rejected_section() {
         let home = tmp_home("ctx-role");
-        let _serial = crate::memory::memory_test_serial().lock().unwrap_or_else(|e| e.into_inner());
-        let _lserial = crate::learning_store::learning_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = crate::memory::memory_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lserial = crate::learning_store::learning_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _mr = override_memory_root(home.join("memory"));
         let _lr = override_learning_root(home.join("learning"));
-        let _rserial = crate::project_identity::registry_test_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let _rserial = crate::project_identity::registry_test_serial()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _rr = override_registry_path(home.join("registry.json"));
         let ws = home.join("ws");
         std::fs::create_dir_all(&ws).unwrap();

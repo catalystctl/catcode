@@ -215,11 +215,7 @@ mod tests {
         let _rs = registry_test_serial()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!(
-            "cov-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
+        let home = std::env::temp_dir().join(format!("cov-{}-{}", std::process::id(), now_secs()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let _mr = override_memory_root(home.join("memory"));
