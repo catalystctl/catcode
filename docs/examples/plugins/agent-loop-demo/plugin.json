@@ -1,0 +1,18 @@
+{
+  "name": "agent-loop-demo",
+  "version": "0.1.0",
+  "description": "P0 demo: pre_input + pre_agent_start + static system_prompt",
+  "system_prompt": "Agent-loop demo plugin is loaded. Prefer concise answers.",
+  "hooks": {
+    "pre_input": {
+      "script": "hooks/pre_input.py",
+      "timeout_ms": 3000,
+      "pass_args": true
+    },
+    "pre_agent_start": {
+      "script": "hooks/pre_agent_start.py",
+      "timeout_ms": 3000,
+      "pass_args": false
+    }
+  }
+}
