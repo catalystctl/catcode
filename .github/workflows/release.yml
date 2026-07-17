@@ -138,8 +138,19 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      # Next.js file tracing / webpack can scan PATH directories; the WindowsApps
+      # folder on GitHub runners contains restricted reparse points that cause
+      # EACCES. Strip it from PATH before building.
+      - name: Sanitize PATH for Windows build
+        shell: pwsh
+        run: |
+          $clean = ($env:Path -split ';' | Where-Object { $_ -notlike '*WindowsApps*' }) -join ';'
+          echo "PATH=$clean" >> "$env:GITHUB_ENV"
+
       - name: Build web bundle on Windows
         shell: bash
+        env:
+          PATH: ${{ env.PATH }}
         run: bash release-web.sh "${{ steps.ver.outputs.version }}"
 
       - name: Rename to Windows-specific artifact
