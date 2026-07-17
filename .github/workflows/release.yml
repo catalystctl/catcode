@@ -85,6 +85,7 @@ jobs:
 
       # --- publish ---------------------------------------------------------
       - name: Create GitHub Release with assets
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -101,3 +102,59 @@ jobs:
           else
             gh release create "$tag" --target master --title "$tag" --generate-notes dist/*
           fi
+
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+
+  release-web-windows:
+    name: Build Windows web bundle
+    runs-on: windows-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bash scripts (release-web.sh) must keep LF line endings on Windows.
+      - name: Force LF line endings for shell scripts
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git checkout -- .
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Using version: $v (commit)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build web bundle on Windows
+        shell: bash
+        run: bash release-web.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Rename to Windows-specific artifact
+        shell: bash
+        run: |
+          mv "dist/catcode-web-${{ steps.ver.outputs.version }}.tar.gz"              "dist/catcode-web-${{ steps.ver.outputs.version }}-windows.tar.gz"
+
+      - name: Upload Windows web bundle to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="${{ steps.ver.outputs.version }}"
+          fi
+          gh release upload "$tag" "dist/catcode-web-${{ steps.ver.outputs.version }}-windows.tar.gz" --clobber

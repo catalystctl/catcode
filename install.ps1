@@ -331,7 +331,21 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
 }
 
 function Install-WebBundle {
-    $tgz = Get-Asset "catcode-web-$($script:Ver).tar.gz"
+    # Newer releases ship a Windows-built web bundle that already contains the
+    # correct native .node binaries. Prefer it so users don't need a C++ compiler.
+    $winBundle = "catcode-web-$($script:Ver)-windows.tar.gz"
+    $genericBundle = "catcode-web-$($script:Ver).tar.gz"
+    $bundleName = $winBundle
+    try {
+        $tgz = Get-Asset $winBundle
+        W-Info "Using Windows web bundle ($winBundle)"
+    } catch {
+        W-Warn "Windows web bundle not available - falling back to cross-platform bundle."
+        W-Warn '  (A Windows-specific bundle will be built by CI in the next release.)'
+        $bundleName = $genericBundle
+        $tgz = Get-Asset $genericBundle
+    }
+
     if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
     Get-ChildItem -LiteralPath $WebDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.
@@ -343,23 +357,27 @@ function Install-WebBundle {
     Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
     Assert-WebBundle -Dir $WebDir
 
-    # The release bundle is built on Linux/macOS CI; native modules (better-sqlite3,
-    # node-pty) contain platform-specific .node binaries. Rebuild them for the target
-    # host so Windows installs don't load an ELF binary.
-    W-Info 'Installing native modules for this platform ...'
-    Push-Location $WebDir
-    try {
-        if ($script:RT -eq 'bun') {
-            $ec = Invoke-Native bun install
-            if ($ec -ne 0) { Die "bun install failed (exit $ec)" }
-        } else {
-            $npm = Get-Command npm -ErrorAction SilentlyContinue
-            if (-not $npm) { Die 'node found but npm is not on PATH - cannot rebuild native modules' }
-            $ec = Invoke-Native $npm.Source rebuild better-sqlite3 node-pty
-            if ($ec -ne 0) { Die "npm rebuild failed (exit $ec) - try running from an elevated prompt or install Visual Studio Build Tools" }
-        }
-    } finally { Pop-Location }
-    W-Ok 'Native modules installed for this platform'
+    # The generic (cross-platform) bundle is built on Linux/macOS CI; native modules
+    # (better-sqlite3, node-pty) contain platform-specific .node binaries. Rebuild
+    # them for the target host so Windows installs don't load an ELF binary.
+    if ($bundleName -eq $genericBundle) {
+        W-Info 'Installing native modules for this platform ...'
+        Push-Location $WebDir
+        try {
+            if ($script:RT -eq 'bun') {
+                $ec = Invoke-Native bun install
+                if ($ec -ne 0) { Die "bun install failed (exit $ec)" }
+            } else {
+                $npm = Get-Command npm -ErrorAction SilentlyContinue
+                if (-not $npm) { Die 'node found but npm is not on PATH - cannot rebuild native modules' }
+                $ec = Invoke-Native $npm.Source rebuild better-sqlite3 node-pty
+                if ($ec -ne 0) {
+                    Die "npm rebuild failed (exit $ec). A Windows-specific web bundle avoids this; until it is available, install Visual Studio Build Tools (Desktop development with C++) and re-run."
+                }
+            }
+        } finally { Pop-Location }
+        W-Ok 'Native modules installed for this platform'
+    }
 
     W-Ok "Web bundle extracted to $WebDir"
 }

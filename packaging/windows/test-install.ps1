@@ -127,12 +127,17 @@ if ($dlCode -eq 0) {
     Pass "bad download fails loudly (exit $dlCode) without silent close"
 }
 
-# ── 6. Install-WebBundle rebuilds native modules for target ─
+# ── 6. Install-WebBundle prefers Windows-specific web bundle ─
 $src = Get-Content -LiteralPath $Installer -Raw
-if ($src -notmatch 'Installing native modules for this platform') {
-    Fail 'Install-WebBundle is missing native-module rebuild step'
+if ($src -notmatch 'Windows web bundle') {
+    Fail 'Install-WebBundle does not prefer a Windows-specific web bundle'
 } else {
-    Pass 'Install-WebBundle will rebuild native modules for the target platform'
+    Pass 'Install-WebBundle prefers Windows-specific web bundle'
+}
+if ($src -notmatch 'Installing native modules for this platform') {
+    Fail 'Install-WebBundle is missing native-module fallback rebuild step'
+} else {
+    Pass 'Install-WebBundle will rebuild native modules as fallback'
 }
 
 # ── 7. Host survives scriptblock-wrapped Die ──────────────────
