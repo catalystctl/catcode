@@ -34,7 +34,7 @@ func TestHistoryRecallDoesNotStompMultiline(t *testing.T) {
 	s.history = []string{"old prompt"}
 	s.histIdx = 1
 	s.input.SetValue("line1\nline2")
-	s.input.SetCursor(len("line1\nli")) // mid second (last) line
+	setInputCursor(&s.input, len("line1\nli")) // mid second (last) line
 
 	if s.historyRecallAllowed(-1) {
 		t.Fatal("Up mid-draft must not recall history")
@@ -46,7 +46,7 @@ func TestHistoryRecallDoesNotStompMultiline(t *testing.T) {
 
 	// Mid first line of a multi-line draft: Up allowed, Down blocked.
 	s.input.SetValue("line1\nline2\nline3")
-	s.input.SetCursor(2)
+	setInputCursor(&s.input, 2)
 	if !s.historyRecallAllowed(-1) {
 		t.Fatal("Up on first line should allow history recall")
 	}
@@ -54,7 +54,7 @@ func TestHistoryRecallDoesNotStompMultiline(t *testing.T) {
 		t.Fatal("Down on first line of multi-line draft must not recall")
 	}
 
-	s.input.SetCursor(len([]rune(s.input.Value())))
+	setInputCursor(&s.input, len([]rune(s.input.Value())))
 	if !s.historyRecallAllowed(+1) {
 		t.Fatal("Down at end of last line should allow history recall")
 	}

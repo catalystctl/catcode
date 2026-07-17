@@ -495,6 +495,15 @@ func setTheme(name string) bool {
 	return false
 }
 
+// themeIsDark reports whether the active theme background is dark (for Bubbles
+// DefaultStyles(isDark) helpers).
+func themeIsDark() bool {
+	rgb := hexRGB(activeTheme.bg)
+	// Relative luminance approximation; thresholds match typical dark UIs.
+	lum := (0.2126*float64(rgb[0]) + 0.7152*float64(rgb[1]) + 0.0722*float64(rgb[2])) / 255
+	return lum < 0.5
+}
+
 // applyTheme mutates the package palette + style vars to match a theme.
 func applyTheme(t theme) {
 	c.bg = t.bg

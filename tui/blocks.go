@@ -310,7 +310,7 @@ func (s *session) logPersist(kind blockKind, text string) {
 func (s *session) logTool(name, args string, sub bool) *block {
 	b := s.push(blkTool)
 	b.name = name
-	b.args = args
+	b.args = capStored(args)
 	b.sub = sub
 	b.started = time.Now()
 	s.refresh()
@@ -343,20 +343,22 @@ func (s *session) allTodosComplete() bool {
 	return pend == 0 && run == 0 && done == len(s.todos)
 }
 
-// maxStoredOutput bounds the tool-result text retained in a block. A multi-MB
-// result (e.g. a huge file dump) is stored verbatim though only ~3 lines ever
-// render; this caps retention so one result can't pin megabytes of memory for
-// the session. The renderer already truncates the visible portion.
+// maxStoredOutput bounds text retained on a block (tool output, args, diff).
+// A multi-MB write/edit payload is stored capped though only a short preview
+// ever renders; this keeps session RSS from pinning megabytes per card.
 const maxStoredOutput = 256 * 1024 // 256 KiB
 
-// capOutput truncates a stored tool-result string to maxStoredOutput bytes,
+// capStored truncates retained block strings to maxStoredOutput bytes,
 // appending a marker when it cut content.
-func capOutput(s string) string {
+func capStored(s string) string {
 	if len(s) <= maxStoredOutput {
 		return s
 	}
 	return s[:maxStoredOutput] + "\n…[truncated]"
 }
+
+// capOutput is the historical name for capping tool-result text.
+func capOutput(s string) string { return capStored(s) }
 
 func (s *session) logToolResult(output string) {
 	b := s.push(blkToolResult)
@@ -366,7 +368,7 @@ func (s *session) logToolResult(output string) {
 
 func (s *session) logApproveDiff(tool, args, diff string) {
 	b := s.push(blkApprove)
-	b.name, b.args, b.diff = tool, args, diff
+	b.name, b.args, b.diff = tool, capStored(args), capStored(diff)
 	s.refresh()
 }
 
@@ -1012,7 +1014,7 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 						}
 						b := s.push(blkTool)
 						b.name = disp
-						b.args = args
+						b.args = capStored(args)
 						b.sub = sub
 						b.id = id
 						b.started = time.Time{} // historical: no timing

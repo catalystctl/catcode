@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 func blockTexts(s *session) []string {
@@ -290,5 +292,55 @@ func TestGoalInfoDeployPersists(t *testing.T) {
 	s.handleCoreEvent(&coreEvent{Type: "info", Raw: raw})
 	if !hasBlockContaining(s, "Goal deploy complete") {
 		t.Fatalf("deploy info should persist: %v", blockTexts(s))
+	}
+}
+
+func TestGoalProgressPanelCollapse(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.keybinds = defaultKeybinds()
+	s.goalState = &goalStateSnap{
+		ID: "g1", Phase: "running", AutoDeploy: true, Goal: "ship a big plan",
+		Prompts: []goalPromptSnap{
+			{StepID: "1", Title: "scout-layout", Agent: "scout", Status: "done", Summary: "mapped modules"},
+			{StepID: "2", Title: "impl-core", Agent: "worker", Status: "running"},
+			{StepID: "3", Title: "verify", Agent: "reviewer", Status: "pending"},
+		},
+	}
+
+	expanded := stripANSI(s.renderGoalProgressPanel(s.width))
+	if !strings.Contains(expanded, "scout-layout") || !strings.Contains(expanded, "impl-core") {
+		t.Fatalf("expanded panel should list steps:\n%s", expanded)
+	}
+	if !strings.Contains(expanded, "collapse") {
+		t.Fatalf("expanded panel should hint collapse:\n%s", expanded)
+	}
+	expH := s.goalProgressPanelHeight()
+
+	s.goalPanelCollapsed = true
+	collapsed := stripANSI(s.renderGoalProgressPanel(s.width))
+	if !strings.Contains(collapsed, "goal · running · 1/3") {
+		t.Fatalf("collapsed panel should keep header:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "scout-layout") || strings.Contains(collapsed, "impl-core") {
+		t.Fatalf("collapsed panel must hide step rows:\n%s", collapsed)
+	}
+	if !strings.Contains(collapsed, "expand") {
+		t.Fatalf("collapsed panel should hint expand:\n%s", collapsed)
+	}
+	colH := s.goalProgressPanelHeight()
+	if colH >= expH {
+		t.Fatalf("collapsed height %d should be smaller than expanded %d", colH, expH)
+	}
+
+	// Toggle keybind flips the flag when a goal panel is showing.
+	s.handleKey(tea.KeyPressMsg{Code: 'g', Mod: tea.ModCtrl | tea.ModShift})
+	if s.goalPanelCollapsed {
+		t.Fatal("Ctrl+Shift+G should expand a collapsed goal panel")
+	}
+	s.handleKey(tea.KeyPressMsg{Code: 'g', Mod: tea.ModCtrl | tea.ModShift})
+	if !s.goalPanelCollapsed {
+		t.Fatal("Ctrl+Shift+G should collapse an expanded goal panel")
 	}
 }

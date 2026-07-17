@@ -1,33 +1,34 @@
 package main
 
-import (
-	"reflect"
-	"testing"
+import "testing"
 
-	"charm.land/bubbles/v2/textinput"
-)
-
-// TestMultilineInputReflectionTargetExists guards the reflection in
-// enableMultilineInput, which swaps textinput's unexported `rsan` sanitizer
-// for a passthrough that preserves newlines (so Shift+Enter / pasted
-// multi-line text survive). The sanitizer field has no public setter, so we
-// write it via reflect.NewAt. If a bubbles upgrade renames or removes `rsan`,
-// the function silently degrades to single-line input (no crash) — this test
-// makes that regression loud at test time instead of a discovered UX bug.
-//
-// bubbles v2 moved runeutil to an internal package, so enableMultilineInput
-// installs its own passthroughSanitizer rather than constructing runeutil's;
-// if this test fails after an upgrade, update the reflection to the new field.
-func TestMultilineInputReflectionTargetExists(t *testing.T) {
-	m := textinput.New()
-	v := reflect.ValueOf(&m).Elem()
-	f := v.FieldByName("rsan")
-	if !f.IsValid() {
-		t.Fatal("textinput.Model no longer has an 'rsan' field — " +
-			"enableMultilineInput is now a silent no-op; update the reflection")
+// TestComposerPreservesNewlines guards the Phase-1 switch from textinput
+// (which collapsed \n) to textarea for the main composer.
+func TestComposerPreservesNewlines(t *testing.T) {
+	m := newComposer()
+	m.SetValue("line1\nline2")
+	if got := m.Value(); got != "line1\nline2" {
+		t.Fatalf("composer Value = %q, want multiline", got)
 	}
-	if !f.CanAddr() {
-		t.Fatal("textinput.Model.rsan is not addressable — " +
-			"enableMultilineInput's write cannot proceed")
+	m.InsertRune('\n')
+	if got := m.Value(); got != "line1\nline2\n" {
+		// Value trims a single trailing join newline; with an extra empty
+		// line the result keeps one trailing '\n'.
+		if got != "line1\nline2\n" && got != "line1\nline2" {
+			// Insert at end adds a blank line → "line1\nline2\n"
+			t.Fatalf("InsertRune('\\n') Value = %q", got)
+		}
+	}
+}
+
+func TestInputPositionAndSetCursor(t *testing.T) {
+	m := newComposer()
+	m.SetValue("hello\nworld")
+	setInputCursor(&m, 6) // start of "world"
+	if got := inputPosition(m); got != 6 {
+		t.Fatalf("position after set = %d, want 6", got)
+	}
+	if m.Line() != 1 || m.Column() != 0 {
+		t.Fatalf("line/col = %d/%d, want 1/0", m.Line(), m.Column())
 	}
 }

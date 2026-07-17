@@ -69,7 +69,7 @@ func (s *session) evalMention() tea.Cmd {
 	s.mentionActive = false
 	s.mentionItems = nil
 	runes := []rune(s.input.Value())
-	pos := s.input.Position()
+	pos := inputPosition(s.input)
 	if pos <= 0 || pos > len(runes) {
 		s.mentionCursor = 0
 		s.mentionScroll = 0
@@ -184,7 +184,7 @@ func (s *session) acceptMention() {
 	it := s.mentionItems[s.mentionCursor]
 	runes := []rune(s.input.Value())
 	at := s.mentionAt // rune index of "@"
-	pos := s.input.Position()
+	pos := inputPosition(s.input)
 	if at < 0 || at > len(runes) || pos < at || pos > len(runes) {
 		return
 	}
@@ -200,7 +200,7 @@ func (s *session) acceptMention() {
 	out = append(out, suffix...)
 	out = append(out, runes[pos:]...)
 	s.input.SetValue(string(out))
-	s.input.SetCursor(at + 1 + len(insertRunes) + len(suffix))
+	setInputCursor(&s.input, at+1+len(insertRunes)+len(suffix))
 	if it.isDir {
 		s.evalMention() // reopen listing for the newly-typed directory
 	} else {
@@ -521,6 +521,18 @@ func sortMentionItems(items []mentionItem) {
 // renderMentionFlyout draws the flyout box shown above the input. Returns ""
 // when the mention is inactive.
 func (s *session) renderMentionFlyout() string {
+	if s.viewChrome != nil && s.viewChrome.mentionOK {
+		return s.viewChrome.mentionFlyout
+	}
+	out := s.renderMentionFlyoutUncached()
+	if s.viewChrome != nil {
+		s.viewChrome.mentionFlyout = out
+		s.viewChrome.mentionOK = true
+	}
+	return out
+}
+
+func (s *session) renderMentionFlyoutUncached() string {
 	if !s.mentionActive {
 		return ""
 	}
@@ -549,7 +561,7 @@ func (s *session) renderMentionFlyout() string {
 	var lines []string
 	state, searchErr := mentionSearchReady, error(nil)
 	runes := []rune(s.input.Value())
-	pos := s.input.Position()
+	pos := inputPosition(s.input)
 	if s.mentionAt >= 0 && pos > s.mentionAt && pos <= len(runes) {
 		query := string(runes[s.mentionAt+1 : pos])
 		if query != "" && !strings.Contains(query, "/") {

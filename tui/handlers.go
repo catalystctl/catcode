@@ -59,6 +59,10 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		s.goalStepLogged = nil
 		s.goalLastLife = ""
 		s.goalCompleteLogged = false
+		// Idle/clear must release the footer — previously we returned without
+		// touching busy, so clear_goal could leave "working" stuck forever.
+		s.busy = false
+		s.subProgress = nil
 		return
 	}
 	snap := &goalStateSnap{
@@ -87,10 +91,12 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		}
 	}
 	s.goalState = snap
-	// Keep the footer busy while deploy / workers / wrap-up are still live
-	// (the planning turn's `done` would otherwise clear busy too early).
+	// Keep the footer busy while deploy / workers / wrap-up / CEO loops are
+	// still live (the planning turn's `done` would otherwise clear busy too early).
+	// Phase set mirrors web goalKeepsStreaming + applyGoalState streaming.
 	switch m.Phase {
-	case "deploying", "running", "synthesizing":
+	case "planning", "reviewing", "deploying", "running", "synthesizing",
+		"verifying", "replanning":
 		s.busy = true
 	case "plan_ready":
 		if m.AutoDeploy {
@@ -137,19 +143,48 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 	s.layout()
 }
 
-// goalKeepsBusy mirrors the web reducer's goalKeepsStreaming: goal deploy and
-// the post-deploy synthesizing turn outlive the planning model's `done`.
+// goalKeepsBusy mirrors the web reducer's goalKeepsStreaming: goal deploy,
+// CEO verify/replan loops, and the post-deploy synthesizing turn outlive the
+// planning model's `done`.
 func (s *session) goalKeepsBusy() bool {
 	if s.goalState == nil {
 		return false
 	}
 	switch s.goalState.Phase {
-	case "deploying", "running", "synthesizing":
+	case "planning", "reviewing", "deploying", "running", "synthesizing",
+		"verifying", "replanning":
 		return true
 	case "plan_ready":
 		return s.goalState.AutoDeploy
 	}
 	return false
+}
+
+// clearBlockingPrompts drops ask/sudo/approval/intercom flyouts that must not
+// outlive a turn boundary. Without this, Ctrl+C abort could clear busy while
+// leaving an orphan ask flyout (scout-ask-wedge).
+func (s *session) clearBlockingPrompts() {
+	s.pendingAsk = nil
+	s.pendingSudo = nil
+	s.pendingApproval = nil
+	s.pendingIntercom = nil
+	s.intercomQueue = nil
+}
+
+// disarmAbortTimeout invalidates any pending abortBusyTimeout tick so a late
+// timer cannot clear busy after the core already answered (or a new turn began).
+func (s *session) disarmAbortTimeout() {
+	s.abortGen++
+}
+
+// armAbortTimeout starts a watchdog after the user cancels. If core never emits
+// aborted/done, release busy so "working" cannot stick forever on a wedged core.
+func (s *session) armAbortTimeout() tea.Cmd {
+	s.abortGen++
+	gen := s.abortGen
+	return tea.Tick(abortBusyTimeout, func(time.Time) tea.Msg {
+		return abortTimeoutMsg{gen: gen}
+	})
 }
 
 func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
@@ -398,17 +433,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		if match != nil {
 			match.output = capOutput(out)
-			match.diff = ev.get("diff")
+			match.diff = capStored(ev.get("diff"))
 			match.ok = ev.get("ok") == "true"
 			match.hasOk = true
 			match.dur = time.Since(match.started)
 			s.cur = nil
 			wasScout := !match.sub && (match.name == "spawn" || match.name == "subagent")
+			// Single rebuild path: invalidate → height adjust if scout panel
+			// released → one refresh. Never refresh() then layout().
 			s.invalidateAll()
-			s.refresh()
 			if wasScout {
-				s.layout() // scout finished: release the active-tasks panel
+				s.relayoutHeights()
 			}
+			s.refresh()
 		} else {
 			s.logToolResult(out)
 		}
@@ -437,6 +474,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.refresh()
 
 	case "done":
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
 		// Do not wipe live subagent shelf while goal deploy / synthesizing is
 		// still running — a planning-turn `done` must not blank the UI mid-goal.
 		if !s.goalKeepsBusy() {
@@ -479,6 +518,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.sendCore(map[string]any{"type": "list_skills"})
 
 	case "aborted":
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
 		s.subProgress = nil
 		if s.queuedNext {
 			// A steer interrupted this turn; the steered turn runs next. Clear the
@@ -500,6 +541,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 
 	case "reset":
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
 		s.busy = false // a reset is a conversation boundary — no turn is in flight
 		s.blocks = nil
 		s.cur = nil
@@ -520,6 +563,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// Loading a session / undo is a conversation boundary — clear any in-flight
 		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with
 		// busy=true and a wiped transcript.
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
 		s.busy = false
 		s.cur = nil
 		s.queuedNext = false
@@ -649,13 +694,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 	case "approval_request":
 		owner := "approval:" + ev.get("request_id")
 		s.suspendComposer(owner)
+		args, diff := capStored(ev.get("args")), capStored(ev.get("diff"))
 		s.pendingApproval = &approvalPrompt{
 			requestID: ev.get("request_id"),
 			tool:      ev.get("tool"),
-			args:      ev.get("args"),
-			diff:      ev.get("diff"),
+			args:      args,
+			diff:      diff,
 		}
-		s.logApproveDiff(ev.get("tool"), ev.get("args"), ev.get("diff"))
+		s.logApproveDiff(ev.get("tool"), args, diff)
 		s.input.Focus()
 	case "ask_request":
 		// The model called the `ask` tool and is blocking on the user's
@@ -729,14 +775,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			if runID != "" {
 				s.removeSubProgress(runID)
 			}
-			s.layout()
+			// Entry removed → shelf height may shrink; do not re-wrap transcript.
+			s.relayoutHeights()
 			break
 		}
 		entry := s.findSubProgress(runID)
 		if entry == nil {
 			entry = &subProgressEntry{runID: runID, agent: ev.get("agent"), started: time.Now()}
 			s.subProgress = append(s.subProgress, entry)
-			s.layout()
+			// New shelf row → height only; View rebuilds chrome without SetContent.
+			s.relayoutHeights()
 		}
 		if tc := ev.get("tool_count"); tc != "" {
 			if n, err := strconv.Atoi(tc); err == nil {
@@ -764,7 +812,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		case "streaming":
 			entry.toolRunning = false
 		}
-		s.refresh()
+		// curTool/counts only change the activity shelf — Bubble Tea still
+		// paints View after this Update; skip transcript renderBlocks/SetContent.
 
 	case "info":
 		// Informational notices from the core (first-run staging, subagent
@@ -1010,7 +1059,8 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// "done" is owned by announceGoalComplete (also called from applyGoalState)
 		// so we do not persist the verbose transition line or double-toast.
 		switch to {
-		case "deploying", "running", "synthesizing", "failed":
+		case "deploying", "running", "synthesizing", "failed",
+			"planning", "reviewing", "verifying", "replanning":
 			if to == "synthesizing" && msg == "" {
 				line = "Workers finished — writing completion summary…"
 				if extras != "" {
@@ -1020,13 +1070,30 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.persistGoalLifecycle(line)
 			if to == "failed" {
 				s.busy = false
+				// Sync local phase so goalKeepsBusy cannot retain busy after a
+				// goal_phase terminal that races ahead of goal_state.
+				if s.goalState != nil {
+					s.goalState.Phase = "failed"
+				}
 				s.logWarn(line)
 			}
 		case "done":
 			s.busy = false
+			if s.goalState != nil {
+				s.goalState.Phase = "done"
+			}
 			s.announceGoalComplete()
 		default:
 			s.logInfo(line)
+		}
+		// Keep local phase snap current for non-terminal CEO phases so
+		// goalKeepsBusy / progress panel stay correct if goal_state lags.
+		if s.goalState != nil {
+			switch to {
+			case "planning", "reviewing", "deploying", "running", "synthesizing",
+				"verifying", "replanning", "plan_ready":
+				s.goalState.Phase = to
+			}
 		}
 		if to == "plan_ready" && s.goalState != nil && !s.goalState.AutoDeploy {
 			s.openGoalPlanReview()
@@ -1117,6 +1184,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logRaw(strings.Join(rows, "\n"))
 	case "error":
 		msg := ev.get("message")
+		// Capture turn-started before logError — pushing an error block finalizes
+		// s.cur via push(), which would make a mid-turn error look pre-turn.
+		coreDead := strings.Contains(strings.ToLower(msg), "core exited")
+		turnStarted := s.cur != nil || s.pendingApproval != nil || s.pendingAsk != nil ||
+			s.pendingSudo != nil || s.queuedNext || s.goalKeepsBusy()
 		s.logError(msg)
 		if s.modal.loading {
 			s.modal.loading = false
@@ -1136,6 +1208,16 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.queued = nil
 			s.queuedNext = false
 			s.layout()
+		}
+		// Mirror web reducer: do NOT always clear busy (mid-turn errors are common).
+		// Pre-turn failures (bad skill/model before any assistant/tool activity)
+		// must release "working" so the footer cannot stick forever when core
+		// emits error without a following done.
+		if s.busy && !turnStarted && !coreDead {
+			s.busy = false
+			s.clearBlockingPrompts()
+			s.layout()
+			s.input.Focus()
 		}
 	case "plugin_installed":
 		scope := ev.get("scope")
@@ -1646,7 +1728,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			s.queuedNext = false
 			s.sendCore(map[string]any{"type": "abort"})
 			s.logWarn("aborting… (Ctrl+C again to quit)")
-			return s, nil
+			return s, s.armAbortTimeout()
 		}
 		return s, s.quit()
 	}
@@ -1802,6 +1884,15 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.layout()
 		return s, nil
 	}
+	// global: collapse / expand the pinned goal progress panel (big goals
+	// otherwise eat a lot of vertical space above the composer).
+	if s.kb(msg, "toggle_goal_panel") {
+		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
+			s.goalPanelCollapsed = !s.goalPanelCollapsed
+			s.layout()
+		}
+		return s, nil
+	}
 	// "/" opens the palette when the input is empty — works while idle and
 	// in-flight, mirroring the @-mention flyout (which also opens mid-turn).
 	if msg.String() == "/" && s.input.Value() == "" {
@@ -1905,7 +1996,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			s.queuedNext = false
 			s.sendCore(map[string]any{"type": "abort"})
 			s.logWarn("aborting…")
-			return s, nil
+			return s, s.armAbortTimeout()
 		case s.kb(msg, "steer"):
 			return s, s.steerFromInput()
 		case s.kb(msg, "send"):
@@ -2250,7 +2341,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.queuedNext = false
 			s.queued = nil
 			s.sendCore(map[string]any{"type": "abort"})
-			return nil
+			s.logWarn("aborting…")
+			return s.armAbortTimeout()
 		case "/exit", "/quit":
 			// Quit the app (alias: /quit). Same clean teardown as the quit key.
 			return s.quit()
@@ -2723,7 +2815,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		// handleKey may already have transferred the draft to this function;
 		// restore it so backpressure never turns into user-visible data loss.
 		s.input.SetValue(text)
-		s.input.CursorEnd()
+		s.input.MoveToEnd()
 		return nil
 	}
 	s.follow = true // jump to bottom so the user sees their turn + the response

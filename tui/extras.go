@@ -2,10 +2,8 @@ package main
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
-	"unsafe"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/atotto/clipboard"
@@ -29,53 +27,10 @@ func (s *session) pushHistory(line string) {
 	s.histIdx = len(s.history)
 }
 
-// enableMultilineInput swaps textinput's rune sanitizer for one that PRESERVES
-// newlines, so Shift+Enter line breaks and pasted multi-line text survive.
-//
-// bubbles' textinput assumes single-line input: its lazily-built sanitizer
-// collapses every '\n' — whether typed or pasted — into a space, making
-// multi-line composition impossible. The sanitizer is cached in an unexported
-// `rsan` field with no public setter, so we set it once right after New() to a
-// passthrough that keeps runes unchanged (so '\n' survives).
-//
-// bubbles v2 moved runeutil to an internal package, so we can't construct its
-// Sanitizer directly; instead we install our own type implementing the same
-// single-method interface (Sanitize([]rune) []rune). Guarded: if the field
-// layout ever changes we skip and fall back to single-line rather than crash.
-type passthroughSanitizer struct{}
-
-func (passthroughSanitizer) Sanitize(runes []rune) []rune { return runes }
-
-func (s *session) enableMultilineInput() {
-	v := reflect.ValueOf(&s.input).Elem()
-	f := v.FieldByName("rsan")
-	if !f.IsValid() || !f.CanAddr() {
-		return // field renamed/removed in a future bubbles — degrade to single-line
-	}
-	// rsan is unexported: use NewAt to obtain a settable reference, then assign
-	// our passthrough sanitizer. f.Type() is the (internal) interface type;
-	// passthroughSanitizer satisfies it via Go's structural interface typing.
-	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().
-		Set(reflect.ValueOf(passthroughSanitizer{}))
-}
-
-// insertNewline inserts a literal line break ('\n') at the textinput cursor so
-// Shift+Enter builds a multi-line message. Mirrors acceptMention's
-// SetValue+SetCursor pattern: textinput.SetValue moves the cursor to the end,
-// so we restore it to just past the inserted newline. A newline also terminates
-// any active @-mention token, so evalMention closes the flyout.
+// insertNewline inserts a literal line break at the composer cursor so
+// Shift+Enter builds a multi-line message. Terminates any active @-mention.
 func (s *session) insertNewline() {
-	val := s.input.Value()
-	pos := s.input.Position()
-	r := []rune(val)
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(r) {
-		pos = len(r)
-	}
-	s.input.SetValue(string(r[:pos]) + "\n" + string(r[pos:]))
-	s.input.SetCursor(pos + 1)
+	s.input.InsertRune('\n')
 	s.evalMention()
 }
 
@@ -100,24 +55,13 @@ func (s *session) recallHistory(dir int) string {
 // dir -1 = Up (history_prev): only when input is empty or cursor is on the
 // first line. dir +1 = Down: empty or cursor on the last line.
 func (s *session) historyRecallAllowed(dir int) bool {
-	val := s.input.Value()
-	if val == "" {
+	if s.input.Value() == "" {
 		return true
 	}
-	pos := s.input.Position()
-	r := []rune(val)
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(r) {
-		pos = len(r)
-	}
 	if dir < 0 {
-		// Up: no newline before the cursor → already on first line.
-		return !strings.ContainsRune(string(r[:pos]), '\n')
+		return s.input.Line() == 0
 	}
-	// Down: no newline after the cursor → already on last line.
-	return !strings.ContainsRune(string(r[pos:]), '\n')
+	return s.input.Line() >= s.input.LineCount()-1
 }
 
 // ---------------------------------------------------------------------------

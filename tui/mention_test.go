@@ -123,7 +123,7 @@ func TestMentionGitIndexHonorsIgnoreRules(t *testing.T) {
 func TestMentionFlyoutNeverExceedsTerminalWidth(t *testing.T) {
 	s := newMentionSession()
 	s.input.SetValue("@")
-	s.input.SetCursor(1)
+	setInputCursor(&s.input, 1)
 	s.evalMention()
 	for width := 1; width <= 24; width++ {
 		s.width = width

@@ -13,6 +13,9 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/progress"
 	"charm.land/lipgloss/v2"
 )
 
@@ -57,6 +60,16 @@ var noColorANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
 // terminals use a single header row, while normal terminals retain both rows.
 func (s *session) headerHeight() int { return lipgloss.Height(s.renderHeader()) }
 
+// viewChromeCache holds chrome strings built once per View so relayoutHeights
+// measure-by-render does not double-build the animated input / panels.
+type viewChromeCache struct {
+	header, footer, inputBox, activityShelf, goalPanel, mentionFlyout, positionBar string
+	headerOK, footerOK, inputOK, shelfOK, goalOK, mentionOK, posOK                 bool
+}
+
+func (s *session) beginViewChrome() { s.viewChrome = &viewChromeCache{} }
+func (s *session) endViewChrome()   { s.viewChrome = nil }
+
 // relayoutHeights recomputes the viewport height to fit the current input-box
 // height + panels and applies it. It is CHEAP: it does not re-render the
 // transcript blocks (their content is unchanged; only the viewport's visible
@@ -100,10 +113,11 @@ func (s *session) relayoutHeights() {
 // input-only changes (typing/pasting) use relayoutHeights() — re-rendering
 // every keystroke is expensive.
 func (s *session) layout() {
-	prevW, prevH := s.viewport.Width(), s.viewport.Height()
+	prevW := s.viewport.Width()
 	s.relayoutHeights()
-	// width/height changed → cached wrapped renders are stale; re-render.
-	if s.viewport.Width() != prevW || s.viewport.Height() != prevH {
+	// Wrap width is viewport.Width(); height-only changes (todo/scout/goal
+	// panels) must not wipe the finalized block cache.
+	if s.viewport.Width() != prevW {
 		s.invalidateAll()
 	}
 	s.refresh()
@@ -154,6 +168,9 @@ func (s *session) renderCoreFailureBanner() string {
 // the current operational state on the right. This preserves transcript space
 // and avoids repeating the same identity in both header and empty state.
 func (s *session) renderHeader() string {
+	if s.viewChrome != nil && s.viewChrome.headerOK {
+		return s.viewChrome.header
+	}
 	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst")
 	left := brand
 	if s.width >= 30 && s.cwd != "" {
@@ -180,13 +197,21 @@ func (s *session) renderHeader() string {
 	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) && s.width >= 42 {
 		right += " · " + truncate(s.models[s.modelIdx].ID, max(8, s.width/3))
 	}
-	return fitRow(s.width, left, mutedStyle.Render(right))
+	out := fitRow(s.width, left, mutedStyle.Render(right))
+	if s.viewChrome != nil {
+		s.viewChrome.header = out
+		s.viewChrome.headerOK = true
+	}
+	return out
 }
 
 // renderPositionBar: a thin scroll affordance. Pinned to the bottom it is a
 // subtle dim rule; scrolled up it becomes an accent bar telling the user how
 // many newer lines are hidden below and how to jump back.
 func (s *session) renderPositionBar() string {
+	if s.viewChrome != nil && s.viewChrome.posOK {
+		return s.viewChrome.positionBar
+	}
 	w := s.width
 	if w < 1 {
 		w = 1
@@ -196,10 +221,11 @@ func (s *session) renderPositionBar() string {
 	if below < 0 {
 		below = 0
 	}
+	var out string
 	if below > 0 {
 		pct := int(s.viewport.ScrollPercent() * 100)
 		msg := fmt.Sprintf("↓ %d new · %d%% · PgDn scroll · Ctrl+End jump", below, pct)
-		return lipgloss.NewStyle().
+		out = lipgloss.NewStyle().
 			Width(max(1, w-2)).MaxWidth(w).
 			Background(lipgloss.Color(c.accent)).
 			Foreground(lipgloss.Color(c.bg)).
@@ -207,7 +233,11 @@ func (s *session) renderPositionBar() string {
 			Padding(0, 1).
 			Render(msg)
 	}
-	return ""
+	if s.viewChrome != nil {
+		s.viewChrome.positionBar = out
+		s.viewChrome.posOK = true
+	}
+	return out
 }
 
 func (s *session) positionBarHeight() int {
@@ -288,6 +318,9 @@ func (s *session) renderApprovalDiff(a *approvalPrompt) string {
 // /stats, and /context. A toast temporarily replaces the left-hand controls so
 // feedback never inserts another layout row.
 func (s *session) renderFooter() string {
+	if s.viewChrome != nil && s.viewChrome.footerOK {
+		return s.viewChrome.footer
+	}
 	left := s.footerControlHint()
 	if toast := s.renderToast(); toast != "" {
 		left = toast
@@ -301,10 +334,17 @@ func (s *session) renderFooter() string {
 		}
 	}
 	controlLine := lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, left, right))
+	var out string
 	if !s.settings.FooterMetrics {
-		return controlLine
+		out = controlLine
+	} else {
+		out = controlLine + "\n" + s.renderFooterPerformance()
 	}
-	return controlLine + "\n" + s.renderFooterPerformance()
+	if s.viewChrome != nil {
+		s.viewChrome.footer = out
+		s.viewChrome.footerOK = true
+	}
+	return out
 }
 
 func (s *session) renderCompactFooter() string {
@@ -322,16 +362,79 @@ func (s *session) primaryFooterHint() string {
 }
 
 func (s *session) footerControlHint() string {
-	if s.pendingApproval != nil {
-		return s.keyHint("approve") + " allow once · " + s.keyHint("deny") + " deny · " +
-			s.keyHint("approve_always") + " always allow type"
+	h := s.newFooterHelp(max(1, s.width))
+	return h.ShortHelpView(s.footerHelpBindings())
+}
+
+func (s *session) newFooterHelp(width int) help.Model {
+	h := help.New()
+	h.ShortSeparator = " · "
+	h.Ellipsis = "…"
+	st := help.DefaultStyles(themeIsDark())
+	st.ShortKey = keyHintStyle
+	st.ShortDesc = dimStyle
+	st.ShortSeparator = dimStyle
+	st.Ellipsis = dimStyle
+	h.Styles = st
+	h.SetWidth(width)
+	return h
+}
+
+func (s *session) footerHelpBindings() []key.Binding {
+	switch {
+	case s.pendingApproval != nil:
+		return []key.Binding{
+			s.bindingFor("approve", "allow once"),
+			s.bindingFor("deny", "deny"),
+			s.bindingFor("approve_always", "always allow type"),
+		}
+	case s.busy:
+		return []key.Binding{
+			s.bindingFor("send", "queue"),
+			s.bindingFor("close", "abort"),
+			s.bindingFor("steer", "steer"),
+		}
+	default:
+		return []key.Binding{
+			s.bindingFor("send", "send"),
+			s.bindingFor("newline", "newline"),
+			s.bindingFor("command_palette", "commands"),
+		}
 	}
-	if s.busy {
-		return s.keyHint("send") + " queue · " + s.keyHint("close") + " abort · " +
-			s.keyHint("steer") + " steer"
+}
+
+// composerHintLine is a dim second line inside the composer while busy/queued/
+// approval is active and the user is already typing (placeholder is hidden).
+func (s *session) composerHintLine(innerW int) string {
+	h := s.newFooterHelp(innerW)
+	switch {
+	case s.pendingApproval != nil:
+		out := h.ShortHelpView([]key.Binding{
+			s.bindingFor("approve", "allow once"),
+			s.bindingFor("deny", "deny"),
+			s.bindingFor("approve_always", "always allow type"),
+		})
+		extra := h.Styles.ShortDesc.Inline(true).Render("clear input first")
+		if out == "" {
+			return extra
+		}
+		return out + h.Styles.ShortSeparator.Inline(true).Render(h.ShortSeparator) + extra
+	case s.queued != nil:
+		out := h.ShortHelpView([]key.Binding{s.bindingFor("close", "cancels queued")})
+		prefix := h.Styles.ShortDesc.Inline(true).Render("queue full")
+		if out == "" {
+			return prefix
+		}
+		return prefix + h.Styles.ShortSeparator.Inline(true).Render(h.ShortSeparator) + out
+	case s.busy:
+		return h.ShortHelpView([]key.Binding{
+			s.bindingFor("send", "queues"),
+			s.bindingFor("close", "aborts"),
+			s.bindingFor("steer", "steers"),
+		})
+	default:
+		return ""
 	}
-	return s.keyHint("send") + " send · " + s.keyHint("newline") + " newline · " +
-		s.keyHint("command_palette") + " commands"
 }
 
 func (s *session) renderFooterPerformance() string {
@@ -576,16 +679,24 @@ func (s *session) renderContext() string {
 	// A 10-cell fill bar tinted by context pressure: green < 60%, amber < 85%,
 	// red ≥ 85% — so a glance at the footer shows how full the window is.
 	const cells = 10
-	filled := cells * pct / 100
-	bar := strings.Repeat("▰", filled) + strings.Repeat("▱", cells-filled)
-	barStyle := successStyle
+	filled := cells * pct / 100 // truncate so sub-cell pressure stays empty
+	ratio := float64(filled) / float64(cells)
+	fullColor := lipgloss.Color(c.success)
 	switch {
 	case pct >= 85:
-		barStyle = errStyle
+		fullColor = lipgloss.Color(c.err)
 	case pct >= 60:
-		barStyle = warnStyle
+		fullColor = lipgloss.Color(c.warn)
 	}
-	return barStyle.Render(bar) + " " + mutedStyle.Render(fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks)))
+	m := progress.New(
+		progress.WithWidth(cells),
+		progress.WithoutPercentage(),
+		progress.WithFillCharacters('▰', '▱'),
+		progress.WithColors(fullColor),
+	)
+	m.EmptyColor = lipgloss.Color(c.dim)
+	bar := m.ViewAs(ratio)
+	return bar + " " + mutedStyle.Render(fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks)))
 }
 
 // composerPlaceholder returns the empty-input hint, contextualized for busy /
@@ -641,6 +752,18 @@ func (s *session) keyLabel(action string) string {
 // is placed on the correct wrapped line via the textinput's own cursor.Model
 // (blink / focus-blur behavior stays identical to the stock textinput).
 func (s *session) renderInputBox() string {
+	if s.viewChrome != nil && s.viewChrome.inputOK {
+		return s.viewChrome.inputBox
+	}
+	out := s.renderInputBoxUncached()
+	if s.viewChrome != nil {
+		s.viewChrome.inputBox = out
+		s.viewChrome.inputOK = true
+	}
+	return out
+}
+
+func (s *session) renderInputBoxUncached() string {
 	w := s.width
 	if w < 1 {
 		w = 1
@@ -702,37 +825,6 @@ func (s *session) renderInputBox() string {
 	return b.String()
 }
 
-// composerHintLine is a dim second line inside the composer while busy/queued/
-// approval is active and the user is already typing (placeholder is hidden).
-func (s *session) composerHintLine(innerW int) string {
-	var text string
-	switch {
-	case s.pendingApproval != nil:
-		var parts []string
-		for _, action := range []struct{ id, label string }{{"approve", "allow once"}, {"deny", "deny"}, {"approve_always", "always allow type"}} {
-			if key := s.keyHint(action.id); key != "" {
-				parts = append(parts, key+" "+action.label)
-			}
-		}
-		parts = append(parts, "clear input first")
-		text = strings.Join(parts, " · ")
-	case s.queued != nil:
-		text = "queue full"
-		if key := s.keyHint("close"); key != "" {
-			text += " · " + key + " cancels queued"
-		}
-	case s.busy:
-		steer := s.keyHint("steer")
-		if steer == "" {
-			steer = "Ctrl+Enter"
-		}
-		text = s.keyHint("send") + " queues · " + s.keyHint("close") + " aborts · " + steer + " steers"
-	default:
-		return ""
-	}
-	return dimStyle.Render(truncateRunes(text, innerW))
-}
-
 // renderInputBoxAnimated draws the input box with a "comet": a soft accent
 // light that sweeps the box perimeter while a turn is in flight — the TUI
 // analog of the web's composer-inflight flowing-gradient ring.
@@ -746,7 +838,7 @@ func (s *session) composerHintLine(innerW int) string {
 //   - the head position is derived from wall-clock time, not a frame count,
 //     so dropped frames skip the comet ahead at constant speed instead of
 //     slowing/stuttering — the single biggest smoothness lever;
-//   - re-renders piggyback on the existing spinner tick (10 FPS, already
+//   - re-renders piggyback on the existing busy-frame tick (10 FPS, already
 //     running while busy) — no new timer, no new re-render storm, and idle
 //     (s.busy == false) is a pure no-op that falls through to the plain border.
 func (s *session) renderInputBoxAnimated(w, innerW int, lines []string) string {
@@ -898,7 +990,7 @@ func (s *session) inputContent(w int) string {
 		}
 		return active.Placeholder.Render(truncateRunes(ph, w))
 	}
-	pos := s.input.Position()
+	pos := inputPosition(s.input)
 	r := []rune(value)
 	if pos < 0 {
 		pos = 0
@@ -1274,6 +1366,18 @@ func (s *session) queueBannerHeight() int {
 // subagents collapse into one row and can be expanded without competing with
 // the composer or hiding the conversation.
 func (s *session) renderActivityShelf() string {
+	if s.viewChrome != nil && s.viewChrome.shelfOK {
+		return s.viewChrome.activityShelf
+	}
+	out := s.renderActivityShelfUncached()
+	if s.viewChrome != nil {
+		s.viewChrome.activityShelf = out
+		s.viewChrome.shelfOK = true
+	}
+	return out
+}
+
+func (s *session) renderActivityShelfUncached() string {
 	switch {
 	case s.pendingApproval != nil:
 		return s.renderApprovalBanner()
@@ -1438,8 +1542,10 @@ func (s *session) View() tea.View {
 		// mutate the input (insertNewline on Shift+Enter, paste) or the tasks panel
 		// (mid-run tool updates) don't all call relayoutHeights themselves, so doing
 		// it here guarantees the viewport shrinks to fit before we render — no
-		// overflow that pushes the footer off-screen between events. It's cheap
-		// (height math only; no transcript block re-render).
+		// overflow that pushes the footer off-screen between events. Chrome strings
+		// are cached for this View so measure-by-render != second full paint.
+		s.beginViewChrome()
+		defer s.endViewChrome()
 		s.relayoutHeights()
 		parts := []string{s.renderHeader()}
 		if b := s.renderCoreFailureBanner(); b != "" {

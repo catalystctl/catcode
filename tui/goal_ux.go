@@ -14,9 +14,12 @@ const goalDisplaySummaryCap = 800
 
 // goalShowsProgressPanel is true while the pinned goal progress panel should
 // render. plan_ready only counts when auto-deploy is armed (parity with web).
+// CEO phases (planning/reviewing/verifying/replanning) match web GOAL_LASTING_PHASES
+// so the header shows "goal · …" instead of plain "working" mid-goal.
 func goalShowsProgressPanel(phase string, autoDeploy bool) bool {
 	switch phase {
-	case "deploying", "running", "synthesizing", "done", "failed":
+	case "planning", "reviewing", "deploying", "running", "synthesizing",
+		"verifying", "replanning", "done", "failed":
 		return true
 	case "plan_ready":
 		return autoDeploy
@@ -186,7 +189,21 @@ func goalStatusBadge(status string) string {
 }
 
 // renderGoalProgressPanel lists goal steps with status during deploy / wrap-up.
+// Collapsed (s.goalPanelCollapsed): one-line header only so big goals don't
+// crowd the composer. Toggle with the toggle_goal_panel keybind (Ctrl+Shift+G).
 func (s *session) renderGoalProgressPanel(w int) string {
+	if s.viewChrome != nil && s.viewChrome.goalOK {
+		return s.viewChrome.goalPanel
+	}
+	out := s.renderGoalProgressPanelUncached(w)
+	if s.viewChrome != nil {
+		s.viewChrome.goalPanel = out
+		s.viewChrome.goalOK = true
+	}
+	return out
+}
+
+func (s *session) renderGoalProgressPanelUncached(w int) string {
 	if s.goalState == nil || !goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 		return ""
 	}
@@ -196,40 +213,50 @@ func (s *session) renderGoalProgressPanel(w int) string {
 	settled, total := s.goalProgressCounts()
 	phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
 	header := fmt.Sprintf("goal · %s · %d/%d", phaseLabel, settled, total)
+	toggle := s.keyHint("toggle_goal_panel")
+	if toggle == "" {
+		toggle = "Ctrl+Shift+G"
+	}
 	var rows []string
-	rows = append(rows, accentStyle.Render("◈ ")+boldBaseStyle.Render(header))
-	maxRows := min(6, max(2, s.height/4))
-	prompts := s.goalState.Prompts
-	hidden := 0
-	if len(prompts) > maxRows {
-		hidden = len(prompts) - maxRows
-		prompts = prompts[:maxRows]
-	}
-	for _, p := range prompts {
-		badge := goalStatusBadge(p.Status)
-		label := goalPromptLabel(p)
-		line := badge + " " + label
-		if p.Agent != "" {
-			line += " · " + p.Agent
+	if s.goalPanelCollapsed {
+		rows = append(rows, accentStyle.Render("◈ ")+boldBaseStyle.Render(header)+
+			dimStyle.Render(" · "+toggle+" expand"))
+	} else {
+		rows = append(rows, accentStyle.Render("◈ ")+boldBaseStyle.Render(header)+
+			dimStyle.Render(" · "+toggle+" collapse"))
+		maxRows := min(6, max(2, s.height/4))
+		prompts := s.goalState.Prompts
+		hidden := 0
+		if len(prompts) > maxRows {
+			hidden = len(prompts) - maxRows
+			prompts = prompts[:maxRows]
 		}
-		st := strings.ToLower(strings.TrimSpace(p.Status))
-		switch st {
-		case "failed":
-			rows = append(rows, warnStyle.Render(truncate(line, max(8, w-6))))
-		case "done":
-			rows = append(rows, successStyle.Render(truncate(line, max(8, w-6))))
-		case "running", "in_progress", "active":
-			rows = append(rows, accentStyle.Render(truncate(line, max(8, w-6))))
-		default:
-			rows = append(rows, dimStyle.Render(truncate(line, max(8, w-6))))
+		for _, p := range prompts {
+			badge := goalStatusBadge(p.Status)
+			label := goalPromptLabel(p)
+			line := badge + " " + label
+			if p.Agent != "" {
+				line += " · " + p.Agent
+			}
+			st := strings.ToLower(strings.TrimSpace(p.Status))
+			switch st {
+			case "failed":
+				rows = append(rows, warnStyle.Render(truncate(line, max(8, w-6))))
+			case "done":
+				rows = append(rows, successStyle.Render(truncate(line, max(8, w-6))))
+			case "running", "in_progress", "active":
+				rows = append(rows, accentStyle.Render(truncate(line, max(8, w-6))))
+			default:
+				rows = append(rows, dimStyle.Render(truncate(line, max(8, w-6))))
+			}
+			if goalTerminalStatus(p.Status) && strings.TrimSpace(p.Summary) != "" {
+				preview := truncate(strings.TrimSpace(p.Summary), max(12, w-10))
+				rows = append(rows, dimStyle.Render("  "+preview))
+			}
 		}
-		if goalTerminalStatus(p.Status) && strings.TrimSpace(p.Summary) != "" {
-			preview := truncate(strings.TrimSpace(p.Summary), max(12, w-10))
-			rows = append(rows, dimStyle.Render("  "+preview))
+		if hidden > 0 {
+			rows = append(rows, dimStyle.Render(fmt.Sprintf("… +%d more steps", hidden)))
 		}
-	}
-	if hidden > 0 {
-		rows = append(rows, dimStyle.Render(fmt.Sprintf("… +%d more steps", hidden)))
 	}
 	body := strings.Join(rows, "\n")
 	boxW := max(1, w-4)

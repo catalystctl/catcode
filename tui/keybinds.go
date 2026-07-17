@@ -43,6 +43,7 @@ var keybindDefs = []keybindDef{
 	{"command_palette_alt", "Global", "Open command palette (alternate)", "ctrl+k"},
 	{"reasoning_picker", "Global", "Set reasoning effort (per model)", "ctrl+r"},
 	{"toggle_activity", "Global", "Expand / collapse activity shelf", "ctrl+g"},
+	{"toggle_goal_panel", "Global", "Expand / collapse goal progress panel", "ctrl+shift+g"},
 	{"close", "Global", "Close modal / deny / abort / cancel", "esc"},
 
 	// Scrolling — transcript viewport, every state.

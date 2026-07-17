@@ -65,7 +65,7 @@ func TestInputBoxNewlineNotDropped(t *testing.T) {
 func TestInputBoxTrailingNewlineShowsBlankRow(t *testing.T) {
 	s := newInputSession(t, 40)
 	s.input.SetValue("hello\n")
-	s.input.SetCursor(len([]rune(s.input.Value()))) // cursor at very end
+	setInputCursor(&s.input, len([]rune(s.input.Value()))) // cursor at very end
 	s.layout()
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
@@ -85,13 +85,13 @@ func TestInputBoxTrailingNewlineShowsBlankRow(t *testing.T) {
 func TestInsertNewlineAtCursor(t *testing.T) {
 	s := newInputSession(t, 60)
 	s.input.SetValue("hello world")
-	s.input.SetCursor(5) // between "hello" and " world"
+	setInputCursor(&s.input, 5) // between "hello" and " world"
 	s.insertNewline()
 
 	if got := s.input.Value(); got != "hello\n world" {
 		t.Fatalf("value after insertNewline = %q, want %q", got, "hello\n world")
 	}
-	if pos := s.input.Position(); pos != 6 {
+	if pos := inputPosition(s.input); pos != 6 {
 		t.Fatalf("cursor should be just past the newline (pos 6), got %d", pos)
 	}
 }
@@ -103,7 +103,7 @@ func TestInsertNewlineAtCursor(t *testing.T) {
 func TestShiftEnterInsertsNewline(t *testing.T) {
 	s := newInputSession(t, 60)
 	s.input.SetValue("foo")
-	s.input.SetCursor(len(s.input.Value())) // cursor at end
+	setInputCursor(&s.input, len([]rune(s.input.Value()))) // cursor at end
 
 	m, _ := s.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift})
 	if m != s {

@@ -13,7 +13,7 @@ func (s *session) suspendComposer(owner string) {
 		}
 	}
 	d := composerDraft{
-		owner: owner, text: s.input.Value(), cursor: s.input.Position(),
+		owner: owner, text: s.input.Value(), cursor: inputPosition(s.input),
 		images: append([]string(nil), s.pendingImages...),
 	}
 	s.composerDrafts = append(s.composerDrafts, d)
@@ -41,7 +41,7 @@ func (s *session) restoreComposer(owner string) {
 		return
 	}
 	s.input.SetValue(d.text)
-	s.input.SetCursor(d.cursor)
+	setInputCursor(&s.input, d.cursor)
 	s.pendingImages = d.images
 	s.input.Focus()
 	_ = s.evalMention()
@@ -54,7 +54,7 @@ func (s *session) restoreAllComposerDrafts() {
 	d := s.composerDrafts[0]
 	s.composerDrafts = nil
 	s.input.SetValue(d.text)
-	s.input.SetCursor(d.cursor)
+	setInputCursor(&s.input, d.cursor)
 	s.pendingImages = d.images
 	s.input.Focus()
 	_ = s.evalMention()

@@ -15,11 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"charm.land/bubbles/v2/spinner"
-	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -61,6 +59,13 @@ const (
 
 type streamRefreshMsg struct{}
 
+// busyFrameMsg drives re-renders while a turn is in flight (~10 FPS) so
+// elapsed timers, ◷ badges, and optional border animation advance without a
+// spinner.Model. Idle sessions do not schedule frames (avoids re-render storms).
+type busyFrameMsg struct{}
+
+const busyFrameInterval = time.Second / 10
+
 type toastKind int
 
 const (
@@ -79,7 +84,7 @@ type oauthBanner struct {
 }
 
 // session is the Bubble Tea model: it owns the core subprocess, the structured
-// list of message blocks, and the viewport/input/spinner.
+// list of message blocks, and the viewport/input/busy-frame clock.
 type session struct {
 	coreCmd    *exec.Cmd
 	coreIn     io.WriteCloser
@@ -125,6 +130,7 @@ type session struct {
 	coreFailure              string
 	streamRefreshPending     bool
 	coreStartGen             uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
+	abortGen                 uint64          // bumped on abort arm/disarm; stale abortTimeoutMsg ignored
 	visionModels             map[string]bool // user-curated vision-capable model ids (drives /vision)
 	visionModel              string          // preferred handoff target ("" = cheapest same-provider)
 	visionEnabled            bool            // auto handoff (default true / recommended ON)
@@ -150,6 +156,7 @@ type session struct {
 	goalStepLogged     map[string]string // step_id → fingerprint of last persisted completion card
 	goalLastLife       string            // last persisted lifecycle line (dedupe phase+state)
 	goalCompleteLogged bool              // dedupe dual goal_state+goal_phase "goal complete"
+	goalPanelCollapsed bool              // collapses the pinned goal progress panel to a one-line header
 
 	settings       *settingsStore
 	keybinds       map[string]string // effective keymap (defaults + user overrides); see keybinds.go
@@ -184,6 +191,7 @@ type session struct {
 	activityExpanded  bool                // expands the compact tasks/subagents activity shelf
 	activityScroll    int                 // first detail row shown in the focused activity shelf
 	cwd               string              // working dir, shown in the header as ~/
+	viewChrome        *viewChromeCache    // non-nil only during View(); dedupes measure+paint
 
 	// Ephemeral UX state (toasts, sticky OAuth, one-shot prompts).
 	toast              *statusToast
@@ -208,10 +216,9 @@ type session struct {
 	// arrives via bracketed paste) as well as local clipboard grab.
 	pendingImages []string
 
-	viewport      viewport.Model
-	input         textinput.Model
-	spinner       spinner.Model
-	spinnerActive bool // whether the spinner animation cycle is running (stopped when idle to avoid re-render storms that disrupt text selection)
+	viewport       viewport.Model
+	input          textarea.Model
+	busyFrameActive bool // ~10 FPS re-render clock while busy/starting (stopped when idle)
 
 	width, height int
 	ready         bool
@@ -251,27 +258,16 @@ func initialSession() *session {
 	s.visionModels = map[string]bool{}
 	s.visionEnabled = true
 
-	s.input = textinput.New()
-	s.input.Placeholder = "Chat with the agent…  (/ commands · ? help)"
-	// textinput v2: placeholder style lives on Styles().{Focused,Blurred}.Placeholder
-	// (the top-level PlaceholderStyle field was removed).
-	ist := s.input.Styles()
-	ist.Focused.Placeholder = placeholderStyle
-	ist.Blurred.Placeholder = placeholderStyle
-	s.input.SetStyles(ist)
-	s.input.Prompt = ""
-	s.input.Focus()
-	s.enableMultilineInput() // keep typed/pasted newlines (see extras.go)
+	s.input = newComposer()
 
 	s.viewport = viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
 	s.viewport.SetContent("")
 
-	sp := spinner.New()
-	sp.Spinner = spinner.Dot
-	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
-	s.spinner = sp
-
 	return s
+}
+
+func busyFrameTick() tea.Cmd {
+	return tea.Tick(busyFrameInterval, func(time.Time) tea.Msg { return busyFrameMsg{} })
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +537,13 @@ const coreStartupTimeout = 30 * time.Second
 // a tick from a previous (restarted) core is ignored.
 type readyTimeoutMsg struct{ gen uint64 }
 
+// abortBusyTimeout is how long we wait after the user aborts before locally
+// clearing busy if core never emits aborted/done (wedged provider / dead pipe).
+const abortBusyTimeout = 15 * time.Second
+
+// abortTimeoutMsg fires when an abort watchdog expires without a terminal event.
+type abortTimeoutMsg struct{ gen uint64 }
+
 // sigtermMsg is sent by the SIGHUP/SIGTERM handler so Bubble Tea restores the
 // terminal (alt-screen / raw-mode) via its normal tea.Quit path instead of a
 // raw os.Exit that would leave the terminal broken.
@@ -595,7 +598,7 @@ func (s *session) sendCore(m map[string]any) bool {
 // ---------------------------------------------------------------------------
 
 func (s *session) Init() tea.Cmd {
-	return tea.Batch(s.startCore(), tick(), s.spinner.Tick)
+	return tea.Batch(s.startCore(), tick(), busyFrameTick())
 }
 
 func tick() tea.Cmd {
@@ -607,6 +610,7 @@ func tick() tea.Cmd {
 func (s *session) resetCoreUIState() {
 	// P1-13: reset stale turn/UI state so the restarted core isn't shown as
 	// "working" with a dead request_id the user could accidentally approve.
+	s.disarmAbortTimeout()
 	s.busy = false
 	s.cur = nil
 	s.queuedNext = false
@@ -687,27 +691,26 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.toast = nil
 		}
 		cmds := []tea.Cmd{tick()}
-		// (Re)start the spinner animation if a turn is in flight but the spinner
-		// cycle has stopped. The cycle stops when idle (see spinner.TickMsg) to
-		// avoid a ~20x/sec re-render storm that disrupts mouse text selection
-		// (copy); tickMsg (every 500ms) catches the busy transition and restarts it.
-		if (s.busy || !s.ready) && !s.spinnerActive {
-			s.spinnerActive = true
-			cmds = append(cmds, s.spinner.Tick)
+		// (Re)start the busy-frame clock if a turn is in flight but the cycle
+		// has stopped. The cycle stops when idle (see busyFrameMsg) to avoid a
+		// ~10x/sec re-render storm that disrupts mouse text selection (copy);
+		// tickMsg (every 500ms) catches the busy transition and restarts it.
+		if (s.busy || !s.ready) && !s.busyFrameActive {
+			s.busyFrameActive = true
+			cmds = append(cmds, busyFrameTick())
 		}
 		return s, tea.Batch(cmds...)
 
-	case spinner.TickMsg:
-		s.spinner, _ = s.spinner.Update(msg)
-		// Only keep the spinner animating while it's actually shown (a running turn
-		// or still starting). When idle, stop ticking so the cursed renderer isn't
-		// driven ~20x/sec — that constant re-render makes mouse text selection
-		// (copy) impossible. tickMsg restarts the cycle when activity resumes.
+	case busyFrameMsg:
+		// Only keep framing while a turn runs or we're still starting. When idle,
+		// stop so the renderer isn't driven ~10x/sec — that constant re-render
+		// makes mouse text selection (copy) impossible. tickMsg restarts the
+		// cycle when activity resumes.
 		if s.busy || !s.ready {
-			s.spinnerActive = true
-			return s, s.spinner.Tick
+			s.busyFrameActive = true
+			return s, busyFrameTick()
 		}
-		s.spinnerActive = false
+		s.busyFrameActive = false
 		return s, nil
 
 	case coreStartErrorMsg:
@@ -718,6 +721,8 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// a goroutine and must not touch UI state itself).
 		s.coreLifecycle = coreFailed
 		s.coreFailure = msg.err.Error()
+		s.busy = false
+		s.clearBlockingPrompts()
 		s.logError(s.coreFailure)
 		return s, nil
 
@@ -747,12 +752,31 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s.coreLifecycle = coreFailed
 		s.coreFailure = "core did not start within 30s — check CATCODE_CORE or the debug log"
+		s.busy = false
+		s.clearBlockingPrompts()
 		s.logError(s.coreFailure)
 		// A process that never completes its handshake is not useful and must not
 		// be left orphaned while the recovery screen waits for Retry.
 		if s.coreCmd != nil && s.coreCmd.Process != nil {
 			_ = s.coreCmd.Process.Kill()
 		}
+		return s, nil
+
+	case abortTimeoutMsg:
+		// User aborted but core never emitted aborted/done. Release the footer so
+		// "working" cannot stick forever on a wedged provider or dead event pump.
+		if msg.gen != s.abortGen || !s.busy {
+			return s, nil
+		}
+		s.busy = false
+		s.queuedNext = false
+		s.queued = nil
+		s.clearBlockingPrompts()
+		s.cur = nil
+		s.finalizeInFlight("[aborted — no response from core]")
+		s.layout()
+		s.logWarn("abort timed out — cleared working state (core may still be wedged)")
+		s.input.Focus()
 		return s, nil
 
 	case sudoTimeoutMsg:

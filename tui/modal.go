@@ -2235,7 +2235,7 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 			setTheme(themes[abs].name)
 			s.settings.Theme = themes[abs].name
 			_ = s.settings.save()
-			s.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
+			s.refreshComposerStyles()
 			s.invalidateAll()
 			s.refresh()
 			s.logInfo("theme: " + themes[abs].name)
@@ -2618,7 +2618,7 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	if strings.HasPrefix(label, "/skill:") {
 		s.closeModal()
 		s.input.SetValue(label + " ")
-		s.input.CursorEnd()
+		s.input.MoveToEnd()
 		s.evalMention()
 		return s.input.Focus()
 	}
@@ -3946,32 +3946,6 @@ func formatUsageNumber(n float64) string {
 		return fmt.Sprintf("%d", int64(n))
 	}
 	return fmt.Sprintf("%.1f", n)
-}
-
-// renderUsageBar draws a filled/empty progress bar using block characters.
-func renderUsageBar(ratio float64, width int) string {
-	if width < 4 {
-		width = 4
-	}
-	if ratio < 0 {
-		ratio = 0
-	}
-	if ratio > 1 {
-		ratio = 1
-	}
-	filled := int(ratio*float64(width) + 0.5)
-	if filled > width {
-		filled = width
-	}
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	// Color by pressure: green < 70%, yellow < 90%, red otherwise.
-	style := successStyle
-	if ratio >= 0.9 {
-		style = errStyle
-	} else if ratio >= 0.7 {
-		style = warnStyle
-	}
-	return style.Render(bar)
 }
 
 func wrapUsageText(s string, width int) []string {

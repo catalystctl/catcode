@@ -29,7 +29,7 @@ func TestMentionSearchCommandRefreshesResults(t *testing.T) {
 
 	s := initialSession()
 	s.input.SetValue("@needle")
-	s.input.SetCursor(len([]rune("@needle")))
+	setInputCursor(&s.input, len([]rune("@needle")))
 	cmd := s.evalMention()
 	if cmd == nil {
 		t.Fatal("first recursive mention evaluation must return a refresh command")
