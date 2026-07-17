@@ -29,12 +29,16 @@ export const CORE_EVENT_TYPES = [
   "done",
   "error",
   "file_change",
+  "goal_certified",
   "goal_completion_summary",
+  "goal_iteration",
   "goal_phase",
   "goal_plan",
+  "goal_review_verdict",
   "goal_state",
   "goal_step_complete",
   "goal_step_verdict",
+  "goal_verify_verdict",
   "history",
   "http_retry",
   "info",
@@ -223,6 +227,43 @@ export interface GoalPhaseEvent {
   done_count?: number;
 }
 
+export interface GoalIterationEvent {
+  type: "goal_iteration";
+  id?: string;
+  iteration: number;
+  max_iterations: number;
+  plan_revision?: number;
+  max_plan_revisions?: number;
+}
+
+export interface GoalReviewVerdictEvent {
+  type: "goal_review_verdict";
+  id?: string;
+  ok: boolean;
+  summary: string;
+  iteration?: number;
+  plan_revision?: number;
+  evidence_paths?: string[];
+}
+
+export interface GoalVerifyVerdictEvent {
+  type: "goal_verify_verdict";
+  id?: string;
+  ok: boolean;
+  summary: string;
+  iteration?: number;
+  remaining_gaps?: string[];
+  evidence_paths?: string[];
+}
+
+export interface GoalCertifiedEvent {
+  type: "goal_certified";
+  id?: string;
+  summary: string;
+  iteration?: number;
+  certified?: boolean;
+}
+
 export interface SubagentStartEvent {
   type: "subagent_start";
   run_id: string;
@@ -302,6 +343,10 @@ export type NarrowCoreEvent =
   | GoalStateEvent
   | GoalPlanEvent
   | GoalPhaseEvent
+  | GoalIterationEvent
+  | GoalReviewVerdictEvent
+  | GoalVerifyVerdictEvent
+  | GoalCertifiedEvent
   | SubagentStartEvent
   | SubagentDoneEvent
   | SubagentProgressEvent
