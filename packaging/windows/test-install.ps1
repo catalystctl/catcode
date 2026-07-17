@@ -127,7 +127,15 @@ if ($dlCode -eq 0) {
     Pass "bad download fails loudly (exit $dlCode) without silent close"
 }
 
-# ── 6. Host survives scriptblock-wrapped Die ──────────────────
+# ── 6. Install-WebBundle rebuilds native modules for target ─
+$src = Get-Content -LiteralPath $Installer -Raw
+if ($src -notmatch 'Installing native modules for this platform') {
+    Fail 'Install-WebBundle is missing native-module rebuild step'
+} else {
+    Pass 'Install-WebBundle will rebuild native modules for the target platform'
+}
+
+# ── 7. Host survives scriptblock-wrapped Die ──────────────────
 $wrappedOk = $false
 $tmpHome = Join-Path ([System.IO.Path]::GetTempPath()) ("catcode-install-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpHome | Out-Null

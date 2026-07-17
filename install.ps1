@@ -342,6 +342,25 @@ function Install-WebBundle {
     if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
     Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
     Assert-WebBundle -Dir $WebDir
+
+    # The release bundle is built on Linux/macOS CI; native modules (better-sqlite3,
+    # node-pty) contain platform-specific .node binaries. Rebuild them for the target
+    # host so Windows installs don't load an ELF binary.
+    W-Info 'Installing native modules for this platform ...'
+    Push-Location $WebDir
+    try {
+        if ($script:RT -eq 'bun') {
+            $ec = Invoke-Native bun install
+            if ($ec -ne 0) { Die "bun install failed (exit $ec)" }
+        } else {
+            $npm = Get-Command npm -ErrorAction SilentlyContinue
+            if (-not $npm) { Die 'node found but npm is not on PATH - cannot rebuild native modules' }
+            $ec = Invoke-Native $npm.Source rebuild better-sqlite3 node-pty
+            if ($ec -ne 0) { Die "npm rebuild failed (exit $ec) - try running from an elevated prompt or install Visual Studio Build Tools" }
+        }
+    } finally { Pop-Location }
+    W-Ok 'Native modules installed for this platform'
+
     W-Ok "Web bundle extracted to $WebDir"
 }
 
