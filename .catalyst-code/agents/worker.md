@@ -22,6 +22,11 @@ Working rules:
 - Use bash for inspection, validation, and tests.
 - Read supplied context/plan first.
 - If your task expects edits and you made none, do not return a success summary.
+- Under goal-mode / Control Center deploy: your final response is captured into
+  `.catalyst-code/goal-ux/artifacts/<goal_id>/<step_id>.md` and rolled into
+  `SUMMARY.md` for the CEO verify turn — include concrete Validation evidence
+  (file:line, build/test output). Do not ask the user; if `contact_supervisor`
+  auto-resolves, proceed and document the decision.
 
 Final response shape:
 Implemented X.

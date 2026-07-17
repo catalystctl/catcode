@@ -15,10 +15,11 @@ session lifecycle events to inspect, approve, modify, or log operations.
 2. Write a `plugin.json` manifest (see format below)
 3. Write executable hook scripts (bash, python, or any language)
 4. Make hook scripts executable (`chmod +x hooks/*.sh`)
-5. The core loads new plugins on next restart, or you can call the `plugin` tool
-   (if loaded by the TUI) to `install`, `remove`, `enable`, or `disable` plugins
-   at runtime. Use `/plugin-reload` (or the `reload_plugins` protocol command)
-   to re-scan directories without restarting — enabled flags are preserved.
+5. The core loads new plugins on next restart. Manage plugins with slash
+   commands `/plugin-install`, `/plugin-enable`, `/plugin-disable`,
+   `/plugin-remove`, `/plugin-reload` (or the matching protocol commands).
+   There is **no** built-in `plugin` tool. Use `/plugin-reload` to re-scan
+   directories without restarting — enabled flags are preserved.
 
 ### Installing a plugin
 
@@ -150,36 +151,49 @@ JSON object to stdout before exiting. Stderr is captured for error reporting.
   sensitive one bypasses the user-facing prompt. Pre-hooks are trusted,
   user-installed code (project hooks gated by `--trust-project-plugins`).
 
-Safety rules enforced by the core:
-- pre_* hooks: non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks the tool)
-- post_* hooks: non-zero exit, timeout, or JSON parse failure → silently skipped (tool already ran)
+Safety rules enforced by the core (per-hook **policy table**, not name prefix):
+- Blocking pre hooks (`pre_bash`/`pre_write`/`pre_read`/`pre_tool`/`pre_input`):
+  non-zero exit, timeout, or JSON parse failure → `allow: false` (blocks)
+- Post hooks + advisory lifecycle hooks: failure → silently skipped
+- `pre_context` / `pre_agent_start`: fail-open on timeout (keep prior messages/prompt)
 - Disabled plugins are never invoked
-- Every hook has a hard timeout (5s default for pre_*, 30s default for post_*)
+- Default timeouts: 5s for blocking pre hooks, 30s otherwise
 - Hook failures never crash the core
+- Multi-plugin composition order is **alphabetical by plugin name** (stable)
 
 ### Available hook points
 
-| Hook point    | Fires when                              | Type |
-|---------------|-----------------------------------------|------|
-| pre_bash      | Before a bash command executes          | pre  |
-| pre_write     | Before a file write/edit                | pre  |
-| pre_read      | Before a file is read                   | pre  |
-| post_bash     | After a bash command completes          | post |
-| post_write    | After a file write/edit completes       | post |
-| post_read     | After a file is read                    | post |
-| pre_tool      | Before ANY tool executes (catch-all)    | pre  |
-| post_tool     | After ANY tool executes (catch-all)     | post |
-| session_start | When a session begins (prompt received) | lifecycle |
-| session_stop  | When a session ends (done/abort)        | lifecycle |
-| pre_compact   | Before conversation compaction         | pre  |
-| pre_turn      | Before a model request (advisory)      | pre  |
+| Hook point         | Fires when                                      | Type |
+|--------------------|-------------------------------------------------|------|
+| pre_bash           | Before a bash command executes                  | pre (block) |
+| pre_write          | Before a file write/edit                        | pre (block) |
+| pre_read           | Before a file is read                           | pre (block) |
+| post_bash          | After a bash command completes                  | post |
+| post_write         | After a file write/edit completes               | post |
+| post_read          | After a file is read                            | post |
+| pre_tool           | Before ANY tool (main, bulk inners, subagent)   | pre (block) |
+| post_tool          | After ANY tool (main + subagent; result modify) | post |
+| pre_input          | Before user text becomes a Message              | pre (block) |
+| pre_agent_start    | Dynamic system-prompt surgery (transient)       | advisory |
+| pre_context        | Rewrite messages before each LLM call           | advisory |
+| turn_start         | Turn begins (after pre_input)                   | lifecycle |
+| turn_end           | Turn ends (before session_stop)                 | lifecycle |
+| session_start      | When a turn starts (prompt received)            | lifecycle |
+| session_stop       | When a turn ends (done/abort) — per-turn        | lifecycle |
+| session_shutdown   | Process/session teardown (once, stdin EOF)      | lifecycle |
+| pre_compact        | Before conversation compaction                  | lifecycle |
+| pre_turn           | Vision handoff only (image-gated; advisory)     | advisory |
 
-### pre_turn hook (model handoff)
+PI doc aliases: `pre_input`≈`input`, `pre_agent_start`≈`before_agent_start`,
+`pre_context`≈`context`, `turn_*`≈`turn_*`. Prefer Catalyst-native names.
 
-`pre_turn` fires once per assistant turn, after the user message (including any
-attached images) is built and before the first model request. It is advisory:
-it can remap the model for the turn but can never block it (a missing/broken
-hook or `allow:false` is ignored — the turn proceeds with the original model).
+### pre_turn hook (vision handoff — not a general turn hook)
+
+`pre_turn` fires **only when images are attached**, after the user message is
+built and before the first model request. It is advisory and vision-specific:
+it can remap the model for the turn but can never block it. For general turn
+boundaries use `turn_start` / `turn_end`. For input/prompt/context surgery use
+`pre_input` / `pre_agent_start` / `pre_context`.
 
 Context `args` (set `pass_args: true` in the manifest):
 ```
