@@ -8,7 +8,7 @@
 # build) is needed on the host. The TUI needs zero host deps; the web
 # service only needs a Node OR Bun runtime to run (not to build).
 #
-#   bash install.sh                       # interactive menu (no args, in a terminal)
+#   bash install.sh                       # interactive menu + optional settings prompts
 #   bash install.sh --install             # download + install catcode (skip menu)
 #   bash install.sh --with-web             # …also install the web service
 #   bash install.sh --add-web              # add the web service to an existing install
@@ -43,6 +43,7 @@
 #   --log-file <path>     write a log here      (default: ~/catalyst-code-install.log)
 #   --no-log              disable logging
 #   --no-color           disable ANSI colors
+#   (interactive menu also offers Customize install settings: prefix/web-dir/port/host/version/base-url)
 #   --dry-run            print the plan, execute nothing
 #   -h, --help           show this help
 # ============================================================
@@ -339,10 +340,14 @@ detect_runtime() {
       die "neither bun nor npm found — install one to BUILD the web frontend (https://bun.sh or https://nodejs.org)"
     fi
   else
-    # Prefer Node for the prebuilt Next standalone server; native addons
-    # (node-pty, better-sqlite3) are more reliable under Node than Bun.
+    # Prefer Node for the prebuilt Next standalone server; both Node and Bun run
+    # the same bundled JavaScript (no native rebuilds required).
     if have node; then
       RUNTIME="node"; RT_BIN="$(command -v node)"; RT="node"
+      local node_ver; node_ver="$(node -v | tr -d 'v')"
+      if ! ver_ge "22.13.0" "$node_ver"; then
+        die "Node.js >= 22.13.0 is required (found v${node_ver}); the web frontend uses node:sqlite"
+      fi
     elif have bun; then
       RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
     else
@@ -409,7 +414,13 @@ verify_sha256() {
   local f="$1" sf="$2" expected actual
   [[ -f "$sf" ]] || die "missing checksum file: $sf"
   expected="$(awk '{print $1; exit}' "$sf")"
-  actual="$(sha256sum "$f" | awk '{print $1}')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$f" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$f" | awk '{print $1}')"
+  else
+    die "missing sha256sum or shasum (needed to verify downloads)"
+  fi
   if [[ "$expected" != "$actual" ]]; then
     die "checksum mismatch for $(basename "$f")
   expected $expected
@@ -469,7 +480,7 @@ install_web_download() {
   if ! $SKIP_SERVICE; then
     protect_existing_web_service
   fi
-  local web_asset="catcode-web-${VER}.tar.gz"
+  local web_asset="catcode-web-${VER}-${OS_TAG}-${ARCH}.tar.gz"
   fetch_asset "$web_asset"
   run_root "Creating $WEB_DIR" mkdir -p "$WEB_DIR"
   # Clean stale contents so an update doesn't leave old chunks.
@@ -551,7 +562,7 @@ validate_web_bundle() {
   ./release-web.sh and pass --base-url / --version pointing at that artifact."
   fi
   local req
-  for req in next ws node-pty better-sqlite3 better-auth; do
+  for req in next ws @lydell/node-pty better-auth; do
     [[ -f "$dir/node_modules/$req/package.json" ]] || \
       die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start).
   Use a newer catcode-web-*.tar.gz built by current release-web.sh."
@@ -717,7 +728,7 @@ check_deps_download() {
   have curl     || missing+=("curl")
   have sha256sum || missing+=("sha256sum (coreutils)")
   if $WITH_WEB; then
-    have bun || have node || have npm || missing+=("bun or node (to RUN the web frontend — https://bun.sh or https://nodejs.org)")
+    have node || have bun || missing+=("Node.js >= 22.13.0 or Bun (to RUN the web frontend — https://nodejs.org or https://bun.sh)")
   fi
   if [[ ${#missing[@]} -gt 0 ]]; then
     printf "\n  ${C_BOLD}${C_RED}Missing dependencies:${C_RST}\n" >&2
@@ -1410,6 +1421,96 @@ summary_add_web() {
   log_warn "Auth: on first launch use /login to paste an API key or complete OAuth — nothing is auto-detected."
 }
 
+# ── interactive install settings (menu path only) ─────────────
+# Prompt for common knobs; Enter keeps the shown default. Only runs on a
+# real TTY after the menu — flagged installs (curl|bash, CI) skip this.
+prompt_value() {
+  local label="$1" default="$2" ans
+  if [[ -n "$default" ]]; then
+    read -rp "  ${C_CYAN}${label}${C_RST} [${C_DIM}${default}${C_RST}]: " ans || true
+  else
+    read -rp "  ${C_CYAN}${label}${C_RST} [${C_DIM}empty / latest${C_RST}]: " ans || true
+  fi
+  if [[ -z "${ans:-}" ]]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$ans"
+  fi
+}
+
+default_web_dir_prompt() {
+  if [[ -n "$WEB_DIR_OVERRIDE" ]]; then
+    printf '%s' "$WEB_DIR_OVERRIDE"
+  elif [[ "$PLATFORM" == "Darwin" ]]; then
+    printf '%s' "$HOME/Library/Application Support/catalyst-code/web"
+  else
+    printf '%s' "/opt/catalyst-code/web"
+  fi
+}
+
+prompt_install_options() {
+  [[ -t 0 ]] || return 0
+  case "$ACTION" in
+    install|add-web|update|reinstall) ;;
+    *) return 0 ;;
+  esac
+
+  local customize=""
+  printf "\n"
+  read -rp "  Customize install settings (paths, port, version)? [y/N]: " customize || true
+  case "${customize:-}" in
+    y|Y|yes|YES) ;;
+    *)
+      log_info "Using defaults (prefix=$PREFIX port=$PORT host=$HOST)"
+      return 0
+      ;;
+  esac
+
+  printf "\n  ${C_BOLD}Install settings${C_RST}  ${C_DIM}(press Enter to keep each default)${C_RST}\n\n"
+
+  local v
+  v="$(prompt_value "Binary install directory" "$PREFIX")"
+  PREFIX="$v"
+
+  v="$(prompt_value "Release version pin" "${VERSION_OVERRIDE}")"
+  VERSION_OVERRIDE="$v"
+
+  v="$(prompt_value "Download base URL (mirror)" "${BASE_URL_OVERRIDE}")"
+  BASE_URL_OVERRIDE="$v"
+
+  local want_web=false
+  $WITH_WEB && want_web=true
+  [[ "$ACTION" == "add-web" ]] && want_web=true
+  if ! $want_web && [[ "$ACTION" == "update" || "$ACTION" == "reinstall" ]]; then
+    if [[ -f "$STATE_FILE" ]] && grep -Eq '^WEB_INSTALLED="yes"' "$STATE_FILE" 2>/dev/null; then
+      want_web=true
+    fi
+  fi
+
+  if $want_web; then
+    v="$(prompt_value "Web bundle directory" "$(default_web_dir_prompt)")"
+    WEB_DIR_OVERRIDE="$v"
+
+    while true; do
+      v="$(prompt_value "Web service port" "$PORT")"
+      if [[ "$v" =~ ^[0-9]+$ ]] && ((10#$v >= 1 && 10#$v <= 65535)); then
+        PORT="$v"
+        break
+      fi
+      printf "  ${C_YELLOW}port must be an integer 1–65535${C_RST}\n"
+    done
+
+    v="$(prompt_value "Web bind host" "$HOST")"
+    HOST="$v"
+  fi
+
+  printf "\n"
+  log_ok "Will use: prefix=$PREFIX  port=$PORT  host=$HOST"
+  [[ -n "$VERSION_OVERRIDE" ]] && log_ok "version pin: $VERSION_OVERRIDE"
+  [[ -n "$BASE_URL_OVERRIDE" ]] && log_ok "base URL: $BASE_URL_OVERRIDE"
+  [[ -n "$WEB_DIR_OVERRIDE" ]] && log_ok "web dir: $WEB_DIR_OVERRIDE"
+}
+
 # ── interactive menu (no args + a terminal) ──────────────────
 show_menu() {
   local v=""
@@ -1455,6 +1556,7 @@ main() {
   # or a non-TTY stdin such as `curl … | bash`) runs the action directly.
   if [[ $# -eq 0 && -t 0 ]]; then
     show_menu
+    prompt_install_options
   else
     parse_args "$@"
   fi

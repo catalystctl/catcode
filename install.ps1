@@ -70,7 +70,7 @@
     Disable colored output.
 
 .EXAMPLE
-    .\install.ps1                  # interactive menu (no params, in a terminal)
+    .\install.ps1                  # interactive menu + optional settings prompts
     .\install.ps1 -WithWeb -Port 8080 -BindHost 127.0.0.1
     .\install.ps1 -Version 0.2.0
     .\install.ps1 -Update
@@ -288,10 +288,16 @@ $script:RT = $null
 $script:RTExe = $null
 
 function Detect-Runtime {
-    # Prefer Node for the prebuilt Next standalone server; native addons are
-    # more reliable under Node than Bun.
+    # Prefer Node for the prebuilt Next standalone server; both Node and Bun run
+    # the same bundled JavaScript (no native rebuilds required).
     $node = Get-Command node -ErrorAction SilentlyContinue
-    if ($node) { $script:RT = 'node'; $script:RTExe = $node.Source; return }
+    if ($node) {
+        $nodeVer = (& node --version) -replace '^v',''
+        if ([version]$nodeVer -lt [version]'22.13.0') {
+            Die "Node.js >= 22.13.0 is required (found v${nodeVer}); the web frontend uses node:sqlite"
+        }
+        $script:RT = 'node'; $script:RTExe = $node.Source; return
+    }
     $bun = Get-Command bun -ErrorAction SilentlyContinue
     if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
     Die 'neither node nor bun found - install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
@@ -318,7 +324,7 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
   Use a newer catcode-web-*.tar.gz built by current release-web.sh.
 "@
     }
-    foreach ($req in @('next', 'ws', 'node-pty', 'better-sqlite3', 'better-auth')) {
+    foreach ($req in @('next', 'ws', '@lydell/node-pty', 'better-auth')) {
         $pkg = Join-Path $Dir "node_modules\$req\package.json"
         if (-not (Test-Path -LiteralPath $pkg)) {
             Die "web bundle missing node_modules/$req - incomplete release artifact (custom server cannot start)."
@@ -331,21 +337,7 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
 }
 
 function Install-WebBundle {
-    # Newer releases ship a Windows-built web bundle that already contains the
-    # correct native .node binaries. Prefer it so users don't need a C++ compiler.
-    $winBundle = "catcode-web-$($script:Ver)-windows.tar.gz"
-    $genericBundle = "catcode-web-$($script:Ver).tar.gz"
-    $bundleName = $winBundle
-    try {
-        $tgz = Get-Asset $winBundle
-        W-Info "Using Windows web bundle ($winBundle)"
-    } catch {
-        W-Warn "Windows web bundle not available - falling back to cross-platform bundle."
-        W-Warn '  (A Windows-specific bundle will be built by CI in the next release.)'
-        $bundleName = $genericBundle
-        $tgz = Get-Asset $genericBundle
-    }
-
+    $tgz = Get-Asset "catcode-web-$($script:Ver)-windows-x86_64.tar.gz"
     if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
     Get-ChildItem -LiteralPath $WebDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.
@@ -356,28 +348,6 @@ function Install-WebBundle {
     if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
     Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
     Assert-WebBundle -Dir $WebDir
-
-    # The generic (cross-platform) bundle is built on Linux/macOS CI; native modules
-    # (better-sqlite3, node-pty) contain platform-specific .node binaries. Rebuild
-    # them for the target host so Windows installs don't load an ELF binary.
-    if ($bundleName -eq $genericBundle) {
-        W-Info 'Installing native modules for this platform ...'
-        Push-Location $WebDir
-        try {
-            if ($script:RT -eq 'bun') {
-                $ec = Invoke-Native bun install
-                if ($ec -ne 0) { Die "bun install failed (exit $ec)" }
-            } else {
-                $npm = Get-Command npm -ErrorAction SilentlyContinue
-                if (-not $npm) { Die 'node found but npm is not on PATH - cannot rebuild native modules' }
-                $ec = Invoke-Native $npm.Source rebuild better-sqlite3 node-pty
-                if ($ec -ne 0) {
-                    Die "npm rebuild failed (exit $ec). A Windows-specific web bundle avoids this; until it is available, install Visual Studio Build Tools (Desktop development with C++) and re-run."
-                }
-            }
-        } finally { Pop-Location }
-        W-Ok 'Native modules installed for this platform'
-    }
 
     W-Ok "Web bundle extracted to $WebDir"
 }
@@ -747,6 +717,71 @@ function Show-Menu {
     }
 }
 
+# Interactive settings prompts (menu path only). Enter keeps each default.
+# Changing Port / BindHost / WebDir here feeds straight into the NSSM/task
+# service install so the web URL updates automatically.
+function Prompt-Value {
+    param([string]$Label, [string]$Default = '')
+    $hint = if ($Default) { $Default } else { 'empty / latest' }
+    $ans = Read-Host "  $Label [$hint]"
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
+    return $ans.Trim()
+}
+
+function Prompt-InstallOptions {
+    param([string]$Action)
+    switch ($Action) {
+        'install' { }
+        'add-web' { }
+        'update' { }
+        'reinstall' { }
+        default { return }
+    }
+
+    Write-Host ''
+    $customize = Read-Host '  Customize install settings (paths, port, version)? [y/N]'
+    if ($customize -notmatch '^(?i)y(es)?$') {
+        W-Info "Using defaults (install=$InstallDir port=$Port host=$BindHost)"
+        return
+    }
+
+    Write-Host ''
+    Write-Host '  Install settings  (press Enter to keep each default)' -ForegroundColor Cyan
+    Write-Host ''
+
+    $script:InstallDir = Prompt-Value 'Binary install directory' $InstallDir
+    $script:Version    = Prompt-Value 'Release version pin' $Version
+    $script:BaseUrl    = Prompt-Value 'Download base URL (mirror)' $BaseUrl
+
+    $wantWeb = [bool]$script:WithWeb -or ($Action -eq 'add-web')
+    if (-not $wantWeb -and ($Action -eq 'update' -or $Action -eq 'reinstall')) {
+        $st = Load-State
+        if ($st -and $st.with_web -eq 'yes') { $wantWeb = $true }
+    }
+
+    if ($wantWeb) {
+        $script:WebDir = Prompt-Value 'Web bundle directory' $WebDir
+
+        while ($true) {
+            $raw = Prompt-Value 'Web service port' "$Port"
+            $p = 0
+            if ([int]::TryParse($raw, [ref]$p) -and $p -ge 1 -and $p -le 65535) {
+                $script:Port = $p
+                break
+            }
+            Write-Host '  port must be an integer 1-65535' -ForegroundColor Yellow
+        }
+
+        $script:BindHost = Prompt-Value 'Web bind host' $BindHost
+    }
+
+    Write-Host ''
+    W-Ok "Will use: install=$($script:InstallDir)  port=$($script:Port)  host=$($script:BindHost)"
+    if ($script:Version) { W-Ok "version pin: $($script:Version)" }
+    if ($script:BaseUrl) { W-Ok "base URL: $($script:BaseUrl)" }
+    if ($wantWeb) { W-Ok "web dir: $($script:WebDir)" }
+}
+
 function Do-AddWeb {
     Write-Host ''
     Write-Host '  Catalyst Code - add web service' -ForegroundColor Cyan
@@ -828,6 +863,7 @@ try { $canMenu = (-not [Console]::IsInputRedirected) -and [Environment]::UserInt
 # resolution that happens earlier in the script.
 if ($PSBoundParameters.Count -eq 0 -and $canMenu) {
     $action = Show-Menu
+    Prompt-InstallOptions -Action $action
 } else {
     if ($Help) { Show-Help; return }
     if ($Update -and $Uninstall) { Die 'cannot combine -Update and -Uninstall.' }

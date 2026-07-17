@@ -1,29 +1,47 @@
 #!/usr/bin/env bash
-# Build a READY-TO-RUN web frontend bundle for the Catalyst Code.
+# Build a READY-TO-RUN, platform-specific web frontend bundle for the Catalyst Code.
 #
-#   dist/catcode-web-<ver>.tar.gz   (+ .sha256)
+#   dist/catcode-web-<ver>-<platform>.tar.gz   (+ .sha256)
 #
 # The tarball contains Next.js's "standalone" output: a server.js + the
 # minimal node_modules it needs + the static/ and public/ assets. It runs
-# under any Node >= 18 (or Bun) with NO `next build` on the host:
+# under Node >= 22.13.0 (or Bun) with NO `next build` on the host:
 #
-#     tar xzf catcode-web-<ver>.tar.gz
+#     tar xzf catcode-web-<ver>-<platform>.tar.gz
 #     PORT=49283 HOSTNAME=0.0.0.0 CATCODE_CORE=/usr/local/bin/catcode-core \
 #       node server.js
 #
-# The web application is portable, while its real terminal uses node-pty's
-# native binding. Build the artifact on the Linux architecture it will run on;
-# node-pty's packaged macOS/Windows prebuilds remain available for local use.
+# The bundle is platform-specific because the terminal uses @lydell/node-pty,
+# a prebuilt (no node-gyp) distribution that ships only the binary for the
+# build host. Build the artifact on the OS/arch it will run on.
 # Requires Bun (https://bun.sh) or Node+npm to BUILD (on the release host),
 # and Node or Bun to RUN (on the install host). `install.sh --with-web` /
-# `install.ps1 -WithWeb` download this tarball instead of building.
+# `install.ps1 -WithWeb` download the correct platform tarball instead of building.
 #
 #   ./release-web.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
-OUT="dist/catcode-web-${VERSION}.tar.gz"
+
+# Platform suffix for the artifact name. Override with CATCODE_WEB_PLATFORM_SUFFIX.
+detect_platform_suffix() {
+  local kernel arch
+  kernel="$(uname -s)"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="arm64" ;;
+  esac
+  case "$kernel" in
+    Linux)  echo "linux-${arch}" ;;
+    Darwin) echo "macos-${arch}" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "windows-x86_64" ;;
+    *)      echo "${kernel}-${arch}" ;;
+  esac
+}
+PLATFORM_SUFFIX="${CATCODE_WEB_PLATFORM_SUFFIX:-$(detect_platform_suffix)}"
+OUT="dist/catcode-web-${VERSION}-${PLATFORM_SUFFIX}.tar.gz"
 
 # --- runtime (bun preferred, npm fallback) ----------------------------------
 RT="" RT_BIN=""
@@ -60,7 +78,7 @@ echo "[4b/5] web: bundle custom server (esbuild) -> .server-bundle.js..."
 ( cd web && ./node_modules/.bin/esbuild src/server/server.ts \
     --bundle --platform=node --format=esm \
     --outfile=.server-bundle.js \
-    --external:next --external:ws --external:node-pty --external:better-sqlite3 --external:kysely \
+    --external:next --external:ws --external:@lydell/node-pty --external:kysely \
     --external:better-auth --external:@better-auth/passkey \
     --external:@catalyst-code/coding-agent )
 
@@ -129,14 +147,14 @@ copy_runtime_package() {
 }
 
 for pkg in \
-  next ws node-pty node-addon-api better-sqlite3 kysely \
-  better-auth @better-auth/passkey @catalyst-code/coding-agent; do
+  next ws @lydell/node-pty kysely \
+  better-auth @better-auth/passkey @better-auth/kysely-adapter @catalyst-code/coding-agent; do
   copy_runtime_package "$pkg"
 done
 
 # npm installs optional native packages for more than one libc/architecture in
 # some environments (notably Next SWC and sharp). A release bundle is already
-# host-specific because of node-pty, so keep only packages compatible with the
+# host-specific because of @lydell/node-pty, so keep only packages compatible with the
 # build host. This avoids shipping both glibc and musl binaries in one artifact.
 node - "$STAGE/node_modules" <<'NODE'
 const fs = require("node:fs");
@@ -206,8 +224,7 @@ node -e '
     private: true,
     type: "module",
     dependencies: {
-      "better-sqlite3": versionOf("better-sqlite3"),
-      "node-pty": versionOf("node-pty")
+      "@lydell/node-pty": versionOf("@lydell/node-pty")
     }
   }, null, 2) + "\n");
 ' "$STAGE"
@@ -262,7 +279,7 @@ fi
 [[ -f "$STAGE/package.json" ]] || { echo "error: staged bundle missing package.json" >&2; exit 1; }
 [[ -f "$STAGE/.next/BUILD_ID" ]] || { echo "error: staged bundle missing .next/BUILD_ID" >&2; exit 1; }
 [[ -f "$STAGE/version.json" ]] || { echo "error: staged bundle missing version.json" >&2; exit 1; }
-for req in next ws node-pty better-sqlite3 kysely better-auth @better-auth/passkey @catalyst-code/coding-agent; do
+for req in next ws @lydell/node-pty kysely better-auth @better-auth/passkey @better-auth/kysely-adapter @catalyst-code/coding-agent; do
   [[ -f "$STAGE/node_modules/$req/package.json" ]] || {
     echo "error: staged bundle missing node_modules/$req (custom server cannot start)" >&2
     exit 1
@@ -271,7 +288,7 @@ done
 # Resolve the custom server's critical imports the same way install hosts will.
 (
   cd "$STAGE"
-  node --input-type=module -e 'await Promise.all(["next","ws","better-sqlite3","better-auth","@catalyst-code/coding-agent"].map((m)=>import(m))); console.log("runtime imports OK")'
+  node --input-type=module -e 'await Promise.all(["next","ws","@lydell/node-pty","better-auth","@catalyst-code/coding-agent"].map((m)=>import(m))); console.log("runtime imports OK")'
 ) || { echo "error: staged bundle failed module resolution smoke test" >&2; exit 1; }
 
 echo "==> version.json commit=${COMMIT_SHORT} dirty=${DIRTY}"

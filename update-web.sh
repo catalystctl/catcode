@@ -4,8 +4,12 @@ set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE="${CATALYST_WEB_SERVICE:-catalyst-code-web.service}"
-BUN="${BUN:-/home/karutoil/.bun/bin/bun}"
-NODE="${NODE:-/home/karutoil/.nvm/versions/node/v22.22.2/bin/node}"
+# Env override → PATH → common bun install location (not a machine-specific absolute).
+BUN="${BUN:-$(command -v bun 2>/dev/null || true)}"
+if [[ -z "$BUN" && -x "${HOME}/.bun/bin/bun" ]]; then
+  BUN="${HOME}/.bun/bin/bun"
+fi
+NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
 PUBLIC_ORIGIN="${CATCODE_WEB_ORIGIN:-https://cc.karutoil.site}"
 PULL=1
 RUN_TESTS=1
@@ -102,6 +106,10 @@ echo "==> Building the standalone web bundle with Node"
 }
 
 echo "==> Restarting $SERVICE"
+# systemd 203/EXEC if the launcher lost +x (git checkout / copy without mode bits).
+if [[ -f scripts/run-web.sh ]]; then
+  chmod +x scripts/run-web.sh
+fi
 "${SYSTEMCTL[@]}" stop "$SERVICE"
 SERVICE_STOPPED=1
 "${SYSTEMCTL[@]}" start "$SERVICE"
