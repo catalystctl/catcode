@@ -354,6 +354,27 @@ export interface WorkState {
   last_activity: string;
 }
 
+/** Structured review / verify verdict from CEO goal events / `goal_state`. */
+export interface GoalVerdict {
+  ok: boolean;
+  summary: string;
+  evidence_paths?: string[];
+  /** Unix epoch ms (`at` on the wire). */
+  at?: number;
+}
+
+/** One verify→replan cycle (or pre-deploy plan-revision wave) for Control Center. */
+export interface GoalIterationRecord {
+  iteration: number;
+  plan_revision?: number;
+  review_verdict?: GoalVerdict | null;
+  verify_verdict?: GoalVerdict | null;
+  remaining_gaps?: string[];
+  /** Prompt snapshot when the iteration was last updated. */
+  prompts?: GoalPrompt[];
+  certified?: boolean;
+}
+
 /** First-class goal mode snapshot from `goal_state` events. */
 export interface GoalModeState {
   id: string;
@@ -364,6 +385,19 @@ export interface GoalModeState {
   allowed_models: string[];
   allowed_providers: string[];
   auto_deploy: boolean;
+  /** Autonomous Control Center CEO loop (self-review + verify/replan). */
+  ceo_mode?: boolean;
+  /** Wire: `"ceo"` | `"single_pass"`. */
+  mode?: string;
+  iteration?: number;
+  max_iterations?: number;
+  plan_revision?: number;
+  max_plan_revisions?: number;
+  review_verdict?: GoalVerdict | null;
+  verify_verdict?: GoalVerdict | null;
+  remaining_gaps?: string[];
+  self_review_feedback?: string | null;
+  certified?: boolean;
   role_models?: {
     planner?: string | null;
     worker?: string | null;
@@ -470,6 +504,39 @@ export type CoreEvent =
       run_id?: string;
     }
   | { type: "goal_completion_summary"; text?: string; summary?: string }
+  | {
+      type: "goal_iteration";
+      id?: string;
+      iteration: number;
+      max_iterations: number;
+      plan_revision?: number;
+      max_plan_revisions?: number;
+    }
+  | {
+      type: "goal_review_verdict";
+      id?: string;
+      ok: boolean;
+      summary: string;
+      iteration?: number;
+      plan_revision?: number;
+      evidence_paths?: string[];
+    }
+  | {
+      type: "goal_verify_verdict";
+      id?: string;
+      ok: boolean;
+      summary: string;
+      iteration?: number;
+      remaining_gaps?: string[];
+      evidence_paths?: string[];
+    }
+  | {
+      type: "goal_certified";
+      id?: string;
+      summary: string;
+      iteration?: number;
+      certified?: boolean;
+    }
   | { type: "search_key_set"; provider: string; has_key: boolean }
   | { type: "plugin_commands"; commands: unknown[] }
   | { type: "plugin_status"; plugin: string; text: string }
@@ -649,6 +716,9 @@ export type CoreCommand =
       allowed_models?: string[];
       allowed_providers?: string[];
       auto_deploy?: boolean;
+      ceo_mode?: boolean;
+      max_iterations?: number;
+      max_plan_revisions?: number;
       planner_model?: string;
       worker_model?: string;
       reviewer_model?: string;
@@ -846,6 +916,8 @@ export interface AgentState {
   goalMode: GoalModeState | null;
   /** Last structured plan from `goal_plan` (for plan-ready review). */
   goalPlan: GoalPlan | null;
+  /** CEO / Control Center iteration history (verify→replan cycles). */
+  goalIterations: GoalIterationRecord[];
   /** Protocol capabilities handshake from `protocol_hello`. */
   protocolHello: ProtocolHello | null;
   /** Latest `cost_update` totals (session-scoped estimate). */

@@ -65,6 +65,7 @@ export const initialState: AgentState = {
   workState: null,
   goalMode: null,
   goalPlan: null,
+  goalIterations: [],
   protocolHello: null,
   cost: null,
   checkpoints: [],
@@ -214,18 +215,26 @@ function finishTurn(state: AgentState): AgentState {
 function goalKeepsStreaming(goal: AgentState["goalMode"]): boolean {
   if (!goal) return false;
   return (
+    goal.phase === "planning" ||
+    goal.phase === "reviewing" ||
     goal.phase === "deploying" ||
     goal.phase === "running" ||
     goal.phase === "synthesizing" ||
+    goal.phase === "verifying" ||
+    goal.phase === "replanning" ||
     (goal.phase === "plan_ready" && goal.auto_deploy)
   );
 }
 
 const GOAL_TERMINAL_STATUSES = new Set(["done", "failed", "skipped"]);
 const GOAL_LASTING_PHASES = new Set([
+  "planning",
+  "reviewing",
   "deploying",
   "running",
   "synthesizing",
+  "verifying",
+  "replanning",
   "done",
   "failed",
 ]);
@@ -238,6 +247,35 @@ function truncateGoalSummary(text: string, max = 800): string {
   const t = String(text ?? "").trim();
   if (!t) return "(step finished with no written summary)";
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+function parseGoalVerdict(raw: unknown): import("./types").GoalVerdict | null {
+  if (!raw || typeof raw !== "object") return null;
+  const v = raw as Record<string, unknown>;
+  return {
+    ok: !!v.ok,
+    summary: String(v.summary ?? ""),
+    evidence_paths: Array.isArray(v.evidence_paths)
+      ? v.evidence_paths.map((p) => String(p))
+      : undefined,
+    at: typeof v.at === "number" ? v.at : undefined,
+  };
+}
+
+function upsertGoalIteration(
+  list: AgentState["goalIterations"],
+  iteration: number,
+  patch: Partial<AgentState["goalIterations"][number]>,
+): AgentState["goalIterations"] {
+  const next = [...(list ?? [])];
+  const idx = next.findIndex((r) => r.iteration === iteration);
+  if (idx < 0) {
+    next.push({ iteration, ...patch });
+    next.sort((a, b) => a.iteration - b.iteration);
+    return next;
+  }
+  next[idx] = { ...next[idx], ...patch };
+  return next;
 }
 
 function storeGoalStepFinal(
@@ -939,6 +977,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           goalMode: null,
           goalPlan: null,
           goalStepFinals: {},
+          goalIterations: [],
         };
       }
       return {
@@ -957,6 +996,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         goalMode: null,
         goalPlan: null,
         goalStepFinals: {},
+        goalIterations: [],
         subagentRuns: {},
         metrics: null,
       };
@@ -1237,6 +1277,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         goalMode: null,
         goalPlan: null,
         goalStepFinals: {},
+        goalIterations: [],
         subagentRuns: {},
         metrics: null,
       };
@@ -1336,7 +1377,13 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     case "goal_state": {
       if (!ev.id || ev.phase === "idle") {
-        return { ...state, goalMode: null, goalPlan: null, goalStepFinals: {} };
+        return {
+          ...state,
+          goalMode: null,
+          goalPlan: null,
+          goalStepFinals: {},
+          goalIterations: [],
+        };
       }
       const goalMode = {
         id: ev.id,
@@ -1347,6 +1394,21 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         allowed_models: ev.allowed_models ?? [],
         allowed_providers: ev.allowed_providers ?? [],
         auto_deploy: ev.auto_deploy,
+        ceo_mode: !!ev.ceo_mode,
+        mode: ev.mode != null ? String(ev.mode) : ev.ceo_mode ? "ceo" : "single_pass",
+        iteration: typeof ev.iteration === "number" ? ev.iteration : 0,
+        max_iterations: typeof ev.max_iterations === "number" ? ev.max_iterations : 0,
+        plan_revision: typeof ev.plan_revision === "number" ? ev.plan_revision : 0,
+        max_plan_revisions:
+          typeof ev.max_plan_revisions === "number" ? ev.max_plan_revisions : 0,
+        review_verdict: parseGoalVerdict(ev.review_verdict),
+        verify_verdict: parseGoalVerdict(ev.verify_verdict),
+        remaining_gaps: Array.isArray(ev.remaining_gaps)
+          ? ev.remaining_gaps.map((g: unknown) => String(g))
+          : [],
+        self_review_feedback:
+          ev.self_review_feedback != null ? String(ev.self_review_feedback) : null,
+        certified: !!ev.certified,
         role_models: ev.role_models,
         model_concurrency: ev.model_concurrency,
         prompts: ev.prompts ?? [],
@@ -1356,9 +1418,21 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         parent_model: ev.parent_model ?? "",
       };
       const terminal = ev.phase === "done" || ev.phase === "failed";
+      let goalIterations = state.goalIterations ?? [];
+      if (goalMode.ceo_mode) {
+        goalIterations = upsertGoalIteration(goalIterations, goalMode.iteration ?? 0, {
+          plan_revision: goalMode.plan_revision,
+          review_verdict: goalMode.review_verdict,
+          verify_verdict: goalMode.verify_verdict,
+          remaining_gaps: goalMode.remaining_gaps,
+          prompts: goalMode.prompts,
+          certified: goalMode.certified,
+        });
+      }
       let next: AgentState = {
         ...state,
         goalMode,
+        goalIterations,
         streaming: goalKeepsStreaming(goalMode) ? true : terminal ? false : state.streaming,
       };
       // Belt-and-suspenders: lasting step cards from prompts when core has not
@@ -1452,6 +1526,170 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         text: truncateGoalSummary(output || (ok ? "passed" : "failed")),
         ok,
         status: ok ? "done" : "failed",
+      });
+      return next;
+    }
+    case "goal_iteration": {
+      const iteration = typeof ev.iteration === "number" ? ev.iteration : 0;
+      const goalMode = state.goalMode
+        ? {
+            ...state.goalMode,
+            iteration,
+            max_iterations:
+              typeof ev.max_iterations === "number"
+                ? ev.max_iterations
+                : state.goalMode.max_iterations,
+            plan_revision:
+              typeof ev.plan_revision === "number"
+                ? ev.plan_revision
+                : state.goalMode.plan_revision,
+            max_plan_revisions:
+              typeof ev.max_plan_revisions === "number"
+                ? ev.max_plan_revisions
+                : state.goalMode.max_plan_revisions,
+          }
+        : state.goalMode;
+      return {
+        ...state,
+        goalMode,
+        goalIterations: upsertGoalIteration(state.goalIterations ?? [], iteration, {
+          plan_revision:
+            typeof ev.plan_revision === "number" ? ev.plan_revision : undefined,
+        }),
+      };
+    }
+    case "goal_review_verdict": {
+      const verdict = {
+        ok: !!ev.ok,
+        summary: String(ev.summary ?? ""),
+        evidence_paths: Array.isArray(ev.evidence_paths)
+          ? ev.evidence_paths.map((p: unknown) => String(p))
+          : undefined,
+      };
+      const iteration =
+        typeof ev.iteration === "number"
+          ? ev.iteration
+          : (state.goalMode?.iteration ?? 0);
+      const goalMode = state.goalMode
+        ? { ...state.goalMode, review_verdict: verdict }
+        : state.goalMode;
+      let next: AgentState = {
+        ...state,
+        goalMode,
+        goalIterations: upsertGoalIteration(state.goalIterations ?? [], iteration, {
+          plan_revision:
+            typeof ev.plan_revision === "number" ? ev.plan_revision : undefined,
+          review_verdict: verdict,
+        }),
+        toasts: pushToast(
+          state.toasts,
+          verdict.ok ? "success" : "info",
+          verdict.ok
+            ? `Plan review passed${verdict.summary ? `: ${verdict.summary.slice(0, 120)}` : ""}`
+            : `Plan review revise${verdict.summary ? `: ${verdict.summary.slice(0, 120)}` : ""}`,
+        ),
+      };
+      next = appendGoalMsg(next, {
+        kind: "verdict",
+        title: verdict.ok ? "Plan review · pass" : "Plan review · revise",
+        text: truncateGoalSummary(verdict.summary || (verdict.ok ? "passed" : "revise")),
+        ok: verdict.ok,
+        status: verdict.ok ? "done" : "failed",
+      });
+      return next;
+    }
+    case "goal_verify_verdict": {
+      const gaps = Array.isArray(ev.remaining_gaps)
+        ? ev.remaining_gaps.map((g: unknown) => String(g))
+        : [];
+      const verdict = {
+        ok: !!ev.ok,
+        summary: String(ev.summary ?? ""),
+        evidence_paths: Array.isArray(ev.evidence_paths)
+          ? ev.evidence_paths.map((p: unknown) => String(p))
+          : undefined,
+      };
+      const iteration =
+        typeof ev.iteration === "number"
+          ? ev.iteration
+          : (state.goalMode?.iteration ?? 0);
+      const goalMode = state.goalMode
+        ? {
+            ...state.goalMode,
+            verify_verdict: verdict,
+            remaining_gaps: gaps,
+            certified: verdict.ok ? true : state.goalMode.certified,
+          }
+        : state.goalMode;
+      let next: AgentState = {
+        ...state,
+        goalMode,
+        lastGoalVerdict: { ok: verdict.ok, output: verdict.summary },
+        goalIterations: upsertGoalIteration(state.goalIterations ?? [], iteration, {
+          verify_verdict: verdict,
+          remaining_gaps: gaps,
+          prompts: goalMode?.prompts,
+          certified: verdict.ok || undefined,
+        }),
+        toasts: pushToast(
+          state.toasts,
+          verdict.ok ? "success" : "error",
+          verdict.ok
+            ? `Verify certified${verdict.summary ? `: ${verdict.summary.slice(0, 120)}` : ""}`
+            : `Verify gaps${verdict.summary ? `: ${verdict.summary.slice(0, 120)}` : ""}`,
+        ),
+      };
+      next = appendGoalMsg(next, {
+        kind: "verdict",
+        title: verdict.ok ? "Verify · certified" : "Verify · remaining gaps",
+        text: truncateGoalSummary(
+          [verdict.summary, gaps.length ? `Gaps: ${gaps.join("; ")}` : ""]
+            .filter(Boolean)
+            .join("\n") || (verdict.ok ? "certified" : "gaps remain"),
+        ),
+        ok: verdict.ok,
+        status: verdict.ok ? "done" : "failed",
+      });
+      return next;
+    }
+    case "goal_certified": {
+      const summary = String(ev.summary ?? "");
+      const iteration =
+        typeof ev.iteration === "number"
+          ? ev.iteration
+          : (state.goalMode?.iteration ?? 0);
+      const goalMode = state.goalMode
+        ? {
+            ...state.goalMode,
+            certified: true,
+            verify_verdict: state.goalMode.verify_verdict ?? {
+              ok: true,
+              summary,
+            },
+          }
+        : state.goalMode;
+      let next: AgentState = {
+        ...state,
+        goalMode,
+        goalIterations: upsertGoalIteration(state.goalIterations ?? [], iteration, {
+          certified: true,
+          verify_verdict: {
+            ok: true,
+            summary,
+          },
+        }),
+        toasts: pushToast(
+          state.toasts,
+          "success",
+          `Mission certified${summary ? `: ${summary.slice(0, 120)}` : ""}`,
+        ),
+      };
+      next = appendGoalMsg(next, {
+        kind: "completion_summary",
+        title: "Mission certified",
+        text: truncateGoalSummary(summary || "Goal certified complete.", 8000),
+        ok: true,
+        status: "done",
       });
       return next;
     }

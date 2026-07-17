@@ -21,6 +21,10 @@ export interface GoalStartOpts {
   allowed_models?: string[];
   allowed_providers?: string[];
   auto_deploy?: boolean;
+  /** Control Center: autonomous CEO loop (default false for classic /goal). */
+  ceo_mode?: boolean;
+  max_iterations?: number;
+  max_plan_revisions?: number;
   planner_model?: string;
   worker_model?: string;
   reviewer_model?: string;
@@ -469,7 +473,11 @@ export function GoalProgressPanel({
     <div className="rounded-lg border border-ink-800 bg-ink-925/70 px-3 py-2.5 text-[12px]">
       <div className="flex items-center gap-2">
         <span className="font-mono uppercase tracking-wide text-accent-soft">
-          {phase === "plan_ready" && goalMode.auto_deploy ? "starting" : phase}
+          {phase === "plan_ready" && goalMode.auto_deploy
+            ? "starting"
+            : phase === "done" && goalMode.certified
+              ? "certified"
+              : phase}
         </span>
         <span className="text-ink-500">
           {done}/{prompts.length || "?"}

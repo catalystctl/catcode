@@ -56,6 +56,8 @@ interface Props {
   onOpenSettings?: () => void;
   /** Chat-only: open project switcher (activity bar is hidden in this mode). */
   onOpenProjects?: () => void;
+  /** Open Control Center mission panel. */
+  onOpenControl?: () => void;
 }
 
 const ALL_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
@@ -281,7 +283,18 @@ export function Header(props: Props) {
                   Switch project
                 </button>
               )}
-              {props.onOpenSettings && (
+              {props.onOpenControl && (
+          <button
+            type="button"
+            onClick={props.onOpenControl}
+            className="rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100"
+            title="Control Center"
+            aria-label="Control Center"
+          >
+            <BoltIcon width={16} height={16} />
+          </button>
+        )}
+        {props.onOpenSettings && (
                 <button
                   role="menuitem"
                   onClick={() => {

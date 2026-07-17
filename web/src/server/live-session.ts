@@ -326,9 +326,10 @@ export class LiveSession {
         steer: false,
       });
     } else if (cmd.type === "start_goal") {
+      const label = cmd.ceo_mode ? "Mission" : "Goal";
       this.state = reduce(this.state, {
         type: "_user",
-        text: `🎯 Goal: ${cmd.goal}`,
+        text: `🎯 ${label}: ${cmd.goal}`,
         model: cmd.model,
         steer: false,
       });

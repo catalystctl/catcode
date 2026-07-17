@@ -13,7 +13,7 @@ import {
   readSessionPreferences,
   writeSessionPreferences,
 } from "@/lib/session-preferences";
-import {
+import { BoltIcon,
   PlusIcon, HistoryIcon, TrashIcon, CompactIcon, XIcon,
   BrainIcon, TerminalIcon, SparkIcon,
   SearchIcon, PencilIcon,
@@ -412,10 +412,11 @@ export function Sidebar(props: Props) {
 
         {/* ── Footer: quick actions + stats ── */}
         <div className="border-t border-ink-800/80 bg-ink-950/45 p-2.5">
-          <div className="grid grid-cols-4 gap-1">
+          <div className="grid grid-cols-5 gap-1">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
             <ActionBtn icon={<SparkIcon width={13} height={13} />} label="Agents" onClick={() => props.onOpenPanel("subagents")} />
+            <ActionBtn icon={<BoltIcon width={13} height={13} />} label="Control" onClick={() => props.onOpenPanel("control")} />
             <ActionBtn icon={<HelpIcon width={13} height={13} />} label="Help" onClick={() => props.onOpenPanel("help")} />
           </div>
           <div className="mt-2 grid grid-cols-3 gap-1 border-t border-ink-800/70 pt-2">

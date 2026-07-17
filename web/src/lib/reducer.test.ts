@@ -596,6 +596,7 @@ describe("goal_state idle clears plan", () => {
     const s = reduce(seeded, { type: "goal_state", id: "", phase: "idle" } as never);
     expect(s.goalMode).toBeNull();
     expect(s.goalPlan).toBeNull();
+    expect(s.goalIterations).toEqual([]);
   });
 });
 
@@ -1002,6 +1003,151 @@ describe("core protocol events", () => {
     });
     s = reduce(s, { type: "session_pinned", path: "/tmp/a.jsonl", pinned: true });
     expect(s.sessions[0].pinned).toBe(true);
+  });
+});
+
+
+describe("CEO / Control Center goal events", () => {
+  test("goal_state maps ceo fields and seeds goalIterations", () => {
+    const s = reduce(initialState, {
+      type: "goal_state",
+      id: "goal-1",
+      goal: "ship control center",
+      phase: "reviewing",
+      concurrency: 4,
+      max_tasks: 8,
+      allowed_models: [],
+      allowed_providers: [],
+      auto_deploy: true,
+      ceo_mode: true,
+      mode: "ceo",
+      iteration: 1,
+      max_iterations: 3,
+      plan_revision: 0,
+      max_plan_revisions: 2,
+      review_verdict: { ok: true, summary: "plan looks good", evidence_paths: [], at: 1 },
+      verify_verdict: null,
+      remaining_gaps: [],
+      certified: false,
+      prompts: [],
+      active_run_ids: [],
+      version: 2,
+      error: null,
+      parent_model: "m",
+    } as never);
+    expect(s.goalMode?.ceo_mode).toBe(true);
+    expect(s.goalMode?.phase).toBe("reviewing");
+    expect(s.goalMode?.iteration).toBe(1);
+    expect(s.goalMode?.review_verdict?.ok).toBe(true);
+    expect(s.goalIterations).toHaveLength(1);
+    expect(s.goalIterations[0].iteration).toBe(1);
+    expect(s.streaming).toBe(true);
+  });
+
+  test("goal_iteration upserts budget counters", () => {
+    let s = reduce(initialState, {
+      type: "goal_state",
+      id: "goal-1",
+      goal: "x",
+      phase: "verifying",
+      concurrency: 2,
+      max_tasks: 4,
+      auto_deploy: true,
+      ceo_mode: true,
+      iteration: 0,
+      max_iterations: 3,
+      prompts: [],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+      allowed_models: [],
+      allowed_providers: [],
+    } as never);
+    s = reduce(s, {
+      type: "goal_iteration",
+      id: "goal-1",
+      iteration: 2,
+      max_iterations: 3,
+      plan_revision: 1,
+      max_plan_revisions: 2,
+    });
+    expect(s.goalMode?.iteration).toBe(2);
+    expect(s.goalMode?.plan_revision).toBe(1);
+    expect(s.goalIterations.some((r) => r.iteration === 2)).toBe(true);
+  });
+
+  test("goal_review_verdict / goal_verify_verdict / goal_certified", () => {
+    let s = reduce(initialState, {
+      type: "goal_state",
+      id: "goal-1",
+      goal: "x",
+      phase: "verifying",
+      concurrency: 2,
+      max_tasks: 4,
+      auto_deploy: true,
+      ceo_mode: true,
+      iteration: 1,
+      max_iterations: 3,
+      prompts: [],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+      allowed_models: [],
+      allowed_providers: [],
+    } as never);
+    s = reduce(s, {
+      type: "goal_review_verdict",
+      ok: false,
+      summary: "needs tighter validation",
+      iteration: 1,
+      plan_revision: 1,
+      evidence_paths: ["plan.md"],
+    });
+    expect(s.goalMode?.review_verdict?.ok).toBe(false);
+    s = reduce(s, {
+      type: "goal_verify_verdict",
+      ok: false,
+      summary: "gaps remain",
+      iteration: 1,
+      remaining_gaps: ["missing abort button"],
+      evidence_paths: ["SUMMARY.md"],
+    });
+    expect(s.goalMode?.remaining_gaps).toEqual(["missing abort button"]);
+    expect(s.lastGoalVerdict?.ok).toBe(false);
+    s = reduce(s, {
+      type: "goal_certified",
+      summary: "all criteria met",
+      iteration: 1,
+      certified: true,
+    });
+    expect(s.goalMode?.certified).toBe(true);
+    expect(s.goalIterations.find((r) => r.iteration === 1)?.certified).toBe(true);
+  });
+
+  test("idle goal_state clears iterations", () => {
+    let s = reduce(initialState, {
+      type: "goal_state",
+      id: "goal-1",
+      goal: "x",
+      phase: "planning",
+      concurrency: 1,
+      max_tasks: 2,
+      auto_deploy: true,
+      ceo_mode: true,
+      iteration: 0,
+      prompts: [],
+      active_run_ids: [],
+      version: 1,
+      error: null,
+      parent_model: "",
+      allowed_models: [],
+      allowed_providers: [],
+    } as never);
+    s = reduce(s, { type: "goal_state", id: "", phase: "idle" } as never);
+    expect(s.goalMode).toBeNull();
+    expect(s.goalIterations).toEqual([]);
   });
 });
 

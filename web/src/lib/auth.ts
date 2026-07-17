@@ -2,8 +2,9 @@ import { betterAuth, APIError } from "better-auth";
 import { passkey } from "@better-auth/passkey";
 import { twoFactor } from "better-auth/plugins/two-factor";
 import { getMigrations } from "better-auth/db/migration";
-import Database from "better-sqlite3";
-import { Kysely, SqliteDialect } from "kysely";
+import { DatabaseSync } from "node:sqlite";
+import { NodeSqliteDialect } from "@better-auth/kysely-adapter/node-sqlite-dialect";
+import { Kysely } from "kysely";
 import crypto from "crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import path from "path";
@@ -61,13 +62,13 @@ function getSecret(): string {
   return s;
 }
 
-// ── database (SQLite via better-sqlite3 + Kysely) ───────────
-// better-sqlite3 requires the parent directory to already exist (it does not
+// ── database (SQLite via node:sqlite + Kysely) ────────────
+// node:sqlite requires the parent directory to already exist (it does not
 // mkdir). Create it before open so Next.js "collect page data" / first boot
 // on a fresh machine (and CI release builds) don't fail with
 // "Cannot open database because the directory does not exist".
 mkdirSync(CONFIG_DIR, { recursive: true });
-const dialect = new SqliteDialect({ database: new Database(DB_PATH) });
+const dialect = new NodeSqliteDialect({ database: new DatabaseSync(DB_PATH) });
 const db = new Kysely<any>({ dialect });
 
 // ── single-account enforcement ──────────────────────────────

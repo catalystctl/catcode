@@ -105,6 +105,9 @@ export interface AgentApi {
     allowed_models?: string[];
     allowed_providers?: string[];
     auto_deploy?: boolean;
+    ceo_mode?: boolean;
+    max_iterations?: number;
+    max_plan_revisions?: number;
     planner_model?: string;
     worker_model?: string;
     reviewer_model?: string;
@@ -376,6 +379,7 @@ export function useAgent(): AgentApi {
         workState: null,
         goalMode: null,
         goalPlan: null,
+        goalIterations: [],
         subagentRuns: {},
         metrics: null,
         currentSessionFile: sessionFile,
@@ -622,6 +626,7 @@ export function useAgent(): AgentApi {
       workState: null,
       goalMode: null,
       goalPlan: null,
+      goalIterations: [],
       subagentRuns: {},
       metrics: null,
     }));
@@ -953,6 +958,9 @@ export function useAgent(): AgentApi {
       allowed_models?: string[];
       allowed_providers?: string[];
       auto_deploy?: boolean;
+      ceo_mode?: boolean;
+      max_iterations?: number;
+      max_plan_revisions?: number;
       planner_model?: string;
       worker_model?: string;
       reviewer_model?: string;
@@ -969,6 +977,9 @@ export function useAgent(): AgentApi {
         allowed_models: opts.allowed_models,
         allowed_providers: opts.allowed_providers,
         auto_deploy: opts.auto_deploy,
+        ceo_mode: opts.ceo_mode,
+        max_iterations: opts.max_iterations,
+        max_plan_revisions: opts.max_plan_revisions,
         planner_model: opts.planner_model,
         worker_model: opts.worker_model,
         reviewer_model: opts.reviewer_model,
@@ -976,7 +987,7 @@ export function useAgent(): AgentApi {
       };
       const eff = effortFor(s.thinkingLevel);
       if (eff) cmd.reasoning_effort = eff;
-      const display = `🎯 Goal: ${opts.goal}`;
+      const display = opts.ceo_mode ? `🎯 Mission: ${opts.goal}` : `🎯 Goal: ${opts.goal}`;
       setState((st) =>
         reduce(st, {
           type: "_user",

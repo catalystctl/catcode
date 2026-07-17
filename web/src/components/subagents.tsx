@@ -77,7 +77,7 @@ function StateBadge({ state }: { state: string }) {
   );
 }
 
-function RunCard({ run, onClick }: { run: SubagentRunView; onClick: () => void }) {
+export function RunCard({ run, onClick }: { run: SubagentRunView; onClick: () => void }) {
   const isContainer = run.mode === "parallel" || run.mode === "chain";
   const title = run.agent ?? (isContainer ? run.mode : "subagent");
   const phaseHint =
@@ -206,7 +206,7 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
   );
 }
 
-function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }) {
+export function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () => void }) {
   const title = run.agent ?? run.mode;
   return (
     <div className="flex min-h-0 flex-1 flex-col">

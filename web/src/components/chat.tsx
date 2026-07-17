@@ -25,6 +25,7 @@ import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
 import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalProgressPanel } from "./goal-modal";
+import { ControlCenterPanel } from "./control-center";
 import { ProviderLoginModal } from "./provider-login-modal";
 import { DiagnosticsModal } from "./diagnostics-modal";
 import { ErrorBoundary } from "./error-boundary";
@@ -97,7 +98,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<
-    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "login" | "logout" | "diagnostics"
+    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "control" | "login" | "logout" | "diagnostics"
   >(null);
   const [images, setImages] = useState<string[]>([]);
   // Keep the server and first client render deterministic. The inline script in
@@ -456,6 +457,9 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         case "goal":
           void a.goalStatus();
           return setModal("goal");
+        case "control":
+          void a.goalStatus();
+          return setModal("control");
         case "cancel-goal":
           return void a.cancelGoal();
         case "index": {
@@ -659,7 +663,8 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           if (p === "memory") agent.listMemory();
           if (p === "plugins") agent.listPlugins();
           if (p === "subagents") void agent.listAgents();
-          setModal(p as "memory" | "plugins" | "subagents" | "help");
+          if (p === "control") void agent.goalStatus();
+          setModal(p as "memory" | "plugins" | "subagents" | "help" | "control");
         }}
         onDeleteSession={(p) => agent.deleteSession(p)}
         onRenameSession={(name, title) => agent.renameSession(name, title)}
@@ -698,6 +703,10 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onSetApproval={agent.setApproval}
           onReconnect={agent.reconnect}
           onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          onOpenControl={() => {
+            void agent.goalStatus();
+            setModal("control");
+          }}
           onOpenIde={!docked ? () => ide.setUiMode("ide") : undefined}
           onOpenSettings={!docked ? openSettings : undefined}
           onOpenProjects={!docked ? openProjects : undefined}
@@ -944,6 +953,20 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           providerPresets={state.providerPresets}
           providers={state.ready?.providers ?? []}
           onStart={(opts) => void agent.startGoal(opts)}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "control" && (
+        <ControlCenterPanel
+          models={state.models}
+          providerPresets={state.providerPresets}
+          providers={state.ready?.providers ?? []}
+          goalMode={state.goalMode}
+          goalPlan={state.goalPlan}
+          goalIterations={state.goalIterations}
+          subagentRuns={state.subagentRuns}
+          onStart={(opts) => void agent.startGoal(opts)}
+          onAbort={() => void agent.cancelGoal()}
           onClose={() => setModal(null)}
         />
       )}
