@@ -1,47 +1,30 @@
 #!/usr/bin/env bash
-# Build a READY-TO-RUN, platform-specific web frontend bundle for the Catalyst Code.
+# Build a READY-TO-RUN, cross-platform web frontend bundle for the Catalyst Code.
 #
-#   dist/catcode-web-<ver>-<platform>.tar.gz   (+ .sha256)
+#   dist/catcode-web-<ver>.tar.gz   (+ .sha256)
 #
 # The tarball contains Next.js's "standalone" output: a server.js + the
 # minimal node_modules it needs + the static/ and public/ assets. It runs
 # under Node >= 22.13.0 (or Bun) with NO `next build` on the host:
 #
-#     tar xzf catcode-web-<ver>-<platform>.tar.gz
+#     tar xzf catcode-web-<ver>.tar.gz
 #     PORT=49283 HOSTNAME=0.0.0.0 CATCODE_CORE=/usr/local/bin/catcode-core \
-#       node server.js
+#       node start.js
 #
-# The bundle is platform-specific because the terminal uses @lydell/node-pty,
-# a prebuilt (no node-gyp) distribution that ships only the binary for the
-# build host. Build the artifact on the OS/arch it will run on.
+# One tarball for Linux/macOS/Windows. The terminal uses zigpty, which ships
+# all platform PTY prebuilds (~450KB) inside a single package — no per-OS web
+# builds, no node-gyp, no Windows release host. Auth uses node:sqlite (no
+# better-sqlite3). sharp / Next SWC are pruned (build-only / unused).
 # Requires Bun (https://bun.sh) or Node+npm to BUILD (on the release host),
 # and Node or Bun to RUN (on the install host). `install.sh --with-web` /
-# `install.ps1 -WithWeb` download the correct platform tarball instead of building.
+# `install.ps1 -WithWeb` download this tarball instead of building.
 #
 #   ./release-web.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
-
-# Platform suffix for the artifact name. Override with CATCODE_WEB_PLATFORM_SUFFIX.
-detect_platform_suffix() {
-  local kernel arch
-  kernel="$(uname -s)"
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="arm64" ;;
-  esac
-  case "$kernel" in
-    Linux)  echo "linux-${arch}" ;;
-    Darwin) echo "macos-${arch}" ;;
-    MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "windows-x86_64" ;;
-    *)      echo "${kernel}-${arch}" ;;
-  esac
-}
-PLATFORM_SUFFIX="${CATCODE_WEB_PLATFORM_SUFFIX:-$(detect_platform_suffix)}"
-OUT="dist/catcode-web-${VERSION}-${PLATFORM_SUFFIX}.tar.gz"
+OUT="dist/catcode-web-${VERSION}.tar.gz"
 
 # --- runtime (bun preferred, npm fallback) ----------------------------------
 RT="" RT_BIN=""
@@ -73,12 +56,12 @@ echo "[4/5] web: next build (output: standalone)..."
 # (Node-compatible — works whether the release host built with bun or npm) and
 # ship it IN PLACE of Next's standalone server.js, so the release serves HTTP
 # plus the terminal WebSocket on a single port. (Contract §7.4.)
-# Keep native node-pty external and copy its package into the final artifact.
+# Keep zigpty external and copy its package (all OS prebuilds) into the artifact.
 echo "[4b/5] web: bundle custom server (esbuild) -> .server-bundle.js..."
 ( cd web && ./node_modules/.bin/esbuild src/server/server.ts \
     --bundle --platform=node --format=esm \
     --outfile=.server-bundle.js \
-    --external:next --external:ws --external:@lydell/node-pty --external:kysely \
+    --external:next --external:ws --external:zigpty --external:kysely \
     --external:better-auth --external:@better-auth/passkey \
     --external:@catalyst-code/coding-agent )
 
@@ -147,57 +130,10 @@ copy_runtime_package() {
 }
 
 for pkg in \
-  next ws @lydell/node-pty kysely \
+  next ws zigpty kysely \
   better-auth @better-auth/passkey @better-auth/kysely-adapter @catalyst-code/coding-agent; do
   copy_runtime_package "$pkg"
 done
-
-# npm installs optional native packages for more than one libc/architecture in
-# some environments (notably Next SWC and sharp). A release bundle is already
-# host-specific because of @lydell/node-pty, so keep only packages compatible with the
-# build host. This avoids shipping both glibc and musl binaries in one artifact.
-node - "$STAGE/node_modules" <<'NODE'
-const fs = require("node:fs");
-const path = require("node:path");
-
-const root = process.argv[2];
-const libc = process.platform === "linux"
-  ? (process.report?.getReport()?.header?.glibcVersionRuntime ? "glibc" : "musl")
-  : undefined;
-
-function matches(values, actual) {
-  if (!Array.isArray(values) || values.length === 0 || !actual) return true;
-  if (values.includes(`!${actual}`)) return false;
-  const positive = values.filter((value) => !value.startsWith("!"));
-  return positive.length === 0 || positive.includes(actual);
-}
-
-const names = [];
-for (const entry of fs.readdirSync(root)) {
-  const full = path.join(root, entry);
-  if (!fs.statSync(full).isDirectory()) continue;
-  if (entry.startsWith("@")) {
-    for (const child of fs.readdirSync(full)) names.push(`${entry}/${child}`);
-  } else {
-    names.push(entry);
-  }
-}
-
-for (const name of names) {
-  const dir = path.join(root, name);
-  try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
-    if (!matches(pkg.os, process.platform) ||
-        !matches(pkg.cpu, process.arch) ||
-        !matches(pkg.libc, libc)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      process.stdout.write(`[prune] incompatible native package: ${name}\n`);
-    }
-  } catch {
-    // Leave packages without readable manifests untouched.
-  }
-}
-NODE
 
 # SWC compiles/transforms application code during `next build`. This bundle
 # contains the completed standalone build, so the production server does not
@@ -205,13 +141,19 @@ NODE
 # build-time tool in every desktop install.
 rm -rf "$STAGE/node_modules/@next"/swc-*
 
+# sharp is an optional Next.js dependency for `next/image` optimization. We
+# serve plain <img> / API URLs and do not use the image optimizer, so the
+# platform .node + libvips (~15–20 MB) is dead weight in every install.
+# Auth already uses node:sqlite (no better-sqlite3). The only intentional
+# native runtime binaries are zigpty's multi-platform prebuilds.
+rm -rf "$STAGE/node_modules/sharp" "$STAGE/node_modules/@img"
+
 # Source maps are useful while developing but are not loaded by the production
 # server. Next and its compiled dependencies account for most of these files.
 find "$STAGE" -type f -name '*.map' -delete
 
 # Next can omit the root package.json when outputFileTracingRoot points above
-# web/. Keep an explicit ESM runtime manifest for `node start.js` and native
-# production dependency tooling.
+# web/. Keep an explicit ESM runtime manifest for `node start.js`.
 node -e '
   const fs = require("node:fs");
   const stage = process.argv[1];
@@ -224,7 +166,7 @@ node -e '
     private: true,
     type: "module",
     dependencies: {
-      "@lydell/node-pty": versionOf("@lydell/node-pty")
+      zigpty: versionOf("zigpty")
     }
   }, null, 2) + "\n");
 ' "$STAGE"
@@ -279,16 +221,35 @@ fi
 [[ -f "$STAGE/package.json" ]] || { echo "error: staged bundle missing package.json" >&2; exit 1; }
 [[ -f "$STAGE/.next/BUILD_ID" ]] || { echo "error: staged bundle missing .next/BUILD_ID" >&2; exit 1; }
 [[ -f "$STAGE/version.json" ]] || { echo "error: staged bundle missing version.json" >&2; exit 1; }
-for req in next ws @lydell/node-pty kysely better-auth @better-auth/passkey @better-auth/kysely-adapter @catalyst-code/coding-agent; do
+for req in next ws zigpty kysely better-auth @better-auth/passkey @better-auth/kysely-adapter @catalyst-code/coding-agent; do
   [[ -f "$STAGE/node_modules/$req/package.json" ]] || {
     echo "error: staged bundle missing node_modules/$req (custom server cannot start)" >&2
     exit 1
   }
 done
+# Fail closed: only zigpty's multi-platform prebuilds may ship .node files
+# (no sharp/swc/better-sqlite3 / per-OS optional packages).
+pty_node_found=0
+while IFS= read -r -d '' node_bin; do
+  case "$node_bin" in
+    "$STAGE"/node_modules/zigpty/prebuilds/*.node)
+      pty_node_found=1
+      ;;
+    *)
+      echo "error: unexpected native addon in web bundle: ${node_bin#"$STAGE"/}" >&2
+      echo "  Only zigpty/prebuilds/*.node are allowed (no sharp/swc/better-sqlite3)." >&2
+      exit 1
+      ;;
+  esac
+done < <(find "$STAGE" -type f -name '*.node' -print0)
+if [[ "$pty_node_found" -eq 0 ]]; then
+  echo "error: staged bundle missing zigpty prebuilds (terminal will not work)" >&2
+  exit 1
+fi
 # Resolve the custom server's critical imports the same way install hosts will.
 (
   cd "$STAGE"
-  node --input-type=module -e 'await Promise.all(["next","ws","@lydell/node-pty","better-auth","@catalyst-code/coding-agent"].map((m)=>import(m))); console.log("runtime imports OK")'
+  node --input-type=module -e 'await Promise.all(["next","ws","zigpty","better-auth","@catalyst-code/coding-agent"].map((m)=>import(m))); console.log("runtime imports OK")'
 ) || { echo "error: staged bundle failed module resolution smoke test" >&2; exit 1; }
 
 echo "==> version.json commit=${COMMIT_SHORT} dirty=${DIRTY}"

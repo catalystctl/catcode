@@ -44,9 +44,10 @@ changes to the chat reducer or `AgentState`.
 3. **Single `useAgent()` instance.** `IdeShell` owns it; panels never open a
    second core connection.
 4. **Native-quality terminal.** The browser renders Ghostty's VT engine through
-   `ghostty-web` (WASM), while the server uses `@lydell/node-pty` for real Unix
-   PTYs and Windows ConPTY. The prebuilt package ships the platform-specific
-   binary with the release artifact. The editor continues to use CodeMirror 6.
+   `ghostty-web` (WASM), while the server uses `zigpty` for real Unix PTYs and
+   Windows ConPTY. `zigpty` ships all platform prebuilds in one package, so the
+   release stays a single cross-platform tarball (no per-OS web builds). The
+   editor continues to use CodeMirror 6.
 
 ## The four panels
 
@@ -54,7 +55,7 @@ changes to the chat reducer or `AgentState`.
 |-------|-----------|-----------|
 | Explorer | `file-tree.tsx` (sidebar) + `editor.tsx` (CodeMirror 6, main) | `/api/tree`, `/api/file` |
 | Source Control | `git-panel.tsx` (sidebar + main) | `/api/git` |
-| Terminal | `terminal.tsx` (Ghostty WASM, bottom panel) | `/api/terminal` (WebSocket + @lydell/node-pty) |
+| Terminal | `terminal.tsx` (Ghostty WASM, bottom panel) | `/api/terminal` (WebSocket + zigpty) |
 | Preview | `preview.tsx` (iframe, main) | `/api/preview`, `/api/dev-proxy` |
 
 All panel components live in `web/src/components/ide/` and are registered in
@@ -104,7 +105,7 @@ Next.js app-router route handlers cannot upgrade to WebSocket, so
   cookie from the upgrade request headers).
 - The first client message must be `{type:"open", cwd?, cols?, rows?}`; then
   `{type:"data"}`, `{type:"resize"}`, `{type:"ping"}`.
-- Each shell runs inside a real pseudoterminal (`@lydell/node-pty`; ConPTY on Windows),
+- Each shell runs inside a real pseudoterminal (`zigpty`; ConPTY on Windows),
   so job control, signals, resize, mouse input, and full-screen TUI applications
   work normally.
 - PTYs are keyed by authenticated user + terminal session ID. WebSocket

@@ -16,8 +16,7 @@ import { type Duplex } from "node:stream";
 import { parse } from "node:url";
 import { normalize, join, relative, resolve, sep } from "node:path";
 import next from "next";
-import * as pty from "@lydell/node-pty";
-import type { IPty } from "@lydell/node-pty";
+import { spawn, type IPty } from "zigpty";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { getSession } from "../lib/auth";
 import { loadProjects } from "../lib/projects";
@@ -205,8 +204,11 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
     exitCode: null,
     cleanupTimer: null,
   };
-  terminal.pty = pty.spawn(shell, [], { name: "xterm-256color", cwd, env, cols, rows });
-  terminal.pty.onData((data) => {
+  // zigpty: real host PTY (openpty / ConPTY). All platform prebuilds ship in
+  // one npm package so the web release stays a single cross-platform tarball.
+  terminal.pty = spawn(shell, [], { name: "xterm-256color", cwd, env, cols, rows });
+  terminal.pty.onData((chunk) => {
+    const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     terminal.scrollback += data;
     if (Buffer.byteLength(terminal.scrollback) > MAX_SCROLLBACK_BYTES) {
       terminal.scrollback = terminal.scrollback.slice(-MAX_SCROLLBACK_BYTES);

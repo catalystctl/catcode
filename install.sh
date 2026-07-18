@@ -472,6 +472,8 @@ install_bins_download() {
 }
 
 # Download + extract the prebuilt web bundle and wire the service.
+# Asset is the universal cross-platform tarball (same on Linux/macOS/Windows):
+#   catcode-web-<ver>.tar.gz
 install_web_download() {
   detect_runtime run
   resolve_web_dir
@@ -480,7 +482,7 @@ install_web_download() {
   if ! $SKIP_SERVICE; then
     protect_existing_web_service
   fi
-  local web_asset="catcode-web-${VER}-${OS_TAG}-${ARCH}.tar.gz"
+  local web_asset="catcode-web-${VER}.tar.gz"
   fetch_asset "$web_asset"
   run_root "Creating $WEB_DIR" mkdir -p "$WEB_DIR"
   # Clean stale contents so an update doesn't leave old chunks.
@@ -562,7 +564,7 @@ validate_web_bundle() {
   ./release-web.sh and pass --base-url / --version pointing at that artifact."
   fi
   local req
-  for req in next ws @lydell/node-pty better-auth; do
+  for req in next ws zigpty better-auth; do
     [[ -f "$dir/node_modules/$req/package.json" ]] || \
       die "web bundle missing node_modules/$req — incomplete release artifact (custom server cannot start).
   Use a newer catcode-web-*.tar.gz built by current release-web.sh."

@@ -324,7 +324,7 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
   Use a newer catcode-web-*.tar.gz built by current release-web.sh.
 "@
     }
-    foreach ($req in @('next', 'ws', '@lydell/node-pty', 'better-auth')) {
+    foreach ($req in @('next', 'ws', 'zigpty', 'better-auth')) {
         $pkg = Join-Path $Dir "node_modules\$req\package.json"
         if (-not (Test-Path -LiteralPath $pkg)) {
             Die "web bundle missing node_modules/$req - incomplete release artifact (custom server cannot start)."
@@ -337,7 +337,8 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
 }
 
 function Install-WebBundle {
-    $tgz = Get-Asset "catcode-web-$($script:Ver)-windows-x86_64.tar.gz"
+    # Universal cross-platform tarball (same asset Linux/macOS/Windows installers fetch).
+    $tgz = Get-Asset "catcode-web-$($script:Ver).tar.gz"
     if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
     Get-ChildItem -LiteralPath $WebDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.

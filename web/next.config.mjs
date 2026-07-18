@@ -64,10 +64,13 @@ const nextConfig = {
   // so Next never tries to bundle it for the edge/client.
   serverExternalPackages: [
     "@catalyst-code/coding-agent",
-    "@lydell/node-pty", // native PTY binding; loaded only by the custom server
+    "zigpty", // real PTY (all OS prebuilds in one package); custom server only
     "kysely",
     "ws", // server-only (custom server /api/terminal WS); never bundled for the client
   ],
+  // We serve plain <img> / API URLs — never use next/image optimization, so
+  // sharp's platform .node + libvips must not be required at runtime.
+  images: { unoptimized: true },
   // Produce a self-contained server bundle (.next/standalone) for the release
   // pipeline — `release-web.sh` ships it as a ready-to-run tarball so the
   // installer never runs `next build` on the host. Strictly additive: `next
