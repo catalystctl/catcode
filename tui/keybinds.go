@@ -38,7 +38,7 @@ var keybindDefs = []keybindDef{
 	// Global — work in every non-modal state.
 	{"quit", "Global", "Quit the application", "ctrl+c"},
 	{"toggle_reasoning", "Global", "Toggle reasoning-block collapse", "ctrl+t"},
-	{"toggle_tool_output", "Global", "Expand / collapse last tool output", "ctrl+o"},
+	{"toggle_tool_output", "Global", "Show / hide nearest tool details", "ctrl+o"},
 	{"command_palette", "Global", "Open command palette", "ctrl+p"},
 	{"command_palette_alt", "Global", "Open command palette (alternate)", "ctrl+k"},
 	{"reasoning_picker", "Global", "Set reasoning effort (per model)", "ctrl+r"},
@@ -581,7 +581,7 @@ func (s *session) helpKeybindLines() []string {
 		fmt.Sprintf("  %-18s open command palette", key("command_palette")+" / "+key("command_palette_alt")),
 		fmt.Sprintf("  %-18s command palette (when input empty)", "/"),
 		fmt.Sprintf("  %-18s toggle reasoning collapse", key("toggle_reasoning")),
-		fmt.Sprintf("  %-18s expand / collapse last tool output", key("toggle_tool_output")),
+		fmt.Sprintf("  %-18s show / hide nearest tool details", key("toggle_tool_output")),
 		fmt.Sprintf("  %-18s set reasoning effort (per model)", key("reasoning_picker")),
 		fmt.Sprintf("  %-18s quit", key("quit")),
 		fmt.Sprintf("  %-18s close modal / deny / abort", key("close")),

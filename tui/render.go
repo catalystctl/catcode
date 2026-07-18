@@ -1523,6 +1523,11 @@ func (s *session) oauthBannerHeight() int {
 }
 
 func (s *session) View() tea.View {
+	if s.reuseLastView && s.hasLastView {
+		s.reuseLastView = false
+		return s.lastView
+	}
+	s.reuseLastView = false
 	var content string
 	if !s.ready {
 		content = baseStyle.Render("starting core…")
@@ -1547,7 +1552,10 @@ func (s *session) View() tea.View {
 		if o := s.renderOauthBanner(); o != "" {
 			parts = append(parts, o)
 		}
-		parts = append(parts, s.viewport.View())
+		// Selection is painted over the viewport's already-cropped rows. This
+		// keeps drag cost proportional to terminal height instead of transcript
+		// length, which matters for large selections and long sessions.
+		parts = append(parts, s.renderVisibleTranscriptSelection(s.viewport.View()))
 		if p := s.renderPositionBar(); p != "" {
 			parts = append(parts, p)
 		}
@@ -1564,6 +1572,13 @@ func (s *session) View() tea.View {
 		view := strings.Join(parts, "\n")
 		if s.modal.kind != modalNone {
 			view = s.renderModalOverlay(view)
+			// Cache exactly what is on-screen before adding selection styling.
+			// Mouse coordinates for modals are screen-relative, unlike transcript
+			// coordinates, so the complete placed overlay is the selection surface.
+			s.modalPlain = plainTranscriptLines(view)
+			view = s.renderModalSelection(view)
+		} else {
+			s.modalPlain = nil
 		}
 		// ask flyout: a blocking `ask` prompt renders as a centered overlay on
 		// top of the full view (like the modal above). renderAskOverlay is a
@@ -1587,9 +1602,12 @@ func (s *session) View() tea.View {
 	// disambiguation + xterm modifyOtherKeys level 2 (restoring them on exit),
 	// so modified keys (Shift/Ctrl+Enter, Esc) arrive as real KeyPressMsgs.
 	v.AltScreen = !plainTerminalMode()
-	if s.settings.MouseWheel {
-		v.MouseMode = tea.MouseModeCellMotion
-	}
+	// Cell motion supplies click, release, drag, and wheel events. Transcript
+	// selection is application-managed, so mouse tracking can stay enabled
+	// without sacrificing drag-to-copy.
+	v.MouseMode = tea.MouseModeCellMotion
+	s.lastView = v
+	s.hasLastView = true
 	return v
 }
 

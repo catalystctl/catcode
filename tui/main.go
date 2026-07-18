@@ -43,6 +43,22 @@ type statusToast struct {
 	until time.Time
 }
 
+// transcriptPoint is a display-cell coordinate in the fully rendered
+// transcript (before the viewport crops it). Mouse selection uses cell
+// coordinates because terminal mouse events and Lip Gloss ranges are both
+// cell-based, including wide graphemes.
+type transcriptPoint struct {
+	line int
+	col  int
+}
+
+type transcriptSelection struct {
+	active  bool // left button is currently held
+	dragged bool // pointer moved away from anchor; distinguishes click from drag
+	anchor  transcriptPoint
+	head    transcriptPoint
+}
+
 type composerDraft struct {
 	owner  string
 	text   string
@@ -66,6 +82,17 @@ type streamRefreshMsg struct{}
 type busyFrameMsg struct{}
 
 const busyFrameInterval = time.Second / 10
+
+// selectionFrameMsg coalesces the much faster stream of terminal drag events
+// into at most one visible selection update per renderer frame.
+type selectionFrameMsg struct {
+	generation uint64
+	modal      bool
+}
+
+// Thirty selection frames per second stays visually smooth while leaving the
+// event loop enough time for large transcript/layout renders.
+const selectionFrameInterval = time.Second / 30
 
 type toastKind int
 
@@ -169,12 +196,26 @@ type session struct {
 	composerDrafts []composerDraft
 
 	// conversation blocks + streaming/caching state
-	blocks        []*block
-	cur           *block // currently-streaming block (assistant/thinking), or nil
-	thinkExpanded bool   // global reasoning expand state (default collapsed)
-	cache         strings.Builder
-	cacheIdx      int
-	cacheLines    int // line count of s.cache (avoids cache.String() for offsets)
+	blocks                   []*block
+	cur                      *block // currently-streaming block (assistant/thinking), or nil
+	thinkExpanded            bool   // global reasoning expand state (default collapsed)
+	cache                    strings.Builder
+	cacheIdx                 int
+	cacheLines               int      // line count of s.cache (avoids cache.String() for offsets)
+	transcriptBase           string   // rendered transcript without mouse-selection styling
+	transcriptPlain          []string // ANSI-free lines cached for hit-testing/copy
+	selection                transcriptSelection
+	selectionMotion          tea.MouseMotionMsg // newest drag event waiting for a selection frame
+	selectionPending         bool
+	selectionFrameScheduled  bool
+	selectionFrameGeneration uint64
+	selectionLastFrame       time.Time
+	reuseLastView            bool // the current event changed no paintable state
+	lastView                 tea.View
+	hasLastView              bool
+	modalSelection           transcriptSelection // selection over the currently rendered modal canvas
+	modalSelectionKind       modalKind
+	modalPlain               []string // ANSI-free last-rendered modal overlay, used for hit-testing/copy
 
 	// scroll: follow=true keeps the viewport pinned to the newest line (the
 	// default). Scrolling up pauses follow so history can be read without the
@@ -202,7 +243,6 @@ type session struct {
 	loginOffered       bool // auto-opened /login once when ready with no key
 	ctrlCAbortArmed    bool // first Ctrl+C while busy aborted; second quits
 	intentionalRestart bool // next core EOF should restart (settings apply)
-	mouseTipShown      bool // one-time PgUp tip when mouse wheel is off
 
 	// @-mention file flyout state (see mention.go): active when an
 	// unbroken @-token sits at the cursor; mentionAt is its rune index.
@@ -521,7 +561,15 @@ func (s *session) startCore() tea.Cmd {
 		close(eventCh)
 	}()
 
-	s.sendCore(map[string]any{"type": "init"})
+	s.sendCore(map[string]any{
+		"type":             "init",
+		"protocol_version": 2,
+		"client": map[string]any{
+			"name":         "catcode-tui",
+			"version":      coreVersion,
+			"capabilities": []string{"run_ids", "session_ids", "event_sequence"},
+		},
+	})
 	// Arm a startup watchdog: if the core starts but never emits `ready` within
 	// coreStartupTimeout (e.g. a bad UMANS_CORE path or a config that panics),
 	// surface a clear error instead of spinning "starting core…" forever. The
@@ -873,6 +921,21 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseWheelMsg:
 		return s, s.handleMouseWheel(msg)
+
+	case tea.MouseClickMsg:
+		return s, s.handleTranscriptMouseClick(msg)
+
+	case tea.MouseMotionMsg:
+		return s, s.handleTranscriptMouseMotion(msg)
+
+	case tea.MouseReleaseMsg:
+		return s, s.handleTranscriptMouseRelease(msg)
+
+	case selectionFrameMsg:
+		if msg.modal {
+			return s, s.handleModalSelectionFrame(msg)
+		}
+		return s, s.handleTranscriptSelectionFrame(msg)
 
 	case tea.PasteMsg:
 		// v2 enables bracketed-paste by default, so every paste arrives as a

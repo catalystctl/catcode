@@ -153,7 +153,6 @@ type settingsStore struct {
 	NoNetwork        bool   `json:"no_network,omitempty"`
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds (also written as idle_timeout_secs for core)
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
-	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
 	FooterMetrics    bool   `json:"footer_metrics"`               // default on; false hides model/performance footer row
 	ReducedMotion    bool   `json:"reduced_motion"`               // disable spring animations (usage bars, etc.)
 	// Runtime knobs: also applied live via set_config; persisted so restart keeps them.
@@ -334,7 +333,6 @@ func loadSettingsFrom(path string) *settingsStore {
 		s.IdleTimeout = n
 	}
 	s.MaxSessionTokens = onDisk.MaxSessionTokens
-	s.MouseWheel = onDisk.MouseWheel
 	if v, ok := raw["footer_metrics"].(bool); ok {
 		s.FooterMetrics = v
 	}
@@ -444,7 +442,7 @@ func (s *settingsStore) save() (err error) {
 		"theme": s.Theme, "think_expanded": s.ThinkExpanded,
 		"sandbox": s.Sandbox, "no_network": s.NoNetwork,
 		"idle_timeout": s.IdleTimeout, "max_session_tokens": s.MaxSessionTokens,
-		"mouse_wheel": s.MouseWheel, "footer_metrics": s.FooterMetrics, "reduced_motion": s.ReducedMotion, "bash_timeout_secs": s.BashTimeoutSecs,
+		"footer_metrics": s.FooterMetrics, "reduced_motion": s.ReducedMotion, "bash_timeout_secs": s.BashTimeoutSecs,
 		"auto_compact": s.AutoCompact, "active_provider": s.ActiveProvider,
 		"provider_keys":   nonNilStringMap(s.ProviderKeys),
 		"keybinds":        nonNilStringMap(s.Keybinds),
@@ -453,6 +451,9 @@ func (s *settingsStore) save() (err error) {
 	for k, v := range overlay {
 		merged[k] = v
 	}
+	// Mouse interaction is always enabled. Remove the retired opt-in on the
+	// next save instead of preserving a setting that no longer has an effect.
+	delete(merged, "mouse_wheel")
 	// Always persist approval / auto_compact explicitly (bool defaults + omitempty
 	// must not drop a deliberate false, and blank approval must not wipe disk).
 	merged["approval"] = s.Approval

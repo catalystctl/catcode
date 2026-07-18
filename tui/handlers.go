@@ -1315,13 +1315,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 // handleMouseWheel routes mouse-wheel events to the transcript viewport,
 // mirroring handleScrollKey so follow mode stays consistent: scrolling up
 // pauses follow (a streaming turn won't yank the view back to the bottom) and
-// scrolling back to the bottom re-pins follow. Non-wheel mouse events (clicks
-// and drags) are dropped so the wheel is the only mouse surface. Works in every
-// state (idle/busy/approval) like the keyboard scroll bindings; modal overlays
-// take over the whole screen and are skipped.
-//
-// Mouse tracking is opt-in: it's enabled at startup only when the Mouse Wheel
-// setting is on, and toggled at runtime via /mouse-wheel
+// scrolling back to the bottom re-pins follow. Click/drag/release events are
+// handled by transcript_mouse.go. Mouse tracking stays enabled for clickable
+// disclosures, application-managed selection, and wheel navigation.
 // applyModels sets the discovered model list and re-applies the persisted
 // model selection + reasoning clamp. Shared by the `ready` and `models`
 // events so a provider switch re-selects the same model id when present.
@@ -1437,14 +1433,13 @@ func (s *session) reauthActiveProvider() {
 	}
 }
 
-// In v2 mouse mode is a declarative View field (set in View() from
-// s.settings.MouseWheel); only wheel events reach here, routed to the
-// transcript viewport. Off (the default) leaves native click-drag text
-// selection/copy to the terminal; when on, hold Shift to select/copy.
+// In v2 mouse mode is a declarative View field. It remains in cell-motion mode
+// for selection, clicks, and wheel scrolling.
 func (s *session) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
-	// Modal overlays own the whole screen; never scroll the transcript behind one.
+	// Modal overlays own the whole screen; route the wheel to their existing
+	// keyboard navigation instead of scrolling the hidden transcript.
 	if s.modal.kind != modalNone {
-		return nil
+		return s.handleModalMouseWheel(msg)
 	}
 	switch msg.Button {
 	case tea.MouseWheelUp:
@@ -2165,10 +2160,6 @@ func (s *session) handleScrollKey(msg tea.KeyPressMsg) bool {
 	case s.kb(msg, "scroll_page_up"):
 		s.follow = false
 		s.viewport.PageUp()
-		if !s.settings.MouseWheel && !s.mouseTipShown {
-			s.mouseTipShown = true
-			s.logInfo("tip: /mouse-wheel on enables wheel scrolling (hold Shift to select/copy)")
-		}
 		return true
 	case s.kb(msg, "scroll_page_down"):
 		s.viewport.PageDown()
@@ -2463,24 +2454,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.openNoNetworkPicker()
 			return nil
 		case "/mouse-wheel":
-			if len(parts) >= 2 {
-				switch strings.ToLower(parts[1]) {
-				case "on", "true", "1":
-					s.settings.MouseWheel = true
-					_ = s.settings.save()
-					s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
-					s.invalidateAll()
-				case "off", "false", "0":
-					s.settings.MouseWheel = false
-					_ = s.settings.save()
-					s.logInfo("mouse wheel: off (click-drag to select/copy text)")
-					s.invalidateAll()
-				default:
-					s.logError("usage: /mouse-wheel [on|off]")
-				}
-				return nil
-			}
-			s.openMouseWheelPicker()
+			// Backward-compatible no-op for old scripts/settings muscle memory.
+			s.logInfo("mouse scrolling, clicking, and drag-copy are always on")
 			return nil
 		case "/footer-metrics":
 			if len(parts) >= 2 {
@@ -2712,7 +2687,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				"Status",
 				"model: " + model + " · provider: " + provider,
 				"approval: " + approvalModeLabel(s.approvalMode()) + " · reasoning: " + effort,
-				"theme: " + activeTheme.name + " · mouse: " + boolStr(s.settings.MouseWheel),
+				"theme: " + activeTheme.name + " · mouse: on",
 			}
 			if metrics := s.renderMetrics(); metrics != "" {
 				lines = append(lines, "performance: "+metrics)

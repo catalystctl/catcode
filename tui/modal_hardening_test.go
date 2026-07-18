@@ -11,12 +11,24 @@ import (
 func TestModalPasteOwnedByFilterAndEditor(t *testing.T) {
 	s := initialSession()
 	s.openCommandPalette()
-	if !s.appendModalPaste("model") || s.modal.filter != "model" {
-		t.Fatalf("filter paste was not consumed: filter=%q", s.modal.filter)
+	if !s.appendModalPaste("model") || s.modal.filter != "model" || s.modal.pickerList.FilterValue() != "model" {
+		t.Fatalf("filter paste was not applied: mirror=%q picker=%q", s.modal.filter, s.modal.pickerList.FilterValue())
 	}
 	s.openValueEditModal(editTargetRemember, "Remember", "note", "before ")
 	if !s.appendModalPaste("after") || s.modal.editBuf.Value() != "before after" {
 		t.Fatalf("editor paste was not consumed: value=%q", s.modal.editBuf.Value())
+	}
+}
+
+func TestModalPasteInsertsAtEditorCursor(t *testing.T) {
+	s := initialSession()
+	s.openValueEditModal(editTargetRemember, "Remember", "note", "before after")
+	s.modal.editBuf.SetCursor(7)
+	if !s.appendModalPaste("new ") {
+		t.Fatal("editor did not consume paste")
+	}
+	if got := s.modal.editBuf.Value(); got != "before new after" {
+		t.Fatalf("cursor paste = %q, want %q", got, "before new after")
 	}
 }
 

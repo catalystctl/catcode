@@ -250,10 +250,11 @@ func TestSettingsSaveClearsKnownValuesAndPreservesUnknown(t *testing.T) {
 			t.Fatalf("%s retained stale value %v", key, got[key])
 		}
 	}
-	for _, key := range []string{"no_network", "mouse_wheel"} {
-		if got[key] != false {
-			t.Fatalf("%s retained stale value %v", key, got[key])
-		}
+	if got["no_network"] != false {
+		t.Fatalf("no_network retained stale value %v", got["no_network"])
+	}
+	if _, ok := got["mouse_wheel"]; ok {
+		t.Fatalf("retired mouse_wheel setting was not removed: %v", got["mouse_wheel"])
 	}
 	if got["max_session_tokens"] != float64(0) {
 		t.Fatalf("max_session_tokens retained stale value %v", got["max_session_tokens"])

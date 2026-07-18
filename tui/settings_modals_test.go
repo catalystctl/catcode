@@ -101,10 +101,13 @@ func TestSettingsHubOpensDedicatedModals(t *testing.T) {
 		t.Fatalf("modal kind = %v, want modalSettings", s.modal.kind)
 	}
 	body := stripANSI(s.renderModalBody())
-	for _, want := range []string{"/approval", "/reasoning", "/theme", "/bash-timeout", "/sandbox", "/mouse-wheel"} {
+	for _, want := range []string{"/approval", "/reasoning", "/theme", "/bash-timeout", "/sandbox"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("settings hub missing %s:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "/mouse-wheel") {
+		t.Errorf("always-on mouse interaction should not have an opt-in setting:\n%s", body)
 	}
 	// Must not show the old field-editor chrome.
 	if strings.Contains(body, "enter edit/apply") || strings.Contains(body, "←→ cycle") {
@@ -143,7 +146,6 @@ func TestDedicatedSettingCommandsOpenModals(t *testing.T) {
 		{"/auto-compact", modalAutoCompact},
 		{"/sandbox", modalSandbox},
 		{"/no-network", modalNoNetwork},
-		{"/mouse-wheel", modalMouseWheel},
 		{"/idle-timeout", modalValueEdit},
 		{"/max-session-tokens", modalValueEdit},
 		{"/settings", modalSettings},
@@ -165,12 +167,11 @@ func TestToggleCommandsWithArgs(t *testing.T) {
 	s.ready = true
 	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
 
-	s.handleUserLine("/mouse-wheel on")
-	if !s.settings.MouseWheel {
-		t.Error("mouse-wheel on should set MouseWheel=true")
-	}
+	// The retired toggle remains a harmless compatibility alias for scripts,
+	// but no longer changes state or opens a modal.
+	s.handleUserLine("/mouse-wheel off")
 	if s.modal.kind != modalNone {
-		t.Error("mouse-wheel on should not open a modal")
+		t.Error("retired mouse-wheel command should not open a modal")
 	}
 
 	s.handleUserLine("/sandbox firejail")

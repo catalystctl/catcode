@@ -51,12 +51,22 @@ func TestRenderSmoke(t *testing.T) {
 	s.push(blkError).text.WriteString("not authenticated — run /login first")
 	s.invalidateAll()
 
-	// flat layout: role glyphs + content, tool output in a │ panel
+	// Flat layout: tool calls form a compact activity run. The command stays
+	// visible, while output waits behind the per-call details toggle.
 	blocks := stripANSI(s.renderBlocks())
-	for _, want := range []string{"you", "leader", "bash", "go test", "PASS", "✗", "not authenticated"} {
+	for _, want := range []string{"you", "leader", "activity", "1 call", "bash", "go test", "details", "✗", "not authenticated"} {
 		if !strings.Contains(blocks, want) {
 			t.Errorf("blocks missing %q:\n%s", want, blocks)
 		}
+	}
+	if strings.Contains(blocks, "PASS") {
+		t.Errorf("compact activity row leaked full tool output:\n%s", blocks)
+	}
+	tb.expanded = true
+	s.invalidateAll()
+	detailed := stripANSI(s.renderBlocks())
+	if !strings.Contains(detailed, "PASS") || !strings.Contains(detailed, "$ go test ./...") {
+		t.Errorf("expanded activity call should restore full output:\n%s", detailed)
 	}
 	t.Logf("BLOCKS:\n%s", blocks)
 
@@ -93,6 +103,9 @@ func TestRenderSmoke(t *testing.T) {
 	}
 	t.Logf("BANNER:\n%s", banner)
 
+	// Keep the palette assertion independent of commands persisted by other
+	// tests or a developer's local TUI session.
+	s.recentCommands = []string{"/approval"}
 	s.openCommandPalette()
 	pal := stripANSI(s.renderModalBody())
 	if !strings.Contains(pal, "Command Palette") || !strings.Contains(pal, "/approval") {
@@ -453,5 +466,53 @@ func TestToolOutputTruncation(t *testing.T) {
 
 	if s.lastToolOutputBlock() != tb {
 		t.Errorf("lastToolOutputBlock should find the tool block")
+	}
+}
+
+func TestToolActivityGroupsCallsAndPreservesDetails(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 88, 28
+	s.models = []modelInfo{{ID: "test-model"}}
+	s.modelIdx = 0
+	s.layout()
+
+	s.logUser("Inspect, update, and verify the parser")
+	read := s.logTool("read_file", `{"path":"parser.go","limit":"40"}`, false)
+	read.output, read.hasOk, read.ok, read.dur = "package parser\n\nfunc parse() {}", true, true, 20*time.Millisecond
+	edit := s.logTool("edit", `{"path":"parser.go","edits":[{"old_text":"parse","new_text":"Parse"}]}`, false)
+	edit.output, edit.hasOk, edit.ok, edit.dur = "updated parser.go", true, true, 30*time.Millisecond
+	test := s.logTool("bash", `{"command":"go test ./..."}`, false)
+	test.output, test.hasOk, test.ok, test.dur = "ok parser", true, true, 40*time.Millisecond
+	s.push(blkAssistant).appendText("The parser is updated and the tests pass.")
+	s.cur = nil
+	s.invalidateAll()
+
+	compact := stripANSI(s.renderBlocks())
+	if strings.Count(compact, "▸ activity") != 1 {
+		t.Fatalf("consecutive tools should share one activity heading:\n%s", compact)
+	}
+	for _, want := range []string{"3 calls", "parser.go", "1 replacement", "go test ./...", "The parser is updated"} {
+		if !strings.Contains(compact, want) {
+			t.Errorf("compact activity missing %q:\n%s", want, compact)
+		}
+	}
+	for _, hidden := range []string{"package parser", "updated parser.go", "ok parser"} {
+		if strings.Contains(compact, hidden) {
+			t.Errorf("compact activity leaked output %q:\n%s", hidden, compact)
+		}
+	}
+
+	edit.expanded = true
+	s.invalidateAll()
+	expanded := stripANSI(s.renderBlocks())
+	if !strings.Contains(expanded, "updated parser.go") {
+		t.Fatalf("expanded call should reveal its tool-specific output:\n%s", expanded)
+	}
+	if strings.Contains(expanded, "package parser") || strings.Contains(expanded, "ok parser") {
+		t.Fatalf("expanding one call should leave sibling calls compact:\n%s", expanded)
+	}
+	if edit.renderEnd <= edit.renderStart {
+		t.Fatalf("expanded call should own a multi-line navigation range: %d-%d", edit.renderStart, edit.renderEnd)
 	}
 }

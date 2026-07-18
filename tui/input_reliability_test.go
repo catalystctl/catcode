@@ -80,8 +80,8 @@ func TestModalPasteNeverLeaksBehindDialog(t *testing.T) {
 	s.input.SetValue("draft")
 	s.openCommandPalette()
 	_, _ = s.Update(tea.PasteMsg{Content: "model"})
-	if s.modal.filter != "model" {
-		t.Fatalf("modal filter = %q", s.modal.filter)
+	if s.modal.filter != "model" || s.modal.pickerList.FilterValue() != "model" {
+		t.Fatalf("modal paste filter: mirror=%q picker=%q", s.modal.filter, s.modal.pickerList.FilterValue())
 	}
 	if s.input.Value() != "draft" {
 		t.Fatalf("hidden composer changed: %q", s.input.Value())

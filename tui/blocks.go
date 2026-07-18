@@ -174,14 +174,36 @@ func (s *session) renderBlocks() string {
 		if blk == s.cur || isInFlight(blk) {
 			break // don't cache the live streaming block or in-flight tools
 		}
+		if isToolActivityBlock(blk) {
+			end := toolActivityRunEnd(s.blocks, s.cacheIdx)
+			// Keep the trailing run live. A model often emits several calls in
+			// succession; waiting for the next conversation block lets them merge
+			// into one activity group instead of freezing several tiny groups in
+			// the prefix cache.
+			if end == len(s.blocks) || toolActivityRunInFlight(s.blocks[s.cacheIdx:end]) {
+				break
+			}
+			start := s.cacheLines
+			rendered := s.renderToolActivity(s.cacheIdx, end, w, start)
+			h := lipgloss.Height(rendered)
+			s.cache.WriteString(rendered)
+			s.cache.WriteString("\n\n")
+			s.cacheLines += h + 1
+			for _, toolBlock := range s.blocks[s.cacheIdx:end] {
+				releaseAfterCache(toolBlock)
+			}
+			s.cacheIdx = end
+			continue
+		}
 		start := s.cacheLines
 		rendered := s.renderBlock(blk, w)
 		h := lipgloss.Height(rendered)
 		blk.renderStart, blk.renderEnd = start, start+h-1
 		s.cache.WriteString(rendered)
 		s.cache.WriteString("\n\n") // breathing room between blocks
-		// rendered + "\n\n" ⇒ h content lines + 2 blank separators (last may trim later)
-		s.cacheLines += h + 2
+		// Two newline bytes after the last content row create one blank row,
+		// so the next block starts h+1 lines after this one.
+		s.cacheLines += h + 1
 		// Drop streaming residue and shrink tool payloads once the card is in
 		// the prefix cache — display comes from s.cache until invalidate.
 		releaseAfterCache(blk)
@@ -190,33 +212,315 @@ func (s *session) renderBlocks() string {
 	var b strings.Builder
 	b.WriteString(s.cache.String())
 	lineBase := s.cacheLines
-	if s.cur != nil {
-		rendered := s.renderBlock(s.cur, w)
-		h := lipgloss.Height(rendered)
-		s.cur.renderStart, s.cur.renderEnd = lineBase, lineBase+h-1
-		b.WriteString(rendered)
-		b.WriteString("\n\n")
-		lineBase += h + 2
-	}
-	// Trailing in-flight tools render live: a spawn scout is shown in the
-	// active-tasks panel (not inline); other tools get a brief head marker
-	// until their result lands, then they re-cache as a full card.
-	for i := s.cacheIdx; i < len(s.blocks); i++ {
+	// Everything after the cached prefix is rendered in order. In practice this
+	// is a live assistant/reasoning block, a trailing activity run, or both.
+	// Keeping this as an ordered walk avoids tool calls visually jumping ahead
+	// of the reasoning/commentary that introduced them.
+	for i := s.cacheIdx; i < len(s.blocks); {
 		blk := s.blocks[i]
-		if blk == s.cur || !isInFlight(blk) {
+		if isToolActivityBlock(blk) {
+			end := toolActivityRunEnd(s.blocks, i)
+			rendered := s.renderToolActivity(i, end, w, lineBase)
+			if rendered != "" {
+				h := lipgloss.Height(rendered)
+				b.WriteString(rendered)
+				b.WriteString("\n\n")
+				lineBase += h + 1
+			}
+			i = end
 			continue
-		}
-		if blk.name == "spawn" || blk.name == "subagent" {
-			continue // active-tasks panel renders the scout
 		}
 		rendered := s.renderBlock(blk, w)
 		h := lipgloss.Height(rendered)
 		blk.renderStart, blk.renderEnd = lineBase, lineBase+h-1
 		b.WriteString(rendered)
 		b.WriteString("\n\n")
-		lineBase += h + 2
+		lineBase += h + 1
+		i++
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// isToolActivityBlock identifies calls/results that belong in the compact
+// activity treatment. Approval decisions remain standalone because they are
+// user interaction, not background agent work.
+func isToolActivityBlock(b *block) bool {
+	return b != nil && (b.kind == blkTool || b.kind == blkToolResult)
+}
+
+func toolActivityRunEnd(blocks []*block, start int) int {
+	end := start
+	for end < len(blocks) && isToolActivityBlock(blocks[end]) {
+		end++
+	}
+	return end
+}
+
+func toolActivityRunInFlight(blocks []*block) bool {
+	for _, b := range blocks {
+		if isInFlight(b) {
+			return true
+		}
+	}
+	return false
+}
+
+// renderToolActivity turns a noisy run of tool cards into a single visual
+// unit. Collapsed calls are one-line summaries; Ctrl+O on the nearest/focused
+// call swaps only that row for the existing full, tool-specific renderer.
+// renderStart/renderEnd stay per-call so transcript navigation and nearest-
+// output discovery continue to target the right call inside a group.
+func (s *session) renderToolActivity(start, end, w, lineBase int) string {
+	if start < 0 || end > len(s.blocks) || start >= end {
+		return ""
+	}
+	visible := make([]*block, 0, end-start)
+	failed, running := 0, 0
+	for _, b := range s.blocks[start:end] {
+		// A live scout already has a richer pinned progress surface. Its nested
+		// operations can still join this run, and the completed spawn call returns
+		// to the transcript as a normal summary row.
+		if b.kind == blkTool && b.inFlight() && (b.name == "spawn" || b.name == "subagent") {
+			b.renderStart, b.renderEnd = 0, -1
+			continue
+		}
+		visible = append(visible, b)
+		if b.kind == blkTool {
+			if b.inFlight() {
+				running++
+			} else if b.hasOk && !b.ok {
+				failed++
+			}
+		}
+	}
+	if len(visible) == 0 {
+		return ""
+	}
+
+	label := fmt.Sprintf("%d call%s", len(visible), pluralS(len(visible)))
+	var state string
+	switch {
+	case failed > 0 && running > 0:
+		state = fmt.Sprintf(" · %d failed · %d running", failed, running)
+	case failed > 0:
+		state = fmt.Sprintf(" · %d failed", failed)
+	case running > 0:
+		state = fmt.Sprintf(" · %d running", running)
+	}
+	allExpanded, inspectable := true, 0
+	for _, b := range visible {
+		if b == nil || b.sub {
+			continue
+		}
+		inspectable++
+		allExpanded = allExpanded && b.expanded
+	}
+	if inspectable == 0 {
+		allExpanded = false
+	}
+	disclosure := "▸"
+	if allExpanded {
+		disclosure = "▾"
+	}
+	heading := roleToolStyle.Render(disclosure+" activity") + dimStyle.Render(" · "+label+state)
+	if key := s.keyHint("toggle_tool_output"); key != "" {
+		heading = fitRow(w, heading, keyHintStyle.Render("click rows · "+key+" details"))
+	}
+
+	var out strings.Builder
+	out.WriteString(heading)
+	line := lineBase + 1 // heading occupies the first line
+	for _, b := range visible {
+		out.WriteByte('\n')
+		var rendered string
+		if b.expanded {
+			if b.kind == blkToolResult {
+				rendered = indentToolDetail(s.renderKeyHints(s.renderBlockFull(b, max(8, w-2))))
+			} else {
+				rendered = indentToolDetail(s.renderKeyHints(s.renderToolBlock(b, max(8, w-2))))
+			}
+		} else {
+			rendered = s.renderCompactToolRow(b, w)
+		}
+		h := lipgloss.Height(rendered)
+		b.renderStart, b.renderEnd = line, line+h-1
+		out.WriteString(rendered)
+		line += h
+	}
+	return out.String()
+}
+
+func indentToolDetail(detail string) string {
+	lines := strings.Split(detail, "\n")
+	for i := range lines {
+		lines[i] = "  " + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (s *session) renderCompactToolRow(b *block, w int) string {
+	prefix := dimStyle.Render("│ ")
+	if s.focusedBlock >= 0 && s.focusedBlock < len(s.blocks) && s.blocks[s.focusedBlock] == b {
+		prefix = accentStyle.Render("▸ ")
+	}
+	if b.kind == blkToolResult {
+		lines := outputLineCount(b.output)
+		detail := "result"
+		if lines > 0 {
+			detail += fmt.Sprintf(" · %d line%s", lines, pluralS(lines))
+		}
+		return prefix + successStyle.Render("✓") + " " + resultStyle.Render(truncate(detail, max(4, w-4)))
+	}
+
+	dur, _, failed := toolStatus(b)
+	status, statusStyle := "·", mutedStyle
+	switch {
+	case b.inFlight():
+		status, statusStyle = "◷", roToolNameStyle
+	case failed:
+		status, statusStyle = "✗", errStyle
+	case b.hasOk && b.ok:
+		status, statusStyle = "✓", successStyle
+	}
+	nameStyle := toolNameStyleFor(b.name)
+	left := prefix + statusStyle.Render(status) + " " + nameStyle.Render(toolDisplayName(b.name))
+	if detail := compactToolDetail(b); detail != "" {
+		left += dimStyle.Render("  " + detail)
+	}
+	if dur == "" {
+		return truncateStyledRow(left, w)
+	}
+	return fitRow(w, left, dimStyle.Render(dur))
+}
+
+func truncateStyledRow(row string, w int) string {
+	if lipgloss.Width(row) <= w {
+		return row
+	}
+	return lipgloss.NewStyle().MaxWidth(max(1, w)).Render(row)
+}
+
+func outputLineCount(output string) int {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return 0
+	}
+	return strings.Count(output, "\n") + 1
+}
+
+// compactToolDetail keeps the most decision-useful part of each call in the
+// timeline without leaking raw JSON into the chat. Full args/output/diffs stay
+// one Ctrl+O away through the existing bespoke renderers.
+func compactToolDetail(b *block) string {
+	var parts []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	switch b.name {
+	case "bash":
+		command := b.arg("command")
+		if command == "" {
+			command = bareToolArg(b.args)
+		}
+		add(command)
+	case "git_commit":
+		if message := b.arg("message"); message != "" {
+			add(`"` + message + `"`)
+		}
+	case "git_add":
+		if n := len(b.argStrArr("paths")); n > 0 {
+			add(fmt.Sprintf("%d file%s", n, pluralS(n)))
+		}
+	case "grep":
+		if pattern := b.arg("pattern"); pattern != "" {
+			add(`"` + pattern + `"`)
+		}
+		if path := b.arg("path"); path != "" {
+			add("in " + path)
+		}
+		if n := outputLineCount(b.output); n > 0 && !b.inFlight() {
+			add(fmt.Sprintf("%d match%s", n, pluralS(n)))
+		}
+	case "glob":
+		add(b.arg("pattern"))
+		if n := outputLineCount(b.output); n > 0 && !b.inFlight() {
+			add(fmt.Sprintf("%d file%s", n, pluralS(n)))
+		}
+	case "list_dir":
+		add(b.arg("path"))
+		if n := outputLineCount(b.output); n > 0 && !b.inFlight() {
+			add(fmt.Sprintf("%d entries", n))
+		}
+	case "edit":
+		add(b.arg("path"))
+		if n := len(b.argObjArr("edits")); n > 0 {
+			add(fmt.Sprintf("%d replacement%s", n, pluralS(n)))
+		}
+	case "write_file":
+		add(b.arg("path"))
+		if content := b.arg("content"); content != "" {
+			n := strings.Count(content, "\n") + 1
+			add(fmt.Sprintf("%d line%s", n, pluralS(n)))
+		}
+	case "todo_write":
+		if n := len(b.argObjArr("todos")); n > 0 {
+			add(fmt.Sprintf("%d item%s", n, pluralS(n)))
+		}
+	case "todo_read":
+		var todos []map[string]json.RawMessage
+		if json.Unmarshal([]byte(strings.TrimSpace(b.output)), &todos) == nil && len(todos) > 0 {
+			add(fmt.Sprintf("%d item%s", len(todos), pluralS(len(todos))))
+		}
+	case "diagnostics":
+		add(b.arg("path"))
+		errors, warnings := countDiag(splitNonEmpty(strings.TrimSpace(b.output), "\n"))
+		if errors > 0 {
+			add(fmt.Sprintf("%d error%s", errors, pluralS(errors)))
+		}
+		if warnings > 0 {
+			add(fmt.Sprintf("%d warning%s", warnings, pluralS(warnings)))
+		}
+	case "memory":
+		add(b.arg("action"))
+		add(b.arg("name"))
+	case "spawn", "subagent":
+		add(b.arg("agent"))
+		add(b.arg("task"))
+	case "bulk":
+		if n := len(b.argObjArr("calls")); n > 0 {
+			add(fmt.Sprintf("%d nested call%s", n, pluralS(n)))
+		}
+	case "web_search":
+		add(b.arg("query"))
+	case "finish":
+		if !b.inFlight() {
+			add(strings.TrimSpace(b.output))
+		}
+	default:
+		add(toolKeyArg(b))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// bareToolArg recovers legacy/test calls whose args are a command string
+// rather than the normal JSON object shape.
+func bareToolArg(args string) string {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return ""
+	}
+	var value string
+	if json.Unmarshal([]byte(args), &value) == nil {
+		return value
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(args), &object) != nil {
+		return args
+	}
+	return ""
 }
 
 // scheduleStreamRefresh coalesces token deltas into one viewport rebuild per
@@ -262,7 +566,12 @@ func (s *session) renderCoreFailure() string {
 // (default) the view pins to the newest line; when the user has scrolled up,
 // follow is off and the current offset is preserved so reading isn't yanked.
 func (s *session) refresh() {
-	s.viewport.SetContent(s.renderBlocks())
+	base := s.renderBlocks()
+	if base != s.transcriptBase || s.transcriptPlain == nil {
+		s.transcriptBase = base
+		s.transcriptPlain = plainTranscriptLines(base)
+	}
+	s.viewport.SetContent(s.transcriptBase)
 	if s.follow {
 		s.viewport.GotoBottom()
 	}
@@ -552,9 +861,9 @@ func (s *session) renderBlockFull(b *block, w int) string {
 			if b.text.Len() == 0 {
 				n = 0
 			}
-			return dimStyle.Render(fmt.Sprintf("▷ reasoning · %d line%s  (ctrl+t expand)", n, pluralS(n)))
+			return dimStyle.Render(fmt.Sprintf("▸ reasoning · %d line%s  (click or ctrl+t expand)", n, pluralS(n)))
 		}
-		return roleLine("◇", "reasoning", "", c.dim) + "\n" +
+		return roleLine("▾", "reasoning", "click to collapse", c.dim) + "\n" +
 			thinkStyle.Render(renderMarkdown(b.text.String(), w))
 	case blkTool:
 		return s.renderToolBlock(b, w)
@@ -746,9 +1055,9 @@ func resultPanel(output string, w int, err bool) string {
 	return panelLines(output, w, dimStyle, resultStyle)
 }
 
-// lastToolOutputBlock returns the most recent block carrying tool output
-// (a top-level blkTool with a result, or a standalone blkToolResult). Used
-// by ctrl+o when pinned to the bottom.
+// lastToolOutputBlock returns the most recent inspectable tool call/result.
+// The historical name is retained for callers, but calls without textual
+// output are included because their args/diff still have useful details.
 func (s *session) lastToolOutputBlock() *block {
 	for i := len(s.blocks) - 1; i >= 0; i-- {
 		b := s.blocks[i]
@@ -758,7 +1067,7 @@ func (s *session) lastToolOutputBlock() *block {
 		if b.kind == blkToolResult {
 			return b
 		}
-		if b.kind == blkTool && !b.sub && b.dur > 0 && strings.TrimSpace(b.output) != "" {
+		if b.kind == blkTool && !b.sub && b.dur > 0 {
 			return b
 		}
 	}
@@ -782,7 +1091,7 @@ func (s *session) nearestToolOutputBlock() *block {
 			candidates = append(candidates, b)
 			continue
 		}
-		if b.kind == blkTool && !b.sub && b.dur > 0 && strings.TrimSpace(b.output) != "" {
+		if b.kind == blkTool && !b.sub && b.dur > 0 {
 			candidates = append(candidates, b)
 		}
 	}

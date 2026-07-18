@@ -79,6 +79,7 @@ var (
 	roToolNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true) // read-only tools
 	errOutStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))               // failed tool output text
 	errRuleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))               // failed tool left rule
+	selectionStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(c.bg)).Background(lipgloss.Color(c.accent)).Bold(true)
 )
 
 // pillStyle returns a solid-background pill chip style for header tags.

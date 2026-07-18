@@ -49,7 +49,6 @@ const (
 	modalSandbox
 	modalAutoCompact
 	modalNoNetwork
-	modalMouseWheel
 	modalFooterMetrics
 	modalReducedMotion
 	modalValueEdit          // free-form edit (api_key, timeouts, remember, attach, run, …)
@@ -455,17 +454,6 @@ func (s *session) openNoNetworkPicker() {
 	}
 }
 
-// openMouseWheelPicker toggles mouse-wheel scrolling.
-func (s *session) openMouseWheelPicker() {
-	s.modal = newModal()
-	s.modal.kind = modalMouseWheel
-	if s.settings.MouseWheel {
-		s.modal.cursor = 0
-	} else {
-		s.modal.cursor = 1
-	}
-}
-
 func (s *session) openFooterMetricsPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalFooterMetrics
@@ -628,13 +616,25 @@ func (s *session) appendModalPaste(text string) bool {
 	if s.modal.kind == modalNone {
 		return false
 	}
-	if s.modal.editing || (s.modal.kind == modalGoal && s.goalDraft.editing) {
-		s.modal.editBuf.SetValue(s.modal.editBuf.Value() + text)
-		s.modal.editBuf.CursorEnd()
+	if s.modalAcceptsTextPaste() {
+		// Let textinput sanitize and insert at its cursor. SetValue+CursorEnd made
+		// every modal paste append, regardless of where the user was editing.
+		s.modal.editBuf, _ = s.modal.editBuf.Update(tea.PasteMsg{Content: text})
+		return true
+	}
+	if s.usesCharmPickerList() {
+		q := s.modal.pickerList.FilterValue() + text
+		s.modal.pickerList.SetFilterText(q)
+		s.modal.pickerList.SetFilterState(list.Filtering)
+		// Keep the legacy mirror synchronized for code paths and tests shared
+		// with the hand-rendered list modals.
+		s.modal.filter = q
+		s.modal.cursor = 0
+		s.modal.scroll = 0
 		return true
 	}
 	switch s.modal.kind {
-	case modalCommand, modalModels, modalSessions, modalMemory, modalReasoning,
+	case modalMemory, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalVision:
 		s.modal.filter += text
 		s.modal.cursor = 0
@@ -642,6 +642,19 @@ func (s *session) appendModalPaste(text string) bool {
 		return true
 	}
 	return false
+}
+
+func (s *session) modalAcceptsTextPaste() bool {
+	switch s.modal.kind {
+	case modalValueEdit, modalOauthCode:
+		return s.modal.editing
+	case modalProviders:
+		return s.modal.editing && s.pendingLogin != ""
+	case modalGoal:
+		return s.modal.editing && s.goalDraft.editing
+	default:
+		return false
+	}
 }
 
 // openMemoryPicker shows saved memories so the user can forget one by Enter.
@@ -1015,6 +1028,12 @@ func (s *session) closeModal() {
 	s.modal.editing = false
 	s.pluginPickerMode = ""
 	s.pendingPluginInstallPath = ""
+	s.selectionFrameGeneration++
+	s.selectionPending = false
+	s.selectionFrameScheduled = false
+	s.modalSelection = transcriptSelection{}
+	s.modalSelectionKind = modalNone
+	s.modalPlain = nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,7 +1054,6 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/auto-compact", desc: "auto context compaction on/off"},
 		{group: "Session", label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
 		{group: "Session", label: "/no-network", desc: "block network in sandbox on/off"},
-		{group: "Session", label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
 		{group: "Session", label: "/footer-metrics", desc: "show model, TPS, and TTFT in footer"},
 		{group: "Session", label: "/reduced-motion", desc: "disable spring animations"},
 		{group: "Session", label: "/idle-timeout", desc: "idle timeout (seconds)"},
@@ -1201,7 +1219,6 @@ func (s *session) settingsHubItems() []listItem {
 		{label: "/auto-compact", desc: boolStr(s.coreAutoCompact)},
 		{label: "/sandbox", desc: s.settings.Sandbox},
 		{label: "/no-network", desc: boolStr(s.settings.NoNetwork) + " (next launch)"},
-		{label: "/mouse-wheel", desc: boolStr(s.settings.MouseWheel)},
 		{label: "/footer-metrics", desc: boolStr(s.settings.FooterMetrics) + " · model, TPS, TTFT"},
 		{label: "/reduced-motion", desc: boolStr(s.settings.ReducedMotion) + " · spring animations"},
 		{label: "/idle-timeout", desc: fmt.Sprintf("%ds (next launch)", s.settings.IdleTimeout)},
@@ -1298,12 +1315,6 @@ func (s *session) noNetworkItems() []listItem {
 	return toggleItems(s.settings.NoNetwork,
 		"block network in sandbox (next launch)",
 		"allow network (next launch)")
-}
-
-func (s *session) mouseWheelItems() []listItem {
-	return toggleItems(s.settings.MouseWheel,
-		"wheel scrolls transcript (Shift+drag to select)",
-		"native click-drag select/copy")
 }
 
 func (s *session) footerMetricsItems() []listItem {
@@ -1558,7 +1569,7 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch s.modal.kind {
 	case modalCommand, modalModels, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalFooterMetrics, modalReducedMotion, modalMemory, modalPluginInstallScope,
+		modalAutoCompact, modalNoNetwork, modalFooterMetrics, modalReducedMotion, modalMemory, modalPluginInstallScope,
 		modalSearchKey, modalRestartConfirm:
 		return s.handleListKey(msg)
 	case modalVision:
@@ -2074,8 +2085,6 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.autoCompactItems()
 	case modalNoNetwork:
 		items = s.noNetworkItems()
-	case modalMouseWheel:
-		items = s.mouseWheelItems()
 	case modalFooterMetrics:
 		items = s.footerMetricsItems()
 	case modalReducedMotion:
@@ -2348,21 +2357,6 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.logInfo("restart skipped — change applies on next launch")
 		return s, nil
-	case modalMouseWheel:
-		items := s.mouseWheelItems()
-		if abs >= 0 && abs < len(items) {
-			on := items[abs].label == "on"
-			s.settings.MouseWheel = on
-			_ = s.settings.save()
-			if on {
-				s.logInfo("mouse wheel: on (hold Shift to select/copy text)")
-			} else {
-				s.logInfo("mouse wheel: off (click-drag to select/copy text)")
-			}
-			s.invalidateAll()
-		}
-		s.closeModal()
-		return s, nil
 	case modalFooterMetrics:
 		items := s.footerMetricsItems()
 		if abs >= 0 && abs < len(items) {
@@ -2451,8 +2445,6 @@ func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
 		s.openSandboxPicker()
 	case "/no-network":
 		s.openNoNetworkPicker()
-	case "/mouse-wheel":
-		s.openMouseWheelPicker()
 	case "/footer-metrics":
 		s.openFooterMetricsPicker()
 	case "/reduced-motion":
@@ -3071,9 +3063,9 @@ func (s *session) helpText() string {
 	lines = append(lines,
 		"",
 		"Mouse & copy",
-		"  click-drag selects/copies text (mouse off by default)",
-		"  /mouse-wheel on  enables wheel scrolling",
-		"  (hold Shift to select/copy while the mouse is on)",
+		"  click reasoning/tool rows to open or close",
+		"  drag chat or modal text to select and copy automatically",
+		"  mouse wheel scrolls the active chat or modal",
 		"",
 		"Slash commands",
 		"  (bare commands open modals; skills still take optional task text)",
@@ -3180,8 +3172,6 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Auto Compact", s.autoCompactItems(), false)
 	case modalNoNetwork:
 		return s.renderListModal("No Network", s.noNetworkItems(), false)
-	case modalMouseWheel:
-		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
 	case modalFooterMetrics:
 		return s.renderListModal("Footer Metrics", s.footerMetricsItems(), false)
 	case modalReducedMotion:
