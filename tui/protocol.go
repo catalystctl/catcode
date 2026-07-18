@@ -147,25 +147,45 @@ type usageReport struct {
 	Windows      []usageWindow `json:"windows"`
 }
 
-// skillInfo mirrors one element of the core's "skills" event array. The
-// content (SKILL.md body) is sent by the core so /skill:<name> can apply a
-// skill without the read_file path restriction blocking global skills.
+// skillInfo mirrors one element of the core's "skills" event array.
+// The TUI palette / autocomplete only needs name + description (+ location);
+// the SKILL.md body stays in the core — apply_skill sends the name and the
+// core inlines the body (so we deliberately omit Content to avoid pinning
+// every skill body for process life; D-005).
 type skillInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Location    string `json:"location"`
-	Content     string `json:"content"`
 }
 
 // coreEvent is one newline-delimited JSON line from the core.
+// fields caches the once-parsed object map so get/rawKey do not re-Unmarshal
+// Raw on every field read (D-004). Populated at ingest or lazily on first get.
 type coreEvent struct {
-	Type string          `json:"type"`
-	Raw  json.RawMessage `json:"-"`
+	Type   string                     `json:"type"`
+	Raw    json.RawMessage            `json:"-"`
+	fields map[string]json.RawMessage `json:"-"`
+}
+
+func (e *coreEvent) ensureFields() map[string]json.RawMessage {
+	if e == nil {
+		return nil
+	}
+	if e.fields != nil {
+		return e.fields
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(e.Raw, &m); err != nil {
+		e.fields = map[string]json.RawMessage{}
+		return e.fields
+	}
+	e.fields = m
+	return e.fields
 }
 
 func (e *coreEvent) get(key string) string {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(e.Raw, &m); err != nil {
+	m := e.ensureFields()
+	if m == nil {
 		return ""
 	}
 	v, ok := m[key]
@@ -182,8 +202,8 @@ func (e *coreEvent) get(key string) string {
 // rawKey returns the raw JSON value for a key (e.g. an array/object), so
 // callers can unmarshal structured fields themselves without re-parsing Raw.
 func (e *coreEvent) rawKey(key string) (json.RawMessage, bool) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(e.Raw, &m); err != nil {
+	m := e.ensureFields()
+	if m == nil {
 		return nil, false
 	}
 	v, ok := m[key]

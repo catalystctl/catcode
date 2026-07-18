@@ -20,11 +20,18 @@
 #   cargo install cargo-zigbuild      # and put zig on PATH
 #
 #   ./release-macos.sh [version]     # version defaults to the git commit (short SHA)
+#   CATCODE_MACOS_ARCH=arm64 ./release-macos.sh   # build one arch (CI fan-out)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${1:-$(git rev-parse --short HEAD 2>/dev/null || grep -m1 '^version' core/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')}"
 EMBED_FILE="tui/embed/catcode-core"
+MACOS_ARCH="${CATCODE_MACOS_ARCH:-all}"
+
+case "$MACOS_ARCH" in
+	all|arm64|x86_64) ;;
+	*) echo "error: CATCODE_MACOS_ARCH must be all, arm64, or x86_64" >&2; exit 1 ;;
+esac
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
 require cargo         "install rustup/rust"
@@ -108,15 +115,21 @@ build_arch() {
 	make_dmg "${out}" "${tag}" || echo "    (warning: .dmg for ${tag} skipped — see message above)"
 }
 
-build_arch aarch64-apple-darwin arm64 arm64
-build_arch x86_64-apple-darwin  amd64 x86_64
+if [[ "$MACOS_ARCH" == all || "$MACOS_ARCH" == arm64 ]]; then
+	build_arch aarch64-apple-darwin arm64 arm64
+fi
+if [[ "$MACOS_ARCH" == all || "$MACOS_ARCH" == x86_64 ]]; then
+	build_arch x86_64-apple-darwin amd64 x86_64
+fi
 
 echo "[done] checksums..."
 ( cd dist
   for f in catcode-${VERSION}-macos-arm64 catcode-${VERSION}-macos-x86_64 \
            catcode-core-${VERSION}-macos-arm64 catcode-core-${VERSION}-macos-x86_64 \
            catcode-${VERSION}-macos-arm64.dmg    catcode-${VERSION}-macos-x86_64.dmg; do
-	[[ -f "$f" ]] && sha256sum "$f" > "$f.sha256"
+	if [[ -f "$f" ]]; then
+		sha256sum "$f" > "$f.sha256"
+	fi
   done )
 
 # P1-23: for distribution, codesign + notarize each artifact with an Apple

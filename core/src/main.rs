@@ -99,7 +99,10 @@ Judgment (tool schemas own the mechanics):
 - Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; for complex logic write a script and run it.
 - Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed (see Deferred tools below).
 - Paths are workspace-relative; absolute paths and ".." are rejected.
-Be concise. When done, summarize in two lines.
+
+Complete and verify requests end-to-end. Stop only when done, blocked on the user,
+or destructive work needs approval. Do in-scope next steps instead of offering them.
+Be concise.
 
 Self-learning:
 - Persist durable facts with `memory` (workspace default; `scope:global` for cross-repo). Prefer `append` over duplicate saves; skip transient task state and trivia. Always pass a one-line `description`. Use durable types (convention/decision/gotcha/…) or importance=high; pass force=true only to override the write policy.
@@ -253,6 +256,15 @@ fn build_main_system_prompt(
     if !inj.is_empty() {
         prompt.push_str(&inj);
     }
+    // Main-agent-only: the `ask` tool is dispatchable only in the orchestrator
+    // loop (subagents escalate via contact_supervisor instead), so the ask-when
+    // -under-specified guidance lives here, not in the shared base prompt.
+    prompt.push_str(
+        "\n\nAsk the user when it matters:\n\
+         - Use `ask` whenever the request is under-specified and guessing could waste work or cause damage: ambiguous scope, multiple valid approaches with real trade-offs, missing required info you cannot find in the workspace, or an irreversible/destructive choice.\n\
+         - Do NOT ask about things you can determine yourself by reading the code or running a command — check first, ask only what you can't resolve.\n\
+         - One round of focused questions beats many; batch related questions in one `ask` call. If the user skips, proceed with best judgment and state your assumptions.",
+    );
     // When auto-reflect is on, defer the completion summary until AFTER the
     // reflection step so the summary is the last message the user reads.
     // Supersedes the "summarize when done" line in SYSTEM_PROMPT_BASE (kept

@@ -121,12 +121,12 @@ func TestTruncateFit(t *testing.T) {
 
 func TestFitListRow(t *testing.T) {
 	// Wide row: label + desc both fit.
-	r := stripANSI(fitListRow("  ", "hello", "5 msgs", 2, 40))
+	r := stripANSI(fitListRow("  ", "hello", "5 msgs", 2, 40, ""))
 	if !strings.Contains(r, "hello") || !strings.Contains(r, "5 msgs") {
 		t.Errorf("wide row should keep label+desc; got %q", r)
 	}
 	// Narrow row: label truncated, desc preserved.
-	r = stripANSI(fitListRow("  ", "a very long title here", "12 msgs", 2, 20))
+	r = stripANSI(fitListRow("  ", "a very long title here", "12 msgs", 2, 20, ""))
 	if !strings.Contains(r, "12 msgs") {
 		t.Errorf("narrow row should preserve desc; got %q", r)
 	}
@@ -135,7 +135,7 @@ func TestFitListRow(t *testing.T) {
 	}
 	// Result must not exceed the width budget.
 	for _, w := range []int{5, 10, 20, 40} {
-		got := lipgloss.Width(fitListRow("  ", "some long long long label", "99 msgs", 2, w))
+		got := lipgloss.Width(fitListRow("  ", "some long long long label", "99 msgs", 2, w, ""))
 		if got > w {
 			t.Errorf("fitListRow width %d > budget %d", got, w)
 		}

@@ -145,7 +145,9 @@ type settingsStore struct {
 	Approval        string `json:"approval"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	Theme           string `json:"theme,omitempty"`
-	ThinkExpanded   bool   `json:"think_expanded,omitempty"`
+	// AttachDir remembers the last directory opened by the /attach file picker.
+	AttachDir     string `json:"attach_dir,omitempty"`
+	ThinkExpanded bool   `json:"think_expanded,omitempty"`
 	// Production knobs (item 3/7): passed to the core on launch.
 	Sandbox          string `json:"sandbox,omitempty"` // none | firejail | seatbelt
 	NoNetwork        bool   `json:"no_network,omitempty"`
@@ -153,6 +155,7 @@ type settingsStore struct {
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
 	MouseWheel       bool   `json:"mouse_wheel,omitempty"`        // opt-in wheel scroll (off keeps native click-drag copy)
 	FooterMetrics    bool   `json:"footer_metrics"`               // default on; false hides model/performance footer row
+	ReducedMotion    bool   `json:"reduced_motion"`               // disable spring animations (usage bars, etc.)
 	// Runtime knobs: also applied live via set_config; persisted so restart keeps them.
 	// JSON names match core apply_json so the core reads them from settings.json too.
 	BashTimeoutSecs int  `json:"bash_timeout_secs,omitempty"`
@@ -316,6 +319,9 @@ func loadSettingsFrom(path string) *settingsStore {
 	if onDisk.Theme != "" {
 		s.Theme = onDisk.Theme
 	}
+	if onDisk.AttachDir != "" {
+		s.AttachDir = onDisk.AttachDir
+	}
 	s.ThinkExpanded = onDisk.ThinkExpanded
 	if onDisk.Sandbox != "" {
 		s.Sandbox = onDisk.Sandbox
@@ -331,6 +337,9 @@ func loadSettingsFrom(path string) *settingsStore {
 	s.MouseWheel = onDisk.MouseWheel
 	if v, ok := raw["footer_metrics"].(bool); ok {
 		s.FooterMetrics = v
+	}
+	if v, ok := raw["reduced_motion"].(bool); ok {
+		s.ReducedMotion = v
 	}
 	if onDisk.BashTimeoutSecs > 0 {
 		s.BashTimeoutSecs = onDisk.BashTimeoutSecs
@@ -435,7 +444,7 @@ func (s *settingsStore) save() (err error) {
 		"theme": s.Theme, "think_expanded": s.ThinkExpanded,
 		"sandbox": s.Sandbox, "no_network": s.NoNetwork,
 		"idle_timeout": s.IdleTimeout, "max_session_tokens": s.MaxSessionTokens,
-		"mouse_wheel": s.MouseWheel, "footer_metrics": s.FooterMetrics, "bash_timeout_secs": s.BashTimeoutSecs,
+		"mouse_wheel": s.MouseWheel, "footer_metrics": s.FooterMetrics, "reduced_motion": s.ReducedMotion, "bash_timeout_secs": s.BashTimeoutSecs,
 		"auto_compact": s.AutoCompact, "active_provider": s.ActiveProvider,
 		"provider_keys":   nonNilStringMap(s.ProviderKeys),
 		"keybinds":        nonNilStringMap(s.Keybinds),
@@ -449,6 +458,7 @@ func (s *settingsStore) save() (err error) {
 	merged["approval"] = s.Approval
 	merged["auto_compact"] = s.AutoCompact
 	merged["footer_metrics"] = s.FooterMetrics
+	merged["reduced_motion"] = s.ReducedMotion
 	// Core apply_json reads idle_timeout_secs; keep the TUI's idle_timeout too.
 	merged["idle_timeout"] = s.IdleTimeout
 	merged["idle_timeout_secs"] = s.IdleTimeout

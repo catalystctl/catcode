@@ -12,18 +12,18 @@ func TestCapStoredArgsAndDiff(t *testing.T) {
 	}
 	huge := strings.Repeat("a", maxStoredOutput+100)
 	got := capStored(huge)
-	if !strings.HasSuffix(got, "\n…[truncated]") {
+	if !strings.HasSuffix(got, storedTruncMarker) {
 		t.Fatalf("missing truncation marker: %q", got[len(got)-20:])
 	}
-	if len(got)-len("\n…[truncated]") != maxStoredOutput {
-		t.Fatalf("body len=%d want %d", len(got)-len("\n…[truncated]"), maxStoredOutput)
+	if len(got)-len(storedTruncMarker) != maxStoredOutput {
+		t.Fatalf("body len=%d want %d", len(got)-len(storedTruncMarker), maxStoredOutput)
 	}
 
 	s := initialSession()
 	s.width = 80
 	s.viewport.SetWidth(80)
 	b := s.logTool("write_file", huge, false)
-	if !strings.HasSuffix(b.args, "\n…[truncated]") {
+	if !strings.HasSuffix(b.args, storedTruncMarker) {
 		t.Fatalf("logTool args not capped")
 	}
 	s.logApproveDiff("edit", huge, huge)
@@ -37,7 +37,7 @@ func TestCapStoredArgsAndDiff(t *testing.T) {
 	if approve == nil {
 		t.Fatal("missing approve block")
 	}
-	if !strings.HasSuffix(approve.args, "\n…[truncated]") || !strings.HasSuffix(approve.diff, "\n…[truncated]") {
+	if !strings.HasSuffix(approve.args, storedTruncMarker) || !strings.HasSuffix(approve.diff, storedTruncMarker) {
 		t.Fatalf("approve args/diff not capped")
 	}
 }

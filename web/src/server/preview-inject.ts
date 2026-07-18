@@ -187,7 +187,7 @@ export type InjectPreviewOptions = {
   inspect?: boolean;
   /**
    * Proxy path prefix (e.g. `/api/dev-proxy/4321`). Injects an early script that
-   * rewrites fetch/XHR root-absolute URLs so Astro/Vite client routers stay
+   * rewrites fetch/XHR/history/location root-absolute URLs so SPA routers stay
    * under the proxy (and send cookies with allow-same-origin).
    */
   pathPrefix?: string;
@@ -195,23 +195,70 @@ export type InjectPreviewOptions = {
 
 const PREFIX_MARK = "<!--catcode-preview-prefix-->";
 
-/** Patch fetch/XHR so `/foo` becomes `/api/dev-proxy/<port>/foo`. */
+/**
+ * Patch fetch/XHR/history/location/WebSocket so root-absolute `/foo` stays under
+ * `/api/dev-proxy/<port>/foo`. Without history/location patches, SPAs that call
+ * `location.assign('/login')` or `history.pushState(…, '/dashboard')` escape the
+ * proxy and load the Catalyst host app instead.
+ */
 export function previewPathPrefixScript(prefix: string): string {
   return `(function(){
   if (window.__catcodeProxyPrefix) return;
   var PREFIX = ${JSON.stringify(prefix)};
   window.__catcodeProxyPrefix = PREFIX;
+
+  var locProto = Location.prototype;
+  var hrefDesc = Object.getOwnPropertyDescriptor(locProto, "href");
+  var pathnameDesc = Object.getOwnPropertyDescriptor(locProto, "pathname");
+
+  function realHref(loc) {
+    try {
+      return hrefDesc && hrefDesc.get ? hrefDesc.get.call(loc || window.location) : String((loc || window.location).href);
+    } catch (e) {
+      return String((loc || window.location).href);
+    }
+  }
+  function realPathname(loc) {
+    try {
+      return pathnameDesc && pathnameDesc.get ? pathnameDesc.get.call(loc || window.location) : String((loc || window.location).pathname);
+    } catch (e) {
+      return String((loc || window.location).pathname);
+    }
+  }
+
+  function stripPath(pathname) {
+    if (pathname.indexOf(PREFIX) === 0) {
+      var rest = pathname.slice(PREFIX.length);
+      if (!rest) return "/";
+      return rest.charAt(0) === "/" ? rest : "/" + rest;
+    }
+    return pathname;
+  }
+
+  function mine(loc) {
+    return loc === window.location;
+  }
+
   function fix(u) {
     if (u == null || typeof u !== "string") return u;
     try {
-      var resolved = new URL(u, location.href);
-      if (resolved.origin === location.origin) {
-        var p = resolved.pathname + resolved.search + resolved.hash;
-        if (p.indexOf(PREFIX) === 0) return u;
-        if (p.charAt(0) === "/") {
-          var next = PREFIX + p;
-          return /^https?:\\/\\//i.test(u) ? resolved.origin + next : next;
+      var resolved = new URL(u, realHref(window.location));
+      // ws/wss origins differ from http(s) even on the same host — still rewrite.
+      var sameSite =
+        resolved.origin === window.location.origin ||
+        ((resolved.protocol === "ws:" || resolved.protocol === "wss:") &&
+          resolved.host === window.location.host);
+      if (!sameSite) return u;
+      if (resolved.pathname.indexOf(PREFIX) === 0) {
+        if (/^https?:\\/\\//i.test(u) || /^wss?:\\/\\//i.test(u)) return resolved.href;
+        return resolved.pathname + resolved.search + resolved.hash;
+      }
+      if (resolved.pathname.charAt(0) === "/") {
+        var next = PREFIX + resolved.pathname + resolved.search + resolved.hash;
+        if (/^https?:\\/\\//i.test(u) || /^wss?:\\/\\//i.test(u)) {
+          return resolved.protocol + "//" + resolved.host + next;
         }
+        return next;
       }
     } catch (e) {}
     return u;
@@ -227,6 +274,7 @@ export function previewPathPrefixScript(prefix: string): string {
     } catch (e) {}
     return input;
   }
+
   var ofetch = window.fetch;
   window.fetch = function(input, init) {
     return ofetch.call(this, fixInput(input), init);
@@ -239,6 +287,135 @@ export function previewPathPrefixScript(prefix: string): string {
       return open.apply(this, args);
     };
   }
+
+  // History API — React Router / Vue Router / etc.
+  var histProto = History.prototype;
+  var origPush = histProto.pushState;
+  var origReplace = histProto.replaceState;
+  histProto.pushState = function(state, title, url) {
+    if (this === window.history && url != null) url = fix(String(url));
+    return origPush.call(this, state, title, url);
+  };
+  histProto.replaceState = function(state, title, url) {
+    if (this === window.history && url != null) url = fix(String(url));
+    return origReplace.call(this, state, title, url);
+  };
+
+  // Hard navigations — location.assign('/login') must stay under the proxy.
+  var origAssign = locProto.assign;
+  var origReplaceLoc = locProto.replace;
+  locProto.assign = function(url) {
+    if (mine(this)) url = fix(String(url));
+    return origAssign.call(this, url);
+  };
+  locProto.replace = function(url) {
+    if (mine(this)) url = fix(String(url));
+    return origReplaceLoc.call(this, url);
+  };
+
+  // Present a root-relative pathname to SPAs (so routes match), while the real
+  // URL stays under PREFIX. Only rewrite for this frame's location.
+  if (pathnameDesc && pathnameDesc.get) {
+    Object.defineProperty(locProto, "pathname", {
+      configurable: true,
+      enumerable: true,
+      get: function() {
+        var p = pathnameDesc.get.call(this);
+        return mine(this) ? stripPath(p) : p;
+      },
+      set: pathnameDesc.set
+        ? function(v) {
+            if (!mine(this)) return pathnameDesc.set.call(this, v);
+            var path = String(v || "/");
+            if (path.charAt(0) !== "/") path = "/" + path;
+            if (path.indexOf(PREFIX) !== 0) path = PREFIX + path;
+            var cur = new URL(realHref(this));
+            cur.pathname = path;
+            if (hrefDesc && hrefDesc.set) hrefDesc.set.call(this, cur.href);
+            else this.assign(cur.href);
+          }
+        : undefined,
+    });
+  }
+  if (hrefDesc && hrefDesc.get) {
+    Object.defineProperty(locProto, "href", {
+      configurable: true,
+      enumerable: true,
+      get: function() {
+        var real = hrefDesc.get.call(this);
+        if (!mine(this)) return real;
+        try {
+          var u = new URL(real);
+          u.pathname = stripPath(u.pathname);
+          return u.href;
+        } catch (e) {
+          return real;
+        }
+      },
+      set: function(v) {
+        if (!mine(this)) {
+          if (hrefDesc.set) hrefDesc.set.call(this, v);
+          else origAssign.call(this, v);
+          return;
+        }
+        var next = fix(String(v));
+        if (hrefDesc.set) hrefDesc.set.call(this, next);
+        else origAssign.call(this, next);
+      },
+    });
+  }
+
+  // WebSocket / EventSource root-absolute URLs.
+  if (typeof window.WebSocket === "function") {
+    var OrigWS = window.WebSocket;
+    function WrappedWS(url, protocols) {
+      var fixed = typeof url === "string" ? fix(url) : url;
+      if (protocols === undefined) return new OrigWS(fixed);
+      return new OrigWS(fixed, protocols);
+    }
+    WrappedWS.prototype = OrigWS.prototype;
+    WrappedWS.CONNECTING = OrigWS.CONNECTING;
+    WrappedWS.OPEN = OrigWS.OPEN;
+    WrappedWS.CLOSING = OrigWS.CLOSING;
+    WrappedWS.CLOSED = OrigWS.CLOSED;
+    window.WebSocket = WrappedWS;
+  }
+  if (typeof window.EventSource === "function") {
+    var OrigES = window.EventSource;
+    function WrappedES(url, init) {
+      var fixed = typeof url === "string" ? fix(url) : url;
+      return init === undefined ? new OrigES(fixed) : new OrigES(fixed, init);
+    }
+    WrappedES.prototype = OrigES.prototype;
+    WrappedES.CONNECTING = OrigES.CONNECTING;
+    WrappedES.OPEN = OrigES.OPEN;
+    WrappedES.CLOSED = OrigES.CLOSED;
+    window.EventSource = WrappedES;
+  }
+
+  // Native <a href="/…"> ignores <base href>; rewrite before navigation.
+  document.addEventListener(
+    "click",
+    function(ev) {
+      if (ev.defaultPrevented || ev.button !== 0) return;
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+      var t = ev.target;
+      var a = t && t.closest ? t.closest("a[href]") : null;
+      if (!a || a.target && a.target !== "" && a.target !== "_self") return;
+      if (a.hasAttribute("download")) return;
+      var href = a.getAttribute("href");
+      if (!href || href.charAt(0) === "#" || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;
+      try {
+        var resolved = new URL(href, realHref(window.location));
+        if (resolved.origin !== window.location.origin) return;
+        if (resolved.pathname.indexOf(PREFIX) === 0) return;
+        if (resolved.pathname.charAt(0) !== "/") return;
+        ev.preventDefault();
+        window.location.assign(resolved.pathname + resolved.search + resolved.hash);
+      } catch (e) {}
+    },
+    true,
+  );
 
   // Scroll-reveal (opacity:0 + IO) often never fires inside Preview iframes.
   // Force observed targets to count as intersecting, and unstick opacity:0

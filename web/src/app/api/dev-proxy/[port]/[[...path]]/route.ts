@@ -5,8 +5,12 @@
 //   → http://127.0.0.1:<port>/[...path]  (fallback http://[::1]:<port>/…)
 //
 // Auth-gated. SSRF-safe: upstream host is always loopback. HTML responses get
-// a relative <base href> + inspect bootstrap so SPA assets stay on the public
-// host (Cloudflare/tunnel) instead of the Node bind address.
+// a relative <base href> + inspect/history bootstrap so SPA assets and client
+// routers stay on the public host under /api/dev-proxy/<port>.
+//
+// Auth headers: forward Authorization (proxied app JWTs) and non-Catalyst
+// cookies; strip better-auth cookies. Rewrite upstream Set-Cookie Path onto
+// the proxy prefix so sessions do not attach to the Catalyst host root.
 //
 // Critical behind reverse proxies: do NOT forward X-Forwarded-* / CF-* headers
 // to the upstream — Vite/webpack would emit absolute asset URLs on the public
@@ -18,6 +22,7 @@
 
 import { getSession } from "@/lib/auth";
 import {
+  filterCookiesForUpstream,
   loopbackUpstreams,
   parseProxyPort,
   proxyBaseHref,
@@ -27,6 +32,7 @@ import {
   rewriteRootAbsoluteUrlsInCss,
   rewriteRootAbsoluteUrlsInHtml,
   rewriteRootAbsoluteUrlsInScript,
+  rewriteSetCookieForProxy,
   upstreamUnreachableHtml,
 } from "@/lib/preview-proxy";
 import { injectPreviewHelpers } from "@/server/preview-inject";
@@ -47,11 +53,14 @@ const HOP_BY_HOP = new Set([
   "content-length",
 ]);
 
-/** Headers that must never reach the upstream (auth + reverse-proxy hints). */
+/** Headers that must never reach the upstream (Catalyst auth + reverse-proxy hints). */
 function shouldDropRequestHeader(name: string): boolean {
   const lower = name.toLowerCase();
   if (HOP_BY_HOP.has(lower)) return true;
-  if (lower === "cookie" || lower === "authorization") return true;
+  // Cookie is filtered separately (forward app cookies, strip better-auth).
+  if (lower === "cookie") return true;
+  // Authorization (Bearer) is forwarded — proxied SPAs use it for their own JWTs.
+  // Catalyst session auth is cookie-based, so this does not leak host credentials.
   if (lower === "origin" || lower === "referer") return true;
   if (lower === "forwarded") return true;
   if (lower.startsWith("x-forwarded-")) return true;
@@ -88,6 +97,9 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     if (shouldDropRequestHeader(key)) return;
     baseHeaders.set(key, value);
   });
+  // Forward proxied-app cookies (e.g. hd_session) but never Catalyst better-auth.
+  const upstreamCookie = filterCookiesForUpstream(req.headers.get("cookie"));
+  if (upstreamCookie) baseHeaders.set("cookie", upstreamCookie);
   // Prefer identity encoding so we can rewrite HTML; upstream may still compress.
   baseHeaders.set("accept-encoding", "identity");
 
@@ -138,10 +150,28 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     if (lower === "content-security-policy") return; // allow our inject + parent postMessage
     if (lower === "x-frame-options") return; // must embed in Preview iframe
     if (lower === "content-encoding") return; // we asked for identity / may rewrite body
+    if (lower === "set-cookie") return; // handled via getSetCookie() below
     outHeaders.set(key, value);
   });
   outHeaders.set("Cache-Control", "no-store");
   outHeaders.set("X-Content-Type-Options", "nosniff");
+
+  // Scope upstream session cookies to the proxy prefix (Path=/ would otherwise
+  // attach to the Catalyst host and leak across apps).
+  const setCookies =
+    typeof upstream.headers.getSetCookie === "function"
+      ? upstream.headers.getSetCookie()
+      : [];
+  if (setCookies.length > 0) {
+    for (const raw of setCookies) {
+      outHeaders.append("Set-Cookie", rewriteSetCookieForProxy(raw, port));
+    }
+  } else {
+    const single = upstream.headers.get("set-cookie");
+    if (single) {
+      outHeaders.append("Set-Cookie", rewriteSetCookieForProxy(single, port));
+    }
+  }
 
   const location = upstream.headers.get("location");
   if (location) {

@@ -113,7 +113,6 @@ TOOL="$(resolve_appimagetool || true)"
 # The AppImage is an OPTIONAL no-install convenience — the installer only needs
 # the standalone + core (already built). If appimagetool is unavailable or its
 # build fails, skip the AppImage rather than failing the whole release.
-APPIMG=""
 _imglog="$(mktemp)"
 if [[ -n "$TOOL" && -x "$TOOL" ]] && APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" "$APPDIR" "$APPIMG" >"$_imglog" 2>&1; then
 	chmod +x "$APPIMG"

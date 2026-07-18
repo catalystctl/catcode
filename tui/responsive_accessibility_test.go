@@ -184,7 +184,7 @@ func TestGoalAndAskKeepFocusedControlVisible(t *testing.T) {
 	]`)
 	s.pendingAsk = parseAskRequest("ask", raw)
 	s.pendingAsk.focusIdx = 3
-	s.pendingAsk.focusInput()
+	s.pendingAsk.jumpToQuestion(3)
 	ask := stripANSI(s.renderAskBox())
 	assertFitsViewport(t, "ask", s.renderAskBox(), s.width, s.height)
 	if !strings.Contains(ask, "Q3") {
@@ -202,7 +202,7 @@ func TestGroupedListBudgetsHeadingRows(t *testing.T) {
 }
 
 func TestIdentityFirstRowsAndUnicodeCells(t *testing.T) {
-	row := stripANSI(fitIdentityListRow("  ", "/model", "a deliberately verbose explanation", 2, 14))
+	row := stripANSI(fitIdentityListRow("  ", "/model", "a deliberately verbose explanation", 2, 14, ""))
 	if !strings.Contains(row, "/model") {
 		t.Fatalf("identity disappeared before description: %q", row)
 	}

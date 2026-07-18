@@ -2,23 +2,12 @@ package main
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
-
-// ansiRe matches CSI escape sequences (SGR colors, cursor moves, clears, …).
-// lipgloss v2 emits 24-bit SGR like \x1b[38;2;r;g;bm and bare \x1b[m resets;
-// the old char-walker stayed in "skip" mode after the final 'm' and ate a
-// following 'm' (e.g. the first letter of "main.go"), so use a real regex.
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
-
-func stripANSI(s string) string {
-	return ansiRe.ReplaceAllString(s, "")
-}
 
 func TestRenderSmoke(t *testing.T) {
 	s := initialSession()
@@ -106,7 +95,7 @@ func TestRenderSmoke(t *testing.T) {
 
 	s.openCommandPalette()
 	pal := stripANSI(s.renderModalBody())
-	if !strings.Contains(pal, "Command Palette") || !strings.Contains(pal, "model") {
+	if !strings.Contains(pal, "Command Palette") || !strings.Contains(pal, "/approval") {
 		t.Errorf("palette missing content:\n%s", pal)
 	}
 	t.Logf("PALETTE:\n%s", pal)
@@ -172,17 +161,17 @@ func TestScrollFollow(t *testing.T) {
 
 func TestMarkdown(t *testing.T) {
 	out := stripANSI(renderMarkdown("Here is `inline` code and **bold** and *italic*.\n\n```go\nch := make(chan int)\n```", 60))
-	for _, want := range []string{"inline", "bold", "italic", "go", "ch := make(chan int)"} {
+	for _, want := range []string{"inline", "bold", "italic", "ch := make(chan int)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("markdown missing %q:\n%s", want, out)
 		}
 	}
 	t.Logf("MARKDOWN:\n%s", out)
 
-	// code block never reflows; over-long lines truncate
-	long := renderMarkdown("```sh\n"+strings.Repeat("x", 200)+"\n```", 40)
-	if !strings.Contains(long, "│") {
-		t.Errorf("code block missing left rule:\n%s", long)
+	// code block renders with chroma styling (no custom left-rule required)
+	long := stripANSI(renderMarkdown("```sh\n"+strings.Repeat("x", 200)+"\n```", 40))
+	if !strings.Contains(long, "xxx") {
+		t.Errorf("code block missing content:\n%s", long)
 	}
 }
 

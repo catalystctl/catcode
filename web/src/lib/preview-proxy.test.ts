@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  filterCookiesForUpstream,
   isLoopbackHost,
   loopbackToProxyPath,
   loopbackUpstreams,
@@ -11,6 +12,7 @@ import {
   rewriteLoopbackUrlsInHtml,
   rewriteRootAbsoluteUrlsInHtml,
   rewriteRootAbsoluteUrlsInScript,
+  rewriteSetCookieForProxy,
   toProxiedPreviewSrc,
   upstreamUnreachableHtml,
 } from "./preview-proxy";
@@ -86,6 +88,39 @@ describe("preview-proxy", () => {
     expect(rewriteLoopbackLocation("https://example.com/x", 3000)).toBe(
       "https://example.com/x",
     );
+  });
+
+  test("rewriteSetCookieForProxy scopes Path to the proxy prefix", () => {
+    expect(
+      rewriteSetCookieForProxy(
+        "hd_session=abc; Path=/; HttpOnly; SameSite=Lax",
+        8080,
+      ),
+    ).toBe("hd_session=abc; Path=/api/dev-proxy/8080; HttpOnly; SameSite=Lax");
+    expect(
+      rewriteSetCookieForProxy("tok=1; Path=/login; Domain=localhost", 3000),
+    ).toBe("tok=1; Path=/api/dev-proxy/3000/login");
+    expect(rewriteSetCookieForProxy("a=b; HttpOnly", 5173)).toBe(
+      "a=b; HttpOnly; Path=/api/dev-proxy/5173",
+    );
+    expect(
+      rewriteSetCookieForProxy("x=y; Path=/api/dev-proxy/5173/already", 5173),
+    ).toBe("x=y; Path=/api/dev-proxy/5173/already");
+  });
+
+  test("filterCookiesForUpstream strips better-auth cookies", () => {
+    expect(
+      filterCookiesForUpstream(
+        "better-auth.session_token=host; hd_session=app; foo=bar",
+      ),
+    ).toBe("hd_session=app; foo=bar");
+    expect(
+      filterCookiesForUpstream(
+        "__Secure-better-auth.session_token=x; other=1",
+      ),
+    ).toBe("other=1");
+    expect(filterCookiesForUpstream("better-auth.session_token=only")).toBeNull();
+    expect(filterCookiesForUpstream(null)).toBeNull();
   });
 
   test("rewriteLoopbackUrlsInHtml rewrites vite-style absolute URLs", () => {
@@ -180,5 +215,10 @@ describe("injectPreviewHelpers", () => {
     expect(out).toContain("<!--catcode-preview-prefix-->");
     expect(out).toContain("__catcodeProxyPrefix");
     expect(out).toContain("/api/dev-proxy/4321");
+    // SPA hard-nav + History API must stay under the proxy prefix.
+    expect(out).toContain("histProto.pushState");
+    expect(out).toContain("locProto.assign");
+    expect(out).toContain("stripPath");
+    expect(out).toContain("WrappedWS");
   });
 });

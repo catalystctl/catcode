@@ -5,27 +5,27 @@ import (
 	"fmt"
 	"strings"
 
-	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 )
 
+const askCustomSentinel = "__custom__"
+
 // askPrompt is the TUI state for a pending `ask` tool call. The core emits an
 // `ask_request` event and blocks until `ask_reply` arrives; this flyout renders
-// each question with its own control (a horizontal select cycle or a free-text
-// box) and sends the answers back on submit, or null on skip.
+// each question via a huh form and sends the answers back on submit, or null on skip.
 type askPrompt struct {
-	requestID string
-	questions []askQuestion
-	focusIdx  int
-	// errMsg is a transient inline error (e.g. "Required: …") shown in the
-	// flyout when submit fails validation. Cleared on the next non-submit
-	// keypress so it never accumulates in the transcript (the old behavior
-	// logged a fresh "✗ required" line per Enter, spamming the log).
-	errMsg string
+	requestID    string
+	questions    []askQuestion
+	fieldValues  []string // parallel values bound to form fields (per question)
+	customValues []string // custom text when select picks "__custom__"
+	form         *huh.Form
+	focusIdx     int // current question index (synced from form focus)
+	errMsg       string
 }
 
-// askQuestion is one field in the flyout.
+// askQuestion is one field in the flyout (metadata for validation/navigation).
 type askQuestion struct {
 	id          string
 	prompt      string
@@ -34,50 +34,17 @@ type askQuestion struct {
 	allowCustom bool
 	required    bool
 	placeholder string
-	// select: current option index. When allowCustom is true, index len(options)
-	// is the "Custom…" entry (custom free-text via `input`).
-	selIdx int
-	// text questions (and select-in-custom-mode) use this input.
-	input textinput.Model
-}
-
-// isCustom reports whether a select question is in custom free-text mode.
-func (q *askQuestion) isCustom() bool {
-	return q.qtype == "select" && q.allowCustom && q.selIdx == len(q.options)
-}
-
-// currentValue returns the answer string for this question ("" if unanswered).
-func (q *askQuestion) currentValue() string {
-	if q.qtype == "text" || q.isCustom() {
-		return strings.TrimSpace(q.input.Value())
-	}
-	if q.selIdx >= 0 && q.selIdx < len(q.options) {
-		return q.options[q.selIdx]
-	}
-	return ""
-}
-
-// numSelectSlots returns the cycle length for a select question (options + the
-// "Custom…" pseudo-entry when allowCustom).
-func (q *askQuestion) numSelectSlots() int {
-	if q.qtype != "select" {
-		return 0
-	}
-	n := len(q.options)
-	if q.allowCustom {
-		n++
-	}
-	return n
 }
 
 // parseAskRequest builds an askPrompt from the `ask_request` event's questions
-// JSON array, creating a textinput for each text-capable question.
+// JSON array, wiring a huh form with Select/Input fields per question.
 func parseAskRequest(requestID string, raw json.RawMessage) *askPrompt {
 	var qs []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &qs); err != nil || len(qs) == 0 {
 		return nil
 	}
 	out := &askPrompt{requestID: requestID, questions: []askQuestion{}}
+	var fields []huh.Field
 	for _, qm := range qs {
 		gs := func(k string) string {
 			if v, ok := qm[k]; ok {
@@ -115,41 +82,190 @@ func parseAskRequest(requestID string, raw json.RawMessage) *askPrompt {
 			required:    gb("required", true),
 			placeholder: gs("placeholder"),
 		}
-		ti := textinput.New()
-		ti.Prompt = ""
-		ti.Placeholder = q.placeholder
-		if ti.Placeholder == "" {
-			if q.qtype == "text" {
-				ti.Placeholder = "Type your answer…"
-			} else {
-				ti.Placeholder = "Type a custom answer…"
-			}
-		}
-		// textinput v2 dropped the public PlaceholderStyle field; the placeholder
-		// style now lives on Styles().{Focused,Blurred}.Placeholder.
-		st := ti.Styles()
-		st.Focused.Placeholder = placeholderStyle
-		st.Blurred.Placeholder = placeholderStyle
-		ti.SetStyles(st)
-		q.input = ti
 		out.questions = append(out.questions, q)
+		qIdx := len(out.questions) - 1
+
+		switch q.qtype {
+		case "select":
+			val := ""
+			if len(q.options) > 0 {
+				val = q.options[0]
+			}
+			out.fieldValues = append(out.fieldValues, val)
+			out.customValues = append(out.customValues, "")
+
+			opts := make([]huh.Option[string], len(q.options))
+			for i, o := range q.options {
+				opts[i] = huh.NewOption(o, o)
+			}
+			if q.allowCustom {
+				opts = append(opts, huh.NewOption("Custom…", askCustomSentinel))
+			}
+			sel := huh.NewSelect[string]().
+				Title(q.prompt).
+				Key(q.id).
+				Options(opts...).
+				Value(&out.fieldValues[qIdx])
+			if q.required {
+				sel.Validate(func(v string) error {
+					if v == "" {
+						return fmt.Errorf("required")
+					}
+					return nil
+				})
+			}
+			fields = append(fields, sel)
+			if q.allowCustom {
+				ph := q.placeholder
+				if ph == "" {
+					ph = "Type a custom answer…"
+				}
+				cust := huh.NewInput().
+					Title("Custom answer").
+					Key(q.id + "_custom").
+					Placeholder(ph).
+					Value(&out.customValues[qIdx])
+				if q.required {
+					cust.Validate(func(v string) error {
+						if out.fieldValues[qIdx] == askCustomSentinel && strings.TrimSpace(v) == "" {
+							return fmt.Errorf("required")
+						}
+						return nil
+					})
+				}
+				fields = append(fields, cust)
+			}
+		default: // text
+			out.fieldValues = append(out.fieldValues, "")
+			out.customValues = append(out.customValues, "")
+			ph := q.placeholder
+			if ph == "" {
+				ph = "Type your answer…"
+			}
+			inp := huh.NewInput().
+				Title(q.prompt).
+				Key(q.id).
+				Placeholder(ph).
+				Value(&out.fieldValues[qIdx])
+			if q.required {
+				inp.Validate(func(v string) error {
+					if strings.TrimSpace(v) == "" {
+						return fmt.Errorf("required")
+					}
+					return nil
+				})
+			}
+			fields = append(fields, inp)
+		}
 	}
-	// Focus the first text-capable question's input so typing works immediately
-	// when the first question is free-text.
-	out.focusInput()
+
+	form := huh.NewForm(huh.NewGroup(fields...)).
+		WithTheme(catalystHuhTheme()).
+		WithShowHelp(true).
+		WithShowErrors(false)
+	out.form = form
+	out.focusIdx = 0
+	_ = form.Init()
 	return out
 }
 
-// focusInput focuses the current question's textinput (text or custom select),
-// blurring all others. Select questions (not custom) need no text focus.
-func (a *askPrompt) focusInput() {
-	for i := range a.questions {
-		if i == a.focusIdx && (a.questions[i].qtype == "text" || a.questions[i].isCustom()) {
-			a.questions[i].input.Focus()
-		} else {
-			a.questions[i].input.Blur()
+func (a *askPrompt) focusedQuestionIndex() int {
+	if a.form == nil {
+		return a.focusIdx
+	}
+	f := a.form.GetFocusedField()
+	if f == nil {
+		return a.focusIdx
+	}
+	key := f.GetKey()
+	for i, q := range a.questions {
+		if key == q.id || key == q.id+"_custom" {
+			return i
 		}
 	}
+	return a.focusIdx
+}
+
+func (a *askPrompt) syncFocusFromForm() {
+	if a.form == nil {
+		return
+	}
+	a.focusIdx = a.focusedQuestionIndex()
+}
+
+// jumpToQuestion moves form focus to the primary field of target (by question
+// index). Select+allowCustom inserts an extra huh field, so we cannot step by
+// question-count alone — advance Next/PrevField until the focused question matches.
+func (a *askPrompt) jumpToQuestion(target int) {
+	if a.form == nil || target < 0 || target >= len(a.questions) {
+		return
+	}
+	forward := target >= a.focusedQuestionIndex()
+	for guard := 0; guard < 64; guard++ {
+		cur := a.focusedQuestionIndex()
+		var curKey string
+		if f := a.form.GetFocusedField(); f != nil {
+			curKey = f.GetKey()
+		}
+		if cur == target {
+			break
+		}
+		var m huh.Model = a.form
+		var cmd tea.Cmd
+		if forward {
+			m, cmd = a.form.Update(huh.NextField())
+		} else {
+			m, cmd = a.form.Update(huh.PrevField())
+		}
+		if f, ok := m.(*huh.Form); ok {
+			a.form = f
+		}
+		_ = cmd
+		nextKey := ""
+		if f := a.form.GetFocusedField(); f != nil {
+			nextKey = f.GetKey()
+		}
+		if nextKey == curKey {
+			break // focus did not move
+		}
+	}
+	// Prefer landing on the question's primary field (not _custom) so ←/→
+	// select cycling still works after Tab/↑↓ navigation.
+	if f := a.form.GetFocusedField(); f != nil && f.GetKey() == a.questions[target].id+"_custom" {
+		m, cmd := a.form.Update(huh.PrevField())
+		if form, ok := m.(*huh.Form); ok {
+			a.form = form
+		}
+		_ = cmd
+	}
+	a.focusIdx = a.focusedQuestionIndex()
+}
+
+func (a *askPrompt) cycleSelect(delta int) {
+	if a.focusIdx < 0 || a.focusIdx >= len(a.questions) {
+		return
+	}
+	q := &a.questions[a.focusIdx]
+	if q.qtype != "select" {
+		return
+	}
+	opts := append([]string(nil), q.options...)
+	if q.allowCustom {
+		opts = append(opts, askCustomSentinel)
+	}
+	if len(opts) == 0 {
+		return
+	}
+	cur := a.fieldValues[a.focusIdx]
+	idx := 0
+	for i, o := range opts {
+		if o == cur {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta + len(opts)) % len(opts)
+	a.fieldValues[a.focusIdx] = opts[idx]
 }
 
 // answers builds the {id: answer} object for ask_reply, including only
@@ -158,8 +274,19 @@ func (a *askPrompt) focusInput() {
 func (a *askPrompt) answers() (map[string]string, []string) {
 	obj := map[string]string{}
 	var missing []string
-	for _, q := range a.questions {
-		v := q.currentValue()
+	for i, q := range a.questions {
+		var v string
+		switch q.qtype {
+		case "select":
+			sel := a.fieldValues[i]
+			if sel == askCustomSentinel {
+				v = strings.TrimSpace(a.customValues[i])
+			} else {
+				v = sel
+			}
+		default:
+			v = strings.TrimSpace(a.fieldValues[i])
+		}
 		if v == "" {
 			if q.required {
 				missing = append(missing, q.prompt)
@@ -183,29 +310,44 @@ func (s *session) sendAskReply(a *askPrompt, answers any) {
 	s.layout()
 }
 
+func (s *session) pumpHuhAsk(msg tea.Msg) {
+	a := s.pendingAsk
+	if a == nil || a.form == nil {
+		return
+	}
+	m, cmd := a.form.Update(msg)
+	if f, ok := m.(*huh.Form); ok {
+		a.form = f
+	}
+	for i := 0; i < 8 && cmd != nil; i++ {
+		next := cmd()
+		if next == nil {
+			break
+		}
+		m, cmd = a.form.Update(next)
+		if f, ok := m.(*huh.Form); ok {
+			a.form = f
+		}
+	}
+	a.syncFocusFromForm()
+}
+
 // handleAskKey owns all keys while the ask flyout is open.
 func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	a := s.pendingAsk
 	if a == nil {
 		return s, nil
 	}
-	// Any key other than submit clears a stale inline error so it doesn't
-	// linger after the user starts fixing the field.
 	if !s.kb(msg, "send") {
 		a.errMsg = ""
 	}
-	// Esc / close: skip the whole prompt (send null).
 	if s.kb(msg, "close") {
 		s.sendAskReply(a, nil)
 		return s, nil
 	}
-	// Enter: submit (validate required first).
 	if s.kb(msg, "send") {
 		obj, missing := a.answers()
 		if len(missing) > 0 {
-			// Show the error INLINE in the flyout (transient) instead of
-			// logging to the transcript — repeated Enter on an empty
-			// required field used to spam "✗ required" lines.
 			a.errMsg = fmt.Sprintf("Required: %s", strings.Join(missing, "; "))
 			return s, nil
 		}
@@ -213,51 +355,37 @@ func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.logSuccess("↦ answers sent")
 		return s, nil
 	}
-	// Tab / ↓ / j: next question (clamp at last). The bare "down" fallback
-	// mirrors the scroll handler so arrows always navigate even if a user
-	// disabled/rebound nav_down in /keybinds.
 	if s.kb(msg, "field_next") || msg.String() == "down" || s.kbAny(msg, "nav_down", "nav_down_alt") {
 		if a.focusIdx < len(a.questions)-1 {
-			a.focusIdx++
-			a.focusInput()
+			a.jumpToQuestion(a.focusIdx + 1)
 		}
 		return s, nil
 	}
-	// Shift+Tab / ↑ / k: previous question (clamp at first).
 	if s.kb(msg, "field_prev") || msg.String() == "up" || s.kbAny(msg, "nav_up", "nav_up_alt") {
 		if a.focusIdx > 0 {
-			a.focusIdx--
-			a.focusInput()
+			a.jumpToQuestion(a.focusIdx - 1)
 		}
 		return s, nil
 	}
-	// Route to the focused question's control.
 	q := &a.questions[a.focusIdx]
-	if q.qtype == "select" && !q.isCustom() {
-		// ←/→ or h/l cycle the options (incl. the "Custom…" slot).
+	if q.qtype == "select" && a.fieldValues[a.focusIdx] != askCustomSentinel {
 		if s.kbAny(msg, "cycle_left", "cycle_left_alt") || msg.String() == "left" || msg.String() == "h" {
-			n := q.numSelectSlots()
-			if n > 0 {
-				q.selIdx = (q.selIdx - 1 + n) % n
-				a.focusInput()
-			}
+			a.cycleSelect(-1)
 			return s, nil
 		}
 		if s.kbAny(msg, "cycle_right", "cycle_right_alt") || msg.String() == "right" || msg.String() == "l" {
-			n := q.numSelectSlots()
-			if n > 0 {
-				q.selIdx = (q.selIdx + 1) % n
-				a.focusInput()
-			}
+			a.cycleSelect(1)
 			return s, nil
 		}
-		// Any other key on a select (not custom): ignore (no typing).
-		return s, nil
+		if msg.String() != "tab" && msg.String() != "shift+tab" && !s.kb(msg, "field_next") && !s.kb(msg, "field_prev") {
+			// Let text keys through only for custom-input follow-up.
+			if a.fieldValues[a.focusIdx] != askCustomSentinel {
+				return s, nil
+			}
+		}
 	}
-	// Text question or select-in-custom-mode: route to the textinput.
-	var cmd tea.Cmd
-	q.input, cmd = q.input.Update(msg)
-	return s, cmd
+	s.pumpHuhAsk(msg)
+	return s, nil
 }
 
 // renderAskOverlay renders the ask flyout as a centered modal over the base view.
@@ -277,7 +405,7 @@ func (s *session) renderAskOverlay(base string) string {
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
-// renderAskBox builds the flyout body.
+// renderAskBox builds the flyout body from the huh form.
 func (s *session) renderAskBox() string {
 	a := s.pendingAsk
 	boxW := s.width - 8
@@ -290,73 +418,42 @@ func (s *session) renderAskBox() string {
 	if boxW < 1 {
 		boxW = 1
 	}
-	inner := boxW - 6 // border(2) + horizontal padding(4)
+	inner := boxW - 6
 	if inner < 1 {
 		inner = 1
 	}
 
-	var b strings.Builder
-	title := accentStyle.Render(truncate("❓ Answer the questions", inner))
-	b.WriteString(title + "\n\n")
-
-	for i, q := range a.questions {
-		focused := i == a.focusIdx
-		marker := "◇"
-		promptStyle := dimStyle
-		if focused {
-			marker = "❯"
-			promptStyle = boldBaseStyle
-		}
-		req := ""
-		if q.required {
-			req = mutedStyle.Render(" *")
-		}
-		b.WriteString(fmt.Sprintf("%s %s%s\n", accentStyle.Render(marker), promptStyle.Render(truncate(q.prompt, max(1, inner-4))), req))
-
-		if q.qtype == "select" && !q.isCustom() {
-			// Horizontal cycle: ◀  Option  ▶  [i/n]
-			cur := "—"
-			if q.selIdx >= 0 && q.selIdx < len(q.options) {
-				cur = q.options[q.selIdx]
-			} else if q.isCustom() {
-				cur = "Custom…"
-			}
-			n := q.numSelectSlots()
-			pos := q.selIdx + 1
-			if q.isCustom() {
-				pos = n
-			}
-			opt := accentStyle.Render("◀") + "  " + boldBaseStyle.Render(truncate(cur, max(1, inner-16))) + "  " + accentStyle.Render("▶")
-			cnt := mutedStyle.Render(fmt.Sprintf("[%d/%d]", pos, n))
-			line := "    " + opt
-			pad := inner - lipgloss.Width(opt) - lipgloss.Width(cnt) - 4
-			if pad < 0 {
-				pad = 0
-			}
-			line += strings.Repeat(" ", pad) + cnt
-			b.WriteString(line + "\n")
-			hint := mutedStyle.Render("←/→ or h/l to choose")
-			if q.allowCustom {
-				hint = mutedStyle.Render("←/→ · cycle to “Custom…” to type your own")
-			}
-			if inner >= 28 {
-				b.WriteString("    " + hint + "\n")
-			}
-		} else {
-			// Text input (text question, or select-in-custom-mode).
-			q.input.SetWidth(max(1, inner-8))
-			if q.isCustom() {
-				b.WriteString("    " + mutedStyle.Render("Custom answer:") + "\n")
-			}
-			field := "    " + q.input.View()
-			b.WriteString(field + "\n")
-		}
-		if i < len(a.questions)-1 {
-			b.WriteString("\n")
+	a.form.WithWidth(inner)
+	formH := s.height - 10
+	if formH < 4 {
+		formH = 4
+	}
+	a.form.WithHeight(formH)
+	body := a.form.View()
+	bodyLines := strings.Split(body, "\n")
+	focusLine := 0
+	for i, line := range bodyLines {
+		if strings.Contains(line, "┃") {
+			focusLine = i
 		}
 	}
+	if a.focusIdx < len(a.questions) {
+		qtitle := a.questions[a.focusIdx].prompt
+		for i, line := range bodyLines {
+			if strings.Contains(stripANSI(line), qtitle) {
+				focusLine = i
+			}
+		}
+	}
+	maxBody := s.height - 8
+	if maxBody < 2 {
+		maxBody = 2
+	}
+	if len(bodyLines) > maxBody {
+		bodyLines = focusWindow(bodyLines, focusLine, maxBody, 1, 1)
+		body = strings.Join(bodyLines, "\n")
+	}
 
-	b.WriteString("\n")
 	sendKey, closeKey := s.keyHint("send"), s.keyHint("close")
 	if sendKey == "" {
 		sendKey = "unbound"
@@ -367,39 +464,36 @@ func (s *session) renderAskBox() string {
 	footerText := fmt.Sprintf("[Tab/↑↓] navigate · [%s] submit · [%s] skip", sendKey, closeKey)
 	if a.focusIdx < len(a.questions) {
 		q := a.questions[a.focusIdx]
-		if q.qtype == "select" && !q.isCustom() {
+		if q.qtype == "select" && a.fieldValues[a.focusIdx] != askCustomSentinel {
 			footerText = fmt.Sprintf("[←/→] choose · [Tab/↑↓] navigate · [%s] submit · [%s] skip", sendKey, closeKey)
 		}
 	}
 	footer := mutedStyle.Render(truncate(footerText, inner))
-	b.WriteString(footer)
+	titleLine := accentStyle.Render(truncate("❓ Answer the questions", inner))
+	focusHint := ""
+	if s.height <= 12 && a.focusIdx >= 0 && a.focusIdx < len(a.questions) {
+		focusHint = boldBaseStyle.Render(truncate(a.questions[a.focusIdx].prompt, inner)) + "\n"
+	}
+	panel := titleLine + "\n\n" + focusHint + body + "\n" + footer
 	if a.errMsg != "" {
-		b.WriteString("\n" + errStyle.Render(truncate("✗ "+a.errMsg, inner)))
+		panel += "\n" + errStyle.Render(truncate("✗ "+a.errMsg, inner))
 	}
 
-	bodyLines := strings.Split(b.String(), "\n")
-	focusLine := 0
-	for i, line := range bodyLines {
-		if strings.Contains(line, "❯") {
-			focusLine = i
-		}
-	}
-	// Rounded border + vertical padding consume four rows. Preserve title and
-	// footer while centering the active question in the remaining viewport.
-	tail := 2
-	if a.errMsg != "" {
-		tail = 3
-	}
-	bodyLines = focusWindow(bodyLines, focusLine, s.height-4, 2, tail)
-	clip := lipgloss.NewStyle().MaxWidth(inner)
-	for i := range bodyLines {
-		bodyLines[i] = clip.Render(bodyLines[i])
-	}
-	body := strings.Join(bodyLines, "\n")
-	return lipgloss.NewStyle().
+	box := lipgloss.NewStyle().
 		Width(boxW).
-		Padding(1, 2).
+		Padding(0, 2).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(c.accent)).
-		Render(body)
+		Render(panel)
+	if s.height > 0 {
+		lines := strings.Split(box, "\n")
+		maxH := s.height - 2
+		if maxH < 1 {
+			maxH = 1
+		}
+		if len(lines) > maxH {
+			box = strings.Join(lines[:maxH], "\n")
+		}
+	}
+	return box
 }

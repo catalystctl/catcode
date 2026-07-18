@@ -1,16 +1,8 @@
 name: Release
 
-# Build prebuilt artifacts for ALL platforms (Linux/macOS/Windows) on a single
-# ubuntu runner via cross-compilation, plus ONE cross-platform web bundle
-# (zigpty ships all OS PTY prebuilds in-package), and publish them to a GitHub
-# Release. The installers (install.sh / install.ps1 -WithWeb) and `catcode
-# --update` download `catcode-web-<ver>.tar.gz` — users never compile the web
-# frontend and no per-OS web CI jobs are required.
-#
-# Triggered by every push to master (and v* tags / manual dispatch). The
-# version IS the git commit (short SHA) — no manual version bumping; each push
-# produces a release keyed by its commit. The installers download `latest`
-# (the most recent commit's release) or a pinned SHA via --version.
+# Build four native targets and the cross-platform web bundle on five
+# independent runners. Publishing waits for all five artifact uploads, making
+# wall-clock time roughly the slowest build instead of the sum of every build.
 
 on:
   push:
@@ -23,96 +15,215 @@ on:
         required: false
 
 permissions:
-  contents: write   # needed by gh release create / softprops/action-gh-release
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  release:
-    name: Build + publish release
+  platform:
+    name: Build ${{ matrix.platform }} artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            script: release-linux.sh
+            rust_targets: ''
+            macos_arch: ''
+            apt_packages: ''
+          - platform: windows
+            script: release-windows.sh
+            rust_targets: x86_64-pc-windows-gnu
+            macos_arch: ''
+            apt_packages: mingw-w64 msitools zip
+          - platform: macos-arm64
+            script: release-macos.sh
+            rust_targets: aarch64-apple-darwin
+            macos_arch: arm64
+            apt_packages: xorriso
+          - platform: macos-x86_64
+            script: release-macos.sh
+            rust_targets: x86_64-apple-darwin
+            macos_arch: x86_64
+            apt_packages: xorriso
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
+        run: |
+          version="$VERSION_OVERRIDE"
+          if [[ -z "$version" ]]; then
+            version="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up native Rust toolchain
+        if: matrix.rust_targets == ''
+        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust cross target
+        if: matrix.rust_targets != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: release-${{ matrix.platform }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: tui/go.sum
+
+      - name: Set up Zig
+        if: startsWith(matrix.platform, 'macos-')
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.13.0'
+      - name: Install cargo-zigbuild
+        if: startsWith(matrix.platform, 'macos-')
+        run: pip install cargo-zigbuild
+
+      - name: Install platform packaging dependencies
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
+
+      - name: Build ${{ matrix.platform }}
+        env:
+          CATCODE_MACOS_ARCH: ${{ matrix.macos_arch }}
+        run: bash "${{ matrix.script }}" "${{ steps.ver.outputs.version }}"
+
+      - name: Upload ${{ matrix.platform }} artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  web:
+    name: Build web bundle
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version (git commit short SHA)
+      - name: Resolve version
         id: ver
+        shell: bash
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            v="${{ inputs.version }}"
-          else
-            v="$(git rev-parse --short HEAD)"
+          version="$VERSION_OVERRIDE"
+          if [[ -z "$version" ]]; then
+            version="$(git rev-parse --short HEAD)"
           fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "Using version: $v (commit)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # --- Rust + cross-compile targets -----------------------------------
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
         with:
-          targets: x86_64-pc-windows-gnu, aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: core
-
-      # --- Go (TUI builds) ------------------------------------------------
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-
-      # --- zig + cargo-zigbuild (macOS cross-compile from Linux) ----------
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: '0.13.0'
-      - name: Install cargo-zigbuild
-        run: pip install cargo-zigbuild
-
-      # --- system deps: mingw (windows gnu), xorriso (dmg), jq, zip, appimagetool deps ---
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            mingw-w64 msitools xorriso jq zip curl python3 file libfuse2
-      - name: Install Bun (web build)
-        uses: oven-sh/setup-bun@v2
+          bun-version: '1.3.14'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      # --- build everything -----------------------------------------------
-      - name: Build all platform artifacts (TUI + core, all platforms)
-        run: bash release-all.sh "${{ steps.ver.outputs.version }}"
+      - name: Restore Bun package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('web/bun.lock', 'sdk/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-bun-
 
-      - name: Build web bundle (single cross-platform catcode-web-<ver>.tar.gz)
+      - name: Restore Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: web/.next/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-${{ hashFiles('web/src/**/*.ts', 'web/src/**/*.tsx', 'web/public/**', 'web/next.config.mjs', 'web/tsconfig.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-
+
+      - name: Build web bundle
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
         run: bash release-web.sh "${{ steps.ver.outputs.version }}"
 
-      - name: Verify web artifact name
-        run: |
-          ver="${{ steps.ver.outputs.version }}"
-          test -f "dist/catcode-web-${ver}.tar.gz"
-          test -f "dist/catcode-web-${ver}.tar.gz.sha256"
-          # Guard against regressing to per-OS web tarballs.
-          if compgen -G "dist/catcode-web-${ver}-*.tar.gz" > /dev/null; then
-            echo "error: unexpected platform-suffixed web tarball(s):" >&2
-            ls -la dist/catcode-web-${ver}-*.tar.gz >&2
-            exit 1
-          fi
-          echo "OK: dist/catcode-web-${ver}.tar.gz"
+      - name: Upload web artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-web
+          path: |
+            dist/catcode-web-${{ steps.ver.outputs.version }}.tar.gz
+            dist/catcode-web-${{ steps.ver.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: List artifacts
-        run: ls -la dist/
+  publish:
+    name: Publish release
+    needs: [platform, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
-      # --- publish ---------------------------------------------------------
-      - name: Create GitHub Release with assets
+      - name: Resolve version
+        id: ver
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_OVERRIDE: ${{ inputs.version }}
         run: |
-          # Release tag = the version (the commit short SHA), unless a v* tag push.
+          version="$VERSION_OVERRIDE"
+          if [[ -z "$version" ]]; then
+            version="$(git rev-parse --short HEAD)"
+          fi
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="$GITHUB_REF_NAME"
           else
-            tag="${{ steps.ver.outputs.version }}"
+            tag="$version"
           fi
-          echo "Publishing release '$tag'..."
-          # --target master creates the SHA tag at HEAD (no pre-existing tag needed).
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assembled release
+        shell: bash
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          test -f "dist/catcode-web-${version}.tar.gz"
+          test -f "dist/catcode-web-${version}.tar.gz.sha256"
+          if compgen -G "dist/catcode-web-${version}-*.tar.gz" > /dev/null; then
+            echo "error: unexpected platform-suffixed web tarball" >&2
+            exit 1
+          fi
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            gh release create "$tag" --target master --title "$tag" --generate-notes dist/*
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              dist/*
           fi

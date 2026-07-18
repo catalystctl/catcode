@@ -225,6 +225,71 @@ export function rewriteLoopbackLocation(location: string, fallbackPort: number):
   }
 }
 
+/**
+ * Scope upstream `Set-Cookie` to the proxy prefix so session cookies do not
+ * attach to the Catalyst host root (and collide with better-auth).
+ *
+ * `Path=/login` → `Path=/api/dev-proxy/<port>/login`
+ * `Path=/` or missing Path → `Path=/api/dev-proxy/<port>`
+ * Absolute Domain=localhost / 127.0.0.1 is stripped (cookie stays host-only).
+ */
+export function rewriteSetCookieForProxy(setCookie: string, port: number): string {
+  const prefix = `/api/dev-proxy/${port}`;
+  const parts = setCookie.split(";").map((p) => p.trim());
+  if (parts.length === 0) return setCookie;
+
+  let pathSeen = false;
+  const out: string[] = [parts[0]];
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    const eq = part.indexOf("=");
+    const name = (eq === -1 ? part : part.slice(0, eq)).trim().toLowerCase();
+    const value = eq === -1 ? "" : part.slice(eq + 1).trim();
+    if (name === "path") {
+      pathSeen = true;
+      const raw = value || "/";
+      if (raw.startsWith(prefix)) {
+        out.push(`Path=${raw}`);
+      } else if (raw === "/" || raw === "") {
+        out.push(`Path=${prefix}`);
+      } else {
+        const suffix = raw.startsWith("/") ? raw : `/${raw}`;
+        out.push(`Path=${prefix}${suffix}`);
+      }
+      continue;
+    }
+    if (name === "domain") {
+      const host = value.replace(/^\./, "").toLowerCase();
+      if (isLoopbackHost(host) || host === "") continue; // host-only on Catalyst origin
+      // Non-loopback Domain would be wrong on the public host — drop it.
+      continue;
+    }
+    out.push(part);
+  }
+  if (!pathSeen) out.push(`Path=${prefix}`);
+  return out.join("; ");
+}
+
+/** Cookie names that belong to Catalyst auth — never forward to upstream apps. */
+const CATALYST_COOKIE_RE = /^(?:__secure-)?better-auth\./i;
+
+/**
+ * Forward proxied-app cookies upstream while stripping Catalyst session cookies.
+ * Returns null when nothing remains to send.
+ */
+export function filterCookiesForUpstream(cookieHeader: string | null): string | null {
+  if (!cookieHeader) return null;
+  const kept = cookieHeader
+    .split(";")
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .filter((c) => {
+      const name = c.split("=", 1)[0]?.trim() ?? "";
+      return name.length > 0 && !CATALYST_COOKIE_RE.test(name);
+    });
+  return kept.length > 0 ? kept.join("; ") : null;
+}
+
 /** Friendly HTML shown in the Preview iframe when nothing is listening. */
 export function upstreamUnreachableHtml(port: number, detail: string): string {
   const safeDetail = detail

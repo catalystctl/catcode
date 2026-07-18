@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# A newer commit makes an in-flight run for the same branch obsolete. This is
+# especially valuable on the self-hosted runner, where stale builds otherwise
+# sit in front of the commit a developer is actually waiting for.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
     name: core (rust)
@@ -38,13 +45,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('tui/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+          cache-dependency-path: tui/go.sum
       - name: gofmt check
         working-directory: tui
         run: test -z "$(gofmt -l .)"
@@ -67,25 +68,33 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            check_plain: false
           - goos: darwin
             goarch: arm64
+            check_plain: false
           - goos: darwin
             goarch: amd64
+            check_plain: false
           - goos: windows
             goarch: amd64
+            check_plain: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      - name: go build (plain)
+          cache-dependency-path: tui/go.sum
+      - name: go build (plain Windows installer variant)
+        if: matrix.check_plain
         working-directory: tui
         run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath .
       - name: go build -tags embed_core (staged dummy core)
         working-directory: tui
         # The embed_core tag embeds tui/embed/catcode-core via go:embed; stage an
         # empty file so the pattern matches (compile-check only — the real core
-        # is injected at release time by release-*.sh).
+        # is injected at release time by release-*.sh). Plain builds are covered
+        # natively by the tui job and above for the Windows MSI variant; macOS
+        # releases only the embedded variant.
         run: |
           mkdir -p embed && touch embed/catcode-core
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -tags embed_core .
@@ -100,7 +109,21 @@ jobs:
           node-version: '22'
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
+      - name: Restore Bun package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('web/bun.lock', 'sdk/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-bun-
+      - name: Restore Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: web/.next/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-${{ hashFiles('web/src/**/*.ts', 'web/src/**/*.tsx', 'web/public/**', 'web/next.config.mjs', 'web/tsconfig.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-
       - name: install
         working-directory: web
         run: bun install --frozen-lockfile
@@ -114,6 +137,9 @@ jobs:
         working-directory: web
         run: bun test
       - name: build
+        # release.yml performs the production build for master in parallel with
+        # this workflow. PRs and non-release branches still get a full build.
+        if: github.ref != 'refs/heads/master' || github.event_name == 'pull_request'
         working-directory: web
         run: node node_modules/next/dist/bin/next build
         env:

@@ -35,12 +35,7 @@ fn diagnostics_path(project_id: &str) -> std::path::PathBuf {
 
 /// Normalize a raw error string into a compact signature (bounded).
 pub fn compact_signature(raw: &str) -> String {
-    let mut s: String = raw.lines().take(3).collect::<Vec<_>>().join(" | ");
-    // Strip absolute paths / hex addresses for stability.
-    s = s
-        .chars()
-        .map(|c| if c.is_ascii_hexdigit() && false { c } else { c })
-        .collect();
+    let s = raw.lines().take(3).collect::<Vec<_>>().join(" | ");
     // Collapse very long digit runs (addresses), keep short error codes.
     let mut out = String::new();
     let mut digit_run = 0;

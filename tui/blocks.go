@@ -125,6 +125,7 @@ func (s *session) push(kind blockKind) *block {
 func (s *session) invalidateAll() {
 	s.cache.Reset()
 	s.cacheIdx = 0
+	s.cacheLines = 0
 	for _, b := range s.blocks {
 		if b != nil {
 			b.renderStr = ""
@@ -173,21 +174,29 @@ func (s *session) renderBlocks() string {
 		if blk == s.cur || isInFlight(blk) {
 			break // don't cache the live streaming block or in-flight tools
 		}
-		start := renderedLineOffset(s.cache.String())
+		start := s.cacheLines
 		rendered := s.renderBlock(blk, w)
-		blk.renderStart, blk.renderEnd = start, start+lipgloss.Height(rendered)-1
+		h := lipgloss.Height(rendered)
+		blk.renderStart, blk.renderEnd = start, start+h-1
 		s.cache.WriteString(rendered)
 		s.cache.WriteString("\n\n") // breathing room between blocks
+		// rendered + "\n\n" ⇒ h content lines + 2 blank separators (last may trim later)
+		s.cacheLines += h + 2
+		// Drop streaming residue and shrink tool payloads once the card is in
+		// the prefix cache — display comes from s.cache until invalidate.
+		releaseAfterCache(blk)
 		s.cacheIdx++
 	}
 	var b strings.Builder
 	b.WriteString(s.cache.String())
+	lineBase := s.cacheLines
 	if s.cur != nil {
 		rendered := s.renderBlock(s.cur, w)
-		start := renderedLineOffset(b.String())
-		s.cur.renderStart, s.cur.renderEnd = start, start+lipgloss.Height(rendered)-1
+		h := lipgloss.Height(rendered)
+		s.cur.renderStart, s.cur.renderEnd = lineBase, lineBase+h-1
 		b.WriteString(rendered)
 		b.WriteString("\n\n")
+		lineBase += h + 2
 	}
 	// Trailing in-flight tools render live: a spawn scout is shown in the
 	// active-tasks panel (not inline); other tools get a brief head marker
@@ -201,19 +210,13 @@ func (s *session) renderBlocks() string {
 			continue // active-tasks panel renders the scout
 		}
 		rendered := s.renderBlock(blk, w)
-		start := renderedLineOffset(b.String())
-		blk.renderStart, blk.renderEnd = start, start+lipgloss.Height(rendered)-1
+		h := lipgloss.Height(rendered)
+		blk.renderStart, blk.renderEnd = lineBase, lineBase+h-1
 		b.WriteString(rendered)
 		b.WriteString("\n\n")
+		lineBase += h + 2
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-func renderedLineOffset(s string) int {
-	if s == "" {
-		return 0
-	}
-	return strings.Count(s, "\n")
 }
 
 // scheduleStreamRefresh coalesces token deltas into one viewport rebuild per
@@ -271,7 +274,7 @@ func (s *session) refresh() {
 
 func (s *session) logUser(text string) {
 	b := s.push(blkUser)
-	b.text.WriteString(text)
+	b.appendText(text)
 	s.refresh()
 }
 
@@ -293,7 +296,7 @@ func (s *session) logWarn(text string) {
 // and also flashes a toast so the user notices without scrolling.
 func (s *session) logError(text string) {
 	b := s.push(blkError)
-	b.text.WriteString(text)
+	b.appendText(text)
 	s.refresh()
 	s.setToast(toastError, text)
 }
@@ -303,7 +306,7 @@ func (s *session) logError(text string) {
 // back to the content.
 func (s *session) logPersist(kind blockKind, text string) {
 	b := s.push(kind)
-	b.text.WriteString(text)
+	b.appendText(text)
 	s.refresh()
 }
 
@@ -346,7 +349,19 @@ func (s *session) allTodosComplete() bool {
 // maxStoredOutput bounds text retained on a block (tool output, args, diff).
 // A multi-MB write/edit payload is stored capped though only a short preview
 // ever renders; this keeps session RSS from pinning megabytes per card.
-const maxStoredOutput = 256 * 1024 // 256 KiB
+// 64 KiB × ~3 fields × maxBlocks is a bounded worst case (~75 MiB), down from
+// the prior 256 KiB ceiling.
+const maxStoredOutput = 64 * 1024 // 64 KiB
+
+// maxStoredText soft-caps assistant/thinking/user streamed text (D-002).
+// Higher than tool payloads so long replies stay readable, but still bounded.
+const maxStoredText = 256 * 1024 // 256 KiB
+
+const storedTruncMarker = "\n…[truncated]"
+
+// maxCachedToolArgs is the args/diff size kept after a tool/approve card has
+// been rendered into the prefix cache (key fields still fit; expand uses output).
+const maxCachedToolArgs = 4 * 1024 // 4 KiB
 
 // capStored truncates retained block strings to maxStoredOutput bytes,
 // appending a marker when it cut content.
@@ -354,11 +369,70 @@ func capStored(s string) string {
 	if len(s) <= maxStoredOutput {
 		return s
 	}
-	return s[:maxStoredOutput] + "\n…[truncated]"
+	return s[:maxStoredOutput] + storedTruncMarker
+}
+
+// capTo truncates s to n bytes with the same marker used elsewhere.
+func capTo(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + storedTruncMarker
 }
 
 // capOutput is the historical name for capping tool-result text.
 func capOutput(s string) string { return capStored(s) }
+
+// appendText soft-caps streamed / user text onto the block builder (D-002).
+func (b *block) appendText(s string) {
+	if b == nil || s == "" {
+		return
+	}
+	if b.text.Len() >= maxStoredText {
+		return
+	}
+	remain := maxStoredText - b.text.Len()
+	if len(s) <= remain {
+		b.text.WriteString(s)
+		return
+	}
+	// Need room for the truncation marker; if we can't fit it, stop as-is.
+	if remain <= len(storedTruncMarker) {
+		return
+	}
+	cut := remain - len(storedTruncMarker)
+	b.text.WriteString(s[:cut])
+	b.text.WriteString(storedTruncMarker)
+}
+
+// releaseAfterCache drops per-block duplicates once the rendered card lives in
+// s.cache: clear streaming renderStr, and shrink tool/approve args+diff so the
+// session does not keep full payloads alongside the cached card (multi-copy).
+func releaseAfterCache(b *block) {
+	if b == nil {
+		return
+	}
+	b.renderStr = ""
+	b.renderLen = 0
+	switch b.kind {
+	case blkTool, blkApprove:
+		if len(b.args) > maxCachedToolArgs {
+			b.args = capTo(b.args, maxCachedToolArgs)
+		}
+		if len(b.diff) > maxCachedToolArgs {
+			b.diff = capTo(b.diff, maxCachedToolArgs)
+		}
+	case blkAssistant, blkThinking, blkUser:
+		// Keep b.text for copy/find/resize re-wrap; soft-cap already bounds it.
+		// Re-pack the Builder so excess capacity from a long stream can be GC'd.
+		if b.text.Len() > 0 && b.text.Cap() > b.text.Len()*2 && b.text.Cap()-b.text.Len() > 64*1024 {
+			s := b.text.String()
+			b.text.Reset()
+			b.text.Grow(len(s))
+			b.text.WriteString(s)
+		}
+	}
+}
 
 func (s *session) logToolResult(output string) {
 	b := s.push(blkToolResult)
@@ -391,6 +465,11 @@ func (s *session) resolveLatestApproval(decision string) {
 		default:
 			return
 		}
+		// Decision is what matters in the transcript; drop bulky args/diff.
+		b.diff = ""
+		if len(b.args) > maxCachedToolArgs {
+			b.args = capTo(b.args, maxCachedToolArgs)
+		}
 		s.invalidateAll()
 		s.refresh()
 		return
@@ -400,7 +479,7 @@ func (s *session) resolveLatestApproval(decision string) {
 // logRaw pushes a pre-styled string verbatim (no further wrapping/styling).
 func (s *session) logRaw(styled string) {
 	b := s.push(blkRaw)
-	b.text.WriteString(styled)
+	b.appendText(styled)
 	s.refresh()
 }
 
@@ -977,28 +1056,37 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 	s.blocks = nil
 	s.cur = nil
 	s.cacheIdx = 0
+	s.cacheLines = 0
 	pending := map[string]*block{} // tool_call_id -> block awaiting its result
-	for _, msg := range msgs {
+	for i := range msgs {
+		msg := msgs[i]
+		msgs[i] = nil // release each message as we go so JSON+blocks don't peak 2× (D-003)
+		if msg == nil {
+			continue
+		}
 		switch get(msg, "role") {
 		case "user":
 			text := contentText(msg["content"])
+			msg["content"] = nil
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
 			b := s.push(blkUser)
-			b.text.WriteString(text)
+			b.appendText(text)
 		case "assistant":
 			if r := contentText(msg["reasoning_content"]); strings.TrimSpace(r) != "" {
 				b := s.push(blkThinking)
-				b.text.WriteString(r)
+				b.appendText(r)
 			}
+			msg["reasoning_content"] = nil
 			if c := contentText(msg["content"]); strings.TrimSpace(c) != "" {
 				b := s.push(blkAssistant)
-				b.text.WriteString(c)
+				b.appendText(c)
 				if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 					b.model = s.models[s.modelIdx].ID
 				}
 			}
+			msg["content"] = nil
 			if raw, ok := msg["tool_calls"]; ok {
 				var calls []map[string]json.RawMessage
 				if json.Unmarshal(raw, &calls) == nil {
@@ -1027,9 +1115,11 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 						}
 					}
 				}
+				msg["tool_calls"] = nil
 			}
 		case "tool":
 			out := contentText(msg["content"])
+			msg["content"] = nil
 			id := get(msg, "tool_call_id")
 			if b, ok := pending[id]; ok && id != "" {
 				b.output = capOutput(out)

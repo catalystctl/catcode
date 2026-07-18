@@ -389,14 +389,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 			s.cur.model = s.models[s.modelIdx].ID
 		}
-		s.cur.text.WriteString(ev.get("text"))
+		s.cur.appendText(ev.get("text"))
 		return s.scheduleStreamRefresh()
 
 	case "thinking":
 		if s.cur == nil || s.cur.kind != blkThinking {
 			s.push(blkThinking)
 		}
-		s.cur.text.WriteString(ev.get("text"))
+		s.cur.appendText(ev.get("text"))
 		return s.scheduleStreamRefresh()
 
 	case "tool_call":
@@ -569,21 +569,19 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.cur = nil
 		s.queuedNext = false
 		s.queued = nil
-		var m map[string]json.RawMessage
-		if json.Unmarshal(ev.Raw, &m) == nil {
-			if raw, ok := m["messages"]; ok {
-				var msgs []map[string]json.RawMessage
-				if json.Unmarshal(raw, &msgs) == nil {
-					s.rebuildBlocksFromHistory(msgs)
-					// Show the loaded session's used context immediately instead
-					// of waiting for the first turn's metrics event.
-					if ti, err := strconv.ParseUint(ev.get("tokens_in"), 10, 64); err == nil {
-						s.contextTokens = ti
-					}
-					s.follow = true
-					s.invalidateAll()
-					s.refresh()
+		if raw, ok := ev.rawKey("messages"); ok {
+			var msgs []map[string]json.RawMessage
+			if json.Unmarshal(raw, &msgs) == nil {
+				s.rebuildBlocksFromHistory(msgs)
+				msgs = nil // release JSON graph; blocks now own the text (D-003)
+				// Show the loaded session's used context immediately instead
+				// of waiting for the first turn's metrics event.
+				if ti, err := strconv.ParseUint(ev.get("tokens_in"), 10, 64); err == nil {
+					s.contextTokens = ti
 				}
+				s.follow = true
+				s.invalidateAll()
+				s.refresh()
 			}
 		}
 	case "compacting":
@@ -889,6 +887,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		if s.modal.kind == modalSessions {
 			s.modal.loading = false
 			s.modal.loadError = ""
+			s.rebuildSessionsPickerList()
 		}
 
 	case "session_changed":
@@ -992,6 +991,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			// Also log so headless/log readers see why.
 			s.logInfo(ur.Message)
 		}
+		return tea.Batch(s.rebuildUsageBars(&ur), waitForEvent(s.coreEvents, s.coreStartGen))
 
 	case "goal_state":
 		s.applyGoalState(ev.Raw)
@@ -1300,15 +1300,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			}
 		}
 	case "skills":
-		// Discoverable skills list (name + description + body content). Populates
-		// the /skill:<name> command-palette entries; the body is inlined into the
-		// apply_skill prompt by the core, so the TUI only needs name/desc here.
+		// Discoverable skills list (name + description). Populates the
+		// /skill:<name> command-palette entries; the body is inlined into the
+		// apply_skill prompt by the core, so the TUI must not retain Content.
 		var skills []skillInfo
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(ev.Raw, &m); err == nil {
-			if raw, ok := m["skills"]; ok {
-				_ = json.Unmarshal(raw, &skills)
-			}
+		if raw, ok := ev.rawKey("skills"); ok {
+			_ = json.Unmarshal(raw, &skills)
 		}
 		s.skillsList = skills
 	}
@@ -2503,6 +2500,26 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.openFooterMetricsPicker()
 			return nil
+		case "/reduced-motion":
+			if len(parts) >= 2 {
+				switch strings.ToLower(parts[1]) {
+				case "on", "true", "1":
+					s.settings.ReducedMotion = true
+				case "off", "false", "0":
+					s.settings.ReducedMotion = false
+				default:
+					s.logError("usage: /reduced-motion [on|off]")
+					return nil
+				}
+				_ = s.settings.save()
+				s.logInfo("reduced motion: " + boolStr(s.settings.ReducedMotion))
+				if s.usageReport != nil {
+					_ = s.rebuildUsageBars(s.usageReport)
+				}
+				return nil
+			}
+			s.openReducedMotionPicker()
+			return nil
 		case "/idle-timeout":
 			if len(parts) >= 2 {
 				var n int
@@ -2548,10 +2565,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/copy":
 			return s.copyLastAssistant()
 		case "/attach":
-			// Bare /attach opens a path modal; with args it sends immediately.
+			// Bare /attach opens a file picker; with args it sends immediately.
 			if len(parts) < 2 {
-				s.openAttachModal()
-				return nil
+				return s.openAttachModal()
 			}
 			promptText := ""
 			if len(parts) > 2 {
@@ -2596,6 +2612,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				cmd["model"] = s.models[s.modelIdx].ID
 			}
 			s.usageReport = nil // show "loading…" until the event lands
+			s.usageBars = nil
 			s.modal.kind = modalUsage
 			s.modal.editing = false
 			s.modal.fieldIdx = 0

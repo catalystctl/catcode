@@ -18,7 +18,7 @@ func TestBareArgCommandsOpenModals(t *testing.T) {
 		target string // for modalValueEdit
 	}{
 		{"/steer", modalValueEdit, editTargetSteer},
-		{"/attach", modalValueEdit, editTargetAttach},
+		{"/attach", modalAttachFile, ""},
 		{"/remember", modalValueEdit, editTargetRemember},
 		{"/plugin-install", modalValueEdit, editTargetPluginInstall},
 		{"/run", modalValueEdit, editTargetRun},
@@ -103,8 +103,8 @@ func TestMemoryPickerEnterForgets(t *testing.T) {
 	if s.modal.kind != modalConfirm || len(s.memoryList) != 2 {
 		t.Fatalf("forget must require confirmation; kind=%v list=%v", s.modal.kind, s.memoryList)
 	}
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyDown}) // Cancel is the safe default.
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	// huh Confirm: Cancel is default; 'y' accepts (Confirm).
+	s.handleModalKey(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	if len(s.memoryList) != 1 || s.memoryList[0].ID != "def" {
 		t.Fatalf("after forget: memoryList=%v", s.memoryList)
 	}
@@ -315,8 +315,7 @@ func TestPluginRemoveSelectUninstalls(t *testing.T) {
 	if s.modal.kind != modalConfirm || len(sPluginStore) != 1 {
 		t.Fatalf("uninstall must require confirmation; kind=%v len=%d", s.modal.kind, len(sPluginStore))
 	}
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyDown})
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	s.handleModalKey(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	if len(sPluginStore) != 0 {
 		t.Fatalf("plugin should be dropped from store; len=%d", len(sPluginStore))
 	}

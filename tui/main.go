@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -124,6 +125,7 @@ type session struct {
 	coreAutoCompact          bool
 	ctxBreakdown             *contextBreakdown
 	usageReport              *usageReport // last /usage reply (provider plan limits)
+	usageBars                []progress.Model
 	coreRestarts             int
 	coreReady                bool // true once the core emitted `ready` (disarms the startup watchdog)
 	coreLifecycle            coreLifecycleState
@@ -172,6 +174,7 @@ type session struct {
 	thinkExpanded bool   // global reasoning expand state (default collapsed)
 	cache         strings.Builder
 	cacheIdx      int
+	cacheLines    int // line count of s.cache (avoids cache.String() for offsets)
 
 	// scroll: follow=true keeps the viewport pinned to the newest line (the
 	// default). Scrolling up pauses follow so history can be read without the
@@ -216,8 +219,8 @@ type session struct {
 	// arrives via bracketed paste) as well as local clipboard grab.
 	pendingImages []string
 
-	viewport       viewport.Model
-	input          textarea.Model
+	viewport        viewport.Model
+	input           textarea.Model
 	busyFrameActive bool // ~10 FPS re-render clock while busy/starting (stopped when idle)
 
 	width, height int
@@ -460,12 +463,21 @@ func (s *session) startCore() tea.Cmd {
 			line, err := r.ReadString('\n')
 			line = strings.TrimSpace(line)
 			if line != "" {
-				var raw json.RawMessage
+				// Parse once into fields; keep a copy of the line as Raw for
+				// handlers that still Unmarshal Raw (D-004).
 				var ev coreEvent
-				if json.Unmarshal([]byte(line), &raw) == nil {
-					ev.Raw = raw
-					if t := ev.get("type"); t != "" {
-						ev.Type = t
+				rawCopy := append(json.RawMessage(nil), line...)
+				var m map[string]json.RawMessage
+				if json.Unmarshal(rawCopy, &m) == nil {
+					ev.Raw = rawCopy
+					ev.fields = m
+					if t, ok := m["type"]; ok {
+						var typ string
+						if json.Unmarshal(t, &typ) == nil {
+							ev.Type = typ
+						} else {
+							ev.Type = strings.TrimSpace(string(t))
+						}
 					}
 				}
 				// Blocking send preserves backpressure (a `done` or
@@ -713,6 +725,23 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.busyFrameActive = false
 		return s, nil
 
+	case progress.FrameMsg:
+		if s.modal.kind != modalUsage || len(s.usageBars) == 0 {
+			return s, nil
+		}
+		var cmds []tea.Cmd
+		for i := range s.usageBars {
+			var cmd tea.Cmd
+			s.usageBars[i], cmd = s.usageBars[i].Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		if len(cmds) == 0 {
+			return s, nil
+		}
+		return s, tea.Batch(cmds...)
+
 	case coreStartErrorMsg:
 		if msg.gen != s.coreStartGen {
 			return s, nil
@@ -868,8 +897,7 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case s.pendingSudo != nil:
 			s.pendingSudo.input, _ = s.pendingSudo.input.Update(msg)
 		case s.pendingAsk != nil:
-			q := &s.pendingAsk.questions[s.pendingAsk.focusIdx]
-			q.input, _ = q.input.Update(msg)
+			s.pumpHuhAsk(msg)
 		default:
 			res := s.handlePasteContent(msg.Content)
 			if res.consumed {
@@ -897,10 +925,17 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	default:
+		// Charm picker lists (command/models/sessions/theme) filter asynchronously:
+		// typing while "/"-filtering returns a filterItems cmd → list.FilterMatchesMsg.
+		// Forward those (and other list-owned msgs) into pickerList; dropping them
+		// here leaves filteredItems stale so the visible list never shrinks.
+		if s.usesCharmPickerList() {
+			return s, s.handlePickerListMsg(msg)
+		}
 		// In v2, enhanced keyboard protocols (Kitty progressive keyboard + xterm
 		// modifyOtherKeys) are auto-enabled by the renderer and every modified key
 		// — Shift/Ctrl+Enter, Esc, Ctrl+letter — arrives as a real KeyPressMsg
-		// dispatched by the case above. Nothing else to do here.
+		// dispatched by the case above.
 	}
 	return s, nil
 }

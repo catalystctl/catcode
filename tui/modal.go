@@ -4,13 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
+	"charm.land/bubbles/v2/filepicker"
+	"charm.land/bubbles/v2/list"
+	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/sahilm/fuzzy"
 )
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,7 @@ const (
 	modalNoNetwork
 	modalMouseWheel
 	modalFooterMetrics
+	modalReducedMotion
 	modalValueEdit          // free-form edit (api_key, timeouts, remember, attach, run, …)
 	modalMemory             // pick a memory to forget
 	modalGoal               // multi-field /goal form (goal, concurrency, models, providers)
@@ -276,19 +281,23 @@ const (
 )
 
 type modal struct {
-	kind        modalKind
-	filter      string // typed filter (list modals)
-	cursor      int    // selected index in the filtered list
-	scroll      int    // help modal vertical scroll
-	fieldIdx    int    // legacy field index (unused by hub; kept for edit buffer routing)
-	editing     bool   // value-edit / login key capture
-	editBuf     textinput.Model
-	editTarget  string // which setting modalValueEdit is editing
-	confirm     string // reset | plugin-remove | memory-forget
-	confirmID   string // exact plugin name / memory id (empty for reset)
-	confirmDesc string // user-facing consequence/target
-	loading     bool   // async picker is waiting for the core
-	loadError   string // durable async error; r retries, esc cancels
+	kind          modalKind
+	filter        string // typed filter (list modals)
+	cursor        int    // selected index in the filtered list
+	scroll        int    // help modal vertical scroll
+	fieldIdx      int    // legacy field index (unused by hub; kept for edit buffer routing)
+	editing       bool   // value-edit / login key capture
+	editBuf       textinput.Model
+	editTarget    string // which setting modalValueEdit is editing
+	confirm       string // reset | plugin-remove | memory-forget
+	confirmID     string // exact plugin name / memory id (empty for reset)
+	confirmDesc   string // user-facing consequence/target
+	confirmChoice bool   // huh confirm value (false = Cancel)
+	confirmForm   *huh.Form
+	filePicker    filepicker.Model
+	pickerList    list.Model
+	loading       bool   // async picker is waiting for the core
+	loadError     string // durable async error; r retries, esc cancels
 }
 
 // openReasoningPicker opens a list of the selected model's advertised
@@ -313,15 +322,6 @@ func newModal() modal {
 	ti.Prompt = ""
 	m.editBuf = ti
 	return m
-}
-
-func (s *session) openDestructiveConfirm(action, id, desc string) {
-	s.modal = newModal()
-	s.modal.kind = modalConfirm
-	s.modal.confirm = action
-	s.modal.confirmID = id
-	s.modal.confirmDesc = desc
-	s.modal.cursor = 0 // Cancel is deliberately the safe default.
 }
 
 func (s *session) confirmItems() []listItem {
@@ -349,16 +349,14 @@ type listItem struct {
 func (s *session) openCommandPalette() {
 	s.modal = newModal()
 	s.modal.kind = modalCommand
-	s.modal.cursor = 0
+	items := s.commandItems()
+	s.modal.pickerList = buildPickerList("Command Palette", items, 0)
 }
 
-// offerCoreRestart opens a yes/no modal to restart the core so launch-only
+// offerCoreRestart opens a huh confirm to restart the core so launch-only
 // settings (sandbox, idle-timeout, …) take effect immediately.
 func (s *session) offerCoreRestart(reason string) {
-	s.modal = newModal()
-	s.modal.kind = modalRestartConfirm
-	s.modal.editTarget = reason // reason text (not a filter query)
-	s.modal.cursor = 0
+	s.openRestartConfirm(reason)
 }
 
 func (s *session) restartConfirmItems() []listItem {
@@ -375,7 +373,12 @@ func (s *session) restartConfirmItems() []listItem {
 func (s *session) openModelPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalModels
-	s.modal.cursor = s.modelIdx
+	items := s.modelItems()
+	sel := s.modelIdx
+	if sel < 0 || sel >= len(items) {
+		sel = 0
+	}
+	s.modal.pickerList = buildPickerList("Models", items, sel)
 }
 
 // openSettings opens the settings hub — a list of dedicated setting commands.
@@ -473,6 +476,16 @@ func (s *session) openFooterMetricsPicker() {
 	}
 }
 
+func (s *session) openReducedMotionPicker() {
+	s.modal = newModal()
+	s.modal.kind = modalReducedMotion
+	if s.settings.ReducedMotion {
+		s.modal.cursor = 0
+	} else {
+		s.modal.cursor = 1
+	}
+}
+
 // openValueEditModal opens a free-form edit box for a single numeric/text setting.
 func (s *session) openValueEditModal(target, title, placeholder, initial string) {
 	s.modal = newModal()
@@ -508,12 +521,6 @@ func (s *session) openMaxSessionTokensModal() {
 // `/remember <text>` on the command line.
 func (s *session) openRememberModal() {
 	s.openValueEditModal(editTargetRemember, "Remember", "durable note for future sessions", "")
-}
-
-// openAttachModal collects an image path for vision (optional prompt uses the
-// current composer text, same as `/attach <path>` with no trailing prompt).
-func (s *session) openAttachModal() {
-	s.openValueEditModal(editTargetAttach, "Attach Image", "/path/to/image.png", "")
 }
 
 // openPluginInstallModal collects a local path or GitHub Release URL; scope is
@@ -677,7 +684,16 @@ func (s *session) openHelp() {
 func (s *session) openSessionsPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalSessions
-	s.modal.cursor = 0
+	s.rebuildSessionsPickerList()
+}
+
+func (s *session) rebuildSessionsPickerList() {
+	items := s.sessionItems()
+	sel := 0
+	if it, ok := s.modal.pickerList.SelectedItem().(catalogItem); ok && it.abs >= 0 && it.abs < len(items) {
+		sel = it.abs
+	}
+	s.modal.pickerList = buildPickerList("Sessions", items, sel)
 }
 
 func (s *session) openPluginPicker(rawPlugins []json.RawMessage) {
@@ -989,18 +1005,6 @@ func (s *session) sessionItems() []listItem {
 	return items
 }
 
-func (s *session) openThemePicker() {
-	s.modal = newModal()
-	s.modal.kind = modalTheme
-	s.modal.cursor = 0
-	for i, t := range themes {
-		if strings.EqualFold(t.name, s.settings.Theme) {
-			s.modal.cursor = i
-			break
-		}
-	}
-}
-
 func (s *session) closeModal() {
 	if s.modal.loading {
 		s.pendingMemoryPicker = false
@@ -1033,6 +1037,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/no-network", desc: "block network in sandbox on/off"},
 		{group: "Session", label: "/mouse-wheel", desc: "mouse-wheel scrolling on/off"},
 		{group: "Session", label: "/footer-metrics", desc: "show model, TPS, and TTFT in footer"},
+		{group: "Session", label: "/reduced-motion", desc: "disable spring animations"},
 		{group: "Session", label: "/idle-timeout", desc: "idle timeout (seconds)"},
 		{group: "Session", label: "/max-session-tokens", desc: "max session tokens (0=unlimited)"},
 		{group: "Session", label: "/reset", desc: "wipe conversation + session file"},
@@ -1156,7 +1161,16 @@ func (s *session) modelItems() []listItem {
 func (s *session) themeItems() []listItem {
 	items := make([]listItem, len(themes))
 	for i, t := range themes {
-		items[i] = listItem{label: t.name, desc: ""}
+		desc := "light palette"
+		rgb := hexRGB(t.bg)
+		lum := (0.2126*float64(rgb[0]) + 0.7152*float64(rgb[1]) + 0.0722*float64(rgb[2])) / 255
+		if lum < 0.5 {
+			desc = "dark palette"
+		}
+		if strings.EqualFold(t.name, activeTheme.name) {
+			desc = "current · " + desc
+		}
+		items[i] = listItem{label: t.name, desc: desc}
 	}
 	return items
 }
@@ -1189,6 +1203,7 @@ func (s *session) settingsHubItems() []listItem {
 		{label: "/no-network", desc: boolStr(s.settings.NoNetwork) + " (next launch)"},
 		{label: "/mouse-wheel", desc: boolStr(s.settings.MouseWheel)},
 		{label: "/footer-metrics", desc: boolStr(s.settings.FooterMetrics) + " · model, TPS, TTFT"},
+		{label: "/reduced-motion", desc: boolStr(s.settings.ReducedMotion) + " · spring animations"},
 		{label: "/idle-timeout", desc: fmt.Sprintf("%ds (next launch)", s.settings.IdleTimeout)},
 		{label: "/max-session-tokens", desc: fmt.Sprintf("%d (next launch)", s.settings.MaxSessionTokens)},
 		{label: "/keybinds", desc: "view & customize keybindings"},
@@ -1295,6 +1310,12 @@ func (s *session) footerMetricsItems() []listItem {
 	return toggleItems(s.settings.FooterMetrics,
 		"show model, TPS, and TTFT below composer",
 		"use the compact one-line footer")
+}
+
+func (s *session) reducedMotionItems() []listItem {
+	return toggleItems(s.settings.ReducedMotion,
+		"disable spring animations (usage bars, etc.)",
+		"allow animated progress and flourishes")
 }
 
 func (s *session) pluginItems() []listItem {
@@ -1466,10 +1487,10 @@ func (s *session) togglePlugin(idx int) {
 	}
 }
 
-// filterList returns the indices of items whose label or desc contains the
-// filter (case-insensitive). Empty filter returns all.
+// filterList returns indices of items matching q, ranked by fuzzy score.
+// Empty filter returns all items in order.
 func filterList(items []listItem, q string) []int {
-	q = strings.ToLower(strings.TrimSpace(q))
+	q = strings.TrimSpace(q)
 	if q == "" {
 		idx := make([]int, len(items))
 		for i := range items {
@@ -1477,43 +1498,18 @@ func filterList(items []listItem, q string) []int {
 		}
 		return idx
 	}
-	type hit struct{ idx, score int }
-	var hits []hit
+	hay := make([]string, len(items))
 	for i, it := range items {
-		label := strings.ToLower(it.label)
-		hay := label + " " + strings.ToLower(it.desc)
-		score := -1
-		switch {
-		case strings.HasPrefix(label, q):
-			score = 1000 - len(label)
-		case strings.Contains(label, q):
-			score = 800 - strings.Index(label, q)
-		case strings.Contains(hay, q):
-			score = 600 - strings.Index(hay, q)
-		default:
-			qi, gaps := 0, 0
-			last := -1
-			for pos, r := range hay {
-				if qi < len(q) && byte(r) == q[qi] {
-					if last >= 0 {
-						gaps += pos - last - 1
-					}
-					last = pos
-					qi++
-				}
-			}
-			if qi == len(q) {
-				score = 400 - gaps
-			}
-		}
-		if score >= 0 {
-			hits = append(hits, hit{i, score})
+		if it.desc != "" {
+			hay[i] = it.label + " " + it.desc
+		} else {
+			hay[i] = it.label
 		}
 	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-	idx := make([]int, len(hits))
-	for i, h := range hits {
-		idx[i] = h.idx
+	matches := fuzzy.Find(q, hay)
+	idx := make([]int, len(matches))
+	for i, m := range matches {
+		idx[i] = m.Index
 	}
 	return idx
 }
@@ -1536,6 +1532,16 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if s.modal.kind == modalGoalPlan {
 		return s.handleGoalPlanKey(msg)
 	}
+	if s.modal.kind == modalConfirm {
+		return s.handleConfirmFormKey(msg)
+	}
+	if s.modal.kind == modalCommand || s.modal.kind == modalModels ||
+		s.modal.kind == modalSessions || s.modal.kind == modalTheme {
+		return s.handlePickerListKey(msg)
+	}
+	if s.modal.kind == modalAttachFile {
+		return s.handleAttachFileKey(msg)
+	}
 	// While editing a value field (settings value-edit, login key, oauth code),
 	// route keys to the edit buffer.
 	if s.modal.editing {
@@ -1550,10 +1556,10 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch s.modal.kind {
-	case modalCommand, modalModels, modalTheme, modalSessions, modalPlugins, modalReasoning,
+	case modalCommand, modalModels, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
-		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalFooterMetrics, modalMemory, modalPluginInstallScope,
-		modalSearchKey, modalRestartConfirm, modalConfirm:
+		modalAutoCompact, modalNoNetwork, modalMouseWheel, modalFooterMetrics, modalReducedMotion, modalMemory, modalPluginInstallScope,
+		modalSearchKey, modalRestartConfirm:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
@@ -2046,8 +2052,6 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.commandItems()
 	case modalModels:
 		items = s.modelItems()
-	case modalTheme:
-		items = s.themeItems()
 	case modalSessions:
 		items = s.sessionItems()
 	case modalPlugins:
@@ -2074,6 +2078,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.mouseWheelItems()
 	case modalFooterMetrics:
 		items = s.footerMetricsItems()
+	case modalReducedMotion:
+		items = s.reducedMotionItems()
 	case modalPluginInstallScope:
 		items = s.pluginInstallScopeItems()
 	case modalSearchKey:
@@ -2236,6 +2242,8 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 			s.settings.Theme = themes[abs].name
 			_ = s.settings.save()
 			s.refreshComposerStyles()
+			invalidateGlamourCache()
+			refreshProgressTheme()
 			s.invalidateAll()
 			s.refresh()
 			s.logInfo("theme: " + themes[abs].name)
@@ -2366,6 +2374,19 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.closeModal()
 		return s, nil
+	case modalReducedMotion:
+		items := s.reducedMotionItems()
+		if abs >= 0 && abs < len(items) {
+			on := items[abs].label == "on"
+			s.settings.ReducedMotion = on
+			_ = s.settings.save()
+			s.logInfo(fmt.Sprintf("reduced motion: %s", boolStr(on)))
+			if s.usageReport != nil {
+				_ = s.rebuildUsageBars(s.usageReport)
+			}
+		}
+		s.closeModal()
+		return s, nil
 	case modalPluginInstallScope:
 		items := s.pluginInstallScopeItems()
 		path := strings.TrimSpace(s.pendingPluginInstallPath)
@@ -2434,6 +2455,8 @@ func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
 		s.openMouseWheelPicker()
 	case "/footer-metrics":
 		s.openFooterMetricsPicker()
+	case "/reduced-motion":
+		s.openReducedMotionPicker()
 	case "/idle-timeout":
 		s.openIdleTimeoutModal()
 	case "/max-session-tokens":
@@ -3111,13 +3134,13 @@ func (s *session) renderModalOverlay(base string) string {
 func (s *session) renderModalBody() string {
 	switch s.modal.kind {
 	case modalCommand:
-		return s.renderListModal("Command Palette", s.commandItems(), true)
+		return s.renderPickerList()
 	case modalModels:
-		return s.renderListModal("Models", s.modelItems(), true)
+		return s.renderPickerList()
 	case modalTheme:
-		return s.renderListModal("Theme", s.themeItems(), false)
+		return s.renderPickerList()
 	case modalSessions:
-		return s.renderListModal("Sessions", s.sessionItems(), true)
+		return s.renderPickerList()
 	case modalPlugins:
 		title := "Plugins"
 		if s.pluginPickerMode == pluginModeRemove {
@@ -3161,6 +3184,8 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Mouse Wheel", s.mouseWheelItems(), false)
 	case modalFooterMetrics:
 		return s.renderListModal("Footer Metrics", s.footerMetricsItems(), false)
+	case modalReducedMotion:
+		return s.renderListModal("Reduced Motion", s.reducedMotionItems(), false)
 	case modalRestartConfirm:
 		title := "Restart core?"
 		if r := strings.TrimSpace(s.modal.editTarget); r != "" {
@@ -3168,11 +3193,9 @@ func (s *session) renderModalBody() string {
 		}
 		return s.renderListModal(title, s.restartConfirmItems(), false)
 	case modalConfirm:
-		title := "Confirm destructive action"
-		if s.modal.confirmID != "" {
-			title += " · " + s.modal.confirmID
-		}
-		return s.renderListModal(title, s.confirmItems(), false)
+		return s.renderConfirmForm()
+	case modalAttachFile:
+		return s.renderAttachFilePicker()
 	case modalPluginInstallScope:
 		title := "Install where?"
 		if p := strings.TrimSpace(s.pendingPluginInstallPath); p != "" {
@@ -3568,7 +3591,7 @@ func (s *session) renderGoalPlanModal() string {
 // truncated to the remaining space — the command name must stay visible so
 // name + description always share one line. The marker is already styled;
 // markerW is its visible width.
-func fitListRow(marker, label, desc string, markerW, width int) string {
+func fitListRow(marker, label, desc string, markerW, width int, filterQ string) string {
 	budget := width - markerW
 	if budget < 0 {
 		budget = 0
@@ -3591,7 +3614,7 @@ func fitListRow(marker, label, desc string, markerW, width int) string {
 	} else {
 		label = truncateFit(label, budget)
 	}
-	row := marker + baseStyle.Render(label)
+	row := marker + styleFuzzyLabel(label, filterQ)
 	switch {
 	case label != "" && desc != "":
 		row += "  " + dimStyle.Render(desc)
@@ -3604,15 +3627,15 @@ func fitListRow(marker, label, desc string, markerW, width int) string {
 // fitIdentityListRow gives the selectable identity (command/model/provider)
 // first claim on a narrow row. Descriptions are supporting copy and may be
 // abbreviated; hiding the thing Enter will select is much more disorienting.
-func fitIdentityListRow(marker, label, desc string, markerW, width int) string {
+func fitIdentityListRow(marker, label, desc string, markerW, width int, filterQ string) string {
 	budget := max(0, width-markerW)
 	if desc == "" {
-		return marker + baseStyle.Render(truncate(label, budget))
+		return marker + styleFuzzyLabel(truncate(label, budget), filterQ)
 	}
 	labelW := lipgloss.Width(label)
 	descW := lipgloss.Width(desc)
 	if labelW+2+descW <= budget {
-		return marker + baseStyle.Render(label) + "  " + dimStyle.Render(desc)
+		return marker + styleFuzzyLabel(label, filterQ) + "  " + dimStyle.Render(desc)
 	}
 	// Keep at least two thirds for identity on compact terminals.
 	labelBudget := budget * 2 / 3
@@ -3621,11 +3644,39 @@ func fitIdentityListRow(marker, label, desc string, markerW, width int) string {
 	}
 	label = truncate(label, labelBudget)
 	remaining := budget - lipgloss.Width(label) - 2
-	row := marker + baseStyle.Render(label)
+	row := marker + styleFuzzyLabel(label, filterQ)
 	if remaining > 0 {
 		row += "  " + dimStyle.Render(truncate(desc, remaining))
 	}
 	return row
+}
+
+// styleFuzzyLabel paints matched runes from the active filter in accent+underline.
+// Truncation must happen on the plain string before calling this.
+func styleFuzzyLabel(label, query string) string {
+	query = strings.TrimSpace(query)
+	if query == "" || label == "" {
+		return baseStyle.Render(label)
+	}
+	matches := fuzzy.Find(query, []string{label})
+	if len(matches) == 0 {
+		return baseStyle.Render(label)
+	}
+	hit := make(map[int]struct{}, len(matches[0].MatchedIndexes))
+	for _, i := range matches[0].MatchedIndexes {
+		hit[i] = struct{}{}
+	}
+	runes := []rune(label)
+	var b strings.Builder
+	for i, r := range runes {
+		ch := string(r)
+		if _, ok := hit[i]; ok {
+			b.WriteString(accentStyle.Underline(true).Render(ch))
+		} else {
+			b.WriteString(baseStyle.Render(ch))
+		}
+	}
+	return b.String()
 }
 
 // modalWidth returns a responsive modal width: as wide as the terminal
@@ -3752,14 +3803,23 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		// label first so the description (msg count · time) is kept whole.
 		identityFirst := s.modal.kind == modalCommand || s.modal.kind == modalModels ||
 			s.modal.kind == modalProviders || s.modal.kind == modalLogout
-		row := fitListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+		filterQ := ""
+		if showFilter {
+			filterQ = s.modal.filter
+		}
+		// Skip match tint on the selected row — hiStyle wraps the whole line.
+		hlQ := filterQ
+		if vi == s.modal.cursor {
+			hlQ = ""
+		}
+		row := fitListRow(marker, items[abs].label, items[abs].desc, 2, rowW, hlQ)
 		if identityFirst {
-			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, rowW)
+			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, rowW, hlQ)
 		}
 		if s.modal.kind == modalCommand && items[abs].shortcut != "" {
 			shortcut := keyHintStyle.Render(items[abs].shortcut)
 			leftW := max(1, rowW-lipgloss.Width(shortcut)-2)
-			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, leftW)
+			row = fitIdentityListRow(marker, items[abs].label, items[abs].desc, 2, leftW, hlQ)
 			gap := max(1, rowW-lipgloss.Width(row)-lipgloss.Width(shortcut))
 			row += strings.Repeat(" ", gap) + shortcut
 		}
@@ -3843,6 +3903,7 @@ func (s *session) renderUsageModal() string {
 		if barWidth > 40 {
 			barWidth = 40
 		}
+		barIdx := 0
 		for _, win := range ur.Windows {
 			label := win.Label
 			if label == "" {
@@ -3854,7 +3915,13 @@ func (s *session) renderUsageModal() string {
 			// Unlimited rows skip the empty bar so they don't look like 0% used.
 			row := "    "
 			if win.Limit != nil && *win.Limit > 0 {
-				row += renderUsageBar(barRatio, barWidth)
+				if !s.motionReduced() && barIdx < len(s.usageBars) {
+					s.usageBars[barIdx].SetWidth(barWidth)
+					row += s.usageBars[barIdx].View()
+					barIdx++
+				} else {
+					row += renderUsageBar(barRatio, barWidth)
+				}
 				if usedStr != "" {
 					row += "  "
 				}
@@ -3875,6 +3942,42 @@ func (s *session) renderUsageModal() string {
 		}
 	}
 	return s.renderScrollableReport(w, "Provider Usage", lines, "esc close · ↑↓ scroll")
+}
+
+func (s *session) usageBarWidth() int {
+	w := s.modalWidth(78) - 28
+	if w < 12 {
+		w = 12
+	}
+	if w > 40 {
+		w = 40
+	}
+	return w
+}
+
+// rebuildUsageBars (re)creates spring-animated meters for limited /usage windows.
+func (s *session) rebuildUsageBars(ur *usageReport) tea.Cmd {
+	if s.motionReduced() || ur == nil {
+		s.usageBars = nil
+		return nil
+	}
+	barWidth := s.usageBarWidth()
+	var bars []progress.Model
+	var cmds []tea.Cmd
+	for _, win := range ur.Windows {
+		if win.Limit != nil && *win.Limit > 0 {
+			_, ratio := formatUsageAmount(win)
+			bar := newUsageWindowBar()
+			bar.SetWidth(barWidth)
+			cmds = append(cmds, bar.SetPercent(ratio))
+			bars = append(bars, bar)
+		}
+	}
+	s.usageBars = bars
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // formatUsageAmount returns a human used/limit string and a 0–1 bar ratio.
@@ -4041,22 +4144,58 @@ func (s *session) renderValueEditModal() string {
 		title = "Edit value"
 	}
 	val := s.modal.editBuf.Value()
-	display := val
-	if display == "" && s.modal.editBuf.Placeholder != "" {
-		display = s.modal.editBuf.Placeholder
-	}
+	display := s.modal.editBuf.View()
 	var lines []string
 	lines = append(lines, accentStyle.Render("◆ "+title))
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", w-2)))
-	lines = append(lines, accentStyle.Render("▸ ")+baseStyle.Render(display))
-	if s.modal.loadError != "" {
+	lines = append(lines, accentStyle.Render("▸ ")+display)
+	// Live validation while typing so errors appear before enter.
+	if msg := s.valueEditError(s.modal.editTarget, strings.TrimSpace(val)); msg != "" && val != "" {
+		for _, line := range wrapUsageText(msg, max(1, w-6)) {
+			lines = append(lines, errStyle.Render("  ✗ "+line))
+		}
+	} else if s.modal.loadError != "" {
 		for _, line := range wrapUsageText(s.modal.loadError, max(1, w-6)) {
 			lines = append(lines, errStyle.Render("  ✗ "+line))
 		}
+	} else if hint := s.valueEditHint(s.modal.editTarget); hint != "" {
+		lines = append(lines, dimStyle.Render("  "+hint))
 	}
 	lines = append(lines, "")
 	lines = append(lines, dimStyle.Render("  type a value · enter save · esc cancel"))
 	return modalBox(w, strings.Join(lines, "\n"))
+}
+
+func (s *session) valueEditHint(target string) string {
+	switch {
+	case strings.HasPrefix(target, editTargetSessionRename):
+		return "non-empty title"
+	case strings.HasPrefix(target, editTargetSearchKey+":"):
+		return "paste key · empty clears"
+	}
+	switch target {
+	case editTargetBashTimeout:
+		return "positive integer seconds"
+	case editTargetIdleTimeout:
+		return "≥ 10 seconds (restarts core)"
+	case editTargetMaxSessionTokens:
+		return "0 = unlimited (restarts core)"
+	case editTargetRemember:
+		return "durable note for future sessions"
+	case editTargetAttach:
+		return "path to an image file"
+	case editTargetPluginInstall:
+		return "path, GitHub URL, or owner/repo"
+	case editTargetSteer:
+		return "mid-turn instruction"
+	case editTargetRun, editTargetParallel, editTargetChain:
+		return "agent name and task"
+	case editTargetCompact:
+		return "optional focus hint"
+	case editTargetTranscriptFind:
+		return "search transcript text"
+	}
+	return ""
 }
 
 func (s *session) renderHelpModal() string {

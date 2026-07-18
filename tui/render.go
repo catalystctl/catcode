@@ -12,10 +12,9 @@ import (
 	"strings"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
-	"charm.land/bubbles/v2/progress"
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -50,11 +49,21 @@ func prefersReducedMotion() bool {
 	return envEnabled("CATCODE_REDUCED_MOTION", "REDUCED_MOTION")
 }
 
+// motionReduced reports whether UI animations should be suppressed (env or setting).
+func (s *session) motionReduced() bool {
+	return prefersReducedMotion() || s.settings.ReducedMotion
+}
+
 func plainTerminalMode() bool {
 	return envEnabled("CATCODE_PLAIN", "CATCODE_NO_ALT_SCREEN")
 }
 
 var noColorANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// stripANSI removes CSI sequences so callers can match plain text in styled output.
+func stripANSI(s string) string {
+	return noColorANSIRe.ReplaceAllString(s, "")
+}
 
 // headerHeight is deliberately measured rather than hard-coded: compact
 // terminals use a single header row, while normal terminals retain both rows.
@@ -370,12 +379,7 @@ func (s *session) newFooterHelp(width int) help.Model {
 	h := help.New()
 	h.ShortSeparator = " · "
 	h.Ellipsis = "…"
-	st := help.DefaultStyles(themeIsDark())
-	st.ShortKey = keyHintStyle
-	st.ShortDesc = dimStyle
-	st.ShortSeparator = dimStyle
-	st.Ellipsis = dimStyle
-	h.Styles = st
+	h.Styles = catalystHelpStyles()
 	h.SetWidth(width)
 	return h
 }
@@ -681,21 +685,7 @@ func (s *session) renderContext() string {
 	const cells = 10
 	filled := cells * pct / 100 // truncate so sub-cell pressure stays empty
 	ratio := float64(filled) / float64(cells)
-	fullColor := lipgloss.Color(c.success)
-	switch {
-	case pct >= 85:
-		fullColor = lipgloss.Color(c.err)
-	case pct >= 60:
-		fullColor = lipgloss.Color(c.warn)
-	}
-	m := progress.New(
-		progress.WithWidth(cells),
-		progress.WithoutPercentage(),
-		progress.WithFillCharacters('▰', '▱'),
-		progress.WithColors(fullColor),
-	)
-	m.EmptyColor = lipgloss.Color(c.dim)
-	bar := m.ViewAs(ratio)
+	bar := renderContextBar(ratio, cells)
 	return bar + " " + mutedStyle.Render(fmt.Sprintf("%d%% %s/%s", pct, compactTokens(cur), compactTokens(maxToks)))
 }
 
@@ -807,7 +797,7 @@ func (s *session) renderInputBoxUncached() string {
 	// The moving perimeter is an opt-in flourish; a static border keeps
 	// streaming text calm and behaves better over SSH. Reduced-motion always
 	// wins even when animation was explicitly requested.
-	if s.busy && envEnabled("CATCODE_ANIMATED_BORDER") && !prefersReducedMotion() {
+	if s.busy && envEnabled("CATCODE_ANIMATED_BORDER") && !s.motionReduced() {
 		return s.renderInputBoxAnimated(w, innerW, lines)
 	}
 	top := "╭" + strings.Repeat("─", w-2) + "╮"

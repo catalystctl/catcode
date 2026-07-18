@@ -810,7 +810,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ask",
-                "description": "Ask the user structured questions and wait for answers. Use to clarify requirements or choose among options before committing. User may skip optional questions or dismiss the prompt.",
+                "description": "Ask the user structured questions and wait for answers. REQUIRED when the request is ambiguous, missing information you cannot find yourself, or a decision has real trade-offs or destructive outcomes. Do NOT ask about things you can determine from the workspace — check first. User may skip optional questions or dismiss the prompt.",
                 "parameters": {
                     "type": "object",
                     "properties": {

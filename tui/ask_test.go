@@ -238,3 +238,37 @@ func TestAskRequiredErrorIsInlineNotSpam(t *testing.T) {
 		t.Fatal("typing should clear the stale inline error")
 	}
 }
+
+// TestAskJumpSkipsCustomField ensures Tab/↑↓ navigation advances by question,
+// not by huh field — select+allowCustom inserts an extra input that must not
+// steal a single NextField step away from the next question.
+func TestAskJumpSkipsCustomField(t *testing.T) {
+	raw := json.RawMessage(`[{
+		"id":"pick","prompt":"Pick","type":"select",
+		"options":["A","B"],"allowCustom":true,"required":true
+	},{
+		"id":"note","prompt":"Note","type":"text","required":false
+	}]`)
+	a := parseAskRequest("ask-jump", raw)
+	if a == nil {
+		t.Fatal("parseAskRequest returned nil")
+	}
+	if got := a.focusedQuestionIndex(); got != 0 {
+		t.Fatalf("start focus question=%d, want 0", got)
+	}
+	a.jumpToQuestion(1)
+	if got := a.focusedQuestionIndex(); got != 1 {
+		t.Fatalf("after jumpToQuestion(1) focus=%d, want 1 (stuck on custom field?)", got)
+	}
+	if f := a.form.GetFocusedField(); f == nil || f.GetKey() != "note" {
+		key := ""
+		if f != nil {
+			key = f.GetKey()
+		}
+		t.Fatalf("expected primary field key=note, got %q", key)
+	}
+	a.jumpToQuestion(0)
+	if got := a.focusedQuestionIndex(); got != 0 {
+		t.Fatalf("after jumpToQuestion(0) focus=%d, want 0", got)
+	}
+}

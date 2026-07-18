@@ -22,7 +22,11 @@ func (s *session) pushHistory(line string) {
 	// Drop leading slash-only echoes from history? Keep them — useful to recall.
 	s.history = append(s.history, line)
 	if len(s.history) > historyMax {
-		s.history = s.history[len(s.history)-historyMax:]
+		// Fresh copy so the dropped prefix (and large pastes it holds) can be
+		// GC'd — slicing alone keeps the old backing array alive (D-009).
+		kept := make([]string, historyMax)
+		copy(kept, s.history[len(s.history)-historyMax:])
+		s.history = kept
 	}
 	s.histIdx = len(s.history)
 }

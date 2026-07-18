@@ -1,13 +1,55 @@
 package main
 
 import (
+	"image/color"
+	"sync"
+
 	"charm.land/bubbles/v2/progress"
 	"charm.land/lipgloss/v2"
 )
 
-// staticProgressBar renders a non-animated bubbles/progress meter at the given
-// ratio (0–1). Colors follow theme pressure thresholds when pressureTint is true.
-func staticProgressBar(ratio float64, width int, full, empty rune, pressureTint bool) string {
+// Reused progress models so footer/usage paints don't allocate a new spring
+// every frame. Width and glyphs are set per call before ViewAs.
+var (
+	progressMu   sync.Mutex
+	usageBar     progress.Model
+	ctxBar       progress.Model
+	progressInit sync.Once
+)
+
+func initProgressModels() {
+	progressInit.Do(rebuildProgressModels)
+}
+
+func rebuildProgressModels() {
+	usageBar = progress.New(
+		progress.WithoutPercentage(),
+		progress.WithFillCharacters('█', '░'),
+		progress.WithColorFunc(pressureColorFunc),
+	)
+	usageBar.EmptyColor = lipgloss.Color(c.dim)
+	ctxBar = progress.New(
+		progress.WithoutPercentage(),
+		progress.WithFillCharacters('▰', '▱'),
+		progress.WithColorFunc(pressureColorFunc),
+	)
+	ctxBar.EmptyColor = lipgloss.Color(c.dim)
+}
+
+func pressureColorFunc(total, _ float64) color.Color {
+	switch {
+	case total >= 0.85:
+		return lipgloss.Color(c.err)
+	case total >= 0.6:
+		return lipgloss.Color(c.warn)
+	default:
+		return lipgloss.Color(c.success)
+	}
+}
+
+// staticProgressBar renders a non-animated bubbles/progress meter at ratio 0–1.
+func staticProgressBar(ratio float64, width int, full, empty rune) string {
+	initProgressModels()
 	if width < 4 {
 		width = 4
 	}
@@ -17,26 +59,43 @@ func staticProgressBar(ratio float64, width int, full, empty rune, pressureTint 
 	if ratio > 1 {
 		ratio = 1
 	}
-	fullColor := lipgloss.Color(c.success)
-	if pressureTint {
-		switch {
-		case ratio >= 0.9:
-			fullColor = lipgloss.Color(c.err)
-		case ratio >= 0.7:
-			fullColor = lipgloss.Color(c.warn)
-		}
+	progressMu.Lock()
+	defer progressMu.Unlock()
+	m := &usageBar
+	if full == '▰' {
+		m = &ctxBar
 	}
-	m := progress.New(
-		progress.WithWidth(width),
-		progress.WithoutPercentage(),
-		progress.WithFillCharacters(full, empty),
-		progress.WithColors(fullColor),
-	)
+	m.Full = full
+	m.Empty = empty
+	m.SetWidth(width)
 	m.EmptyColor = lipgloss.Color(c.dim)
 	return m.ViewAs(ratio)
 }
 
+// newUsageWindowBar returns a spring-animated progress meter for /usage windows.
+func newUsageWindowBar() progress.Model {
+	bar := progress.New(
+		progress.WithoutPercentage(),
+		progress.WithFillCharacters('█', '░'),
+		progress.WithColorFunc(pressureColorFunc),
+	)
+	bar.EmptyColor = lipgloss.Color(c.dim)
+	return bar
+}
+
 // renderUsageBar draws a filled/empty progress bar for /usage windows.
 func renderUsageBar(ratio float64, width int) string {
-	return staticProgressBar(ratio, width, '█', '░', true)
+	return staticProgressBar(ratio, width, '█', '░')
+}
+
+// renderContextBar draws the compact footer context-window meter.
+func renderContextBar(ratio float64, width int) string {
+	return staticProgressBar(ratio, width, '▰', '▱')
+}
+
+// refreshProgressTheme rebuilds meters after a theme switch.
+func refreshProgressTheme() {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+	rebuildProgressModels()
 }

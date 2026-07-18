@@ -37,15 +37,26 @@ command -v node >/dev/null 2>&1 || {
 }
 echo "==> building catalyst-code web ${VERSION} (runtime: ${RT})"
 
+install_deps() {
+  local dir="$1"
+  if [[ "$RT" == bun ]]; then
+    ( cd "$dir" && "$RT_BIN" install --frozen-lockfile )
+  elif [[ -f "$dir/package-lock.json" ]]; then
+    ( cd "$dir" && "$RT_BIN" ci )
+  else
+    ( cd "$dir" && "$RT_BIN" install )
+  fi
+}
+
 # --- 1. SDK -----------------------------------------------------------------
 echo "[1/5] sdk: install deps (${RT})..."
-( cd sdk && $RT install )
+install_deps sdk
 echo "[2/5] sdk: build (tsc -> sdk/dist/)..."
 ( cd sdk && $RT run build )
 
 # --- 2. web (next build, standalone output) ---------------------------------
 echo "[3/5] web: install deps (${RT})..."
-( cd web && $RT install )
+install_deps web
 echo "[4/5] web: next build (output: standalone)..."
 ( cd web && NEXT_TELEMETRY_DISABLED=1 node node_modules/next/dist/bin/next build )
 
