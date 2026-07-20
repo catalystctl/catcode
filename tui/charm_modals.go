@@ -142,6 +142,14 @@ func (s *session) handlePickerListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		}
 		return s, nil
 	}
+	// Type-to-filter: a printable keypress while the list is not filtering
+	// jumps straight into filter mode and feeds the key to the filter input —
+	// the pre-Charm modals filtered on plain typing, no "/" prefix needed.
+	// "/" itself is left to the list's own binding so it opens an empty filter
+	// instead of inserting a literal slash.
+	if !filtering && msg.Text != "" && msg.String() != "/" {
+		s.modal.pickerList.SetFilterState(list.Filtering)
+	}
 	var cmd tea.Cmd
 	s.modal.pickerList, cmd = s.modal.pickerList.Update(msg)
 	s.syncPickerListFilter()

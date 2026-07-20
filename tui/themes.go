@@ -504,7 +504,8 @@ func themeIsDark() bool {
 	return lum < 0.5
 }
 
-// applyTheme mutates the package palette + style vars to match a theme.
+// applyTheme mutates the package palette, derives the structural tones, then
+// rebuilds every style var to match a theme.
 func applyTheme(t theme) {
 	c.bg = t.bg
 	c.fg = t.fg
@@ -522,7 +523,17 @@ func applyTheme(t theme) {
 	// They only move a colour toward the theme foreground when needed.
 	c.secondary = ensureThemeContrast(t.muted, t.bg, t.fg, 4.5)
 	c.decor = ensureThemeContrast(t.dim, t.bg, t.fg, 3.0)
+	// Derive the surface/sunken/rail/soft tones from the authored palette so the
+	// structural hierarchy stays consistent across light and dark themes while
+	// the authored hex values (Catalyst included) are never touched.
+	deriveSurfaceTones(t, themeIsDark())
+	rebuildThemeStyles()
+}
 
+// rebuildThemeStyles assigns every package style var from the current palette.
+// Single source for both the NO_COLOR and colour branches; called by applyTheme
+// on every theme switch so nothing goes stale.
+func rebuildThemeStyles() {
 	if colorsDisabled() {
 		baseStyle = lipgloss.NewStyle()
 		boldBaseStyle = lipgloss.NewStyle().Bold(true)
@@ -564,6 +575,14 @@ func applyTheme(t theme) {
 		roToolNameStyle = lipgloss.NewStyle().Bold(true)
 		errOutStyle = lipgloss.NewStyle().Bold(true)
 		errRuleStyle = lipgloss.NewStyle().Bold(true)
+		surfaceStyle = lipgloss.NewStyle()
+		sunkenStyle = lipgloss.NewStyle()
+		railStyle = lipgloss.NewStyle()
+		userRailStyle = lipgloss.NewStyle().Bold(true)
+		composerBorderStyle = lipgloss.NewStyle()
+		cardStyle = lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).Padding(0, 1)
+		recessedStyle = lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).Padding(0, 1)
+		hairlineStyle = lipgloss.NewStyle()
 		return
 	}
 
@@ -586,7 +605,7 @@ func applyTheme(t theme) {
 	inputPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
 	placeholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.secondary))
 	codeTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg))
-	codeInlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.tool))
+	codeInlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.inlineCode))
 	italicStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Italic(true)
 	linkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Underline(true)
 	roleUserStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.user)).Bold(true)
@@ -604,6 +623,23 @@ func applyTheme(t theme) {
 	roToolNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent)).Bold(true)
 	errOutStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
 	errRuleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.err))
+	// Structural surface / rail styles.
+	surfaceStyle = lipgloss.NewStyle().Background(lipgloss.Color(c.surface))
+	sunkenStyle = lipgloss.NewStyle().Background(lipgloss.Color(c.sunken))
+	railStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.railDim))
+	userRailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))
+	composerBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.railDim))
+	// Redesign primitives. Border-only: no solid fill, so the terminal
+	// background shows through after the text instead of a grey slab.
+	cardStyle = lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.railDim)).
+		Padding(0, 1)
+	recessedStyle = lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.railDim)).
+		Padding(0, 1)
+	hairlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.railDim))
 }
 
 func parseHexColor(s string) ([3]float64, bool) {

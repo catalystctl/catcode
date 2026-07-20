@@ -202,6 +202,61 @@ func TestUpdateForwardsFilterMatchesMsgToPicker(t *testing.T) {
 	}
 }
 
+// TestPickerListTypeToFilter: typing a printable key while NOT in filter mode
+// must jump straight into filtering (the pre-Charm modal behavior) — no "/"
+// prefix required. The list must shrink on the same keystrokes.
+func TestPickerListTypeToFilter(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.authed = true
+	s.width, s.height = 80, 24
+	s.models = []modelInfo{{ID: "m1", Name: "Model 1"}}
+	s.modelIdx = 0
+	s.openCommandPalette()
+
+	before := len(s.modal.pickerList.VisibleItems())
+	if before < 2 {
+		t.Fatalf("precondition: need multiple palette items, got %d", before)
+	}
+
+	for _, r := range "theme" {
+		pumpPickerKey(s, keyMsg(string(r)))
+	}
+	if !s.modal.pickerList.SettingFilter() {
+		t.Fatal("plain typing should enter filter mode without a leading \"/\"")
+	}
+	if got := s.modal.pickerList.FilterValue(); got != "theme" {
+		t.Fatalf("filter value = %q, want theme", got)
+	}
+	after := len(s.modal.pickerList.VisibleItems())
+	if after >= before {
+		t.Fatalf("type-to-filter should shrink list; before=%d after=%d", before, after)
+	}
+	if after == 0 {
+		t.Fatal("filter \"theme\" should still match /theme")
+	}
+}
+
+// TestPickerListSlashStillOpensEmptyFilter: "/" must keep its native behavior —
+// enter filter mode without inserting a literal "/" into the filter input.
+func TestPickerListSlashStillOpensEmptyFilter(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.authed = true
+	s.width, s.height = 80, 24
+	s.models = []modelInfo{{ID: "m1", Name: "Model 1"}}
+	s.modelIdx = 0
+	s.openCommandPalette()
+
+	pumpPickerKey(s, keyMsg("/"))
+	if !s.modal.pickerList.SettingFilter() {
+		t.Fatal("\"/\" should enter filter mode")
+	}
+	if got := s.modal.pickerList.FilterValue(); got != "" {
+		t.Fatalf("filter value = %q, want empty (slash must not be inserted)", got)
+	}
+}
+
 // takeFilterMatchesMsg runs cmd (expanding BatchMsg) and returns the first
 // FilterMatchesMsg. Skips slow Tick/Blink cmds via a short timeout.
 func takeFilterMatchesMsg(t *testing.T, cmd tea.Cmd) list.FilterMatchesMsg {

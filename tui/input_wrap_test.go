@@ -16,17 +16,17 @@ func newInputSession(t *testing.T, width int) *session {
 	return s
 }
 
-// TestInputBoxEmptyIsThreeLines: an empty input renders the single-line
-// placeholder box (top border + placeholder + bottom border).
-func TestInputBoxEmptyIsThreeLines(t *testing.T) {
+// TestInputBoxEmptyUsesOpenComposer: an empty input renders as a rounded card
+// with the prompt/placeholder row inside.
+func TestInputBoxEmptyUsesOpenComposer(t *testing.T) {
 	s := newInputSession(t, 80)
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
 	if len(lines) != 3 {
-		t.Fatalf("empty input box should be 3 lines, got %d:\n%s", len(lines), box)
+		t.Fatalf("empty composer should be 3 lines, got %d:\n%s", len(lines), box)
 	}
-	if !strings.HasPrefix(lines[0], "╭") || !strings.HasPrefix(lines[2], "╰") {
-		t.Fatalf("input box missing rounded borders:\n%s", box)
+	if !strings.HasPrefix(lines[0], "╭") || !strings.Contains(lines[1], "❯ ") {
+		t.Fatalf("composer missing card border or prompt:\n%s", box)
 	}
 	if !strings.Contains(lines[1], "Chat with the agent") {
 		t.Fatalf("input box missing placeholder:\n%s", box)
@@ -35,7 +35,7 @@ func TestInputBoxEmptyIsThreeLines(t *testing.T) {
 
 // TestInputBoxWrapsLongMessage: a value longer than the box width soft-wraps
 // onto multiple rows instead of scrolling one line — every char is still
-// visible and each content row is boxed with side borders.
+// visible and continuation rows align beneath the prompt.
 func TestInputBoxWrapsLongMessage(t *testing.T) {
 	s := newInputSession(t, 40) // inner width = 36
 	s.input.SetValue(strings.Repeat("a", 80))
@@ -44,15 +44,14 @@ func TestInputBoxWrapsLongMessage(t *testing.T) {
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
 	if len(lines) <= 3 {
-		t.Fatalf("a long message should wrap to multiple rows (box > 3 lines), got %d:\n%s", len(lines), box)
+		t.Fatalf("a long message should wrap to multiple composer rows, got %d:\n%s", len(lines), box)
 	}
-	// borders bookend the box; every interior row must be side-bordered.
-	if !strings.HasPrefix(lines[0], "╭") || !strings.HasPrefix(lines[len(lines)-1], "╰") {
-		t.Fatalf("box missing top/bottom border:\n%s", box)
+	if !strings.HasPrefix(lines[0], "╭") || !strings.Contains(lines[1], "❯ ") {
+		t.Fatalf("composer missing card border/prompt:\n%s", box)
 	}
-	for i := 1; i < len(lines)-1; i++ {
-		if !strings.HasPrefix(lines[i], "│") || !strings.HasSuffix(lines[i], "│") {
-			t.Fatalf("content row %d missing side borders: %q", i, lines[i])
+	for i := 2; i < len(lines)-1; i++ {
+		if !strings.HasPrefix(lines[i], "│   ") {
+			t.Fatalf("continuation row %d is not prompt-aligned: %q", i, lines[i])
 		}
 	}
 	// wrapping must not drop any characters
@@ -60,8 +59,8 @@ func TestInputBoxWrapsLongMessage(t *testing.T) {
 		t.Fatalf("wrapping dropped/duplicated chars: want 80 a's, got %d", got)
 	}
 	// the box grew to fit the wrapped content
-	if h := s.inputBoxHeight(); h <= 3 {
-		t.Fatalf("inputBoxHeight should grow past 3 for a wrapped message, got %d", h)
+	if h := s.inputBoxHeight(); h <= 2 {
+		t.Fatalf("inputBoxHeight should grow past 2 for a wrapped message, got %d", h)
 	}
 }
 
@@ -74,7 +73,7 @@ func TestInputBoxCapsVeryLong(t *testing.T) {
 
 	box := s.renderInputBox()
 	h := lipglossHeight(box)
-	// maxInputLines content + up to 2 "…" markers + 2 borders.
+	// maxInputLines content + up to 2 "…" markers + top and bottom card borders.
 	const ceiling = maxInputLines + 2 + 2
 	if h > ceiling {
 		t.Fatalf("box height %d exceeds cap %d for a 1000-char message:\n%s", h, ceiling, box)
@@ -87,13 +86,13 @@ func TestInputBoxShrinksAfterClear(t *testing.T) {
 	s := newInputSession(t, 40)
 	s.input.SetValue(strings.Repeat("c", 80))
 	s.layout()
-	if s.inputBoxHeight() <= 3 {
-		t.Fatalf("expected wrapped box to be > 3 lines")
+	if s.inputBoxHeight() <= 2 {
+		t.Fatalf("expected wrapped composer to be > 2 lines")
 	}
 	s.input.Reset()
 	s.layout()
 	if h := s.inputBoxHeight(); h != 3 {
-		t.Fatalf("after clearing, box should be 3 lines, got %d", h)
+		t.Fatalf("after clearing, composer should be 3 lines, got %d:\n%s", h, stripANSI(s.renderInputBox()))
 	}
 }
 

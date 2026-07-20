@@ -102,7 +102,7 @@ func (s *session) applyGoalState(raw json.RawMessage) {
 		if m.AutoDeploy {
 			s.busy = true
 		}
-	case "done", "failed", "idle":
+	case "done", "failed", "cancelled", "idle":
 		// Clear the footer once the goal settles — wrap-up's `done` arrives
 		// while phase is still synthesizing (goalKeepsBusy), so this is the
 		// path that actually releases busy after a successful goal.
@@ -1059,7 +1059,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// "done" is owned by announceGoalComplete (also called from applyGoalState)
 		// so we do not persist the verbose transition line or double-toast.
 		switch to {
-		case "deploying", "running", "synthesizing", "failed",
+		case "deploying", "running", "synthesizing", "failed", "cancelled",
 			"planning", "reviewing", "verifying", "replanning":
 			if to == "synthesizing" && msg == "" {
 				line = "Workers finished — writing completion summary…"
@@ -1068,12 +1068,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 			s.persistGoalLifecycle(line)
-			if to == "failed" {
+			if to == "failed" || to == "cancelled" {
 				s.busy = false
 				// Sync local phase so goalKeepsBusy cannot retain busy after a
 				// goal_phase terminal that races ahead of goal_state.
 				if s.goalState != nil {
-					s.goalState.Phase = "failed"
+					s.goalState.Phase = to
 				}
 				s.logWarn(line)
 			}

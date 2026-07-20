@@ -322,9 +322,10 @@ func (s *session) renderToolActivity(start, end, w, lineBase int) string {
 	if allExpanded {
 		disclosure = "▾"
 	}
+	innerW := max(8, w-4) // card border + padding
 	heading := roleToolStyle.Render(disclosure+" activity") + dimStyle.Render(" · "+label+state)
 	if key := s.keyHint("toggle_tool_output"); key != "" {
-		heading = fitRow(w, heading, keyHintStyle.Render("click rows · "+key+" details"))
+		heading = fitRow(innerW, heading, keyHintStyle.Render("click rows · "+key+" details"))
 	}
 
 	var out strings.Builder
@@ -335,19 +336,19 @@ func (s *session) renderToolActivity(start, end, w, lineBase int) string {
 		var rendered string
 		if b.expanded {
 			if b.kind == blkToolResult {
-				rendered = indentToolDetail(s.renderKeyHints(s.renderBlockFull(b, max(8, w-2))))
+				rendered = indentToolDetail(s.renderKeyHints(s.renderBlockFull(b, innerW)))
 			} else {
-				rendered = indentToolDetail(s.renderKeyHints(s.renderToolBlock(b, max(8, w-2))))
+				rendered = indentToolDetail(s.renderKeyHints(s.renderToolBlock(b, innerW)))
 			}
 		} else {
-			rendered = s.renderCompactToolRow(b, w)
+			rendered = s.renderCompactToolRow(b, innerW)
 		}
 		h := lipgloss.Height(rendered)
 		b.renderStart, b.renderEnd = line, line+h-1
 		out.WriteString(rendered)
 		line += h
 	}
-	return out.String()
+	return cardStyle.Width(w).Render(out.String())
 }
 
 func indentToolDetail(detail string) string {
@@ -359,7 +360,7 @@ func indentToolDetail(detail string) string {
 }
 
 func (s *session) renderCompactToolRow(b *block, w int) string {
-	prefix := dimStyle.Render("│ ")
+	prefix := ""
 	if s.focusedBlock >= 0 && s.focusedBlock < len(s.blocks) && s.blocks[s.focusedBlock] == b {
 		prefix = accentStyle.Render("▸ ")
 	}
@@ -848,28 +849,36 @@ const streamBatch = 64 // P1-12: bytes of streaming growth between full re-rende
 func (s *session) renderBlockFull(b *block, w int) string {
 	switch b.kind {
 	case blkUser:
-		return roleLine("●", "you", "", c.user) + "\n" + renderMarkdown(b.text.String(), w)
+		// The user's turn is a right-aligned surface bubble: a rounded card that
+		// caps its width so long conversations stay readable and the transcript
+		// keeps a clear visual rhythm.
+		return s.renderUserBubble(b.text.String(), w)
 	case blkAssistant:
+		// The assistant is the app's ambient voice: a quiet model tag above
+		// flush-left prose with a thin accent rail. No heavy ledger header.
 		meta := b.model
 		if meta == "" && len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 			meta = s.models[s.modelIdx].ID
 		}
-		return roleLine("◆", "leader", meta, c.accent) + "\n" + renderMarkdown(b.text.String(), w)
+		return s.renderAssistantTurn(meta, b.text.String(), w)
 	case blkThinking:
 		if b.collapsed {
 			n := strings.Count(b.text.String(), "\n") + 1
 			if b.text.Len() == 0 {
 				n = 0
 			}
-			return dimStyle.Render(fmt.Sprintf("▸ reasoning · %d line%s  (click or ctrl+t expand)", n, pluralS(n)))
+			label := fmt.Sprintf("▸ reasoning · %d line%s", n, pluralS(n))
+			if key := s.keyLabel("toggle_reasoning"); key != "" {
+				label += " · " + key + " expand"
+			}
+			return softPillStyle(c.secondary, c.surface).Render(label)
 		}
-		return roleLine("▾", "reasoning", "click to collapse", c.dim) + "\n" +
-			thinkStyle.Render(renderMarkdown(b.text.String(), w))
+		content := thinkStyle.Render(renderMarkdown(b.text.String(), w-4))
+		return recessedStyle.Width(max(1, w-2)).Render(content)
 	case blkTool:
 		return s.renderToolBlock(b, w)
 	case blkToolResult:
-		return roleLine("▹", "result", "", c.success) + "\n" +
-			renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w, "lines", false)
+		return renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w, "lines", false)
 	case blkSuccess:
 		return renderStatusLine("✓ ", successStyle, baseStyle, b.text.String(), w)
 	case blkWarn:
@@ -1239,11 +1248,88 @@ func jsonStringField(s, key string) string {
 //
 //	● you   · 14:32
 func roleLine(glyph, role, meta, color string) string {
-	out := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render(glyph + " " + role)
+	// Glowing role marker: a solid dot in the role colour, then a strong label —
+	// the Catalyst status-dot idiom applied to conversation turns.
+	out := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(glyph)
+	out += " " + lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render(role)
 	if meta != "" {
 		out += mutedStyle.Render("  " + truncate(meta, 40))
 	}
 	return out
+}
+
+// turnRail wraps a conversation turn's body in the Catalyst hairline rail: a
+// single left │ in the given colour (peach for the user, quiet for the
+// assistant) with a small left inset, so turns are visually grouped and
+// scannable. The rail colour — not a box — carries the structure, matching the
+// web's hairline dividers. Empty lines keep the rail so the group reads whole.
+func turnRail(body string, rail lipgloss.Style) string {
+	bar := rail.Render("│")
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		lines[i] = bar + " " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// heavyRail is the user-turn treatment: a thick accent bar (blockquote-style,
+// reads as "you typed this") that stays visually distinct from the thin `│`
+// tool rails. bodyIndent is a quiet left inset for the assistant body.
+func heavyRail(body string, rail lipgloss.Style) string {
+	bar := rail.Render("▌")
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		lines[i] = bar + " " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+func bodyIndent(body string) string {
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		lines[i] = "  " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderUserBubble wraps the user's message in a right-aligned rounded surface
+// card. The bubble width is capped so long conversations keep a clear rhythm
+// and short messages don't stretch across the whole terminal.
+func (s *session) renderUserBubble(text string, w int) string {
+	maxW := max(24, w*6/10)
+	if maxW > w-4 {
+		maxW = w - 4
+	}
+	innerW := maxW - 4 // card border + horizontal padding
+	content := renderMarkdown(text, innerW)
+	card := cardStyle.Width(maxW).Render(content)
+	return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(card)
+}
+
+// renderAssistantTurn renders the model's reply as full-width prose with a
+// quiet model tag above and a thin accent rail down the left.
+func (s *session) renderAssistantTurn(meta, text string, w int) string {
+	var out strings.Builder
+	if meta != "" {
+		out.WriteString(dimStyle.Render("  " + truncate(meta, 48)))
+		out.WriteByte('\n')
+	}
+	out.WriteString(turnRail(renderMarkdown(text, w-2), railStyle))
+	return out.String()
+}
+
+// turnHeader renders a ledger section header: the role tag on the left, then a
+// full-width hairline rule filling the rest of the row. Every user turn anchors
+// one, so the transcript reads as a ruled ledger with clear section breaks —
+// the Catalyst hairline divider idiom applied to conversation structure.
+func turnHeader(tag, color string, w int) string {
+	label := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render("●") +
+		" " + lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render(tag)
+	used := lipgloss.Width(label) + 1
+	if w-used < 1 {
+		return label
+	}
+	return label + " " + railStyle.Render(strings.Repeat("─", w-used))
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,18 +1347,27 @@ var welcomeExamples = []string{
 	"Review recent changes",
 }
 
+// surfacePanel returns the shared "card" chrome for centred empty-state panels
+// (welcome / login / starting): hairline railDim border + a lifted surface fill,
+// the same material as the composer so all card chrome reads as one system.
+func surfacePanel(width int) lipgloss.Style {
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(c.railDim)).
+		BorderBackground(lipgloss.Color(c.surface)).
+		Background(lipgloss.Color(c.surface)).
+		Padding(0, 1).
+		Width(width)
+}
+
 func (s *session) renderWelcome() string {
 	w := s.viewport.Width()
 	h := s.viewport.Height()
 
 	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
 		panelW := min(50, max(20, w-4))
-		panel := lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(c.decor)).
-			Padding(0, 1).
-			Width(panelW).
-			Render(accentStyle.Render("◷ Starting…") + "\n\n" +
+		panel := surfacePanel(panelW).Render(
+			accentStyle.Render("◷ Starting…") + "\n\n" +
 				baseStyle.Render("Connecting to the core and checking credentials."))
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 	}
@@ -1293,12 +1388,7 @@ func (s *session) renderWelcome() string {
 			"",
 			dimStyle.Render("Enter opens /login · / for commands · ? help"),
 		}
-		panel := lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(c.decor)).
-			Padding(0, 1).
-			Width(panelW).
-			Render(strings.Join(rows, "\n"))
+		panel := surfacePanel(panelW).Render(strings.Join(rows, "\n"))
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 	}
 	if h < 10 || w < 32 {

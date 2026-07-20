@@ -19,7 +19,7 @@ const goalDisplaySummaryCap = 800
 func goalShowsProgressPanel(phase string, autoDeploy bool) bool {
 	switch phase {
 	case "planning", "reviewing", "deploying", "running", "synthesizing",
-		"verifying", "replanning", "done", "failed":
+		"verifying", "replanning", "done", "failed", "cancelled":
 		return true
 	case "plan_ready":
 		return autoDeploy
@@ -39,7 +39,7 @@ func goalProgressPhaseLabel(phase string, autoDeploy bool) string {
 
 func goalTerminalStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "done", "failed", "skipped":
+	case "done", "failed", "skipped", "cancelled":
 		return true
 	default:
 		return false
@@ -48,7 +48,7 @@ func goalTerminalStatus(status string) bool {
 
 func goalStepOK(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "failed", "skipped":
+	case "failed", "skipped", "cancelled":
 		return false
 	default:
 		return true
@@ -259,13 +259,7 @@ func (s *session) renderGoalProgressPanelUncached(w int) string {
 		}
 	}
 	body := strings.Join(rows, "\n")
-	boxW := max(1, w-4)
-	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.decor)).
-		Padding(0, 1).
-		Width(boxW).MaxWidth(max(1, w)).
-		Render(body)
+	return cardStyle.Width(max(1, w-2)).MaxWidth(max(1, w)).Render(body)
 }
 
 func (s *session) goalProgressPanelHeight() int {

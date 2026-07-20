@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 func mouseTranscriptSession(t *testing.T) (*session, *block, *block, *block) {
@@ -45,6 +46,16 @@ func transcriptMouseY(s *session, line int) int {
 	return s.transcriptViewportTop() + line - s.viewport.YOffset()
 }
 
+func transcriptNeedleCell(t *testing.T, s *session, line int, needle string) int {
+	t.Helper()
+	text := s.transcriptPlainLines()[line]
+	byteOffset := strings.Index(text, needle)
+	if byteOffset < 0 {
+		t.Fatalf("transcript line %q does not contain %q", text, needle)
+	}
+	return lipgloss.Width(text[:byteOffset])
+}
+
 func clickTranscriptLine(s *session, line, x int) tea.Cmd {
 	y := transcriptMouseY(s, line)
 	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
@@ -56,9 +67,10 @@ func TestTranscriptMouseDragSelectsHighlightsAndCopies(t *testing.T) {
 	// User content begins one line below its role header.
 	line := s.blocks[0].renderStart + 1
 	y := transcriptMouseY(s, line)
-	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: 0, Y: y, Button: tea.MouseLeft})
-	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 5, Y: y, Button: tea.MouseLeft})
-	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: 5, Y: y, Button: tea.MouseLeft})
+	start := transcriptNeedleCell(t, s, line, "Select")
+	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: start, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: start + 5, Y: y, Button: tea.MouseLeft})
+	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: start + 5, Y: y, Button: tea.MouseLeft})
 
 	if cmd == nil {
 		t.Fatal("drag release should return clipboard commands")
@@ -120,8 +132,8 @@ func TestTranscriptMouseDragOnDisclosureDoesNotToggleIt(t *testing.T) {
 	s, reasoning, _, _ := mouseTranscriptSession(t)
 	y := transcriptMouseY(s, reasoning.renderStart)
 	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: 0, Y: y, Button: tea.MouseLeft})
-	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 7, Y: y, Button: tea.MouseLeft})
-	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: 7, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 9, Y: y, Button: tea.MouseLeft})
+	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: 9, Y: y, Button: tea.MouseLeft})
 	if cmd == nil {
 		t.Fatal("dragging a disclosure row should copy the selection")
 	}
@@ -137,8 +149,8 @@ func TestTranscriptMouseMotionCoalescesToLatestFrame(t *testing.T) {
 	s, _, _, _ := mouseTranscriptSession(t)
 	line := s.blocks[0].renderStart + 1
 	y := transcriptMouseY(s, line)
-	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: 0, Y: y, Button: tea.MouseLeft})
-	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 2, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: 3, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 5, Y: y, Button: tea.MouseLeft})
 	first := s.selection.head
 
 	// Force this event inside the current frame instead of relying on test
@@ -165,12 +177,13 @@ func TestTranscriptMouseReleaseUsesFinalCoalescedPosition(t *testing.T) {
 	s, _, _, _ := mouseTranscriptSession(t)
 	line := s.blocks[0].renderStart + 1
 	y := transcriptMouseY(s, line)
-	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: 0, Y: y, Button: tea.MouseLeft})
-	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 2, Y: y, Button: tea.MouseLeft})
+	start := transcriptNeedleCell(t, s, line, "Select")
+	s.handleTranscriptMouseClick(tea.MouseClickMsg{X: start, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: start + 2, Y: y, Button: tea.MouseLeft})
 	s.selectionLastFrame = time.Now()
-	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: 5, Y: y, Button: tea.MouseLeft})
+	s.handleTranscriptMouseMotion(tea.MouseMotionMsg{X: start + 5, Y: y, Button: tea.MouseLeft})
 
-	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: 8, Y: y, Button: tea.MouseLeft})
+	cmd := s.handleTranscriptMouseRelease(tea.MouseReleaseMsg{X: start + 8, Y: y, Button: tea.MouseLeft})
 	if cmd == nil {
 		t.Fatal("release should copy the final selection")
 	}

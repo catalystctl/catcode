@@ -17,9 +17,9 @@ func TestInputBoxRendersLiteralNewline(t *testing.T) {
 
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
-	// top + 2 content rows + bottom
+	// top border + 2 content rows + bottom border
 	if len(lines) != 4 {
-		t.Fatalf("two-line input should render 4 box rows (got %d):\n%s", len(lines), box)
+		t.Fatalf("two-line input should render 4 composer rows (got %d):\n%s", len(lines), box)
 	}
 	// both source lines must appear on their own bordered rows, neither dropped
 	if !strings.Contains(lines[1], "line1") {
@@ -28,10 +28,8 @@ func TestInputBoxRendersLiteralNewline(t *testing.T) {
 	if !strings.Contains(lines[2], "line2") {
 		t.Fatalf("second line missing from row 2: %q\n%s", lines[2], box)
 	}
-	for i := 1; i < 3; i++ {
-		if !strings.HasPrefix(lines[i], "│") || !strings.HasSuffix(lines[i], "│") {
-			t.Fatalf("content row %d missing side borders: %q", i, lines[i])
-		}
+	if !strings.Contains(lines[1], "❯ ") || !strings.HasPrefix(lines[2], "│   ") {
+		t.Fatalf("composer rows are not prompt-aligned: %q / %q", lines[1], lines[2])
 	}
 	if h := s.inputBoxHeight(); h != 4 {
 		t.Fatalf("inputBoxHeight should be 4 for a two-line message, got %d", h)
@@ -47,7 +45,7 @@ func TestInputBoxNewlineNotDropped(t *testing.T) {
 	box := stripANSI(s.renderInputBox())
 	// exactly one '\n' is structural (between the two lines) and must not be
 	// rendered as a literal glyph on a content row.
-	for _, ln := range strings.Split(box, "\n")[1 : len(strings.Split(box, "\n"))-1] {
+	for _, ln := range strings.Split(box, "\n")[1:] {
 		if strings.ContainsAny(ln, "\n") {
 			t.Fatalf("content row contains a literal newline: %q", ln)
 		}
@@ -69,13 +67,13 @@ func TestInputBoxTrailingNewlineShowsBlankRow(t *testing.T) {
 	s.layout()
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
-	// top + "hello" + blank + bottom = 4 rows
+	// top border + "hello" + blank + bottom border = 4 rows
 	if len(lines) != 4 {
 		t.Fatalf("trailing newline should render a blank row (got %d rows):\n%s", len(lines), box)
 	}
-	// row 3 is a blank boxed line: side borders with only spaces between them.
-	blank := strings.Trim(lines[2], "│ ")
-	if blank != "" {
+	// row 3 is a blank continuation aligned under the prompt.
+	content := strings.TrimSuffix(strings.TrimPrefix(lines[2], "│"), "│")
+	if strings.TrimSpace(content) != "" {
 		t.Fatalf("row 3 should be a blank boxed line, got %q", lines[2])
 	}
 }

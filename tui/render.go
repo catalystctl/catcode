@@ -173,22 +173,25 @@ func (s *session) renderCoreFailureBanner() string {
 		Render(" " + msg)
 }
 
-// renderHeader is deliberately one row: product + location on the left and
-// the current operational state on the right. This preserves transcript space
-// and avoids repeating the same identity in both header and empty state.
+// renderHeader is a minimal chrome strip: product + location on the left,
+// operational state on the right, followed by a single hairline rule. The
+// transcript is the hero, so the header avoids a heavy surface fill.
 func (s *session) renderHeader() string {
 	if s.viewChrome != nil && s.viewChrome.headerOK {
 		return s.viewChrome.header
 	}
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst")
+	// Brand: the Catalyst wordmark — accent diamond + strong fg. "Code" in muted
+	// keeps the full product name (Catalyst Code) without competing with the mark.
+	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
 	left := brand
 	if s.width >= 30 && s.cwd != "" {
-		left += dimStyle.Render("  " + truncatePath(s.cwd, max(8, s.width/2-12)))
+		left += mutedStyle.Render("  " + truncatePath(s.cwd, max(8, s.width/2-12)))
 	}
 	state := "starting"
+	stateDot := c.secondary
 	switch {
 	case s.coreLifecycle == coreFailed:
-		state = "core down"
+		state, stateDot = "core down", c.err
 	case s.busy:
 		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 			settled, total := s.goalProgressCounts()
@@ -197,16 +200,19 @@ func (s *session) renderHeader() string {
 		} else {
 			state = "working"
 		}
+		stateDot = c.accent
 	case s.authed:
-		state = "ready"
+		state, stateDot = "ready", c.success
 	case len(s.models) > 0:
-		state = "no key"
+		state, stateDot = "no key", c.warn
 	}
-	right := state
+	// The Catalyst status dot (●) carries the operational state.
+	right := statusDot(stateDot) + " " + boldBaseStyle.Render(state)
 	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) && s.width >= 42 {
-		right += " · " + truncate(s.models[s.modelIdx].ID, max(8, s.width/3))
+		right += mutedStyle.Render(" · " + truncate(s.models[s.modelIdx].ID, max(8, s.width/3)))
 	}
-	out := fitRow(s.width, left, mutedStyle.Render(right))
+	row := fitRow(s.width, " "+left, " "+right+" ")
+	out := row
 	if s.viewChrome != nil {
 		s.viewChrome.header = out
 		s.viewChrome.headerOK = true
@@ -279,6 +285,9 @@ func (s *session) renderApprovalBanner() string {
 		avail = 8
 	}
 	summary := truncate(approvalSummary(a.tool, a.args), avail)
+	// The approval banner is the one place the UI asks for a decision, so it gets
+	// the Catalyst warn (amber) as a solid accent bar — the highest-contrast
+	// surface in the app, impossible to miss while scrolling.
 	msg := "⚠  approval required  " + toolIcon(a.tool) + " " + toolDisplayName(a.tool) + "  " + summary
 	if controls != "" {
 		msg += "   " + controls
@@ -758,10 +767,13 @@ func (s *session) renderInputBoxUncached() string {
 	if w < 1 {
 		w = 1
 	}
-	if w < 4 {
+	if w < 8 {
 		return lipgloss.NewStyle().MaxWidth(w).Render(s.inputContent(w))
 	}
-	innerW := w - 4 // "│ " + content + " │"
+	// The composer is a rounded surface card. Border + horizontal padding consume
+	// four cells; the "❯ " prompt prefix consumes another two on text lines.
+	cardInnerW := w - 4
+	textW := cardInnerW - 2
 	// Attachment chips sit above the typed text so pasted images are visible
 	// even when the text field is empty (image-only send).
 	var chipLine string
@@ -777,13 +789,13 @@ func (s *session) renderInputBoxUncached() string {
 		if detach != "" {
 			hint = "  " + detach + " remove"
 		}
-		if lipgloss.Width(chip)+lipgloss.Width(hint) <= innerW {
+		if lipgloss.Width(chip)+lipgloss.Width(hint) <= cardInnerW {
 			chipLine = accentStyle.Render(chip) + dimStyle.Render(hint)
 		} else {
-			chipLine = accentStyle.Render(truncate(chip, innerW))
+			chipLine = accentStyle.Render(truncate(chip, cardInnerW))
 		}
 	}
-	content := s.inputContent(innerW)
+	content := s.inputContent(textW)
 	var lines []string
 	if chipLine != "" {
 		lines = append(lines, chipLine)
@@ -791,76 +803,60 @@ func (s *session) renderInputBoxUncached() string {
 	lines = append(lines, strings.Split(content, "\n")...)
 	// Busy / approval hint under the typed text when the box has content so
 	// controls stay discoverable even after the placeholder is gone.
-	if hint := s.composerHintLine(innerW); hint != "" && s.input.Value() != "" {
+	if hint := s.composerHintLine(cardInnerW); hint != "" && s.input.Value() != "" {
 		lines = append(lines, hint)
 	}
 	// The moving perimeter is an opt-in flourish; a static border keeps
 	// streaming text calm and behaves better over SSH. Reduced-motion always
 	// wins even when animation was explicitly requested.
 	if s.busy && envEnabled("CATCODE_ANIMATED_BORDER") && !s.motionReduced() {
-		return s.renderInputBoxAnimated(w, innerW, lines)
+		return s.renderInputBoxAnimated(w, cardInnerW, textW, lines)
 	}
-	top := "╭" + strings.Repeat("─", w-2) + "╮"
-	bot := "╰" + strings.Repeat("─", w-2) + "╯"
-	var b strings.Builder
-	b.WriteString(top)
-	for _, ln := range lines {
-		pad := innerW - lipgloss.Width(ln)
-		if pad < 0 {
-			pad = 0
-		}
-		b.WriteString("\n│ " + ln + strings.Repeat(" ", pad) + " │")
-	}
-	b.WriteString("\n" + bot)
-	return b.String()
+	return s.renderComposerStatic(w, cardInnerW, textW, lines)
 }
 
-// renderInputBoxAnimated draws the input box with a "comet": a soft accent
-// light that sweeps the box perimeter while a turn is in flight — the TUI
-// analog of the web's composer-inflight flowing-gradient ring.
-//
-// Anti-jank design (see the tui-animation-infrastructure memory):
-//   - geometry is identical to the idle border (same ╭─╮│╰╯ chars + counts);
-//     only each cell's foreground color changes → zero layout shift;
-//   - 24-bit truecolor per cell via lipgloss (auto-downscaled on 256-color
-//     terminals), blended between the theme's dim (faded) and accent (bright
-//     head) so the sweep is a smooth gradient, not an ANSI stair-step;
-//   - the head position is derived from wall-clock time, not a frame count,
-//     so dropped frames skip the comet ahead at constant speed instead of
-//     slowing/stuttering — the single biggest smoothness lever;
-//   - re-renders piggyback on the existing busy-frame tick (10 FPS, already
-//     running while busy) — no new timer, no new re-render storm, and idle
-//     (s.busy == false) is a pure no-op that falls through to the plain border.
-func (s *session) renderInputBoxAnimated(w, innerW int, lines []string) string {
-	H := len(lines)
-	P := 2 * (w + H) // perimeter length in cells
+// renderComposerStatic draws the composer as a rounded surface card: the
+// prompt glyph lives inside the card, content lines are inset consistently, and
+// the border uses the theme's railDim so the composer is present but quiet.
+func (s *session) renderComposerStatic(w, cardInnerW, textW int, lines []string) string {
+	prompt := accentStyle.Render("❯")
+	var content strings.Builder
+	for i, ln := range lines {
+		if i == 0 {
+			content.WriteString(prompt + " " + ln)
+		} else {
+			content.WriteString("  " + ln)
+		}
+		if i < len(lines)-1 {
+			content.WriteByte('\n')
+		}
+	}
+	return cardStyle.Width(w).Render(content.String())
+}
 
-	// One full lap per inflightCycle; phase ∈ [0,1) is wall-clock driven.
+// renderInputBoxAnimated draws the composer as a rounded surface card with a
+// soft accent "comet" sweeping the top border. Geometry matches the static card
+// exactly: only border foreground colors animate → zero layout shift.
+func (s *session) renderInputBoxAnimated(w, cardInnerW, textW int, lines []string) string {
+	// The comet sweeps the w-2 horizontal cells between the rounded corners.
+	P := w - 2
 	phase := float64(time.Now().UnixNano()%int64(inflightCycle)) / float64(int64(inflightCycle))
 	head := phase * float64(P)
 
-	// Precompute a smooth brightness ramp of lipgloss styles from dim→accent.
-	// Quantizing to a modest number of levels is visually indistinguishable for
-	// a soft gaussian glow but avoids building one style object per cell.
-	base := hexRGB(c.dim)
+	base := hexRGB(c.railDim)
 	accent := hexRGB(c.accent)
 	sigma := float64(P) / inflightSigmaDiv
+	if sigma < 1 {
+		sigma = 1
+	}
 	ramp := make([]lipgloss.Style, inflightLevels)
 	for i := 0; i < inflightLevels; i++ {
 		t := float64(i) / float64(inflightLevels-1)
 		rgb := blendRGB(base, accent, t)
 		ramp[i] = lipgloss.NewStyle().Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", rgb[0], rgb[1], rgb[2])))
 	}
-
-	// styleAt returns the ramp style for a perimeter cell at index idx, given a
-	// head that has swept to `head`. Distance wraps around the ring symmetrically.
 	styleAt := func(idx int) lipgloss.Style {
 		d := float64(idx) - head
-		if d < -float64(P)/2 {
-			d += float64(P)
-		} else if d > float64(P)/2 {
-			d -= float64(P)
-		}
 		if d < 0 {
 			d = -d
 		}
@@ -873,45 +869,38 @@ func (s *session) renderInputBoxAnimated(w, innerW int, lines []string) string {
 		}
 		return ramp[li]
 	}
-	render := func(idx int, ch string) string { return styleAt(idx).Render(ch) }
 
 	var b strings.Builder
-	// Top edge (clockwise): ╭ at 0, ─ at 1..w-2, ╮ at w-1.
-	b.WriteString(render(0, "╭"))
-	for i := 1; i < w-1; i++ {
-		b.WriteString(render(i, "─"))
+	b.WriteString(railStyle.Render("╭"))
+	for i := 0; i < P; i++ {
+		b.WriteString(styleAt(i).Render("─"))
 	}
-	b.WriteString(render(w-1, "╮"))
-	// Middle rows: left │ (left edge) + content + right │ (right edge).
-	for r, ln := range lines {
-		pad := innerW - lipgloss.Width(ln)
-		if pad < 0 {
-			pad = 0
+	b.WriteString(railStyle.Render("╮"))
+
+	prompt := accentStyle.Render("❯")
+	left := railStyle.Render("│ ")
+	right := railStyle.Render(" │")
+	for i, ln := range lines {
+		b.WriteByte('\n')
+		b.WriteString(left)
+		var row string
+		if i == 0 {
+			row = prompt + " " + ln
+		} else {
+			row = "  " + ln
 		}
-		rightIdx := w + r      // right edge, traversed top→bottom
-		leftIdx := P - (r + 1) // left edge, wraps to meet ╭ at index 0
-		b.WriteString("\n")
-		b.WriteString(render(leftIdx, "│"))
-		b.WriteString(" " + ln + strings.Repeat(" ", pad) + " ")
-		b.WriteString(render(rightIdx, "│"))
-	}
-	// Bottom edge. The perimeter runs clockwise (right→left along the bottom
-	// for index continuity with the right edge), but the string is written
-	// left→right for display — so ╰ is leftmost and ╯ rightmost.
-	b.WriteString("\n")
-	for j := 0; j < w; j++ {
-		idx := w + H + (w - 1 - j)
-		var ch string
-		switch {
-		case j == w-1:
-			ch = "╯"
-		case j == 0:
-			ch = "╰"
-		default:
-			ch = "─"
+		// Pad the row to the card's inner width so the right border aligns.
+		if dw := cardInnerW - lipgloss.Width(row); dw > 0 {
+			row += strings.Repeat(" ", dw)
 		}
-		b.WriteString(render(idx, ch))
+		b.WriteString(row)
+		b.WriteString(right)
 	}
+
+	b.WriteByte('\n')
+	b.WriteString(railStyle.Render("╰"))
+	b.WriteString(railStyle.Render(strings.Repeat("─", P)))
+	b.WriteString(railStyle.Render("╯"))
 	return b.String()
 }
 
@@ -978,7 +967,7 @@ func (s *session) inputContent(w int) string {
 		if ph == "" {
 			return ""
 		}
-		return active.Placeholder.Render(truncateRunes(ph, w))
+		return active.Placeholder.Render(truncateFit(ph, w))
 	}
 	pos := inputPosition(s.input)
 	r := []rune(value)
@@ -1108,6 +1097,8 @@ func composerTextStyle() lipgloss.Style {
 	if colorsDisabled() {
 		return lipgloss.NewStyle().Inline(true)
 	}
+	// Inline(true) lets the composer card's surface fill show through around
+	// glyphs (lipgloss pads the fill) instead of the text repainting its own bg.
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(c.fg)).Inline(true)
 }
 
@@ -1115,9 +1106,11 @@ func composerCursorStyle() lipgloss.Style {
 	if colorsDisabled() {
 		return lipgloss.NewStyle().Reverse(true)
 	}
+	// A solid accent cell cursor: the web caret-glow as a block.
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color(c.bg)).
-		Background(lipgloss.Color(c.accent))
+		Background(lipgloss.Color(c.accent)).
+		Bold(true)
 }
 
 // wrapRunesMultiline splits r on literal '\n' then width-wraps each segment
@@ -1229,7 +1222,7 @@ func (s *session) renderActiveTasks(w int) string {
 	boxW := max(1, w-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.decor)).
+		BorderForeground(lipgloss.Color(c.railDim)).
 		Padding(0, 1).
 		Width(boxW).MaxWidth(max(1, w)).MaxHeight(max(1, s.height)).
 		Render(body)
@@ -1300,7 +1293,7 @@ func (s *session) renderTodoPanel() string {
 	boxW := max(1, s.width-4) // border + horizontal padding consume four cells
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.decor)).
+		BorderForeground(lipgloss.Color(c.railDim)).
 		Padding(0, 1).
 		Width(boxW).MaxWidth(max(1, s.width)).MaxHeight(max(1, s.height)).
 		Render(body)
@@ -1380,8 +1373,9 @@ func (s *session) renderActivityShelfUncached() string {
 		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 			settled, total := s.goalProgressCounts()
 			phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
-			return accentStyle.Render("◈ ") +
+			label := accentStyle.Render("◈ ") +
 				baseStyle.Render(fmt.Sprintf("Goal %s · %d/%d steps", phaseLabel, settled, total))
+			return surfaceStyle.Padding(0, 1).Render(label)
 		}
 		return ""
 	}
@@ -1403,8 +1397,9 @@ func (s *session) renderActivityShelfUncached() string {
 		toggle = "Ctrl+G"
 	}
 	if !s.activityExpanded {
-		return accentStyle.Render("◷ ") + baseStyle.Render(strings.Join(parts, " · ")) +
+		label := accentStyle.Render("◷ ") + baseStyle.Render(strings.Join(parts, " · ")) +
 			dimStyle.Render(" · "+toggle+" expand")
+		return surfaceStyle.Padding(0, 1).Render(label)
 	}
 
 	var details []string
@@ -1435,12 +1430,7 @@ func (s *session) renderActivityShelfUncached() string {
 	}
 	lines := []string{accentStyle.Render("Activity") + dimStyle.Render(" · focused · ↑↓ scroll · Esc close"+position)}
 	lines = append(lines, details[s.activityScroll:end]...)
-	boxW := max(1, s.width-4)
-	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.decor)).
-		Padding(0, 1).
-		Width(boxW).MaxWidth(max(1, s.width)).
+	return cardStyle.Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
 		Render(strings.Join(lines, "\n"))
 }
 

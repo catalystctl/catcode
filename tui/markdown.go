@@ -153,8 +153,8 @@ func catalystGlamourStyle() ansi.StyleConfig {
 	base.H3.Color = strPtr(c.user)
 	base.Link.Color = strPtr(c.accent)
 	base.LinkText.Color = strPtr(c.accent)
-	base.Code.Color = strPtr(c.tool)
-	base.Code.BackgroundColor = strPtr(c.dim)
+	base.Code.Color = strPtr(c.inlineCode)
+	base.Code.BackgroundColor = strPtr(c.railDim)
 	base.CodeBlock.Color = strPtr(c.muted)
 	base.CodeBlock.Margin = &zero
 	base.Emph.Color = strPtr(c.fg)

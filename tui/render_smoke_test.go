@@ -54,7 +54,7 @@ func TestRenderSmoke(t *testing.T) {
 	// Flat layout: tool calls form a compact activity run. The command stays
 	// visible, while output waits behind the per-call details toggle.
 	blocks := stripANSI(s.renderBlocks())
-	for _, want := range []string{"you", "leader", "activity", "1 call", "bash", "go test", "details", "✗", "not authenticated"} {
+	for _, want := range []string{"Explain the diff", "glm-5.2", "activity", "1 call", "bash", "go test", "details", "✗", "not authenticated"} {
 		if !strings.Contains(blocks, want) {
 			t.Errorf("blocks missing %q:\n%s", want, blocks)
 		}
@@ -332,7 +332,7 @@ func TestFullView(t *testing.T) {
 	s.refresh()
 
 	view := stripANSI(s.View().Content)
-	for _, want := range []string{"Catalyst", "umans-glm-5.2", "ready", "you", "leader", "os.ReadFile", "Enter send", "Chat with the agent"} {
+	for _, want := range []string{"Catalyst", "umans-glm-5.2", "ready", "How do I read a file", "os.ReadFile", "Enter send", "Chat with the agent"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("full view missing %q:\n%s", want, view)
 		}
@@ -387,14 +387,14 @@ func TestActiveTasks(t *testing.T) {
 		t.Errorf("shelf should be empty once the run finishes, got:\n%s", p)
 	}
 
-	// bordered input box: top + input row + bottom
+	// composer: rounded card + prompted input row
 	box := stripANSI(s.renderInputBox())
 	lines := strings.Split(box, "\n")
 	if len(lines) != 3 {
-		t.Fatalf("input box should be 3 lines, got %d:\n%s", len(lines), box)
+		t.Fatalf("composer should be 3 lines, got %d:\n%s", len(lines), box)
 	}
-	if !strings.HasPrefix(lines[0], "╭") || !strings.HasPrefix(lines[2], "╰") {
-		t.Errorf("input box missing rounded borders:\n%s", box)
+	if !strings.HasPrefix(lines[0], "╭") || !strings.Contains(lines[1], "❯ ") {
+		t.Errorf("composer missing card border or prompt:\n%s", box)
 	}
 	if !strings.Contains(lines[1], "Enter queues") {
 		t.Errorf("busy input box missing in-flight placeholder:\n%s", box)

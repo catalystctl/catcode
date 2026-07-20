@@ -48,12 +48,12 @@ func TestVisualGoldens(t *testing.T) {
 	t.Run("40x12 idle", func(t *testing.T) {
 		s := visualSession(40, 12)
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst …project ready
+		want := `◆ Catalyst Code …project ● ready
 What would you like to build?
 ▸ 1. Understand this repository
 ↑↓ choose · enter use · / commands
 ╭─╮
-│ Chat with the agent… (/ commands · …
+│ ❯ Chat with the agent… (/ commands… │
 ╰─╯
 Enter send ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k
 glm-5.2 · 42 tok/s · 180ms ttft`
@@ -68,12 +68,13 @@ glm-5.2 · 42 tok/s · 180ms ttft`
 		s.pendingApproval = &approvalPrompt{requestID: "r1", tool: "bash", args: `{"command":"rm -rf dist"}`}
 		s.layout()
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst ~/project ready · glm-5.2
-● you
-Delete generated build artifacts
+		want := `◆ Catalyst Code ~/project ● ready · glm-5.2
+╭─╮
+│ Delete generated build artifacts │
+╰─╯
 ⚠ approval required ❯ bash rm -rf dist [Y] once · [N] deny · [A] type
 ╭─╮
-│ Type a follow-up, or clear input to use the approval keys… │
+│ ❯ Type a follow-up, or clear input to use the approval keys… │
 ╰─╯
 Y allow once · N deny · A always allow type ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k
 glm-5.2 · 42 tok/s · 180ms ttft`
@@ -93,9 +94,10 @@ glm-5.2 · 42 tok/s · 180ms ttft`
 		s.activityExpanded = true
 		s.layout()
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst ~/project ready · glm-5.2
-● you
-Refactor the parser and verify it
+		want := `◆ Catalyst Code ~/project ● ready · glm-5.2
+╭─╮
+│ Refactor the parser and verify it │
+╰─╯
 ╭─╮
 │ Activity · focused · ↑↓ scroll · Esc close │
 │ Subagents │
@@ -105,7 +107,7 @@ Refactor the parser and verify it
 │ [○] Run tests │
 ╰─╯
 ╭─╮
-│ Chat with the agent… (/ commands · ? help) │
+│ ❯ Chat with the agent… (/ commands · ? help) │
 ╰─╯
 Enter send · Shift+Enter newline · Ctrl+P commands ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k
 glm-5.2 · 42 tok/s · 180ms ttft`
