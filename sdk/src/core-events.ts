@@ -11,6 +11,7 @@ export const CORE_EVENT_TYPES = [
   "aborted",
   "agents",
   "approval_changed",
+  "approval_expired",
   "approval_request",
   "ask_request",
   "audit",
@@ -62,11 +63,14 @@ export const CORE_EVENT_TYPES = [
   "ready",
   "reflecting",
   "reset",
+  "run_cancelled",
+  "runtime_status",
   "search_key_set",
   "session_change_failed",
   "session_changed",
   "session_deleted",
   "session_pinned",
+  "session_recovered",
   "session_renamed",
   "sessions",
   "skills",
@@ -92,6 +96,7 @@ export const CORE_EVENT_TYPES = [
   "worktree_cleaned",
   "worktree_promoted",
   "worktree_ready",
+  "worktree_seeded",
 ] as const;
 
 export type CoreEventType = (typeof CORE_EVENT_TYPES)[number];
@@ -101,13 +106,64 @@ export function isKnownCoreEventType(type: string): type is CoreEventType {
 }
 
 /** Wire-level core event. Always has `type`; other fields vary by kind. */
-export type CoreEvent = { type: string } & Record<string, unknown>;
+export interface ProtocolMetadata {
+  protocol_version?: number;
+  session_id?: string;
+  run_id?: string;
+  sequence?: number;
+}
+
+export type CoreEvent = { type: string } & ProtocolMetadata & Record<string, unknown>;
+
+export interface RuntimeResource {
+  id: number;
+  kind: string;
+  label: string;
+  session_id: string;
+  run_id?: string;
+  cancelled: boolean;
+}
+
+export interface RuntimeStatusEvent extends ProtocolMetadata {
+  type: "runtime_status";
+  discarded_stale_results: number;
+  resources: RuntimeResource[];
+  pending_approvals: number;
+  pending_asks: number;
+  pending_sudos: number;
+}
+
+export type ToolResultStatus =
+  | "success"
+  | "denied"
+  | "cancelled"
+  | "timed_out"
+  | "failed"
+  | "stale"
+  | "partially_completed";
+
+export interface ToolResultEvent extends ProtocolMetadata {
+  type: "tool_result";
+  id: string;
+  ok: boolean;
+  status: ToolResultStatus;
+  output: string;
+  diff?: string;
+  tool?: string;
+}
+
+export interface SessionRecoveredEvent extends ProtocolMetadata {
+  type: "session_recovered";
+  warnings: string[];
+  interrupted_runs: string[];
+}
 
 // ── Narrow helpers for common / newly added events ──
 
 export interface ProtocolHelloEvent {
   type: "protocol_hello";
   version: string;
+  protocol_version: number;
   min_client: string;
   capabilities: string[];
 }

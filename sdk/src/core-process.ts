@@ -13,6 +13,7 @@ import { openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { resolveCoreBinary, configDir, ensureDir } from "./config.js";
 import type { CoreEvent } from "./core-events.js";
+import { VERSION } from "./version.js";
 
 export type { CoreEvent } from "./core-events.js";
 export {
@@ -164,7 +165,15 @@ export class CoreProcess {
       });
 
       // Send the handshake.
-      this.send({ type: "init" });
+      this.send({
+        type: "init",
+        protocol_version: 2,
+        client: {
+          name: "catcode-sdk",
+          version: VERSION,
+          capabilities: ["run_ids", "session_ids", "event_sequence"],
+        },
+      });
     });
     return this.readyPromise;
   }
