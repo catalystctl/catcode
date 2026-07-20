@@ -36,6 +36,12 @@ jobs:
       - name: test (--locked)
         working-directory: core
         run: cargo test --locked
+      - name: release artifact smoke
+        working-directory: core
+        run: |
+          cargo build --release --locked
+          target/release/core --version
+          target/release/core --help | grep -q 'newline-delimited JSON'
 
   tui:
     name: tui (go)
@@ -110,6 +116,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
+      - name: protocol schema consistency
+        run: node scripts/check-protocol-schema.mjs
+      - name: architecture boundary consistency
+        run: node scripts/check-architecture.mjs
       - name: Restore Bun package cache
         uses: actions/cache@v4
         with:
@@ -127,6 +137,15 @@ jobs:
       - name: install
         working-directory: web
         run: bun install --frozen-lockfile
+      - name: SDK install
+        working-directory: sdk
+        run: bun install --frozen-lockfile
+      - name: SDK typecheck
+        working-directory: sdk
+        run: bun run typecheck
+      - name: SDK protocol tests
+        working-directory: sdk
+        run: bun test
       - name: typecheck
         working-directory: web
         run: bun run typecheck
