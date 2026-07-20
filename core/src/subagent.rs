@@ -855,10 +855,11 @@ pub fn subagent_tool_defs(
 #[derive(Clone, Debug)]
 pub struct SubagentRun {
     pub id: String,
+    pub parent_run_id: Option<String>,
     pub mode: String, // single | parallel | chain
     pub agent: Option<String>,
     pub agents: Vec<String>,
-    pub state: String, // running | completed | failed | paused
+    pub state: String, // running | completed | failed | cancelled | paused
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub depth: u32,
@@ -870,7 +871,7 @@ pub struct SubagentRun {
     pub messages: Arc<Mutex<Vec<Message>>>,
 }
 
-/// Maximum number of *terminal* (completed/failed/paused) run records kept for
+/// Maximum number of terminal run records kept for
 /// `status`/history. Still-running runs are always retained. Without this cap
 /// the map grew without bound over a long session — every subagent invocation
 /// (single/parallel/chain) left a permanent entry pinning an
@@ -891,7 +892,7 @@ fn prune_terminal_runs(runs: &mut HashMap<String, SubagentRun>) {
         .iter()
         // A `paused` (interrupted) run is NOT droppable — the user may still
         // `resume`/`steer` it. Only genuinely terminal runs (completed/failed)
-        // are eligible for eviction.
+        // are eligible for eviction (including explicitly cancelled runs).
         .filter(|(_, r)| r.state != "running" && r.state != "paused")
         .map(|(id, r)| (r.ended_at.unwrap_or(r.started_at), id.clone()))
         .collect();
@@ -918,7 +919,13 @@ pub fn execute(
     cancel: CancellationToken,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>> {
-    Box::pin(async move {
+    let inherited_parent_run_id = crate::runtime::current_run_id().or_else(|| {
+        args.get("_parent_run_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+    });
+    let session = st.runtime.session_context();
+    Box::pin(crate::runtime::scope_session(session, async move {
         let workspace = st.cfg.read().await.workspace.clone();
         let cfg = st.cfg.read().await.clone();
         let max_depth = resolve_max_depth(&cfg.subagents);
@@ -952,6 +959,7 @@ pub fn execute(
                     &agent,
                     prompt,
                     &run_id,
+                    inherited_parent_run_id.clone(),
                     model_override,
                     ContextKind::Fresh,
                     depth,
@@ -1033,6 +1041,7 @@ pub fn execute(
                 &agent,
                 &task,
                 &run_id,
+                inherited_parent_run_id.clone(),
                 model_override,
                 context,
                 depth,
@@ -1077,6 +1086,7 @@ pub fn execute(
                 &args,
                 depth,
                 &cancel,
+                inherited_parent_run_id.clone(),
             )
             .await;
         }
@@ -1092,12 +1102,13 @@ pub fn execute(
                 &args,
                 depth,
                 &cancel,
+                inherited_parent_run_id,
             )
             .await;
         }
 
         Outcome::err("subagent requires 'agent'+'task', 'tasks', 'chain', or 'action'")
-    })
+    }))
 }
 
 fn parse_context(args: &Value, agent: &AgentConfig) -> ContextKind {
@@ -1110,6 +1121,63 @@ fn parse_context(args: &Value, agent: &AgentConfig) -> ContextKind {
 
 fn next_run_id() -> String {
     allocate_run_id()
+}
+
+async fn persist_subagent_state(
+    st: &State,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    state: crate::session::RunState,
+    detail: Option<&str>,
+) {
+    let path = st.cfg.read().await.session_file.clone();
+    if let Some(path) = path {
+        crate::session::append_activity_state(
+            &path,
+            st.runtime.session_id().as_str(),
+            run_id,
+            "subagent",
+            parent_run_id,
+            None,
+            state,
+            detail,
+        );
+    }
+}
+
+async fn fail_registered_subagent_setup(
+    st: &State,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    started: u64,
+    message: String,
+) -> Outcome {
+    let ended = now_ms();
+    let mut runs = st.subagent_runs.lock().await;
+    if let Some(run) = runs.get_mut(run_id) {
+        run.state = "failed".into();
+        run.ended_at = Some(ended);
+        run.summary = Some(nonempty_run_summary(&message));
+    }
+    prune_terminal_runs(&mut runs);
+    drop(runs);
+    persist_subagent_state(
+        st,
+        run_id,
+        parent_run_id,
+        crate::session::RunState::Failed,
+        Some(&message),
+    )
+    .await;
+    emit_subagent_done(
+        run_id,
+        "failed",
+        Some(&message),
+        started,
+        ended.max(started),
+        parent_run_id,
+    );
+    Outcome::err(message)
 }
 
 /// Allocate a fresh subagent run id (also used by goal deploy so step cards can link).
@@ -1132,6 +1200,7 @@ async fn run_single(
     agent: &AgentConfig,
     task: &str,
     run_id: &str,
+    parent_run_id: Option<String>,
     model_override: Option<String>,
     context: ContextKind,
     depth: u32,
@@ -1153,10 +1222,21 @@ async fn run_single(
     // does). Previously this was a detached token never wired into the loop, so
     // interrupt was a no-op.
     let run_cancel = cancel.child_token();
+    let session = st.runtime.session_context();
+    let Some(_subagent_resource) = st.runtime.register_owned_session_resource(
+        &session,
+        crate::runtime::ResourceKind::Subagent,
+        format!("subagent:{run_id}:{}", agent.name),
+        parent_run_id.as_deref(),
+        run_cancel.clone(),
+    ) else {
+        return Outcome::err("subagent rejected because its session is no longer active");
+    };
     let started = now_ms();
     let messages = Arc::new(Mutex::new(Vec::new()));
     let run = SubagentRun {
         id: run_id.to_string(),
+        parent_run_id: parent_run_id.clone(),
         mode: "single".into(),
         agent: Some(agent.name.clone()),
         agents: vec![agent.name.clone()],
@@ -1183,7 +1263,16 @@ async fn run_single(
         task,
         depth,
         started,
+        parent_run_id.as_deref(),
     );
+    persist_subagent_state(
+        st,
+        run_id,
+        parent_run_id.as_deref(),
+        crate::session::RunState::Started,
+        Some(&agent.name),
+    )
+    .await;
     emit_subagent_message(run_id, "user", task);
 
     // Wrap the run in catch_unwind so a panic inside run_agent_inner (e.g. the
@@ -1235,7 +1324,13 @@ async fn run_single(
     };
 
     // Finalize run state.
-    let final_state = if result.ok { "completed" } else { "failed" };
+    let final_state = if run_cancel.is_cancelled() {
+        "cancelled"
+    } else if result.ok {
+        "completed"
+    } else {
+        "failed"
+    };
     let mut runs = st.subagent_runs.lock().await;
     let mut done_ended: u64 = started;
     let mut done_summary: Option<String> = None;
@@ -1251,7 +1346,27 @@ async fn run_single(
     if bridge {
         st.intercom.unregister(&my_target);
     }
-    emit_subagent_done(run_id, final_state, done_summary.as_deref(), done_ended);
+    let persisted_state = match final_state {
+        "completed" => crate::session::RunState::Completed,
+        "cancelled" => crate::session::RunState::Cancelled,
+        _ => crate::session::RunState::Failed,
+    };
+    persist_subagent_state(
+        st,
+        run_id,
+        parent_run_id.as_deref(),
+        persisted_state,
+        done_summary.as_deref(),
+    )
+    .await;
+    emit_subagent_done(
+        run_id,
+        final_state,
+        done_summary.as_deref(),
+        started,
+        done_ended,
+        parent_run_id.as_deref(),
+    );
     result
 }
 
@@ -1611,6 +1726,7 @@ async fn run_agent_inner(
             cancel,
             &mut timer,
             Some(st),
+            run_id,
         )
         .await
         {
@@ -1921,19 +2037,18 @@ async fn dispatch_subagent_tool(
     if force_deny {
         return Outcome::err(format!("tool call '{}' denied by permission rule", name));
     }
-    let needs_approval = if force_allow || escalated {
-        false
-    } else {
-        match cfg.approval {
-            crate::config::Approval::Never => false,
-            crate::config::Approval::Destructive => {
-                kind == tools::ToolKind::Destructive || restricted.is_some()
-            }
-            crate::config::Approval::Always => true,
-        }
-    };
+    let needs_approval = crate::tooling::approval::approval_required(
+        &cfg.approval,
+        kind,
+        restricted.is_some(),
+        force_allow,
+        escalated,
+        false,
+    );
     if needs_approval {
-        match crate::request_approval(st, id, name, args_str, kind_str, cancel).await {
+        match crate::request_approval(st, id, name, args_str, kind_str, Some(my_target), cancel)
+            .await
+        {
             crate::ApprovalResult::Granted => {}
             crate::ApprovalResult::Denied => {
                 return Outcome::err(format!("tool call '{}' was denied by the user", name));
@@ -2304,6 +2419,7 @@ async fn stream_with_fallback(
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
     st: Option<&Arc<State>>,
+    trace_run_id: &str,
 ) -> Result<(Message, String, u64, u64, u64, String), String> {
     let mut last_err = String::from("no model candidates");
     for (i, model) in candidates.iter().enumerate() {
@@ -2330,7 +2446,7 @@ async fn stream_with_fallback(
         } else {
             provider
         };
-        match crate::provider::stream_turn(
+        let provider_result = crate::provider::stream_turn(
             client,
             use_provider,
             cfg.idle_timeout_secs,
@@ -2347,8 +2463,27 @@ async fn stream_with_fallback(
             estimate_messages_tokens(messages),
             true,
         )
-        .await
-        {
+        .await;
+        if provider_result.is_err() {
+            timer.finish_failed_provider_call();
+        }
+        if let (Some(st), Some(call_metrics)) = (st, timer.take_provider_call_metrics()) {
+            st.logger.log(
+                "provider_request",
+                json!({
+                    "subagent_id": trace_run_id,
+                    "provider": &use_provider.name,
+                    "provider_kind": use_provider.kind.as_str(),
+                    "model": model,
+                    "duration_ms": call_metrics.duration_ms,
+                    "ttft_ms": call_metrics.ttft_ms,
+                    "stream_ms": call_metrics.stream_ms,
+                    "status": if provider_result.is_ok() { "completed" } else { "failed" },
+                    "subagent": true,
+                }),
+            );
+        }
+        match provider_result {
             Ok((assistant, fr, ti, to, cached)) => {
                 let assistant_msg = Message::try_from(&assistant).unwrap_or_else(|e| {
                     emit(
@@ -2414,6 +2549,7 @@ fn emit_subagent_start(
     task: &str,
     depth: u32,
     started_at: u64,
+    parent_run_id: Option<&str>,
 ) {
     let mut ev = Event::new("subagent_start")
         .with("run_id", json!(run_id))
@@ -2424,6 +2560,9 @@ fn emit_subagent_start(
         .with("started_at", json!(started_at));
     if let Some(a) = agent {
         ev = ev.with("agent", json!(a));
+    }
+    if let Some(parent_run_id) = parent_run_id {
+        ev = ev.with("parent_run_id", json!(parent_run_id));
     }
     emit(&ev);
 }
@@ -2490,11 +2629,22 @@ fn finalize_subagent_text(current: Option<&str>, history: &[crate::message::Mess
     "(step finished with no written summary)".to_string()
 }
 
-fn emit_subagent_done(run_id: &str, state: &str, summary: Option<&str>, ended_at: u64) {
+fn emit_subagent_done(
+    run_id: &str,
+    state: &str,
+    summary: Option<&str>,
+    started_at: u64,
+    ended_at: u64,
+    parent_run_id: Option<&str>,
+) {
     let mut ev = Event::new("subagent_done")
         .with("run_id", json!(run_id))
         .with("state", json!(state))
-        .with("ended_at", json!(ended_at));
+        .with("ended_at", json!(ended_at))
+        .with("duration_ms", json!(ended_at.saturating_sub(started_at)));
+    if let Some(parent_run_id) = parent_run_id {
+        ev = ev.with("parent_run_id", json!(parent_run_id));
+    }
     if let Some(s) = summary {
         ev = ev.with("summary", json!(s));
     }
@@ -2630,6 +2780,7 @@ async fn run_parallel(
     args: &Value,
     depth: u32,
     cancel: &CancellationToken,
+    parent_run_id: Option<String>,
 ) -> Outcome {
     let workspace = st.cfg.read().await.workspace.clone();
     let cfg = st.cfg.read().await.clone();
@@ -2689,9 +2840,20 @@ async fn run_parallel(
     // Child token so interrupt_action cancels just this batch (and a parent
     // /abort propagates), not the whole orchestrator.
     let run_cancel = cancel.child_token();
+    let session = st.runtime.session_context();
+    let Some(_subagent_resource) = st.runtime.register_owned_session_resource(
+        &session,
+        crate::runtime::ResourceKind::Subagent,
+        format!("subagent:{run_id}:parallel"),
+        parent_run_id.as_deref(),
+        run_cancel.clone(),
+    ) else {
+        return Outcome::err("parallel subagent rejected because its session is no longer active");
+    };
     let started = now_ms();
     let run = SubagentRun {
         id: run_id.clone(),
+        parent_run_id: parent_run_id.clone(),
         mode: "parallel".into(),
         agent: None,
         agents: agent_names.clone(),
@@ -2714,7 +2876,16 @@ async fn run_parallel(
         &format!("parallel ({} tasks)", tasks.len()),
         depth,
         started,
+        parent_run_id.as_deref(),
     );
+    persist_subagent_state(
+        st,
+        &run_id,
+        parent_run_id.as_deref(),
+        crate::session::RunState::Started,
+        Some("parallel"),
+    )
+    .await;
 
     // Pre-create worktrees (fail fast before spawning).
     let mut worktrees: Vec<Option<std::path::PathBuf>> = Vec::with_capacity(resolved.len());
@@ -2738,7 +2909,14 @@ async fn run_parallel(
                         for wt in worktrees.iter().flatten() {
                             let _ = crate::worktree::remove_worktree(&workspace, wt);
                         }
-                        return Outcome::err(format!("worktree seed failed for task {i}: {e}"));
+                        return fail_registered_subagent_setup(
+                            st,
+                            &run_id,
+                            parent_run_id.as_deref(),
+                            started,
+                            format!("worktree seed failed for task {i}: {e}"),
+                        )
+                        .await;
                     }
                 },
                 Err(e) => {
@@ -2749,7 +2927,14 @@ async fn run_parallel(
                             let _ = j;
                         }
                     }
-                    return Outcome::err(format!("worktree setup failed for task {i}: {e}"));
+                    return fail_registered_subagent_setup(
+                        st,
+                        &run_id,
+                        parent_run_id.as_deref(),
+                        started,
+                        format!("worktree setup failed for task {i}: {e}"),
+                    )
+                    .await;
                 }
             }
         }
@@ -2772,6 +2957,7 @@ async fn run_parallel(
         let cancelc = run_cancel.clone(); // child of parent; interrupt cancels just this batch
         let semc = sem.clone();
         let rid = format!("{}-{}", run_id, i);
+        let parent_batch_run_id = run_id.clone();
         let wt = worktrees.get(i).cloned().flatten();
         let h = tokio::spawn(async move {
             let _permit = semc.acquire().await.ok();
@@ -2783,6 +2969,7 @@ async fn run_parallel(
                 &agent,
                 &task,
                 &rid,
+                Some(parent_batch_run_id),
                 model_override,
                 ctx,
                 depth,
@@ -2832,7 +3019,13 @@ async fn run_parallel(
     }
 
     // finalize run
-    let final_state = if all_ok { "completed" } else { "failed" };
+    let final_state = if run_cancel.is_cancelled() {
+        "cancelled"
+    } else if all_ok {
+        "completed"
+    } else {
+        "failed"
+    };
     let mut runs = st.subagent_runs.lock().await;
     let mut done_ended: u64 = started;
     if let Some(r) = runs.get_mut(&run_id) {
@@ -2842,7 +3035,20 @@ async fn run_parallel(
     }
     prune_terminal_runs(&mut runs);
     drop(runs);
-    emit_subagent_done(&run_id, final_state, None, done_ended);
+    let persisted_state = match final_state {
+        "completed" => crate::session::RunState::Completed,
+        "cancelled" => crate::session::RunState::Cancelled,
+        _ => crate::session::RunState::Failed,
+    };
+    persist_subagent_state(st, &run_id, parent_run_id.as_deref(), persisted_state, None).await;
+    emit_subagent_done(
+        &run_id,
+        final_state,
+        None,
+        started,
+        done_ended,
+        parent_run_id.as_deref(),
+    );
 
     let mut blocks = String::new();
     for (i, o) in collected.iter() {
@@ -2873,6 +3079,7 @@ async fn run_chain(
     args: &Value,
     depth: u32,
     cancel: &CancellationToken,
+    parent_run_id: Option<String>,
 ) -> Outcome {
     if chain.is_empty() {
         return Outcome::err("chain requires a non-empty 'chain' array");
@@ -2888,13 +3095,25 @@ async fn run_chain(
     // /abort still propagates through it), not the parent orchestrator/turn
     // and its siblings — matching run_single/run_parallel.
     let run_cancel = cancel.child_token();
+    let session = st.runtime.session_context();
+    let Some(_subagent_resource) = st.runtime.register_owned_session_resource(
+        &session,
+        crate::runtime::ResourceKind::Subagent,
+        format!("subagent:{run_id}:chain"),
+        parent_run_id.as_deref(),
+        run_cancel.clone(),
+    ) else {
+        return Outcome::err("chain subagent rejected because its session is no longer active");
+    };
     let chain_agents: Vec<String> = chain
         .iter()
         .filter_map(|s| s.get("agent").and_then(|v| v.as_str()).map(String::from))
         .collect();
     let started = now_ms();
+    let chain_parent_run_id = parent_run_id.clone();
     let run = SubagentRun {
         id: run_id.clone(),
+        parent_run_id,
         mode: "chain".into(),
         agent: None,
         agents: chain_agents.clone(),
@@ -2917,7 +3136,16 @@ async fn run_chain(
         &format!("chain ({} steps)", chain.len()),
         depth,
         started,
+        chain_parent_run_id.as_deref(),
     );
+    persist_subagent_state(
+        st,
+        &run_id,
+        chain_parent_run_id.as_deref(),
+        crate::session::RunState::Started,
+        Some("chain"),
+    )
+    .await;
 
     // The step loop runs in an inner async block so EVERY exit path (abort,
     // unknown agent, a failed step, or clean completion) falls through to the
@@ -2944,6 +3172,7 @@ async fn run_chain(
                     &group_args,
                     depth,
                     &run_cancel,
+                    Some(run_id.clone()),
                 ))
                 .await;
                 if !o.ok {
@@ -2992,6 +3221,7 @@ async fn run_chain(
                 &agent,
                 &task,
                 &step_id,
+                Some(run_id.clone()),
                 model_override,
                 context,
                 depth,
@@ -3017,7 +3247,13 @@ async fn run_chain(
     // Finalize the parent run record on every exit path, and remove the
     // chain_dir temp directory (previously leaked — one per chain run,
     // including failed/aborted ones — filling /tmp over a long session).
-    let final_state = if outcome.ok { "completed" } else { "failed" };
+    let final_state = if run_cancel.is_cancelled() {
+        "cancelled"
+    } else if outcome.ok {
+        "completed"
+    } else {
+        "failed"
+    };
     let mut runs = st.subagent_runs.lock().await;
     let mut done_ended: u64 = started;
     if let Some(r) = runs.get_mut(&run_id) {
@@ -3027,7 +3263,27 @@ async fn run_chain(
     }
     prune_terminal_runs(&mut runs);
     drop(runs);
-    emit_subagent_done(&run_id, final_state, None, done_ended);
+    let persisted_state = match final_state {
+        "completed" => crate::session::RunState::Completed,
+        "cancelled" => crate::session::RunState::Cancelled,
+        _ => crate::session::RunState::Failed,
+    };
+    persist_subagent_state(
+        st,
+        &run_id,
+        chain_parent_run_id.as_deref(),
+        persisted_state,
+        None,
+    )
+    .await;
+    emit_subagent_done(
+        &run_id,
+        final_state,
+        None,
+        started,
+        done_ended,
+        chain_parent_run_id.as_deref(),
+    );
     let _ = std::fs::remove_dir_all(&chain_dir);
     outcome
 }
@@ -3153,6 +3409,7 @@ pub async fn peek_action(args: &Value, st: &Arc<State>) -> Outcome {
     drop(msgs);
     let body = json!({
         "id": r.id,
+        "parent_run_id": r.parent_run_id,
         "state": r.state,
         "mode": r.mode,
         "agents": r.agents,
@@ -3449,10 +3706,11 @@ fn format_run(r: &SubagentRun) -> String {
         .map(|e| e.saturating_sub(r.started_at) / 1000)
         .unwrap_or(0);
     format!(
-        "[{}] {} ({}) — {} — {}s — target: {}",
+        "[{}] {} ({}) — parent: {} — {} — {}s — target: {}",
         r.state,
         r.id,
         r.mode,
+        r.parent_run_id.as_deref().unwrap_or("-"),
         r.agents.join(","),
         dur,
         r.intercom_target.clone().unwrap_or("-".into())

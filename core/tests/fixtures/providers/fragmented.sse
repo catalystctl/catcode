@@ -1,0 +1,7 @@
+event: message
+data: {"choices":[{"delta":{"reasoning_content":"think"}}]}
+
+data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

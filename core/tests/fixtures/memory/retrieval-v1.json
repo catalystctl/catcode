@@ -1,0 +1,164 @@
+{
+  "cases": [
+    {
+      "name": "exact path and symbol recall",
+      "prompt": "update RuntimeCoordinator in core/src/runtime/coordinator.rs",
+      "fingerprint": {
+        "symbols": ["RuntimeCoordinator"],
+        "subsystems": ["runtime"]
+      },
+      "expected_top": "runtime-ownership",
+      "memories": [
+        {
+          "name": "runtime-ownership",
+          "description": "RuntimeCoordinator owns lifecycle state",
+          "content": "Run invalidation is centralized.",
+          "ref_files": ["core/src/runtime/coordinator.rs"],
+          "ref_symbols": ["RuntimeCoordinator"]
+        },
+        {
+          "name": "css-preference",
+          "description": "Use compact spacing",
+          "content": "Keep mobile controls compact."
+        }
+      ]
+    },
+    {
+      "name": "project scope beats global preference",
+      "prompt": "which test command should I run for this Rust core",
+      "fingerprint": {"languages": ["rust"], "validation_classes": ["unit"]},
+      "expected_top": "project-test-command",
+      "memories": [
+        {
+          "name": "project-test-command",
+          "description": "Run cargo test for the Rust core",
+          "content": "Use the core Cargo manifest.",
+          "scope": "workspace"
+        },
+        {
+          "name": "global-test-command",
+          "description": "Run cargo test for Rust projects",
+          "content": "Use cargo test.",
+          "scope": "global"
+        }
+      ]
+    },
+    {
+      "name": "stale fact rejection",
+      "prompt": "where is the protocol event sink implemented",
+      "expected_top": "current-event-sink",
+      "memories": [
+        {
+          "name": "current-event-sink",
+          "description": "EventSink is in core/src/runtime/event_sink.rs",
+          "content": "All protocol events flow through EventSink.",
+          "status": "verified"
+        },
+        {
+          "name": "old-event-sink",
+          "description": "Event output is implemented directly in protocol.rs",
+          "content": "println writes every event.",
+          "status": "stale"
+        }
+      ]
+    },
+    {
+      "name": "contradictory memory suppression",
+      "prompt": "what build command should be used for the web application",
+      "expected_top": "confirmed-build-command",
+      "memories": [
+        {
+          "name": "confirmed-build-command",
+          "description": "Use bun run build for the web application",
+          "content": "The package script is the confirmed build entrypoint."
+        },
+        {
+          "name": "disputed-build-command",
+          "description": "Use bun run build for the web application",
+          "content": "This recollection has conflicting evidence.",
+          "contradiction_count": 4
+        }
+      ]
+    },
+    {
+      "name": "irrelevant memory suppression",
+      "prompt": "diagnose authentication error from provider request",
+      "fingerprint": {"diagnostic_classes": ["authentication"]},
+      "expected_top": "provider-auth-failure",
+      "max_results": 2,
+      "memories": [
+        {
+          "name": "provider-auth-failure",
+          "description": "Authentication failures are fatal provider errors",
+          "content": "Do not retry invalid credentials."
+        },
+        {
+          "name": "editor-colors",
+          "description": "Preferred editor theme",
+          "content": "Use a dark background."
+        }
+      ]
+    },
+    {
+      "name": "architecture fact recall",
+      "prompt": "which component owns session replacement and run invalidation",
+      "fingerprint": {"subsystems": ["runtime"]},
+      "expected_top": "runtime-architecture",
+      "memories": [
+        {
+          "name": "runtime-architecture",
+          "description": "RuntimeCoordinator owns session replacement and invalidation",
+          "content": "See the synthetic repository architecture document.",
+          "ref_files": ["ARCHITECTURE.md", "src/runtime.rs"],
+          "ref_symbols": ["RuntimeCoordinator"]
+        },
+        {"name": "provider-architecture", "description": "Provider adapters decode streams"}
+      ]
+    },
+    {
+      "name": "user preference recall",
+      "prompt": "how verbose should the final response be for this user",
+      "expected_top": "concise-final-preference",
+      "memories": [
+        {
+          "name": "concise-final-preference",
+          "description": "User prefers concise final responses",
+          "content": "Lead with outcomes and avoid excessive formatting.",
+          "mem_type": "preference",
+          "scope": "global"
+        },
+        {"name": "rust-style", "description": "Use rustfmt for Rust code"}
+      ]
+    },
+    {
+      "name": "failure pattern retrieval",
+      "prompt": "provider stream disconnects after a partial SSE JSON frame",
+      "fingerprint": {"diagnostic_classes": ["stream_disconnect"]},
+      "expected_top": "partial-sse-disconnect",
+      "memories": [
+        {
+          "name": "partial-sse-disconnect",
+          "description": "Partial SSE JSON at disconnect is a malformed response",
+          "content": "Call the incremental decoder finish method and surface the truncated frame."
+        },
+        {"name": "approval-timeout", "description": "Approval wait expired"}
+      ]
+    },
+    {
+      "name": "token budget adherence",
+      "prompt": "runtime coordinator exact path",
+      "expected_top": "runtime-path",
+      "max_results": 1,
+      "max_total_tokens": 40,
+      "memories": [
+        {
+          "name": "runtime-path",
+          "description": "Runtime coordinator path",
+          "content": "core/src/runtime/coordinator.rs",
+          "ref_files": ["core/src/runtime/coordinator.rs"]
+        },
+        {"name": "long-irrelevant", "description": "Unrelated frontend layout guidance that should not consume the retrieval budget"}
+      ]
+    }
+  ]
+}

@@ -167,7 +167,7 @@ pub struct Config {
     // --- plugin system (centerpiece) ---
     pub plugin_dir: PathBuf,           // directory scanned for plugins
     pub plugins_disabled: Vec<String>, // plugin names that are explicitly disabled
-    pub trust_project_plugins: bool, // allow loading project-scoped plugins (.catalyst-code/plugins). Default false for safety; set via env/CLI only — never a project config file, which an untrusted repo could use to self-enable its own hooks.
+    pub trust_project_plugins: bool, // Permit repo-shipped plugins under <workspace>/.catalyst-code/plugins. Default false; set only through env/CLI so a repository cannot self-authorize. Plugins installed explicitly through /plugin-install carry a user-installed marker and remain usable without this blanket trust flag.
     // --- regex denylist upgrade (quick win) ---
     pub bash_deny_regex: Vec<String>, // regex patterns that block bash commands
     pub bash_deny_regex_compiled: Vec<regex::Regex>, // pre-compiled at startup
@@ -844,7 +844,7 @@ impl Default for Config {
             ask_rules: Vec::new(),
             plugin_dir: PathBuf::from(".catalyst-code/plugins"),
             plugins_disabled: Vec::new(),
-            trust_project_plugins: false, // secure default: don't auto-run repo-shipped plugins
+            trust_project_plugins: false, // default: do not execute repo-shipped plugin scripts
             bash_deny_regex: Vec::new(),
             bash_deny_regex_compiled: Vec::new(),
             subagents: SubagentConfig::default(),
@@ -874,7 +874,7 @@ OPTIONS:
       --diag-timeout <SECS>     Diagnostics tool (cargo check/tsc/go build) timeout in seconds [env: CATALYST_CODE_DIAG_TIMEOUT]
       --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: CATALYST_CODE_SANDBOX]
       --no-network             Block bash network egress (unshare -n) [env: CATALYST_CODE_NO_NETWORK=1]
-      --trust-project-plugins  Load project-scoped plugins (.catalyst-code/plugins). Off by default for safety [env: CATALYST_CODE_TRUST_PROJECT_PLUGINS=1]
+      --trust-project-plugins  Allow repo-shipped .catalyst-code/plugins scripts to load [env: CATALYST_CODE_TRUST_PROJECT_PLUGINS=1]
       --idle-timeout <SECS>    SSE idle timeout in seconds [env: CATALYST_CODE_IDLE_TIMEOUT]
       --max-session-tokens <N> Hard session token budget (0=unlimited) [env: CATALYST_CODE_MAX_SESSION_TOKENS]
       --debug-log <FILE>        Structured JSONL debug log [env: CATALYST_CODE_DEBUG_LOG]

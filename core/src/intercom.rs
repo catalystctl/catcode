@@ -43,6 +43,9 @@ static ASK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// giving up. Prevents an unanswered orchestrator/peer from wedging a subagent
 /// forever (P1-6).
 const INTERCOM_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_MAILBOX_MESSAGES: usize = 256;
+const MAX_PENDING_ASKS: usize = 256;
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -160,6 +163,22 @@ impl IntercomBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|t| t != target);
+        let removed = {
+            let mut pending = self.pending_asks.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, ask)| ask.from == target || ask.to == target)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for ask in removed {
+            *ask.reply.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("[agent finished]".to_string());
+            ask.notify.notify_waiters();
+        }
     }
 
     /// Known peer targets (for the `intercom({action:"targets"})` introspection
@@ -174,6 +193,12 @@ impl IntercomBus {
     /// Post a fire-and-forget message into a target's mailbox. Returns Err if
     /// the target is unknown (no registered mailbox and not the orchestrator).
     pub fn post(&self, msg: IntercomMessage) -> Result<(), String> {
+        if msg.message.len() > MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "intercom message exceeds the {} byte limit",
+                MAX_MESSAGE_BYTES
+            ));
+        }
         let target = msg.to.clone();
         // The orchestrator always exists as a conceptual target even if no
         // mailbox was explicitly created for it (it answers via the TUI).
@@ -195,10 +220,14 @@ impl IntercomBus {
             .get(&target)
             .cloned();
         if let Some(mb) = mailbox {
-            mb.messages
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back(msg.clone());
+            let mut messages = mb.messages.lock().unwrap_or_else(|e| e.into_inner());
+            if messages.len() >= MAX_MAILBOX_MESSAGES {
+                return Err(format!(
+                    "intercom mailbox '{target}' is full ({MAX_MAILBOX_MESSAGES} messages)"
+                ));
+            }
+            messages.push_back(msg.clone());
+            drop(messages);
             mb.notify.notify_one();
         }
         Ok(())
@@ -235,9 +264,20 @@ impl IntercomBus {
     /// Register a blocking ask and return its handle. The caller awaits the
     /// handle's notify; the recipient resolves it via `resolve_ask`.
     pub fn create_ask(&self, ask: PendingAsk) -> Result<Arc<PendingAsk>, String> {
+        if ask.message.len() > MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "intercom ask exceeds the {} byte limit",
+                MAX_MESSAGE_BYTES
+            ));
+        }
         let arc = Arc::new(ask);
         {
             let mut pa = self.pending_asks.lock().unwrap_or_else(|e| e.into_inner());
+            if pa.len() >= MAX_PENDING_ASKS {
+                return Err(format!(
+                    "too many pending intercom asks (limit {MAX_PENDING_ASKS})"
+                ));
+            }
             pa.insert(arc.id.clone(), arc.clone());
         }
         // Surface it: if addressed to the orchestrator, emit an event so the
@@ -305,6 +345,131 @@ impl IntercomBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+
+    /// Invalidate every mailbox and pending ask at a session boundary. Pending
+    /// waiters are explicitly woken before their handles are dropped so no
+    /// subagent can remain blocked on an intercom reply from the old session.
+    pub fn reset(&self) {
+        let pending = {
+            let mut asks = self
+                .pending_asks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *asks)
+        };
+        for ask in pending.into_values() {
+            *ask.reply
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some("[session replaced]".to_string());
+            ask.notify.notify_waiters();
+        }
+        self.mailboxes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let orchestrator = self.orchestrator_target();
+        *self
+            .known_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![orchestrator];
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn reset_drops_mailboxes_and_wakes_pending_asks() {
+        let bus = IntercomBus::new();
+        bus.register_target("child");
+        let pending = bus
+            .create_ask(PendingAsk {
+                id: "ask-1".into(),
+                from: "child".into(),
+                to: "orchestrator".into(),
+                message: "choose".into(),
+                reason: "need_decision".into(),
+                ts: 1,
+                reply: Mutex::new(None),
+                notify: Arc::new(Notify::new()),
+            })
+            .unwrap();
+        bus.reset();
+        assert_eq!(bus.targets(), ["orchestrator"]);
+        assert_eq!(bus.pending_count(), 0);
+        assert_eq!(
+            pending.reply.lock().unwrap().as_deref(),
+            Some("[session replaced]")
+        );
+    }
+
+    #[test]
+    fn mailbox_and_message_sizes_are_bounded() {
+        let bus = IntercomBus::new();
+        bus.register_target("child");
+        for index in 0..MAX_MAILBOX_MESSAGES {
+            bus.post(IntercomMessage {
+                id: format!("m-{index}"),
+                from: "peer".into(),
+                to: "child".into(),
+                message: "ok".into(),
+                reason: String::new(),
+                ts: 1,
+                ask_id: String::new(),
+            })
+            .unwrap();
+        }
+        assert!(bus
+            .post(IntercomMessage {
+                id: "overflow".into(),
+                from: "peer".into(),
+                to: "child".into(),
+                message: "no".into(),
+                reason: String::new(),
+                ts: 1,
+                ask_id: String::new(),
+            })
+            .unwrap_err()
+            .contains("full"));
+        assert!(bus
+            .post(IntercomMessage {
+                id: "large".into(),
+                from: "peer".into(),
+                to: "child".into(),
+                message: "x".repeat(MAX_MESSAGE_BYTES + 1),
+                reason: String::new(),
+                ts: 1,
+                ask_id: String::new(),
+            })
+            .unwrap_err()
+            .contains("byte limit"));
+    }
+
+    #[test]
+    fn unregister_wakes_and_removes_related_asks() {
+        let bus = IntercomBus::new();
+        bus.register_target("child");
+        let pending = bus
+            .create_ask(PendingAsk {
+                id: "ask-child".into(),
+                from: "child".into(),
+                to: "orchestrator".into(),
+                message: "choose".into(),
+                reason: "need_decision".into(),
+                ts: 1,
+                reply: Mutex::new(None),
+                notify: Arc::new(Notify::new()),
+            })
+            .unwrap();
+        bus.unregister("child");
+        assert_eq!(bus.pending_count(), 0);
+        assert_eq!(
+            pending.reply.lock().unwrap().as_deref(),
+            Some("[agent finished]")
+        );
     }
 }
 

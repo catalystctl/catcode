@@ -8,52 +8,42 @@
 use crate::config::{ProviderKind, ResolvedProvider};
 use crate::logging::{estimate_tokens, TurnTimer};
 use crate::message::{self, Message};
-use crate::protocol::{emit, Event, ModelInfo};
-use bytes::BytesMut;
+#[cfg(test)]
+use crate::protocol::ModelInfo;
+use crate::protocol::{emit, Event};
+use crate::providers::adapter::{
+    malformed_response, ProviderAdapter, ProviderProtocol, ProviderRequest,
+};
+pub use crate::providers::discovery::*;
+use crate::providers::registry::{adapter_for, protocol_for};
+use crate::providers::sse::{SseDecoder, SseFrame};
+use crate::providers::streaming::NormalizedStreamEvent;
+pub use crate::providers::usage::*;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Append SSE bytes and split out complete lines without `String::drain`
-/// (which shifts the remainder on every line).
-fn sse_take_lines(buf: &mut BytesMut, chunk: &[u8], lines: &mut Vec<String>) {
-    buf.extend_from_slice(chunk);
-    loop {
-        let nl = match buf.iter().position(|&b| b == b'\n') {
-            Some(i) => i,
-            None => break,
-        };
-        let mut line_bytes = buf.split_to(nl + 1);
-        line_bytes.truncate(line_bytes.len() - 1); // drop \n
-        if line_bytes.last() == Some(&b'\r') {
-            line_bytes.truncate(line_bytes.len() - 1);
-        }
-        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-        lines.push(line);
-    }
-}
-
 #[allow(dead_code)]
 pub const DEFAULT_BASE_URL: &str = "https://api.code.umans.ai/v1";
-const MODELS_INFO_PATH: &str = "/models/info";
+pub(crate) const MODELS_INFO_PATH: &str = "/models/info";
 /// Standard OpenAI `/models` list endpoint (first-party OpenAI + Gemini's
 /// OpenAI-compatible shim). Used as a fallback when `/models/info` (Umans)
 /// isn't served by the endpoint.
-const OPENAI_MODELS_PATH: &str = "/models";
+pub(crate) const OPENAI_MODELS_PATH: &str = "/models";
 const CHAT_PATH: &str = "/chat/completions";
 /// Anthropic Messages API requires an `anthropic-version` header.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Identity betas Anthropic's gateway expects for Claude subscription (OAuth)
 /// Bearer tokens on the Messages API. Plugin OAuth providers that use Claude
 /// Pro/Max should also send matching UA / x-app via plugin headers.
-const CLAUDE_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.1.160";
-const CLAUDE_OAUTH_X_APP: &str = "cli";
+pub(crate) const CLAUDE_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+pub(crate) const CLAUDE_OAUTH_USER_AGENT: &str = "claude-cli/2.1.160";
+pub(crate) const CLAUDE_OAUTH_X_APP: &str = "cli";
 /// Anthropic endpoints: `{base_url}/messages` and `{base_url}/models`
 /// (base_url conventionally ends in `/v1`, e.g. `https://api.anthropic.com/v1`).
 const ANTHROPIC_MESSAGES_PATH: &str = "/messages";
-const ANTHROPIC_MODELS_PATH: &str = "/models";
+pub(crate) const ANTHROPIC_MODELS_PATH: &str = "/models";
 
 /// True if the base URL points at an Umans endpoint. Umans accepts extra
 /// fields (reasoning_effort, reasoning_content replay) that vanilla OpenAI
@@ -91,1085 +81,6 @@ pub fn is_cursor_bridge(base_url: &str) -> bool {
         _ => false,
     };
     loopback && url.path().trim_end_matches('/') == "/cursor/v1"
-}
-
-/// Live account-wide concurrency usage from the Umans gateway's `/v1/usage`
-/// endpoint. `used` = the number of concurrent sessions right now (across ALL
-/// clients on this key, not just this process — the gateway tracks it), `limit`
-/// = the plan's concurrency ceiling. `limit == None` means the plan has no
-/// concurrency cap (unlimited) OR the field was absent — the footer renders
-/// these as `∞`.
-///
-/// Returns `None` only when the HTTP request fails or the payload can't be
-/// parsed — a successful fetch always yields `Some` (the inner fields may be
-/// `None`). Polled every few seconds by the background task in `main.rs` so the
-/// footer can show a live "Conc used/limit" ahead of tps; mirrors the
-/// pi-provider-umans status widget.
-pub struct UmansUsage {
-    pub used: Option<u64>,
-    pub limit: Option<u64>,
-}
-
-// ─── Provider-agnostic /usage command ────────────────────────────────────────
-//
-// `/usage` resolves the provider for the currently selected model and asks that
-// provider for plan/window limits (5-hour, weekly, concurrency, …). Each
-// first-party endpoint implements its own fetch+parse; unknown providers return
-// `available: false` with a short explanation. The wire shape is a list of
-// windows so the TUI can render one progress row per limit without knowing
-// provider details.
-
-/// One rate-limit / quota window for the `/usage` modal.
-#[derive(Clone, Debug, Default)]
-pub struct UsageWindow {
-    /// Stable id for the window (e.g. `five_hour`, `weekly`, `concurrency`).
-    pub id: String,
-    /// Human label shown in the UI (e.g. "5-hour", "Weekly", "Concurrency").
-    pub label: String,
-    /// Used amount. For `unit == "percent"` this is utilization 0–100.
-    pub used: Option<f64>,
-    /// Limit amount. For `unit == "percent"` this is typically 100.
-    pub limit: Option<f64>,
-    /// How to interpret used/limit: `percent` | `sessions` | `requests` |
-    /// `tokens` | `credits` | `count`.
-    pub unit: String,
-    /// Unix epoch seconds when this window resets (if known).
-    pub resets_at: Option<i64>,
-    /// Optional free-form detail (e.g. "resets in 42m").
-    pub detail: Option<String>,
-}
-
-/// Provider-level usage snapshot returned by `fetch_provider_usage`.
-#[derive(Clone, Debug, Default)]
-pub struct ProviderUsage {
-    /// False when this provider has no usage endpoint or the fetch failed.
-    pub available: bool,
-    /// Optional plan/subscription label (e.g. "Pro", "Max", "Team").
-    pub plan: Option<String>,
-    /// Explanation when unavailable, or a short note alongside windows.
-    pub message: Option<String>,
-    pub windows: Vec<UsageWindow>,
-}
-
-impl ProviderUsage {
-    fn unavailable(message: impl Into<String>) -> Self {
-        Self {
-            available: false,
-            plan: None,
-            message: Some(message.into()),
-            windows: Vec::new(),
-        }
-    }
-
-    /// Serialize for the `usage` event payload (without provider/model, which
-    /// the command handler attaches).
-    pub fn to_event_fields(&self) -> serde_json::Map<String, Value> {
-        let mut m = serde_json::Map::new();
-        m.insert("available".into(), json!(self.available));
-        if let Some(ref p) = self.plan {
-            m.insert("plan".into(), json!(p));
-        }
-        if let Some(ref msg) = self.message {
-            m.insert("message".into(), json!(msg));
-        }
-        let windows: Vec<Value> = self
-            .windows
-            .iter()
-            .map(|w| {
-                let mut o = serde_json::Map::new();
-                o.insert("id".into(), json!(w.id));
-                o.insert("label".into(), json!(w.label));
-                o.insert("unit".into(), json!(w.unit));
-                if let Some(u) = w.used {
-                    o.insert("used".into(), json!(u));
-                }
-                if let Some(l) = w.limit {
-                    o.insert("limit".into(), json!(l));
-                }
-                if let Some(r) = w.resets_at {
-                    o.insert("resets_at".into(), json!(r));
-                }
-                if let Some(ref d) = w.detail {
-                    o.insert("detail".into(), json!(d));
-                }
-                Value::Object(o)
-            })
-            .collect();
-        m.insert("windows".into(), Value::Array(windows));
-        m
-    }
-}
-
-/// Dispatch usage fetch for the resolved provider. Detects Umans / Codex /
-/// Anthropic OAuth / xAI endpoints; everything else returns a clear
-/// "not available" message so `/usage` never hard-errors.
-pub async fn fetch_provider_usage(
-    client: &reqwest::Client,
-    rp: &ResolvedProvider,
-) -> ProviderUsage {
-    if is_umans(&rp.base_url) {
-        return match rp.api_key.as_deref() {
-            Some(k) => match fetch_umans_usage_full(client, &rp.base_url, k).await {
-                Some(u) => u,
-                None => ProviderUsage::unavailable(
-                    "Could not reach Umans /usage — check your network and API key.",
-                ),
-            },
-            None => ProviderUsage::unavailable("Umans is not authenticated — run /login."),
-        };
-    }
-    if is_codex_endpoint(&rp.base_url) {
-        return match rp.api_key.as_deref() {
-            Some(k) => match fetch_codex_usage(client, &rp.base_url, k, &rp.headers).await {
-                Some(u) => u,
-                None => ProviderUsage::unavailable(
-                    "Could not reach ChatGPT Codex usage — try /login again.",
-                ),
-            },
-            None => ProviderUsage::unavailable("OpenAI Codex is not authenticated — run /login."),
-        };
-    }
-    if rp.kind.is_anthropic() {
-        // Claude subscription OAuth exposes 5h / weekly windows. API-key mode
-        // does not have a comparable account-usage endpoint.
-        if rp.oauth {
-            return match rp.api_key.as_deref() {
-                Some(k) => match fetch_anthropic_oauth_usage(client, k).await {
-                    Some(u) => u,
-                    None => ProviderUsage::unavailable(
-                        "Could not reach Anthropic OAuth usage — try /login again.",
-                    ),
-                },
-                None => ProviderUsage::unavailable("Anthropic is not authenticated — run /login."),
-            };
-        }
-        return ProviderUsage::unavailable(
-            "Anthropic API-key mode has no account usage endpoint. \
-             Use a Claude Pro/Max subscription via a plugin OAuth provider for 5-hour and weekly limits, \
-             or check console.anthropic.com for organization rate limits.",
-        );
-    }
-    if is_gemini_endpoint(&rp.base_url) || is_code_assist_endpoint(&rp.base_url) {
-        return ProviderUsage::unavailable(
-            "Google Gemini does not expose plan usage via API. Check quotas in Google AI Studio / Cloud Console.",
-        );
-    }
-    if is_xai_endpoint(&rp.base_url) || rp.name == "xai" {
-        // SuperGrok / X Premium+ OAuth (same client Grok Build uses) can read
-        // monthly credit usage from the cli-chat-proxy billing endpoint.
-        return match rp.api_key.as_deref() {
-            Some(k) => match fetch_xai_usage(client, k, &rp.headers).await {
-                Some(u) => u,
-                None => ProviderUsage::unavailable(
-                    "Could not reach xAI billing — try /login again, or check console.x.ai.",
-                ),
-            },
-            None => ProviderUsage::unavailable("xAI is not authenticated — run /login."),
-        };
-    }
-    if is_opencode_go(&rp.base_url) {
-        return ProviderUsage::unavailable(
-            "OpenCode Go does not expose subscription usage via API yet.",
-        );
-    }
-    // Last-chance probe: some OpenAI-compatible gateways mirror Umans' `/usage`.
-    if let Some(k) = rp.api_key.as_deref() {
-        if let Some(u) = fetch_umans_usage_full(client, &rp.base_url, k).await {
-            if u.available && !u.windows.is_empty() {
-                return u;
-            }
-        }
-    }
-    ProviderUsage::unavailable(format!(
-        "Provider `{}` does not publish usage stats for /usage.",
-        if rp.name.is_empty() {
-            "unknown"
-        } else {
-            &rp.name
-        }
-    ))
-}
-
-/// Parse the Umans `/v1/usage` JSON payload into `UmansUsage`. Pure (no I/O) so
-/// it can be unit-tested against the documented response shape:
-/// `{ limits: { concurrency: { limit }, requests: { limit } },
-///    usage: { requests_in_window, concurrent_sessions } }`.
-/// `used` = `usage.concurrent_sessions`; `limit` = `limits.concurrency.limit`
-/// (null/absent → `None`, rendered as ∞ by the UI).
-pub fn parse_umans_usage(v: &Value) -> UmansUsage {
-    let used = v
-        .get("usage")
-        .and_then(|u| u.get("concurrent_sessions"))
-        .and_then(|c| c.as_u64());
-    let limit = v
-        .get("limits")
-        .and_then(|l| l.get("concurrency"))
-        .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_u64());
-    UmansUsage { used, limit }
-}
-
-/// Full Umans usage for the `/usage` modal: plan name, concurrency, requests
-/// window, optional token totals, and reset countdown. Pure parser so tests
-/// can cover the documented pi-provider-umans payload shape.
-pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
-    let plan = v
-        .get("plan")
-        .and_then(|p| {
-            p.get("display_name")
-                .or_else(|| p.get("slug"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-        })
-        .filter(|s| !s.is_empty());
-
-    let provider_message = v
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string);
-
-    let resets_at = v
-        .get("window")
-        .and_then(|w| w.get("resets_at"))
-        .and_then(|r| {
-            r.as_i64()
-                .or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok()))
-        });
-
-    let remaining_minutes = v
-        .get("window")
-        .and_then(|w| w.get("remaining_minutes"))
-        .and_then(|m| m.as_f64().or_else(|| m.as_u64().map(|u| u as f64)));
-
-    let reset_detail = remaining_minutes.map(|m| {
-        if m < 1.0 {
-            "resets soon".to_string()
-        } else if m < 60.0 {
-            format!("resets in {}m", m.round() as u64)
-        } else {
-            let h = (m / 60.0).floor() as u64;
-            let mins = (m % 60.0).round() as u64;
-            if mins == 0 {
-                format!("resets in {h}h")
-            } else {
-                format!("resets in {h}h {mins}m")
-            }
-        }
-    });
-
-    let mut windows = Vec::new();
-
-    let conc_used = v
-        .get("usage")
-        .and_then(|u| u.get("concurrent_sessions"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
-    let conc_limit = v
-        .get("limits")
-        .and_then(|l| l.get("concurrency"))
-        .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_f64().or_else(|| l.as_u64().map(|u| u as f64)));
-    if conc_used.is_some() || conc_limit.is_some() {
-        windows.push(UsageWindow {
-            id: "concurrency".into(),
-            label: "Concurrency".into(),
-            used: conc_used,
-            limit: conc_limit,
-            unit: "sessions".into(),
-            resets_at: None,
-            detail: None,
-        });
-    }
-
-    let req_used = v
-        .get("usage")
-        .and_then(|u| u.get("requests_in_window"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
-    let req_limit = v
-        .get("limits")
-        .and_then(|l| l.get("requests"))
-        .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_f64().or_else(|| l.as_u64().map(|u| u as f64)));
-    if req_used.is_some() || req_limit.is_some() {
-        windows.push(UsageWindow {
-            id: "requests".into(),
-            label: "Requests (window)".into(),
-            used: req_used,
-            limit: req_limit,
-            unit: "requests".into(),
-            resets_at,
-            detail: reset_detail.clone(),
-        });
-    }
-
-    let tokens_in = v
-        .get("usage")
-        .and_then(|u| u.get("tokens_in"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
-    let tokens_out = v
-        .get("usage")
-        .and_then(|u| u.get("tokens_out"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
-    if tokens_in.is_some() || tokens_out.is_some() {
-        let tin = tokens_in.unwrap_or(0.0);
-        let tout = tokens_out.unwrap_or(0.0);
-        windows.push(UsageWindow {
-            id: "tokens".into(),
-            label: "Tokens (session window)".into(),
-            used: Some(tin + tout),
-            limit: None,
-            unit: "tokens".into(),
-            resets_at: None,
-            detail: Some(format!(
-                "in {} / out {}",
-                format_token_count(tin),
-                format_token_count(tout)
-            )),
-        });
-    }
-
-    if windows.is_empty() {
-        return ProviderUsage::unavailable("Umans returned no usage fields.");
-    }
-    ProviderUsage {
-        available: true,
-        plan,
-        message: provider_message,
-        windows,
-    }
-}
-
-fn format_token_count(n: f64) -> String {
-    if n >= 1_000_000.0 {
-        format!("{:.1}M", n / 1_000_000.0)
-    } else if n >= 1_000.0 {
-        format!("{:.1}k", n / 1_000.0)
-    } else {
-        format!("{}", n.round() as u64)
-    }
-}
-
-pub async fn fetch_umans_usage(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-) -> Option<UmansUsage> {
-    let v = fetch_umans_usage_json(client, base_url, api_key).await?;
-    Some(parse_umans_usage(&v))
-}
-
-async fn fetch_umans_usage_full(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-) -> Option<ProviderUsage> {
-    let v = fetch_umans_usage_json(client, base_url, api_key).await?;
-    Some(parse_umans_usage_full(&v))
-}
-
-async fn fetch_umans_usage_json(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-) -> Option<Value> {
-    // base_url conventionally ends in `/v1` (e.g. https://api.code.umans.ai/v1),
-    // so the usage endpoint is `{base_url}/usage` — matching how the chat path
-    // is built as `{base_url}/chat/completions`. (The pi-provider-umans build
-    // is `{base-without-v1}/v1/usage`; both resolve to the same URL.)
-    let url = format!("{}/usage", base_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .bearer_auth(api_key)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.json().await.ok()
-}
-
-/// Label a Codex/ChatGPT rate-limit window from its duration in seconds.
-/// Primary is typically 5h (18000); secondary is weekly (604800).
-fn window_label_from_seconds(secs: u64, fallback: &str) -> (String, String) {
-    // Allow small drift around the documented windows.
-    if (17_000..=19_000).contains(&secs) {
-        return ("five_hour".into(), "5-hour".into());
-    }
-    if (3 * 3600 - 300..=3 * 3600 + 300).contains(&secs) {
-        return ("three_hour".into(), "3-hour".into());
-    }
-    if (6 * 24 * 3600..=8 * 24 * 3600).contains(&secs) {
-        return ("weekly".into(), "Weekly".into());
-    }
-    if secs >= 3600 {
-        let h = secs / 3600;
-        return (format!("{h}h"), format!("{h}-hour"));
-    }
-    if secs >= 60 {
-        let m = secs / 60;
-        return (format!("{m}m"), format!("{m}-minute"));
-    }
-    (fallback.into(), fallback.into())
-}
-
-/// Parse ChatGPT Codex `/wham/usage` JSON into provider usage windows.
-/// Shape (simplified): `{ plan_type, rate_limit: { primary_window, secondary_window },
-/// credits?: { balance, has_credits, unlimited } }` where each window has
-/// `used_percent`, `limit_window_seconds`, `reset_at`.
-pub fn parse_codex_usage(v: &Value) -> ProviderUsage {
-    let plan = v
-        .get("plan_type")
-        .and_then(|p| p.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Sometimes nested under plan
-            v.get("plan").and_then(|p| {
-                p.as_str().map(|s| s.to_string()).or_else(|| {
-                    p.get("type")
-                        .or_else(|| p.get("name"))
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                })
-            })
-        });
-
-    let mut windows = Vec::new();
-
-    let rate_limit = v.get("rate_limit").and_then(|r| {
-        // Payload may double-wrap Option: null, object, or nested.
-        if r.is_null() {
-            None
-        } else {
-            Some(r)
-        }
-    });
-
-    if let Some(rl) = rate_limit {
-        for (key, fallback_id, fallback_label) in [
-            ("primary_window", "primary", "Primary"),
-            ("secondary_window", "secondary", "Secondary"),
-        ] {
-            if let Some(w) = parse_codex_rate_window(rl.get(key), fallback_id, fallback_label) {
-                windows.push(w);
-            }
-        }
-    }
-
-    // Credits balance (optional).
-    if let Some(credits) = v.get("credits").filter(|c| !c.is_null()) {
-        let unlimited = credits
-            .get("unlimited")
-            .and_then(|u| u.as_bool())
-            .unwrap_or(false);
-        let balance = credits.get("balance").and_then(|b| {
-            b.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| b.as_f64())
-                .or_else(|| b.as_u64().map(|u| u as f64))
-        });
-        if unlimited {
-            windows.push(UsageWindow {
-                id: "credits".into(),
-                label: "Credits".into(),
-                used: None,
-                limit: None,
-                unit: "credits".into(),
-                resets_at: None,
-                detail: Some("unlimited".into()),
-            });
-        } else if let Some(bal) = balance {
-            windows.push(UsageWindow {
-                id: "credits".into(),
-                label: "Credits remaining".into(),
-                used: None,
-                limit: Some(bal),
-                unit: "credits".into(),
-                resets_at: None,
-                detail: Some(format!("{bal}")),
-            });
-        }
-    }
-
-    if windows.is_empty() {
-        return ProviderUsage::unavailable("Codex returned no rate-limit windows.");
-    }
-    ProviderUsage {
-        available: true,
-        plan,
-        message: None,
-        windows,
-    }
-}
-
-fn parse_codex_rate_window(
-    node: Option<&Value>,
-    fallback_id: &str,
-    fallback_label: &str,
-) -> Option<UsageWindow> {
-    let w = node?;
-    // Handle optional double-boxing / null.
-    let w = if w.is_null() {
-        return None;
-    } else {
-        w
-    };
-    let used_percent = w
-        .get("used_percent")
-        .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)))?;
-    let window_secs = w
-        .get("limit_window_seconds")
-        .and_then(|s| s.as_u64().or_else(|| s.as_f64().map(|f| f as u64)))
-        .unwrap_or(0);
-    let resets_at = w
-        .get("reset_at")
-        .and_then(|r| r.as_i64().or_else(|| r.as_u64().map(|u| u as i64)));
-    let (id, label) = if window_secs > 0 {
-        window_label_from_seconds(window_secs, fallback_id)
-    } else {
-        (fallback_id.into(), fallback_label.into())
-    };
-    let detail = resets_at.and_then(format_resets_at_detail);
-    Some(UsageWindow {
-        id,
-        label,
-        used: Some(used_percent),
-        limit: Some(100.0),
-        unit: "percent".into(),
-        resets_at,
-        detail,
-    })
-}
-
-fn format_resets_at_detail(resets_at: i64) -> Option<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    let delta = resets_at - now;
-    if delta <= 0 {
-        return Some("resets soon".into());
-    }
-    let mins = delta / 60;
-    if mins < 60 {
-        return Some(format!("resets in {mins}m"));
-    }
-    let hours = mins / 60;
-    let rem_m = mins % 60;
-    if hours < 48 {
-        if rem_m == 0 {
-            Some(format!("resets in {hours}h"))
-        } else {
-            Some(format!("resets in {hours}h {rem_m}m"))
-        }
-    } else {
-        let days = hours / 24;
-        let rem_h = hours % 24;
-        if rem_h == 0 {
-            Some(format!("resets in {days}d"))
-        } else {
-            Some(format!("resets in {days}d {rem_h}h"))
-        }
-    }
-}
-
-async fn fetch_codex_usage(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    headers: &[(String, String)],
-) -> Option<ProviderUsage> {
-    // Chat path is `{chatgpt.com/backend-api}/codex/...`; usage lives at
-    // `{chatgpt.com/backend-api}/wham/usage` (official codex CLI).
-    let trimmed = base_url.trim_end_matches('/');
-    let backend = trimmed.strip_suffix("/codex").unwrap_or(trimmed);
-    let url = format!("{backend}/wham/usage");
-    let mut req = client
-        .get(&url)
-        .bearer_auth(api_key)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(10));
-    for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    Some(parse_codex_usage(&v))
-}
-
-/// Parse Anthropic OAuth `/api/oauth/usage` utilization payload.
-/// Shape: `{ five_hour?: { utilization, resets_at }, seven_day?: {...},
-/// seven_day_opus?: {...}, seven_day_sonnet?: {...}, extra_usage?: {...} }`.
-/// `utilization` is 0–100; `resets_at` is ISO-8601 or unix seconds.
-pub fn parse_anthropic_oauth_usage(v: &Value) -> ProviderUsage {
-    let mut windows = Vec::new();
-    for (key, label) in [
-        ("five_hour", "5-hour"),
-        ("seven_day", "Weekly"),
-        ("seven_day_opus", "Weekly (Opus)"),
-        ("seven_day_sonnet", "Weekly (Sonnet)"),
-        ("seven_day_oauth_apps", "Weekly (OAuth apps)"),
-    ] {
-        if let Some(w) = parse_anthropic_rate_limit(v.get(key), key, label) {
-            windows.push(w);
-        }
-    }
-    // Extra usage / overage credits.
-    if let Some(extra) = v.get("extra_usage").filter(|e| !e.is_null()) {
-        let enabled = extra
-            .get("is_enabled")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(true);
-        if enabled {
-            let util = extra
-                .get("utilization")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
-            let used_credits = extra
-                .get("used_credits")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
-            let monthly = extra
-                .get("monthly_limit")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
-            if util.is_some() || used_credits.is_some() || monthly.is_some() {
-                windows.push(UsageWindow {
-                    id: "extra_usage".into(),
-                    label: "Extra usage".into(),
-                    used: util.or(used_credits),
-                    limit: if util.is_some() { Some(100.0) } else { monthly },
-                    unit: if util.is_some() {
-                        "percent".into()
-                    } else {
-                        "credits".into()
-                    },
-                    resets_at: None,
-                    detail: match (used_credits, monthly) {
-                        (Some(u), Some(m)) => Some(format!("{u}/{m} credits")),
-                        _ => None,
-                    },
-                });
-            }
-        }
-    }
-
-    if windows.is_empty() {
-        return ProviderUsage::unavailable(
-            "No Claude subscription limits returned (API-key accounts have no 5h/weekly windows).",
-        );
-    }
-    ProviderUsage {
-        available: true,
-        plan: None,
-        message: None,
-        windows,
-    }
-}
-
-fn parse_anthropic_rate_limit(node: Option<&Value>, id: &str, label: &str) -> Option<UsageWindow> {
-    let w = node.filter(|n| !n.is_null())?;
-    let utilization = w
-        .get("utilization")
-        .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)))?;
-    let resets_at = w.get("resets_at").and_then(|r| {
-        if let Some(n) = r.as_i64().or_else(|| r.as_u64().map(|u| u as i64)) {
-            return Some(n);
-        }
-        // ISO-8601 string → unix seconds (best-effort).
-        r.as_str().and_then(parse_iso8601_unix)
-    });
-    Some(UsageWindow {
-        id: id.into(),
-        label: label.into(),
-        used: Some(utilization),
-        limit: Some(100.0),
-        unit: "percent".into(),
-        resets_at,
-        detail: resets_at.and_then(format_resets_at_detail),
-    })
-}
-
-/// Best-effort ISO-8601 → unix seconds. Handles `2026-07-09T12:00:00Z` and
-/// bare unix digit strings. Offset forms are treated as UTC (close enough for
-/// "resets in …" display).
-fn parse_iso8601_unix(s: &str) -> Option<i64> {
-    // Format: YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // If it's pure digits, treat as unix already.
-    if let Ok(n) = s.parse::<i64>() {
-        return Some(n);
-    }
-    // Character positions: 0..4 year, 5..7 month, 8..10 day, 11..13 hour,
-    // 14..16 min, 17..19 sec. Fractional seconds and timezone are ignored.
-    if s.len() < 19 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let year: i64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
-    let month: i64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
-    let day: i64 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
-    let hour: i64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
-    let min: i64 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
-    let sec: i64 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    // Days from civil date (Howard Hinnant algorithm) → unix.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
-}
-
-async fn fetch_anthropic_oauth_usage(
-    client: &reqwest::Client,
-    access_token: &str,
-) -> Option<ProviderUsage> {
-    // Same endpoint Claude Code's /usage uses (api.anthropic.com OAuth usage).
-    let url = "https://api.anthropic.com/api/oauth/usage";
-    let resp = client
-        .get(url)
-        .bearer_auth(access_token)
-        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
-        .header("user-agent", CLAUDE_OAUTH_USER_AGENT)
-        .header("x-app", CLAUDE_OAUTH_X_APP)
-        .header("Accept", "application/json")
-        .header("Content-Type", "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    Some(parse_anthropic_oauth_usage(&v))
-}
-
-// ─── xAI / SuperGrok weekly usage ────────────────────────────────────────────
-//
-// SuperGrok uses one shared **weekly** usage pool across Chat / Imagine /
-// Voice / Build / API (docs.x.ai/grok/faq#usage--limits). Grok Build's
-// `/usage` reads it from:
-//   GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
-// Shape (the authoritative SuperGrok view — matches the website Usage tab):
-//   { config: {
-//       creditUsagePercent: 30.0,                 // total weekly % used
-//       currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start, end },
-//       productUsage: [{ product: "GrokBuild", usagePercent: 29.0 }, …],
-//       onDemandCap/Used, prepaidBalance, …
-//   } }
-// Without `?format=credits` the same host returns a legacy raw-credit shape
-// (`monthlyLimit`/`used`) that does NOT match the website % — we always prefer
-// the credits format. Optional plan enrichment from grok.com/rest/subscriptions.
-
-/// SuperGrok weekly-pool endpoint (Grok Build / website-compatible).
-const XAI_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// Consumer subscription status (tier name) for SuperGrok / Premium+ accounts.
-const XAI_SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
-
-/// Unwrap Grok's `{ "val": number }` money/credit wrappers (or a bare number).
-fn xai_val_number(v: Option<&Value>) -> Option<f64> {
-    let v = v?;
-    if let Some(n) = v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)) {
-        return Some(n);
-    }
-    if let Some(n) = v
-        .get("val")
-        .and_then(|x| x.as_f64().or_else(|| x.as_u64().map(|u| u as f64)))
-    {
-        return Some(n);
-    }
-    // Some payloads stringify the value.
-    if let Some(s) = v.as_str().or_else(|| v.get("val").and_then(|x| x.as_str())) {
-        return s.parse::<f64>().ok();
-    }
-    None
-}
-
-/// Map SuperGrok subscription tier enum to a short plan label.
-fn xai_tier_label(tier: &str) -> String {
-    match tier {
-        "SUBSCRIPTION_TIER_GROK_PRO" | "SUBSCRIPTION_TIER_SUPERGROK" => "SuperGrok".into(),
-        "SUBSCRIPTION_TIER_GROK_HEAVY" | "SUBSCRIPTION_TIER_SUPERGROK_HEAVY" => {
-            "SuperGrok Heavy".into()
-        }
-        "SUBSCRIPTION_TIER_GROK_LITE" | "SUBSCRIPTION_TIER_SUPERGROK_LITE" => {
-            "SuperGrok Lite".into()
-        }
-        "SUBSCRIPTION_TIER_X_PREMIUM_PLUS" => "X Premium+".into(),
-        "SUBSCRIPTION_TIER_X_PREMIUM" => "X Premium".into(),
-        other => {
-            // Strip common prefixes for unknown tiers.
-            other
-                .trim_start_matches("SUBSCRIPTION_TIER_")
-                .replace('_', " ")
-                .to_string()
-        }
-    }
-}
-
-/// Friendly product names for SuperGrok productUsage breakdown.
-fn xai_product_label(product: &str) -> String {
-    match product {
-        "GrokBuild" | "Build" => "Build".into(),
-        "Api" | "API" => "API".into(),
-        "Chat" => "Chat".into(),
-        "Imagine" => "Imagine".into(),
-        "Voice" => "Voice".into(),
-        other => other.to_string(),
-    }
-}
-
-/// Parse SuperGrok `GET /v1/billing?format=credits` (website-matching %) into
-/// provider usage windows. Falls back to the legacy raw-credit shape when the
-/// credits-format fields are absent.
-pub fn parse_xai_billing(v: &Value) -> ProviderUsage {
-    // Payload may be `{ config: {...} }` or the config object itself.
-    let cfg = v.get("config").unwrap_or(v);
-
-    // ── Preferred: format=credits (matches grok.com Settings → Usage) ──
-    let credit_pct = cfg
-        .get("creditUsagePercent")
-        .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)));
-
-    // Weekly window from currentPeriod (type USAGE_PERIOD_TYPE_WEEKLY).
-    let period = cfg.get("currentPeriod");
-    let period_end = period
-        .and_then(|p| p.get("end"))
-        .and_then(|s| s.as_str())
-        .and_then(parse_iso8601_unix)
-        .or_else(|| {
-            cfg.get("billingPeriodEnd")
-                .and_then(|s| s.as_str())
-                .and_then(parse_iso8601_unix)
-        });
-    let period_start = period
-        .and_then(|p| p.get("start"))
-        .and_then(|s| s.as_str())
-        .and_then(parse_iso8601_unix)
-        .or_else(|| {
-            cfg.get("billingPeriodStart")
-                .and_then(|s| s.as_str())
-                .and_then(parse_iso8601_unix)
-        });
-    let _ = period_start; // reserved for future "window elapsed" UI
-    let period_type = period
-        .and_then(|p| p.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    let is_weekly = period_type.contains("WEEKLY") || period_type.is_empty();
-
-    let mut windows = Vec::new();
-
-    if let Some(pct) = credit_pct {
-        let label = if is_weekly {
-            "Weekly usage".to_string()
-        } else {
-            "Usage".to_string()
-        };
-        windows.push(UsageWindow {
-            id: if is_weekly {
-                "weekly".into()
-            } else {
-                "usage".into()
-            },
-            label,
-            used: Some(pct),
-            limit: Some(100.0),
-            unit: "percent".into(),
-            resets_at: period_end,
-            detail: period_end.and_then(format_resets_at_detail),
-        });
-
-        // Per-product breakdown (API, Build, Chat, Imagine, Voice) — same as
-        // the website Usage tab. Percentages are shares of the weekly pool.
-        if let Some(arr) = cfg.get("productUsage").and_then(|a| a.as_array()) {
-            for entry in arr {
-                let product = entry
-                    .get("product")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("other");
-                let p_pct = entry
-                    .get("usagePercent")
-                    .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)));
-                let Some(p_pct) = p_pct else { continue };
-                // Skip zero-share products to keep the modal clean.
-                if p_pct <= 0.0 {
-                    continue;
-                }
-                windows.push(UsageWindow {
-                    id: format!("product_{}", product.to_ascii_lowercase()),
-                    label: xai_product_label(product),
-                    used: Some(p_pct),
-                    limit: Some(100.0),
-                    unit: "percent".into(),
-                    resets_at: None,
-                    detail: None,
-                });
-            }
-        }
-    } else {
-        // ── Legacy fallback: raw used/monthlyLimit (does NOT match website %) ──
-        let used = xai_val_number(cfg.get("used"));
-        let limit = xai_val_number(cfg.get("monthlyLimit"))
-            .or_else(|| xai_val_number(cfg.get("weeklyLimit")))
-            .or_else(|| xai_val_number(cfg.get("limit")));
-        if used.is_some() || limit.is_some() {
-            windows.push(UsageWindow {
-                id: "weekly".into(),
-                label: "Weekly usage".into(),
-                used,
-                limit,
-                unit: "credits".into(),
-                resets_at: period_end,
-                detail: period_end.and_then(format_resets_at_detail),
-            });
-        }
-    }
-
-    // On-demand / prepaid (extra usage credits).
-    let on_demand_cap = xai_val_number(cfg.get("onDemandCap"));
-    let on_demand_used =
-        xai_val_number(cfg.get("onDemandUsed")).or_else(|| xai_val_number(cfg.get("onDemand")));
-    let prepaid = xai_val_number(cfg.get("prepaidBalance"));
-
-    if let Some(cap) = on_demand_cap.filter(|c| *c > 0.0) {
-        windows.push(UsageWindow {
-            id: "on_demand".into(),
-            label: "On-demand cap".into(),
-            used: on_demand_used,
-            limit: Some(cap),
-            unit: "credits".into(),
-            resets_at: None,
-            detail: None,
-        });
-    } else if let Some(od) = on_demand_used.filter(|c| *c > 0.0) {
-        windows.push(UsageWindow {
-            id: "on_demand".into(),
-            label: "On-demand used".into(),
-            used: Some(od),
-            limit: None,
-            unit: "credits".into(),
-            resets_at: None,
-            detail: None,
-        });
-    }
-    if let Some(bal) = prepaid.filter(|b| *b > 0.0) {
-        windows.push(UsageWindow {
-            id: "prepaid".into(),
-            label: "Extra credits".into(),
-            used: None,
-            limit: Some(bal),
-            unit: "credits".into(),
-            resets_at: None,
-            detail: Some(format!("{} remaining", format_token_count(bal))),
-        });
-    }
-
-    if windows.is_empty() {
-        return ProviderUsage::unavailable("xAI billing returned no credit fields.");
-    }
-
-    // Plan label: not always present on the billing payload; subscriptions
-    // enrichment fills this in when available.
-    let plan = cfg
-        .get("plan")
-        .and_then(|p| p.as_str())
-        .or_else(|| cfg.get("tier").and_then(|t| t.as_str()))
-        .or_else(|| cfg.get("subscription_tier").and_then(|t| t.as_str()))
-        .or_else(|| v.get("plan").and_then(|p| p.as_str()))
-        .map(|s| {
-            if s.starts_with("SUBSCRIPTION_TIER_") {
-                xai_tier_label(s)
-            } else {
-                s.to_string()
-            }
-        });
-
-    ProviderUsage {
-        available: true,
-        plan,
-        message: None,
-        windows,
-    }
-}
-
-/// Pull SuperGrok / Premium tier from grok.com subscriptions (best-effort).
-fn parse_xai_subscription_plan(v: &Value) -> Option<String> {
-    let subs = v.get("subscriptions")?.as_array()?;
-    // Prefer an active subscription; otherwise take the first.
-    let active = subs.iter().find(|s| {
-        s.get("status")
-            .and_then(|st| st.as_str())
-            .is_some_and(|st| st.contains("ACTIVE"))
-    });
-    let sub = active.or_else(|| subs.first())?;
-    let tier = sub.get("tier").and_then(|t| t.as_str())?;
-    Some(xai_tier_label(tier))
-}
-
-async fn fetch_xai_subscription_plan(
-    client: &reqwest::Client,
-    access_token: &str,
-) -> Option<String> {
-    let resp = client
-        .get(XAI_SUBSCRIPTIONS_URL)
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    parse_xai_subscription_plan(&v)
-}
-
-async fn fetch_xai_usage(
-    client: &reqwest::Client,
-    access_token: &str,
-    headers: &[(String, String)],
-) -> Option<ProviderUsage> {
-    let mut req = client
-        .get(XAI_BILLING_URL)
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(10));
-    for (k, v) in headers {
-        // Don't override Authorization / Accept we just set.
-        let kl = k.to_ascii_lowercase();
-        if kl == "authorization" || kl == "accept" {
-            continue;
-        }
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    let mut usage = parse_xai_billing(&v);
-    // Enrich plan label from consumer subscriptions when billing omits it.
-    if usage.plan.is_none() {
-        if let Some(plan) = fetch_xai_subscription_plan(client, access_token).await {
-            usage.plan = Some(plan);
-        }
-    }
-    Some(usage)
 }
 
 /// The reasoning levels offered when a model advertises none of its own
@@ -1603,1455 +514,6 @@ async fn anthropic_complete(
         })
 }
 
-fn fallback_models() -> Vec<ModelInfo> {
-    // ponytail: GLM chat template maps any effort except 'high' to 'max', which
-    // degenerates thinking output. Advertise only ["high"] so resolve_effort
-    // clamps to it — replacing the old hardcoded model-name sniff.
-    let std = || {
-        DEFAULT_THINKING_LEVELS
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-    };
-    vec![
-        ModelInfo {
-            id: "umans-coder".into(),
-            name: "Umans Coder".into(),
-            reasoning: true,
-            context_window: 262144,
-            max_tokens: 32768,
-            thinking_levels: std(),
-            vision: false,
-
-            ..Default::default()
-        },
-        ModelInfo {
-            id: "umans-kimi-k2.5".into(),
-            name: "Umans Kimi K2.5".into(),
-            reasoning: true,
-            context_window: 262144,
-            max_tokens: 32768,
-            thinking_levels: std(),
-            vision: false,
-
-            ..Default::default()
-        },
-        ModelInfo {
-            id: "umans-kimi-k2.6".into(),
-            name: "Umans Kimi K2.6".into(),
-            reasoning: true,
-            context_window: 262144,
-            max_tokens: 32768,
-            thinking_levels: std(),
-            vision: false,
-
-            ..Default::default()
-        },
-        ModelInfo {
-            id: "umans-glm-5.1".into(),
-            name: "Umans GLM 5.1".into(),
-            reasoning: true,
-            context_window: 202752,
-            max_tokens: 131072,
-            thinking_levels: vec!["high".to_string()],
-            vision: false,
-
-            ..Default::default()
-        },
-        ModelInfo {
-            id: "umans-glm-5.2".into(),
-            name: "Umans GLM 5.2".into(),
-            reasoning: true,
-            context_window: 413696,
-            max_tokens: 131072,
-            thinking_levels: vec!["high".to_string()],
-            vision: false,
-
-            ..Default::default()
-        },
-        ModelInfo {
-            id: "umans-minimax-m2.5".into(),
-            name: "Umans MiniMax M2.5".into(),
-            reasoning: true,
-            context_window: 204800,
-            max_tokens: 8192,
-            thinking_levels: std(),
-            vision: false,
-
-            ..Default::default()
-        },
-    ]
-}
-
-/// Discover models live from /models/info; cache to disk with an 8-hour TTL.
-/// Falls back to the disk cache (even if stale) on HTTP error, then to the
-/// hardcoded snapshot as a last resort.
-/// Discover available models for the active provider. Branches on the
-/// provider's wire protocol: OpenAI-compatible (`/models/info`) or Anthropic
-/// (`/v1/models`). Results are cached to disk, keyed by base URL + kind so an
-/// OpenAI and an Anthropic endpoint at the same host don't collide.
-pub async fn discover_models(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-) -> Vec<ModelInfo> {
-    let cache_key = provider_cache_key(provider);
-    match provider.kind {
-        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, false).await,
-        ProviderKind::Anthropic => {
-            discover_models_anthropic(client, provider, &cache_key, false).await
-        }
-    }
-}
-
-/// Like [`discover_models`], but bypasses the fresh-cache (TTL) early return so a
-/// live fetch is ALWAYS performed and the disk cache is rewritten with the
-/// current model list. Used by the startup background refresh (see `main.rs`)
-/// for the Umans provider so newly-added models appear without waiting out the
-/// 8h TTL. Still falls back to the stale cache / curated snapshot on HTTP
-/// failure, so an unreachable endpoint never degrades the caller.
-pub async fn discover_models_force_refresh(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-) -> Vec<ModelInfo> {
-    let cache_key = provider_cache_key(provider);
-    match provider.kind {
-        ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, true).await,
-        ProviderKind::Anthropic => {
-            discover_models_anthropic(client, provider, &cache_key, true).await
-        }
-    }
-}
-
-/// Cache key: base URL (trailing slash normalized) + provider kind.
-fn provider_cache_key(provider: &ResolvedProvider) -> String {
-    format!(
-        "{}|{}",
-        provider.base_url.trim_end_matches('/'),
-        provider.kind.as_str()
-    )
-}
-
-async fn discover_models_openai(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-    cache_key: &str,
-    force_live: bool,
-) -> Vec<ModelInfo> {
-    // OpenCode Go: the single /v1/models endpoint serves every model over both
-    // wire protocols with no protocol field, so fetch it live and filter to
-    // this provider's protocol (OpenAI chat/completions here). See
-    // opencode_go_discover_models for the family-prefix partition + caching.
-    if is_opencode_go(&provider.base_url) {
-        return opencode_go_discover_models(client, provider, cache_key, true).await;
-    }
-    // 1. Try disk cache (fresh: < 8 hours old). Skipped on a forced live refresh
-    //    (the startup background check) so newly-added models are picked up every
-    //    launch instead of waiting out the TTL window.
-    if !force_live {
-        if let Some(models) = read_models_cache(cache_key) {
-            return models;
-        }
-    }
-
-    // 2. Fetch live from the endpoint. Auth is optional here (Umans /models/info
-    // is public; custom OpenAI-compatible endpoints may gate it). Send the key
-    // only when one is configured so an unauthenticated default still works.
-    //
-    // `/models/info` is Umans-specific (rich capabilities). First-party and
-    // other vanilla OpenAI-compatible endpoints don't serve it, so on a miss
-    // we fall back to the standard OpenAI `/models` list and synthesize
-    // ModelInfo with curated per-id capabilities.
-    let url = format!("{}{MODELS_INFO_PATH}", provider.base_url);
-    let mut req = client.get(&url).timeout(Duration::from_secs(5));
-    if let Some(k) = provider.api_key.as_deref() {
-        req = req.bearer_auth(k);
-    }
-    let live = match req.send().await {
-        Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
-            Ok(v) => v,
-            Err(_) => Value::Null,
-        }),
-        _ => Vec::new(),
-    };
-
-    // 2b. /models/info miss (non-Umans endpoint) → standard OpenAI `/models`.
-    if live.is_empty() {
-        let url = if is_codex_endpoint(&provider.base_url) {
-            // The Codex `/models` endpoint REQUIRES `client_version` and filters
-            // the catalog by each model's `minimal_client_version`: a value too
-            // low (e.g. our own CARGO_PKG_VERSION "0.2.0") returns an EMPTY
-            // list, so discovery falls back to a stale hardcoded list and the
-            // user ends up sending a slug the backend rejects. The official
-            // `codex` CLI sends its own version (>= the latest models' minimum);
-            // dev builds send "0.0.0", which the backend special-cases to return
-            // the FULL account catalog regardless of minimums. We are not the
-            // codex CLI, so use the "0.0.0" dev sentinel — it reliably yields the
-            // models this account can actually use (verified: returns 4 models
-            // vs 0 for a low non-zero version).
-            format!(
-                "{}{OPENAI_MODELS_PATH}?client_version=0.0.0",
-                provider.base_url
-            )
-        } else {
-            format!("{}{OPENAI_MODELS_PATH}", provider.base_url)
-        };
-        let mut req = client.get(&url).timeout(Duration::from_secs(8));
-        if let Some(k) = provider.api_key.as_deref() {
-            req = req.bearer_auth(k);
-        }
-        for (k, v) in &provider.headers {
-            req = req.header(k, v);
-        }
-        if let Ok(r) = req.send().await {
-            if r.status().is_success() {
-                if let Ok(v) = r.json::<Value>().await {
-                    let listed = if is_codex_endpoint(&provider.base_url) {
-                        parse_codex_models_response(&v)
-                    } else if is_xai_endpoint(&provider.base_url) {
-                        // xAI's `/models` includes context_length, image
-                        // pricing, and non-chat media models. Parse with the
-                        // xAI-aware path, then enrich vision/chat filter from
-                        // `/language-models` when available.
-                        let mut models = parse_xai_models_list(&v);
-                        if let Some(lang) = fetch_xai_language_model_ids(client, provider).await {
-                            apply_xai_language_models_enrichment(&mut models, &lang);
-                        }
-                        models
-                    } else {
-                        parse_openai_models_list(&v)
-                    };
-                    // Enrich with models.dev caps (context/output/reasoning/vision)
-                    // for models the curated table left at generic defaults.
-                    let mut listed = listed;
-                    if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
-                        crate::models_dev::enrich_models(&mut listed, &dev, &provider.base_url);
-                    }
-                    // Registry enrichment fills gaps (especially context/output
-                    // limits), but the provider's live catalog is authoritative
-                    // for fields it explicitly reports. Re-apply those fields
-                    // after models.dev so Cursor reasoning levels/disable flags
-                    // and vendor-published limits are not overwritten.
-                    apply_live_model_list_fields(&v, &mut listed);
-                    if !listed.is_empty() {
-                        write_models_cache(cache_key, &listed);
-                        return listed;
-                    }
-                }
-            }
-        }
-    }
-
-    if live.is_empty() {
-        // Neither endpoint served a usable list — stale cache, else curated
-        // fallbacks for the vendor (Gemini host → Gemini models, else Umans).
-        return read_models_cache_stale(cache_key)
-            .unwrap_or_else(|| openai_fallback_models(&provider.base_url));
-    }
-
-    // 3. Write fresh data to disk cache.
-    write_models_cache(cache_key, &live);
-    live
-}
-
-/// Model cache TTL in seconds (8 hours).
-const MODELS_CACHE_TTL: u64 = 28800;
-
-/// Cache schema version. Bumped when the parsed model shape OR the cache file
-/// shape changes so a stale cache written by an older parser (e.g. one that
-/// stored empty thinking_levels or wrong vision flags, or the old single-`key`
-/// file shape) is treated as a miss and refreshed, instead of masking the fix
-/// for up to the TTL window.
-// v7: xAI models parse live `context_length` / vision from `/models` +
-// `/language-models` (previously hardcoded wrong windows for Grok).
-// v8: Antigravity Gemini 3 + Claude-via-Antigravity catalog.
-const MODELS_CACHE_VERSION: u64 = 9;
-
-/// True when a parsed cache object matches the current schema version. Pure
-/// (no disk) so the version gate can be unit-tested.
-fn cache_version_ok(cache: &Value) -> bool {
-    cache.get("version").and_then(|v| v.as_u64()) == Some(MODELS_CACHE_VERSION)
-}
-
-fn models_cache_path() -> Option<std::path::PathBuf> {
-    let home = crate::config::home_dir()?;
-    Some(home.join(".config/catalyst-code/models-cache.json"))
-}
-
-fn read_models_cache(cache_key: &str) -> Option<Vec<ModelInfo>> {
-    let path = models_cache_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    let cache: Value = serde_json::from_str(&content).ok()?;
-    if !cache_version_ok(&cache) {
-        return None;
-    }
-    // The cache holds a `key -> entry` map so multiple providers' caches coexist
-    // (previously a single `key` field meant each provider's write clobbered the
-    // file, so only the last writer ever hit on the next startup).
-    let entry = cache.get("entries")?.get(cache_key)?;
-    let updated = entry.get("updated_at")?.as_u64()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if now.saturating_sub(updated) > MODELS_CACHE_TTL {
-        return None;
-    }
-    parse_cache_models(entry)
-}
-
-fn read_models_cache_stale(cache_key: &str) -> Option<Vec<ModelInfo>> {
-    let path = models_cache_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    let cache: Value = serde_json::from_str(&content).ok()?;
-    if !cache_version_ok(&cache) {
-        return None;
-    }
-    let entry = cache.get("entries")?.get(cache_key)?;
-    parse_cache_models(entry)
-}
-
-fn write_models_cache(cache_key: &str, models: &[ModelInfo]) {
-    let path = match models_cache_path() {
-        Some(p) => p,
-        None => return,
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let models_json: Vec<Value> = models
-        .iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "name": m.name,
-                "reasoning": m.reasoning,
-                "context_window": m.context_window,
-                "max_tokens": m.max_tokens,
-                "thinking_levels": m.thinking_levels,
-                "vision": m.vision,
-            })
-        })
-        .collect();
-    // Load the existing entries map (if present and same schema) so this
-    // provider's entry is MERGED in rather than clobbering the whole file —
-    // multi-provider caches then all hit on the next startup instead of only
-    // the last writer's. Written atomically (temp + fsync + rename) so a crash
-    // mid-write can't truncate/corrupt the cache file.
-    // Cross-process lock: the cache is a shared read-modify-write (we merge
-    // this provider's entry into the existing entries map). Without a lock two
-    // processes refreshing different providers concurrently would both read the
-    // same base and the second rename would clobber the first's entry. Advisory
-    // (flock); auto-releases on exit/crash so there are no stale locks.
-    let _lock = match crate::fsutil::FileLock::acquire(&path.with_extension("lock")) {
-        Ok(g) => g,
-        Err(_) => return, // best-effort: never block the turn on a wedged lock
-    };
-    let mut entries: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .filter(cache_version_ok)
-        .and_then(|c| c.get("entries").cloned())
-        .and_then(|e| e.as_object().cloned())
-        .unwrap_or_default();
-    entries.insert(
-        cache_key.to_string(),
-        json!({ "updated_at": now, "models": models_json }),
-    );
-    let cache = json!({
-        "version": MODELS_CACHE_VERSION,
-        "entries": entries,
-    });
-    // Unique-temp atomic write (fsutil): two processes never share a temp file,
-    // so a concurrent writer can't corrupt this one's write.
-    let _ = crate::fsutil::atomic_write_str(
-        &path,
-        &serde_json::to_string(&cache).unwrap_or_else(|_| "{}".into()),
-    );
-}
-
-fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
-    let arr = cache.get("models")?.as_array()?;
-    let mut out = Vec::new();
-    for m in arr {
-        let id = m.get("id")?.as_str()?.to_string();
-        let name = m.get("name")?.as_str()?.to_string();
-        let context_window = m.get("context_window")?.as_u64()? as u32;
-        let max_tokens = m.get("max_tokens")?.as_u64()? as u32;
-        let vision = m.get("vision").and_then(|v| v.as_bool()).unwrap_or(false);
-        let thinking_levels = m
-            .get("thinking_levels")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.push(ModelInfo {
-            id,
-            name,
-            reasoning: m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(true),
-            context_window,
-            max_tokens,
-            thinking_levels,
-            vision,
-
-            ..Default::default()
-        });
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-/// Parse the live /models/info response into ModelInfo vec.
-fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
-    let mut out = Vec::new();
-    if let Some(obj) = data.as_object() {
-        for (id, info) in obj {
-            let caps = info.get("capabilities");
-            let cw = caps
-                .and_then(|c| c.get("context_window"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(200_000) as u32;
-            let mt = caps
-                .and_then(|c| c.get("recommended_max_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(65000) as u32;
-            // Vision comes from capabilities.supports_vision, which the endpoint
-            // encodes as true / false / "via-handoff". Only boolean true counts
-            // as native client-side vision; "via-handoff" (GLM 5.2, whose vision
-            // only works on /v1/messages) falls through to false so the
-            // vision-handoff plugin routes image turns to a natively-capable model.
-            let vision = caps
-                .and_then(|c| c.get("supports_vision"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let name = info
-                .get("display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(id)
-                .to_string();
-            // The live /models/info endpoint nests reasoning config under
-            // capabilities.reasoning: { supported, can_disable, levels,
-            // default_level }. Read levels from there so each model advertises
-            // the efforts it actually accepts (e.g. GLM: none/high/max, flash:
-            // none/low/medium/high, kimi: []). Flat capability fields
-            // (thinking_levels / reasoning_levels / reasoning_efforts) are kept
-            // as a fallback for other OpenAI-compatible endpoints.
-            let reasoning_caps = caps.and_then(|c| c.get("reasoning"));
-            let reasoning_supported = reasoning_caps
-                .and_then(|r| r.get("supported"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let thinking_levels = reasoning_caps
-                .and_then(|r| r.get("levels"))
-                .or_else(|| {
-                    caps.and_then(|c| {
-                        c.get("thinking_levels")
-                            .or_else(|| c.get("reasoning_levels"))
-                            .or_else(|| c.get("reasoning_efforts"))
-                    })
-                })
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            out.push(ModelInfo {
-                id: id.clone(),
-                name,
-                reasoning: reasoning_supported,
-                context_window: cw,
-                max_tokens: mt,
-                thinking_levels,
-                vision,
-
-                ..Default::default()
-            });
-        }
-    }
-    if out.is_empty() {
-        Vec::new()
-    } else {
-        out
-    }
-}
-
-/// Parse the standard OpenAI `GET /models` list (`{data:[{id,...}]}`) into
-/// ModelInfo, applying curated per-id capabilities for known OpenAI and Gemini
-/// model families. Most OpenAI-compatible endpoints return only ids, so we
-/// synthesize caps from known families. When the vendor includes richer fields
-/// (`context_length`, `context_window`, image token prices), those override the
-/// curated defaults — xAI does this on `/v1/models`.
-fn parse_openai_models_list(data: &Value) -> Vec<ModelInfo> {
-    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter_map(|m| {
-            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
-            let name = m
-                .get("name")
-                .or_else(|| m.get("display_name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&id)
-                .to_string();
-            let mut info = openai_model_caps(&id, &name);
-            apply_live_model_fields(m, &mut info);
-            Some(info)
-        })
-        .collect();
-    if out.is_empty() {
-        return Vec::new();
-    }
-    // de-dup by id, preserve order
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|m| seen.insert(m.id.clone()));
-    out
-}
-
-/// Overlay vendor-reported fields from a `/models` list item onto curated caps.
-/// Safe no-ops when the fields are absent (vanilla OpenAI list).
-fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
-    if let Some(reasoning) = m.get("reasoning").and_then(|v| v.as_bool()) {
-        info.reasoning = reasoning;
-    }
-    if let Some(levels) = m
-        .get("reasoning_levels")
-        .or_else(|| m.get("thinking_levels"))
-        .and_then(|v| v.as_array())
-    {
-        info.thinking_levels = levels
-            .iter()
-            .filter_map(|level| level.as_str().map(str::to_string))
-            .filter(|level| !level.is_empty())
-            .collect();
-    }
-    if let Some(ctx) = m
-        .get("context_length")
-        .or_else(|| m.get("context_window"))
-        .or_else(|| m.get("max_context_window"))
-        .or_else(|| m.get("max_model_len"))
-        .and_then(|v| v.as_u64())
-        .filter(|&c| c > 0)
-    {
-        info.context_window = ctx.min(u32::MAX as u64) as u32;
-        // Keep max_tokens below context so there's room for the prompt.
-        if info.max_tokens >= info.context_window {
-            info.max_tokens = xai_default_max_tokens(info.context_window);
-        }
-    }
-    if let Some(max) = m
-        .get("max_tokens")
-        .or_else(|| m.get("max_output_tokens"))
-        .or_else(|| m.get("max_completion_tokens"))
-        .and_then(|v| v.as_u64())
-        .filter(|&c| c > 0)
-    {
-        info.max_tokens = max.min(u32::MAX as u64) as u32;
-    }
-    // Image input pricing / modality hints (xAI, some gateways).
-    if m.get("prompt_image_token_price")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        > 0
-    {
-        info.vision = true;
-    }
-    if let Some(mods) = m.get("input_modalities").and_then(|v| v.as_array()) {
-        if mods.iter().any(|x| x.as_str() == Some("image")) {
-            info.vision = true;
-        }
-    }
-}
-
-fn apply_live_model_list_fields(data: &Value, models: &mut [ModelInfo]) {
-    let Some(entries) = data.get("data").and_then(|value| value.as_array()) else {
-        return;
-    };
-    for info in models {
-        if let Some(entry) = entries.iter().find(|entry| {
-            entry.get("id").and_then(|value| value.as_str()) == Some(info.id.as_str())
-        }) {
-            apply_live_model_fields(entry, info);
-        }
-    }
-}
-
-/// Parse xAI `GET /v1/models` into chat ModelInfos, using live `context_length`
-/// and filtering out image/video/TTS media models that cannot run the agent loop.
-fn parse_xai_models_list(data: &Value) -> Vec<ModelInfo> {
-    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter(|m| is_xai_chat_model_entry(m))
-        .filter_map(|m| {
-            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
-            let name = m
-                .get("name")
-                .or_else(|| m.get("display_name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&id)
-                .to_string();
-            let mut info = xai_model_caps(&id, &name);
-            apply_live_model_fields(m, &mut info);
-            // If context came from the API, re-derive a sensible max_tokens
-            // (xAI does not publish max output on this endpoint).
-            if m.get("context_length").is_some() {
-                info.max_tokens = xai_default_max_tokens(info.context_window);
-            }
-            Some(info)
-        })
-        .collect();
-    if out.is_empty() {
-        return Vec::new();
-    }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|m| seen.insert(m.id.clone()));
-    sort_xai_models(&mut out);
-    out
-}
-
-/// True when a `/models` list item is a chat/completions language model (not
-/// Grok Imagine image/video or other media-only surfaces).
-fn is_xai_chat_model_entry(m: &Value) -> bool {
-    let id = m
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if id.is_empty() {
-        return false;
-    }
-    // Media / non-chat surfaces.
-    if id.contains("imagine")
-        || id.contains("image")
-        || id.contains("video")
-        || id.contains("tts")
-        || id.contains("speech")
-        || id.contains("voice")
-        || id.contains("embedding")
-        || id.contains("whisper")
-    {
-        return false;
-    }
-    // Chat models advertise text completion pricing and/or a context window.
-    m.get("completion_text_token_price").is_some()
-        || m.get("context_length")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0
-}
-
-/// Default max output tokens when the vendor does not report one. Keeps a
-/// comfortable generation budget while leaving headroom under the context window.
-fn xai_default_max_tokens(context_window: u32) -> u32 {
-    let headroom = context_window.saturating_sub(4_096).max(8_192);
-    headroom.min(65_536)
-}
-
-/// Curated xAI Grok capabilities used as the base before live `/models` fields
-/// overlay `context_length` / vision. Reasoning is inferred from the model id.
-fn xai_model_caps(id: &str, name: &str) -> ModelInfo {
-    let l = id.to_ascii_lowercase();
-    let std_levels: Vec<String> = DEFAULT_THINKING_LEVELS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    // Offline defaults aligned with live xAI catalog (May–Jul 2026). Live
-    // `context_length` from `/models` always wins when discovery succeeds.
-    let (ctx, reasoning, levels): (u32, bool, Vec<String>) = if l.contains("non-reasoning") {
-        (1_000_000, false, Vec::new())
-    } else if l.contains("grok-build") {
-        (256_000, true, std_levels.clone())
-    } else if l.contains("grok-4.5") {
-        (500_000, true, std_levels.clone())
-    } else if l.contains("grok-4.3") || l.contains("grok-4.20") || l.contains("multi-agent") {
-        (1_000_000, true, std_levels.clone())
-    } else if l.contains("grok") {
-        (256_000, true, std_levels)
-    } else {
-        (200_000, true, Vec::new())
-    };
-    // All current Grok chat models accept image inputs (prompt_image_token_price).
-    let vision = l.contains("grok");
-    ModelInfo {
-        id: id.to_string(),
-        name: name.to_string(),
-        reasoning,
-        context_window: ctx,
-        max_tokens: xai_default_max_tokens(ctx),
-        thinking_levels: levels,
-        vision,
-        ..Default::default()
-    }
-}
-
-/// Pin coding default (`grok-build-0.1`) first, then flagship reasoning models.
-fn sort_xai_models(models: &mut [ModelInfo]) {
-    models.sort_by(|a, b| {
-        xai_model_sort_key(&a.id)
-            .cmp(&xai_model_sort_key(&b.id))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-fn xai_model_sort_key(id: &str) -> u32 {
-    let l = id.to_ascii_lowercase();
-    if l == "grok-build-0.1" || l.starts_with("grok-build") {
-        0
-    } else if l.starts_with("grok-4.5") {
-        1
-    } else if l.starts_with("grok-4.3") {
-        2
-    } else if l.contains("reasoning") && !l.contains("non-reasoning") {
-        3
-    } else if l.contains("multi-agent") {
-        4
-    } else if l.contains("non-reasoning") {
-        5
-    } else {
-        10
-    }
-}
-
-/// Fetch xAI `GET /v1/language-models` and return a map of model id → whether
-/// the model accepts image inputs. Used to drop media-only ids and set vision.
-async fn fetch_xai_language_model_ids(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-) -> Option<std::collections::HashMap<String, bool>> {
-    let url = format!(
-        "{}/language-models",
-        provider.base_url.trim_end_matches('/')
-    );
-    let mut req = client.get(&url).timeout(Duration::from_secs(8));
-    if let Some(k) = provider.api_key.as_deref() {
-        req = req.bearer_auth(k);
-    }
-    for (k, v) in &provider.headers {
-        req = req.header(k, v);
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().await.ok()?;
-    let arr = v
-        .get("models")
-        .or_else(|| v.get("data"))
-        .and_then(|d| d.as_array())?;
-    let mut map = std::collections::HashMap::new();
-    for m in arr {
-        let Some(id) = m.get("id").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        let vision = m
-            .get("input_modalities")
-            .and_then(|mods| mods.as_array())
-            .map(|mods| mods.iter().any(|x| x.as_str() == Some("image")))
-            .unwrap_or(false)
-            || m.get("prompt_image_token_price")
-                .and_then(|p| p.as_u64())
-                .unwrap_or(0)
-                > 0;
-        map.insert(id.to_string(), vision);
-    }
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
-}
-
-/// Restrict the discovered list to language-models ids (when that catalog is
-/// available) and apply vision flags from `input_modalities`.
-fn apply_xai_language_models_enrichment(
-    models: &mut Vec<ModelInfo>,
-    language: &std::collections::HashMap<String, bool>,
-) {
-    models.retain(|m| language.contains_key(&m.id));
-    for m in models.iter_mut() {
-        if let Some(&vision) = language.get(&m.id) {
-            m.vision = vision;
-        }
-    }
-    sort_xai_models(models);
-}
-
-/// Parse ChatGPT Codex `GET /backend-api/codex/models` (`{models:[...]}`).
-/// This is the subscription catalog, so it is the source of truth for which
-/// ChatGPT models the logged-in account can actually use.
-fn parse_codex_models_response(data: &Value) -> Vec<ModelInfo> {
-    let Some(arr) = data.get("models").and_then(|m| m.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(Option<u64>, ModelInfo)> = arr
-        .iter()
-        .filter(|m| {
-            // The Codex catalog marks internal/auto models with
-            // `visibility: "hide"` (e.g. `codex-auto-review`). These must
-            // never be offered or picked as the default — they aren't meant
-            // for direct user turns. The official codex CLI excludes them the
-            // same way (only `visibility == "list"` models appear in the picker).
-            m.get("supported_in_api")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true)
-                && m.get("visibility").and_then(|v| v.as_str()) != Some("hide")
-        })
-        .filter_map(|m| {
-            let id = m
-                .get("slug")
-                .or_else(|| m.get("id"))
-                .and_then(|v| v.as_str())?;
-            let name = m
-                .get("display_name")
-                .or_else(|| m.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(id);
-            let mut info = openai_model_caps(id, name);
-            if let Some(ctx) = m
-                .get("context_window")
-                .or_else(|| m.get("max_context_window"))
-                .and_then(|v| v.as_u64())
-            {
-                info.context_window = ctx.min(u32::MAX as u64) as u32;
-            }
-            let levels = m
-                .get("supported_reasoning_levels")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| {
-                            x.get("effort")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| x.as_str())
-                                .map(String::from)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !levels.is_empty() {
-                info.thinking_levels = levels;
-                info.reasoning = true;
-            }
-            info.vision = m
-                .get("supports_image_detail_original")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(info.vision);
-            let priority = m.get("priority").and_then(|v| v.as_u64());
-            Some((priority, info))
-        })
-        .collect();
-    // Sort by the catalog's `priority` ascending so the flagship (lowest
-    // priority number, e.g. gpt-5.5) lands first and becomes the
-    // default-selected model. The official codex CLI picks its default via a
-    // separate server `is_default` flag that isn't exposed in this response;
-    // priority-ascending is a faithful proxy. Models lacking a priority sort
-    // last (stable).
-    out.sort_by_key(|(p, _)| p.unwrap_or(u64::MAX));
-    let mut out: Vec<ModelInfo> = out.into_iter().map(|(_, m)| m).collect();
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|m| seen.insert(m.id.clone()));
-    out
-}
-
-/// Curated capabilities for an OpenAI- or Gemini-family model id. Returns
-/// conservative defaults (ctx 200k, max 8k, reasoning true, vision false) for
-/// unknown ids so an unrecognized model still works.
-#[allow(clippy::if_same_then_else)]
-fn openai_model_caps(id: &str, name: &str) -> ModelInfo {
-    let l = id.to_ascii_lowercase();
-    let std_levels: Vec<String> = DEFAULT_THINKING_LEVELS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    // (context_window, max_tokens, reasoning, vision, thinking_levels)
-    let (ctx, max, reasoning, vision, levels): (u32, u32, bool, bool, Vec<String>) = if l
-        .contains("gpt-5-codex")
-    {
-        (272_144, 163_840, true, true, std_levels.clone())
-    } else if l.contains("gpt-5") {
-        (272_144, 128_000, true, true, std_levels.clone())
-    } else if l.contains("o4-mini") {
-        (200_000, 100_000, true, true, std_levels.clone())
-    } else if l.starts_with("o4") || l.contains("o4-") {
-        (200_000, 100_000, true, true, std_levels.clone())
-    } else if l.starts_with("o3") || l.contains("o3-") {
-        (200_000, 100_000, true, false, std_levels.clone())
-    } else if l.contains("o1") {
-        (200_000, 100_000, true, false, vec!["high".to_string()])
-    } else if l.contains("gpt-4.1") {
-        (1_047_576, 32_768, false, true, Vec::new())
-    } else if l.contains("gpt-4o") {
-        (128_000, 16_384, false, true, Vec::new())
-    } else if l.contains("gemini-3") && l.contains("flash") {
-        // Gemini 3 Flash (Antigravity): thinkingLevel minimal/low/medium/high.
-        (
-            1_048_576,
-            65_536,
-            true,
-            true,
-            vec![
-                "minimal".into(),
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-            ],
-        )
-    } else if l.contains("gemini-3") {
-        // Gemini 3 / 3.1 Pro (Antigravity): thinkingLevel low/high only.
-        (
-            1_048_576,
-            65_535,
-            true,
-            true,
-            vec!["low".into(), "high".into()],
-        )
-    } else if l.contains("claude-opus") && l.contains("thinking") {
-        // Claude-via-Antigravity (Opus thinking) — 200k ctx.
-        (200_000, 64_000, true, true, std_levels.clone())
-    } else if l.contains("claude-sonnet-4") || l.contains("claude-opus-4") {
-        (200_000, 64_000, false, true, Vec::new())
-    } else if l.contains("gemini-2.5-pro") || (l.contains("gemini-2.5") && !l.contains("flash")) {
-        (1_048_576, 65_536, true, true, std_levels.clone())
-    } else if l.contains("gemini-2.5-flash") {
-        (1_048_576, 65_536, true, true, std_levels.clone())
-    } else if l.contains("gemini-2.0-flash") {
-        (1_048_576, 8_192, false, true, Vec::new())
-    } else if l.contains("gemini") {
-        (1_048_576, 8_192, false, true, Vec::new())
-    } else if l.contains("grok") {
-        // Delegate to xai_model_caps so offline OpenAI-list parsing matches
-        // the SuperGrok catalog (context_length is overlaid from live API).
-        return xai_model_caps(id, name);
-    } else {
-        (200_000, 8_192, true, false, Vec::new())
-    };
-    ModelInfo {
-        id: id.to_string(),
-        name: name.to_string(),
-        reasoning,
-        context_window: ctx,
-        max_tokens: max,
-        thinking_levels: levels,
-        vision,
-        ..Default::default()
-    }
-}
-
-/// True when the base URL points at Google's Gemini OpenAI-compatible endpoint.
-pub fn is_gemini_endpoint(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "generativelanguage.googleapis.com"
-}
-
-/// True when the base URL points at a Code Assist / Antigravity gateway
-/// (`cloudcode-pa.googleapis.com` or the daily/autopush sandboxes). OAuth-
-/// authenticated Gemini/Claude-via-Antigravity requests are routed here —
-/// `generativelanguage.googleapis.com` only accepts API keys.
-pub fn is_code_assist_endpoint(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "cloudcode-pa.googleapis.com"
-        || host == "daily-cloudcode-pa.sandbox.googleapis.com"
-        || host == "autopush-cloudcode-pa.sandbox.googleapis.com"
-        || (host.ends_with(".sandbox.googleapis.com") && host.contains("cloudcode-pa"))
-}
-
-/// True when the base URL points at ChatGPT's Codex subscription backend.
-pub fn is_codex_endpoint(base_url: &str) -> bool {
-    let host_path = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    host_path == "chatgpt.com/backend-api/codex"
-        || host_path == "chat.openai.com/backend-api/codex"
-        || host_path == "chatgpt-staging.com/backend-api/codex"
-}
-
-/// Default headers the official `codex` CLI attaches to every ChatGPT Codex
-/// request. `originator` identifies the client; `User-Agent` avoids looking
-/// like a bare bot. Idempotent — skips names already present.
-pub fn inject_codex_headers(headers: &mut Vec<(String, String)>) {
-    const ORIGINATOR: &str = "codex_cli_rs";
-    let mut has_originator = false;
-    let mut has_ua = false;
-    for (k, _) in headers.iter() {
-        let kl = k.to_ascii_lowercase();
-        if kl == "originator" {
-            has_originator = true;
-        }
-        if kl == "user-agent" {
-            has_ua = true;
-        }
-    }
-    if !has_originator {
-        headers.push(("originator".to_string(), ORIGINATOR.to_string()));
-    }
-    if !has_ua {
-        let os = if cfg!(target_os = "macos") {
-            "macOS"
-        } else if cfg!(target_os = "windows") {
-            "Windows"
-        } else if cfg!(target_os = "linux") {
-            "Linux"
-        } else {
-            "Unix"
-        };
-        headers.push((
-            "User-Agent".to_string(),
-            format!(
-                "codex_cli_rs/{} ({}; {})",
-                env!("CARGO_PKG_VERSION"),
-                os,
-                std::env::consts::ARCH
-            ),
-        ));
-    }
-}
-
-/// True if the base URL points at an OpenCode Go endpoint. OpenCode Go is a
-/// single subscription that serves some models via an OpenAI-compatible
-/// `/v1/chat/completions` endpoint and others via an Anthropic `/v1/messages`
-/// endpoint — all under one API key at `https://opencode.ai/zen/go/v1`. The
-/// harness models this as TWO provider configs (one OpenAI-kind, one
-/// Anthropic-kind) sharing the base URL + key; discovery returns a curated,
-/// protocol-specific model list for each (see `opencode_go_openai_models` /
-/// `opencode_go_anthropic_models`).
-pub fn is_opencode_go(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "opencode.ai" && base_url.to_ascii_lowercase().contains("/zen/go/")
-}
-
-pub fn is_iflow_endpoint(base_url: &str) -> bool {
-    let h = endpoint_host(base_url);
-    h == "apis.iflow.cn" || h == "iflow.cn" || h.ends_with(".iflow.cn")
-}
-
-fn endpoint_host(base_url: &str) -> String {
-    base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-/// Capabilities for an OpenCode Go model id. The OpenCode Go `/v1/models`
-/// endpoint returns only ids (no context window / max tokens / reasoning /
-/// vision), and does NOT indicate which wire protocol each model uses — that
-/// mapping lives in the OpenCode docs, not the API — so the harness curates
-/// the list. The per-model (context_window, max_tokens, vision) values come
-/// from the **Models.dev** registry (`https://models.dev/models.json`) — the
-/// same registry OpenCode itself uses — keyed by each model's upstream provider
-/// entry (e.g. `zhipuai/glm-5.2`, `minimax/MiniMax-M3`). The OpenCode Go
-/// endpoint exposes no richer endpoint of its own (`/v1/models/info` and
-/// `/v1/models/{id}` both 404), so Models.dev is the authoritative source.
-/// `max_tokens` is the model's max OUTPUT: for the Anthropic-served models
-/// (MiniMax/Qwen) the harness sends it as the request `max_tokens` (Anthropic
-/// requires the field), so an accurate value avoids truncating long replies;
-/// for the OpenAI-served models `max_tokens` is metadata only (the OpenAI path
-/// does not send it, so the server applies its own default). `context_window`
-/// drives the harness's compaction threshold, so an accurate value keeps
-/// compaction from firing far too early on the million-token models.
-///
-/// Reasoning: for Anthropic-served models (MiniMax/Qwen, per
-/// [`opencode_go_model_protocol`]), `thinking_levels` is set to
-/// `["low", "medium", "high"]` which enables the standard Anthropic
-/// `thinking` block (budgets: 4 096 / 12 288 / 24 576 tokens, clamped below
-/// `max_tokens`). The block is only sent when the user picks an effort >
-/// "none". For OpenAI-served models (GLM / Kimi / DeepSeek / MiMo),
-/// reasoning stays false + levels empty — the OpenAI path only sends
-/// `reasoning_effort` for Umans endpoints, and opencode-go is not Umans.
-/// For ids not in the table (a model the registry hasn't indexed), fall back
-/// to conservative flat defaults.
-fn opencode_go_model_caps(id: &str, name: &str) -> ModelInfo {
-    let (context_window, max_tokens, vision) =
-        opencode_go_caps(id).unwrap_or((200_000, 8_192, false));
-    let reasoning;
-    let thinking_levels;
-    if opencode_go_model_protocol(id) == Some(false) {
-        // Anthropic-served models: enable extended thinking via the standard
-        // Anthropic `thinking` block. Budgets: low=4096, medium=12288, high=24576
-        // (capped below max_tokens by anthropic_thinking_budget).
-        reasoning = true;
-        thinking_levels = vec!["low".into(), "medium".into(), "high".into()];
-    } else {
-        // OpenAI-served models: reasoning_effort is only sent for Umans
-        // endpoints (opencode-go is not Umans), so no reasoning.
-        reasoning = false;
-        thinking_levels = Vec::new();
-    }
-    ModelInfo {
-        id: id.to_string(),
-        name: name.to_string(),
-        reasoning,
-        context_window,
-        max_tokens,
-        thinking_levels,
-        vision,
-        ..Default::default()
-    }
-}
-
-/// Real `(context_window, max_tokens, vision)` for each documented OpenCode Go
-/// model id, sourced from Models.dev (`https://models.dev/models.json`). Values
-/// are the upstream model's limits (OpenCode Go passes the upstream context
-/// through, per its tiered pricing for the 256K+/1M models). `vision` is true
-/// when the upstream entry's `modalities.input` includes `image`. Returns
-/// `None` for ids the registry hasn't indexed; the caller then uses flat
-/// defaults. Keep this in sync with [`opencode_go_known_models`] (ids + display
-/// names) and [`opencode_go_model_protocol`] (family→wire-protocol routing).
-fn opencode_go_caps(id: &str) -> Option<(u32, u32, bool)> {
-    let l = id.to_ascii_lowercase();
-    Some(match l.as_str() {
-        // OpenAI-compatible /v1/chat/completions (zhipu / moonshot / deepseek / xiaomi)
-        "glm-5.2" => (1_000_000, 131_072, false),
-        "glm-5.1" => (200_000, 131_072, false),
-        "kimi-k2.7-code" => (262_144, 262_144, true),
-        "kimi-k2.6" => (262_144, 262_144, true),
-        "deepseek-v4-pro" => (1_000_000, 384_000, false),
-        "deepseek-v4-flash" => (1_000_000, 384_000, false),
-        "mimo-v2.5" => (1_048_576, 131_072, true),
-        "mimo-v2.5-pro" => (1_048_576, 131_072, false),
-        // Anthropic /v1/messages (minimax / alibaba)
-        "minimax-m3" => (512_000, 128_000, true),
-        "minimax-m2.7" => (204_800, 131_072, false),
-        "minimax-m2.5" => (204_800, 131_072, false),
-        "qwen3.7-max" => (1_000_000, 65_536, false),
-        "qwen3.7-plus" => (1_000_000, 64_000, true),
-        "qwen3.6-plus" => (1_000_000, 65_536, true),
-        _ => return None,
-    })
-}
-
-/// All OpenCode Go model ids documented in the OpenCode Go docs endpoint
-/// table, paired with their display names. The live `/v1/models` endpoint
-/// returns ids without display names or a protocol field, so this table
-/// supplies both: the display name (for known ids) and, via the family prefix
-/// in [`opencode_go_model_protocol`], the wire protocol. It is also the
-/// offline fallback when the endpoint is unreachable.
-fn opencode_go_known_models() -> &'static [(&'static str, &'static str)] {
-    &[
-        // OpenAI-compatible /v1/chat/completions
-        ("glm-5.2", "GLM-5.2"),
-        ("glm-5.1", "GLM-5.1"),
-        ("kimi-k2.7-code", "Kimi K2.7 Code"),
-        ("kimi-k2.6", "Kimi K2.6"),
-        ("deepseek-v4-pro", "DeepSeek V4 Pro"),
-        ("deepseek-v4-flash", "DeepSeek V4 Flash"),
-        ("mimo-v2.5", "MiMo-V2.5"),
-        ("mimo-v2.5-pro", "MiMo-V2.5-Pro"),
-        // Anthropic /v1/messages
-        ("minimax-m3", "MiniMax M3"),
-        ("minimax-m2.7", "MiniMax M2.7"),
-        ("minimax-m2.5", "MiniMax M2.5"),
-        ("qwen3.7-max", "Qwen3.7 Max"),
-        ("qwen3.7-plus", "Qwen3.7 Plus"),
-        ("qwen3.6-plus", "Qwen3.6 Plus"),
-    ]
-}
-
-/// The wire protocol an OpenCode Go model id is served over, inferred from its
-/// family prefix. The `/v1/models` endpoint exposes no protocol field, but the
-/// OpenCode Go docs endpoint table partitions cleanly by family:
-/// `glm`/`kimi`/`deepseek`/`mimo` → OpenAI (`/v1/chat/completions`);
-/// `minimax`/`qwen` → Anthropic (`/v1/messages`). Returns `None` for ids whose
-/// family is unknown to the docs (e.g. `hy3-preview`) — those are dropped
-/// during discovery rather than misrouted to a protocol they may not speak.
-fn opencode_go_model_protocol(id: &str) -> Option<bool> {
-    let l = id.to_ascii_lowercase();
-    if l.starts_with("glm-")
-        || l.starts_with("kimi-")
-        || l.starts_with("deepseek-")
-        || l.starts_with("mimo-")
-    {
-        Some(true)
-    } else if l.starts_with("minimax-") || l.starts_with("qwen") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// Display name for an OpenCode Go model id: the curated name from the docs
-/// table when known, else synthesized as `Brand <rest>` from the family prefix
-/// (so newly-added ids the docs table hasn't caught up to still get a readable
-/// name instead of a raw slug).
-fn opencode_go_display_name(id: &str) -> String {
-    let l = id.to_ascii_lowercase();
-    if let Some((_, name)) = opencode_go_known_models().iter().find(|(k, _)| *k == l) {
-        return name.to_string();
-    }
-    let (rest, brand) = if let Some(r) = l.strip_prefix("glm-") {
-        (r, "GLM")
-    } else if let Some(r) = l.strip_prefix("kimi-") {
-        (r, "Kimi")
-    } else if let Some(r) = l.strip_prefix("deepseek-") {
-        (r, "DeepSeek")
-    } else if let Some(r) = l.strip_prefix("mimo-") {
-        (r, "MiMo")
-    } else if let Some(r) = l.strip_prefix("minimax-") {
-        (r, "MiniMax")
-    } else if let Some(r) = l.strip_prefix("qwen") {
-        (r, "Qwen")
-    } else {
-        return id.to_string();
-    };
-    let rest_str: String = rest
-        .split('-')
-        .map(|tok| {
-            let mut c = tok.chars();
-            match c.next() {
-                Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    if rest_str.is_empty() {
-        brand.to_string()
-    } else {
-        format!("{brand} {rest_str}")
-    }
-}
-
-/// Parse an OpenCode Go `/v1/models` response (`{data:[{id,...}]}`) and keep
-/// only the ids served over the given wire protocol, mapping each to curated
-/// capabilities. The endpoint lists every model with no protocol field, so we
-/// partition by family prefix (see [`opencode_go_model_protocol`]); ids whose
-/// family is unknown are dropped (we can't safely route them).
-fn opencode_go_filter_models(data: &Value, openai: bool) -> Vec<ModelInfo> {
-    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter_map(|m| {
-            let id = m.get("id").and_then(|v| v.as_str())?;
-            if opencode_go_model_protocol(id) != Some(openai) {
-                return None;
-            }
-            let name = opencode_go_display_name(id);
-            Some(opencode_go_model_caps(id, &name))
-        })
-        .collect();
-    // de-dup by id, preserve order
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|m| seen.insert(m.id.clone()));
-    out
-}
-
-/// Discover OpenCode Go models by fetching the single `/v1/models` endpoint
-/// (which lists every model over both wire protocols, with no protocol field),
-/// filtering to `openai`-protocol models, and caching the result. Falls back to
-/// the stale disk cache, then the hardcoded curated list, when the endpoint is
-/// unreachable.
-///
-/// OpenCode Go is modeled as TWO provider configs sharing one base URL + key
-/// (OpenAI-kind + Anthropic-kind); this is called for each with `openai`
-/// selecting the protocol. The cache key already encodes the kind, so the two
-/// partitions never collide.
-async fn opencode_go_discover_models(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-    cache_key: &str,
-    openai: bool,
-) -> Vec<ModelInfo> {
-    // 1. Fresh disk cache (< 8h TTL).
-    if let Some(models) = read_models_cache(cache_key) {
-        return models;
-    }
-    // 2. Fetch the live OpenAI-style /v1/models list. The endpoint serves every
-    //    model here regardless of wire protocol; auth is optional (the list is
-    //    public) but we send the key when configured.
-    let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
-    let mut req = client.get(&url).timeout(Duration::from_secs(8));
-    if let Some(k) = provider.api_key.as_deref() {
-        req = req.bearer_auth(k);
-    }
-    for (k, v) in &provider.headers {
-        req = req.header(k, v);
-    }
-    let live = match req.send().await {
-        Ok(r) if r.status().is_success() => {
-            opencode_go_filter_models(&r.json::<Value>().await.unwrap_or(Value::Null), openai)
-        }
-        _ => Vec::new(),
-    };
-    if !live.is_empty() {
-        write_models_cache(cache_key, &live);
-        return live;
-    }
-    // 3. Stale cache, else the hardcoded curated list for this protocol.
-    read_models_cache_stale(cache_key).unwrap_or_else(|| opencode_go_fallback_models(openai))
-}
-
-/// Hardcoded curated list for one protocol — the offline fallback when the
-/// OpenCode Go `/v1/models` endpoint is unreachable. Derived from
-/// [`opencode_go_known_models`] filtered to the protocol family.
-fn opencode_go_fallback_models(openai: bool) -> Vec<ModelInfo> {
-    opencode_go_known_models()
-        .iter()
-        .filter(|(id, _)| opencode_go_model_protocol(id) == Some(openai))
-        .map(|(id, name)| opencode_go_model_caps(id, name))
-        .collect()
-}
-
-/// OpenCode Go models served via the OpenAI-compatible `/v1/chat/completions`
-/// endpoint — the offline fallback for the `opencode-go` (OpenAI-kind) provider
-/// config. Derived from [`opencode_go_known_models`] filtered to the OpenAI
-/// protocol family.
-#[allow(dead_code)]
-fn opencode_go_openai_models() -> Vec<ModelInfo> {
-    opencode_go_fallback_models(true)
-}
-
-/// OpenCode Go models served via the Anthropic `/v1/messages` endpoint — the
-/// offline fallback for the `opencode-go-anthropic` (Anthropic-kind) provider
-/// config. Derived from [`opencode_go_known_models`] filtered to the Anthropic
-/// protocol family.
-#[allow(dead_code)]
-fn opencode_go_anthropic_models() -> Vec<ModelInfo> {
-    opencode_go_fallback_models(false)
-}
-
-/// Curated fallback models for an OpenAI-compatible endpoint that served no
-/// list at all. Gemini host → Gemini models; xAI host → Grok models; otherwise
-/// the Umans default list.
-fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
-    if is_codex_endpoint(base_url) {
-        return codex_fallback_models();
-    }
-    // Code Assist endpoint (OAuth Gemini) and the standard Gemini endpoint both
-    // serve the same models — use the Gemini fallback list for both.
-    if is_gemini_endpoint(base_url) || is_code_assist_endpoint(base_url) {
-        return gemini_fallback_models();
-    }
-    if is_xai_endpoint(base_url) {
-        return xai_fallback_models();
-    }
-    fallback_models()
-}
-
-fn codex_fallback_models() -> Vec<ModelInfo> {
-    // Current ChatGPT-subscription Codex model slugs (from the official codex
-    // CLI's bundled models.json). These are the source of truth when the live
-    // `/backend-api/codex/models` catalog can't be reached. The OLD list
-    // (gpt-5.2-codex / gpt-5.1-codex-max / gpt-5-codex) are STALE slugs the
-    // backend rejects with "model is not supported when using Codex with a
-    // ChatGPT account". Ordered flagship-first so the first entry is the default.
-    [
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.2",
-    ]
-    .iter()
-    .map(|id| openai_model_caps(id, id))
-    .collect()
-}
-
-/// Static Antigravity / Gemini model list used when live discovery is
-/// unreachable. Antigravity quota models first (Gemini 3 + Claude), then the
-/// older Gemini 2.5 models as a secondary set.
-fn gemini_fallback_models() -> Vec<ModelInfo> {
-    // (id, display_name) — Antigravity model ids match the Code Assist gateway
-    // (no "models/" prefix; Gemini 3 Pro uses -low/-high tiers).
-    let ids: &[(&str, &str)] = &[
-        ("gemini-3.1-pro-high", "Gemini 3.1 Pro (Antigravity)"),
-        ("gemini-3-pro-high", "Gemini 3 Pro (Antigravity)"),
-        ("gemini-3-flash", "Gemini 3 Flash (Antigravity)"),
-        (
-            "claude-opus-4-6-thinking",
-            "Claude Opus 4.6 Thinking (Antigravity)",
-        ),
-        ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Antigravity)"),
-        ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-        ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-    ];
-    ids.iter()
-        .map(|(id, name)| openai_model_caps(id, name))
-        .collect()
-}
-
-/// Static xAI Grok model list used when `/models` is unreachable. Context
-/// windows match the live SuperGrok catalog; `grok-build-0.1` is first.
-fn xai_fallback_models() -> Vec<ModelInfo> {
-    let ids = [
-        "grok-build-0.1",
-        "grok-4.5",
-        "grok-4.3",
-        "grok-4.20-0309-reasoning",
-        "grok-4.20-0309-non-reasoning",
-        "grok-4.20-multi-agent-0309",
-    ];
-    let mut models: Vec<ModelInfo> = ids.iter().map(|id| xai_model_caps(id, id)).collect();
-    sort_xai_models(&mut models);
-    models
-}
-
-/// True when the base URL points at xAI's API (`api.x.ai`).
-pub fn is_xai_endpoint(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "api.x.ai" || host == "x.ai" || host.ends_with(".x.ai")
-}
-
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
 /// tool result message. Context compaction can drop tool results while keeping
 /// the assistant message that made the call, causing a 400. Mirrors the Umans
@@ -3196,17 +658,12 @@ pub fn sanitize_tool_call_arguments(messages: &mut Vec<Message>) -> usize {
     fixed
 }
 
-fn token_count(v: &Value) -> Option<u64> {
-    if let Some(n) = v.as_u64() {
-        return Some(n);
-    }
-    if let Some(n) = v.as_f64() {
-        return Some(n as u64);
-    }
-    if let Some(s) = v.as_str() {
-        return s.trim().parse::<u64>().ok();
-    }
-    None
+#[cfg(test)]
+fn token_count(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().map(|number| number as u64))
+        .or_else(|| value.as_str()?.trim().parse().ok())
 }
 
 /// Detect the provider failure mode where a model writes a DSML function call
@@ -3427,59 +884,67 @@ pub async fn stream_turn(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
-    match provider.kind {
-        ProviderKind::OpenAI => {
-            if is_code_assist_endpoint(&provider.base_url) {
-                stream_turn_gemini(
-                    client,
-                    provider,
-                    idle_timeout_secs,
-                    model,
-                    messages,
-                    tools,
-                    reasoning_effort,
-                    thinking_levels,
-                    max_tokens,
-                    cancel,
-                    timer,
-                    prompt_est,
-                    quiet,
-                )
-                .await
-            } else if is_codex_endpoint(&provider.base_url) {
-                stream_turn_codex(
-                    client,
-                    provider,
-                    idle_timeout_secs,
-                    model,
-                    messages,
-                    tools,
-                    reasoning_effort,
-                    cancel,
-                    timer,
-                    prompt_est,
-                    quiet,
-                )
-                .await
-            } else {
-                stream_turn_openai(
-                    client,
-                    provider,
-                    idle_timeout_secs,
-                    model,
-                    messages,
-                    tools,
-                    reasoning_effort,
-                    thinking_levels,
-                    cancel,
-                    timer,
-                    prompt_est,
-                    quiet,
-                )
-                .await
-            }
+    timer.begin_provider_call();
+    let adapter = adapter_for(provider);
+    if !adapter.capabilities().streaming {
+        return Err(format!(
+            "provider adapter '{}' does not support streaming",
+            adapter.id()
+        ));
+    }
+    match protocol_for(provider) {
+        ProviderProtocol::GoogleCodeAssist => {
+            stream_turn_gemini(
+                client,
+                provider,
+                idle_timeout_secs,
+                model,
+                messages,
+                tools,
+                reasoning_effort,
+                thinking_levels,
+                max_tokens,
+                cancel,
+                timer,
+                prompt_est,
+                quiet,
+            )
+            .await
         }
-        ProviderKind::Anthropic => {
+        ProviderProtocol::CodexResponses => {
+            stream_turn_codex(
+                client,
+                provider,
+                idle_timeout_secs,
+                model,
+                messages,
+                tools,
+                reasoning_effort,
+                cancel,
+                timer,
+                prompt_est,
+                quiet,
+            )
+            .await
+        }
+        ProviderProtocol::OpenAiChat => {
+            stream_turn_openai(
+                client,
+                provider,
+                idle_timeout_secs,
+                model,
+                messages,
+                tools,
+                reasoning_effort,
+                thinking_levels,
+                cancel,
+                timer,
+                prompt_est,
+                quiet,
+            )
+            .await
+        }
+        ProviderProtocol::AnthropicMessages => {
             stream_turn_anthropic(
                 client,
                 provider,
@@ -3514,26 +979,30 @@ async fn stream_turn_codex(
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     let api_key = provider.api_key.as_deref().unwrap_or("");
-    // Convert Messages → Values for the Codex path (keep existing translator).
-    let values = Message::to_openai_messages(messages);
-    let (instructions, input) = codex_responses_input(&values);
-    let body = json!({
-        "model": model,
-        "instructions": instructions,
-        "input": input,
-        "tools": codex_responses_tools(tools),
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "reasoning": { "effort": reasoning_effort, "summary": "auto" },
-        "store": false,
-        "stream": true,
-        "include": ["reasoning.encrypted_content"],
-    });
-    let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
-    let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
+    let adapter = adapter_for(provider);
+    let built = adapter.build_request(&ProviderRequest {
+        provider,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        thinking_levels: &[],
+        max_tokens: 0,
+    })?;
+    let body = built.body;
+    let url = built.url;
+    let resp = send_with_retry(
+        client,
+        &url,
+        api_key,
+        &provider.headers,
+        &body,
+        cancel,
+        adapter_for(provider),
+    )
+    .await?;
     let mut stream = resp.bytes_stream();
-    let mut buf = BytesMut::new();
-    let mut sse_lines: Vec<String> = Vec::new();
+    let mut decoder = SseDecoder::default();
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut calls: Vec<ToolAccum> = Vec::new();
@@ -3550,106 +1019,26 @@ async fn stream_turn_codex(
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| format!("stream read: {}", fmt_chain(&e)))?;
-        sse_lines.clear();
-        sse_take_lines(&mut buf, &chunk, &mut sse_lines);
-        for line in sse_lines.drain(..) {
-            let data = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"));
-            let Some(data) = data else { continue };
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            let Ok(obj) = serde_json::from_str::<Value>(data) else {
-                continue;
+        for frame in decoder.push(&chunk) {
+            let obj = match frame {
+                SseFrame::Json { value, .. } => value,
+                SseFrame::Done => continue,
+                SseFrame::Malformed { preview, .. } => {
+                    return Err(format!("malformed provider SSE frame: {preview}"));
+                }
             };
-            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "response.output_text.delta" => {
-                    if let Some(t) = obj.get("delta").and_then(|v| v.as_str()) {
-                        if content.is_empty() {
-                            timer.mark_first_token();
-                        }
-                        content.push_str(t);
-                        if !quiet {
-                            emit(&Event::new("delta").with("text", json!(t)));
-                        }
-                    }
-                }
-                "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                    if let Some(t) = obj.get("delta").and_then(|v| v.as_str()) {
-                        if reasoning.is_empty() {
-                            timer.mark_first_token();
-                        }
-                        reasoning.push_str(t);
-                        if !quiet {
-                            emit(&Event::new("thinking").with("text", json!(t)));
-                        }
-                    }
-                }
-                "response.output_item.done" => {
-                    if let Some(item) = obj.get("item") {
-                        if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                            timer.mark_first_token();
-                            let call_id = item
-                                .get("call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let name = item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let args = item
-                                .get("arguments")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}")
-                                .to_string();
-                            let idx = calls.len();
-                            if !quiet {
-                                emit(
-                                    &Event::new("tool_call_start")
-                                        .with("id", json!(call_id))
-                                        .with("index", json!(idx)),
-                                );
-                                emit(
-                                    &Event::new("tool_call_name")
-                                        .with("index", json!(idx))
-                                        .with("name", json!(name)),
-                                );
-                                emit(
-                                    &Event::new("tool_call_args")
-                                        .with("index", json!(idx))
-                                        .with("args", json!(args)),
-                                );
-                            }
-                            calls.push(ToolAccum {
-                                id: call_id,
-                                name,
-                                args,
-                            });
-                        }
-                    }
-                }
-                "response.completed" => {
-                    if let Some(u) = obj.get("response").and_then(|r| r.get("usage")) {
-                        if let Some(p) = u.get("input_tokens").and_then(token_count) {
-                            tokens_in = p;
-                        }
-                        if let Some(o) = u.get("output_tokens").and_then(token_count) {
-                            tokens_out = o;
-                        }
-                        if let Some(c) = u
-                            .get("input_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(token_count)
-                        {
-                            cached_tokens = c;
-                        }
-                    }
-                }
-                "response.failed" => return Err(format!("Responses API failed: {obj}")),
-                _ => {}
+            for event in adapter.decode_stream_event(&obj) {
+                apply_codex_event(
+                    event,
+                    &mut content,
+                    &mut reasoning,
+                    &mut calls,
+                    &mut tokens_in,
+                    &mut tokens_out,
+                    &mut cached_tokens,
+                    timer,
+                    quiet,
+                )?;
             }
             if !quiet && (!content.is_empty() || !reasoning.is_empty()) {
                 let now = Instant::now();
@@ -3676,6 +1065,30 @@ async fn stream_turn_codex(
                     emit(&ev);
                 }
             }
+        }
+    }
+    for frame in decoder.finish() {
+        let value = match frame {
+            SseFrame::Json { value, .. } => value,
+            SseFrame::Done => continue,
+            SseFrame::Malformed { preview, .. } => {
+                return Err(format!(
+                    "malformed provider SSE frame at disconnect: {preview}"
+                ));
+            }
+        };
+        for event in adapter.decode_stream_event(&value) {
+            apply_codex_event(
+                event,
+                &mut content,
+                &mut reasoning,
+                &mut calls,
+                &mut tokens_in,
+                &mut tokens_out,
+                &mut cached_tokens,
+                timer,
+                quiet,
+            )?;
         }
     }
     timer.end_call(
@@ -3714,63 +1127,86 @@ async fn stream_turn_codex(
     ))
 }
 
-fn codex_responses_input(messages: &[Value]) -> (String, Vec<Value>) {
-    let mut instructions = Vec::new();
-    let mut input = Vec::new();
-    for m in messages {
-        match m.get("role").and_then(|v| v.as_str()).unwrap_or("") {
-            "system" => instructions.push(content_text(m.get("content").unwrap_or(&Value::Null))),
-            "user" => input.push(json!({"type":"message","role":"user","content":[{"type":"input_text","text":content_text(m.get("content").unwrap_or(&Value::Null))}]})),
-            "assistant" => {
-                if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
-                    for tc in calls {
-                        input.push(json!({
-                            "type":"function_call",
-                            "call_id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                            "name": tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
-                            "arguments": tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}"),
-                        }));
-                    }
-                } else {
-                    let text = content_text(m.get("content").unwrap_or(&Value::Null));
-                    if !text.is_empty() { input.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})); }
-                }
+#[allow(clippy::too_many_arguments)]
+fn apply_codex_event(
+    event: NormalizedStreamEvent,
+    content: &mut String,
+    reasoning: &mut String,
+    calls: &mut Vec<ToolAccum>,
+    tokens_in: &mut u64,
+    tokens_out: &mut u64,
+    cached_tokens: &mut u64,
+    timer: &mut TurnTimer,
+    quiet: bool,
+) -> Result<(), String> {
+    match event {
+        NormalizedStreamEvent::TextDelta(text) => {
+            if content.is_empty() {
+                timer.mark_first_token();
             }
-            "tool" => input.push(json!({
-                "type":"function_call_output",
-                "call_id": m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
-                "output": content_text(m.get("content").unwrap_or(&Value::Null)),
-            })),
-            _ => {}
+            content.push_str(&text);
+            if !quiet {
+                emit(&Event::new("delta").with("text", json!(text)));
+            }
         }
+        NormalizedStreamEvent::ReasoningDelta(text) => {
+            if reasoning.is_empty() {
+                timer.mark_first_token();
+            }
+            reasoning.push_str(&text);
+            if !quiet {
+                emit(&Event::new("thinking").with("text", json!(text)));
+            }
+        }
+        NormalizedStreamEvent::ToolCallStart(delta) => {
+            timer.mark_first_token();
+            let index = calls.len();
+            let call = ToolAccum {
+                id: delta.id.unwrap_or_default(),
+                name: delta.name.unwrap_or_default(),
+                args: delta.arguments.unwrap_or_else(|| "{}".into()),
+            };
+            if !quiet {
+                emit(
+                    &Event::new("tool_call_start")
+                        .with("id", json!(call.id))
+                        .with("index", json!(index)),
+                );
+                emit(
+                    &Event::new("tool_call_name")
+                        .with("index", json!(index))
+                        .with("name", json!(call.name)),
+                );
+                emit(
+                    &Event::new("tool_call_args")
+                        .with("index", json!(index))
+                        .with("args", json!(call.args)),
+                );
+            }
+            calls.push(call);
+        }
+        NormalizedStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens: cached,
+        } => {
+            if let Some(value) = input_tokens {
+                *tokens_in = value;
+            }
+            if let Some(value) = output_tokens {
+                *tokens_out = value;
+            }
+            if let Some(value) = cached {
+                *cached_tokens = value;
+            }
+        }
+        NormalizedStreamEvent::FatalError(message)
+        | NormalizedStreamEvent::RetryableError(message) => return Err(message),
+        NormalizedStreamEvent::ToolCallDelta(_)
+        | NormalizedStreamEvent::ToolCallComplete { .. }
+        | NormalizedStreamEvent::FinishReason(_) => {}
     }
-    (instructions.join("\n\n"), input)
-}
-
-fn content_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        _ => v.to_string(),
-    }
-}
-
-fn codex_responses_tools(tools: &[Value]) -> Vec<Value> {
-    tools.iter().filter_map(|t| {
-        let f = t.get("function")?;
-        Some(json!({
-            "type": "function",
-            "name": f.get("name").cloned().unwrap_or(Value::Null),
-            "description": f.get("description").cloned().unwrap_or(Value::Null),
-            "parameters": f.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
-            "strict": false,
-        }))
-    }).collect()
+    Ok(())
 }
 
 /// OpenAI-compatible streaming turn. Emits the same delta/thinking/tool_call
@@ -3798,62 +1234,28 @@ async fn stream_turn_openai(
     let cursor_bridge = is_cursor_bridge(base_url);
     let supports_reasoning_content = umans || cursor_bridge;
     let api_key = provider.api_key.as_deref().unwrap_or("");
-    // Convert Messages → OpenAI-shaped JSON for the wire.
-    let openai_messages = Message::to_openai_messages(messages);
-    // Stable tool-def ordering helps provider prefix caches across turns.
-    let mut tools_sorted = tools.to_vec();
-    tools_sorted.sort_by(|a, b| {
-        let na = a
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let nb = b
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        na.cmp(nb)
-    });
-    let mut body = json!({
-        "model": model,
-        "messages": openai_messages,
-        "tools": tools_sorted,
-        "tool_choice": "auto",
-        "stream": true,
-        "stream_options": { "include_usage": true },
-    });
-    // Structured plan: when goal_write_plan is in the tool list (planning
-    // phase), force that tool so the plan schema is respected.
-    if tools_sorted.iter().any(|t| {
-        t.get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
-            == Some("goal_write_plan")
-    }) {
-        body["tool_choice"] = json!({
-            "type": "function",
-            "function": { "name": "goal_write_plan" }
-        });
-    }
-    if supports_reasoning_content {
-        // Resolve the requested effort against the model's advertised thinking
-        // levels: clamp to the closest supported level when the model constrains
-        // the set (e.g. GLM only accepts "high"). Empty levels => pass through.
-        let resolved = resolve_effort(reasoning_effort, thinking_levels);
-        if resolved != reasoning_effort && !quiet {
-            emit(&Event::new("info").with(
-                "message",
-                json!(format!(
-                    "reasoning effort '{}' not supported by model '{}'; using '{}'",
-                    reasoning_effort, model, resolved
-                )),
-            ));
+    let adapter = adapter_for(provider);
+    let built = adapter.build_request(&ProviderRequest {
+        provider,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        thinking_levels,
+        max_tokens: 0,
+    })?;
+    if !quiet {
+        for notice in &built.notices {
+            emit(&Event::new("info").with("message", json!(notice)));
         }
-        body["reasoning_effort"] = json!(resolved);
     }
-
-    let url = format!("{base_url}{CHAT_PATH}");
+    let mut body = built.body;
+    let url = built.url;
+    let tools_sorted = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     // ponytail: retry the stream only while NOTHING has been emitted to the TUI
     // yet — once a delta/thinking/tool_call event went out, a retry would
@@ -3892,15 +1294,18 @@ async fn stream_turn_openai(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let resp = send_with_retry(client, &url, api_key, &provider.headers, &body, cancel).await?;
+        let resp = send_with_retry(
+            client,
+            &url,
+            api_key,
+            &provider.headers,
+            &body,
+            cancel,
+            adapter,
+        )
+        .await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = BytesMut::new();
-        let mut sse_lines: Vec<String> = Vec::new();
-        // P2-3: accumulator for a JSON object split across several `data:`
-        // lines (some OpenAI-compatible servers do this). A complete object
-        // parses on the first line, so the common path is unchanged; only a
-        // fragment keeps accumulating until it's whole.
-        let mut pending = String::new();
+        let mut decoder = SseDecoder::default();
         let mut emitted = false;
         let mut err: Option<String> = None;
 
@@ -3920,170 +1325,106 @@ async fn stream_turn_openai(
                     break;
                 }
             };
-            sse_lines.clear();
-            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
-
-            // Process complete SSE frames. A frame may span multiple `data:` lines that
-            // must be concatenated before parsing (some OpenAI-compatible servers split).
-            for line in sse_lines.drain(..) {
-                if line.is_empty() {
-                    // Blank line = event boundary: drop any half-accumulated frame.
-                    pending.clear();
-                    continue;
-                }
-                if line.starts_with(':') {
-                    continue; // SSE comment / keepalive
-                }
-                let data = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"))
-                    .unwrap_or("");
-                if data == "[DONE]" {
-                    pending.clear();
-                    continue;
-                }
-                if data.is_empty() {
-                    continue;
-                }
-                pending.push_str(data);
-                let obj = match serde_json::from_str::<Value>(&pending) {
-                    Ok(o) => {
-                        pending.clear();
-                        o
+            for frame in decoder.push(&chunk) {
+                let obj = match frame {
+                    SseFrame::Json { value, .. } => value,
+                    SseFrame::Done => continue,
+                    SseFrame::Malformed { preview, .. } => {
+                        err = Some(malformed_response(&preview).message);
+                        break 'read_stream;
                     }
-                    Err(_) => continue, // wait for more `data:` lines to complete the frame
                 };
 
-                // OpenAI-compatible gateways may report an upstream failure
-                // as an SSE error frame after the HTTP 200 stream has started.
-                // Treat that as a provider failure; otherwise a partial model
-                // response can be mistaken for a successful completion.
-                if let Some(error) = obj.get("error") {
-                    let detail = error
-                        .get("message")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| error.to_string());
-                    err = Some(format!("provider stream error: {detail}"));
-                    break 'read_stream;
-                }
-
-                // usage is sent in a final chunk with an empty choices array.
-                // usage is sent in a final chunk with an empty choices array.
-                if let Some(u) = obj.get("usage") {
-                    if let Some(p) = u.get("prompt_tokens").and_then(token_count) {
-                        tokens_in = p;
-                    }
-                    if let Some(c) = u.get("completion_tokens").and_then(token_count) {
-                        tokens_out = c;
-                    }
-                    // prompt_tokens_details.cached_tokens — the prefix-cache hit count.
-                    // Absent on servers that don't support/report caching (stays 0).
-                    if let Some(c) = u
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(token_count)
-                    {
-                        cached_tokens = c;
-                    }
-                }
-
-                let Some(choice) = obj.get("choices").and_then(|c| c.get(0)) else {
-                    continue;
-                };
-                let delta = choice.get("delta");
-
-                if let Some(c) = delta
-                    .and_then(|d| d.get("content"))
-                    .and_then(|v| v.as_str())
-                {
-                    if !c.is_empty() {
-                        if content.is_empty() {
-                            timer.mark_first_token();
-                        }
-                        content.push_str(c);
-                        if !quiet {
-                            emitted = true;
-                            emit(&Event::new("delta").with("text", json!(c)));
-                        }
-                    }
-                }
-                if let Some(r) = delta
-                    .and_then(|d| d.get("reasoning_content"))
-                    .and_then(|v| v.as_str())
-                {
-                    if !r.is_empty() {
-                        if reasoning.is_empty() {
-                            timer.mark_first_token();
-                        }
-                        reasoning.push_str(r);
-                        if !quiet {
-                            emitted = true;
-                            emit(&Event::new("thinking").with("text", json!(r)));
-                        }
-                    }
-                }
-                if let Some(tcs) = delta
-                    .and_then(|d| d.get("tool_calls"))
-                    .and_then(|v| v.as_array())
-                {
-                    if !tcs.is_empty() {
-                        timer.mark_first_token();
-                    }
-                    for tc in tcs {
-                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        while tool_calls.len() <= idx {
-                            tool_calls.push(ToolAccum::default());
-                        }
-                        let acc = &mut tool_calls[idx];
-                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                            if acc.id.is_empty() {
-                                acc.id = id.to_string();
-                                if !quiet {
-                                    emitted = true;
-                                    emit(
-                                        &Event::new("tool_call_start")
-                                            .with("id", json!(id))
-                                            .with("index", json!(idx)),
-                                    );
-                                }
+                for event in adapter.decode_stream_event(&obj) {
+                    match event {
+                        NormalizedStreamEvent::TextDelta(text) => {
+                            if content.is_empty() {
+                                timer.mark_first_token();
                             }
-                        }
-                        let func = tc.get("function");
-                        if let Some(name) =
-                            func.and_then(|f| f.get("name")).and_then(|v| v.as_str())
-                        {
-                            if acc.name.is_empty() {
-                                acc.name = name.to_string();
-                                if !quiet {
-                                    emitted = true;
-                                    emit(
-                                        &Event::new("tool_call_name")
-                                            .with("index", json!(idx))
-                                            .with("name", json!(name)),
-                                    );
-                                }
-                            }
-                        }
-                        if let Some(args) = func
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str())
-                        {
-                            acc.args.push_str(args);
+                            content.push_str(&text);
                             if !quiet {
                                 emitted = true;
-                                emit(
-                                    &Event::new("tool_call_args")
-                                        .with("index", json!(idx))
-                                        .with("args", json!(args)),
-                                );
+                                emit(&Event::new("delta").with("text", json!(text)));
                             }
                         }
-                    }
-                }
-                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                    if !fr.is_empty() {
-                        finish_reason = fr.to_string();
+                        NormalizedStreamEvent::ReasoningDelta(text) => {
+                            if reasoning.is_empty() {
+                                timer.mark_first_token();
+                            }
+                            reasoning.push_str(&text);
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("thinking").with("text", json!(text)));
+                            }
+                        }
+                        NormalizedStreamEvent::ToolCallStart(delta)
+                        | NormalizedStreamEvent::ToolCallDelta(delta) => {
+                            timer.mark_first_token();
+                            let idx = delta.index;
+                            while tool_calls.len() <= idx {
+                                tool_calls.push(ToolAccum::default());
+                            }
+                            let acc = &mut tool_calls[idx];
+                            if let Some(id) = delta.id {
+                                if acc.id.is_empty() {
+                                    acc.id.clone_from(&id);
+                                    if !quiet {
+                                        emitted = true;
+                                        emit(
+                                            &Event::new("tool_call_start")
+                                                .with("id", json!(id))
+                                                .with("index", json!(idx)),
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(name) = delta.name {
+                                if acc.name.is_empty() {
+                                    acc.name.clone_from(&name);
+                                    if !quiet {
+                                        emitted = true;
+                                        emit(
+                                            &Event::new("tool_call_name")
+                                                .with("index", json!(idx))
+                                                .with("name", json!(name)),
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(arguments) = delta.arguments {
+                                acc.args.push_str(&arguments);
+                                if !quiet {
+                                    emitted = true;
+                                    emit(
+                                        &Event::new("tool_call_args")
+                                            .with("index", json!(idx))
+                                            .with("args", json!(arguments)),
+                                    );
+                                }
+                            }
+                        }
+                        NormalizedStreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens: cached,
+                        } => {
+                            if let Some(value) = input_tokens {
+                                tokens_in = value;
+                            }
+                            if let Some(value) = output_tokens {
+                                tokens_out = value;
+                            }
+                            if let Some(value) = cached {
+                                cached_tokens = value;
+                            }
+                        }
+                        NormalizedStreamEvent::FinishReason(reason) => finish_reason = reason,
+                        NormalizedStreamEvent::ToolCallComplete { .. } => {}
+                        NormalizedStreamEvent::RetryableError(detail)
+                        | NormalizedStreamEvent::FatalError(detail) => {
+                            err = Some(format!("provider stream error: {detail}"));
+                            break 'read_stream;
+                        }
                     }
                 }
             }
@@ -4259,206 +1600,6 @@ async fn stream_turn_openai(
 // builder, and SSE response parser. Gemini 3 + Claude-via-Antigravity ride the
 // same path.
 
-/// Map a user-facing / catalog model id onto the Antigravity Code Assist wire
-/// id. Strips `models/` and `antigravity-` prefixes; for Gemini 3 Pro (which
-/// requires a `-low`/`-high` tier suffix on Antigravity) appends the tier from
-/// the requested reasoning effort when missing.
-fn resolve_antigravity_model_id(model: &str, reasoning_effort: &str) -> String {
-    let mut id = model.strip_prefix("models/").unwrap_or(model).to_string();
-    if let Some(rest) = id.strip_prefix("antigravity-") {
-        id = rest.to_string();
-    }
-    let lower = id.to_ascii_lowercase();
-    // Gemini 3 / 3.1 Pro on Antigravity requires an explicit -low/-high tier.
-    let is_pro = (lower.starts_with("gemini-3") || lower.starts_with("gemini-3.1"))
-        && lower.contains("pro")
-        && !lower.contains("flash");
-    let has_tier = lower.ends_with("-low") || lower.ends_with("-high");
-    if is_pro && !has_tier {
-        let tier = match reasoning_effort.to_ascii_lowercase().as_str() {
-            "low" | "minimal" | "none" | "" => "low",
-            _ => "high",
-        };
-        id = format!("{id}-{tier}");
-    }
-    id
-}
-
-/// Apply the right thinkingConfig shape for the Antigravity model family.
-fn apply_antigravity_thinking(request: &mut Value, model: &str, reasoning_effort: &str) {
-    let lower = model.to_ascii_lowercase();
-    let effort = reasoning_effort.to_ascii_lowercase();
-    let off = matches!(effort.as_str(), "" | "none" | "off");
-    if lower.contains("gemini-3") {
-        // Gemini 3 uses thinkingLevel strings, not numeric budgets.
-        if off {
-            // Still send a low level — Gemini 3 rejects budget 0; "low" is the
-            // cheapest tier Antigravity accepts for Pro, "minimal" for Flash.
-            let level = if lower.contains("flash") {
-                "minimal"
-            } else {
-                "low"
-            };
-            request["request"]["generationConfig"]["thinkingConfig"] =
-                json!({ "thinkingLevel": level, "includeThoughts": true });
-        } else {
-            let level = match effort.as_str() {
-                "minimal" => "minimal",
-                "low" => "low",
-                "medium" => "medium",
-                "high" | "max" => "high",
-                _ => {
-                    if lower.contains("flash") {
-                        "medium"
-                    } else {
-                        "high"
-                    }
-                }
-            };
-            // Pro only accepts low/high — clamp medium/minimal.
-            let level = if !lower.contains("flash") {
-                match level {
-                    "high" => "high",
-                    _ => "low",
-                }
-            } else {
-                level
-            };
-            request["request"]["generationConfig"]["thinkingConfig"] =
-                json!({ "thinkingLevel": level, "includeThoughts": true });
-        }
-        return;
-    }
-    // Gemini 2.5 / Claude-via-Antigravity: numeric budget.
-    if off {
-        request["request"]["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
-    } else {
-        let budget = match effort.as_str() {
-            "low" | "minimal" => 8192,
-            "medium" => 16384,
-            "high" | "max" => 32768,
-            _ => 16384,
-        };
-        request["request"]["generationConfig"]["thinkingConfig"] =
-            json!({ "thinkingBudget": budget, "includeThoughts": true });
-    }
-}
-
-/// Convert `&[Message]` to the Code Assist (native GenAI) `contents` array.
-/// Returns (contents, systemInstruction). System messages are extracted into a
-/// separate `systemInstruction` field (the GenAI API doesn't put them in
-/// `contents`). Tool-result messages need the function NAME (not just
-/// tool_call_id), so we track the last assistant's tool_call id→name map.
-fn messages_to_genai_contents(messages: &[Message]) -> (Vec<Value>, Option<Value>) {
-    let mut contents = Vec::new();
-    let mut system_parts: Vec<Value> = Vec::new();
-    let mut last_tool_call_names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
-    for msg in messages {
-        match msg {
-            Message::System { content, .. } => {
-                let text = genai_content_to_text(content);
-                if !text.is_empty() {
-                    system_parts.push(json!({"text": text}));
-                }
-            }
-            Message::User { content, .. } => {
-                let text = genai_content_to_text(content);
-                contents.push(json!({"role": "user", "parts": [{"text": text}]}));
-            }
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                last_tool_call_names.clear();
-                let mut parts: Vec<Value> = Vec::new();
-                if let Some(text) = content {
-                    if !text.is_empty() {
-                        parts.push(json!({"text": text}));
-                    }
-                }
-                if let Some(tcs) = tool_calls {
-                    for tc in tcs {
-                        last_tool_call_names.insert(tc.id.clone(), tc.function.name.clone());
-                        let args: Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
-                        parts.push(
-                            json!({"functionCall": {"name": &tc.function.name, "args": args}}),
-                        );
-                    }
-                }
-                if !parts.is_empty() {
-                    contents.push(json!({"role": "model", "parts": parts}));
-                }
-            }
-            Message::Tool {
-                tool_call_id,
-                name,
-                content,
-            } => {
-                let func_name = name
-                    .clone()
-                    .or_else(|| last_tool_call_names.get(tool_call_id).cloned())
-                    .unwrap_or_else(|| "unknown".to_string());
-                contents.push(json!({
-                    "role": "function",
-                    "parts": [{"functionResponse": {"name": func_name, "response": {"result": content}}}]
-                }));
-            }
-        }
-    }
-
-    let system_instruction = if system_parts.is_empty() {
-        None
-    } else {
-        Some(json!({"parts": system_parts}))
-    };
-    (contents, system_instruction)
-}
-
-/// Extract plain text from a `Content` (string or multimodal — joins text parts).
-fn genai_content_to_text(content: &crate::message::Content) -> String {
-    use crate::message::{Content, ContentPart};
-    match content {
-        Content::Text(s) => s.clone(),
-        Content::Multimodal(parts) => parts
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.clone()),
-                ContentPart::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-/// Convert OpenAI-shaped tool schemas to GenAI `tools` format.
-/// OpenAI: `[{"type":"function","function":{"name":..,"description":..,"parameters":..}}]`
-/// GenAI:  `[{"functionDeclarations":[{"name":..,"description":..,"parameters":..}]}]`
-fn tools_to_genai(tools: &[Value]) -> Vec<Value> {
-    let decls: Vec<Value> = tools
-        .iter()
-        .filter_map(|t| t.get("function"))
-        .map(|f| {
-            let mut d = json!({
-                "name": f.get("name").cloned().unwrap_or(json!("")),
-                "description": f.get("description").cloned().unwrap_or(json!("")),
-            });
-            if let Some(p) = f.get("parameters") {
-                d["parameters"] = p.clone();
-            }
-            d
-        })
-        .collect();
-    if decls.is_empty() {
-        Vec::new()
-    } else {
-        vec![json!({"functionDeclarations": decls})]
-    }
-}
-
 /// Stream a turn through the Antigravity / Code Assist API (native GenAI
 /// wire format). This is the OAuth path for Gemini 3 + Claude-via-Antigravity
 /// — `generativelanguage.googleapis.com` only accepts API keys; the OAuth
@@ -4479,60 +1620,19 @@ async fn stream_turn_gemini(
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
     let api_key = provider.api_key.as_deref().unwrap_or("");
-    let base_url = provider.base_url.trim_end_matches('/');
     let max_attempts = 3u32;
-
-    // Project ID for Code Assist / Antigravity. Built-in Google OAuth was
-    // removed; plugins (or env) must supply the project. Fall back to the
-    // public Antigravity default used by CLIProxy / business accounts.
-    let project = provider
-        .headers
-        .iter()
-        .find(|(k, _)| {
-            let kl = k.to_ascii_lowercase();
-            kl == "x-goog-user-project"
-                || kl == "cloudaicompanion-project"
-                || kl == "x-code-assist-project"
-        })
-        .map(|(_, v)| v.clone())
-        .or_else(|| std::env::var("CODE_ASSIST_PROJECT").ok())
-        .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "rising-fact-p41fc".to_string());
-
-    // Convert messages + tools to GenAI format.
-    let (contents, system_instruction) = messages_to_genai_contents(messages);
-    let genai_tools = tools_to_genai(tools);
-
-    // Strip "models/" / "antigravity-" prefixes; resolve Gemini 3 Pro tier.
-    let model_name = resolve_antigravity_model_id(model, reasoning_effort);
-
-    // Build the request body. `userAgent: "antigravity"` is required by the
-    // Antigravity gateway (CLIProxy / opencode-antigravity-auth send it).
-    let mut request = json!({
-        "model": model_name,
-        "project": project,
-        "userAgent": "antigravity",
-        "request": {
-            "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-            },
-        },
-    });
-    if let Some(si) = system_instruction {
-        request["request"]["systemInstruction"] = si;
-    }
-    if !genai_tools.is_empty() {
-        request["request"]["tools"] = json!(genai_tools);
-    }
-    // Thinking config:
-    // - Gemini 3: thinkingLevel string (minimal/low/medium/high)
-    // - Gemini 2.5 / Claude-via-Antigravity: thinkingBudget numeric + includeThoughts
-    // - "none"/empty: disable (budget 0) for non-Gemini-3 families
-    apply_antigravity_thinking(&mut request, &model_name, reasoning_effort);
-
-    let url = format!("{base_url}:streamGenerateContent?alt=sse");
+    let adapter = adapter_for(provider);
+    let built = adapter.build_request(&ProviderRequest {
+        provider,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        thinking_levels: &[],
+        max_tokens,
+    })?;
+    let request = built.body;
+    let url = built.url;
     let idle = Duration::from_secs(idle_timeout_secs.max(5));
     let est_prompt = prompt_est;
     let mut last_stats: Option<Instant> = None;
@@ -4549,15 +1649,21 @@ async fn stream_turn_gemini(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let resp =
-            send_with_retry(client, &url, api_key, &provider.headers, &request, cancel).await?;
+        let resp = send_with_retry(
+            client,
+            &url,
+            api_key,
+            &provider.headers,
+            &request,
+            cancel,
+            adapter_for(provider),
+        )
+        .await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = BytesMut::new();
-        let mut sse_lines: Vec<String> = Vec::new();
-        let mut pending = String::new();
+        let mut decoder = SseDecoder::default();
         let mut err: Option<String> = None;
 
-        loop {
+        'read_stream: loop {
             let chunk = tokio::select! {
                 c = tokio::time::timeout(idle, stream.next()) => match c {
                     Ok(x) => x,
@@ -4573,115 +1679,88 @@ async fn stream_turn_gemini(
                     break;
                 }
             };
-            sse_lines.clear();
-            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
-
-            for line in sse_lines.drain(..) {
-                if line.is_empty() || line.starts_with(':') {
-                    pending.clear();
-                    continue;
-                }
-                let data = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"))
-                    .unwrap_or("");
-                if data == "[DONE]" || data.is_empty() {
-                    pending.clear();
-                    continue;
-                }
-                pending.push_str(data);
-                let obj = match serde_json::from_str::<Value>(&pending) {
-                    Ok(o) => {
-                        pending.clear();
-                        o
+            for frame in decoder.push(&chunk) {
+                let obj = match frame {
+                    SseFrame::Json { value, .. } => value,
+                    SseFrame::Done => continue,
+                    SseFrame::Malformed { preview, .. } => {
+                        err = Some(malformed_response(&preview).message);
+                        break 'read_stream;
                     }
-                    Err(_) => continue,
                 };
 
-                // Code Assist wraps the GenAI response in a "response" field.
-                let resp_obj = obj.get("response").unwrap_or(&obj);
-
-                // Usage metadata (may arrive on any chunk, finalized on the last).
-                if let Some(u) = resp_obj.get("usageMetadata") {
-                    if let Some(p) = u.get("promptTokenCount").and_then(token_count) {
-                        tokens_in = p;
-                    }
-                    if let Some(c) = u.get("candidatesTokenCount").and_then(token_count) {
-                        tokens_out = c;
-                    }
-                    if let Some(t) = u.get("cachedContentTokenCount").and_then(token_count) {
-                        cached_tokens = t;
-                    }
-                }
-
-                let Some(candidate) = resp_obj.get("candidates").and_then(|c| c.get(0)) else {
-                    continue;
-                };
-
-                // Parse content parts (text / thought / functionCall).
-                if let Some(parts) = candidate
-                    .get("content")
-                    .and_then(|c| c.get("parts"))
-                    .and_then(|p| p.as_array())
-                {
-                    for part in parts {
-                        // Regular text content.
-                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            let is_thought = part
-                                .get("thought")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            if !t.is_empty() {
-                                if is_thought {
-                                    if reasoning.is_empty() {
-                                        timer.mark_first_token();
-                                    }
-                                    reasoning.push_str(t);
-                                    if !quiet {
-                                        emitted = true;
-                                        emit(&Event::new("thinking").with("text", json!(t)));
-                                    }
-                                } else {
-                                    if content.is_empty() {
-                                        timer.mark_first_token();
-                                    }
-                                    content.push_str(t);
-                                    if !quiet {
-                                        emitted = true;
-                                        emit(&Event::new("delta").with("text", json!(t)));
-                                    }
-                                }
+                for event in adapter.decode_stream_event(&obj) {
+                    match event {
+                        NormalizedStreamEvent::TextDelta(text) => {
+                            if content.is_empty() {
+                                timer.mark_first_token();
+                            }
+                            content.push_str(&text);
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("delta").with("text", json!(text)));
                             }
                         }
-                        // Function call (tool call).
-                        if let Some(fc) = part.get("functionCall") {
-                            let name = fc
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let args = fc.get("args").cloned().unwrap_or(json!({}));
+                        NormalizedStreamEvent::ReasoningDelta(text) => {
+                            if reasoning.is_empty() {
+                                timer.mark_first_token();
+                            }
+                            reasoning.push_str(&text);
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("thinking").with("text", json!(text)));
+                            }
+                        }
+                        NormalizedStreamEvent::ToolCallStart(delta) => {
+                            timer.mark_first_token();
+                            let name = delta.name.unwrap_or_default();
+                            let args = delta
+                                .arguments
+                                .as_deref()
+                                .and_then(|arguments| serde_json::from_str(arguments).ok())
+                                .unwrap_or_else(|| json!({}));
+                            let index = genai_tool_calls.len();
                             genai_tool_calls.push((name.clone(), args.clone()));
                             if !quiet {
                                 emitted = true;
                                 emit(
                                     &Event::new("tool_call_name")
-                                        .with("index", json!(genai_tool_calls.len() - 1))
+                                        .with("index", json!(index))
                                         .with("name", json!(name)),
                                 );
                                 emit(
                                     &Event::new("tool_call_args")
-                                        .with("index", json!(genai_tool_calls.len() - 1))
+                                        .with("index", json!(index))
                                         .with("args", json!(args.to_string())),
                                 );
                             }
                         }
-                    }
-                }
-
-                if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str()) {
-                    if !fr.is_empty() && fr != "FINISH_REASON_UNSPECIFIED" {
-                        finish_reason = fr.to_string();
+                        NormalizedStreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens: cached,
+                        } => {
+                            if let Some(value) = input_tokens {
+                                tokens_in = value;
+                            }
+                            if let Some(value) = output_tokens {
+                                tokens_out = value;
+                            }
+                            if let Some(value) = cached {
+                                cached_tokens = value;
+                            }
+                        }
+                        NormalizedStreamEvent::FinishReason(reason) => finish_reason = reason,
+                        NormalizedStreamEvent::FatalError(message) => {
+                            err = Some(message);
+                            break;
+                        }
+                        NormalizedStreamEvent::RetryableError(message) => {
+                            err = Some(message);
+                            break;
+                        }
+                        NormalizedStreamEvent::ToolCallDelta(_)
+                        | NormalizedStreamEvent::ToolCallComplete { .. } => {}
                     }
                 }
 
@@ -4867,6 +1946,7 @@ async fn send_with_retry(
     headers: &[(String, String)],
     body: &Value,
     cancel: &CancellationToken,
+    adapter: &dyn ProviderAdapter,
 ) -> Result<reqwest::Response, String> {
     let mut attempt = 0u32;
     loop {
@@ -4911,9 +1991,10 @@ async fn send_with_retry(
             Err(e) => {
                 // Transport error: retry with backoff.
                 if attempt >= 4 {
+                    let normalized = adapter.normalize_error(None, &fmt_chain(&e));
                     return Err(format!(
                         "request failed after {attempt} attempts: {}",
-                        fmt_chain(&e)
+                        normalized.message
                     ));
                 }
                 let backoff = backoff_ms(attempt, None);
@@ -4937,7 +2018,8 @@ async fn send_with_retry(
         let retryable = status.as_u16() == 429 || status.is_server_error();
         if !retryable || attempt >= 4 {
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status}: {text}"));
+            let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
+            return Err(format!("HTTP {status}: {}", normalized.message));
         }
 
         // P2-6: Retry-After may be integer seconds OR an HTTP-date; parse both.
@@ -5334,17 +2416,6 @@ pub fn build_anthropic_request(
     Value::Object(body)
 }
 
-/// Map an Anthropic `stop_reason` to the OpenAI `finish_reason` the harness
-/// expects ("stop" | "tool_calls" | "length").
-fn anthropic_stop_reason(sr: &str) -> String {
-    match sr {
-        "end_turn" | "stop_sequence" => "stop".to_string(),
-        "tool_use" => "tool_calls".to_string(),
-        "max_tokens" => "length".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// Accumulator for one Anthropic content block while streaming (text / thinking
 /// / tool_use). Keyed by the block `index` from the SSE events.
 #[derive(Default)]
@@ -5353,30 +2424,6 @@ struct AnthropicBlock {
     tool_id: String,
     tool_name: String,
     tool_args: String,
-}
-
-/// Initialize a `tool_use` block from a `content_block_start` event's
-/// `content_block` object — sets the tool id + name ONLY. The streamed
-/// arguments arrive separately via `input_json_delta` fragments (handled in
-/// the `content_block_delta` arm), so the start event's `input` field — which
-/// Anthropic's streaming API always sends as the empty placeholder `{}` for a
-/// tool_use — must NOT be captured here. Prepending it would corrupt the
-/// assembled arguments as `{}{...}` (e.g. `{}{"command":"ls"}`), which the
-/// tool dispatcher then rejects as malformed JSON. This was observed with
-/// MiniMax-M3 over the OpenCode Go Anthropic `/v1/messages` path. Empty args
-/// are substituted with `"{}"` downstream when finalizing tool_calls, so
-/// leaving `tool_args` empty here is correct.
-fn init_tool_use_block(b: &mut AnthropicBlock, cb: &Value) {
-    b.tool_id = cb
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    b.tool_name = cb
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
 }
 
 /// POST an Anthropic request with retry on 429/5xx (same policy as the OpenAI
@@ -5389,6 +2436,7 @@ async fn send_anthropic_request(
     body: &Value,
     cancel: &CancellationToken,
 ) -> Result<reqwest::Response, String> {
+    let adapter = adapter_for(provider);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -5428,7 +2476,8 @@ async fn send_anthropic_request(
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 if !retryable || attempt >= 4 {
                     let text = r.text().await.unwrap_or_default();
-                    return Err(format!("HTTP {status}: {text}"));
+                    let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
+                    return Err(format!("HTTP {status}: {}", normalized.message));
                 }
                 let retry_after = r
                     .headers()
@@ -5447,9 +2496,10 @@ async fn send_anthropic_request(
             }
             Err(e) => {
                 if attempt >= 4 {
+                    let normalized = adapter.normalize_error(None, &fmt_chain(&e));
                     return Err(format!(
                         "request failed after {attempt} attempts: {}",
-                        fmt_chain(&e)
+                        normalized.message
                     ));
                 }
                 let backoff = backoff_ms(attempt, None);
@@ -5483,14 +2533,18 @@ async fn stream_turn_anthropic(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
-    let mt = if max_tokens == 0 { 8192 } else { max_tokens };
-    // Use the native Message-based Anthropic request builder.
-    let mut body =
-        message::build_anthropic_request(messages, tools, reasoning_effort, thinking_levels, mt);
-    body["stream"] = json!(true);
-    body["model"] = json!(model);
-
-    let url = format!("{}{ANTHROPIC_MESSAGES_PATH}", provider.base_url);
+    let adapter = adapter_for(provider);
+    let built = adapter.build_request(&ProviderRequest {
+        provider,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        thinking_levels,
+        max_tokens,
+    })?;
+    let body = built.body;
+    let url = built.url;
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
     // Live stats: same grounded prompt estimate as the OpenAI path; the real
     // `usage` at stream end overwrites the footer with exact values.
@@ -5511,14 +2565,11 @@ async fn stream_turn_anthropic(
         attempt += 1;
         let resp = send_anthropic_request(client, &url, provider, &body, cancel).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = BytesMut::new();
-        let mut sse_lines: Vec<String> = Vec::new();
-        let mut cur_event = String::new();
-        let mut pending = String::new();
+        let mut decoder = SseDecoder::default();
         let mut emitted = false;
         let mut err: Option<String> = None;
 
-        loop {
+        'read_stream: loop {
             let chunk = tokio::select! {
                 c = tokio::time::timeout(idle, stream.next()) => match c {
                     Ok(x) => x,
@@ -5537,190 +2588,117 @@ async fn stream_turn_anthropic(
                     break;
                 }
             };
-            sse_lines.clear();
-            sse_take_lines(&mut buf, &chunk, &mut sse_lines);
-
-            // Process complete SSE frames. Anthropic frames pair an `event:`
-            // line with a `data:` line; the event type drives dispatch.
-            for line in sse_lines.drain(..) {
-                if line.is_empty() {
-                    pending.clear();
-                    cur_event.clear();
-                    continue;
-                }
-                if line.starts_with(':') {
-                    continue; // SSE comment / keepalive
-                }
-                if let Some(ev) = line.strip_prefix("event:") {
-                    cur_event = ev.trim().to_string();
-                    continue;
-                }
-                let data = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"))
-                    .unwrap_or("");
-                if data.is_empty() {
-                    continue;
-                }
-                if data == "[DONE]" {
-                    pending.clear();
-                    continue;
-                }
-                pending.push_str(data);
-                let obj = match serde_json::from_str::<Value>(&pending) {
-                    Ok(o) => {
-                        pending.clear();
-                        o
+            for frame in decoder.push(&chunk) {
+                let (event_name, mut obj) = match frame {
+                    SseFrame::Json { event, value } => (event, value),
+                    SseFrame::Done => continue,
+                    SseFrame::Malformed { preview, .. } => {
+                        err = Some(malformed_response(&preview).message);
+                        break 'read_stream;
                     }
-                    Err(_) => continue, // wait for more `data:` lines to complete the frame
                 };
 
-                // Anthropic's first-party stream includes an `event:` line, but
-                // a number of Messages-compatible gateways emit data-only SSE
-                // and carry the same discriminator in the JSON `type` field.
-                // Accept both forms so those endpoints stream progressively
-                // instead of silently accumulating an empty final response.
-                let event_type = if cur_event.is_empty() {
-                    obj.get("type").and_then(Value::as_str).unwrap_or("")
-                } else {
-                    cur_event.as_str()
-                };
-                match event_type {
-                    "message_start" => {
-                        if let Some(u) = obj.get("message").and_then(|m| m.get("usage")) {
-                            if let Some(p) = u.get("input_tokens").and_then(token_count) {
-                                tokens_in = p;
-                            }
-                            if let Some(c) = u.get("cache_read_input_tokens").and_then(token_count)
-                            {
-                                cached_tokens = c;
-                            }
-                        }
+                // Some compatible gateways provide the discriminator only in
+                // the SSE `event:` line. Normalize that transport quirk before
+                // handing the object to the adapter's pure decoder.
+                if obj.get("type").is_none() {
+                    if let Some(event_name) = event_name {
+                        obj["type"] = json!(event_name);
                     }
-                    "content_block_start" => {
-                        let idx = obj.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        while blocks.len() <= idx {
-                            blocks.push(AnthropicBlock::default());
+                }
+                for event in adapter.decode_stream_event(&obj) {
+                    match event {
+                        NormalizedStreamEvent::TextDelta(text) => {
+                            if content.is_empty() {
+                                timer.mark_first_token();
+                            }
+                            content.push_str(&text);
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("delta").with("text", json!(text)));
+                            }
                         }
-                        let cb = obj.get("content_block").cloned().unwrap_or(Value::Null);
-                        let btype = cb
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("text")
-                            .to_string();
-                        let b = &mut blocks[idx];
-                        b.kind = btype.clone();
-                        if btype == "tool_use" {
-                            // tool id + name only; the streamed `input` arrives
-                            // via input_json_delta (see init_tool_use_block).
+                        NormalizedStreamEvent::ReasoningDelta(text) => {
+                            if reasoning.is_empty() {
+                                timer.mark_first_token();
+                            }
+                            reasoning.push_str(&text);
+                            if !quiet {
+                                emitted = true;
+                                emit(&Event::new("thinking").with("text", json!(text)));
+                            }
+                        }
+                        NormalizedStreamEvent::ToolCallStart(delta) => {
                             timer.mark_first_token();
-                            init_tool_use_block(b, &cb);
+                            while blocks.len() <= delta.index {
+                                blocks.push(AnthropicBlock::default());
+                            }
+                            let block = &mut blocks[delta.index];
+                            block.kind = "tool_use".into();
+                            if let Some(id) = delta.id {
+                                block.tool_id = id;
+                            }
+                            if let Some(name) = delta.name {
+                                block.tool_name = name;
+                            }
                             if !quiet {
                                 emitted = true;
                                 emit(
                                     &Event::new("tool_call_start")
-                                        .with("id", json!(b.tool_id))
-                                        .with("index", json!(idx)),
+                                        .with("id", json!(block.tool_id))
+                                        .with("index", json!(delta.index)),
                                 );
-                                if !b.tool_name.is_empty() {
+                                if !block.tool_name.is_empty() {
                                     emit(
                                         &Event::new("tool_call_name")
-                                            .with("index", json!(idx))
-                                            .with("name", json!(b.tool_name)),
+                                            .with("index", json!(delta.index))
+                                            .with("name", json!(block.tool_name)),
                                     );
                                 }
                             }
                         }
-                    }
-                    "content_block_delta" => {
-                        let idx = obj.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        while blocks.len() <= idx {
-                            blocks.push(AnthropicBlock::default());
-                        }
-                        let Some(delta) = obj.get("delta") else {
-                            continue;
-                        };
-                        let dtype = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match dtype {
-                            "text_delta" => {
-                                if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() {
-                                        if content.is_empty() {
-                                            timer.mark_first_token();
-                                        }
-                                        content.push_str(t);
-                                        blocks[idx].kind = "text".into();
-                                        if !quiet {
-                                            emitted = true;
-                                            emit(&Event::new("delta").with("text", json!(t)));
-                                        }
-                                    }
+                        NormalizedStreamEvent::ToolCallDelta(delta) => {
+                            timer.mark_first_token();
+                            while blocks.len() <= delta.index {
+                                blocks.push(AnthropicBlock::default());
+                            }
+                            let block = &mut blocks[delta.index];
+                            block.kind = "tool_use".into();
+                            if let Some(arguments) = delta.arguments {
+                                block.tool_args.push_str(&arguments);
+                                if !quiet {
+                                    emitted = true;
+                                    emit(
+                                        &Event::new("tool_call_args")
+                                            .with("index", json!(delta.index))
+                                            .with("args", json!(arguments)),
+                                    );
                                 }
                             }
-                            "thinking_delta" => {
-                                if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() {
-                                        if reasoning.is_empty() {
-                                            timer.mark_first_token();
-                                        }
-                                        reasoning.push_str(t);
-                                        blocks[idx].kind = "thinking".into();
-                                        if !quiet {
-                                            emitted = true;
-                                            emit(&Event::new("thinking").with("text", json!(t)));
-                                        }
-                                    }
-                                }
-                            }
-                            "input_json_delta" => {
-                                if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str())
-                                {
-                                    if !pj.is_empty() {
-                                        timer.mark_first_token();
-                                    }
-                                    let b = &mut blocks[idx];
-                                    if b.kind.is_empty() {
-                                        b.kind = "tool_use".into();
-                                    }
-                                    b.tool_args.push_str(pj);
-                                    if !quiet {
-                                        emitted = true;
-                                        emit(
-                                            &Event::new("tool_call_args")
-                                                .with("index", json!(idx))
-                                                .with("args", json!(pj)),
-                                        );
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
-                    }
-                    "content_block_stop" => { /* block complete; nothing to emit */ }
-                    "message_delta" => {
-                        if let Some(d) = obj.get("delta") {
-                            if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
-                                finish_reason = anthropic_stop_reason(sr);
+                        NormalizedStreamEvent::ToolCallComplete { .. } => {}
+                        NormalizedStreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens: cached,
+                        } => {
+                            if let Some(value) = input_tokens {
+                                tokens_in = value;
+                            }
+                            if let Some(value) = output_tokens {
+                                tokens_out = value;
+                            }
+                            if let Some(value) = cached {
+                                cached_tokens = value;
                             }
                         }
-                        if let Some(u) = obj.get("usage") {
-                            if let Some(o) = u.get("output_tokens").and_then(token_count) {
-                                tokens_out = o;
-                            }
+                        NormalizedStreamEvent::FinishReason(reason) => finish_reason = reason,
+                        NormalizedStreamEvent::RetryableError(message)
+                        | NormalizedStreamEvent::FatalError(message) => {
+                            err = Some(message);
+                            break;
                         }
                     }
-                    "message_stop" | "ping" => { /* keepalive / done */ }
-                    "error" => {
-                        let msg = obj
-                            .get("error")
-                            .and_then(|e| e.get("message"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("anthropic stream error")
-                            .to_string();
-                        err = Some(msg);
-                        break;
-                    }
-                    _ => {}
                 }
 
                 // Live footer stats (same ~400ms throttle as the OpenAI path).
@@ -5822,143 +2800,6 @@ async fn stream_turn_anthropic(
         tokens_out,
         cached_tokens,
     ))
-}
-
-/// Discover models from an Anthropic-compatible endpoint (`GET /v1/models`).
-/// Anthropic lists model ids but not capabilities, so each id is mapped through
-/// a curated capability table; unknown ids get conservative defaults.
-async fn discover_models_anthropic(
-    client: &reqwest::Client,
-    provider: &ResolvedProvider,
-    cache_key: &str,
-    force_live: bool,
-) -> Vec<ModelInfo> {
-    // OpenCode Go: the single /v1/models endpoint serves every model over both
-    // wire protocols with no protocol field, so fetch it live and filter to
-    // this provider's protocol (Anthropic /v1/messages here). See
-    // opencode_go_discover_models for the family-prefix partition + caching.
-    if is_opencode_go(&provider.base_url) {
-        return opencode_go_discover_models(client, provider, cache_key, false).await;
-    }
-    if !force_live {
-        if let Some(models) = read_models_cache(cache_key) {
-            return models;
-        }
-    }
-    let url = format!("{}{ANTHROPIC_MODELS_PATH}", provider.base_url);
-    let mut req = client.get(&url).timeout(Duration::from_secs(8));
-    if provider.oauth {
-        if let Some(k) = provider.api_key.as_deref() {
-            req = req.header("authorization", format!("Bearer {k}"));
-        }
-        req = req.header("anthropic-beta", CLAUDE_OAUTH_BETA);
-    } else if let Some(k) = provider.api_key.as_deref() {
-        req = req.header("x-api-key", k);
-    }
-    req = req.header("anthropic-version", ANTHROPIC_VERSION);
-    for (k, v) in &provider.headers {
-        req = req.header(k, v);
-    }
-    let mut live = match req.send().await {
-        Ok(r) if r.status().is_success() => {
-            parse_anthropic_models(&r.json::<Value>().await.unwrap_or_else(|_| json!({})))
-        }
-        _ => read_models_cache_stale(cache_key).unwrap_or_else(anthropic_fallback_models),
-    };
-    // Enrich with models.dev caps for models the curated table left at
-    // generic defaults (relevant for Anthropic-compatible gateways).
-    if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
-        crate::models_dev::enrich_models(&mut live, &dev, &provider.base_url);
-    }
-    write_models_cache(cache_key, &live);
-    live
-}
-
-/// Parse Anthropic `GET /v1/models` -> `{data:[{id,display_name,...}]}` into
-/// ModelInfo, applying curated per-id capabilities. Falls back to the static
-/// list when the response has no models.
-fn parse_anthropic_models(data: &Value) -> Vec<ModelInfo> {
-    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
-        return anthropic_fallback_models();
-    };
-    let mut out: Vec<ModelInfo> = arr
-        .iter()
-        .filter_map(|m| {
-            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
-            let name = m
-                .get("display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&id)
-                .to_string();
-            Some(anthropic_model_caps(&id, &name))
-        })
-        .collect();
-    if out.is_empty() {
-        return anthropic_fallback_models();
-    }
-    // de-dup by id, preserve order
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|m| seen.insert(m.id.clone()));
-    out
-}
-
-/// Curated capabilities for a Claude model id (context window, max output,
-/// extended-thinking support, vision). Unknown ids get conservative defaults
-/// (thinking off, vision on — Claude has had vision since 3.0).
-#[allow(clippy::if_same_then_else)] // families share caps today but are kept
-                                    // distinct for readability + future divergence as models gain new caps.
-fn anthropic_model_caps(id: &str, name: &str) -> ModelInfo {
-    let l = id.to_ascii_lowercase();
-    let (ctx, max, thinking, vision) = if l.contains("opus-4") {
-        (200_000, 32_000, true, true)
-    } else if l.contains("sonnet-4") {
-        (200_000, 16_000, true, true)
-    } else if l.contains("haiku-4") {
-        (200_000, 8_192, false, true)
-    } else if l.contains("3-7-sonnet") || l.contains("3.7-sonnet") {
-        (200_000, 8_192, true, true)
-    } else if l.contains("3-5-sonnet") || l.contains("3.5-sonnet") {
-        (200_000, 8_192, false, true)
-    } else if l.contains("3-5-haiku") || l.contains("3.5-haiku") {
-        (200_000, 8_192, false, true)
-    } else if l.contains("3-opus") || l.contains("3.0-opus") {
-        (200_000, 4_096, false, true)
-    } else if l.contains("3-haiku") {
-        (200_000, 4_096, false, true)
-    } else {
-        (200_000, 8_192, false, true)
-    };
-    ModelInfo {
-        id: id.to_string(),
-        name: name.to_string(),
-        reasoning: thinking,
-        context_window: ctx,
-        max_tokens: max,
-        thinking_levels: if thinking {
-            DEFAULT_THINKING_LEVELS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        },
-        vision,
-        ..Default::default()
-    }
-}
-
-/// Static Claude model list used when `/v1/models` is unreachable.
-fn anthropic_fallback_models() -> Vec<ModelInfo> {
-    let ids = [
-        "claude-opus-4-1",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-0",
-        "claude-haiku-4-5",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022",
-    ];
-    ids.iter().map(|id| anthropic_model_caps(id, id)).collect()
 }
 
 #[cfg(test)]
@@ -7088,15 +3929,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_stop_reason_maps_to_openai() {
-        assert_eq!(anthropic_stop_reason("end_turn"), "stop");
-        assert_eq!(anthropic_stop_reason("stop_sequence"), "stop");
-        assert_eq!(anthropic_stop_reason("tool_use"), "tool_calls");
-        assert_eq!(anthropic_stop_reason("max_tokens"), "length");
-        assert_eq!(anthropic_stop_reason("weird"), "weird");
-    }
-
-    #[test]
     fn anthropic_image_block_data_url_and_plain_url() {
         let b = anthropic_image_block("data:image/png;base64,QUJD").unwrap();
         assert_eq!(b["type"], "image");
@@ -7195,26 +4027,6 @@ mod tests {
         assert_eq!(rblocks[0]["type"], "tool_result");
         assert_eq!(rblocks[0]["tool_use_id"], "call_1");
         assert_eq!(rblocks[0]["content"], "contents of foo");
-    }
-
-    #[test]
-    fn anthropic_tool_use_start_ignores_empty_input_placeholder() {
-        // Anthropic streaming: content_block_start always carries `input: {}`
-        // for a tool_use; the real args arrive via input_json_delta. The start
-        // handler must NOT capture that placeholder — doing so prepends "{}"
-        // and corrupts the assembled args as `{}{...}` (regression observed
-        // with MiniMax-M3 over the opencode-go Anthropic path).
-        let mut b = AnthropicBlock::default();
-        init_tool_use_block(
-            &mut b,
-            &json!({"type":"tool_use","id":"toolu_1","name":"bash","input":{}}),
-        );
-        assert_eq!(b.tool_id, "toolu_1");
-        assert_eq!(b.tool_name, "bash");
-        assert_eq!(b.tool_args, ""); // placeholder was NOT captured
-                                     // simulate input_json_delta fragments appending the real args
-        b.tool_args.push_str(r#"{"command":"ls -la"}"#);
-        assert_eq!(b.tool_args, r#"{"command":"ls -la"}"#); // no leading "{}"
     }
 
     #[test]
@@ -7667,32 +4479,6 @@ mod tests {
         .expect_err("a repeated protocol violation must not silently complete");
         assert!(error.contains("invalid reasoning DSML"));
         assert_eq!(server.await.unwrap().len(), 2);
-    }
-
-    #[test]
-    fn sse_lines_are_released_before_the_blank_event_boundary() {
-        let mut buf = BytesMut::new();
-        let mut lines = Vec::new();
-
-        // A network read can end immediately after the data line. The parser
-        // must release that delta now, not wait for a later transport chunk
-        // containing the blank SSE event delimiter.
-        sse_take_lines(
-            &mut buf,
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n",
-            &mut lines,
-        );
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("\"one\""));
-
-        lines.clear();
-        sse_take_lines(&mut buf, b"\ndata: part", &mut lines);
-        assert_eq!(lines, vec![String::new()]);
-        assert_eq!(&buf[..], b"data: part");
-
-        lines.clear();
-        sse_take_lines(&mut buf, b"ial\n", &mut lines);
-        assert_eq!(lines, vec!["data: partial"]);
     }
 
     #[tokio::test]

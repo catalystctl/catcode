@@ -65,9 +65,17 @@ impl Logger {
 
     /// Append one structured record. `kind` is a short tag (e.g. "tool", "http_retry").
     pub fn log(&self, kind: &str, payload: Value) {
+        let (session_id, run_id) = (
+            crate::runtime::current_session_id(),
+            crate::runtime::current_run_id(),
+        );
+        let mut payload = payload;
+        redact_log_value(&mut payload);
         let rec = json!({
             "ts": now_iso(),
             "kind": kind,
+            "session_id": session_id,
+            "run_id": run_id,
             "payload": payload,
         });
         let mut line = serde_json::to_string(&rec).unwrap_or_default();
@@ -76,6 +84,32 @@ impl Logger {
             let _ = f.write_all(line.as_bytes());
             let _ = f.flush();
         }
+    }
+}
+
+fn redact_log_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "api_key"
+                        | "authorization"
+                        | "password"
+                        | "access_token"
+                        | "refresh_token"
+                        | "id_token"
+                        | "client_secret"
+                        | "oauth_token"
+                ) {
+                    *value = Value::String("[REDACTED]".into());
+                } else {
+                    redact_log_value(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_log_value),
+        _ => {}
     }
 }
 
@@ -212,6 +246,8 @@ pub struct TurnTimer {
     /// so each request is timed independently of the wall time spent waiting for
     /// tool calls to run between requests.
     pub call_first_token: Option<Instant>,
+    call_started: Option<Instant>,
+    last_provider_call: Option<ProviderCallMetrics>,
     /// Accumulated generation time across every stream call in the turn (ms):
     /// each call's first-token → end window, summed. Excludes prefill (TTFT)
     /// and tool-call wait, so TPS reflects pure model generation throughput.
@@ -226,16 +262,30 @@ pub struct TurnTimer {
     pub out_tokens_est: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderCallMetrics {
+    pub duration_ms: u64,
+    pub ttft_ms: Option<u64>,
+    pub stream_ms: Option<u64>,
+}
+
 impl TurnTimer {
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
             first_token: None,
             call_first_token: None,
+            call_started: None,
+            last_provider_call: None,
             gen_ms: 0,
             out_tokens: 0,
             out_tokens_est: 0,
         }
+    }
+    pub fn begin_provider_call(&mut self) {
+        self.call_started = Some(Instant::now());
+        self.call_first_token = None;
+        self.last_provider_call = None;
     }
     /// Record the first generated token of the turn (TTFT) and of the current
     /// stream call (generation-time accounting). Called on the first reasoning,
@@ -286,7 +336,32 @@ impl TurnTimer {
         }
         self.out_tokens = self.out_tokens.saturating_add(tokens_out);
         self.out_tokens_est = self.out_tokens_est.saturating_add(est_out);
+        self.finish_provider_call();
         self.call_first_token = None;
+    }
+
+    pub fn finish_failed_provider_call(&mut self) {
+        self.finish_provider_call();
+        self.call_first_token = None;
+    }
+
+    pub fn take_provider_call_metrics(&mut self) -> Option<ProviderCallMetrics> {
+        self.last_provider_call.take()
+    }
+
+    fn finish_provider_call(&mut self) {
+        let Some(started) = self.call_started.take() else {
+            return;
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let ttft_ms = self
+            .call_first_token
+            .map(|first| first.duration_since(started).as_millis() as u64);
+        self.last_provider_call = Some(ProviderCallMetrics {
+            duration_ms,
+            ttft_ms,
+            stream_ms: ttft_ms.map(|ttft| duration_ms.saturating_sub(ttft)),
+        });
     }
     pub fn finalize(
         self,
@@ -413,5 +488,60 @@ mod tests {
         // Nothing streamed into gen_ms (e.g. only untimed tool-call args) → no TPS.
         let m = t.finalize(1000, 50, 0, "test".into());
         assert!(m.tps.is_none());
+    }
+
+    #[test]
+    fn provider_call_metrics_split_ttft_and_stream_duration() {
+        let mut timer = TurnTimer::new();
+        timer.begin_provider_call();
+        timer.call_started = Some(Instant::now() - std::time::Duration::from_millis(80));
+        timer.call_first_token = Some(Instant::now() - std::time::Duration::from_millis(50));
+        timer.end_call(1, 1);
+        let metrics = timer.take_provider_call_metrics().unwrap();
+        assert!(metrics.duration_ms >= 75);
+        assert!(metrics
+            .ttft_ms
+            .is_some_and(|ttft| (25..=40).contains(&ttft)));
+        assert!(metrics.stream_ms.is_some_and(|stream| stream >= 45));
+    }
+
+    #[test]
+    fn failed_provider_call_still_records_duration() {
+        let mut timer = TurnTimer::new();
+        timer.begin_provider_call();
+        timer.call_started = Some(Instant::now() - std::time::Duration::from_millis(20));
+        timer.finish_failed_provider_call();
+        let metrics = timer.take_provider_call_metrics().unwrap();
+        assert!(metrics.duration_ms >= 15);
+        assert_eq!(metrics.ttft_ms, None);
+        assert_eq!(metrics.stream_ms, None);
+    }
+
+    #[test]
+    fn structured_log_redacts_nested_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "catalyst-code-log-redaction-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let logger = Logger::new(Some(&path));
+            logger.log(
+                "security_test",
+                json!({
+                    "api_key": "secret-one",
+                    "nested": {"refresh_token": "secret-two", "safe": "visible"},
+                }),
+            );
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let record: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(record["payload"]["api_key"], "[REDACTED]");
+        assert_eq!(record["payload"]["nested"]["refresh_token"], "[REDACTED]");
+        assert_eq!(record["payload"]["nested"]["safe"], "visible");
+        assert!(!text.contains("secret-one"));
+        assert!(!text.contains("secret-two"));
+        let _ = std::fs::remove_file(path);
     }
 }

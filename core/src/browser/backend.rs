@@ -53,7 +53,9 @@ pub(crate) fn stub_capabilities() -> Value {
 
 #[allow(dead_code)]
 pub(crate) fn create_response(session_id: &str, tab_id: &str, profile: &str) -> Value {
+    #[allow(unused_mut)]
     let mut caps = stub_capabilities();
+    #[allow(unused_mut)]
     let mut warnings: Vec<Value> = Vec::new();
     #[cfg(feature = "native-browser")]
     {

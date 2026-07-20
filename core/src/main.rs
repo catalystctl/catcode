@@ -7,11 +7,13 @@
 // the lint here rather than obscure the call sites.
 #![allow(clippy::too_many_arguments)]
 
+mod agent;
 mod audit;
 mod browser;
 mod change_coupling;
 mod checkpoint;
 mod codebase_index;
+mod commands;
 mod config;
 mod context_pack;
 mod coverage_ledger;
@@ -31,6 +33,8 @@ mod learning_retrieval;
 mod learning_store;
 mod logging;
 mod memory;
+#[cfg(test)]
+mod memory_eval;
 mod memory_hygiene;
 mod memory_recall;
 mod memory_staleness;
@@ -44,7 +48,9 @@ mod presence;
 mod project_identity;
 mod protocol;
 mod provider;
+mod providers;
 mod rejected_approaches;
+mod runtime;
 mod search_tool;
 mod session;
 mod skill_metrics;
@@ -53,12 +59,13 @@ mod subagent;
 mod task_fingerprint;
 mod test_env;
 mod tool_cache;
+mod tooling;
 mod tools;
 mod vision;
 mod workspace;
 mod worktree;
 
-use config::{Approval, Config, PermissionRule, ResolvedProvider};
+use config::{Approval, Config, ResolvedProvider};
 use git_ctx::{git_context_injection, read_git_context};
 use intercom::IntercomBus;
 use logging::{
@@ -70,6 +77,7 @@ use memory::{memory_injection, relevant_memories_tail};
 use message::{ContentPart, FunctionCall, ImageUrl, Message, ToolCall};
 use plugins::{PluginManager, PLUGIN_DOCS};
 use protocol::{emit, emit_aborted_done, emit_turn_rejected, Command, Event, ModelInfo};
+use runtime::{CancellationReason, ResourceKind, RunContext, RuntimeCoordinator};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -452,7 +460,14 @@ fn provider_presets_json(cfg: &Config, pm: Option<&plugins::PluginManager>) -> V
 #[allow(dead_code)]
 pub struct PendingApproval {
     request_id: String,
+    session_id: String,
+    run_id: String,
+    coordinator_bound: bool,
+    cancellation: CancellationToken,
+    tool_call_id: String,
     tool: String,
+    risk: &'static str,
+    created_at_ms: u64,
     args: Value,
     notify: Arc<Notify>,
     granted: Mutex<Option<bool>>, // Some(true)=approved, Some(false)=denied, None=awaiting
@@ -508,7 +523,11 @@ pub struct State {
     pub active_provider: RwLock<Option<String>>,
     pub conversation: Mutex<Vec<Message>>,
     pub models: RwLock<Vec<ModelInfo>>,
-    pub current: Mutex<Option<CancellationToken>>,
+    /// Runtime identity/cancellation authority. `current` is retained as the
+    /// async-facing active-turn slot while migration proceeds; both carry the
+    /// same RunContext and stale finishers may clear it only by matching id.
+    pub runtime: Arc<RuntimeCoordinator>,
+    pub current: Mutex<Option<RunContext>>,
     pub handle: Mutex<Option<JoinHandle<()>>>,
     /// Pending approval requests keyed by their unique approval id (see
     /// APPROVAL_SEQ) so parallel subagents can't clobber each other's request.
@@ -619,15 +638,111 @@ pub struct State {
     pub auto_checkpoint_taken: std::sync::atomic::AtomicBool,
     /// Session-scoped count of `read_file` hits on `SKILL.md` (skill utilization).
     pub skill_read_count: std::sync::atomic::AtomicU64,
+    /// Full conversation compactions completed in this logical session.
+    pub compaction_count: std::sync::atomic::AtomicU64,
 }
 
 /// Cancel any in-flight turn and drop the one-deep follow-up queue. Shared by
 /// `/abort`, `/new`, `/clear`, `/reset`, and `load_session` so conversation
 /// boundaries never leave a prior turn streaming into the new context.
-async fn cancel_in_flight_turn(state: &State) {
+async fn cancel_in_flight_turn(state: &State, reason: CancellationReason, replace_session: bool) {
+    let cancellation_started = std::time::Instant::now();
     *state.queued.lock().await = None;
-    if let Some(tok) = state.current.lock().await.take() {
-        tok.cancel();
+    let cancelled = state.runtime.cancel_current(reason);
+    if replace_session {
+        state.runtime.replace_session(reason);
+    }
+    if let Some(run) = state.current.lock().await.take() {
+        run.cancellation().cancel();
+    }
+    if let Some(goal) = state.goal_deploy_cancel.lock().await.take() {
+        goal.cancel();
+    }
+    {
+        fn cancel_run_tree(run: &subagent::SubagentRun) {
+            if let Some(cancel) = &run.cancel {
+                cancel.cancel();
+            }
+            for child in &run.children {
+                cancel_run_tree(child);
+            }
+        }
+        let runs = state.subagent_runs.lock().await;
+        for run in runs.values() {
+            cancel_run_tree(run);
+        }
+    }
+    state.intercom.reset();
+
+    // Wake every interactive waiter. Their run cancellation is authoritative,
+    // but explicit notification bounds cleanup even if a waiter is between
+    // registering itself and entering its cancellation select.
+    for pending in state.pending.lock().await.values() {
+        *pending.granted.lock().await = Some(false);
+        pending.notify.notify_waiters();
+    }
+    for pending in state.pending_asks.lock().await.values() {
+        *pending.answers.lock().await = Some(Value::Null);
+        pending.notify.notify_waiters();
+    }
+    for pending in state.pending_sudos.lock().await.values() {
+        *pending.result.lock().await = Some(None);
+        pending.notify.notify_waiters();
+    }
+
+    // A session boundary must not race state replacement against a still-live
+    // turn. Most turns stop immediately through their cancellation token; abort
+    // the Rust task after a bounded grace period as a final containment step.
+    let mut forced_abort = false;
+    let mut cleanup_failures = 0_u64;
+    if let Some(mut handle) = state.handle.lock().await.take() {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => cleanup_failures = cleanup_failures.saturating_add(1),
+            Err(_) => {
+                forced_abort = true;
+                handle.abort();
+                if handle.await.is_err() {
+                    // A forced task abort returns JoinError::cancelled. Record the
+                    // forced containment separately, not as a cleanup failure.
+                }
+            }
+        }
+    }
+    state.pending.lock().await.clear();
+    state.pending_asks.lock().await.clear();
+    state.pending_sudos.lock().await.clear();
+    let duration_ms = cancellation_started.elapsed().as_millis() as u64;
+    let remaining_uncancelled_resources = state
+        .runtime
+        .snapshot()
+        .resources
+        .into_iter()
+        .filter(|resource| !resource.cancelled)
+        .count() as u64;
+    cleanup_failures = cleanup_failures.saturating_add(remaining_uncancelled_resources);
+    if let Some(cancelled) = cancelled {
+        state.logger.log(
+            "cancellation",
+            json!({
+                "session_id": &cancelled.session_id,
+                "run_id": &cancelled.run_id,
+                "reason": cancelled.reason.as_str(),
+                "duration_ms": duration_ms,
+                "status": if cleanup_failures == 0 { "completed" } else { "cleanup_failed" },
+                "forced_abort": forced_abort,
+                "cleanup_failures": cleanup_failures,
+            }),
+        );
+        emit(
+            &Event::new("run_cancelled")
+                .with("session_id", json!(cancelled.session_id))
+                .with("run_id", json!(cancelled.run_id))
+                .with("reason", json!(cancelled.reason.as_str()))
+                .with("duration_ms", json!(duration_ms))
+                .with("forced_abort", json!(forced_abort))
+                .with("cleanup_failures", json!(cleanup_failures)),
+        );
     }
 }
 
@@ -1016,7 +1131,12 @@ pub async fn aggregate_models_for(
     let names = logged_in_providers_for(cfg, keys, pm);
     if names.is_empty() {
         let rp = cfg.resolve_provider_with(keys, active);
-        let mut models = provider::discover_models(client, &rp).await;
+        let mut models = providers::registry::adapter_for(&rp)
+            .discover_models(providers::adapter::ProviderContext {
+                client,
+                provider: &rp,
+            })
+            .await;
         // Legacy/default models get the resolved provider tag so they route
         // correctly; models already tagged (e.g. by an earlier aggregation run
         // round-tripped through the session) keep their tag.
@@ -1037,7 +1157,12 @@ pub async fn aggregate_models_for(
         // Enrich with an OAuth subscription token (gcloud/`claude` CLI) when the
         // provider has no API key, so OAuth-only providers can discover models.
         let rp = oauth::enrich_oauth(rp, client, pm).await;
-        let mut discovered = provider::discover_models(client, &rp).await;
+        let mut discovered = providers::registry::adapter_for(&rp)
+            .discover_models(providers::adapter::ProviderContext {
+                client,
+                provider: &rp,
+            })
+            .await;
         for m in &mut discovered {
             m.provider = rp.name.clone();
             if seen.insert((m.provider.clone(), m.id.clone())) {
@@ -1080,591 +1205,7 @@ pub async fn aggregate_models_for(
 /// Rolling work-state summary. See the block comment above for the cache
 /// strategy. Updated by the signal helpers below and rendered into the
 /// transient tail message by `work_state_message`.
-#[derive(Clone, Default)]
-pub struct WorkState {
-    pub goal: String,
-    pub done: Vec<String>,
-    pub in_progress: Vec<String>,
-    pub next: Vec<String>,
-    pub recent_files: Vec<String>,
-    pub last_activity: String,
-    pub version: u64,
-}
-
-impl WorkState {
-    /// Render as a compact, model-facing system block. Empty sections are
-    /// omitted so the block stays minimal; each list is capped so a runaway
-    /// plan can't bloat every request.
-    pub fn render(&self) -> String {
-        const MAX_LIST: usize = 6;
-        const MAX_FILES: usize = 8;
-        let mut out = String::from(
-            "[Work state — ambient status the harness keeps current via todo_write \
-             and file edits. Use it as context; respond to the user's latest message, \
-             not to this block. Keep it accurate by updating todos as you work.]",
-        );
-        out.push_str("\nGoal: ");
-        let goal = if self.goal.is_empty() {
-            "(not yet stated)".to_string()
-        } else {
-            truncate_str(self.goal.as_str(), 240)
-        };
-        out.push_str(&goal);
-        {
-            let mut section = |label: &str, items: &[String]| {
-                if items.is_empty() {
-                    return;
-                }
-                out.push('\n');
-                out.push_str(label);
-                for it in items.iter().take(MAX_LIST) {
-                    out.push_str("\n- ");
-                    out.push_str(&truncate_str(it, 160));
-                }
-                if items.len() > MAX_LIST {
-                    out.push_str(&format!("\n- … +{} more", items.len() - MAX_LIST));
-                }
-            };
-            section("Done:", &self.done);
-            section("In progress:", &self.in_progress);
-            section("Next:", &self.next);
-        }
-        if !self.recent_files.is_empty() {
-            out.push_str("\nRecently touched: ");
-            let files: Vec<String> = self
-                .recent_files
-                .iter()
-                .take(MAX_FILES)
-                .map(|s| truncate_str(s, 120))
-                .collect();
-            out.push_str(&files.join(", "));
-        }
-        if !self.last_activity.is_empty() {
-            out.push_str("\nLast: ");
-            out.push_str(&truncate_str(&self.last_activity, 160));
-        }
-        out
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.goal.is_empty()
-            && self.done.is_empty()
-            && self.in_progress.is_empty()
-            && self.next.is_empty()
-            && self.recent_files.is_empty()
-            && self.last_activity.is_empty()
-    }
-
-    fn touch(&mut self) {
-        self.version = self.version.wrapping_add(1);
-    }
-
-    /// Partition a `todo_write` payload into done/in-progress/next. Pure logic
-    /// (no locking/emit) so it is unit-testable; the async wrapper adds those.
-    pub fn sync_from_todos(&mut self, todos: &[Value]) {
-        let mut done = Vec::new();
-        let mut in_progress = Vec::new();
-        let mut next = Vec::new();
-        for t in todos {
-            let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-            if subject.is_empty() {
-                continue;
-            }
-            match t.get("status").and_then(|v| v.as_str()).unwrap_or("") {
-                "completed" => done.push(subject.to_string()),
-                "in_progress" => in_progress.push(subject.to_string()),
-                _ => next.push(subject.to_string()),
-            }
-        }
-        self.done = done;
-        self.in_progress = in_progress;
-        self.next = next;
-        self.touch();
-    }
-
-    /// Record file paths touched (most-recent-first, deduped, capped) and a
-    /// short last-activity note. Pure logic; the async wrapper extracts paths.
-    pub fn record_files(&mut self, tool: &str, paths: &[String]) {
-        if paths.is_empty() {
-            return;
-        }
-        // Iterate in reverse so the FIRST-listed (primary) path lands at the
-        // front of the most-recent-first list — "Recently touched: a.rs, b.rs"
-        // reads naturally when a.rs was the edit's primary target.
-        for p in paths.iter().rev() {
-            if let Some(pos) = self.recent_files.iter().position(|x| x == p) {
-                self.recent_files.remove(pos);
-            }
-            self.recent_files.insert(0, p.clone());
-        }
-        self.recent_files.truncate(8);
-        let act = format!("{} {}", tool, paths.join(", "));
-        self.last_activity = truncate_str(&act, 160);
-        self.touch();
-    }
-}
-
-/// Emit a `work_state` event with the current rolling summary so the TUI/web
-/// can render a live status panel alongside the conversation.
-async fn emit_work_state(st: &State) {
-    let ws = st.work_state.lock().await.clone();
-    emit(
-        &Event::new("work_state")
-            .with("version", json!(ws.version))
-            .with("goal", json!(ws.goal))
-            .with("done", json!(ws.done))
-            .with("in_progress", json!(ws.in_progress))
-            .with("next", json!(ws.next))
-            .with("recent_files", json!(ws.recent_files))
-            .with("last_activity", json!(ws.last_activity)),
-    );
-}
-
-/// Cancel an in-flight goal deploy task (if any).
-async fn cancel_goal_deploy(st: &State) {
-    if let Some(tok) = st.goal_deploy_cancel.lock().await.take() {
-        tok.cancel();
-    }
-}
-
-/// Spawn the deterministic goal deploy loop on a child cancel token.
-/// After workers finish, starts a parent synthesizing turn so the user gets a
-/// completion follow-up (the planning turn already called `finish`).
-///
-/// Non-async on purpose: callers inside parent-turn helpers must not `.await` this
-/// (breaks a recursive `Future: Send` cycle with `start_goal_parent_turn`).
-fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
-    tokio::spawn(async move {
-        cancel_goal_deploy(&st).await;
-        // Emit before the (possibly slow) workspace snapshot so UIs leave the
-        // plan_ready dark gap immediately.
-        emit(&Event::new("info").with("message", json!("Goal deploy: snapshotting workspace…")));
-        let tok = CancellationToken::new();
-        *st.goal_deploy_cancel.lock().await = Some(tok.clone());
-        // Snapshot inside the task so ApproveGoalPlan / auto-deploy return fast.
-        {
-            let cfg = st.cfg.read().await;
-            let _ = checkpoint::create(
-                &cfg.workspace,
-                cfg.session_file.as_deref(),
-                "auto-before-goal-deploy",
-                &[],
-                true,
-            );
-        }
-        let need_followup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
-        // Clear cancel slot only if we still own it. A newer spawn cancels
-        // this token first, so a cancelled token means the slot was replaced.
-        if !tok.is_cancelled() {
-            *st.goal_deploy_cancel.lock().await = None;
-        }
-        if !need_followup || tok.is_cancelled() {
-            return;
-        }
-        let phase = {
-            let g = st.goal.lock().await;
-            g.phase.clone()
-        };
-        match phase {
-            goal::GoalPhase::Verifying => {
-                spawn_goal_verify(st.clone(), client.clone()).await;
-            }
-            goal::GoalPhase::Synthesizing => {
-                let wrap = {
-                    let g = st.goal.lock().await;
-                    (
-                        goal::build_wrapup_prompt(&g),
-                        g.parent_model.clone(),
-                        g.reasoning_effort.clone(),
-                        g.id.clone(),
-                    )
-                };
-                let (prompt, model, effort, goal_id) = wrap;
-                start_goal_parent_turn(
-                    st.clone(),
-                    client.clone(),
-                    prompt,
-                    model,
-                    effort,
-                    goal_id,
-                    "wrapup",
-                )
-                .await;
-            }
-            _ => {}
-        }
-    });
-}
-
-/// After a planning turn ends: fail if no plan, or kick review/deploy.
-async fn maybe_finish_goal_planning(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
-    enum Next {
-        Deploy,
-        Review,
-        None,
-    }
-    let next = {
-        let mut g = st.goal.lock().await;
-        // Deploy path: plan was written this turn (or earlier) and auto-deploy is armed.
-        if g.deploy_after_turn && g.plan.is_some() && !g.prompts.is_empty() {
-            g.deploy_after_turn = false;
-            if g.ceo_mode && g.max_plan_revisions > 0 {
-                Next::Review
-            } else {
-                Next::Deploy
-            }
-        } else if g.phase == goal::GoalPhase::Planning {
-            if cancelled {
-                goal::fail_goal(&mut g, "planning aborted");
-            } else if g.plan.is_none() {
-                goal::fail_goal(
-                    &mut g,
-                    "planning turn ended without goal_write_plan — re-run /goal",
-                );
-            }
-            Next::None
-        } else {
-            Next::None
-        }
-    };
-    match next {
-        Next::Deploy => spawn_goal_deploy(st.clone(), client.clone()),
-        // Fire-and-forget like deploy: planning finishers still hold st.current,
-        // so awaiting review here always hit the "session busy" path and skipped
-        // self-review (never deploying). Spawn so current can clear first.
-        Next::Review => spawn_goal_review(st.clone(), client.clone()),
-        Next::None => {}
-    }
-}
-
-/// Start the CEO pre-deploy self-review parent turn.
-///
-/// Non-async on purpose (same pattern as [`spawn_goal_deploy`]): callers inside
-/// parent-turn finishers must not `.await` this while `st.current` is still held.
-fn spawn_goal_review(st: Arc<State>, client: reqwest::Client) {
-    tokio::spawn(async move {
-        // Wait for the planning turn to release the session slot.
-        for _ in 0..120 {
-            if st.current.lock().await.is_none() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let wrap = {
-            let mut g = st.goal.lock().await;
-            if g.plan.is_none() || g.prompts.is_empty() {
-                return;
-            }
-            // Only start review from plan_ready (fresh plan) or reviewing (retry).
-            if g.phase != goal::GoalPhase::PlanReady && g.phase != goal::GoalPhase::Reviewing {
-                return;
-            }
-            goal::transition(
-                &mut g,
-                goal::GoalPhase::Reviewing,
-                Some("CEO self-reviewing plan"),
-            );
-            (
-                goal::build_self_review_prompt(&g),
-                g.parent_model.clone(),
-                g.reasoning_effort.clone(),
-                g.id.clone(),
-            )
-        };
-        let (prompt, model, effort, goal_id) = wrap;
-        start_goal_parent_turn(st, client, prompt, model, effort, goal_id, "review").await;
-    });
-}
-
-/// Start the CEO post-deploy verify parent turn.
-async fn spawn_goal_verify(st: Arc<State>, client: reqwest::Client) {
-    let wrap = {
-        let g = st.goal.lock().await;
-        if g.phase != goal::GoalPhase::Verifying {
-            return;
-        }
-        (
-            goal::build_verify_prompt(&g),
-            g.parent_model.clone(),
-            g.reasoning_effort.clone(),
-            g.id.clone(),
-        )
-    };
-    let (prompt, model, effort, goal_id) = wrap;
-    start_goal_parent_turn(st, client, prompt, model, effort, goal_id, "verify").await;
-}
-
-/// Shared helper: start a parent orchestrator turn for review/verify/wrap-up.
-async fn start_goal_parent_turn(
-    st: Arc<State>,
-    client: reqwest::Client,
-    prompt: String,
-    model: String,
-    effort: String,
-    goal_id: String,
-    kind: &str,
-) {
-    let models = st.models.read().await;
-    let turn_model = if models.iter().any(|m| m.id == model) {
-        Some(model)
-    } else {
-        models.first().map(|m| m.id.clone())
-    };
-    drop(models);
-
-    let Some(turn_model) = turn_model else {
-        let mut g = st.goal.lock().await;
-        if g.id == goal_id {
-            match kind {
-                "review" if g.phase == goal::GoalPhase::Reviewing => {
-                    goal::fail_goal(&mut g, "plan self-review skipped: no models");
-                }
-                "verify" if g.phase == goal::GoalPhase::Verifying => {
-                    goal::fail_goal(&mut g, "goal verify skipped: no models");
-                }
-                "wrapup" if g.phase == goal::GoalPhase::Synthesizing => {
-                    goal::finish_synthesis(&mut g, false);
-                    goal::sync_work_state_from_prompts(&st, &g).await;
-                }
-                _ => {}
-            }
-        }
-        emit(
-            &Event::new("error").with("message", json!(format!("goal {kind} skipped: no models"))),
-        );
-        return;
-    };
-
-    // Wait for the session slot. Review/verify/wrap-up are spawned from finishers
-    // or deploy tasks that may still briefly hold `st.current`; never skip CEO
-    // self-review by silently accepting the plan (that left missions stuck in
-    // plan_ready with deploy_after_turn armed and nobody consuming it).
-    for _ in 0..120 {
-        if st.current.lock().await.is_none() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-
-    enum BusyAction {
-        FailVerify,
-        FailReview,
-        FinishWrapup,
-        Abort,
-    }
-    let busy = {
-        let mut cur = st.current.lock().await;
-        if cur.is_some() {
-            drop(cur);
-            let mut g = st.goal.lock().await;
-            if g.id != goal_id {
-                Some(BusyAction::Abort)
-            } else {
-                match kind {
-                    "review" if g.phase == goal::GoalPhase::Reviewing => {
-                        goal::fail_goal(
-                            &mut g,
-                            "plan self-review skipped: session still busy after wait",
-                        );
-                        Some(BusyAction::FailReview)
-                    }
-                    "verify" if g.phase == goal::GoalPhase::Verifying => {
-                        goal::fail_goal(&mut g, "goal verify skipped: another turn is running");
-                        Some(BusyAction::FailVerify)
-                    }
-                    "wrapup" if g.phase == goal::GoalPhase::Synthesizing => {
-                        goal::finish_synthesis(&mut g, false);
-                        Some(BusyAction::FinishWrapup)
-                    }
-                    _ => Some(BusyAction::Abort),
-                }
-            }
-        } else {
-            let tok2 = CancellationToken::new();
-            *cur = Some(tok2.clone());
-            drop(cur);
-            st.goal_wrapup_active
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let handle = tokio::spawn(run_turn_and_drain(
-                st.clone(),
-                client.clone(),
-                turn_model,
-                prompt,
-                effort,
-                None,
-                tok2,
-            ));
-            *st.handle.lock().await = Some(handle);
-            None
-        }
-    };
-
-    match busy {
-        Some(BusyAction::FailVerify)
-        | Some(BusyAction::FailReview)
-        | Some(BusyAction::FinishWrapup) => {
-            // Sync work state after releasing the goal lock (busy block above).
-            {
-                let g = st.goal.lock().await;
-                if g.id == goal_id {
-                    goal::sync_work_state_from_prompts(&st, &g).await;
-                }
-            }
-            emit(&Event::new("info").with(
-                "message",
-                json!(format!(
-                    "Goal {kind} finished without parent turn (another turn is running)"
-                )),
-            ));
-        }
-        Some(BusyAction::Abort) | None => {}
-    }
-}
-
-/// After the post-deploy synthesizing turn ends, mark the goal Done.
-async fn maybe_finish_goal_synthesis(st: &Arc<State>, cancelled: bool) {
-    // Measure wrap-up assistant text so finish_synthesis can skip a redundant
-    // deterministic card when the model already streamed a rich summary.
-    let wrapup_chars = {
-        let conv = st.conversation.lock().await;
-        conv.iter()
-            .rev()
-            .find(|m| m.role() == "assistant")
-            .and_then(|m| m.content_text())
-            .map(|t| t.trim().chars().count())
-            .unwrap_or(0)
-    };
-    let mut g = st.goal.lock().await;
-    if g.phase != goal::GoalPhase::Synthesizing {
-        return;
-    }
-    goal::finish_synthesis_with_wrapup(&mut g, cancelled, Some(wrapup_chars));
-    goal::sync_work_state_from_prompts(st, &g).await;
-}
-
-/// After a CEO self-review turn ends: deploy or re-enter planning.
-async fn maybe_finish_goal_reviewing(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
-    let assistant = {
-        let conv = st.conversation.lock().await;
-        conv.iter()
-            .rev()
-            .find(|m| m.role() == "assistant")
-            .and_then(|m| m.content_text())
-            .map(|t| t.to_string())
-            .unwrap_or_default()
-    };
-    let (outcome, prompt, model, effort) = {
-        let mut g = st.goal.lock().await;
-        if g.phase != goal::GoalPhase::Reviewing {
-            return;
-        }
-        let outcome = goal::finish_reviewing(&mut g, cancelled, &assistant);
-        let next = match outcome {
-            goal::ReviewOutcome::Deploy => (outcome, None, String::new(), String::new()),
-            goal::ReviewOutcome::Replan => (
-                outcome,
-                Some(goal::planning_prompt(&g)),
-                g.parent_model.clone(),
-                g.reasoning_effort.clone(),
-            ),
-            goal::ReviewOutcome::Failed => (outcome, None, String::new(), String::new()),
-        };
-        // Snapshot for work-state sync after releasing the goal lock.
-        let mode_snapshot = g.clone();
-        drop(g);
-        goal::sync_work_state_from_prompts(st, &mode_snapshot).await;
-        next
-    };
-    match outcome {
-        goal::ReviewOutcome::Deploy => {
-            spawn_goal_deploy(st.clone(), client.clone());
-        }
-        goal::ReviewOutcome::Replan => {
-            if let Some(prompt) = prompt {
-                start_turn(st, client, model, prompt, effort, None).await;
-            }
-        }
-        goal::ReviewOutcome::Failed => {}
-    }
-}
-
-/// After a CEO verify turn ends: certify Done or replan / fail.
-async fn maybe_finish_goal_verifying(st: &Arc<State>, client: &reqwest::Client, cancelled: bool) {
-    let assistant = {
-        let conv = st.conversation.lock().await;
-        conv.iter()
-            .rev()
-            .find(|m| m.role() == "assistant")
-            .and_then(|m| m.content_text())
-            .map(|t| t.to_string())
-            .unwrap_or_default()
-    };
-    let (outcome, prompt, model, effort) = {
-        let mut g = st.goal.lock().await;
-        if g.phase != goal::GoalPhase::Verifying {
-            return;
-        }
-        let outcome = goal::finish_verifying(&mut g, cancelled, &assistant);
-        let next = match outcome {
-            goal::VerifyOutcome::Replan => (
-                outcome,
-                Some(goal::planning_prompt(&g)),
-                g.parent_model.clone(),
-                g.reasoning_effort.clone(),
-            ),
-            other => (other, None, String::new(), String::new()),
-        };
-        let mode_snapshot = g.clone();
-        drop(g);
-        goal::sync_work_state_from_prompts(st, &mode_snapshot).await;
-        next
-    };
-    if matches!(outcome, goal::VerifyOutcome::Replan) {
-        if let Some(prompt) = prompt {
-            start_turn(st, client, model, prompt, effort, None).await;
-        }
-    }
-}
-
-/// Finalize goal parent turns that may end via `finish` (includes planning).
-async fn maybe_finish_goal_orchestrator_turn(
-    st: &Arc<State>,
-    client: &reqwest::Client,
-    cancelled: bool,
-) {
-    maybe_finish_goal_planning(st, client, cancelled).await;
-    maybe_finish_goal_followup_turn(st, client, cancelled).await;
-}
-
-/// Finalize review / verify / wrap-up follow-ups (safe from drain; never planning).
-async fn maybe_finish_goal_followup_turn(
-    st: &Arc<State>,
-    client: &reqwest::Client,
-    cancelled: bool,
-) {
-    maybe_finish_goal_reviewing(st, client, cancelled).await;
-    maybe_finish_goal_verifying(st, client, cancelled).await;
-    maybe_finish_goal_synthesis(st, cancelled).await;
-}
-
-/// Seed the work-state goal from a user prompt (the first substantive message).
-/// Subsequent calls are no-ops once a goal is set, so the goal reflects the
-/// session's original intent rather than every follow-up. Slash commands and
-/// trivially short prompts are ignored so they don't pin the goal.
-async fn maybe_seed_work_state_goal(st: &State, prompt: &str) {
-    let p = prompt.trim();
-    if p.is_empty() || p.starts_with('/') || p.chars().count() < 8 {
-        return;
-    }
-    let mut ws = st.work_state.lock().await;
-    if !ws.goal.is_empty() {
-        return;
-    }
-    ws.goal = truncate_str(p.lines().next().unwrap_or(p), 240);
-    ws.touch();
-    drop(ws);
-    emit_work_state(st).await;
-}
+pub(crate) use crate::agent::goal_runtime::*;
 
 /// Mirror a `todo_write` payload into the work-state's done/in-progress/next
 /// lists. The todo list IS the structured work state; this keeps the rolling
@@ -1948,6 +1489,9 @@ async fn persist_stats(st: &State) {
         tokens_out: *st.tokens_out.lock().await,
         cached_tokens: *st.cached_tokens.lock().await,
         turns: st.logger.turn_count(),
+        compactions: st
+            .compaction_count
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     session::save_stats(&p, &stats);
 }
@@ -1968,6 +1512,8 @@ async fn reset_stats(st: &State) {
     *st.tokens_out.lock().await = 0;
     *st.cached_tokens.lock().await = 0;
     st.logger.set_turns(0);
+    st.compaction_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = st.cfg.read().await.session_file.clone() {
         session::save_stats(&p, &session::SessionStats::default());
     }
@@ -1981,6 +1527,8 @@ async fn restore_stats(st: &State, session_path: &std::path::Path) {
     *st.tokens_out.lock().await = s.tokens_out;
     *st.cached_tokens.lock().await = s.cached_tokens;
     st.logger.set_turns(s.turns);
+    st.compaction_count
+        .store(s.compactions, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Generate a unique filename for a new session file. std has no date
@@ -1994,2688 +1542,23 @@ fn new_session_filename() -> String {
     format!("{}.jsonl", now.as_nanos())
 }
 
-#[tokio::main]
-async fn main() {
-    // One-time rename migration: move the pre-rename on-disk layout
-    // (~/.config/umans-harness/, ~/.umans-harness/) to the current names
-    // (~/.config/catalyst-code/, ~/.catalyst-code/), preserving sessions,
-    // memory, OAuth tokens, settings, and staged agent/skill/plugin files.
-    // Runs before staging + config load so this run sees the migrated data.
-    staging::migrate_legacy_dirs();
-    // Stage the harness's global defaults (agents, orchestrator skill,
-    // vision-handoff plugin) into ~/.catalyst-code/ on first run — shared
-    // across every project, editable once, never per-project by default. Done
-    // before config/plugin loading so staged files are picked up this run.
-    let stage = staging::stage_if_needed();
-    if stage.first_run {
-        eprintln!(
-            "[staging] first run: staged {} default file(s) into {}",
-            stage.written.len(),
-            stage.home.display()
-        );
-    }
-    let mut cfg = config::load();
-    // Explicit auth only — do not scan env vars or third-party OAuth stores.
-    // Users must `/login` with an API key or complete this app's OAuth flow.
-    let _ = config::auto_login_env_presets(&mut cfg);
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
+fn main() {
+    // The agent turn is intentionally decomposed into helpers, but its joined
+    // async state machine still carries provider, tool-wave, plugin, and goal
+    // state. Tokio's default worker stack is too small for debug/instrumented
+    // builds and can abort the whole core before the panic guard is entered.
+    // Keep the stack explicit and bounded rather than depending on the caller's
+    // RUST_MIN_STACK environment.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
         .build()
-        .expect("client");
-
-    // Load plugins before initial model discovery. Plugin OAuth credentials are
-    // durable, and their token action may also start a provider sidecar (Cursor
-    // does this). Discovering with `None` here meant the saved provider was
-    // restored as active but omitted from the first model snapshot until the
-    // user ran /login again or manually switched providers.
-    let plugin_manager = PluginManager::new_with_global_plugins(
-        cfg.plugin_dir.clone(),
-        cfg.workspace.clone(),
-        cfg.trust_project_plugins,
-    );
-    for name in &cfg.plugins_disabled {
-        let _ = plugin_manager.disable(name);
-    }
-
-    // Discover models up front. In the multi-login model, models are aggregated
-    // across all logged-in providers (configured + key available) so `/models`
-    // can mix providers. At init there are no runtime keys yet beyond the
-    // persisted ones already in cfg, so this resolves from config/env.
-    let init_provider = cfg.resolve_provider(&HashMap::new());
-    let init_keys = cfg.persisted_keys.clone();
-    let models = aggregate_models_for(
-        &cfg,
-        &init_keys,
-        cfg.active_provider.as_deref(),
-        &client,
-        Some(&plugin_manager),
-    )
-    .await;
-    let logger = Logger::new(cfg.debug_log.as_deref());
-    logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
-
-    // Resume session if configured and present. A future-version session file
-    // returns Err (surfaced to the user via an `error` event at Init) rather
-    // than silently starting blank.
-    let (resumed, session_error): (Vec<Message>, Option<String>) = match cfg.session_file.as_ref() {
-        Some(p) => match session::load(p.as_path()) {
-            Ok(v) => (v, None),
-            Err(e) => (Vec::new(), Some(e)),
-        },
-        None => (Vec::new(), None),
-    };
-    // Persisted cumulative stats travel with the session file (sidecar
-    // <session>.stats) so `/stats` survives a restart — previously in-memory
-    // only, so reopening showed zeros for tokens/turns.
-    let init_stats: session::SessionStats = cfg
-        .session_file
-        .as_ref()
-        .map(|p| session::load_stats(p.as_path()))
-        .unwrap_or_default();
-    logger.set_turns(init_stats.turns);
-    // Persisted "always" approval escalations travel with the session file
-    // (sidecar <session>.escalations) so a restart doesn't un-gate kinds the
-    // user already approved.
-    let init_escalations: HashSet<&'static str> = cfg
-        .session_file
-        .as_ref()
-        .map(|p| session::load_escalations(p.as_path()))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|s| match s.as_str() {
-            "destructive" => Some("destructive"),
-            "readonly" => Some("readonly"),
-            _ => None,
-        })
-        .collect();
-    // Ensure the session file exists (header only) so the active session is
-    // always listed by `list_sessions`, even before the first message lands.
-    if let Some(p) = cfg.session_file.as_ref() {
-        session::ensure(p.as_path());
-    }
-
-    // Pre-compute token estimate for resumed conversation.
-    let init_est = estimate_messages_tokens(&resumed);
-
-    let vision_cfg = VisionConfig::load(&cfg.workspace);
-    let state = Arc::new(State {
-        cfg: RwLock::new(cfg),
-        client: client.clone(),
-        api_keys: RwLock::new(HashMap::new()),
-        active_provider: RwLock::new(None),
-        conversation: Mutex::new(resumed),
-        models: RwLock::new(models),
-        current: Mutex::new(None),
-        handle: Mutex::new(None),
-        pending: Mutex::new(std::collections::HashMap::new()),
-        pending_asks: Mutex::new(std::collections::HashMap::new()),
-        pending_sudos: Mutex::new(std::collections::HashMap::new()),
-        logger,
-        tokens_in: Mutex::new(init_stats.tokens_in),
-        tokens_out: Mutex::new(init_stats.tokens_out),
-        cached_tokens: Mutex::new(init_stats.cached_tokens),
-        escalated_kinds: Mutex::new(init_escalations),
-        queued: Mutex::new(None),
-        pending_bash: Mutex::new(Vec::new()),
-        plugin_manager,
-        vision: RwLock::new(vision_cfg),
-        last_turn_time: Mutex::new(std::time::Instant::now()),
-        estimated_tokens: Mutex::new(init_est),
-        last_real_prompt_tokens: Mutex::new(None),
-        conv_len_at_last_real: Mutex::new(0),
-        last_model: Mutex::new(None),
-        last_turn_metrics: Mutex::new(None),
-
-        work_state: Mutex::new(WorkState::default()),
-        goal: Mutex::new(goal::GoalMode::default()),
-        goal_deploy_cancel: Mutex::new(None),
-        goal_wrapup_active: std::sync::atomic::AtomicBool::new(false),
-        intercom: IntercomBus::new(),
-        subagent_runs: Mutex::new(std::collections::HashMap::new()),
-        pending_oauth: Mutex::new(None),
-        peers: Mutex::new(Vec::new()),
-        last_concurrency_note: Mutex::new(None),
-        tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
-        enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
-        undo_count: std::sync::atomic::AtomicU64::new(0),
-        auto_checkpoint_taken: std::sync::atomic::AtomicBool::new(false),
-        skill_read_count: std::sync::atomic::AtomicU64::new(0),
-    });
-
-    // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
-    // (read from settings.json by Config::load). A key set via `/login` or the
-    // settings modal is saved by the TUI into settings.json; loading it here
-    // makes it survive a restart and take precedence over provider config/env
-    // keys (runtime keys are checked first in provider resolution).
-    {
-        let cfg = state.cfg.read().await;
-        for (name, key) in cfg.persisted_keys.iter() {
-            state
-                .api_keys
-                .write()
-                .await
-                .insert(name.clone(), key.clone());
-        }
-    }
-
-    // Background poll of the Umans gateway's `/v1/usage` endpoint so the footer
-    // can show a LIVE, account-wide concurrency usage (used/limit) ahead of tps.
-    // Updated every few seconds, independent of turns. Polls ANY configured Umans
-    // provider that has a key (not just the active one) so conc stays live even
-    // when a non-Umans provider is active but a Umans model is selected. Emits
-    // `umans_conc { used, limit, provider }` — `provider` is the Umans provider
-    // name it polled, so the UI only renders the field when the SELECTED model
-    // routes to that provider (a Gemini/OpenAI model selected → hidden). Both
-    // null + no provider when no Umans provider is available, to clear the UI.
-    {
-        let st = state.clone();
-        let cl = client.clone();
-        tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(5);
-            let mut last_provider: Option<String> = None;
-            loop {
-                match st.umans_provider_with_key().await {
-                    Some(rp) => {
-                        let name = rp.name.clone();
-                        let (used, limit) = match rp.api_key.as_deref() {
-                            Some(k) => {
-                                match provider::fetch_umans_usage(&cl, &rp.base_url, k).await {
-                                    Some(u) => (u.used, u.limit),
-                                    None => (None, None),
-                                }
-                            }
-                            None => (None, None),
-                        };
-                        let used_v = used.map(Value::from).unwrap_or(Value::Null);
-                        let limit_v = limit.map(Value::from).unwrap_or(Value::Null);
-                        emit(
-                            &Event::new("umans_conc")
-                                .with("used", used_v)
-                                .with("limit", limit_v)
-                                .with("provider", json!(name)),
-                        );
-                        last_provider = Some(name);
-                    }
-                    None => {
-                        if last_provider.take().is_some() {
-                            emit(
-                                &Event::new("umans_conc")
-                                    .with("used", Value::Null)
-                                    .with("limit", Value::Null),
-                            );
-                        }
-                    }
-                }
-                tokio::time::sleep(interval).await;
-            }
-        });
-    }
-
-    // Startup background refresh of the Umans model cache. The TTL-gated cache
-    // (8h, see provider::MODELS_CACHE_TTL) means newly-added Umans models
-    // wouldn't appear until the TTL expires; this one-shot task forces a live
-    // `/models/info` fetch on every launch so new models are cached locally and
-    // surface in `/models` without a restart. Non-blocking: init already loaded
-    // the (possibly stale) cached models for an instant first render, and we
-    // only re-emit a `models` event when the live id set actually changed, so
-    // the TUI's model selection (by id) is preserved and an unchanged or
-    // offline fetch causes no spurious churn. Mirrors the launch-time update
-    // check + conc poll: background, best-effort, silent on failure.
-    {
-        let st = state.clone();
-        let cl = client.clone();
-        tokio::spawn(async move {
-            let Some(rp) = st.umans_provider_for_model_refresh().await else {
-                return; // No Umans provider (active or configured) — nothing to refresh.
-            };
-            // Snapshot the model ids we currently hold for this provider so we
-            // can tell whether the live fetch actually changed anything.
-            let prev_ids: std::collections::HashSet<String> = {
-                let models = st.models.read().await;
-                models
-                    .iter()
-                    .filter(|m| m.provider == rp.name)
-                    .map(|m| m.id.clone())
-                    .collect()
-            };
-            // Force a live fetch (bypassing the TTL) and rewrite the cache. On
-            // HTTP failure this falls back to the stale cache / curated
-            // snapshot, so the id set is unchanged and we skip the re-emit.
-            let live = provider::discover_models_force_refresh(&cl, &rp).await;
-            let new_ids: std::collections::HashSet<String> =
-                live.iter().map(|m| m.id.clone()).collect();
-            if new_ids == prev_ids {
-                return; // No new/removed models — leave the in-memory list alone.
-            }
-            // The live set changed: re-aggregate (reads the now-updated cache
-            // for every provider) and re-emit `models` so the TUI/web pick up
-            // the new models mid-session without a restart.
-            st.refresh_models(&cl).await;
-        });
-    }
-
-    // Cross-session presence: publish this session's rolling work-state so other
-    // processes in the SAME workspace can detect concurrent activity (and stop
-    // "fixing" phantom errors caused by a neighbor's in-flight edits). Per-pid
-    // JSON file under ~/.config/catalyst-code/presence/<hash(cwd)>/, rewritten
-    // every few seconds; stale records reaped by readers. Awareness only — no
-    // coordination/locking. The `workspace_activity` tool + the anomaly nudge
-    // in `run_turn` consume this; the cached peer snapshot avoids a filesystem
-    // read on every tool result.
-    {
-        let st = state.clone();
-        let pid = std::process::id();
-        let started = presence::unix_now();
-        let presence_ws = {
-            let cfg = state.cfg.read().await;
-            cfg.workspace.clone()
-        };
-        // Publish immediately so a peer checking right after we start sees us.
-        {
-            let ws = st.work_state.lock().await;
-            let session_id = st
-                .cfg
-                .read()
-                .await
-                .session_file
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(String::from);
-            let model = st.last_model.lock().await.clone();
-            let rec =
-                presence::PresenceRecord::from_work_state(&ws, pid, session_id, model, started);
-            drop(ws);
-            presence::write_presence(&presence_ws, pid, &rec);
-        }
-        tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(8);
-            loop {
-                tokio::time::sleep(interval).await;
-                let ws = st.work_state.lock().await;
-                let session_id = st
-                    .cfg
-                    .read()
-                    .await
-                    .session_file
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(String::from);
-                let model = st.last_model.lock().await.clone();
-                let rec =
-                    presence::PresenceRecord::from_work_state(&ws, pid, session_id, model, started);
-                drop(ws);
-                presence::write_presence(&presence_ws, pid, &rec);
-                // Refresh the cached peer snapshot so the anomaly nudge stays
-                // current without a filesystem read on the hot path.
-                *st.peers.lock().await = presence::read_peers(&presence_ws, pid);
-            }
-        });
-    }
-
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let cmd = match serde_json::from_str::<Command>(&line) {
-            Ok(c) => c,
-            Err(e) => {
-                emit(&Event::new("error").with("message", json!(format!("bad command: {e}"))));
-                continue;
-            }
-        };
-        match cmd {
-            Command::Init => {
-                let models = state.models.read().await.clone();
-                // Enrich OAuth so SuperGrok / Claude / Gemini look signed-in on
-                // startup (they store tokens on disk, not as api_key in config).
-                let rp = state.resolved_provider_enriched().await;
-                let authed = rp.api_key.is_some();
-                let cfg = state.cfg.read().await;
-                let conv_len = state.conversation.lock().await.len();
-                let skipped_plugins = state.plugin_manager.skipped_project_plugins();
-                let loaded_plugins: Vec<String> =
-                    state.plugin_manager.list().keys().cloned().collect();
-                // Only surface skips that left the plugin unavailable (a same-named
-                // global copy may still be loaded — common for staged defaults).
-                let skipped_unavailable: Vec<String> = skipped_plugins
-                    .iter()
-                    .filter(|n| !loaded_plugins.iter().any(|l| l == *n))
-                    .cloned()
-                    .collect();
-                emit(
-                    &Event::new("ready")
-                        .with("models", json!(models))
-                        .with("authed", json!(authed))
-                        .with("workspace", json!(cfg.workspace.display().to_string()))
-                        .with("approval", json!(cfg.approval.as_str()))
-                        .with("base_url", json!(rp.base_url))
-                        .with("provider", json!(rp.name))
-                        .with("providerKind", json!(rp.kind.as_str()))
-                        .with("providers", json!(cfg.provider_names()))
-                        .with(
-                            "providerPresets",
-                            json!(provider_presets_json(&cfg, Some(&state.plugin_manager))),
-                        )
-                        .with("bash_timeout_secs", json!(cfg.bash_timeout_secs))
-                        .with("auto_compact", json!(cfg.auto_compact))
-                        .with("context_compact_at", json!(cfg.context_compact_at))
-                        .with("context_digest_at", json!(cfg.context_digest_at))
-                        .with("sandbox", json!(cfg.sandbox.as_str()))
-                        .with("resumed_messages", json!(conv_len))
-                        .with("plugins", json!(loaded_plugins))
-                        .with("plugins_skipped", json!(skipped_unavailable.clone())),
-                );
-                emit(
-                    &Event::new("protocol_hello")
-                        .with("version", json!(env!("CARGO_PKG_VERSION")))
-                        .with("min_client", json!("0.2.0"))
-                        .with(
-                            "capabilities",
-                            json!([
-                                "worktree",
-                                "checkpoint",
-                                "file_change",
-                                "audit",
-                                "routing",
-                                "allow_pattern",
-                                "cost_update"
-                            ]),
-                        ),
-                );
-                if !skipped_unavailable.is_empty() {
-                    let names = skipped_unavailable.join(", ");
-                    emit(
-                        &Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "Skipped project plugin(s): {names}. They live under .catalyst-code/plugins but need --trust-project-plugins, or reinstall with `/plugin-install <src> workspace` (user-install marker) or `/plugin-install <src> global`."
-                            )),
-                        ),
-                    );
-                }
-                // Tell the user when the harness staged its global defaults
-                // (first run) so the global ~/.catalyst-code/ layout is
-                // discoverable.
-                if stage.first_run {
-                    emit(
-                        &Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "First run: staged {} default file(s) into {} — agents, the pi-subagents skill, and the vision-handoff plugin now live globally and are shared across all projects. Edit them there to customize; drop a file in a project's own .catalyst-code/ to override for that project only.",
-                                stage.written.len(),
-                                stage.home.display()
-                            )),
-                        ),
-                    );
-                }
-                // Surface a future-version session-load error to the user.
-                if let Some(e) = session_error.as_ref() {
-                    emit(&Event::new("error").with("message", json!(e)));
-                }
-                // Publish the discoverable-skills list so the TUI/web can
-                // populate their `/skill:<name>` autocomplete immediately.
-                emit_skills_event(&cfg.workspace);
-                // Same for subagents (builtin + user + project overlays).
-                emit_agents_event(&cfg.workspace, &cfg);
-                // Replay any resumed conversation so the TUI shows prior history
-                // on launch instead of starting from an empty transcript.
-                if conv_len > 0 {
-                    let conv = state.conversation.lock().await;
-                    let visible: Vec<Value> = conv
-                        .iter()
-                        .filter(|m| !m.is_system())
-                        .map(Value::from)
-                        .collect();
-                    let est = estimate_messages_tokens(&conv);
-                    emit(
-                        &Event::new("history")
-                            .with("messages", json!(visible))
-                            .with("tokens_in", json!(est)),
-                    );
-                    // The conversation was left mid-`ask` by a prior core
-                    // restart (assistant `ask` tool_call with no tool result).
-                    // Tell the user a message will re-present the question so
-                    // they don't see a wedged transcript with no explanation.
-                    if find_trailing_unanswered_ask(&conv[..]).is_some() {
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!(
-                                "A question from the previous session was interrupted by a restart. Send any message to answer it and continue."
-                            ),
-                        ));
-                    }
-                }
-            }
-            Command::SetKey { api_key, provider } => {
-                // Apply the key to a named provider, or to the active provider
-                // when no name is given (backward-compatible with the pre-provider
-                // single-key flow, which lands in the "default" slot). Setting a
-                // key "logs in" that provider, so re-aggregate models so its
-                // models appear in `/models` alongside any others logged in.
-                let name = match provider {
-                    Some(p) => p,
-                    None => state.resolved_provider().await.name,
-                };
-                state.api_keys.write().await.insert(name.clone(), api_key);
-                state.logger.log("set_key", json!({ "provider": name }));
-                emit(
-                    &Event::new("authed")
-                        .with("ok", json!(true))
-                        .with("provider", json!(name)),
-                );
-                state.refresh_models(&client).await;
-            }
-            Command::SetSearchKey { provider, api_key } => {
-                // Set or clear a search-tool API key (Exa / Tavily) for
-                // `web_search`. Persisted to config.json `search_keys` so it
-                // survives restarts; `search_tool` reads it ahead of the
-                // `EXA_API_KEY` / `TAVILY_API_KEY` env vars.
-                let provider = provider.trim().to_ascii_lowercase();
-                if provider != "exa" && provider != "tavily" {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "set_search_key: unknown provider '{provider}' (expected 'exa' or 'tavily')"
-                        )),
-                    ));
-                    return;
-                }
-                let key = api_key.trim().to_string();
-                let has_key = !key.is_empty();
-                let snapshot = {
-                    let mut cfg = state.cfg.write().await;
-                    if has_key {
-                        cfg.search_keys.insert(provider.clone(), key);
-                    } else {
-                        cfg.search_keys.remove(&provider);
-                    }
-                    cfg.search_keys.clone()
-                };
-                if let Err(e) = crate::config::save_search_keys(&snapshot) {
-                    state.logger.log(
-                        "set_search_key",
-                        json!({ "provider": &provider, "err": e.to_string() }),
-                    );
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!("set_search_key: failed to persist: {e}")),
-                    ));
-                    return;
-                }
-                state.logger.log(
-                    "set_search_key",
-                    json!({ "provider": &provider, "has_key": has_key }),
-                );
-                emit(
-                    &Event::new("search_key_set")
-                        .with("provider", json!(&provider))
-                        .with("has_key", json!(has_key)),
-                );
-            }
-            Command::SetProvider { name } => {
-                // Set the default/fallback provider. In the multi-login model a
-                // turn routes to the selected model's provider; this only matters
-                // for model-less operations (compaction summarize) and legacy
-                // models without a provider tag. Re-aggregate (don't wipe other
-                // providers' models). Unknown names are ignored (stays put).
-                {
-                    let cfg = state.cfg.read().await;
-                    if cfg.find_provider(&name).is_none() {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!(format!("unknown provider '{name}'; not switching")),
-                        ));
-                        return;
-                    }
-                }
-                *state.active_provider.write().await = Some(name.clone());
-                let rp = state.resolved_provider_enriched().await;
-                state.logger.log(
-                    "set_provider",
-                    json!({ "provider": rp.name, "kind": rp.kind.as_str(), "base_url": rp.base_url }),
-                );
-                emit(
-                    &Event::new("provider_changed")
-                        .with("provider", json!(rp.name))
-                        .with("kind", json!(rp.kind.as_str()))
-                        .with("base_url", json!(rp.base_url))
-                        .with("has_key", json!(rp.api_key.is_some())),
-                );
-                if rp.api_key.is_some() {
-                    emit(
-                        &Event::new("authed")
-                            .with("ok", json!(true))
-                            .with("provider", json!(rp.name)),
-                    );
-                }
-                state.refresh_models(&client).await;
-            }
-            Command::ListProviderPresets => {
-                let cfg = state.cfg.read().await;
-                emit(&Event::new("provider_presets").with(
-                    "presets",
-                    json!(provider_presets_json(&cfg, Some(&state.plugin_manager))),
-                ));
-            }
-            Command::Login { preset, api_key } => {
-                // Log in to a first-party provider from a preset: resolve the key
-                // (explicit arg → preset env var), insert/replace into config,
-                // seed the runtime key, persist, and re-aggregate models across
-                // all logged-in providers so this provider's models join `/models`.
-                // Multiple providers can be logged in at once. Most presets create
-                // one config; OpenCode Go creates two (OpenAI-kind +
-                // Anthropic-kind) sharing the base URL + key.
-                let Some(p) = config::find_preset(&preset) else {
-                    let available = config::PROVIDER_PRESETS
-                        .iter()
-                        .map(|p| p.id)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "unknown provider preset '{preset}'; available: {available}"
-                        )),
-                    ));
-                    return;
-                };
-                // API-key path: require an explicitly pasted key. Do not scan
-                // the environment. Subscription OAuth is plugin-only
-                // (`login_oauth`). Keyless login is only for local presets
-                // with an empty api_key_env (Ollama / LM Studio).
-                let key = api_key.filter(|s| !s.is_empty());
-                if key.is_none() && !p.api_key_env.is_empty() {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "no API key provided for '{}' — paste a key via /login (subscription OAuth is available via plugins)",
-                            p.label
-                        )),
-                    ));
-                    return;
-                }
-                let configs = config::preset_provider_configs(p, key.clone());
-                let name = configs[0].name.clone();
-                // Insert or replace each provider config (e.g. opencode-go +
-                // opencode-go-anthropic for the OpenCode Go preset).
-                {
-                    let mut cfg = state.cfg.write().await;
-                    for pc in &configs {
-                        if let Some(i) = cfg.providers.iter().position(|x| x.name == pc.name) {
-                            cfg.providers[i] = pc.clone();
-                        } else {
-                            cfg.providers.push(pc.clone());
-                        }
-                    }
-                }
-                // Seed the runtime key for every config so the immediate turn
-                // works without a restart (only when a key was actually resolved).
-                if let Some(k) = &key {
-                    let mut keys = state.api_keys.write().await;
-                    for pc in &configs {
-                        keys.insert(pc.name.clone(), k.clone());
-                    }
-                }
-                // Make the newly logged-in provider the default/fallback (used
-                // for model-less compaction and legacy models). This does NOT
-                // restrict routing — the selected model still routes to its own
-                // provider; it only picks the fallback.
-                *state.active_provider.write().await = Some(name.clone());
-                // Persist to the core-owned config.json (best-effort).
-                {
-                    let cfg = state.cfg.read().await;
-                    if let Err(e) = config::save_providers_config(&cfg.providers, Some(&name)) {
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "logged into '{}' for this session (could not persist to config.json: {e})",
-                                p.label
-                            )),
-                        ));
-                    }
-                }
-                let rp = state.resolved_provider().await;
-                state.logger.log(
-                    "login",
-                    json!({ "provider": name, "kind": p.kind.as_str(), "base_url": p.base_url, "has_key": key.is_some() }),
-                );
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(if key.is_some() {
-                        format!("logged into {}.", p.label)
-                    } else {
-                        format!("logged into {} (no API key required).", p.label)
-                    }),
-                ));
-                emit(
-                    &Event::new("provider_changed")
-                        .with("provider", json!(rp.name))
-                        .with("kind", json!(rp.kind.as_str()))
-                        .with("base_url", json!(rp.base_url))
-                        .with("has_key", json!(rp.api_key.is_some())),
-                );
-                emit(
-                    &Event::new("authed")
-                        .with("ok", json!(key.is_some()))
-                        .with("provider", json!(name)),
-                );
-                state.refresh_models(&client).await;
-            }
-            Command::Logout { provider } => {
-                // Log out of a provider: drop its runtime key, remove it from the
-                // configured providers, persist, and re-aggregate models so its
-                // models disappear from `/models`. The persisted TUI key (in
-                // settings.json) is cleared by the TUI side.
-                //
-                // OpenCode Go is one subscription backed by two provider configs
-                // (opencode-go + opencode-go-anthropic); logging out either drops
-                // both so the user doesn't strand a half-configured subscription.
-                let to_remove: Vec<String> =
-                    if provider == "opencode-go" || provider == "opencode-go-anthropic" {
-                        vec![
-                            "opencode-go".to_string(),
-                            "opencode-go-anthropic".to_string(),
-                        ]
-                    } else {
-                        vec![provider.clone()]
-                    };
-                let existed;
-                {
-                    let mut cfg = state.cfg.write().await;
-                    let before = cfg.providers.len();
-                    cfg.providers.retain(|p| !to_remove.contains(&p.name));
-                    existed = cfg.providers.len() != before;
-                }
-                for n in &to_remove {
-                    state.api_keys.write().await.remove(n);
-                }
-                if !existed && provider != "default" {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("not logged into '{provider}'"))),
-                    );
-                    return;
-                }
-                // Delete plugin OAuth credential files so the provider is fully
-                // logged out (not just its config/runtime key).
-                for n in &to_remove {
-                    state.plugin_manager.clear_oauth(n).await;
-                }
-                // If the active provider was one of those logged out, clear the
-                // override so the fallback resolves to the first remaining / legacy.
-                {
-                    let active = state.active_provider.read().await.clone();
-                    if active
-                        .as_deref()
-                        .map(|a| to_remove.iter().any(|n| n == a))
-                        .unwrap_or(false)
-                    {
-                        *state.active_provider.write().await = None;
-                    }
-                }
-                // Persist the trimmed provider list (fall back to the first
-                // remaining provider, else legacy).
-                {
-                    let cfg = state.cfg.read().await;
-                    let active = cfg.providers.first().map(|p| p.name.clone());
-                    let _ = config::save_providers_config(&cfg.providers, active.as_deref());
-                }
-                state.logger.log("logout", json!({ "provider": provider }));
-                emit(
-                    &Event::new("info")
-                        .with("message", json!(format!("logged out of '{}'", provider))),
-                );
-                let rp = state.resolved_provider_enriched().await;
-                emit(
-                    &Event::new("provider_changed")
-                        .with("provider", json!(rp.name))
-                        .with("kind", json!(rp.kind.as_str()))
-                        .with("base_url", json!(rp.base_url))
-                        .with("has_key", json!(rp.api_key.is_some())),
-                );
-                if rp.api_key.is_some() {
-                    emit(
-                        &Event::new("authed")
-                            .with("ok", json!(true))
-                            .with("provider", json!(rp.name)),
-                    );
-                } else {
-                    emit(
-                        &Event::new("authed")
-                            .with("ok", json!(false))
-                            .with("provider", json!(rp.name)),
-                    );
-                }
-                state.refresh_models(&client).await;
-            }
-            Command::LoginOauth { preset } => {
-                // Plugin-declared subscription OAuth only. Built-in vendor
-                // OAuth was removed from core — install a plugin that declares
-                // an `oauth` block (e.g. catcode-chatgpt-provider).
-                let plugin_login = state.plugin_manager.supports_oauth_login(&preset);
-                if !plugin_login {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "'{preset}' has no plugin OAuth login — install a plugin that declares oauth.provider_id=\"{preset}\", or paste an API key via /login"
-                        )),
-                    ));
-                    return;
-                }
-                let label = state
-                    .plugin_manager
-                    .oauth_config(&preset)
-                    .map(|c| c.label)
-                    .unwrap_or_else(|| preset.clone());
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!("starting OAuth login for {label}…")),
-                ));
-                let st = state.clone();
-                let cl = client.clone();
-                // Generation counter: a second /login cancels applying an older
-                // in-flight OAuth (user re-ran login with a new device code).
-                static OAUTH_GEN: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let gen = OAUTH_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                tokio::spawn(async move {
-                    // Use free protocol::emit (Send) — not a captured &dyn Fn.
-                    let prompt_emit = |p: oauth::OAuthPrompt| {
-                        emit(
-                            &Event::new("oauth_prompt")
-                                .with("url", json!(p.url))
-                                .with("code", json!(p.code))
-                                .with("message", json!(p.message)),
-                        );
-                    };
-                    let outcome = st.plugin_manager.oauth_login(&preset, &prompt_emit).await;
-                    // Stale attempt (user started another login) — drop result.
-                    if OAUTH_GEN.load(std::sync::atomic::Ordering::SeqCst) != gen {
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!("Ignoring a superseded OAuth attempt (a newer /login is in progress)."),
-                        ));
-                        return;
-                    }
-                    match outcome {
-                        Ok(oauth::LoginOutcome::Done) => {
-                            finalize_oauth(&st, &cl, &preset, &label).await;
-                        }
-                        Ok(oauth::LoginOutcome::AwaitingCode { pending }) => {
-                            *st.pending_oauth.lock().await = Some(pending);
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!("OAuth login awaiting a code. Open the URL above on any device, approve, then paste the code via /oauth-code <code>."),
-                            ));
-                        }
-                        Err(e) => {
-                            st.logger.log(
-                                "login_oauth_error",
-                                json!({ "provider": preset, "error": e }),
-                            );
-                            emit(
-                                &Event::new("error")
-                                    .with("message", json!(format!("OAuth login failed: {e}"))),
-                            );
-                        }
-                    }
-                });
-            }
-            Command::OauthCode { code } => {
-                // Complete a pending plugin OAuth login (manual / device paste).
-                let pending = state.pending_oauth.lock().await.take();
-                let pending = match pending {
-                    Some(p) => p,
-                    None => {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!("No pending OAuth login. Run /login first — the no-browser flow prints a URL; paste its code here with /oauth-code <code>."),
-                        ));
-                        return;
-                    }
-                };
-                let preset = pending.kind.clone();
-                let label = state
-                    .plugin_manager
-                    .oauth_config(&preset)
-                    .map(|c| c.label)
-                    .unwrap_or_else(|| preset.clone());
-                if state.plugin_manager.oauth_config(&preset).is_none() {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "no plugin OAuth provider for '{preset}' — pending login discarded"
-                        )),
-                    ));
-                    return;
-                }
-                let result = state
-                    .plugin_manager
-                    .oauth_complete(&preset, &pending, &code)
-                    .await;
-                match result {
-                    Ok(()) => {
-                        finalize_oauth(&state, &client, &preset, &label).await;
-                    }
-                    Err(e) => {
-                        // Restore the pending state so the user can retry with a
-                        // corrected code without restarting /login.
-                        *state.pending_oauth.lock().await = Some(pending);
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!(format!(
-                                "OAuth code exchange failed: {e} (pending login restored — try /oauth-code again with the correct code)"
-                            )),
-                        ));
-                    }
-                }
-            }
-            Command::SetApproval { mode } => {
-                let new = Approval::parse(&mode);
-                state.cfg.write().await.approval = new.clone();
-                state
-                    .logger
-                    .log("set_approval", json!({ "mode": new.as_str() }));
-                emit(&Event::new("approval_changed").with("mode", json!(new.as_str())));
-            }
-            Command::SetConfig { key, value } => {
-                // Minimal runtime knob setter for the values the TUI settings
-                // modal edits. Coerce string-or-number to u64, string-or-bool
-                // to bool.
-                let as_u64 = |v: &Value| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-                };
-                let as_bool = |v: &Value| {
-                    v.as_bool().or_else(|| {
-                        v.as_str().and_then(|s| match s {
-                            "1" | "true" | "on" => Some(true),
-                            "0" | "false" | "off" => Some(false),
-                            _ => None,
-                        })
-                    })
-                };
-                let mut cfg = state.cfg.write().await;
-                let out_key = key.clone();
-                let mut out_val = value.clone();
-                match key.as_str() {
-                    "bash_timeout_secs" => {
-                        if let Some(n) = as_u64(&value) {
-                            cfg.bash_timeout_secs = n;
-                            out_val = json!(n);
-                        }
-                    }
-                    "auto_compact" => {
-                        if let Some(b) = as_bool(&value) {
-                            cfg.auto_compact = b;
-                            out_val = json!(b);
-                        }
-                    }
-                    "sandbox" => {
-                        let mode = value.as_str().map(String::from).or_else(|| {
-                            value
-                                .as_bool()
-                                .map(|b| if b { "firejail".into() } else { "none".into() })
-                        });
-                        if let Some(mode) = mode {
-                            cfg.sandbox = config::Sandbox::parse(&mode);
-                            out_val = json!(cfg.sandbox.as_str());
-                        }
-                    }
-                    _ => {
-                        drop(cfg);
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!(format!("unknown config key: {key}"))),
-                        );
-                        return;
-                    }
-                }
-                state
-                    .logger
-                    .log("set_config", json!({ "key": out_key, "value": out_val }));
-                drop(cfg);
-                emit(
-                    &Event::new("config_changed")
-                        .with("key", json!(out_key))
-                        .with("value", json!(out_val)),
-                );
-            }
-            Command::Reset => {
-                cancel_in_flight_turn(&state).await;
-                state.conversation.lock().await.clear();
-                state.pending_bash.lock().await.clear();
-                state.enabled_deferred_tools.lock().await.clear();
-                state.tool_output_cache.lock().await.invalidate_all();
-                let cfg = state.cfg.read().await;
-                if let Some(p) = cfg.session_file.as_ref() {
-                    session::rewrite(p, &[]);
-                }
-                state.invalidate_real_token_baseline().await;
-                clear_work_state(&state).await;
-                reset_stats(&state).await;
-                emit(&Event::new("reset"));
-            }
-            Command::Clear => {
-                // In-memory only: keep the session file so a restart can still resume.
-                cancel_in_flight_turn(&state).await;
-                state.conversation.lock().await.clear();
-                state.pending_bash.lock().await.clear();
-                state.enabled_deferred_tools.lock().await.clear();
-                state.tool_output_cache.lock().await.invalidate_all();
-                state.invalidate_real_token_baseline().await;
-                clear_work_state(&state).await;
-                reset_stats(&state).await;
-                emit(&Event::new("reset"));
-            }
-            Command::Undo => {
-                // Count for telemetry (session_stop human_corrections).
-                state
-                    .undo_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Restore filesystem from the latest auto checkpoint (if any)
-                // BEFORE popping conversation, so the user gets both back.
-                {
-                    let cfg = state.cfg.read().await;
-                    let _ = checkpoint::restore_latest_auto(
-                        &cfg.workspace,
-                        cfg.session_file.as_deref(),
-                    );
-                }
-                // Drop the last turn: a user msg + everything after it (assistant, tool msgs).
-                let mut conv = state.conversation.lock().await;
-                // Walk back past trailing tool/assistant messages to the last user message.
-                while let Some(last) = conv.last() {
-                    if last.is_user() {
-                        conv.pop();
-                        break;
-                    }
-                    conv.pop();
-                }
-                if let Some(p) = state.cfg.read().await.session_file.as_ref() {
-                    session::rewrite(p, &conv);
-                }
-                // Replay remaining history so the TUI rebuilds the transcript
-                // (trimmed last turn only) instead of wiping the whole view.
-                let visible: Vec<Value> = conv
-                    .iter()
-                    .filter(|m| !m.is_system())
-                    .map(Value::from)
-                    .collect();
-                let est = estimate_messages_tokens(&conv);
-                drop(conv);
-                // The dropped turn invalidates the real baseline's length anchor.
-                state.invalidate_real_token_baseline().await;
-                *state.estimated_tokens.lock().await = est;
-                clear_work_state(&state).await;
-                emit(
-                    &Event::new("history")
-                        .with("messages", json!(visible))
-                        .with("tokens_in", json!(est)),
-                );
-            }
-            Command::CreateCheckpoint { label, paths } => {
-                let cfg = state.cfg.read().await;
-                let label = label.unwrap_or_else(|| "manual".into());
-                let paths = paths.unwrap_or_default();
-                match checkpoint::create(
-                    &cfg.workspace,
-                    cfg.session_file.as_deref(),
-                    &label,
-                    &paths,
-                    false,
-                ) {
-                    Ok(m) => emit(&Event::new("info").with(
-                        "message",
-                        json!(format!("checkpoint {} created ({})", m.id, m.kind)),
-                    )),
-                    Err(e) => emit(&Event::new("error").with("message", json!(e))),
-                }
-            }
-            Command::ListCheckpoints => {
-                let cfg = state.cfg.read().await;
-                let index = checkpoint::index_path(cfg.session_file.as_deref(), &cfg.workspace);
-                let metas = checkpoint::list(&index);
-                emit(&Event::new("checkpoints").with("checkpoints", json!(metas)));
-            }
-            Command::RestoreCheckpoint { id } => {
-                let cfg = state.cfg.read().await;
-                match checkpoint::restore(&cfg.workspace, cfg.session_file.as_deref(), &id) {
-                    Ok(m) => emit(&Event::new("info").with(
-                        "message",
-                        json!(format!("restored checkpoint {} ({})", m.id, m.kind)),
-                    )),
-                    Err(e) => emit(&Event::new("error").with("message", json!(e))),
-                }
-            }
-            Command::Compact { instructions } => {
-                // Force compaction now, then emit a compacted event. Uses the
-                // summarize strategy (honoring any `/compact <instructions>`
-                // override or the configured `compact_instructions`) when an api
-                // key is present; falls back to naive drop-oldest otherwise.
-                let mut messages = state.conversation.lock().await.clone();
-                if messages.len() > 2 {
-                    dispatch_lifecycle(&state, "pre_compact").await;
-                    let before_est = estimate_messages_tokens(&messages);
-                    // Size the reclaim against the user's actual model window,
-                    // not a hardcoded 200k.
-                    let (model_ctx, model_max_tokens) = {
-                        let last = state.last_model.lock().await.clone();
-                        let models = state.models.read().await;
-                        last.as_deref()
-                            .and_then(|m| models.iter().find(|mi| mi.id == m))
-                            .map(|m| (m.context_window as u64, m.max_tokens))
-                            .unwrap_or((200_000, 8_192))
-                    };
-                    let cfg = state.cfg.read().await.clone();
-                    let policy = context_policy(
-                        &messages,
-                        model_ctx,
-                        model_max_tokens,
-                        cfg.context_compact_at,
-                        cfg.context_digest_at,
-                    );
-                    emit(
-                        &Event::new("compacting")
-                            .with("before_tokens", json!(before_est))
-                            .with("trigger", json!("manual"))
-                            .with("context_window", json!(model_ctx))
-                            .with("threshold_tokens", json!(policy.compact_threshold))
-                            .with("hard_limit_tokens", json!(policy.hard_limit))
-                            .with(
-                                "utilization_pct",
-                                json!(utilization_pct(before_est, model_ctx)),
-                            ),
-                    );
-                    let model_name = state.last_model.lock().await.clone().unwrap_or_default();
-                    let rp = state.resolve_provider_for_model(&model_name).await;
-                    // A `/compact <instructions>` override takes precedence over
-                    // the configured default; empty/whitespace falls back.
-                    let instr = match instructions
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        Some(s) => Some(s),
-                        None => cfg.compact_instructions.as_deref(),
-                    };
-                    // Manual compact is a one-shot — a fresh (never-cancelled)
-                    // token is fine; there's no in-flight turn to abort it.
-                    let cancel = CancellationToken::new();
-                    let summary_chars = if rp.api_key.is_some() && !model_name.is_empty() {
-                        let mp = state.plugin_manager.memory_provider();
-                        compact_with_summary(
-                            &client,
-                            &cfg,
-                            &rp,
-                            &model_name,
-                            &mut messages,
-                            &cancel,
-                            false,
-                            model_ctx,
-                            instr,
-                            mp.as_ref(),
-                        )
-                        .await
-                    } else {
-                        compact_conversation(&mut messages, model_ctx);
-                        0
-                    };
-                    *state.conversation.lock().await = messages.clone();
-                    let after_est = estimate_messages_tokens(&messages);
-                    *state.estimated_tokens.lock().await = after_est;
-                    // Manual compaction rewrote history; drop the stale baseline.
-                    state.invalidate_real_token_baseline().await;
-                    if let Some(p) = state.cfg.read().await.session_file.as_ref() {
-                        session::rewrite(p, &messages);
-                    }
-                    emit(
-                        &Event::new("compacted")
-                            .with("before_tokens", json!(before_est))
-                            .with("after_tokens", json!(after_est))
-                            .with("summary_chars", json!(summary_chars))
-                            .with("context_window", json!(model_ctx))
-                            .with("threshold_tokens", json!(policy.compact_threshold))
-                            .with("hard_limit_tokens", json!(policy.hard_limit))
-                            .with("within_limit", json!(after_est <= policy.hard_limit)),
-                    );
-                    if after_est > policy.hard_limit {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!(format!(
-                                "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
-                                policy.hard_limit
-                            )),
-                        ));
-                    }
-                } else {
-                    emit(&Event::new("info").with("message", json!("nothing to compact yet")));
-                }
-            }
-            Command::ListSessions => {
-                let (dir, current_name) = {
-                    let cfg = state.cfg.read().await;
-                    let sf = cfg.session_file.as_ref();
-                    let dir = sf
-                        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let cur = sf.and_then(|p| p.file_name()).map(|n| n.to_os_string());
-                    (dir, cur)
-                };
-                let mut entries: Vec<Value> = Vec::new();
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for e in rd.flatten() {
-                        let path = e.path();
-                        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                            continue;
-                        }
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let info = session::describe(&path);
-                        let meta = session::read_meta(&path);
-                        let mtime = e
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let current = current_name
-                            .as_ref()
-                            .map(|n| *n == e.file_name())
-                            .unwrap_or(false);
-                        let title = meta
-                            .title
-                            .or(info.title)
-                            .unwrap_or_else(|| "(no messages yet)".to_string());
-                        entries.push(json!({
-                            "name": name,
-                            "path": path.display().to_string(),
-                            "title": title,
-                            "messages": info.messages,
-                            "mtime": mtime,
-                            "current": current,
-                            "pinned": meta.pinned,
-                        }));
-                    }
-                }
-                // Most recently modified first.
-                entries.sort_by(|a, b| {
-                    b["pinned"]
-                        .as_bool()
-                        .unwrap_or(false)
-                        .cmp(&a["pinned"].as_bool().unwrap_or(false))
-                        .then_with(|| {
-                            b["mtime"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                .cmp(&a["mtime"].as_u64().unwrap_or(0))
-                        })
-                });
-                let files: Vec<String> = entries
-                    .iter()
-                    .filter_map(|e| e["name"].as_str().map(|s| s.to_string()))
-                    .collect();
-                emit(
-                    &Event::new("sessions")
-                        .with("sessions", json!(entries))
-                        .with("files", json!(files)),
-                );
-            }
-            Command::LoadSession { path } => {
-                let mut p = std::path::PathBuf::from(&path);
-                // Resolve relative paths against the sessions dir so the picker
-                // (which may send a bare filename) works.
-                if !p.is_absolute() {
-                    if let Some(sess_dir) = state
-                        .cfg
-                        .read()
-                        .await
-                        .session_file
-                        .as_ref()
-                        .and_then(|sf| sf.parent())
-                    {
-                        p = sess_dir.join(&p);
-                    }
-                }
-                let loaded = match session::load(&p) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        emit(
-                            &Event::new("session_change_failed")
-                                .with("path", json!(path))
-                                .with("message", json!(e)),
-                        );
-                        continue;
-                    }
-                };
-                cancel_in_flight_turn(&state).await;
-                *state.conversation.lock().await = loaded.clone();
-                state.pending_bash.lock().await.clear();
-                state.enabled_deferred_tools.lock().await.clear();
-                state.tool_output_cache.lock().await.invalidate_all();
-                // Restore the loaded session's cumulative stats so `/stats` shows
-                // its real totals, not the prior session's.
-                restore_stats(&state, &p).await;
-                // Point the session_file at the loaded path so future appends go there.
-                state.cfg.write().await.session_file = Some(p.clone());
-                emit(
-                    &Event::new("session_changed")
-                        .with("path", json!(p.display().to_string()))
-                        .with("new", json!(false)),
-                );
-                emit(&Event::new("reset"));
-                // Replay the loaded transcript so the TUI shows prior turns
-                // instead of an empty view after switching/resuming a session.
-                let visible: Vec<Value> = loaded
-                    .iter()
-                    .filter(|m| !m.is_system())
-                    .map(Value::from)
-                    .collect();
-                let est = estimate_messages_tokens(&loaded);
-                *state.estimated_tokens.lock().await = est;
-                // Loaded history has no known real token count yet; the next
-                // request's `usage` will re-establish the baseline.
-                state.invalidate_real_token_baseline().await;
-                clear_work_state(&state).await;
-                emit(
-                    &Event::new("history")
-                        .with("messages", json!(visible))
-                        .with("tokens_in", json!(est)),
-                );
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!("loaded {} messages from {}", loaded.len(), path)),
-                ));
-            }
-            Command::RenameSession { path, title } => {
-                let mut p = std::path::PathBuf::from(&path);
-                if !p.is_absolute() {
-                    if let Some(dir) = state
-                        .cfg
-                        .read()
-                        .await
-                        .session_file
-                        .as_ref()
-                        .and_then(|x| x.parent())
-                    {
-                        p = dir.join(&p);
-                    }
-                }
-                let title = title.trim();
-                if title.is_empty() {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!("session title cannot be empty")),
-                    );
-                    continue;
-                }
-                let title = title.chars().take(120).collect::<String>();
-                match session::update_meta(&p, |meta| meta.title = Some(title.clone())) {
-                    Ok(_) => emit(
-                        &Event::new("session_renamed")
-                            .with("path", json!(path))
-                            .with("title", json!(title)),
-                    ),
-                    Err(e) => emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("rename session failed: {e}"))),
-                    ),
-                }
-            }
-            Command::PinSession { path, pinned } => {
-                let mut p = std::path::PathBuf::from(&path);
-                if !p.is_absolute() {
-                    if let Some(dir) = state
-                        .cfg
-                        .read()
-                        .await
-                        .session_file
-                        .as_ref()
-                        .and_then(|x| x.parent())
-                    {
-                        p = dir.join(&p);
-                    }
-                }
-                match session::update_meta(&p, |meta| meta.pinned = pinned) {
-                    Ok(_) => emit(
-                        &Event::new("session_pinned")
-                            .with("path", json!(path))
-                            .with("pinned", json!(pinned)),
-                    ),
-                    Err(e) => emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("pin session failed: {e}"))),
-                    ),
-                }
-            }
-            Command::DeleteSession { path } => {
-                let mut p = std::path::PathBuf::from(&path);
-                if !p.is_absolute() {
-                    if let Some(dir) = state
-                        .cfg
-                        .read()
-                        .await
-                        .session_file
-                        .as_ref()
-                        .and_then(|x| x.parent())
-                    {
-                        p = dir.join(&p);
-                    }
-                }
-                let current = state.cfg.read().await.session_file.clone();
-                if current.as_ref() == Some(&p) {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!("cannot delete the active session; start or load another first"),
-                    ));
-                    continue;
-                }
-                match session::delete_with_sidecars(&p) {
-                    Ok(()) => emit(&Event::new("session_deleted").with("path", json!(path))),
-                    Err(e) => emit(
-                        &Event::new("error")
-                            .with("message", json!(format!("delete session failed: {e}"))),
-                    ),
-                }
-            }
-            Command::NewSession { path } => {
-                // Stop any in-flight turn so it can't keep writing into the new session.
-                cancel_in_flight_turn(&state).await;
-                // Start a fresh session file in the same project dir. The old
-                // file is left on disk so sessions accumulate per project.
-                let new_path = match path {
-                    Some(name) => {
-                        let mut p = std::path::PathBuf::from(name);
-                        if !p.is_absolute() {
-                            if let Some(sess_dir) = state
-                                .cfg
-                                .read()
-                                .await
-                                .session_file
-                                .as_ref()
-                                .and_then(|sf| sf.parent())
-                            {
-                                p = sess_dir.join(&p);
-                            }
-                        }
-                        p
-                    }
-                    None => {
-                        let dir = state
-                            .cfg
-                            .read()
-                            .await
-                            .session_file
-                            .as_ref()
-                            .and_then(|p| p.parent().map(|x| x.to_path_buf()))
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        dir.join(new_session_filename())
-                    }
-                };
-                session::ensure(&new_path);
-                *state.conversation.lock().await = Vec::new();
-                state.pending_bash.lock().await.clear();
-                state.enabled_deferred_tools.lock().await.clear();
-                state.tool_output_cache.lock().await.invalidate_all();
-                state.invalidate_real_token_baseline().await;
-                clear_work_state(&state).await;
-                state.cfg.write().await.session_file = Some(new_path.clone());
-                // Fresh session: zero the cumulative stats (in memory + sidecar).
-                reset_stats(&state).await;
-                state
-                    .undo_count
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                state
-                    .skill_read_count
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                state.logger.log(
-                    "new_session",
-                    json!({ "path": new_path.display().to_string() }),
-                );
-                emit(
-                    &Event::new("session_changed")
-                        .with("path", json!(new_path.display().to_string()))
-                        .with("new", json!(true)),
-                );
-                emit(&Event::new("reset"));
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!("started new session: {}", new_path.display())),
-                ));
-            }
-            Command::Stats => {
-                // Cumulative REAL usage (billing totals — accurate by construction:
-                // each turn adds the endpoint's actual prompt/completion tokens).
-                let ti = *state.tokens_in.lock().await; // cumulative prompt
-                let to = *state.tokens_out.lock().await; // cumulative output
-                let cached = *state.cached_tokens.lock().await;
-                let turns = state.logger.turn_count();
-                let cache_hit_ratio = if ti > 0 {
-                    cached as f64 / ti as f64
-                } else {
-                    0.0
-                };
-                // `tokens_in` = the CURRENT real context — the SAME grounded
-                // estimate the footer uses (real prompt_tokens + small delta) — so
-                // /stats "in" matches the footer instead of the cumulative prompt,
-                // which re-sums the whole prefix every turn and looks inflated next
-                // to it. The cumulative prompt is still exposed as `total_in` for
-                // billing and the cache ratio.
-                let ctx = {
-                    let conv = state.conversation.lock().await;
-                    let last_real = *state.last_real_prompt_tokens.lock().await;
-                    let len_at = *state.conv_len_at_last_real.lock().await;
-                    grounded_estimate(&conv, last_real, len_at)
-                };
-                let msg_count = state.conversation.lock().await.len();
-                let session_file = state
-                    .cfg
-                    .read()
-                    .await
-                    .session_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                emit(
-                    &Event::new("stats")
-                        .with("tokens_in", json!(ctx)) // current context (footer match)
-                        .with("tokens_out", json!(to)) // cumulative output
-                        .with("total_in", json!(ti)) // cumulative prompt (billing)
-                        .with("tokens_total", json!(ti + to)) // cumulative in+out
-                        .with("cached_tokens", json!(cached))
-                        .with("cache_hit_ratio", json!(cache_hit_ratio))
-                        .with("turns", json!(turns))
-                        .with("messages", json!(msg_count))
-                        .with("session_file", json!(session_file)),
-                );
-            }
-            Command::Usage { model } => {
-                // Provider plan/rate-limit usage for the model the user is on.
-                // Resolve model → owning provider → provider-specific usage
-                // endpoint (Umans / Codex / Claude OAuth / …). Read-only.
-                let model_name = match model.filter(|m| !m.is_empty()) {
-                    Some(m) => m,
-                    None => state.last_model.lock().await.clone().unwrap_or_default(),
-                };
-                // When we still have no model (fresh session, never sent), fall
-                // back to the first discovered model so /usage still works.
-                let model_name = if model_name.is_empty() {
-                    state
-                        .models
-                        .read()
-                        .await
-                        .first()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_default()
-                } else {
-                    model_name
-                };
-                let rp = if model_name.is_empty() {
-                    let rp = state.resolved_provider().await;
-                    oauth::enrich_oauth(rp, &client, Some(&state.plugin_manager)).await
-                } else {
-                    state.resolve_provider_for_model(&model_name).await
-                };
-                let usage = provider::fetch_provider_usage(&client, &rp).await;
-                let mut ev = Event::new("usage")
-                    .with("provider", json!(rp.name))
-                    .with("provider_kind", json!(rp.kind.to_string()))
-                    .with("model", json!(model_name))
-                    .with("base_url", json!(rp.base_url));
-                for (k, v) in usage.to_event_fields() {
-                    ev = ev.with(&k, v);
-                }
-                emit(&ev);
-            }
-            Command::Context => {
-                // Token-breakdown: where is the context window being spent?
-                // Aggregates per-message token estimates (same char/4 heuristic
-                // the footer uses) so the user can see the biggest consumers
-                // before compaction fires. Read-only — never mutates state.
-                let conv = state.conversation.lock().await.clone();
-                let total = {
-                    let last_real = *state.last_real_prompt_tokens.lock().await;
-                    let len_at = *state.conv_len_at_last_real.lock().await;
-                    grounded_estimate(&conv, last_real, len_at)
-                };
-                let (model_ctx, model_max_tokens) = {
-                    let last = state.last_model.lock().await.clone();
-                    let models = state.models.read().await;
-                    last.as_deref()
-                        .and_then(|m| models.iter().find(|mi| mi.id == m))
-                        .map(|m| (m.context_window as u64, m.max_tokens))
-                        .unwrap_or((200_000, 8_192))
-                };
-                let cfg = state.cfg.read().await;
-                let policy = context_policy(
-                    &conv,
-                    model_ctx,
-                    model_max_tokens,
-                    cfg.context_compact_at,
-                    cfg.context_digest_at,
-                );
-                let pct = if model_ctx > 0 {
-                    (total as f64 / model_ctx as f64 * 100.0).round() as u64
-                } else {
-                    0
-                };
-                // Per-message estimates; role buckets are aggregated below from
-                // the entries for clean u64 values.
-                let mut entries: Vec<Value> = Vec::with_capacity(conv.len());
-                for (i, m) in conv.iter().enumerate() {
-                    let tokens = estimate_messages_tokens(std::slice::from_ref(m));
-                    let role = m.role();
-                    let preview: String = m
-                        .content_text()
-                        .map(|t| {
-                            let t = t.replace('\n', " ");
-                            if t.chars().count() > 100 {
-                                format!("{}…", t.chars().take(100).collect::<String>())
-                            } else {
-                                t
-                            }
-                        })
-                        .unwrap_or_else(|| "(no text / multimodal)".to_string());
-                    entries.push(json!({
-                        "index": i,
-                        "role": role,
-                        "tokens": tokens,
-                        "preview": preview,
-                    }));
-                }
-                // Aggregate per-role token totals.
-                let role_obj: Value = {
-                    let mut counts: std::collections::BTreeMap<String, u64> =
-                        std::collections::BTreeMap::new();
-                    for e in &entries {
-                        let r = e["role"].as_str().unwrap_or("").to_string();
-                        let t = e["tokens"].as_u64().unwrap_or(0);
-                        *counts.entry(r).or_insert(0) += t;
-                    }
-                    let mut map = serde_json::Map::new();
-                    for (k, v) in counts {
-                        map.insert(k, json!(v));
-                    }
-                    Value::Object(map)
-                };
-                let system_tokens = entries
-                    .iter()
-                    .filter(|e| e["role"].as_str() == Some("system"))
-                    .map(|e| e["tokens"].as_u64().unwrap_or(0))
-                    .sum::<u64>();
-                // Top 10 consumers by tokens (descending).
-                entries.sort_by(|a, b| b["tokens"].as_u64().cmp(&a["tokens"].as_u64()));
-                let top: Vec<Value> = entries.iter().take(10).cloned().collect();
-                emit(
-                    &Event::new("context_breakdown")
-                        .with("total_tokens", json!(total))
-                        .with("context_window", json!(model_ctx))
-                        .with("pct", json!(pct))
-                        .with("digest_threshold_tokens", json!(policy.digest_threshold))
-                        .with("compact_threshold_tokens", json!(policy.compact_threshold))
-                        .with("hard_limit_tokens", json!(policy.hard_limit))
-                        .with("response_reserve_tokens", json!(policy.response_reserve))
-                        .with("safety_margin_tokens", json!(policy.safety_margin))
-                        .with("messages", json!(conv.len()))
-                        .with("system_tokens", json!(system_tokens))
-                        .with("by_role", role_obj)
-                        .with("top_consumers", json!(top)),
-                );
-            }
-            Command::InstallPlugin { path, scope } => {
-                let scope = match plugins::PluginInstallScope::parse(
-                    scope.as_deref().unwrap_or("global"),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        emit(
-                            &Event::new("plugin_error")
-                                .with("name", json!(path))
-                                .with("message", json!(e)),
-                        );
-                        continue;
-                    }
-                };
-                match state.plugin_manager.install_source(&path, scope).await {
-                    Ok(plugin) => {
-                        let hooks_list: Vec<String> = plugin.hooks.keys().cloned().collect();
-                        emit(
-                            &Event::new("plugin_installed")
-                                .with("name", json!(plugin.name))
-                                .with("version", json!(plugin.version))
-                                .with("description", json!(plugin.description))
-                                .with("hooks", json!(hooks_list))
-                                .with("scope", json!(scope.as_str()))
-                                .with("path", json!(plugin.source_path.display().to_string())),
-                        );
-                    }
-                    Err(e) => {
-                        emit(
-                            &Event::new("plugin_error")
-                                .with("name", json!(path))
-                                .with("message", json!(e)),
-                        );
-                    }
-                }
-            }
-            Command::RemovePlugin { name } => {
-                let _ = state.plugin_manager.remove(&name);
-                emit(&Event::new("plugin_removed").with("name", json!(name)));
-            }
-            Command::EnablePlugin { name } => {
-                let _ = state.plugin_manager.enable(&name);
-                emit(&Event::new("plugin_enabled").with("name", json!(name)));
-            }
-            Command::DisablePlugin { name } => {
-                let _ = state.plugin_manager.disable(&name);
-                emit(&Event::new("plugin_disabled").with("name", json!(name)));
-            }
-            Command::ListPlugins => {
-                let plugins = state.plugin_manager.list();
-                let mut entries: Vec<Value> = plugins
-                    .values()
-                    .map(|p| {
-                        let mut hooks: Vec<String> = p.hooks.keys().cloned().collect();
-                        hooks.sort();
-                        let scope = state.plugin_manager.scope_of_path(&p.source_path);
-                        let tools: Vec<String> = p.tools.iter().map(|t| t.name.clone()).collect();
-                        let commands: Vec<String> =
-                            p.commands.iter().map(|c| c.name.clone()).collect();
-                        json!({
-                            "name": p.name,
-                            "version": p.version,
-                            "enabled": p.enabled,
-                            "description": p.description,
-                            "hooks": hooks,
-                            "tools": tools,
-                            "commands": commands,
-                            "disable_tools": p.disable_tools,
-                            "has_oauth": p.oauth.is_some(),
-                            "has_memory_provider": p.memory_provider.is_some(),
-                            "has_system_prompt": !p.system_prompt.trim().is_empty(),
-                            "path": p.source_path.display().to_string(),
-                            "scope": scope.as_str(),
-                        })
-                    })
-                    .collect();
-                entries.sort_by(|a, b| {
-                    a.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-                });
-                emit(&Event::new("plugins_list").with("plugins", json!(entries)));
-                let cmds = state.plugin_manager.command_definitions();
-                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
-            }
-            Command::ListPluginCommands => {
-                let cmds = state.plugin_manager.command_definitions();
-                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
-            }
-            Command::ReloadPlugins => {
-                let summary = state.plugin_manager.reload();
-                let plugins = state.plugin_manager.list();
-                let mut entries: Vec<Value> = plugins
-                    .values()
-                    .map(|p| {
-                        let mut hooks: Vec<String> = p.hooks.keys().cloned().collect();
-                        hooks.sort();
-                        let scope = state.plugin_manager.scope_of_path(&p.source_path);
-                        let tools: Vec<String> = p.tools.iter().map(|t| t.name.clone()).collect();
-                        let commands: Vec<String> =
-                            p.commands.iter().map(|c| c.name.clone()).collect();
-                        json!({
-                            "name": p.name,
-                            "version": p.version,
-                            "enabled": p.enabled,
-                            "description": p.description,
-                            "hooks": hooks,
-                            "tools": tools,
-                            "commands": commands,
-                            "disable_tools": p.disable_tools,
-                            "has_oauth": p.oauth.is_some(),
-                            "has_memory_provider": p.memory_provider.is_some(),
-                            "has_system_prompt": !p.system_prompt.trim().is_empty(),
-                            "path": p.source_path.display().to_string(),
-                            "scope": scope.as_str(),
-                        })
-                    })
-                    .collect();
-                entries.sort_by(|a, b| {
-                    a.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-                });
-                emit(&Event::new("plugins_list").with("plugins", json!(entries)));
-                let cmds = state.plugin_manager.command_definitions();
-                emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
-                let loaded = summary.get("loaded").and_then(|v| v.as_u64()).unwrap_or(0);
-                let skipped = summary
-                    .get("skipped")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let err_n = summary
-                    .get("errors")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!(
-                        "plugins reloaded: {loaded} loaded, {skipped} skipped, {err_n} errors"
-                    )),
-                ));
-                // Refresh system prompt so plugin injections / memory providers
-                // pick up enable/disable / newly loaded plugins.
-                let _ = refresh_memory_injection(&state).await;
-            }
-            Command::PluginCommand { name, args } => {
-                match state.plugin_manager.command_config(&name) {
-                    Some(cfg) => {
-                        let ws = state.cfg.read().await.workspace.display().to_string();
-                        let session_id = state
-                            .cfg
-                            .read()
-                            .await
-                            .session_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let out =
-                            plugins::execute_plugin_command(&cfg, &args, &ws, &session_id).await;
-                        if out.ok {
-                            emit(&Event::new("info").with("message", json!(out.output)));
-                        } else {
-                            emit(&Event::new("error").with("message", json!(out.output)));
-                        }
-                    }
-                    None => {
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!(format!("unknown plugin command '{name}'"))),
-                        );
-                    }
-                }
-            }
-            Command::GetVisionConfig => {
-                let vc = state.vision.read().await.clone();
-                let models = state.models.read().await.clone();
-                let models_json: Vec<Value> = models
-                    .iter()
-                    .map(|m| {
-                        json!({
-                            "id": m.id.clone(),
-                            "vision": m.vision || vc.has_vision(m.id.as_str()),
-                            "provider": m.provider.clone(),
-                            "cost_rank": vision::vision_cost_rank(&m.id),
-                        })
-                    })
-                    .collect();
-                emit(
-                    &Event::new("vision_config")
-                        .with("enabled", json!(vc.enabled))
-                        .with("vision_models", json!(vc.vision_models.clone()))
-                        .with("vision_model", json!(vc.vision_model.clone()))
-                        .with("models", json!(models_json)),
-                );
-            }
-            Command::SetVisionConfig {
-                enabled,
-                vision_models,
-                vision_model,
-            } => {
-                let vc = VisionConfig {
-                    enabled,
-                    vision_models,
-                    vision_model: vision_model.filter(|s| !s.is_empty()),
-                };
-                let workspace = state.cfg.read().await.workspace.clone();
-                vc.save(&workspace);
-                *state.vision.write().await = vc.clone();
-                let models = state.models.read().await.clone();
-                let models_json: Vec<Value> = models
-                    .iter()
-                    .map(|m| {
-                        json!({
-                            "id": m.id.clone(),
-                            "vision": m.vision || vc.has_vision(m.id.as_str()),
-                            "provider": m.provider.clone(),
-                            "cost_rank": vision::vision_cost_rank(&m.id),
-                        })
-                    })
-                    .collect();
-                emit(
-                    &Event::new("vision_config")
-                        .with("enabled", json!(vc.enabled))
-                        .with("vision_models", json!(vc.vision_models.clone()))
-                        .with("vision_model", json!(vc.vision_model.clone()))
-                        .with("models", json!(models_json)),
-                );
-            }
-            Command::ListSkills => {
-                // Re-publish the discoverable-skills list (project then user
-                // scope). The TUI/web request this after a turn ends so a skill
-                // created mid-session (e.g. by /reflect or /index) shows up in
-                // the `/skill:<name>` autocomplete without a restart.
-                let ws = state.cfg.read().await.workspace.clone();
-                emit_skills_event(&ws);
-            }
-            Command::ListAgents => {
-                let cfg = state.cfg.read().await;
-                emit_agents_event(&cfg.workspace, &cfg);
-            }
-            Command::ApplySkill {
-                name,
-                task,
-                model,
-                reasoning_effort,
-            } => {
-                let st = state.clone();
-                let client = client.clone();
-                let models = st.models.read().await.clone();
-                if !models.iter().any(|m| m.id == model) {
-                    emit_turn_rejected(format!("unknown model: {model}"));
-                    continue;
-                }
-                let ws = st.cfg.read().await.workspace.clone();
-                let skills = subagent::discover_skills_full(&ws);
-                let skill = skills
-                    .into_iter()
-                    .find(|s| s.name.eq_ignore_ascii_case(&name));
-                let Some(skill) = skill else {
-                    emit_turn_rejected(format!(
-                        "unknown skill '{name}' — use /skill:<name> with a name from the autocomplete"
-                    ));
-                    continue;
-                };
-                let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
-                let prompt = build_skill_prompt(&skill, task.as_deref());
-                start_turn(&st, &client, model, prompt, effort, None).await;
-            }
-            Command::StartGoal {
-                goal: goal_text,
-                concurrency,
-                max_tasks,
-                allowed_models,
-                allowed_providers,
-                auto_deploy,
-                ceo_mode,
-                max_iterations,
-                max_plan_revisions,
-                planner_model,
-                worker_model,
-                reviewer_model,
-                model_concurrency,
-                model,
-                reasoning_effort,
-            } => {
-                let models = state.models.read().await.clone();
-                if !models.iter().any(|m| m.id == model) {
-                    emit_turn_rejected(format!("unknown model: {model}"));
-                    continue;
-                }
-                // Cancel any prior goal deploy.
-                cancel_goal_deploy(&state).await;
-                let cfg = state.cfg.read().await;
-                let defaults = (
-                    cfg.subagents.parallel_concurrency,
-                    cfg.subagents.parallel_max_tasks,
-                );
-                drop(cfg);
-                match goal::new_goal(goal::StartGoalArgs {
-                    goal: goal_text,
-                    concurrency,
-                    max_tasks,
-                    allowed_models: allowed_models.unwrap_or_default(),
-                    allowed_providers: allowed_providers.unwrap_or_default(),
-                    auto_deploy,
-                    ceo_mode,
-                    max_iterations,
-                    max_plan_revisions,
-                    role_models: goal::RoleModels {
-                        planner: planner_model,
-                        worker: worker_model,
-                        reviewer: reviewer_model,
-                    },
-                    model_concurrency: model_concurrency.unwrap_or_default(),
-                    model: model.clone(),
-                    reasoning_effort: reasoning_effort.clone(),
-                    default_concurrency: defaults.0,
-                    default_max_tasks: defaults.1,
-                }) {
-                    Ok(mode) => {
-                        let prompt = goal::planning_prompt(&mode);
-                        let effort = mode.reasoning_effort.clone();
-                        // Planning turn uses parent_model (may be planner role pin).
-                        let plan_model = mode.parent_model.clone();
-                        // Seed WorkState.goal (replace, not one-shot).
-                        {
-                            let mut ws = state.work_state.lock().await;
-                            ws.goal = truncate_str(&mode.goal, 240);
-                            ws.done.clear();
-                            ws.in_progress.clear();
-                            ws.next.clear();
-                            ws.last_activity = "goal:planning".into();
-                            ws.touch();
-                        }
-                        emit_work_state(&state).await;
-                        {
-                            let mut g = state.goal.lock().await;
-                            *g = mode;
-                            goal::emit_goal_state(&g);
-                        }
-                        emit(&Event::new("info").with("message", json!("Goal mode: planning…")));
-                        // Prefer planner role model when set; else selected model.
-                        let turn_model = if models.iter().any(|m| m.id == plan_model) {
-                            plan_model
-                        } else {
-                            model
-                        };
-                        // Speculative scout while the planner runs (readonly recon).
-                        {
-                            let st_scout = state.clone();
-                            let client_scout = client.clone();
-                            let goal_for_scout = {
-                                let g = state.goal.lock().await;
-                                g.goal.clone()
-                            };
-                            let parent = turn_model.clone();
-                            tokio::spawn(async move {
-                                let provider = st_scout.resolve_provider_for_model(&parent).await;
-                                let args = json!({
-                                    "agent": "scout",
-                                    "task": format!(
-                                        "Quick readonly reconnaissance for this goal (do not modify files):\n{goal_for_scout}\n\nSummarize relevant files, risks, and entry points in under 800 words."
-                                    ),
-                                    "context": "fresh",
-                                });
-                                let cancel = CancellationToken::new();
-                                let outcome = crate::subagent::execute(
-                                    st_scout.clone(),
-                                    client_scout,
-                                    provider,
-                                    parent,
-                                    args,
-                                    cancel,
-                                    0,
-                                )
-                                .await;
-                                if outcome.ok && !outcome.output.trim().is_empty() {
-                                    let mut g = st_scout.goal.lock().await;
-                                    let text: String = outcome.output.chars().take(4000).collect();
-                                    g.scout_findings = Some(text);
-                                    emit(&Event::new("info").with(
-                                        "message",
-                                        json!("speculative scout finished — findings available for deploy"),
-                                    ));
-                                }
-                            });
-                        }
-                        start_turn(&state, &client, turn_model, prompt, effort, None).await;
-                    }
-                    Err(e) => {
-                        emit(&Event::new("error").with("message", json!(e)));
-                    }
-                }
-            }
-            Command::CancelGoal => {
-                cancel_goal_deploy(&state).await;
-                state
-                    .goal_wrapup_active
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                // Also abort a planning turn if active.
-                if let Some(tok) = state.current.lock().await.take() {
-                    tok.cancel();
-                }
-                let mut g = state.goal.lock().await;
-                if g.phase == goal::GoalPhase::Idle {
-                    emit(&Event::new("info").with("message", json!("no active goal to cancel")));
-                } else {
-                    goal::fail_goal(&mut g, "cancelled by user");
-                    emit(&Event::new("info").with("message", json!("goal cancelled")));
-                }
-            }
-            Command::GoalStatus => {
-                let g = state.goal.lock().await;
-                goal::emit_goal_state(&g);
-                goal::emit_goal_plan(&g);
-            }
-            Command::ApproveGoalPlan => {
-                let (should_deploy, model) = {
-                    let mut g = state.goal.lock().await;
-                    if g.phase != goal::GoalPhase::PlanReady {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!(format!(
-                                "approve_goal_plan requires phase plan_ready (got {})",
-                                g.phase.as_str()
-                            )),
-                        ));
-                        (false, String::new())
-                    } else if g.prompts.is_empty() {
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!("no plan prompts to deploy")),
-                        );
-                        (false, String::new())
-                    } else {
-                        g.deploy_after_turn = false;
-                        g.auto_deploy = true;
-                        // Close the approve→checkpoint dark gap: emit state +
-                        // lasting bridge before the (possibly slow) snapshot.
-                        g.touch();
-                        goal::emit_goal_state(&g);
-                        emit(&Event::new("info").with(
-                            "message",
-                            json!("Goal plan approved — deploying (snapshotting workspace…)"),
-                        ));
-                        (true, g.parent_model.clone())
-                    }
-                };
-                if should_deploy {
-                    let _ = model;
-                    spawn_goal_deploy(state.clone(), client.clone());
-                }
-            }
-            Command::ReviseGoal {
-                feedback,
-                model,
-                reasoning_effort,
-            } => {
-                let models = state.models.read().await.clone();
-                if !models.iter().any(|m| m.id == model) {
-                    emit_turn_rejected(format!("unknown model: {model}"));
-                    continue;
-                }
-                cancel_goal_deploy(&state).await;
-                let prompt = {
-                    let mut g = state.goal.lock().await;
-                    if g.goal.is_empty() {
-                        emit_turn_rejected("no goal to revise — use start_goal first");
-                        None
-                    } else {
-                        g.revise_feedback = Some(feedback);
-                        g.plan = None;
-                        g.prompts.clear();
-                        g.error = None;
-                        g.deploy_after_turn = false;
-                        g.parent_model = model.clone();
-                        if let Some(e) = reasoning_effort {
-                            g.reasoning_effort = e;
-                        }
-                        goal::transition(&mut g, goal::GoalPhase::Planning, Some("revising plan"));
-                        Some((goal::planning_prompt(&g), g.reasoning_effort.clone()))
-                    }
-                };
-                if let Some((prompt, effort)) = prompt {
-                    start_turn(&state, &client, model, prompt, effort, None).await;
-                }
-            }
-            Command::UserBash {
-                command,
-                exclude_from_context,
-            } => {
-                handle_user_bash(&state, command, exclude_from_context).await;
-            }
-            Command::RefreshMemory => {
-                let msg = refresh_memory_injection(&state).await;
-                emit(&Event::new("info").with("message", json!(msg)));
-            }
-            Command::SaveMemory { text, tags, scope } => {
-                if text.trim().is_empty() {
-                    emit(
-                        &Event::new("error")
-                            .with("message", json!("save_memory: 'text' must not be empty")),
-                    );
-                } else {
-                    // Derive a name from the text (first words + timestamp) so
-                    // the slug/filename is unique and human-readable.
-                    let name = {
-                        let stem: String = text
-                            .split_whitespace()
-                            .take(5)
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        format!("{stem} [{ts}]")
-                    };
-                    let mem_type = tags
-                        .as_ref()
-                        .and_then(|t| t.first().cloned())
-                        .unwrap_or_else(|| "note".to_string());
-                    let ws = state.cfg.read().await.workspace.clone();
-                    let mem_scope = memory::Scope::parse(scope.as_deref().unwrap_or("workspace"));
-                    let save_result = if let Some(mp) = state.plugin_manager.memory_provider() {
-                        let args = json!({
-                            "name": name,
-                            "content": text,
-                            "type": mem_type,
-                            "description": "",
-                            "scope": mem_scope.as_str(),
-                        });
-                        let r = plugins::execute_memory_provider(
-                            &mp,
-                            "save",
-                            &args,
-                            &ws.display().to_string(),
-                            "",
-                        )
-                        .await;
-                        if r.ok {
-                            Ok(r.id)
-                        } else {
-                            Err(r.output)
-                        }
-                    } else {
-                        memory::save_memory_scoped(&ws, mem_scope, &name, &text, &mem_type, "").map(
-                            |p| {
-                                p.file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default()
-                            },
-                        )
-                    };
-                    match save_result {
-                        Ok(id) => {
-                            // Refresh the injection so the next turn sees the new memory.
-                            let _ = refresh_memory_injection(&state).await;
-                            emit(
-                                &Event::new("memory_saved")
-                                    .with("id", json!(id))
-                                    .with("message", json!("memory saved")),
-                            );
-                        }
-                        Err(e) => {
-                            emit(
-                                &Event::new("error")
-                                    .with("message", json!(format!("save_memory failed: {e}"))),
-                            );
-                        }
-                    }
-                }
-            }
-            Command::ListMemory => {
-                let ws = state.cfg.read().await.workspace.clone();
-                let arr: Vec<Value> = if let Some(mp) = state.plugin_manager.memory_provider() {
-                    let r = plugins::execute_memory_provider(
-                        &mp,
-                        "list",
-                        &json!({}),
-                        &ws.display().to_string(),
-                        "",
-                    )
-                    .await;
-                    if r.ok && !r.entries.is_empty() {
-                        r.entries
-                    } else if r.ok {
-                        Vec::new()
-                    } else {
-                        emit(&Event::new("error").with(
-                            "message",
-                            json!(format!("list_memory failed: {}", r.output)),
-                        ));
-                        Vec::new()
-                    }
-                } else {
-                    let entries = memory::scan_all_memories(&ws);
-                    entries
-                        .iter()
-                        .map(|m| {
-                            let id = m
-                                .path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            json!({
-                                "id": id,
-                                "name": m.name,
-                                "type": m.mem_type,
-                                "description": m.description,
-                                "content": m.content,
-                                "scope": m.scope.as_str(),
-                                // Display fields consumed by the TUI's /memory list:
-                                // `text` is the scannable label (the memory name),
-                                // `tags` surfaces the type as a single tag.
-                                "text": m.name,
-                                "tags": [m.mem_type],
-                            })
-                        })
-                        .collect()
-                };
-                emit(
-                    &Event::new("memory_list")
-                        .with("entries", json!(arr))
-                        .with("count", json!(arr.len())),
-                );
-            }
-            Command::ForgetMemory { id, scope } => {
-                let ws = state.cfg.read().await.workspace.clone();
-                let result = if let Some(mp) = state.plugin_manager.memory_provider() {
-                    let mut args = json!({ "id": id });
-                    if let Some(s) = scope.as_deref().filter(|s| !s.is_empty()) {
-                        args["scope"] = json!(s);
-                    }
-                    let r = plugins::execute_memory_provider(
-                        &mp,
-                        "forget",
-                        &args,
-                        &ws.display().to_string(),
-                        "",
-                    )
-                    .await;
-                    if r.ok {
-                        Ok(())
-                    } else {
-                        Err(r.output)
-                    }
-                } else {
-                    match scope.as_deref() {
-                        Some(s) if !s.is_empty() => {
-                            memory::forget_memory_scoped(&ws, memory::Scope::parse(s), &id)
-                        }
-                        _ => memory::forget_memory_any(&ws, &id),
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        let _ = refresh_memory_injection(&state).await;
-                        emit(
-                            &Event::new("memory_saved")
-                                .with("message", json!(format!("forgot memory '{id}'"))),
-                        );
-                    }
-                    Err(e) => {
-                        emit(
-                            &Event::new("error")
-                                .with("message", json!(format!("forget_memory failed: {e}"))),
-                        );
-                    }
-                }
-            }
-            Command::Approve {
-                request_id,
-                decision,
-                pattern,
-            } => {
-                // Look up by the unique approval id (the request_id the TUI
-                // echoes back), not the tool-call id — concurrent approvals from
-                // parallel subagents (which may each use `call_1`) can't resolve
-                // to the wrong request.
-                let p = state.pending.lock().await.get(&request_id).cloned();
-                if let Some(p) = p {
-                    match decision.as_str() {
-                        "yes" => *p.granted.lock().await = Some(true),
-                        "always" => {
-                            *p.granted.lock().await = Some(true);
-                            *p.escalated.lock().await = true;
-                        }
-                        "allow_session" => {
-                            *p.granted.lock().await = Some(true);
-                            *p.allow_session.lock().await = true;
-                        }
-                        "allow_pattern" => {
-                            *p.granted.lock().await = Some(true);
-                            let pat = pattern.or_else(|| {
-                                p.args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .or_else(|| {
-                                        p.args
-                                            .get("command")
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from)
-                                    })
-                            });
-                            *p.allow_pattern.lock().await = pat;
-                        }
-                        _ => *p.granted.lock().await = Some(false),
-                    }
-                    p.notify.notify_one();
-                }
-            }
-            Command::IntercomReply { request_id, reply } => {
-                // The orchestrator (user, via the TUI) replies to a subagent's
-                // contact_supervisor need_decision ask. Resolves the pending ask
-                // so the awaiting subagent loop wakes and continues.
-                let ok = state.intercom.resolve_ask(&request_id, &reply);
-                if ok {
-                    emit(&Event::new("info").with("message", json!("reply delivered to subagent")));
-                } else {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!("no pending intercom ask for id {request_id}")),
-                    ));
-                }
-            }
-            Command::AskReply {
-                request_id,
-                answers,
-            } => {
-                // The user answered (or skipped) a pending `ask` tool call.
-                // Resolves the awaiting request_ask() so the model continues.
-                let p = state.pending_asks.lock().await.get(&request_id).cloned();
-                if let Some(p) = p {
-                    *p.answers.lock().await = Some(answers);
-                    p.notify.notify_one();
-                } else {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!("no pending ask for id {request_id}")),
-                    ));
-                }
-            }
-            Command::SudoReply {
-                request_id,
-                approved,
-                password,
-            } => {
-                // The user approved (with password) or declined (Esc) a pending
-                // sudo_request. Resolves the awaiting request_sudo() so the
-                // blocked bash call either runs with `sudo -S` or returns a
-                // "declined" outcome to the agent.
-                let p = state.pending_sudos.lock().await.get(&request_id).cloned();
-                if let Some(p) = p {
-                    *p.result.lock().await = Some(if approved { password } else { None });
-                    p.notify.notify_one();
-                } else {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!("no pending sudo request for id {request_id}")),
-                    ));
-                }
-            }
-            Command::Abort => {
-                // Cancel the running turn AND drop any queued follow-up/steer so a
-                // single abort fully stops the loop (not just the current turn).
-                // If a goal/mission is active, also cancel deploy + fail the goal
-                // (Control Center Abort sends cancel_goal; bare Abort must match).
-                cancel_goal_deploy(&state).await;
-                state
-                    .goal_wrapup_active
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                {
-                    let mut g = state.goal.lock().await;
-                    if g.is_active() {
-                        goal::fail_goal(&mut g, "cancelled by user");
-                        emit(&Event::new("info").with("message", json!("goal cancelled")));
-                    }
-                }
-                cancel_in_flight_turn(&state).await;
-            }
-            Command::ClearQueue => {
-                // Drop a queued follow-up/steer but leave the running turn alone —
-                // the TUI's Esc uses this to cancel just the queued message.
-                // (If a steer already cancelled the in-flight turn, that turn's
-                // `aborted` will still fire; clearing here means the steer won't
-                // run and the loop winds down to idle.)
-                let had = state.queued.lock().await.take().is_some();
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(if had {
-                        "queue cleared"
-                    } else {
-                        "queue already empty"
-                    }),
-                ));
-            }
-            Command::Send {
-                prompt,
-                model,
-                reasoning_effort,
-                images,
-            } => {
-                let st = state.clone();
-                let client = client.clone();
-                let models = st.models.read().await.clone();
-                let valid = models.iter().any(|m| m.id == model);
-                if !valid {
-                    emit_turn_rejected(format!("unknown model: {model}"));
-                    continue;
-                }
-                let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
-                // If a turn is already running, buffer this prompt (one-deep) instead
-                // of dropping it. It drains when the running turn emits `done`.
-                start_turn(&st, &client, model, prompt, effort, images).await;
-            }
-            Command::Steer {
-                prompt,
-                model,
-                reasoning_effort,
-            } => {
-                let st = state.clone();
-                let client_c = client.clone();
-                let models = st.models.read().await.clone();
-                if !models.iter().any(|m| m.id == model) {
-                    emit_turn_rejected(format!("unknown model: {model}"));
-                    continue;
-                }
-                let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
-                // Steer = interrupt the running turn and redirect it. Cancel the
-                // in-flight token and set the steer as the next queued prompt
-                // (superseding any queued follow-up); the run_turn drain then runs
-                // it, so the `current` token hand-off stays clean. With nothing
-                // in flight, steer degrades to a normal turn.
-                emit(&Event::new("steer").with("prompt", json!(prompt)));
-                if st.current.lock().await.is_some() {
-                    *st.queued.lock().await = Some(QueuedPrompt {
-                        prompt,
-                        model,
-                        effort,
-                    });
-                    if let Some(tok) = st.current.lock().await.take() {
-                        tok.cancel();
-                    }
-                } else {
-                    let tok = CancellationToken::new();
-                    *st.current.lock().await = Some(tok.clone());
-                    let handle = tokio::spawn(run_turn_and_drain(
-                        st.clone(),
-                        client_c,
-                        model,
-                        prompt,
-                        effort,
-                        None,
-                        tok,
-                    ));
-                    *st.handle.lock().await = Some(handle);
-                }
-            }
-        }
-    }
-    // stdin EOF: don't tear down the runtime while a turn is still running.
-    let h = state.handle.lock().await.take();
-    if let Some(h) = h {
-        let _ = h.await;
-    }
-    // P0-H3: true process/session teardown (once). Distinct from per-turn
-    // `session_stop` used by telemetry plugins.
-    dispatch_lifecycle(&state, "session_shutdown").await;
-    // Clean up our presence record so peers don't see a stale session. Best
-    // effort — a kill -9 / crash leaves a stale file that `read_peers` reaps
-    // by mtime, so this is an optimization (instant disappearance), not a
-    // correctness requirement.
-    {
-        let ws = state.cfg.read().await.workspace.clone();
-        presence::clear_presence(&ws, std::process::id());
-    }
+        .expect("failed to build core async runtime")
+        .block_on(commands::dispatcher::run());
 }
-
 /// Check if a tool call matches a permission rule. Used by the approval gate
 /// to skip prompting for allow-listed tools, or block deny-listed ones outright.
-pub(crate) fn tool_matches_rule(tool_name: &str, args: &Value, rule: &PermissionRule) -> bool {
-    if !rule.tool_name.eq_ignore_ascii_case(tool_name) && rule.tool_name != "*" {
-        return false;
-    }
-    if rule.rule_content.is_empty() || rule.rule_content == "*" {
-        return true;
-    }
-    // Rule content matching: check against tool args.
-    // For bash: match against the command string.
-    // For write_file/edit: match against the path.
-    // For grep/glob: match against the search pattern.
-    // For WebFetch: match against URL domain.
-    // Use glob-style matching with * wildcards.
-    let candidate = match tool_name {
-        "bash" => args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-        "write_file" | "edit" | "patch" | "read_file" | "bulk_read" | "bulk_write"
-        | "bulk_edit" | "delete" | "mkdir" => {
-            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
-        }
-        "rename" => args.get("from").and_then(|v| v.as_str()).unwrap_or(""),
-        "grep" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
-        "glob" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
-        _ => "",
-    };
-    if candidate.is_empty() {
-        return false;
-    }
-    star_match_rule(&rule.rule_content, candidate)
-}
-
-fn star_match_rule(pattern: &str, text: &str) -> bool {
-    // Simple glob: * matches any sequence, ? matches one char.
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=p.len() {
-        if p[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=p.len() {
-        for j in 1..=t.len() {
-            match p[i - 1] {
-                '*' => dp[i][j] = dp[i - 1][j] || dp[i][j - 1],
-                '?' => dp[i][j] = dp[i - 1][j - 1],
-                c => dp[i][j] = dp[i - 1][j - 1] && c == t[j - 1],
-            }
-        }
-    }
-    dp[p.len()][t.len()]
-}
-
-/// If this tool call targets a restricted ("dangerous") path, return the
-/// blocklist reason. The approval gate uses this so that — under
-/// `Destructive`/`Always` — a restricted path (`.env`, `.git/**`, `.ssh/**`,
-/// `id_rsa`, …) forces an approval prompt for BOTH reads and writes, instead
-/// of the old unconditional hard block. Under `Never` the gate skips this
-/// entirely, so ALL file restrictions are disabled.
-///
-/// `root` is the workspace root used to resolve symlinks: each path is first
-/// checked against the blocklist in its RAW model-supplied form (catches a
-/// literal `.env`/`.git` early), then — after `workspace::resolve` follows
-/// symlinks to a canonical absolute path — checked AGAIN against the
-/// canonical path's components. A symlink alias such as `linkdir -> .git`
-/// makes `linkdir/config` pass the raw check (no `.git` in the literal
-/// string) yet resolve to `<root>/.git/config`; the canonical re-check closes
-/// that bypass, since the canonical path is what actually gets read/written.
-/// If `resolve` fails (e.g. the path escapes the workspace) the raw-check
-/// result stands unchanged.
-///
-/// Covers the content-touching tools: `read_file` (read), `write_file`/
-/// `edit`/`patch` (write), and the bulk variants (each inner path is checked).
-/// Search/list tools (`grep`/`glob`/`list_dir`) and `bash` are intentionally
-/// excluded — they don't read a single restricted file's content by path.
-pub(crate) fn restricted_path_for_tool(
-    name: &str,
-    args: &Value,
-    root: &std::path::Path,
-) -> Option<String> {
-    fn path_of(a: &Value) -> Option<&str> {
-        a.get("path")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-    }
-    // Check one path string: raw form first, then the symlink-resolved
-    // canonical path. Both use the same blocklist; the canonical pass is what
-    // defeats a symlink alias (linkdir -> .git) the raw pass can't see.
-    fn check(raw: &str, root: &std::path::Path) -> Option<String> {
-        if let Some(reason) = workspace::check_dangerous_path(raw) {
-            return Some(reason);
-        }
-        let canon = workspace::resolve(root, raw).ok()?;
-        // Reduce to a root-relative, forward-slash form so the same
-        // component-glob logic (`.git/**`, `**/.ssh/**`, …) that checks the
-        // raw string applies to the canonical path, cross-platform.
-        let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let rel = canon.strip_prefix(&canon_root).unwrap_or(&canon);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        workspace::check_dangerous_path(&rel_str)
-    }
-    match name {
-        "read_file" | "write_file" | "edit" | "patch" | "delete" | "mkdir" => {
-            path_of(args).and_then(|raw| check(raw, root))
-        }
-        "rename" => {
-            let from = args
-                .get("from")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let to = args
-                .get("to")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            from.and_then(|raw| check(raw, root))
-                .or_else(|| to.and_then(|raw| check(raw, root)))
-        }
-        "bulk_read" => args
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.as_str())
-                    .find_map(|raw| check(raw, root))
-            }),
-        "bulk_write" => args
-            .get("files")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
-                    .find_map(|raw| check(raw, root))
-            }),
-        "bulk_edit" => args
-            .get("edits")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
-                    .find_map(|raw| check(raw, root))
-            }),
-        // `bulk`: recurse into inner calls — if ANY inner call targets a
-        // restricted path, the whole bulk prompts (then approved calls proceed).
-        "bulk" => args
-            .get("calls")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter().find_map(|c| {
-                    let n = c.get("name").and_then(|v| v.as_str())?;
-                    let a = c.get("args")?;
-                    restricted_path_for_tool(n, a, root)
-                })
-            }),
-        _ => None,
-    }
-}
-
-/// Build the user-message prompt for an `apply_skill` invocation: instructs
-/// the model to read and follow the named skill, inlining the skill body (the
-/// core reads it from disk so global skills under ~/.catalyst-code/skills
-/// work despite read_file's path restriction), and appending an optional task.
+pub(crate) use crate::tooling::approval::{restricted_path_for_tool, tool_matches_rule};
 fn build_skill_prompt(skill: &subagent::SkillEntry, task: Option<&str>) -> String {
     let mut p = format!(
         "Apply the \"{}\" skill. Read and follow the procedure in the skill file below.\n\n<skill name=\"{}\">\n{}\n</skill>\n",
@@ -4858,8 +1741,8 @@ async fn start_turn(
         }
         return;
     }
-    let tok = CancellationToken::new();
-    *state.current.lock().await = Some(tok.clone());
+    let run = state.runtime.start_run();
+    *state.current.lock().await = Some(run.clone());
     let handle = tokio::spawn(run_turn_and_drain(
         state.clone(),
         client.clone(),
@@ -4867,7 +1750,7 @@ async fn start_turn(
         prompt,
         effort,
         images,
-        tok,
+        run,
     ));
     *state.handle.lock().await = Some(handle);
 }
@@ -4894,9 +1777,17 @@ fn run_turn_and_drain(
     prompt: String,
     effort: String,
     images: Option<Vec<String>>,
-    tok: CancellationToken,
+    run: RunContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(async move {
+    Box::pin(runtime::scope_run(run.clone(), async move {
+        let Some(resource) =
+            st.runtime
+                .register_run_resource(&run, ResourceKind::Task, "foreground_agent_turn")
+        else {
+            return;
+        };
+        let tok = resource.cancellation().clone();
+        append_runtime_run_state(&st, &run, session::RunState::Started, None).await;
         // Run the turn inside a panic guard: if run_turn panics (a bug or a
         // malformed model payload hitting an unwrap/index), we still clear
         // `current` and emit error+done so the TUI never wedges on a stuck
@@ -4904,6 +1795,7 @@ fn run_turn_and_drain(
         let result = AssertUnwindSafe(run_turn(
             &st,
             &client,
+            run.clone(),
             model,
             prompt,
             effort,
@@ -4916,7 +1808,15 @@ fn run_turn_and_drain(
         // the current-token slot unconditionally so new turns can start.
         dispatch_lifecycle(&st, "turn_end").await;
         dispatch_lifecycle(&st, "session_stop").await;
-        st.current.lock().await.take();
+        {
+            let mut current = st.current.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|active| active.run_id() == run.run_id())
+            {
+                current.take();
+            }
+        }
         // Flush any `!cmd` context messages that were deferred while this turn
         // ran (must land after tool_use/tool_result pairs are complete).
         flush_pending_bash(&st).await;
@@ -4948,26 +1848,83 @@ fn run_turn_and_drain(
             ));
             sync_session_file(&st).await;
             emit(&Event::new("done"));
+            append_runtime_run_state(
+                &st,
+                &run,
+                session::RunState::Failed,
+                Some("agent turn panicked"),
+            )
+            .await;
+            st.runtime.complete_run(&run);
             return;
         }
+        let terminal_state = if tok.is_cancelled() {
+            session::RunState::Cancelled
+        } else {
+            session::RunState::Completed
+        };
+        append_runtime_run_state(&st, &run, terminal_state, None).await;
+        st.runtime.complete_run(&run);
         // Drain a queued prompt if one was buffered while we ran (follow-up/steer).
-        if let Some(q) = st.queued.lock().await.take() {
-            let tok2 = CancellationToken::new();
-            *st.current.lock().await = Some(tok2.clone());
-            // Store the handle so stdin EOF (which awaits state.handle) waits for
-            // this drained turn too — otherwise it may tear the runtime down
-            // while a queued follow-up/steer is still running.
-            *st.handle.lock().await = Some(tokio::spawn(run_turn_and_drain(
-                st.clone(),
-                client.clone(),
-                q.model,
-                q.prompt,
-                q.effort,
-                None,
-                tok2,
-            )));
+        let same_session = st.runtime.session_id() == *run.session_id();
+        if same_session {
+            if let Some(q) = st.queued.lock().await.take() {
+                let next_run = st.runtime.start_run();
+                *st.current.lock().await = Some(next_run.clone());
+                // Store the handle so stdin EOF (which awaits state.handle) waits for
+                // this drained turn too — otherwise it may tear the runtime down
+                // while a queued follow-up/steer is still running.
+                *st.handle.lock().await = Some(tokio::spawn(run_turn_and_drain(
+                    st.clone(),
+                    client.clone(),
+                    q.model,
+                    q.prompt,
+                    q.effort,
+                    None,
+                    next_run,
+                )));
+            }
         }
-    })
+    }))
+}
+
+async fn append_runtime_run_state(
+    state: &State,
+    run: &RunContext,
+    status: session::RunState,
+    detail: Option<&str>,
+) {
+    let path = state.cfg.read().await.session_file.clone();
+    if let Some(path) = path {
+        session::append_run_state(
+            &path,
+            run.session_id().as_str(),
+            run.run_id().as_str(),
+            status,
+            detail,
+        );
+    }
+}
+
+pub(crate) async fn execute_plugin_hook_logged(
+    st: &Arc<State>,
+    hook: &str,
+    plugin_name: &str,
+    config: &plugins::HookConfig,
+    context: &Value,
+) -> plugins::HookResult {
+    let started = std::time::Instant::now();
+    let result = plugins::execute_hook(hook, plugin_name, config, context).await;
+    st.logger.log(
+        "plugin_hook",
+        json!({
+            "plugin": plugin_name,
+            "hook": hook,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "status": if result.allow { "allowed" } else { "denied" },
+        }),
+    );
+    result
 }
 
 /// Dispatch a lifecycle/session hook (session_start / session_stop /
@@ -5005,7 +1962,7 @@ pub(crate) async fn dispatch_lifecycle(st: &Arc<State>, hook: &str) {
             &session_id,
             config.pass_args,
         );
-        let _ = plugins::execute_hook(hook, plugin_name, config, &ctx).await;
+        let _ = execute_plugin_hook_logged(st, hook, plugin_name, config, &ctx).await;
     }
 }
 
@@ -5045,7 +2002,7 @@ pub(crate) async fn run_pre_input(st: &Arc<State>, text: &str) -> Result<String,
             &session_id,
             config.pass_args,
         );
-        let result = plugins::execute_hook("pre_input", plugin_name, config, &ctx).await;
+        let result = execute_plugin_hook_logged(st, "pre_input", plugin_name, config, &ctx).await;
         if !result.allow {
             return Err(format!(
                 "input denied by plugin '{}' pre_input: {}",
@@ -5096,7 +2053,8 @@ pub(crate) async fn run_pre_agent_start(st: &Arc<State>) -> Option<String> {
             &session_id,
             config.pass_args,
         );
-        let result = plugins::execute_hook("pre_agent_start", plugin_name, config, &ctx).await;
+        let result =
+            execute_plugin_hook_logged(st, "pre_agent_start", plugin_name, config, &ctx).await;
         if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
             if let Some(s) = obj.get("system_prompt").and_then(|v| v.as_str()) {
                 if s.len() > SYSTEM_PROMPT_MODIFY_MAX_BYTES {
@@ -5174,7 +2132,7 @@ pub(crate) async fn run_pre_context(st: &Arc<State>, messages: &mut Vec<Message>
             &session_id,
             config.pass_args,
         );
-        let result = plugins::execute_hook("pre_context", plugin_name, config, &ctx).await;
+        let result = execute_plugin_hook_logged(st, "pre_context", plugin_name, config, &ctx).await;
         if let Some(obj) = result.modify.as_ref().and_then(|m| m.as_object()) {
             if let Some(msgs_v) = obj.get("messages") {
                 let Ok(new_msgs) = serde_json::from_value::<Vec<Message>>(msgs_v.clone()) else {
@@ -5242,7 +2200,7 @@ pub(crate) async fn run_pre_hooks(
             &session_id,
             config.pass_args,
         );
-        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+        let result = execute_plugin_hook_logged(st, hook_name, plugin_name, config, &ctx).await;
         if !result.allow {
             return Some(format!(
                 "tool call '{}' denied by plugin '{}' hook '{}': {}",
@@ -5305,7 +2263,7 @@ pub(crate) async fn run_post_hooks(
         if let Some(obj) = ctx.as_object_mut() {
             obj.insert("result".to_string(), result_json);
         }
-        let result = plugins::execute_hook(hook_name, plugin_name, config, &ctx).await;
+        let result = execute_plugin_hook_logged(st, hook_name, plugin_name, config, &ctx).await;
         // Post hooks can't block; a deny is treated as an observed note only.
         if !result.reason.is_empty() {
             hook_notes.push(format!("{}/{}: {}", plugin_name, hook_name, result.reason));
@@ -5537,6 +2495,7 @@ enum ParallelWaveResult {
 /// the turn if the user hits /abort during an approval prompt.
 async fn run_parallel_readonly_wave(
     st: &Arc<State>,
+    run: &RunContext,
     calls: &[message::ToolCall],
     tool_defs: &[Value],
     cancel: &CancellationToken,
@@ -5550,6 +2509,8 @@ async fn run_parallel_readonly_wave(
         args_str: String,
         exec_args: Value,
         hook_notes: Vec<String>,
+        context: crate::tooling::ToolExecutionContext,
+        _resource: runtime::ResourceLease,
         /// Pre-resolved outcome (deny / restore / duplicate) skips execution.
         early: Option<tools::Outcome>,
     }
@@ -5638,6 +2599,18 @@ async fn run_parallel_readonly_wave(
         }
 
         let cfg = st.cfg.read().await.clone();
+        let context = crate::tooling::ToolExecutionContext::new(
+            run.clone(),
+            id.clone(),
+            cfg.clone(),
+            st.runtime.clone(),
+            None,
+        );
+        let Some(resource) = context.register_resource(ResourceKind::Task, format!("tool:{name}"))
+        else {
+            context.note_stale_result();
+            return ParallelWaveResult::Aborted;
+        };
         let kind = tools::classify(&name);
         let kind_str: &'static str = match kind {
             tools::ToolKind::ReadOnly => "readonly",
@@ -5685,19 +2658,16 @@ async fn run_parallel_readonly_wave(
         } else {
             restricted_path_for_tool(&name, &args, &cfg.workspace)
         };
-        let needs_approval = if force_allow || escalated {
-            false
-        } else {
-            match cfg.approval {
-                Approval::Never => false,
-                Approval::Destructive => {
-                    kind == tools::ToolKind::Destructive || restricted.is_some()
-                }
-                Approval::Always => true,
-            }
-        };
+        let needs_approval = crate::tooling::approval::approval_required(
+            &cfg.approval,
+            kind,
+            restricted.is_some(),
+            force_allow,
+            escalated,
+            false,
+        );
         if needs_approval {
-            match request_approval(st, &id, &name, &args_str, kind_str, cancel).await {
+            match request_approval(st, &id, &name, &args_str, kind_str, None, cancel).await {
                 ApprovalResult::Granted => {}
                 ApprovalResult::Denied => {
                     let msg = format!("tool call '{}' was denied by the user", name);
@@ -5785,6 +2755,8 @@ async fn run_parallel_readonly_wave(
             args_str,
             exec_args,
             hook_notes,
+            context,
+            _resource: resource,
             early,
         });
     }
@@ -5800,6 +2772,11 @@ async fn run_parallel_readonly_wave(
         .filter(|(_, p)| p.early.is_none())
         .map(|(i, p)| (i, p.name.clone(), p.exec_args.clone()))
         .collect();
+
+    for item in prepared.iter().filter(|item| item.early.is_none()) {
+        item.context
+            .persist_state(session::RunState::Started, Some(item.name.as_str()));
+    }
 
     let mut outcomes: Vec<tools::Outcome> = prepared
         .iter()
@@ -5826,6 +2803,15 @@ async fn run_parallel_readonly_wave(
         for ((idx, _, _), outcome) in to_run.into_iter().zip(ran) {
             outcomes[idx] = outcome;
         }
+    }
+
+    if prepared.iter().any(|item| !item.context.is_active()) {
+        for item in &prepared {
+            if !item.context.is_active() {
+                item.context.note_stale_result();
+            }
+        }
+        return ParallelWaveResult::Aborted;
     }
 
     for (p, mut outcome) in prepared.into_iter().zip(outcomes) {
@@ -5856,6 +2842,18 @@ async fn run_parallel_readonly_wave(
             &mut hook_notes,
         )
         .await;
+
+        if p.early.is_none() {
+            let persisted_tool_state = if cancel.is_cancelled() {
+                session::RunState::Cancelled
+            } else if outcome.ok {
+                session::RunState::Completed
+            } else {
+                session::RunState::Failed
+            };
+            p.context
+                .persist_state(persisted_tool_state, Some(p.name.as_str()));
+        }
 
         if outcome.ok && p.name == "read_file" {
             if let Some(path) = p.exec_args.get("path").and_then(|v| v.as_str()) {
@@ -5897,9 +2895,18 @@ async fn run_parallel_readonly_wave(
         {
             outcome.output = apply_ingress_cap(&p.name, &p.args_str, outcome.output);
         }
+        let status = crate::tooling::ToolResultStatus::from_legacy(outcome.ok, &outcome.output);
         st.logger.log(
             "tool",
-            json!({ "name": p.name, "args": p.args_str, "ok": outcome.ok, "output_len": outcome.output.len(), "parallel_wave": true }),
+            json!({
+                "tool_call_id": &p.id,
+                "name": &p.name,
+                "args_hash": audit::args_hash(&p.args_str),
+                "status": status.as_str(),
+                "output_len": outcome.output.len(),
+                "duration_ms": p.context.elapsed_ms(),
+                "parallel_wave": true,
+            }),
         );
         let mut ev = Event::new("tool_result")
             .with("id", json!(p.id))
@@ -5922,1879 +2929,7 @@ async fn run_parallel_readonly_wave(
     ParallelWaveResult::Done
 }
 
-async fn run_turn(
-    st: &Arc<State>,
-    client: &reqwest::Client,
-    model: String,
-    prompt: String,
-    effort: String,
-    images: Option<Vec<String>>,
-    cancel: CancellationToken,
-) {
-    // Remember the model the user selected so the manual `/compact` command
-    // can size its reclaim budget against the right context window.
-    *st.last_model.lock().await = Some(model.clone());
-    // Lifecycle hook: notify plugins a session/turn is starting. Best-effort
-    // and never blocks the turn.
-    dispatch_lifecycle(st, "session_start").await;
-    st.auto_checkpoint_taken
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-
-    // Speculative readonly prefetch: warm tool_cache from recurring file
-    // categories (never mutates the workspace).
-    speculative_prefetch(st, &prompt).await;
-
-    // If the conversation was left mid-`ask` by a prior core restart (the
-    // assistant `ask` tool_call is persisted but no tool result exists),
-    // re-present the question before the turn proceeds. Without this the
-    // session is wedged (no modal) and the orphan-sanitizer would later
-    // insert a synthetic EMPTY result, losing the question. No-op on the
-    // common case of no trailing unanswered ask. Idempotent: once the ask
-    // has a result, `find_trailing_unanswered_ask` returns None.
-    resume_pending_ask(st, &cancel).await;
-
-    // Clear the last-turn metrics at turn entry so a panic before finalization
-    // can't leak the PRIOR turn's numbers to this turn's `session_stop` hook
-    // (which fires unconditionally from the panic guard). A completed turn sets
-    // it fresh at finalization; a failed turn leaves it None and the telemetry
-    // plugin skips rather than recording a phantom turn.
-    *st.last_turn_metrics.lock().await = None;
-
-    // Vision handoff (pre_turn) and other plugins may remap the model for
-    // this turn; keep a mutable binding so a swap propagates to the request loop.
-    let mut model = model;
-
-    // Auto-reflect turn-local state (SELF_LEARNING §11 deterministic seam). The
-    // shape (tool names + file categories) is accumulated as tools run; at the
-    // first `finish`/natural completion of a non-trivial turn it is logged to
-    // the recurrence store and a reflection continuation is injected so durable
-    // facts/patterns get persisted without relying on the model remembering to.
-    // `reflected` prevents re-entry: the reflect's own `finish` exits for real.
-    let mut reflected = false;
-    let mut turn_tool_calls: u32 = 0;
-    let mut shape_tools: Vec<String> = Vec::new();
-    let mut shape_files: Vec<String> = Vec::new();
-
-    // Ensure system prompt is present; persist every finalized message to the session file.
-    let mut init_est_add = 0u64;
-    // Expand `@<path>` file mentions so the model sees the referenced file's
-    // contents directly (no `read_file` round-trip) — mirroring how
-    // `apply_skill` inlines a skill body. The transcript keeps the concise
-    // `@path` the user typed (the TUI/web already logged the raw text).
-    let (user_text, attached_files) = {
-        let c = st.cfg.read().await;
-        expand_file_mentions(&prompt, &c.workspace, c.max_read_bytes)
-    };
-    if !attached_files.is_empty() {
-        emit(&Event::new("info").with(
-            "message",
-            json!(format!(
-                "attached {} file(s) from @mentions: {}",
-                attached_files.len(),
-                attached_files.join(", ")
-            )),
-        ));
-    }
-    // P0-H1: pre_input — plugins may rewrite/deny user text before it becomes
-    // a conversation Message. Deny aborts the turn with an error event.
-    let user_text = match run_pre_input(st, &user_text).await {
-        Ok(t) => t,
-        Err(reason) => {
-            emit(&Event::new("error").with("message", json!(reason)));
-            emit(&Event::new("done"));
-            return;
-        }
-    };
-    // P0-H1: turn_start — advisory turn-boundary signal (distinct from vision
-    // pre_turn and from session_start).
-    dispatch_lifecycle(st, "turn_start").await;
-    {
-        let mut conv = st.conversation.lock().await;
-        if conv.is_empty() {
-            let (workspace, auto_reflect) = {
-                let c = st.cfg.read().await;
-                (c.workspace.clone(), c.auto_reflect)
-            };
-            let sys_msg = Message::system(build_main_system_prompt(
-                &workspace,
-                &st.plugin_manager,
-                auto_reflect,
-            ));
-            init_est_add += estimate_message_tokens(&sys_msg);
-            conv.push(sys_msg);
-            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                session::append(p, &conv[0]);
-            }
-        }
-        // Build the user message. If images are attached and vision is allowed,
-        // emit a multimodal content array (text + image_url parts).
-        let allow_vision = st.cfg.read().await.allow_vision;
-        let user_msg = match (&images, allow_vision) {
-            (Some(imgs), true) if !imgs.is_empty() => {
-                let mut parts: Vec<ContentPart> = vec![ContentPart::Text {
-                    text: user_text.clone(),
-                }];
-                for img in imgs {
-                    let url = image_to_data_url(img);
-                    parts.push(ContentPart::Image {
-                        image_url: ImageUrl { url, detail: None },
-                    });
-                }
-                Message::user_multimodal(parts)
-            }
-            _ => Message::user(user_text.clone()),
-        };
-        init_est_add += estimate_message_tokens(&user_msg);
-        conv.push(user_msg);
-        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-            session::append(p, conv.last().unwrap());
-        }
-    }
-    if init_est_add > 0 {
-        *st.estimated_tokens.lock().await += init_est_add;
-    }
-
-    // Seed the rolling work-state's goal from the user's first substantive
-    // prompt. No-op once a goal is set; slash commands / tiny prompts ignored.
-    maybe_seed_work_state_goal(st, &prompt).await;
-
-    // Vision handoff (pre_turn hook): let plugins inspect the upcoming turn
-    // (model + attached images) and optionally remap the model before the first
-    // request. Advisory — a broken/missing hook or `allow:false` never blocks
-    // the turn; only `modify.model` (validated against discovered models) is honored.
-    {
-        let has_images = images.as_ref().is_some_and(|v| !v.is_empty());
-        let image_count = images.as_ref().map_or(0, |v| v.len());
-        let vc = st.vision.read().await.clone();
-        let models_snapshot = st.models.read().await.clone();
-        let active_provider = models_snapshot
-            .iter()
-            .find(|m| m.id == model.as_str())
-            .map(|m| m.provider.clone())
-            .unwrap_or_default();
-        let recommended = vision::recommend_vision_model(&model, &models_snapshot, &vc);
-        let models_json: Vec<Value> = models_snapshot
-            .iter()
-            .map(|m| {
-                json!({
-                    "id": m.id.clone(),
-                    "vision": m.vision || vc.has_vision(m.id.as_str()),
-                    "provider": m.provider.clone(),
-                    "cost_rank": vision::vision_cost_rank(&m.id),
-                })
-            })
-            .collect();
-        let (workspace, session_id) = {
-            let cfg = st.cfg.read().await;
-            (
-                cfg.workspace.display().to_string(),
-                cfg.session_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            )
-        };
-        let original_model = model.clone();
-
-        // First-class enable gate (default ON). When off, skip plugin remap and
-        // tell the user why images won't be seen.
-        if has_images && !vc.enabled {
-            let current_has_vision = models_snapshot
-                .iter()
-                .find(|m| m.id == model.as_str())
-                .map(|m| m.vision || vc.has_vision(m.id.as_str()))
-                .unwrap_or(false);
-            if !current_has_vision {
-                emit(&Event::new("info").with(
-                    "message",
-                    json!(format!(
-                        "image attached but vision handoff is disabled and '{}' lacks vision; enable it in Settings / /vision (recommended), or pick a vision model",
-                        model
-                    )),
-                ));
-            }
-        } else if has_images {
-            for (plugin_name, config) in &st.plugin_manager.get_hook_configs("pre_turn") {
-                let turn_args = json!({
-                    "model": model.clone(),
-                    "has_images": has_images,
-                    "image_count": image_count,
-                    "models": models_json,
-                    "vision_model": vc.vision_model.clone(),
-                    "enabled": vc.enabled,
-                    "provider": active_provider,
-                    "recommended_vision_model": recommended,
-                });
-                let ctx = plugins::build_context(
-                    "pre_turn",
-                    "",
-                    &workspace,
-                    Some(&turn_args),
-                    &session_id,
-                    config.pass_args,
-                );
-                let result = plugins::execute_hook("pre_turn", plugin_name, config, &ctx).await;
-                if let Some(new_model) = result
-                    .modify
-                    .as_ref()
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-                {
-                    if new_model != model.as_str() {
-                        let valid = models_snapshot.iter().any(|m| m.id.as_str() == new_model);
-                        if valid {
-                            let why = if result.reason.is_empty() {
-                                "vision handoff".to_string()
-                            } else {
-                                result.reason.clone()
-                            };
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!(format!(
-                                    "vision handoff: {} → {} ({})",
-                                    model, new_model, why
-                                )),
-                            ));
-                            st.logger.log(
-                                "vision_handoff",
-                                json!({
-                                    "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
-                                }),
-                            );
-                            model = new_model.to_string();
-                        } else {
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!(format!(
-                                    "vision handoff ignored: '{}' is not a discovered model",
-                                    new_model
-                                )),
-                            ));
-                        }
-                    }
-                }
-            }
-            // No vision plugin handed off an image-bearing turn on a non-vision
-            // model. Prefer the Rust-ranked recommendation (works even if the
-            // plugin is missing / python3 absent), else warn.
-            if model == original_model {
-                let current_has_vision = models_snapshot
-                    .iter()
-                    .find(|m| m.id == model.as_str())
-                    .map(|m| m.vision || vc.has_vision(m.id.as_str()))
-                    .unwrap_or(false);
-                if !current_has_vision {
-                    if let Some(rec) = recommended.as_ref() {
-                        if models_snapshot
-                            .iter()
-                            .any(|m| m.id.as_str() == rec.as_str())
-                        {
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!(format!(
-                                    "vision handoff: {} → {} (cheapest same-provider)",
-                                    model, rec
-                                )),
-                            ));
-                            st.logger.log(
-                                "vision_handoff",
-                                json!({
-                                    "from": model, "to": rec, "plugin": "core",
-                                    "reason": "cheapest same-provider"
-                                }),
-                            );
-                            model = rec.clone();
-                        }
-                    } else {
-                        emit(&Event::new("info").with("message", json!(format!(
-                            "image attached but '{}' lacks vision and no same-provider vision model is available to hand off to; use /vision to set one (or select a vision model with /model)",
-                            model
-                        ))));
-                    }
-                }
-            }
-        }
-    }
-
-    // Main agent tool list: core built-ins (always) + session-enabled deferred
-    // tools (via load_tools) + goal_write_plan when planning, MERGED with tools
-    // declared by enabled plugins, then filtered by every plugin's
-    // `disable_tools`. Subagent-only tools (contact_supervisor/intercom) stay
-    // hidden on the main agent. Three plugin capabilities converge here:
-    //   • ADD       — a plugin `tools` entry adds a new capability.
-    //   • OVERRIDE  — a plugin tool with `override:true` whose name matches a
-    //                  built-in REPLACES that built-in: the plugin's declared
-    //                  schema is shown to the model and calls route to the
-    //                  plugin handler (see the dispatch below).
-    //   • REMOVE    — `disable_tools` names are dropped from the final list
-    //                  (built-in OR override). `disable_tools` is the strongest
-    //                  lever: a disabled name is gone, period.
-    // A plugin tool that merely collides with a built-in name (no `override`)
-    // is still skipped — the built-in wins, unchanged.
-    let overridden = st.plugin_manager.overridden_tool_names();
-    let disabled = st.plugin_manager.disabled_tools();
-    let enabled_deferred = st.enabled_deferred_tools.lock().await.clone();
-    let goal_planning = {
-        let g = st.goal.lock().await;
-        g.phase == goal::GoalPhase::Planning
-    };
-    let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
-    reserved.insert("contact_supervisor".into());
-    reserved.insert("intercom".into());
-    let mut tool_defs: Vec<Value> = tools::definitions()
-        .into_iter()
-        .filter(|d| {
-            let n = d
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            reserved.insert(n.to_string());
-            // Hide the reserved subagent-only tools, AND any built-in a plugin
-            // is overriding (its plugin version is added below instead).
-            if n == "contact_supervisor" || n == "intercom" || overridden.contains(n) {
-                return false;
-            }
-            // Core tools always; deferred only when session-enabled (or goal
-            // planning needs goal_write_plan).
-            if tools::is_core_tool(n) {
-                return true;
-            }
-            if n == "goal_write_plan" && goal_planning {
-                return true;
-            }
-            enabled_deferred.contains(n)
-        })
-        .collect();
-    for d in st.plugin_manager.tool_definitions() {
-        let n = d
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        // An override tool replaces the built-in (already excluded above), so
-        // it's always added and claims the name. A plain custom tool is added
-        // only if its name isn't already taken (built-in or another plugin).
-        let is_override = overridden.contains(n);
-        if !is_override && !reserved.insert(n.to_string()) {
-            eprintln!(
-                "[plugins] tool '{}' collides with a built-in or already-registered tool; skipping",
-                n
-            );
-            continue;
-        }
-        tool_defs.push(d);
-    }
-    // REMOVE: `disable_tools` is a final, composition-winning filter — a
-    // disabled name vanishes whether it was a built-in, an override, or a
-    // custom plugin tool. (No-op when no plugin disables anything.)
-    if !disabled.is_empty() {
-        tool_defs.retain(|d| {
-            d.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .is_none_or(|n| !disabled.contains(n))
-        });
-    }
-    let mut timer = TurnTimer::new();
-
-    // Working conversation buffer for this turn: cloned once here, then kept
-    // across agentic loop iterations. Tool/assistant appends update both this
-    // buffer and `st.conversation`; we only re-sync from state after parallel
-    // waves / reflect that mutate state without going through `messages`.
-    let mut messages = st.conversation.lock().await.clone();
-
-    // Idle compaction: if 60+ minutes since the last turn completed, compact the
-    // conversation so the next turn starts lean. Uses the same summarize strategy
-    // as the threshold path; falls back to naive drop-oldest without an api key.
-    {
-        let last = *st.last_turn_time.lock().await;
-        let cfg = st.cfg.read().await.clone();
-        if cfg.auto_compact && last.elapsed().as_secs() > 3600 {
-            let est = grounded_estimate(
-                &messages,
-                *st.last_real_prompt_tokens.lock().await,
-                *st.conv_len_at_last_real.lock().await,
-            );
-            let (idle_ctx, idle_max_tokens) = st
-                .models
-                .read()
-                .await
-                .iter()
-                .find(|m| m.id == model)
-                .map(|m| (m.context_window as u64, m.max_tokens))
-                .unwrap_or((200_000, 8_192));
-            let policy = context_policy(
-                &messages,
-                idle_ctx,
-                idle_max_tokens,
-                cfg.context_compact_at,
-                cfg.context_digest_at,
-            );
-            // Idleness alone is not token pressure. Only compact when this same
-            // conversation would cross the normal model-aware threshold.
-            if should_auto_compact(cfg.auto_compact, est, messages.len(), policy) {
-                emit(
-                    &Event::new("compacting")
-                        .with("before_tokens", json!(est))
-                        .with("trigger", json!("idle_threshold"))
-                        .with("context_window", json!(idle_ctx))
-                        .with("threshold_tokens", json!(policy.compact_threshold))
-                        .with("hard_limit_tokens", json!(policy.hard_limit))
-                        .with("response_reserve_tokens", json!(policy.response_reserve))
-                        .with("utilization_pct", json!(utilization_pct(est, idle_ctx))),
-                );
-                dispatch_lifecycle(st, "pre_compact").await;
-                let rp = st.resolve_provider_for_model(&model).await;
-                let summary_chars = if rp.api_key.is_some() {
-                    let mp = st.plugin_manager.memory_provider();
-                    compact_with_summary(
-                        client,
-                        &cfg,
-                        &rp,
-                        &model,
-                        &mut messages,
-                        &cancel,
-                        false,
-                        idle_ctx,
-                        cfg.compact_instructions.as_deref(),
-                        mp.as_ref(),
-                    )
-                    .await
-                } else {
-                    compact_conversation(&mut messages, idle_ctx);
-                    0
-                };
-                *st.conversation.lock().await = messages.clone();
-                if let Some(p) = cfg.session_file.as_ref() {
-                    session::rewrite(p, &messages);
-                }
-                let after_est = estimate_messages_tokens(&messages);
-                *st.estimated_tokens.lock().await = after_est;
-                // Idle compaction rewrote history; the old real baseline is stale.
-                st.invalidate_real_token_baseline().await;
-                emit(
-                    &Event::new("compacted")
-                        .with("before_tokens", json!(est))
-                        .with("after_tokens", json!(after_est))
-                        .with("summary_chars", json!(summary_chars))
-                        .with("context_window", json!(idle_ctx))
-                        .with("threshold_tokens", json!(policy.compact_threshold))
-                        .with("hard_limit_tokens", json!(policy.hard_limit))
-                        .with("within_limit", json!(after_est <= policy.hard_limit)),
-                );
-                if after_est > policy.hard_limit {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
-                            policy.hard_limit
-                        )),
-                    ));
-                    emit(&Event::new("done"));
-                    return;
-                }
-            }
-        }
-    }
-
-    loop {
-        if cancel.is_cancelled() {
-            sync_session_file(st).await;
-            emit_aborted_done();
-            return;
-        }
-        // Session token budget (hard ceiling across the whole session, not per turn).
-        // 0 = unlimited. Trips before the request so we don't blow past a cost cap.
-        let budget = st.cfg.read().await.max_session_tokens;
-        if budget > 0 {
-            let spent = *st.tokens_in.lock().await + *st.tokens_out.lock().await;
-            if spent >= budget {
-                emit(&Event::new("error").with(
-                    "message",
-                    json!(format!(
-                        "session token budget exhausted ({spent} >= {budget}); start a new session"
-                    )),
-                ));
-                emit(&Event::new("done"));
-                return;
-            }
-        }
-
-        // Resolve the provider for this turn. In the multi-login model the
-        // turn routes to the selected model's owning provider (so `/models`
-        // can mix providers); falls back to the active/legacy provider for
-        // models without a provider tag. Errors out if no API key is available
-        // for the resolved provider (runtime key -> config literal -> env var).
-        let provider = {
-            let rp = st.resolve_provider_for_model(&model).await;
-            match rp.api_key.as_ref() {
-                Some(_) => rp,
-                None => {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!(format!(
-                            "no API key set for provider '{}'; use /login to log in",
-                            rp.name
-                        )),
-                    ));
-                    sync_session_file(st).await;
-                    emit(&Event::new("done"));
-                    return;
-                }
-            }
-        };
-
-        let cfg = st.cfg.read().await.clone();
-        // Context window management: compact at the configured threshold
-        // (default 90%) or sooner when model-aware response headroom requires
-        // it. `auto_compact` gates every automatic history rewrite: pressure
-        // digest, threshold compaction, idle compaction, and subagent reclaim.
-        // When false, the user must /compact manually (or /clear).
-        // `messages` is the turn-local working buffer (cloned once before the loop).
-        let (model_ctx, thinking_levels, max_tokens) = st
-            .models
-            .read()
-            .await
-            .iter()
-            .find(|m| m.id == model)
-            .map(|m| {
-                (
-                    m.context_window as u64,
-                    m.thinking_levels.clone(),
-                    m.max_tokens,
-                )
-            })
-            .unwrap_or((200_000, Vec::new(), 8_192));
-        // Anchor on the endpoint's REAL `prompt_tokens` from the last request
-        // (the authoritative count of the conversation as the model tokenized it —
-        // system + messages + tool-call framing the char/4 heuristic cannot see)
-        // and only char/4-estimate the messages appended since. This is far more
-        // accurate than re-estimating the whole history every loop iteration, so
-        // compaction fires at the right time instead of drifting late into a
-        // context-window 400. Falls back to a full char/4 estimate when no real
-        // usage has been seen yet (first turn) or right after compaction.
-        let last_real = *st.last_real_prompt_tokens.lock().await;
-        let len_at = *st.conv_len_at_last_real.lock().await;
-        let mut est = grounded_estimate(&messages, last_real, len_at);
-        *st.estimated_tokens.lock().await = est;
-        let policy = context_policy(
-            &messages,
-            model_ctx,
-            max_tokens,
-            cfg.context_compact_at,
-            cfg.context_digest_at,
-        );
-        // Soft digest: collapse stale, large tool results AND oversized tool-call
-        // arguments into one-line digests well before the compaction threshold so
-        // they stop being re-sent verbatim on every turn. Keep-window is sized by
-        // token budget (20% of the context window), not a fixed message count —
-        // a few huge recent results no longer block reclaim of everything older.
-        // Idempotent; tool_call_id + role preserved so pairing stays intact.
-        if should_auto_digest(cfg.auto_compact, est, policy) {
-            let before_est = est;
-            let changed = {
-                let mut cache = st.tool_output_cache.lock().await;
-                soft_digest_conversation(&mut messages, model_ctx, Some(&mut cache))
-            };
-            if changed > 0 {
-                *st.conversation.lock().await = messages.clone();
-                if let Some(p) = cfg.session_file.as_ref() {
-                    session::rewrite(p, &messages);
-                }
-                est = estimate_messages_tokens(&messages);
-                *st.estimated_tokens.lock().await = est;
-                // Digest rewrote message contents, so the real prompt_tokens
-                // baseline no longer matches — drop it until the next request.
-                st.invalidate_real_token_baseline().await;
-                st.logger.log(
-                    "digested",
-                    json!({ "results": changed, "before_tokens": before_est, "after_tokens": est }),
-                );
-                emit(
-                    &Event::new("digested")
-                        .with("results", json!(changed))
-                        .with("before_tokens", json!(before_est))
-                        .with("after_tokens", json!(est))
-                        .with("trigger", json!("pressure"))
-                        .with("context_window", json!(model_ctx))
-                        .with("threshold_tokens", json!(policy.digest_threshold))
-                        .with("hard_limit_tokens", json!(policy.hard_limit))
-                        .with(
-                            "utilization_pct",
-                            json!(utilization_pct(before_est, model_ctx)),
-                        ),
-                );
-            }
-        }
-        let force_summarize = est > policy.hard_limit;
-        if should_auto_compact(cfg.auto_compact, est, messages.len(), policy) {
-            emit(
-                &Event::new("compacting")
-                    .with("before_tokens", json!(est))
-                    .with("trigger", json!("threshold"))
-                    .with("context_window", json!(model_ctx))
-                    .with("threshold_tokens", json!(policy.compact_threshold))
-                    .with("hard_limit_tokens", json!(policy.hard_limit))
-                    .with("response_reserve_tokens", json!(policy.response_reserve))
-                    .with("safety_margin_tokens", json!(policy.safety_margin))
-                    .with("utilization_pct", json!(utilization_pct(est, model_ctx))),
-            );
-            dispatch_lifecycle(st, "pre_compact").await;
-            let summary_chars = {
-                let mp = st.plugin_manager.memory_provider();
-                compact_with_summary(
-                    client,
-                    &cfg,
-                    &provider,
-                    &model,
-                    &mut messages,
-                    &cancel,
-                    force_summarize,
-                    model_ctx,
-                    cfg.compact_instructions.as_deref(),
-                    mp.as_ref(),
-                )
-                .await
-            };
-            *st.conversation.lock().await = messages.clone();
-            if let Some(p) = cfg.session_file.as_ref() {
-                session::rewrite(p, &messages);
-            }
-            let after_est = estimate_messages_tokens(&messages);
-            *st.estimated_tokens.lock().await = after_est;
-            // Compaction rewrote history; the old real baseline is stale.
-            st.invalidate_real_token_baseline().await;
-            emit(
-                &Event::new("compacted")
-                    .with("before_tokens", json!(est))
-                    .with("after_tokens", json!(after_est))
-                    .with("summary_chars", json!(summary_chars))
-                    .with("context_window", json!(model_ctx))
-                    .with("threshold_tokens", json!(policy.compact_threshold))
-                    .with("hard_limit_tokens", json!(policy.hard_limit))
-                    .with("within_limit", json!(after_est <= policy.hard_limit)),
-            );
-            if after_est > policy.hard_limit {
-                emit(&Event::new("error").with(
-                    "message",
-                    json!(format!(
-                        "context remains too large after compaction ({after_est} > safe limit {}); remove or split an oversized recent message",
-                        policy.hard_limit
-                    )),
-                ));
-                sync_session_file(st).await;
-                emit(&Event::new("done"));
-                return;
-            }
-        }
-
-        // Sanitize orphaned tool calls + malformed tool-call arguments right
-        // before the request. Orphans can arise not only from context compaction
-        // but from ANY turn that ended with an assistant `tool_calls` message
-        // whose matching results weren't all appended — notably an aborted
-        // approval, which `return`s after the assistant message (carrying ALL
-        // its tool_calls) was already persisted but before results for the
-        // aborted + remaining calls were appended. The next request would then
-        // ship an orphaned `tool_calls` and the API rejects it with HTTP 400
-        // "No tool output found for function call …", which bricks the session
-        // (it repeats every turn). The scan is O(n) with tiny constants and a
-        // strict no-op on clean turns; we persist back only when it actually
-        // changed something, so clean turns pay just the scan (no clone, no
-        // session rewrite). The subagent path already does this unconditionally
-        // (subagent.rs) — this makes the main loop consistent with it.
-        let orphan_fixes = provider::sanitize_orphaned_tool_calls(&mut messages);
-        let fixed_args = provider::sanitize_tool_call_arguments(&mut messages);
-        if orphan_fixes > 0 || fixed_args > 0 {
-            *st.conversation.lock().await = messages.clone();
-            if let Some(p) = cfg.session_file.as_ref() {
-                session::rewrite(p, &messages);
-            }
-            if orphan_fixes > 0 {
-                emit(&Event::new("info").with("message", json!(format!(
-                    "inserted {orphan_fixes} synthetic tool result(s) for tool call(s) whose result was missing (e.g. after an aborted turn) — the conversation is valid again for the API"
-                ))));
-            }
-            if fixed_args > 0 {
-                emit(&Event::new("info").with("message", json!(format!(
-                    "sanitized {fixed_args} malformed tool-call argument(s) to keep the conversation valid for the API"
-                ))));
-            }
-        }
-        // Best pre-stream estimate of this request's prompt size, grounded on the
-        // endpoint's last real `prompt_tokens` when available. Passed to
-        // stream_turn so the live footer percentage tracks reality while output
-        // streams in (the real `usage` chunk at stream end then overwrites it).
-        let prompt_est = grounded_estimate(
-            &messages,
-            *st.last_real_prompt_tokens.lock().await,
-            *st.conv_len_at_last_real.lock().await,
-        );
-        // Transient tails (never persisted): relevant memories for this turn,
-        // then rolling work-state. Both sit AFTER the stable conversation prefix
-        // so updating them does not bust the provider prefix cache.
-        let mut transient_tails = 0usize;
-        let last_user = messages
-            .iter()
-            .rev()
-            .find_map(|m| match m {
-                Message::User { .. } => {
-                    if let Some(t) = m.content_text() {
-                        return Some(t.to_string());
-                    }
-                    // Multimodal user message: join text parts only.
-                    m.content_parts().map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                message::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-        // Skip relevance when a memory_provider plugin owns injection — it
-        // already decided what belongs in the standing prompt.
-        let mem_tail = {
-            let has_provider = st.plugin_manager.has_memory_provider();
-            if has_provider || last_user.trim().is_empty() {
-                String::new()
-            } else {
-                let ws = st.cfg.read().await.workspace.clone();
-                relevant_memories_tail(&ws, &last_user)
-            }
-        };
-        // Skill auto-suggestion: append a [RELEVANT SKILL] hint when a skill's
-        // name+description semantically matches the prompt, so the agent can
-        // apply it without remembering /skill:<name>. Sits with the
-        // relevant-memories tail as one transient (non-prefix-cached) message.
-        let mut tail = mem_tail;
-        if !last_user.trim().is_empty() {
-            let ws = st.cfg.read().await.workspace.clone();
-            let pack = context_pack::build_context_pack(&ws, &last_user);
-            if !pack.is_empty() {
-                if tail.is_empty() {
-                    tail = pack;
-                } else {
-                    tail.push_str("\n\n");
-                    tail.push_str(&pack);
-                }
-            }
-            if let Some(h) = subagent::relevant_skill_hint(&ws, &last_user) {
-                // Utility signal: skill was retrieved (not yet proven followed).
-                if let Some(start) = h.find(char::from_u32(39).unwrap()) {
-                    if let Some(end) = h[start + 1..].find(char::from_u32(39).unwrap()) {
-                        let name = &h[start + 1..start + 1 + end];
-                        if !name.is_empty() {
-                            let _ = skill_metrics::record_outcome(
-                                name,
-                                skill_metrics::OutcomeKind::Success,
-                            );
-                        }
-                    }
-                }
-                if tail.is_empty() {
-                    tail = h;
-                } else {
-                    tail.push_str("\n\n");
-                    tail.push_str(&h);
-                }
-            }
-        }
-        if !tail.is_empty() {
-            messages.push(Message::system(tail));
-            transient_tails += 1;
-        }
-        let ws_msg = work_state_message(st).await;
-        if let Some(msg) = &ws_msg {
-            messages.push(msg.clone());
-            transient_tails += 1;
-        }
-        // P0-H1: pre_agent_start — dynamic system-prompt surgery as a transient
-        // system message (not persisted). Fail-open on hook errors.
-        if let Some(dyn_prompt) = run_pre_agent_start(st).await {
-            messages.push(Message::system(dyn_prompt));
-            transient_tails += 1;
-        }
-        // P0-H1: pre_context — rewrite the message list before the LLM call.
-        // Fail-open: invalid/oversized modify keeps prior messages.
-        run_pre_context(st, &mut messages).await;
-        // messages is already Vec<Message> — pass directly.
-        let (assistant, _finish, tokens_in, tokens_out, cached_tokens) =
-            match provider::stream_turn(
-                client,
-                &provider,
-                cfg.idle_timeout_secs,
-                &model,
-                &messages,
-                &tool_defs,
-                &effort,
-                &thinking_levels,
-                max_tokens,
-                &cancel,
-                &mut timer,
-                prompt_est,
-                false,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    st.logger.log("turn_error", json!({ "error": e }));
-                    sync_session_file(st).await;
-                    if e == "aborted" {
-                        emit(&Event::new("aborted"));
-                    } else {
-                        emit(&Event::new("error").with("message", json!(e)));
-                    }
-                    emit(&Event::new("done"));
-                    return;
-                }
-            };
-
-        // Strip transient tails before recording the token baseline so
-        // conv_len_at_last_real reflects the persisted conversation length
-        // (without the transient messages) and grounded_estimate's delta slice
-        // stays correct. On the error path above we `return` first, so the
-        // transient messages are simply dropped along with `messages`.
-        for _ in 0..transient_tails {
-            messages.pop();
-        }
-
-        // Convert the assistant from OpenAI-shaped Value to Message.
-        let assistant_msg = Message::try_from(&assistant).unwrap_or_else(|e| {
-            emit(&Event::new("error").with("message", json!(format!("assistant parse: {e}"))));
-            Message::assistant("")
-        });
-
-        // Anchor all future estimates on the endpoint's REAL `prompt_tokens` —
-        // the exact count of `messages` as the model tokenized it (system +
-        // history + tool-call framing). `messages` is exactly what we sent, so its
-        // length marks where the real baseline stops and the char/4 delta begins;
-        // the compaction trigger and live footer then reflect reality instead of
-        // a whole-history char/4 guess. Only when the endpoint actually reports
-        // usage (some don't); otherwise we keep the previous baseline.
-        if tokens_in > 0 {
-            *st.last_real_prompt_tokens.lock().await = Some(tokens_in);
-            *st.conv_len_at_last_real.lock().await = messages.len();
-        }
-
-        // Accumulate token counts for /stats. When the endpoint omits usage
-        // (tokens come back zero) estimate from the exchanged messages so the
-        // session totals aren't stuck at zero alongside the footer budget.
-        let (acc_in, acc_out) = if tokens_in > 0 || tokens_out > 0 {
-            (tokens_in, tokens_out)
-        } else {
-            // Endpoint omitted usage: estimate THIS turn's input as the prompt we
-            // sent (the whole messages array) and output as the assistant reply —
-            // NOT the accumulated session total, which would double-count every
-            // prior turn and trip --max-session-tokens after 1-2 turns on
-            // usage-less endpoints.
-            (
-                estimate_messages_tokens(&messages),
-                estimate_message_tokens(&assistant_msg),
-            )
-        };
-        *st.tokens_in.lock().await += acc_in;
-        *st.tokens_out.lock().await += acc_out;
-        // Accumulate prefix-cache hits so /stats can show cache effectiveness.
-        *st.cached_tokens.lock().await += cached_tokens;
-
-        // Append + persist the finalized assistant message.
-        {
-            messages.push(assistant_msg.clone());
-            let mut conv = st.conversation.lock().await;
-            conv.clone_from(&messages);
-            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                session::append(p, conv.last().unwrap());
-            }
-        }
-        *st.estimated_tokens.lock().await += estimate_message_tokens(&assistant_msg);
-
-        let tool_calls = assistant_msg.tool_calls().map(|tc| tc.to_vec());
-        match tool_calls {
-            Some(calls) if !calls.is_empty() => {
-                // Leading contiguous readonly recon tools (≥2) run as a parallel
-                // wave after per-call gates. Writes / finish / bash / … stay in
-                // the sequential loop below so HITL and side effects stay ordered.
-                let mut call_offset = 0usize;
-                {
-                    let mut wave_end = 0usize;
-                    while wave_end < calls.len()
-                        && tools::is_parallel_wave_tool(&calls[wave_end].function.name)
-                    {
-                        wave_end += 1;
-                    }
-                    if wave_end >= 2 {
-                        match run_parallel_readonly_wave(
-                            st,
-                            &calls[..wave_end],
-                            &tool_defs,
-                            &cancel,
-                            &mut turn_tool_calls,
-                            &mut shape_tools,
-                            &mut shape_files,
-                        )
-                        .await
-                        {
-                            ParallelWaveResult::Aborted => return,
-                            ParallelWaveResult::Done => call_offset = wave_end,
-                        }
-                    }
-                }
-                for tc in &calls[call_offset..] {
-                    // Honor an abort mid-batch: without this, the synchronous
-                    // fall-through tools (write_file/edit/patch/read_file/…)
-                    // run to completion after the user hit /abort — only
-                    // bash/fetch/web_search/diagnostics were cancel-wrapped.
-                    // Check before each call so a batch's remaining
-                    // destructive writes don't execute once the turn is
-                    // cancelled. (Any orphaned tool_calls this leaves are
-                    // repaired by the always-run sanitizer next turn.)
-                    if cancel.is_cancelled() {
-                        sync_session_file(st).await;
-                        emit_aborted_done();
-                        return;
-                    }
-                    let id = tc.id.clone();
-                    let name = tc.function.name.clone();
-                    let args_str = tc.function.arguments.clone();
-                    emit(
-                        &Event::new("tool_call")
-                            .with("id", json!(id))
-                            .with("name", json!(name))
-                            .with("args", json!(args_str)),
-                    );
-                    // Accumulate the turn's work-shape for auto-reflect (skip
-                    // `finish` — it signals completion, not work).
-                    if name != "finish" {
-                        turn_tool_calls = turn_tool_calls.saturating_add(1);
-                        shape_tools.push(name.clone());
-                        for cat in extract_file_categories(&name, &args_str) {
-                            shape_files.push(cat);
-                        }
-                    }
-                    let args: Value = match serde_json::from_str(&args_str) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            // Malformed JSON arguments: the model produced an argument
-                            // string that isn't valid JSON (common with long, quote-heavy
-                            // commands wrapped inside `bulk`'s nested JSON). Return an
-                            // actionable error so the model retries simply, and flag the
-                            // conversation for argument sanitization so the malformed
-                            // assistant message doesn't make the next API request fail
-                            // with "function.arguments must be valid JSON" — which would
-                            // repeat on every turn and brick the session.
-                            let msg = format!(
-                                "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
-                                name
-                            );
-                            emit(
-                                &Event::new("tool_result")
-                                    .with("id", json!(id))
-                                    .with("ok", json!(false))
-                                    .with("output", json!(msg)),
-                            );
-                            let tool_result = Message::tool(id.clone(), msg);
-                            let est = estimate_message_tokens(&tool_result);
-                            let mut conv = st.conversation.lock().await;
-                            conv.push(tool_result);
-                            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                session::append(p, conv.last().unwrap());
-                            }
-                            *st.estimated_tokens.lock().await += est;
-                            continue;
-                        }
-                    };
-
-                    // Tool-schema gate: only tools currently offered in `tool_defs`
-                    // may run. Deferred tools (git_*, fetch, bulk_*, …) stay out of
-                    // the schema until `load_tools` enables them — without this
-                    // gate a model that invents the name (e.g. after reading a
-                    // skill) would still execute and defeat staging.
-                    let offered = tool_defs.iter().any(|d| {
-                        d.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            == Some(name.as_str())
-                    });
-                    if !offered {
-                        let msg = if tools::is_deferred_tool(&name) {
-                            format!(
-                                "tool '{name}' is deferred and not enabled this session. \
-                                 Call load_tools with tools:[\"{name}\"] (or a group: git, web, bulk, browser, all), \
-                                 then retry the call."
-                            )
-                        } else {
-                            format!(
-                                "tool '{name}' is not available on this agent (not in the current tool list)."
-                            )
-                        };
-                        emit(
-                            &Event::new("tool_result")
-                                .with("id", json!(id))
-                                .with("ok", json!(false))
-                                .with("output", json!(msg)),
-                        );
-                        let tool_result = Message::tool(id.clone(), msg);
-                        let est = estimate_message_tokens(&tool_result);
-                        let mut conv = st.conversation.lock().await;
-                        conv.push(tool_result);
-                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                            session::append(p, conv.last().unwrap());
-                        }
-                        *st.estimated_tokens.lock().await += est;
-                        continue;
-                    }
-
-                    // Approval gate for destructive tools. A plugin tool that
-                    // dispatches (a custom name, OR an `override:true` tool that
-                    // replaces a built-in) carries its own kind; everything else
-                    // uses the static classify() table. A plugin tool that merely
-                    // collides with a built-in name (no override) does NOT
-                    // dispatch to the plugin, so it falls through to classify().
-                    let cfg = st.cfg.read().await.clone();
-                    let kind = match st.plugin_manager.tool_config(&name) {
-                        Some(tc) if tc.override_builtin || !tools::is_builtin(&name) => tc.kind,
-                        _ => tools::classify(&name),
-                    };
-                    let kind_str: &'static str = match kind {
-                        tools::ToolKind::ReadOnly => "readonly",
-                        tools::ToolKind::Destructive => "destructive",
-                    };
-                    // Skip the gate if the user previously said "always" to this kind.
-                    let escalated = st.escalated_kinds.lock().await.contains(kind_str);
-
-                    // Check permission rules before the approval gate.
-                    // DENY rules take precedence; ALLOW rules skip the gate entirely.
-                    let mut force_allow = false;
-                    let mut force_deny = false;
-                    let mut force_ask = false;
-                    for rule in &cfg.allow_rules {
-                        if tool_matches_rule(&name, &args, rule) {
-                            force_allow = true;
-                            break;
-                        }
-                    }
-                    if !force_allow {
-                        for rule in &cfg.deny_rules {
-                            if tool_matches_rule(&name, &args, rule) {
-                                force_deny = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !force_allow && !force_deny {
-                        for rule in &cfg.ask_rules {
-                            if tool_matches_rule(&name, &args, rule) {
-                                force_ask = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if force_deny {
-                        let msg = format!("tool call '{}' denied by permission rule", name);
-                        emit(
-                            &Event::new("tool_result")
-                                .with("id", json!(id))
-                                .with("ok", json!(false))
-                                .with("output", json!(msg)),
-                        );
-                        let tool_result = Message::tool(id.clone(), msg);
-                        let est = estimate_message_tokens(&tool_result);
-                        let mut conv = st.conversation.lock().await;
-                        conv.push(tool_result);
-                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                            session::append(p, conv.last().unwrap());
-                        }
-                        *st.estimated_tokens.lock().await += est;
-                        continue;
-                    }
-
-                    // Restricted ("dangerous") paths (.env, .git/**, .ssh/**, id_rsa, …).
-                    // Under `Never` ALL file restrictions are disabled — no
-                    // prompt, no block. Under `Destructive`/`Always` a
-                    // restricted path forces an approval prompt (for reads AND
-                    // writes) instead of the old unconditional hard block; an
-                    // approved call proceeds.
-                    let restricted = if matches!(cfg.approval, Approval::Never) {
-                        None
-                    } else {
-                        restricted_path_for_tool(&name, &args, &cfg.workspace)
-                    };
-                    let needs_approval = if force_allow || escalated {
-                        false
-                    } else if force_ask {
-                        true
-                    } else {
-                        match cfg.approval {
-                            Approval::Never => false,
-                            Approval::Destructive => {
-                                kind == tools::ToolKind::Destructive || restricted.is_some()
-                            }
-                            Approval::Always => true,
-                        }
-                    };
-                    if needs_approval {
-                        match request_approval(st, &id, &name, &args_str, kind_str, &cancel).await {
-                            ApprovalResult::Granted => {}
-                            ApprovalResult::Denied => {
-                                let msg = format!("tool call '{}' was denied by the user", name);
-                                emit(
-                                    &Event::new("tool_result")
-                                        .with("id", json!(id))
-                                        .with("ok", json!(false))
-                                        .with("output", json!(msg)),
-                                );
-                                let tool_result = Message::tool(id.clone(), msg);
-                                let est = estimate_message_tokens(&tool_result);
-                                let mut conv = st.conversation.lock().await;
-                                conv.push(tool_result);
-                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                    session::append(p, conv.last().unwrap());
-                                }
-                                *st.estimated_tokens.lock().await += est;
-                                continue;
-                            }
-                            ApprovalResult::Aborted => {
-                                sync_session_file(st).await;
-                                emit(&Event::new("aborted"));
-                                emit(&Event::new("done"));
-                                return;
-                            }
-                        }
-                    }
-
-                    // Auto-checkpoint before the first destructive mutation in a
-                    // turn so Undo can restore the filesystem as well as chat.
-                    if kind == tools::ToolKind::Destructive {
-                        maybe_auto_checkpoint(st).await;
-                    }
-
-                    // Dispatch pre-execution hooks for this tool. Two phases compose:
-                    //   1. the tool-SPECIFIC pre_* hook (pre_bash/pre_write/pre_read)
-                    //      — transforms/audits/denies that tool's call; and
-                    //   2. the catch-all `pre_tool` hook, which fires for EVERY tool
-                    //      (memory, todo_write, git_*, subagent, plugin tools, …)
-                    //      so a plugin can intercept any call — the same reach a
-                    //      core edit of this dispatch loop has. pre_tool runs AFTER
-                    //      the specific hook so it sees the final amended args.
-                    // Each hook may allow (optionally overriding arg fields via
-                    // `modify`, and/or posting a `reason`), or deny (the call is
-                    // skipped and the reason is returned to the model). Hooks
-                    // compose: each sees the args as amended by earlier hooks.
-                    let hook_name = match name.as_str() {
-                        "bash" => "pre_bash",
-                        "write_file" | "edit" => "pre_write",
-                        "read_file" | "grep" | "glob" => "pre_read",
-                        _ => "",
-                    };
-                    let any_pre = (!hook_name.is_empty() && st.plugin_manager.has_hook(hook_name))
-                        || st.plugin_manager.has_hook("pre_tool");
-                    // exec_args starts as the original args and is amended in place
-                    // by pre-hooks. Only clone when a hook will actually run, so
-                    // large write payloads aren't copied in the common case.
-                    let mut exec_args = if any_pre { args.clone() } else { args };
-                    let mut hook_notes: Vec<String> = Vec::new();
-                    let mut denied: Option<String> = None;
-                    if !hook_name.is_empty() {
-                        denied = run_pre_hooks(
-                            st,
-                            &cfg,
-                            hook_name,
-                            &name,
-                            &mut exec_args,
-                            &mut hook_notes,
-                        )
-                        .await;
-                    }
-                    if denied.is_none() && name != "finish" {
-                        denied = run_pre_hooks(
-                            st,
-                            &cfg,
-                            "pre_tool",
-                            &name,
-                            &mut exec_args,
-                            &mut hook_notes,
-                        )
-                        .await;
-                    }
-                    if let Some(msg) = denied {
-                        emit(
-                            &Event::new("tool_result")
-                                .with("id", json!(id))
-                                .with("ok", json!(false))
-                                .with("output", json!(msg)),
-                        );
-                        let tool_result = Message::tool(id.clone(), msg);
-                        let est = estimate_message_tokens(&tool_result);
-                        let mut conv = st.conversation.lock().await;
-                        conv.push(tool_result);
-                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                            session::append(p, conv.last().unwrap());
-                        }
-                        *st.estimated_tokens.lock().await += est;
-                        continue;
-                    }
-
-                    // bulk inner-call gate: run the same permission deny-rules +
-                    // dangerous-path + plugin pre-hook gate on EACH inner call so
-                    // destructive ops can't evade the safety floor by hiding inside
-                    // a single `bulk` call (the outer deny/hook loop above only sees
-                    // the `bulk` call itself). Denied inner calls are recorded by
-                    // index and rendered by execute_bulk.
-                    let mut bulk_denied: std::collections::HashMap<usize, String> =
-                        std::collections::HashMap::new();
-                    if name == "bulk" {
-                        if let Some(calls) =
-                            exec_args.get_mut("calls").and_then(|v| v.as_array_mut())
-                        {
-                            for (i, c) in calls.iter_mut().enumerate() {
-                                let iname = c
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let iargs = c.get("args").cloned().unwrap_or(json!({}));
-                                let mut modified = iargs.clone();
-                                let mut dmsg: Option<String> = None;
-                                // Deferred-tool staging: bulk must not smuggle
-                                // fetch/git_*/web_search/… that aren't enabled.
-                                if tools::is_deferred_tool(&iname)
-                                    && !matches!(
-                                        iname.as_str(),
-                                        "bulk" | "bulk_read" | "bulk_write" | "bulk_edit"
-                                    )
-                                {
-                                    let enabled = st.enabled_deferred_tools.lock().await.clone();
-                                    let planning =
-                                        st.goal.lock().await.phase == goal::GoalPhase::Planning;
-                                    if !(enabled.contains(&iname)
-                                        || (iname == "goal_write_plan" && planning))
-                                    {
-                                        dmsg = Some(format!(
-                                            "deferred tool '{iname}' is not enabled — call load_tools first, then retry"
-                                        ));
-                                    }
-                                }
-                                // permission deny-rules (ALLOW skips, DENY blocks)
-                                let mut force_allow = false;
-                                if dmsg.is_none() {
-                                    for rule in &cfg.allow_rules {
-                                        if tool_matches_rule(&iname, &iargs, rule) {
-                                            force_allow = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if dmsg.is_none() && !force_allow {
-                                    for rule in &cfg.deny_rules {
-                                        if tool_matches_rule(&iname, &iargs, rule) {
-                                            dmsg = Some("denied by permission rule".into());
-                                            break;
-                                        }
-                                    }
-                                }
-                                // plugin pre-hooks (the security-relevant ones)
-                                if dmsg.is_none() {
-                                    let hook_name = match iname.as_str() {
-                                        "bash" => "pre_bash",
-                                        "write_file" | "edit" => "pre_write",
-                                        "read_file" | "grep" | "glob" => "pre_read",
-                                        _ => "",
-                                    };
-                                    if !hook_name.is_empty() {
-                                        if let Some(deny) = run_pre_hooks(
-                                            st,
-                                            &cfg,
-                                            hook_name,
-                                            &iname,
-                                            &mut modified,
-                                            &mut hook_notes,
-                                        )
-                                        .await
-                                        {
-                                            dmsg = Some(deny);
-                                        }
-                                    }
-                                    if dmsg.is_none() && iname != "finish" {
-                                        if let Some(deny) = run_pre_hooks(
-                                            st,
-                                            &cfg,
-                                            "pre_tool",
-                                            &iname,
-                                            &mut modified,
-                                            &mut hook_notes,
-                                        )
-                                        .await
-                                        {
-                                            dmsg = Some(deny);
-                                        }
-                                    }
-                                }
-                                if let Some(m) = dmsg {
-                                    bulk_denied.insert(i, m);
-                                } else {
-                                    *c = json!({ "name": iname, "args": modified });
-                                }
-                            }
-                        }
-                    }
-
-                    // Execute. bash/bulk/diagnostics/spawn are async; others sync.
-                    // The async ones are wrapped in a `select!` on the turn cancel
-                    // so /abort can interrupt them mid-flight — kill_on_drop frees
-                    // the spawned child when the future is dropped.
-                    let mut outcome = if let Some(restored) = {
-                        // Identical re-call of a read-only tool after a digest /
-                        // ingress-cap: restore content without re-executing.
-                        // Restore is capped so a re-call cannot re-bloat context.
-                        let cache = st.tool_output_cache.lock().await;
-                        cache.get(&name, &args_str).map(|s| s.to_string())
-                    } {
-                        tools::Outcome::ok(apply_restore_cap(&restored))
-                    } else if let Some((prior_id, preview)) = {
-                        let conv = st.conversation.lock().await;
-                        find_duplicate_tool_result(&conv, &name, &args_str)
-                    } {
-                        // Same tool+args already in history undigested — point at
-                        // it instead of duplicating tens of KB in the transcript.
-                        tools::Outcome::ok(format!(
-                            "[duplicate of tool_call_id {prior_id}; content unchanged]\n{preview}"
-                        ))
-                    } else if let Some(tc) = st
-                        .plugin_manager
-                        .tool_config(&name)
-                        .filter(|tc| tc.override_builtin || !tools::is_builtin(&name))
-                    {
-                        // Plugin-declared tool: dispatch to its handler script
-                        // (subprocess, stdin=args JSON, stdout={ok,output}).
-                        // This branch covers BOTH custom plugin tools (a name no
-                        // built-in owns) AND `override:true` tools that REPLACE
-                        // a built-in's implementation — the filter admits a
-                        // built-in name only when the plugin explicitly opted
-                        // into overriding it, so a mere name collision still
-                        // falls through to the built-in handler below. Wrapped in
-                        // a select! on the turn cancel so /abort can interrupt it
-                        // mid-flight; kill_on_drop frees the child.
-                        let session_id = cfg
-                            .session_file
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let ws = cfg.workspace.display().to_string();
-                        tokio::select! {
-                            o = plugins::execute_plugin_tool(&name, &tc, &exec_args, &ws, &session_id) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err(format!("{name} aborted")),
-                        }
-                    } else if name == "bash" {
-                        let cmd = exec_args
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let timeout_override = exec_args.get("timeout").and_then(|v| v.as_u64());
-                        // Sudo passthrough: if the command invokes `sudo`, we
-                        // must NOT let it run directly — sudo opens /dev/tty to
-                        // read the password, which garbles the TUI. Instead we
-                        // surface a `sudo_request` to the user. On approve the
-                        // password is fed via `sudo -S` on stdin; on decline
-                        // (Esc) the agent is told the user declined.
-                        //
-                        // In Approval::Never, probe sudo non-interactively and
-                        // prompt only when it explicitly asks for a password.
-                        // NOPASSWD/cached credentials run immediately; other
-                        // failures are surfaced by `sudo -n` without a flyout.
-                        if tools::command_uses_sudo(cmd) {
-                            let needs_prompt = if matches!(cfg.approval, Approval::Never) {
-                                let sudo_preflight = tools::sudo_preflight(&cfg).await;
-                                tools::sudo_should_prompt(&cfg.approval, sudo_preflight)
-                            } else {
-                                true
-                            };
-                            if needs_prompt {
-                                match request_sudo(st, cmd, &cancel).await {
-                                    SudoResult::Approved { password } => {
-                                        tokio::select! {
-                                            o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::Password(password)) => o,
-                                            _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
-                                        }
-                                    }
-                                    SudoResult::Declined => tools::Outcome::ok(
-                                        "The user declined the sudo request — the \
-                                         command was NOT run. Ask the user to run it \
-                                         manually, or re-attempt without sudo.",
-                                    ),
-                                    SudoResult::Aborted => {
-                                        sync_session_file(st).await;
-                                        emit(&Event::new("aborted"));
-                                        emit(&Event::new("done"));
-                                        return;
-                                    }
-                                }
-                            } else {
-                                // NOPASSWD / cached — run with `sudo -n`
-                                // (non-interactive, never opens /dev/tty).
-                                tokio::select! {
-                                    o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::NonInteractive) => o,
-                                    _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
-                                }
-                            }
-                        } else {
-                            tokio::select! {
-                                o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::None) => o,
-                                _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
-                            }
-                        }
-                    } else if name == "bulk" {
-                        tokio::select! {
-                            o = tools::execute_bulk(&exec_args, &cfg, &bulk_denied) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("bulk aborted"),
-                        }
-                    } else if name == "fetch" {
-                        tokio::select! {
-                            o = tools::execute_fetch(&exec_args, &cfg) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("fetch aborted"),
-                        }
-                    } else if name == "web_search" {
-                        tokio::select! {
-                            o = tools::execute_web_search(&exec_args, &cfg) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("web_search aborted"),
-                        }
-                    } else if name == "diagnostics" {
-                        tokio::select! {
-                            o = tools::execute_diagnostics(&exec_args, &cfg) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("diagnostics aborted"),
-                        }
-                    } else if name == "test_env" {
-                        tokio::select! {
-                            o = tools::execute_test_env(&exec_args, &cfg) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("test_env aborted"),
-                        }
-                    } else if browser::is_browser_tool(&name) {
-                        tokio::select! {
-                            o = browser::execute_browser(&name, &exec_args, &cfg) => o,
-                            _ = cancel.cancelled() => tools::Outcome::err("browser tool aborted"),
-                        }
-                    } else if name == "spawn" || name == "subagent" {
-                        // When goal mode is active, cap concurrency on parallel
-                        // fan-out to the goal's limit (defense in depth).
-                        let mut sub_args = exec_args.clone();
-                        {
-                            let g = st.goal.lock().await;
-                            if g.is_active() {
-                                if let Some(c) =
-                                    sub_args.get("concurrency").and_then(|v| v.as_u64())
-                                {
-                                    sub_args["concurrency"] =
-                                        json!(goal::cap_concurrency(c as u32, &g));
-                                } else if sub_args.get("tasks").is_some() {
-                                    sub_args["concurrency"] = json!(g.concurrency);
-                                }
-                            }
-                        }
-                        subagent::execute(
-                            st.clone(),
-                            client.clone(),
-                            provider.clone(),
-                            model.clone(),
-                            sub_args,
-                            cancel.clone(),
-                            0,
-                        )
-                        .await
-                    } else if name == "goal_write_plan" {
-                        goal::handle_goal_write_plan(st, &exec_args).await
-                    } else if name == "load_tools" {
-                        handle_load_tools(st, &exec_args, &mut tool_defs).await
-                    } else if name == "ask" {
-                        // CEO / Control Center autonomy: never block on the user.
-                        let ceo_active = {
-                            let g = st.goal.lock().await;
-                            g.ceo_mode && g.is_active()
-                        };
-                        if ceo_active {
-                            tools::Outcome::ok(
-                                "CEO mode is active — do not ask the user. Decide autonomously,                                  document assumptions, and continue. Do not re-call ask.".to_string(),
-                            )
-                        } else {
-                            // Blocking user-interaction tool: surface a flyout and
-                            // wait for the answer (or skip/abort). Validation errors
-                            // and skips return a normal Outcome; an abort ends the
-                            // turn like the approval gate does.
-                            match request_ask(st, &exec_args, &cancel).await {
-                            AskResult::Answered { questions, answers } => {
-                                tools::Outcome::ok(format_ask_answers(&questions, &answers))
-                            }
-                            AskResult::Skipped => tools::Outcome::ok(
-                                "The user skipped the questions. Proceed with your best judgment and note any assumptions.",
-                            ),
-                            AskResult::Aborted => {
-                                sync_session_file(st).await;
-                                emit(&Event::new("aborted"));
-                                emit(&Event::new("done"));
-                                return;
-                            }
-                        }
-                        }
-                    } else if name == "memory" {
-                        // Route through the plugin memory_provider when one is
-                        // active and no tool override already handled this call.
-                        if let Some(mp) = st.plugin_manager.memory_provider() {
-                            let action = exec_args
-                                .get("action")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let session_id = cfg
-                                .session_file
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            let ws = cfg.workspace.display().to_string();
-                            tokio::select! {
-                                r = plugins::execute_memory_provider(&mp, action, &exec_args, &ws, &session_id) => r.into_outcome(),
-                                _ = cancel.cancelled() => tools::Outcome::err("memory aborted"),
-                            }
-                        } else {
-                            let n = name.clone();
-                            let a = exec_args.clone();
-                            let c = cfg.clone();
-                            match tokio::task::spawn_blocking(move || tools::execute(&n, &a, &c))
-                                .await
-                            {
-                                Ok(o) => o,
-                                Err(_) => tools::Outcome::err("tool task panicked"),
-                            }
-                        }
-                    } else {
-                        let n = name.clone();
-                        let a = exec_args.clone();
-                        let c = cfg.clone();
-                        match tokio::task::spawn_blocking(move || tools::execute(&n, &a, &c)).await
-                        {
-                            Ok(o) => o,
-                            Err(_) => tools::Outcome::err("tool task panicked"),
-                        }
-                    };
-
-                    // Milestone 1.1: a memory save/append/forget via the AI
-                    // tool must be visible to subsequent turns in THIS session,
-                    // so rebuild the memory slice of the system prompt now (no-op
-                    // + prefix-cache-safe when unchanged). The /memory,
-                    // /save-memory and /forget-memory commands refresh from their
-                    // own handlers; this covers the model's tool path.
-                    if name == "memory" {
-                        let action = exec_args
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if matches!(action, "save" | "append" | "forget" | "consolidate") {
-                            refresh_memory_injection(st).await;
-                        }
-                    }
-
-                    // Rolling work-state: mirror todo_write + file edits into the
-                    // KV-cache-aware summary so the model sees current work state
-                    // every turn without a tool call. Only on success so a failed
-                    // write doesn't pollute the recent-files list.
-                    if outcome.ok {
-                        match name.as_str() {
-                            "todo_write" => sync_work_state_from_todos(st, &exec_args).await,
-                            "write_file" | "edit" | "patch" | "bulk_write" | "bulk_edit"
-                            | "delete" | "rename" | "mkdir" => {
-                                record_file_touch(st, &name, &exec_args).await
-                            }
-                            "read_file" => {
-                                if let Some(path) = exec_args.get("path").and_then(|v| v.as_str()) {
-                                    let lower = path.to_ascii_lowercase();
-                                    if lower.ends_with("skill.md")
-                                        || lower.contains("/.catalyst-code/skills/")
-                                        || lower.contains("\\.catalyst-code\\skills\\")
-                                    {
-                                        st.skill_read_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Dispatch post-execution hooks for this tool. Two phases,
-                    // mirroring the pre-hook structure: the tool-SPECIFIC post_*
-                    // hook (post_bash/post_write/post_read), then the catch-all
-                    // `post_tool` that fires for EVERY tool. Each hook receives the
-                    // tool's CURRENT result and may MODIFY it (return
-                    // `modify: {"output":…, "ok":…, "diff":…}`) — e.g. redact a
-                    // secret, append context, reformat. Post-hooks never block (the
-                    // op already ran); `allow:false` is ignored, only `reason` +
-                    // `modify` are honored.
-                    let post_hook = match name.as_str() {
-                        "bash" => "post_bash",
-                        "write_file" | "edit" => "post_write",
-                        "read_file" | "grep" | "glob" => "post_read",
-                        _ => "",
-                    };
-                    if !post_hook.is_empty() {
-                        run_post_hooks(
-                            st,
-                            &cfg,
-                            post_hook,
-                            &name,
-                            &exec_args,
-                            &mut outcome,
-                            &mut hook_notes,
-                        )
-                        .await;
-                    }
-                    if name != "finish" {
-                        run_post_hooks(
-                            st,
-                            &cfg,
-                            "post_tool",
-                            &name,
-                            &exec_args,
-                            &mut outcome,
-                            &mut hook_notes,
-                        )
-                        .await;
-                    }
-
-                    // finish sentinel: the model signaled completion.
-                    if name == "finish" && outcome.ok && outcome.output == tools::FINISH_SENTINEL {
-                        // Auto-reflect gate: before the first `finish` exits a
-                        // non-trivial turn, inject a reflection continuation (the
-                        // deterministic seam SELF_LEARNING §11 deferred) instead
-                        // of completing. Falls through to the normal tool-result
-                        // push + re-stream; `reflected` prevents re-entry.
-                        let mut do_reflect = false;
-                        let mut recurrence = 0usize;
-                        if !reflected {
-                            if let Some((nudge, rec)) = maybe_reflect_prompt(
-                                st,
-                                &prompt,
-                                turn_tool_calls,
-                                &shape_tools,
-                                &shape_files,
-                                cancel.is_cancelled(),
-                            )
-                            .await
-                            {
-                                reflected = true;
-                                outcome.output = nudge;
-                                recurrence = rec;
-                                do_reflect = true;
-                            }
-                        }
-                        if do_reflect {
-                            emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
-                            // Fall through → the finish tool_result (carrying
-                            // the nudge) is pushed below and the loop re-streams.
-                        } else {
-                            // Emit a real tool_result so the TUI/web don't leave
-                            // the finish card empty / stuck as "[no result]".
-                            let finish_msg = tools::FINISH_MESSAGE;
-                            emit(
-                                &Event::new("tool_result")
-                                    .with("id", json!(id))
-                                    .with("ok", json!(true))
-                                    .with("output", json!(finish_msg)),
-                            );
-                            let tool_result = Message::tool(id.clone(), finish_msg);
-                            let est = estimate_message_tokens(&tool_result);
-                            messages.push(tool_result.clone());
-                            {
-                                let mut conv = st.conversation.lock().await;
-                                // Keep conversation identical to the working
-                                // buffer (clone_from, not push) so a divergent
-                                // mid-turn sync can't leave finish unpaired.
-                                conv.clone_from(&messages);
-                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                                    session::append(p, conv.last().unwrap());
-                                }
-                            }
-                            *st.estimated_tokens.lock().await += est;
-                            *st.last_turn_time.lock().await = std::time::Instant::now();
-                            let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
-                            let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                            *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                            emit_turn_metrics(st, &metrics).await;
-                            st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps, "finish_tool": true }));
-                            st.logger.record_turn();
-                            persist_stats(st).await;
-                            sync_session_file(st).await;
-                            maybe_finish_goal_orchestrator_turn(st, client, cancel.is_cancelled())
-                                .await;
-                            emit(&Event::new("done"));
-                            return;
-                        }
-                    }
-                    // Surface plugin hook feedback to the model. Any pre-hook that
-                    // modified args or posted a reason, and any post-hook that
-                    // observed something, is appended to the tool result so the
-                    // model knows its write/edit/read/bash call was inspected.
-                    if !hook_notes.is_empty() {
-                        outcome.output.push_str("\n\nPlugin hooks:\n- ");
-                        outcome.output.push_str(&hook_notes.join("\n- "));
-                    }
-                    // Cross-session anomaly nudge: if another session is
-                    // active in this workspace and this tool failed (or touched
-                    // a file a peer is editing), append a note so the agent
-                    // checks the neighbors before assuming it caused the error.
-                    // Uses the cached peer snapshot — no filesystem read here.
-                    if let Some(note) =
-                        maybe_concurrency_note(st, &name, &exec_args, outcome.ok).await
-                    {
-                        outcome.output.push_str("\n\n");
-                        outcome.output.push_str(&note);
-                    }
-                    // Cache + ingress: store full output for restorable tools so
-                    // digests / caps can shrink context; identical re-calls restore.
-                    // Destructive tools wipe the cache (tree may have changed).
-                    if outcome.ok {
-                        if tool_cache::invalidates_cache(&name) {
-                            st.tool_output_cache.lock().await.invalidate_all();
-                        } else if tool_cache::ToolOutputCache::is_restorable(&name)
-                            && !outcome.output.starts_with("[restored from digest cache]")
-                            && !outcome.output.starts_with("[duplicate of tool_call_id")
-                        {
-                            st.tool_output_cache.lock().await.store(
-                                &name,
-                                &args_str,
-                                &outcome.output,
-                            );
-                        }
-                    }
-                    // Hard ingress cap: never let a single tool result dominate
-                    // the context window. Prefer smart-truncation over an opaque
-                    // digest on first ingress; soft digest collapses further later.
-                    // Skip restore/duplicate pointers (already compact).
-                    if outcome.ok
-                        && !outcome.output.starts_with("[restored from digest cache]")
-                        && !outcome.output.starts_with("[duplicate of tool_call_id")
-                    {
-                        outcome.output = apply_ingress_cap(&name, &args_str, outcome.output);
-                    }
-                    // Debug log: records full tool args (file contents, commands) which may
-                    // include secrets the model handles. Opt-in (cfg.debug_log), user-owned.
-                    st.logger.log("tool", json!({ "name": name, "args": args_str, "ok": outcome.ok, "output_len": outcome.output.len() }));
-                    let mut ev = Event::new("tool_result")
-                        .with("id", json!(id))
-                        .with("ok", json!(outcome.ok))
-                        .with("output", json!(outcome.output));
-                    // Surface a unified-diff rendering to the TUI as a separate
-                    // `diff` field (edit/patch/write_file). It is NOT added to the
-                    // model-facing tool content (`output`) so the model's context
-                    // stays compact — the diff is for the human approver.
-                    if let Some(d) = &outcome.diff {
-                        ev = ev.with("diff", json!(d));
-                    }
-                    emit(&ev);
-                    if outcome.ok {
-                        if let Some(d) = &outcome.diff {
-                            if !d.is_empty() {
-                                let path =
-                                    exec_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                                emit(
-                                    &Event::new("file_change")
-                                        .with("path", json!(path))
-                                        .with("unified_diff", json!(d))
-                                        .with("tool", json!(name)),
-                                );
-                            }
-                        } else if matches!(
-                            name.as_str(),
-                            "write_file" | "edit" | "patch" | "delete" | "rename" | "mkdir"
-                        ) {
-                            let path = exec_args
-                                .get("path")
-                                .or_else(|| exec_args.get("to"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !path.is_empty() {
-                                emit(
-                                    &Event::new("file_change")
-                                        .with("path", json!(path))
-                                        .with("tool", json!(name)),
-                                );
-                            }
-                        }
-                    }
-                    let tool_result = Message::tool(id.clone(), &outcome.output);
-                    let est = estimate_message_tokens(&tool_result);
-                    messages.push(tool_result.clone());
-                    let mut conv = st.conversation.lock().await;
-                    conv.push(tool_result);
-                    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                        session::append(p, conv.last().unwrap());
-                    }
-                    *st.estimated_tokens.lock().await += est;
-                }
-                // Re-sync after parallel wave / any path that touched conversation
-                // without going through the working buffer.
-                messages.clone_from(&*st.conversation.lock().await);
-                // Loop back for the model to continue.
-            }
-            _ => {
-                // Turn complete — or, on a non-trivial turn, inject a reflect
-                // continuation before the real completion (auto-reflect gate).
-                let mut do_reflect = false;
-                let mut recurrence = 0usize;
-                let mut reflect_prompt = String::new();
-                if !reflected {
-                    if let Some((p, rec)) = maybe_reflect_prompt(
-                        st,
-                        &prompt,
-                        turn_tool_calls,
-                        &shape_tools,
-                        &shape_files,
-                        cancel.is_cancelled(),
-                    )
-                    .await
-                    {
-                        reflected = true;
-                        reflect_prompt = p;
-                        recurrence = rec;
-                        do_reflect = true;
-                    }
-                }
-                if do_reflect {
-                    // Push the reflect prompt as a user message and re-stream.
-                    let msg = Message::user(reflect_prompt);
-                    let est = estimate_message_tokens(&msg);
-                    messages.push(msg.clone());
-                    let mut conv = st.conversation.lock().await;
-                    conv.push(msg);
-                    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                        session::append(p, conv.last().unwrap());
-                    }
-                    *st.estimated_tokens.lock().await += est;
-                    drop(conv);
-                    emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
-                    // Don't return → the outer loop re-streams the reflection.
-                } else {
-                    // Turn complete: emit metrics + done.
-                    *st.last_turn_time.lock().await = std::time::Instant::now();
-                    let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
-                    let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
-                    *st.last_turn_metrics.lock().await = Some(metrics.clone());
-                    emit_turn_metrics(st, &metrics).await;
-                    st.logger.log("turn_done", json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "tps": metrics.tps }));
-                    st.logger.record_turn();
-                    persist_stats(st).await;
-                    maybe_finish_goal_orchestrator_turn(st, client, cancel.is_cancelled()).await;
-                    emit(&Event::new("done"));
-                    return;
-                }
-            }
-        }
-    }
-}
-
+pub(crate) use crate::agent::turn_loop::run_turn;
 pub(crate) enum ApprovalResult {
     Granted,
     Denied,
@@ -7805,15 +2940,25 @@ pub(crate) enum ApprovalResult {
 /// (which may each emit a tool call `call_1`) never collide on the shared
 /// pending-approval map. The id embeds the originating tool-call id for tracing.
 static APPROVAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Ask the TUI to approve a tool call; block until answered or aborted.
-/// On "always", only the matched tool KIND is escalated (not the whole session).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+use crate::tooling::approval::{
+    approval_pattern_within_requested_scope, sanitized_approval_preview,
+};
 pub(crate) async fn request_approval(
     st: &Arc<State>,
     id: &str,
     name: &str,
     args: &str,
     kind_str: &'static str,
+    owner_run_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> ApprovalResult {
     let request_id = format!(
@@ -7822,9 +2967,39 @@ pub(crate) async fn request_approval(
         id
     );
     let notify = Arc::new(Notify::new());
+    let active = st.runtime.snapshot();
+    let coordinator_bound = owner_run_id.is_none();
+    let run_id = match owner_run_id
+        .map(str::to_string)
+        .or_else(|| active.run_id.as_ref().map(ToString::to_string))
+    {
+        Some(run_id) => run_id,
+        None => return ApprovalResult::Aborted,
+    };
+    let resource = if coordinator_bound {
+        st.runtime
+            .register_active_run_resource(ResourceKind::Approval, format!("approval:{request_id}"))
+    } else {
+        let session = st.runtime.session_context();
+        st.runtime.register_session_resource(
+            &session,
+            ResourceKind::Approval,
+            format!("child_approval:{request_id}"),
+        )
+    };
+    let Some(resource) = resource else {
+        return ApprovalResult::Aborted;
+    };
     let pending = Arc::new(PendingApproval {
         request_id: request_id.clone(),
+        session_id: active.session_id.to_string(),
+        run_id,
+        coordinator_bound,
+        cancellation: cancel.clone(),
+        tool_call_id: id.to_string(),
         tool: name.to_string(),
+        risk: kind_str,
+        created_at_ms: now_ms(),
         args: serde_json::from_str(args).unwrap_or(json!({})),
         notify: notify.clone(),
         granted: Mutex::new(None),
@@ -7868,10 +3043,17 @@ pub(crate) async fn request_approval(
         }
         _ => None,
     };
+    let args_preview = sanitized_approval_preview(&args_v);
     let evt = Event::new("approval_request")
         .with("request_id", json!(request_id))
+        .with("session_id", json!(pending.session_id))
+        .with("run_id", json!(pending.run_id))
+        .with("tool_call_id", json!(pending.tool_call_id))
         .with("tool", json!(name))
-        .with("args", json!(args));
+        .with("risk", json!(pending.risk))
+        .with("requested_permission", json!(kind_str))
+        .with("created_at", json!(pending.created_at_ms))
+        .with("args", json!(args_preview));
     let evt = if let Some(d) = &diff {
         evt.with("diff", json!(d))
     } else {
@@ -7884,7 +3066,41 @@ pub(crate) async fn request_approval(
         _ = notify.notified() => pending.granted.lock().await.unwrap_or(false),
         _ = cancel.cancelled() => {
             st.pending.lock().await.remove(&request_id);
+            st.logger.log("approval_wait", json!({
+                "request_id": &request_id,
+                "tool_call_id": id,
+                "tool": name,
+                "status": "cancelled",
+                "duration_ms": now_ms().saturating_sub(pending.created_at_ms),
+            }));
             return ApprovalResult::Aborted;
+        }
+        _ = resource.cancellation().cancelled() => {
+            st.pending.lock().await.remove(&request_id);
+            st.logger.log("approval_wait", json!({
+                "request_id": &request_id,
+                "tool_call_id": id,
+                "tool": name,
+                "status": "cancelled",
+                "duration_ms": now_ms().saturating_sub(pending.created_at_ms),
+            }));
+            return ApprovalResult::Aborted;
+        }
+        _ = tokio::time::sleep(APPROVAL_TIMEOUT) => {
+            st.pending.lock().await.remove(&request_id);
+            emit(
+                &Event::new("approval_expired")
+                    .with("request_id", json!(request_id))
+                    .with("tool_call_id", json!(id)),
+            );
+            st.logger.log("approval_wait", json!({
+                "request_id": &request_id,
+                "tool_call_id": id,
+                "tool": name,
+                "status": "timed_out",
+                "duration_ms": now_ms().saturating_sub(pending.created_at_ms),
+            }));
+            return ApprovalResult::Denied;
         }
     };
 
@@ -7950,6 +3166,16 @@ pub(crate) async fn request_approval(
         );
     }
     st.pending.lock().await.remove(&request_id);
+    st.logger.log(
+        "approval_wait",
+        json!({
+            "request_id": &request_id,
+            "tool_call_id": id,
+            "tool": name,
+            "status": if granted { "granted" } else { "denied" },
+            "duration_ms": now_ms().saturating_sub(pending.created_at_ms),
+        }),
+    );
     if granted {
         ApprovalResult::Granted
     } else {
@@ -8100,6 +3326,12 @@ pub(crate) async fn request_ask(
         ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let notify = Arc::new(Notify::new());
+    let Some(resource) = st
+        .runtime
+        .register_active_run_resource(ResourceKind::Ask, format!("ask:{request_id}"))
+    else {
+        return AskResult::Aborted;
+    };
     let pending = Arc::new(PendingAsk {
         request_id: request_id.clone(),
         questions: questions.clone(),
@@ -8120,6 +3352,10 @@ pub(crate) async fn request_ask(
     let answers = tokio::select! {
         _ = notify.notified() => pending.answers.lock().await.take(),
         _ = cancel.cancelled() => {
+            st.pending_asks.lock().await.remove(&request_id);
+            return AskResult::Aborted;
+        }
+        _ = resource.cancellation().cancelled() => {
             st.pending_asks.lock().await.remove(&request_id);
             return AskResult::Aborted;
         }
@@ -8290,6 +3526,14 @@ pub(crate) async fn request_sudo(
         SUDO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let notify = Arc::new(Notify::new());
+    let session = st.runtime.session_context();
+    let Some(resource) = st.runtime.register_session_resource(
+        &session,
+        ResourceKind::Sudo,
+        format!("sudo:{request_id}"),
+    ) else {
+        return SudoResult::Aborted;
+    };
     let pending = Arc::new(PendingSudo {
         request_id: request_id.clone(),
         command: command.to_string(),
@@ -8310,6 +3554,10 @@ pub(crate) async fn request_sudo(
     let result = tokio::select! {
         _ = notify.notified() => pending.result.lock().await.take(),
         _ = cancel.cancelled() => {
+            st.pending_sudos.lock().await.remove(&request_id);
+            return SudoResult::Aborted;
+        }
+        _ = resource.cancellation().cancelled() => {
             st.pending_sudos.lock().await.remove(&request_id);
             return SudoResult::Aborted;
         }
@@ -8412,585 +3660,7 @@ const SOFT_DIGEST_KEEP_FRACTION: f32 = 0.20;
 /// Minimum tool-result size (bytes) worth digesting. Small results (ok/err
 /// one-liners, denial messages) stay full — they're cheap and the model may
 /// need them verbatim.
-const DIGEST_MIN_BYTES: usize = 256;
-/// Soft reclaim leaves more history than full compaction while still creating
-/// useful runway. It is a target after the 70% default trigger, not a trigger.
-const SOFT_DIGEST_TARGET_FRACTION: f32 = 0.60;
-/// Post-compaction target: reclaim until the conversation fits under this
-/// fraction of the context window (was 0.50 — left too little runway).
-const POST_COMPACT_BUDGET_FRACTION: f32 = 0.35;
-
-/// One shared, model-aware policy for every automatic context rewrite. The
-/// configured percentages remain user-facing intent, while `hard_limit`
-/// reserves enough room for a likely response plus protocol/tokenizer drift.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ContextPolicy {
-    pub digest_threshold: u64,
-    pub compact_threshold: u64,
-    pub hard_limit: u64,
-    pub response_reserve: u64,
-    pub safety_margin: u64,
-}
-
-pub(crate) fn context_policy(
-    messages: &[Message],
-    context_window: u64,
-    max_output_tokens: u32,
-    compact_at: f32,
-    digest_at: f32,
-) -> ContextPolicy {
-    if context_window == 0 {
-        return ContextPolicy {
-            digest_threshold: 0,
-            compact_threshold: 0,
-            hard_limit: 0,
-            response_reserve: 0,
-            safety_margin: 0,
-        };
-    }
-
-    // Start with 5% output runway, then grow it when recent assistant replies
-    // demonstrate that this session needs more. Bound it by both model metadata
-    // and 25% of the window so an advertised 128k output cap does not force a
-    // healthy 400k context to compact around 50–60%.
-    let base_reserve = ((context_window as f64 * 0.05) as u64)
-        .max(512)
-        .min(context_window / 10);
-    let observed = messages
-        .iter()
-        .rev()
-        .filter(|m| m.is_assistant())
-        .take(4)
-        .map(estimate_message_tokens)
-        .max()
-        .unwrap_or(0)
-        .saturating_mul(2);
-    let metadata_cap = if max_output_tokens == 0 {
-        context_window / 4
-    } else {
-        (max_output_tokens as u64).min(context_window / 4)
-    };
-    let response_reserve = base_reserve
-        .max(observed)
-        .min(metadata_cap.max(base_reserve));
-    let safety_margin = ((context_window as f64 * 0.02) as u64)
-        .max(256)
-        .min(context_window / 20);
-    let hard_limit = context_window
-        .saturating_sub(response_reserve)
-        .saturating_sub(safety_margin);
-    let configured_compact = (context_window as f64 * compact_at as f64).round() as u64;
-    let compact_threshold = configured_compact.min(hard_limit);
-    let digest_threshold = if digest_at <= 0.0 {
-        0
-    } else {
-        ((context_window as f64 * digest_at as f64).round() as u64).min(compact_threshold)
-    };
-    ContextPolicy {
-        digest_threshold,
-        compact_threshold,
-        hard_limit,
-        response_reserve,
-        safety_margin,
-    }
-}
-
-fn utilization_pct(tokens: u64, context_window: u64) -> u64 {
-    if context_window == 0 {
-        0
-    } else {
-        ((tokens as f64 / context_window as f64) * 100.0).round() as u64
-    }
-}
-
-pub(crate) fn should_auto_digest(auto_compact: bool, est: u64, policy: ContextPolicy) -> bool {
-    auto_compact && policy.digest_threshold > 0 && est > policy.digest_threshold
-}
-
-pub(crate) fn should_auto_compact(
-    auto_compact: bool,
-    est: u64,
-    message_count: usize,
-    policy: ContextPolicy,
-) -> bool {
-    auto_compact && est > policy.compact_threshold && (est > policy.hard_limit || message_count > 4)
-}
-
-/// Index where the soft-digest keep-window begins: walk backward accumulating
-/// tokens until `keep_budget` (20% of context, floored at 4k) is exceeded,
-/// always keeping at least `SOFT_DIGEST_MIN_KEEP` messages.
-fn soft_digest_keep_start(messages: &[Message], context_window: u64) -> usize {
-    let n = messages.len();
-    if n <= SOFT_DIGEST_MIN_KEEP {
-        return 0;
-    }
-    let budget = ((context_window as f32 * SOFT_DIGEST_KEEP_FRACTION) as u64).max(4_000);
-    let mut acc: u64 = 0;
-    let mut start = n;
-    for i in (0..n).rev() {
-        let t = estimate_message_tokens(&messages[i]);
-        if i < n.saturating_sub(SOFT_DIGEST_MIN_KEEP) && acc + t > budget {
-            break;
-        }
-        acc += t;
-        start = i;
-    }
-    start
-}
-
-/// Soft-digest path used by the main loop and subagents: collapse stale large
-/// tool results AND oversized tool-call arguments outside the token-budgeted
-/// keep window, then budget-reclaim any remaining oversized call args / results
-/// that still push the conversation over the soft reclaim target.
-/// When `cache` is provided, restorable tool outputs are stored before they are
-/// replaced so "re-run identical call to restore" is truthful.
-/// Returns total items changed.
-pub fn soft_digest_conversation(
-    messages: &mut Vec<Message>,
-    context_window: u64,
-    cache: Option<&mut tool_cache::ToolOutputCache>,
-) -> usize {
-    // Prefill cache from oversized tool results we're about to digest so a
-    // later identical re-call can restore without re-executing.
-    if let Some(cache) = cache {
-        cache_tool_results_before_digest(messages, cache);
-    }
-    let keep_start = soft_digest_keep_start(messages, context_window);
-    let mut changed = 0usize;
-    let n = messages.len();
-    if n <= SOFT_DIGEST_MIN_KEEP {
-        // Few-but-huge: digest ALL oversized tool results (keep=0) so a 3–6
-        // message chat dominated by large reads still reclaims at the soft
-        // threshold instead of waiting for 90% compact.
-        changed += digest_stale_tool_results(messages, 0);
-        changed += digest_stale_call_args(messages, n);
-    } else if keep_start > 0 {
-        let keep = n.saturating_sub(keep_start);
-        changed += digest_stale_tool_results(messages, keep);
-        changed += digest_stale_call_args(messages, keep_start);
-    }
-    // else: keep_start==0 but n > MIN_KEEP means the whole history still fits
-    // in the keep budget — don't collapse recent results; leave reclaim to
-    // digest_to_budget below.
-    // Soft budget reclaim: the default trigger is 70% and the target is 60%,
-    // leaving useful runway without making this lightweight path resemble a
-    // full compaction.
-    let soft_budget = ((context_window as f32) * SOFT_DIGEST_TARGET_FRACTION) as u64;
-    changed += digest_to_budget(messages, soft_budget);
-    changed
-}
-
-/// Store restorable tool outputs into the digest cache before they are
-/// collapsed, so identical re-calls can restore after soft digest / compact.
-fn cache_tool_results_before_digest(messages: &[Message], cache: &mut tool_cache::ToolOutputCache) {
-    let mut call_map: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    for m in messages {
-        if let Some(calls) = m.tool_calls() {
-            for tc in calls {
-                if !tc.id.is_empty() {
-                    call_map.insert(
-                        tc.id.clone(),
-                        (tc.function.name.clone(), tc.function.arguments.clone()),
-                    );
-                }
-            }
-        }
-    }
-    for m in messages {
-        if !m.is_tool() {
-            continue;
-        }
-        let content = match m.content_text() {
-            Some(c) if !c.starts_with("[digested:") && c.len() > DIGEST_MIN_BYTES => c,
-            _ => continue,
-        };
-        let id = m.tool_call_id().unwrap_or("");
-        let Some((name, args)) = call_map.get(id) else {
-            continue;
-        };
-        if tool_cache::ToolOutputCache::is_restorable(name) {
-            cache.store(name, args, content);
-        }
-    }
-}
-
-/// Collapse stale, large `role: "tool"` results into a one-line digest so they
-/// stop being re-sent verbatim on every turn. Only tool messages older than the
-/// last `keep` messages are eligible, and only if their content exceeds
-/// `DIGEST_MIN_BYTES`. Already-digested results are skipped (idempotent). The
-/// tool_call_id and role are preserved so orphaned-call sanitization and the
-/// model's tool-call/result pairing stay intact. Returns the count digested.
-#[allow(clippy::ptr_arg)]
-pub fn digest_stale_tool_results(messages: &mut Vec<Message>, keep: usize) -> usize {
-    if messages.len() <= keep {
-        return 0;
-    }
-    // Build tool_call_id -> (tool_name, args_json) from assistant tool_calls so
-    // the digest records WHAT was read/run, not just the size.
-    let mut call_map: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    for m in messages.iter() {
-        if !m.is_assistant() {
-            continue;
-        }
-        if let Some(calls) = m.tool_calls() {
-            for tc in calls {
-                if tc.id.is_empty() {
-                    continue;
-                }
-                call_map.insert(
-                    tc.id.clone(),
-                    (tc.function.name.clone(), tc.function.arguments.clone()),
-                );
-            }
-        }
-    }
-    let digest_to = messages.len().saturating_sub(keep);
-    let mut changed = 0usize;
-    for m in messages[..digest_to].iter_mut() {
-        if !m.is_tool() {
-            continue;
-        }
-        let content = match m.content_text() {
-            Some(c) => c,
-            None => continue,
-        };
-        if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
-            continue;
-        }
-        let id = m.tool_call_id().unwrap_or("").to_string();
-        let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
-        let lines = content.lines().count();
-        let digest = make_digest(&name, &args_json, content.len(), lines);
-        if let Message::Tool {
-            ref mut content, ..
-        } = m
-        {
-            *content = digest;
-            changed += 1;
-        }
-    }
-    changed
-}
-
-/// Soft-path reclaim for oversized assistant `tool_call.arguments` (write_file
-/// content, edit payloads, …). Unlike `digest_oversized_call_args` (budget-driven
-/// at compact time), this digests every eligible call at or before `until_idx`
-/// so large write/edit args stop riding every turn well before the 90% compact.
-fn digest_stale_call_args(messages: &mut [Message], until_idx: usize) -> usize {
-    let end = until_idx.min(messages.len());
-    let mut changed = 0usize;
-    for m in messages.iter_mut().take(end) {
-        if let Message::Assistant {
-            ref mut tool_calls, ..
-        } = m
-        {
-            if let Some(calls) = tool_calls.as_mut() {
-                for tc in calls.iter_mut() {
-                    if tc.function.arguments.len() <= 2048 {
-                        continue;
-                    }
-                    if let Some(digested) =
-                        digest_call_args_field(&tc.function.name, &tc.function.arguments)
-                    {
-                        tc.function.arguments = digested;
-                        changed += 1;
-                    }
-                }
-            }
-        }
-    }
-    changed
-}
-
-/// Reclaim oversized assistant `tool_call.arguments` (H3): the tool-result
-/// digest (`digest_to_budget`'s main loop) only collapses `role:"tool"`
-/// messages, so a huge NON-tool message — an assistant tool_call whose
-/// `arguments` JSON embeds a large payload (a `write_file`'s `content`, an
-/// `edit`'s `edits`, a `patch`'s diff) — survives compaction untouched. If it
-/// lands in the kept tail and alone approaches the window, the next request
-/// is oversized → HTTP 400 that repeats every turn. This replaces that payload
-/// field with a one-line digest (keeping id/name + valid JSON) oldest-first
-/// until `messages` fits `budget`. Returns the count digested.
-fn digest_oversized_call_args(messages: &mut [Message], budget: u64) -> usize {
-    if estimate_messages_tokens(messages) <= budget {
-        return 0;
-    }
-    let mut changed = 0usize;
-    for i in 0..messages.len() {
-        if estimate_messages_tokens(messages) <= budget {
-            break;
-        }
-        // Borrow this one message mutably (the immutable budget-check borrow
-        // above has already ended at the `;`).
-        if let Message::Assistant {
-            ref mut tool_calls, ..
-        } = messages[i]
-        {
-            if let Some(calls) = tool_calls.as_mut() {
-                for tc in calls.iter_mut() {
-                    if tc.function.arguments.len() <= 2048 {
-                        continue;
-                    }
-                    if let Some(digested) =
-                        digest_call_args_field(&tc.function.name, &tc.function.arguments)
-                    {
-                        tc.function.arguments = digested;
-                        changed += 1;
-                    }
-                }
-            }
-        }
-    }
-    changed
-}
-
-/// If a tool-call's `arguments` JSON embeds a large payload field, replace just
-/// that field with a one-line digest, keeping the rest of the args + valid
-/// JSON. Returns the new arguments string, or `None` when there is nothing to
-/// trim (unknown tool, missing field, or the field is already small).
-fn digest_call_args_field(tool: &str, args_json: &str) -> Option<String> {
-    let mut v: Value = serde_json::from_str(args_json).ok()?;
-    let field = match tool {
-        "write_file" => "content",
-        "edit" | "bulk_edit" => "edits",
-        "patch" => "patch",
-        "bulk_write" => "files",
-        _ => return None,
-    };
-    let obj = v.as_object_mut()?;
-    let cur = obj.get(field)?;
-    let cur_len = serde_json::to_string(cur).map(|s| s.len()).unwrap_or(0);
-    if cur_len <= 2048 {
-        return None;
-    }
-    let digest = format!(
-        "[digested: {} `{}` was {} bytes — re-run to regenerate]",
-        tool, field, cur_len
-    );
-    obj.insert(field.to_string(), Value::String(digest));
-    Some(serde_json::to_string(&v).unwrap_or_else(|_| args_json.to_string()))
-}
-
-/// Last-resort token reclaim for compaction: collapse oversized `role:"tool"`
-/// results into one-line digests until `messages` fits under `budget` tokens.
-/// Unlike `digest_stale_tool_results` (which only touches results older than a
-/// keep-window and bails on small conversations), this digests ANY eligible
-/// tool result — including recent ones — oldest-first, stopping as soon as the
-/// budget is met so the most recent results stay verbatim when possible.
-///
-/// This is what makes compaction effective when a few huge tool results (large
-/// file reads, verbose command output) dominate the context: dropping old
-/// turns can't reclaim enough because the bulk lives in the kept tail, but
-/// collapsing those results to a one-liner (with a re-run hint) drops 100k+
-/// tokens at a time. `tool_call_id` + `role` are preserved, so tool-call/result
-/// pairing and orphan-sanitization stay intact. Returns the count digested.
-fn digest_to_budget(messages: &mut [Message], budget: u64) -> usize {
-    if estimate_messages_tokens(messages) <= budget {
-        return 0;
-    }
-    // tool_call_id -> (tool_name, args_json) from assistant tool_calls, so the
-    // digest records WHAT was read/run, not just the size.
-    let mut call_map: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    for m in messages.iter() {
-        if !m.is_assistant() {
-            continue;
-        }
-        if let Some(calls) = m.tool_calls() {
-            for tc in calls {
-                if tc.id.is_empty() {
-                    continue;
-                }
-                call_map.insert(
-                    tc.id.clone(),
-                    (tc.function.name.clone(), tc.function.arguments.clone()),
-                );
-            }
-        }
-    }
-    // Walk oldest-first, collapsing oversized tool results until the budget is
-    // met. Recent results are processed last and so stay verbatim when earlier
-    // digests already reached the budget.
-    let mut changed = 0usize;
-    for i in 0..messages.len() {
-        if estimate_messages_tokens(messages) <= budget {
-            break;
-        }
-        if !messages[i].is_tool() {
-            continue;
-        }
-        let content = match messages[i].content_text() {
-            Some(c) => c,
-            None => continue,
-        };
-        if content.starts_with("[digested:") || content.len() <= DIGEST_MIN_BYTES {
-            continue;
-        }
-        let id = messages[i].tool_call_id().unwrap_or("").to_string();
-        let (name, args_json) = call_map.get(&id).cloned().unwrap_or_default();
-        let lines = content.lines().count();
-        let digest = make_digest(&name, &args_json, content.len(), lines);
-        if let Message::Tool {
-            ref mut content, ..
-        } = messages[i]
-        {
-            *content = digest;
-            changed += 1;
-        }
-    }
-    // Also reclaim huge NON-tool messages: an assistant tool_call.arguments
-    // (e.g. a write_file of a large file, whose content lives in the args JSON)
-    // is never touched by the tool-result digest above, so a single such
-    // message in the kept tail can keep the request oversized → HTTP 400 that
-    // repeats every turn. Replace the large payload field with a one-line
-    // digest (id/name kept) so the model still sees the call shape.
-    changed += digest_oversized_call_args(messages, budget);
-    changed
-}
-
-/// back to the content: the tool name, its key argument, and the size/line
-/// count. The suffix tells the model how to recover the full output.
-fn make_digest(tool: &str, args_json: &str, len: usize, lines: usize) -> String {
-    let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
-    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let what = match tool {
-        "read_file" => {
-            if lines > 0 {
-                format!(
-                    "read_file {:?} ({} lines, {} bytes)",
-                    get("path"),
-                    lines,
-                    len
-                )
-            } else {
-                format!("read_file {:?} ({} bytes)", get("path"), len)
-            }
-        }
-        "bulk_read" => format!("bulk_read ({} bytes)", len),
-        "bash" => format!(
-            "bash {:?} ({} bytes)",
-            truncate_str(get("command"), 80),
-            len
-        ),
-        "grep" => format!(
-            "grep {:?} ({} bytes)",
-            truncate_str(get("pattern"), 80),
-            len
-        ),
-        "glob" => format!(
-            "glob {:?} ({} bytes)",
-            truncate_str(get("pattern"), 80),
-            len
-        ),
-        "diagnostics" => format!("diagnostics ({} bytes)", len),
-        other => format!("{} ({} bytes)", other, len),
-    };
-    let how = if tool == "bash" {
-        "re-run if needed"
-    } else if tool_cache::ToolOutputCache::is_restorable(tool) {
-        "re-run identical call to restore (cached if available)"
-    } else {
-        "re-run to recover full output"
-    };
-    format!("[digested: {what} — {how}]")
-}
-
-/// Cap a freshly produced tool result before it enters the conversation.
-/// Oversized outputs are smart-truncated (head-error salvage + tail) rather than
-/// immediately digested to a one-liner — the model still sees useful content on
-/// first ingress. Soft digest later collapses stale results further. Full bytes
-/// remain in `tool_output_cache` for identical re-calls (themselves restore-capped).
-pub(crate) const INGRESS_MAX_BYTES: usize = 24 * 1024;
-/// Cap applied when restoring a cached tool output so a re-call after digest
-/// cannot re-bloat the conversation with the full payload.
-pub(crate) const RESTORE_MAX_BYTES: usize = 16 * 1024;
-
-pub(crate) fn apply_ingress_cap(tool: &str, args_json: &str, output: String) -> String {
-    let _ = (tool, args_json); // kept for call-site symmetry / future per-tool caps
-    if output.len() <= INGRESS_MAX_BYTES || output.starts_with("[digested:") {
-        return output;
-    }
-    tools::smart_truncate(&output, INGRESS_MAX_BYTES)
-}
-
-pub(crate) fn apply_restore_cap(output: &str) -> String {
-    if output.len() <= RESTORE_MAX_BYTES {
-        return format!("[restored from digest cache]\n{output}");
-    }
-    let truncated = tools::smart_truncate(output, RESTORE_MAX_BYTES);
-    format!(
-        "[restored from digest cache — truncated to {RESTORE_MAX_BYTES} bytes; \
-         re-call with a narrower offset/limit if you need another slice]\n{truncated}"
-    )
-}
-
-/// Find an earlier undigested tool result for the same tool name + args JSON.
-/// Used to avoid duplicating large read/grep output when the model re-issues
-/// an identical call while the prior result is still verbatim in history.
-pub(crate) fn find_duplicate_tool_result(
-    messages: &[Message],
-    tool: &str,
-    args_json: &str,
-) -> Option<(String, String)> {
-    if !tool_cache::ToolOutputCache::is_restorable(tool) {
-        return None;
-    }
-    let mut call_map: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    for m in messages {
-        if let Some(calls) = m.tool_calls() {
-            for tc in calls {
-                call_map.insert(
-                    tc.id.clone(),
-                    (tc.function.name.clone(), tc.function.arguments.clone()),
-                );
-            }
-        }
-    }
-    for m in messages.iter().rev() {
-        if !m.is_tool() {
-            continue;
-        }
-        let id = m.tool_call_id()?.to_string();
-        let (name, args) = call_map.get(&id)?;
-        if name != tool || args != args_json {
-            continue;
-        }
-        let content = m.content_text()?;
-        if content.starts_with("[digested:")
-            || content.starts_with("[duplicate of tool_call_id")
-            || content.starts_with("[restored from digest cache]")
-        {
-            continue;
-        }
-        if content.len() <= DIGEST_MIN_BYTES {
-            continue;
-        }
-        let preview = trunc_chars(content, 400);
-        return Some((id, preview));
-    }
-    None
-}
-
-/// Truncate a string to `n` chars at a char boundary, appending an ellipsis.
-fn truncate_str(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(n).collect();
-    out.push('…');
-    out
-}
-
-fn trunc_chars(s: &str, n: usize) -> String {
-    truncate_str(s, n)
-}
-
-/// Enable deferred tool schemas for the rest of this session (and this turn's
-/// subsequent model rounds). Core tools are always available; `load_tools` is
-/// how the model opts into git/fetch/bulk/diagnostics/spawn/etc.
+pub(crate) use crate::agent::compaction::*;
 async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>) -> tools::Outcome {
     let mut names: Vec<String> = Vec::new();
     if let Some(arr) = args.get("tools").and_then(|v| v.as_array()) {
@@ -9237,178 +3907,6 @@ async fn refresh_memory_injection(state: &State) -> String {
 /// messages. A fixed count over-keeps a quiet stretch and under-keeps when a
 /// huge tool result eats the whole window; a budget keeps the live context
 /// that actually fits and lets the summary reclaim the rest.
-fn token_budget_tail_start(messages: &[Message], context_window: u64) -> usize {
-    const MIN_TAIL: usize = 6;
-    const TAIL_FRACTION: f32 = 0.25;
-    let n = messages.len();
-    if n <= MIN_TAIL {
-        return 0;
-    }
-    let budget = ((context_window as f32 * TAIL_FRACTION) as u64).max(6_000);
-    let mut acc: u64 = 0;
-    let mut start = n;
-    for i in (0..n).rev() {
-        let t = estimate_message_tokens(&messages[i]);
-        // Always keep the most recent MIN_TAIL messages; only enforce the
-        // budget on older ones so a single giant tool result can't shrink the
-        // tail to nothing.
-        if i < n.saturating_sub(MIN_TAIL) && acc + t > budget {
-            break;
-        }
-        acc += t;
-        start = i;
-    }
-    start
-}
-
-/// Naive compaction fallback: keep the system prompt + a token-budgeted tail
-/// verbatim, drop the middle with a marker. `context_window` sizes the tail
-/// (0/unset → the 6k floor). Used when summarization is disabled or unavailable.
-/// Hint the system allocator to release freed heap pages back to the OS.
-///
-/// Rust's default allocator on glibc Linux does NOT eagerly return freed memory:
-/// a turn clones the conversation several times (lock-across-await forces
-/// clones) and compaction drops the old copies, but the freed bytes stay in
-/// malloc's arenas, so RSS creeps up over a long session and never falls back
-/// (the "starts at 11M, now 27M" symptom). `malloc_trim(0)` releases the free
-/// top-of-arena pages. Called once per turn — negligible vs a multi-second
-/// model turn. No-op on non-glibc targets (musl/macOS/Windows return freed
-/// memory to the OS far more eagerly on their own).
-#[cfg(all(unix, target_env = "gnu"))]
-fn trim_heap() {
-    extern "C" {
-        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
-    }
-    unsafe {
-        malloc_trim(0);
-    }
-}
-
-#[cfg(not(all(unix, target_env = "gnu")))]
-fn trim_heap() {}
-
-pub fn compact_conversation(messages: &mut Vec<Message>, context_window: u64) {
-    if messages.len() <= 2 {
-        return;
-    }
-    let system = messages[0].clone();
-    let tail_start = token_budget_tail_start(messages, context_window).max(1);
-    let tail: Vec<Message> = messages[tail_start..].to_vec();
-    let mut compacted = vec![system];
-    compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped.]"));
-    compacted.extend(tail);
-    // The kept tail can still hold the bulk of the tokens when a few tool
-    // results are huge (large file reads, verbose command output). Dropping old
-    // turns reclaims nothing there; collapse those oversized results into
-    // one-line digests until the conversation fits under half the window.
-    let budget = ((context_window as f32) * POST_COMPACT_BUDGET_FRACTION) as u64;
-    digest_to_budget(&mut compacted, budget);
-    *messages = compacted;
-}
-
-/// Compact a conversation by summarizing older turns into one system message,
-/// keeping the system prompt + a token-budgeted tail verbatim. Falls back to
-/// the naive drop-oldest (`compact_conversation`) when summarization is
-/// disabled and not forced, or when there's too little middle to summarize. On
-/// summary failure, degrades to a drop-oldest marker so the turn still
-/// proceeds. `force_summarize` overrides `summarize_on_compact=false` — used by
-/// the 95% hard cap where naive drop-oldest may not reclaim enough.
-pub async fn compact_with_summary(
-    client: &reqwest::Client,
-    cfg: &Config,
-    provider: &ResolvedProvider,
-    model: &str,
-    messages: &mut Vec<Message>,
-    cancel: &CancellationToken,
-    force_summarize: bool,
-    context_window: u64,
-    instructions: Option<&str>,
-    memory_provider: Option<&plugins::PluginMemoryProviderConfig>,
-) -> usize {
-    // Returns the character count of the produced summary system message (0
-    // when no summary was generated — naive drop-oldest fallback or a
-    // failed/too-small summarize). Surfaced on the `compacted` event so the
-    // TUI can show how big the rolling summary is.
-    if messages.len() <= 2 {
-        return 0;
-    }
-    if !cfg.summarize_on_compact && !force_summarize {
-        compact_conversation(messages, context_window);
-        return 0;
-    }
-    let tail_start = token_budget_tail_start(messages, context_window).max(1);
-    if tail_start <= 1 {
-        compact_conversation(messages, context_window);
-        return 0;
-    }
-    let to_summarize: Vec<Message> = messages[1..tail_start].to_vec();
-    let kept: Vec<Message> = messages[tail_start..].to_vec();
-    // Pre-digest the middle so the summarize HTTP call itself stays small, then
-    // one combined summarize+facts call (avoids a second full pass).
-    let mut for_summary = to_summarize.clone();
-    let _ = soft_digest_conversation(&mut for_summary, context_window, None);
-    let combined = provider::summarize_and_extract(
-        client,
-        provider,
-        model,
-        &for_summary,
-        cancel,
-        instructions,
-    )
-    .await;
-    let mut summary_chars = 0usize;
-    let mut compacted = vec![messages[0].clone()];
-    if let Some((s, facts)) = combined {
-        let content = format!("[Summary of earlier turns]\n{s}");
-        summary_chars = content.chars().count();
-        compacted.push(Message::system(content));
-        // Session memory extraction: persist durable facts so future sessions inherit
-        // project knowledge. Best-effort; never blocks compaction. Facts ACCUMULATE
-        // across compactions (append, not overwrite) so early-session facts survive,
-        // with a rolling byte cap so the file stays bounded.
-        if cfg.summarize_on_compact {
-            if let Some(facts) = facts {
-                if let Some(mp) = memory_provider {
-                    let args = json!({
-                        "name": "session-extract",
-                        "content": facts,
-                        "type": "session",
-                        "description": "auto-extracted durable facts (accumulated on compaction)",
-                        "cap_bytes": 16384,
-                    });
-                    let _ = plugins::execute_memory_provider(
-                        mp,
-                        "compact_append",
-                        &args,
-                        &cfg.workspace.display().to_string(),
-                        "",
-                    )
-                    .await;
-                } else {
-                    let _ = memory::append_memory(
-                        &cfg.workspace,
-                        "session-extract",
-                        &facts,
-                        "session",
-                        "auto-extracted durable facts (accumulated on compaction)",
-                        16_384,
-                    );
-                }
-            }
-        }
-    } else {
-        compacted.push(Message::system("[Earlier conversation history was compacted to fit the context window. Tool results from prior turns were dropped; summarization was unavailable.]"));
-    }
-    // The kept tail can still hold the bulk of the tokens when a few recent
-    // tool results are huge. Collapse them so the compacted conversation
-    // actually fits the window instead of no-op'ing back to its original size.
-    compacted.extend(kept);
-    let budget = ((context_window as f32) * POST_COMPACT_BUDGET_FRACTION) as u64;
-    digest_to_budget(&mut compacted, budget);
-    *messages = compacted;
-    summary_chars
-}
-
 /// Turn an image reference into a data URL. Accepts:
 /// - an existing data URL (data:image/...;base64,...) → passthrough
 /// - an absolute or workspace-relative file path → read + base64-encode

@@ -240,6 +240,13 @@ pub struct MemoryEntry {
     /// Optional schema version (frontmatter `schema_version`). Absent on
     /// legacy files; treated as 1. Schema 2 adds status/confidence/evidence.
     pub schema_version: u32,
+    /// Originating session/run when known. Legacy and manually authored
+    /// memories leave these empty; diagnostics must treat them as provenance,
+    /// never as authority.
+    pub source_session: Option<String>,
+    pub source_run: Option<String>,
+    /// Unix creation timestamp when recorded by the producer.
+    pub created_at: Option<u64>,
     /// Learning status (frontmatter `status:`). Defaults to `verified` for
     /// legacy files so existing memories keep ranking.
     pub status: MemoryStatus,
@@ -830,6 +837,9 @@ fn write_memory_file(
         || !e.ref_files.is_empty()
         || !e.ref_symbols.is_empty()
         || !e.evidence_episodes.is_empty()
+        || e.source_session.is_some()
+        || e.source_run.is_some()
+        || e.created_at.is_some()
     {
         v2.push_str(&format!("schema_version: {}\n", e.schema_version.max(2)));
         if e.status != MemoryStatus::Verified {
@@ -843,6 +853,15 @@ fn write_memory_file(
         }
         if e.contradiction_count > 0 {
             v2.push_str(&format!("contradiction_count: {}\n", e.contradiction_count));
+        }
+        if let Some(ref session) = e.source_session {
+            v2.push_str(&format!("source_session: {session}\n"));
+        }
+        if let Some(ref run) = e.source_run {
+            v2.push_str(&format!("source_run: {run}\n"));
+        }
+        if let Some(created_at) = e.created_at {
+            v2.push_str(&format!("created_at: {created_at}\n"));
         }
         if let Some(t) = e.last_verified_at {
             v2.push_str(&format!("last_verified_at: {t}\n"));
@@ -1411,6 +1430,9 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
     let mut deprecated = false;
     let mut superseded_by: Option<String> = None;
     let mut schema_version: u32 = 1;
+    let mut source_session: Option<String> = None;
+    let mut source_run: Option<String> = None;
+    let mut created_at: Option<u64> = None;
     let mut status = MemoryStatus::Verified;
     let mut confidence: f32 = 1.0;
     let mut support_count: u32 = 0;
@@ -1500,6 +1522,9 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
             "schema_version" => {
                 schema_version = val.parse().unwrap_or(1);
             }
+            "source_session" => source_session = (!val.is_empty()).then_some(val),
+            "source_run" => source_run = (!val.is_empty()).then_some(val),
+            "created_at" => created_at = val.parse().ok(),
             "status" => status = MemoryStatus::parse(&val),
             "confidence" => {
                 confidence = val.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0);
@@ -1565,6 +1590,9 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
         deprecated,
         superseded_by,
         schema_version,
+        source_session,
+        source_run,
+        created_at,
         status,
         confidence,
         support_count,
@@ -1955,6 +1983,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -1986,6 +2017,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2094,6 +2128,9 @@ mod tests {
                 deprecated: false,
                 superseded_by: None,
                 schema_version: 1,
+                source_session: None,
+                source_run: None,
+                created_at: None,
                 status: MemoryStatus::Verified,
                 confidence: 1.0,
                 support_count: 0,
@@ -2117,6 +2154,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2160,6 +2200,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2196,6 +2239,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2218,6 +2264,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2254,6 +2303,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Verified,
             confidence: 1.0,
             support_count: 0,
@@ -2276,6 +2328,9 @@ mod tests {
             deprecated: true,
             superseded_by: Some("cursor-provider".into()),
             schema_version: 1,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status: MemoryStatus::Deprecated,
             confidence: 1.0,
             support_count: 0,
@@ -2443,13 +2498,16 @@ mod tests {
         let dir = store.dir(&ws);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let md = "---\nname: provider-arch\ndescription: key providers in config\ntype: architecture\nschema_version: 2\nstatus: needs_verification\nconfidence: 0.80\nsupport_count: 3\nfiles: core/src/provider.rs, core/src/plugins.rs\nsymbols: ProviderConfig\n---\nBody stays readable.\n";
+        let md = "---\nname: provider-arch\ndescription: key providers in config\ntype: architecture\nschema_version: 2\nsource_session: session-7\nsource_run: run-9\ncreated_at: 1700000000\nstatus: needs_verification\nconfidence: 0.80\nsupport_count: 3\nfiles: core/src/provider.rs, core/src/plugins.rs\nsymbols: ProviderConfig\n---\nBody stays readable.\n";
         std::fs::write(dir.join("provider-arch.md"), md).unwrap();
 
         let entries = store.scan(&ws);
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.schema_version, 2);
+        assert_eq!(e.source_session.as_deref(), Some("session-7"));
+        assert_eq!(e.source_run.as_deref(), Some("run-9"));
+        assert_eq!(e.created_at, Some(1_700_000_000));
         assert_eq!(e.status, MemoryStatus::NeedsVerification);
         assert!((e.confidence - 0.80).abs() < 0.001);
         assert_eq!(e.support_count, 3);

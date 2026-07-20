@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 /// Bump when the on-disk message shape changes. load() validates the header.
-pub const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 2;
 
 fn header_line() -> String {
     format!("{{\"_session_version\": {}}}", SESSION_VERSION)
@@ -41,6 +41,107 @@ fn ensure_header(path: &Path) {
 /// immediately, even before the first message is appended.
 pub fn ensure(path: &Path) {
     ensure_header(path);
+    migrate_header(path);
+}
+
+fn migrate_header(path: &Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Some((first, rest)) = content.split_once('\n') else {
+        return;
+    };
+    let Ok(header) = serde_json::from_str::<Value>(first) else {
+        return;
+    };
+    let Some(version) = header.get("_session_version").and_then(Value::as_u64) else {
+        return;
+    };
+    if version as u32 >= SESSION_VERSION {
+        return;
+    }
+    let migrated = format!("{}\n{}", header_line(), rest);
+    let _ = crate::fsutil::atomic_write_str(path, &migrated);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Started,
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RunRecord {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub state: RunState,
+    pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct LoadReport {
+    pub messages: Vec<Message>,
+    pub warnings: Vec<String>,
+    pub unfinished_runs: Vec<RunRecord>,
+}
+
+pub fn append_run_state(
+    path: &Path,
+    session_id: &str,
+    run_id: &str,
+    state: RunState,
+    detail: Option<&str>,
+) {
+    append_activity_state(path, session_id, run_id, "run", None, None, state, detail);
+}
+
+/// Append a lifecycle record for foreground or child activity. New optional
+/// identity fields are backward-compatible with v2 journals and let recovery
+/// distinguish an interrupted tool, subagent, or goal without ever restarting it.
+#[allow(clippy::too_many_arguments)]
+pub fn append_activity_state(
+    path: &Path,
+    session_id: &str,
+    run_id: &str,
+    kind: &str,
+    parent_run_id: Option<&str>,
+    tool_call_id: Option<&str>,
+    state: RunState,
+    detail: Option<&str>,
+) {
+    ensure_header(path);
+    ensure_record_boundary(path);
+    let record = RunRecord {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        kind: Some(kind.to_string()),
+        parent_run_id: parent_run_id.map(str::to_string),
+        tool_call_id: tool_call_id.map(str::to_string),
+        state,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        detail: detail.map(str::to_string),
+    };
+    let Ok(mut file) = OpenOptions::new().append(true).open(path) else {
+        return;
+    };
+    let line = serde_json::json!({"_run": record});
+    let _ = writeln!(file, "{line}");
+    let _ = file.flush();
 }
 
 /// Append one message to the session file (creating it with a header if needed).
@@ -49,6 +150,7 @@ pub fn ensure(path: &Path) {
 /// disk sync per tool result. Crash window: last incomplete turn.
 pub fn append(path: &Path, msg: &Message) {
     ensure_header(path);
+    ensure_record_boundary(path);
     let Ok(mut f) = OpenOptions::new().append(true).open(path) else {
         return;
     };
@@ -56,6 +158,24 @@ pub fn append(path: &Path, msg: &Message) {
     line.push('\n');
     let _ = f.write_all(line.as_bytes());
     let _ = f.flush();
+}
+
+fn ensure_record_boundary(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = OpenOptions::new().read(true).append(true).open(path) else {
+        return;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if length == 0 || file.seek(SeekFrom::End(-1)).is_err() {
+        return;
+    }
+    let mut last = [0_u8; 1];
+    if file.read_exact(&mut last).is_ok() && last[0] != b'\n' {
+        let _ = file.write_all(b"\n");
+        let _ = file.flush();
+    }
 }
 
 /// fsync the session file so finalized turns survive a crash. Call at turn
@@ -76,13 +196,30 @@ pub fn sync(path: &Path) {
 /// misread/drop a session on upgrade (the caller surfaces the error to the
 /// user instead of quietly starting blank).
 pub fn load(path: &Path) -> Result<Vec<Message>, String> {
+    load_report(path).map(|report| report.messages)
+}
+
+/// Load readable conversation records and return explicit recovery details.
+/// Malformed records do not erase valid history; an incomplete final line is
+/// treated as a crash-truncated append, while malformed interior lines are
+/// counted separately. Started runs without a terminal record are returned so
+/// startup can persist an `interrupted` terminal state without rerunning work.
+pub fn load_report(path: &Path) -> Result<LoadReport, String> {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return Ok(Vec::new()); // missing file: nothing to resume (not an error)
+        return Ok(LoadReport::default());
     };
-    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let nonempty: Vec<(usize, &str)> = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .collect();
+    let mut lines = nonempty.iter();
     // First non-empty line must be the version header. If it's absent or a
     // future version, bail with a clear error rather than guess.
-    let first = lines.next().unwrap_or("");
+    let first = lines.next().map(|(_, line)| *line).unwrap_or("");
+    let mut report = LoadReport::default();
+    let mut run_states = std::collections::HashMap::<String, RunRecord>::new();
+    let mut first_is_message = false;
     if let Ok(v) = serde_json::from_str::<Value>(first) {
         if let Some(ver) = v.get("_session_version").and_then(|x| x.as_u64()) {
             if ver as u32 > SESSION_VERSION {
@@ -91,24 +228,74 @@ pub fn load(path: &Path) -> Result<Vec<Message>, String> {
                     path.display()
                 ));
             }
-            // header consumed; load the rest
+            if (ver as u32) < SESSION_VERSION {
+                report.warnings.push(format!(
+                    "session schema v{ver} loaded through compatibility mode; it will migrate to v{SESSION_VERSION} before the next append"
+                ));
+            }
         } else {
-            // no header on an old file — treat the first line as a real message
-            let mut out = Vec::new();
-            if let Ok(m) = serde_json::from_str::<Message>(first) {
-                out.push(m);
-            }
-            for l in lines {
-                if let Ok(m) = serde_json::from_str::<Message>(l) {
-                    out.push(m);
+            first_is_message = true;
+            report.warnings.push(
+                "legacy session without a version header loaded in compatibility mode".into(),
+            );
+        }
+    } else if !first.is_empty() {
+        first_is_message = true;
+    }
+
+    let records: Vec<(usize, &str)> = if first_is_message {
+        nonempty.clone()
+    } else {
+        nonempty.into_iter().skip(1).collect()
+    };
+    let last_line = records.last().map(|(line, _)| *line);
+    let final_line_terminated = content.ends_with('\n');
+    let mut malformed = Vec::new();
+    for (line_number, line) in records {
+        let line_number = line_number + 1;
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                if Some(line_number - 1) == last_line && !final_line_terminated {
+                    report.warnings.push(format!(
+                        "recovered session after ignoring a truncated final record at line {line_number}"
+                    ));
+                } else {
+                    malformed.push(line_number);
                 }
+                continue;
             }
-            return Ok(out);
+        };
+        if let Some(run) = value.get("_run") {
+            match serde_json::from_value::<RunRecord>(run.clone()) {
+                Ok(record) => {
+                    run_states.insert(record.run_id.clone(), record);
+                }
+                Err(_) => malformed.push(line_number),
+            }
+            continue;
+        }
+        match serde_json::from_value::<Message>(value) {
+            Ok(message) => report.messages.push(message),
+            Err(_) => malformed.push(line_number),
         }
     }
-    Ok(lines
-        .filter_map(|l| serde_json::from_str::<Message>(l).ok())
-        .collect())
+    if !malformed.is_empty() {
+        report.warnings.push(format!(
+            "ignored {} malformed session record(s) at line(s) {}",
+            malformed.len(),
+            malformed
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    report.unfinished_runs = run_states
+        .into_values()
+        .filter(|record| record.state == RunState::Started)
+        .collect();
+    Ok(report)
 }
 
 /// Sidecar path for per-session "always" approval escalations (tool kinds the
@@ -179,6 +366,8 @@ pub struct SessionStats {
     pub tokens_out: u64,
     pub cached_tokens: u64,
     pub turns: u64,
+    #[serde(default)]
+    pub compactions: u64,
 }
 
 fn stats_path(session_path: &Path) -> PathBuf {
@@ -446,7 +635,7 @@ mod tests {
         append(&p, &Message::user("hi"));
         // header line present and well-formed
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(raw.starts_with("{\"_session_version\": 1}"));
+        assert!(raw.starts_with("{\"_session_version\": 2}"));
         // load() drops the header, returns only real messages
         assert_eq!(load(&p).unwrap().len(), 1);
     }
@@ -466,6 +655,159 @@ mod tests {
         let r = load(&p);
         assert!(r.is_err(), "expected an error for a future-version session");
         assert!(r.unwrap_err().contains("newer than supported"));
+    }
+
+    #[test]
+    fn legacy_header_migrates_without_losing_messages() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_migration");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        std::fs::write(
+            &p,
+            "{\"_session_version\": 1}\n{\"role\":\"user\",\"content\":\"old\"}\n",
+        )
+        .unwrap();
+        let report = load_report(&p).unwrap();
+        assert_eq!(report.messages.len(), 1);
+        assert!(!report.warnings.is_empty());
+        ensure(&p);
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .starts_with("{\"_session_version\": 2}"));
+        assert_eq!(load(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovery_reports_truncation_malformed_records_and_unfinished_runs() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\"_session_version\": 2}\n",
+                "{\"role\":\"user\",\"content\":\"survives\"}\n",
+                "not-json\n",
+                "{\"_run\":{\"session_id\":\"s1\",\"run_id\":\"r1\",\"state\":\"started\",\"timestamp_ms\":1}}\n",
+                "{\"role\":\"assistant\",\"content\":"
+            ),
+        )
+        .unwrap();
+        let report = load_report(&p).unwrap();
+        assert_eq!(report.messages.len(), 1);
+        assert_eq!(report.unfinished_runs.len(), 1);
+        assert_eq!(report.unfinished_runs[0].run_id, "r1");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("malformed")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("truncated")));
+
+        append_run_state(&p, "s1", "r1", RunState::Interrupted, Some("restart"));
+        assert!(load_report(&p).unwrap().unfinished_runs.is_empty());
+    }
+
+    #[test]
+    fn completed_run_is_not_reported_as_unfinished() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_run_terminal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        ensure(&p);
+        append_run_state(&p, "s1", "r1", RunState::Started, None);
+        append_run_state(&p, "s1", "r1", RunState::Completed, None);
+        assert!(load_report(&p).unwrap().unfinished_runs.is_empty());
+    }
+
+    #[test]
+    fn recovery_identifies_interrupted_tool_subagent_and_goal_without_resuming() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_activity_recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        ensure(&p);
+        append_activity_state(
+            &p,
+            "s1",
+            "tool-run",
+            "tool",
+            Some("parent-run"),
+            Some("call-7"),
+            RunState::Started,
+            Some("bash"),
+        );
+        append_activity_state(
+            &p,
+            "s1",
+            "sub-run",
+            "subagent",
+            Some("parent-run"),
+            None,
+            RunState::Started,
+            Some("worker"),
+        );
+        append_activity_state(
+            &p,
+            "s1",
+            "goal-1",
+            "goal",
+            None,
+            None,
+            RunState::Started,
+            Some("deploying"),
+        );
+
+        let report = load_report(&p).unwrap();
+        assert!(
+            report.messages.is_empty(),
+            "recovery must not synthesize replay work"
+        );
+        assert_eq!(report.unfinished_runs.len(), 3);
+        let by_kind: std::collections::HashMap<_, _> = report
+            .unfinished_runs
+            .iter()
+            .map(|record| (record.kind.as_deref().unwrap(), record))
+            .collect();
+        assert_eq!(by_kind["tool"].tool_call_id.as_deref(), Some("call-7"));
+        assert_eq!(
+            by_kind["subagent"].parent_run_id.as_deref(),
+            Some("parent-run")
+        );
+        assert_eq!(by_kind["goal"].run_id, "goal-1");
+
+        for record in report.unfinished_runs {
+            append_activity_state(
+                &p,
+                &record.session_id,
+                &record.run_id,
+                record.kind.as_deref().unwrap_or("run"),
+                record.parent_run_id.as_deref(),
+                record.tool_call_id.as_deref(),
+                RunState::Interrupted,
+                Some("recovered after restart; not resumed"),
+            );
+        }
+        assert!(load_report(&p).unwrap().unfinished_runs.is_empty());
+    }
+
+    #[test]
+    fn normal_replay_preserves_messages_and_terminal_activity() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_normal_replay");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &Message::user("hello"));
+        append(&p, &Message::assistant("done"));
+        append_run_state(&p, "s1", "r1", RunState::Started, None);
+        append_run_state(&p, "s1", "r1", RunState::Completed, None);
+        let report = load_report(&p).unwrap();
+        assert_eq!(report.messages.len(), 2);
+        assert!(report.unfinished_runs.is_empty());
     }
 
     #[test]
@@ -546,6 +888,7 @@ mod tests {
                 tokens_out: 678,
                 cached_tokens: 9000,
                 turns: 7,
+                compactions: 3,
             },
         );
         // “Reopen” → the sidecar restores the same totals.
@@ -554,6 +897,7 @@ mod tests {
         assert_eq!(s.tokens_out, 678);
         assert_eq!(s.cached_tokens, 9000);
         assert_eq!(s.turns, 7);
+        assert_eq!(s.compactions, 3);
         // Garbage in the sidecar degrades to zeros (never panics).
         std::fs::write(stats_path(&p), "not json").unwrap();
         let s = load_stats(&p);

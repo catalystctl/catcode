@@ -46,6 +46,7 @@ pub enum GoalPhase {
     Blocked,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl GoalPhase {
@@ -63,6 +64,7 @@ impl GoalPhase {
             GoalPhase::Blocked => "blocked",
             GoalPhase::Done => "done",
             GoalPhase::Failed => "failed",
+            GoalPhase::Cancelled => "cancelled",
         }
     }
 
@@ -79,6 +81,72 @@ impl GoalPhase {
                 | GoalPhase::Replanning
         )
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GoalTransitionError {
+    pub code: String,
+    pub from: GoalPhase,
+    pub to: GoalPhase,
+    pub message: String,
+}
+
+/// Validate the persisted goal state machine before mutating it. Explicit user
+/// revision may reopen a terminal goal into Planning; autonomous execution may
+/// otherwise only move forward or enter a terminal failure/cancellation state.
+pub fn validate_transition(from: &GoalPhase, to: &GoalPhase) -> Result<(), GoalTransitionError> {
+    let allowed = from == to
+        || matches!(
+            (from, to),
+            (GoalPhase::Idle, GoalPhase::Planning)
+                | (GoalPhase::Planning, GoalPhase::PlanReady)
+                | (GoalPhase::PlanReady, GoalPhase::Reviewing)
+                | (GoalPhase::PlanReady, GoalPhase::Deploying)
+                | (GoalPhase::PlanReady, GoalPhase::Planning)
+                | (GoalPhase::Reviewing, GoalPhase::PlanReady)
+                | (GoalPhase::Reviewing, GoalPhase::Planning)
+                | (GoalPhase::Deploying, GoalPhase::Running)
+                | (GoalPhase::Running, GoalPhase::Verifying)
+                | (GoalPhase::Running, GoalPhase::Synthesizing)
+                | (GoalPhase::Verifying, GoalPhase::Done)
+                | (GoalPhase::Verifying, GoalPhase::Replanning)
+                | (GoalPhase::Replanning, GoalPhase::Planning)
+                | (GoalPhase::Synthesizing, GoalPhase::Done)
+                | (GoalPhase::Blocked, GoalPhase::Planning)
+                | (GoalPhase::Done, GoalPhase::Planning)
+                | (GoalPhase::Failed, GoalPhase::Planning)
+                | (GoalPhase::Cancelled, GoalPhase::Planning)
+        )
+        || (matches!(
+            to,
+            GoalPhase::Failed | GoalPhase::Cancelled | GoalPhase::Blocked
+        ) && !matches!(
+            from,
+            GoalPhase::Idle | GoalPhase::Done | GoalPhase::Failed | GoalPhase::Cancelled
+        ));
+    if allowed {
+        return Ok(());
+    }
+    Err(GoalTransitionError {
+        code: "invalid_goal_transition".into(),
+        from: from.clone(),
+        to: to.clone(),
+        message: format!(
+            "invalid goal transition: {} -> {}",
+            from.as_str(),
+            to.as_str()
+        ),
+    })
+}
+
+fn emit_transition_error(error: &GoalTransitionError) {
+    emit(
+        &Event::new("error")
+            .with("code", json!(error.code))
+            .with("from", json!(error.from.as_str()))
+            .with("to", json!(error.to.as_str()))
+            .with("message", json!(error.message)),
+    );
 }
 
 /// Structured review / verify verdict surfaced to the UI.
@@ -295,7 +363,7 @@ impl GoalMode {
     pub fn is_active(&self) -> bool {
         !matches!(
             self.phase,
-            GoalPhase::Idle | GoalPhase::Done | GoalPhase::Failed
+            GoalPhase::Idle | GoalPhase::Done | GoalPhase::Failed | GoalPhase::Cancelled
         )
     }
 
@@ -441,6 +509,38 @@ pub fn goal_step_needs_worktree(agent: &str) -> bool {
         // worker (and unknown/custom agents that may edit shared files)
         _ => true,
     }
+}
+
+/// Appended to every deploy step's task so workers know the deferred `browser`
+/// tools (and git/web/bulk) exist and can be loaded on demand. The subagent
+/// system prompt already lists the deferred groups; this reminder ties them to
+/// the step so web/UI verification is not silently skipped.
+const TOOL_AVAILABILITY_SECTION: &str = "
+
+# Tool availability
+Deferred tools are loadable on demand via `load_tools` (call it before first use): `git`, `web`, `bulk`, and `browser` (native WRY browser — create/navigate/snapshot/click/fill/screenshot). If this step needs to drive or verify a web page, UI, or end-to-end flow, load the `browser` group and use the `browser_*` tools instead of skipping that work.";
+
+/// Appended (conditionally — see [`goal_step_should_validate`]) to
+/// implementation/review steps so every deploy step self-validates: build,
+/// run tests, confirm zero errors, and report results. This is the "ensure
+/// validation after every step" guarantee — it does not depend on the planner
+/// remembering to write a test clause into `step.task`.
+const VALIDATION_GATE_SECTION: &str = "
+
+# Validation gate (required for this step)
+Where applicable to this step's work, finish only after:
+- Building/compiling the affected code and confirming zero errors (e.g. `cargo check` / `cargo build`, `go build ./...`, `npm run build`, `tsc --noEmit`).
+- Running the relevant test suite and confirming zero failures (e.g. `cargo test`, `go test ./...`, `npm test`, `pytest`). If you added or changed behavior, add or update tests for it.
+- Fixing any errors or failing tests before reporting done — never leave a red build.
+- Summarizing the build/test results (commands run + pass/fail counts) in your final output.";
+
+/// Whether a goal deploy step should receive the per-step validation gate
+/// (build/compile + run tests, confirm zero errors). Pure-recon agents
+/// (scout / researcher / context-builder) only read and produce notes, so the
+/// gate is skipped for them. Implementation, review, and custom agents must
+/// validate their own work.
+pub fn goal_step_should_validate(agent: &str) -> bool {
+    !matches!(agent, "scout" | "researcher" | "context-builder")
 }
 
 fn should_validate_goal_after_wave(wave_idx: usize, wave_count: usize) -> bool {
@@ -746,21 +846,31 @@ pub fn apply_plan(
         .map(|s| format!("\n\n# Speculative scout findings\n{s}"))
         .unwrap_or_default();
     for step in &plan.steps {
+        let validation_block = if plan.validation.is_empty() {
+            "(none specified)".to_string()
+        } else {
+            plan.validation
+                .iter()
+                .map(|v| format!("- {v}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Per-step validation gate is appended only to implementation/review
+        // agents (pure-recon steps only read — see goal_step_should_validate).
+        let validation_gate = if goal_step_should_validate(&step.agent) {
+            VALIDATION_GATE_SECTION
+        } else {
+            ""
+        };
         let full_task = format!(
-            "# Goal\n{}\n\n# Step: {}\n{}\n\n# Validation criteria for the overall goal\n{}{}",
+            "# Goal\n{}\n\n# Step: {}\n{}\n\n# Validation criteria for the overall goal\n{}{}{}{}",
             mode.goal,
             step.title,
             step.task,
-            if plan.validation.is_empty() {
-                "(none specified)".into()
-            } else {
-                plan.validation
-                    .iter()
-                    .map(|v| format!("- {v}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            },
-            scout_block
+            validation_block,
+            scout_block,
+            TOOL_AVAILABILITY_SECTION,
+            validation_gate,
         );
         prompts.push(DeployPrompt {
             step_id: step.id.clone(),
@@ -778,12 +888,9 @@ pub fn apply_plan(
     mode.prompts = prompts;
     mode.error = None;
     mode.touch();
-    if mode.auto_deploy {
-        mode.phase = GoalPhase::PlanReady;
-        mode.deploy_after_turn = true;
-    } else {
-        mode.phase = GoalPhase::PlanReady;
-        mode.deploy_after_turn = false;
+    mode.deploy_after_turn = mode.auto_deploy;
+    if !transition(mode, GoalPhase::PlanReady, Some("plan ready")) {
+        return Err("invalid goal phase while applying plan".into());
     }
     Ok(())
 }
@@ -1220,22 +1327,36 @@ pub fn write_step_artifact(
     ))
 }
 
-pub fn transition(mode: &mut GoalMode, to: GoalPhase, message: Option<&str>) {
+pub fn transition(mode: &mut GoalMode, to: GoalPhase, message: Option<&str>) -> bool {
     let from = mode.phase.clone();
     if from == to {
-        return;
+        return true;
+    }
+    if let Err(error) = validate_transition(&from, &to) {
+        emit_transition_error(&error);
+        return false;
     }
     mode.phase = to.clone();
     mode.touch();
     emit_goal_phase(&from, &to, message);
     emit_goal_state(mode);
+    true
 }
 
 pub fn fail_goal(mode: &mut GoalMode, err: impl Into<String>) {
     let msg = err.into();
     mode.error = Some(msg.clone());
     mode.deploy_after_turn = false;
+    mode.active_run_ids.clear();
     transition(mode, GoalPhase::Failed, Some(msg.as_str()));
+}
+
+pub fn cancel_goal(mode: &mut GoalMode, reason: impl Into<String>) {
+    let message = reason.into();
+    mode.error = Some(message.clone());
+    mode.deploy_after_turn = false;
+    mode.active_run_ids.clear();
+    transition(mode, GoalPhase::Cancelled, Some(message.as_str()));
 }
 
 pub fn clear_goal(mode: &mut GoalMode) {
@@ -1410,6 +1531,9 @@ Focus the new plan on closing these gaps; do not re-do certified work.
 - Use agents: scout, researcher, planner, worker, reviewer, context-builder, oracle, delegate (or custom agents).
 - Prefer agents planner / worker / reviewer when they match the work so role model pins apply.
 - Assign step.model only from the allowed models list (or omit to use role/default).
+- Each implementation/review step's `task` must name how to validate that step: the build + test commands to run and what "done" looks like (e.g. `cargo test -p foo`, `go test ./...`, `npm run build && npm test`). The harness appends a generic validation gate to these steps automatically; your `task` makes it concrete.
+- Put goal-level acceptance criteria in the plan's `validation` array (checkable later with file:line / build / test evidence), not buried inside a single step.
+- Browser tools are available: for goals that touch a web UI, site, or need real end-to-end verification, plan steps that use the deferred `browser` tools and tell the worker to `load_tools` group `browser` (create / navigate / snapshot / click / fill / screenshot). Do not skip browser verification just because it is harder.
 - Keep steps ≤ {max_tasks}.
 
 After goal_write_plan succeeds, briefly confirm the plan in one short paragraph. Do not start implementing."#,
@@ -1546,7 +1670,7 @@ pub fn finish_synthesis_with_wrapup(
         return;
     }
     if cancelled {
-        fail_goal(mode, "goal wrap-up aborted");
+        cancel_goal(mode, "goal wrap-up aborted");
         return;
     }
     let failed: Vec<&str> = mode
@@ -1608,7 +1732,7 @@ pub fn finish_reviewing(
         return ReviewOutcome::Failed;
     }
     if cancelled {
-        fail_goal(mode, "plan self-review aborted");
+        cancel_goal(mode, "plan self-review aborted");
         return ReviewOutcome::Failed;
     }
     let (ok, summary, gaps) = parse_ceo_verdict(assistant_text);
@@ -1688,7 +1812,7 @@ pub fn finish_verifying(
         return VerifyOutcome::Failed;
     }
     if cancelled {
-        fail_goal(mode, "goal verify aborted");
+        cancel_goal(mode, "goal verify aborted");
         return VerifyOutcome::Failed;
     }
     let (ok, summary, mut gaps) = parse_ceo_verdict(assistant_text);
@@ -1770,6 +1894,55 @@ pub fn finish_verifying(
 // Deploy (via subagent::execute parallel waves)
 // ---------------------------------------------------------------------------
 
+async fn persist_goal_activity(
+    st: &State,
+    goal_id: &str,
+    state: crate::session::RunState,
+    detail: Option<&str>,
+) {
+    let path = st.cfg.read().await.session_file.clone();
+    if let Some(path) = path {
+        crate::session::append_activity_state(
+            &path,
+            st.runtime.session_id().as_str(),
+            goal_id,
+            "goal",
+            crate::runtime::current_run_id().as_deref(),
+            None,
+            state,
+            detail,
+        );
+    }
+}
+
+async fn await_goal_worker<F>(
+    future: F,
+    cancellation: &CancellationToken,
+    timeout: std::time::Duration,
+) -> Outcome
+where
+    F: std::future::Future<Output = Outcome>,
+{
+    tokio::pin!(future);
+    match tokio::time::timeout(timeout, &mut future).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            cancellation.cancel();
+            // Give the owned subagent loop a bounded grace period to finalize
+            // its run record, mailbox, resources, and worktree after cancellation.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut future).await;
+            Outcome::err(format!(
+                "goal worker timed out after {}s and was cancelled",
+                timeout.as_secs()
+            ))
+        }
+    }
+}
+
+fn accepts_goal_worker_result(mode: &GoalMode, goal_id: &str, cancelled: bool) -> bool {
+    !cancelled && mode.id == goal_id && mode.is_active()
+}
+
 /// Run deploy for the current plan. Caller must hold no goal lock across await.
 ///
 /// On success, leaves the goal in [`GoalPhase::Synthesizing`] (classic) or
@@ -1810,6 +1983,13 @@ pub async fn deploy_goal(
             Some("deploying plan steps"),
         );
     }
+    persist_goal_activity(
+        &st,
+        &goal_id,
+        crate::session::RunState::Started,
+        Some("deploying"),
+    )
+    .await;
 
     // Build step dependency map from plan.
     let steps: Vec<GoalStep> = {
@@ -1824,6 +2004,14 @@ pub async fn deploy_goal(
         Err(e) => {
             let mut mode = st.goal.lock().await;
             fail_goal(&mut mode, format!("deploy ordering failed: {e}"));
+            drop(mode);
+            persist_goal_activity(
+                &st,
+                &goal_id,
+                crate::session::RunState::Failed,
+                Some("deploy ordering failed"),
+            )
+            .await;
             return false;
         }
     };
@@ -1857,7 +2045,7 @@ pub async fn deploy_goal(
     for (wave_idx, wave) in waves.into_iter().enumerate() {
         if cancel.is_cancelled() {
             let mut mode = st.goal.lock().await;
-            fail_goal(&mut mode, "goal cancelled");
+            cancel_goal(&mut mode, "goal cancelled");
             return false;
         }
 
@@ -1923,7 +2111,8 @@ pub async fn deploy_goal(
                     )
                 })
                 .count();
-            if from != GoalPhase::Running {
+            if from != GoalPhase::Running && validate_transition(&from, &GoalPhase::Running).is_ok()
+            {
                 mode.phase = GoalPhase::Running;
             }
             mode.touch();
@@ -1982,6 +2171,7 @@ pub async fn deploy_goal(
                 emit_goal_state(&mode);
             }
             let run_id_task = run_id.clone();
+            let parent_goal_id = goal_id.clone();
             handles.push((
                 step_id_outer,
                 tokio::spawn(async move {
@@ -2014,6 +2204,15 @@ pub async fn deploy_goal(
                     // queued steps stay Pending (no Running→Skipped flash).
                     {
                         let mut mode = st_c.goal.lock().await;
+                        if !accepts_goal_worker_result(&mode, &parent_goal_id, false) {
+                            st_c.runtime.note_stale_result();
+                            return (
+                                step_id,
+                                false,
+                                "stale goal worker discarded before execution".into(),
+                                Some(run_id_task),
+                            );
+                        }
                         if let Some(prompt) = mode.prompts.iter_mut().find(|x| x.step_id == step_id)
                         {
                             prompt.status = DeployStatus::Running;
@@ -2027,6 +2226,7 @@ pub async fn deploy_goal(
                         "task": p.task,
                         "context": "fresh",
                         "run_id": run_id_task,
+                        "_parent_run_id": parent_goal_id,
                     });
                     if let Some(m) = &p.model {
                         args["model"] = json!(m);
@@ -2044,11 +2244,26 @@ pub async fn deploy_goal(
                     let provider = st_c
                         .resolve_provider_for_model(p.model.as_deref().unwrap_or(&parent))
                         .await;
+                    let worker_timeout = {
+                        let configured = st_c.cfg.read().await.idle_timeout_secs;
+                        std::time::Duration::from_secs(configured.saturating_mul(5).max(300))
+                    };
+                    let worker_cancel = cancel_c.child_token();
                     // Single-agent execute (worktree handled inside execute when set).
                     // Previously wrapped every step as a one-item parallel batch
                     // whenever concurrency > 1, which raced git worktree add.
-                    let outcome = crate::subagent::execute(
-                        st_c, client_c, provider, parent, args, cancel_c, 0,
+                    let outcome = await_goal_worker(
+                        crate::subagent::execute(
+                            st_c,
+                            client_c,
+                            provider,
+                            parent,
+                            args,
+                            worker_cancel.clone(),
+                            0,
+                        ),
+                        &worker_cancel,
+                        worker_timeout,
                     )
                     .await;
                     (step_id, outcome.ok, outcome.output, Some(run_id_task))
@@ -2061,6 +2276,10 @@ pub async fn deploy_goal(
             match h.await {
                 Ok((_id, ok, output, joined_run_id)) => {
                     let mut mode = st.goal.lock().await;
+                    if !accepts_goal_worker_result(&mode, &goal_id, cancel.is_cancelled()) {
+                        st.runtime.note_stale_result();
+                        continue;
+                    }
                     let summary = nonempty_step_summary(&output);
                     let _ = write_step_artifact(&workspace, &goal_id, &step_id, &output);
                     let (title, agent, run_id, status, clear_rid) =
@@ -2122,6 +2341,10 @@ pub async fn deploy_goal(
                     wave_failed = true;
                     failed_steps.insert(step_id.clone());
                     let mut mode = st.goal.lock().await;
+                    if !accepts_goal_worker_result(&mode, &goal_id, cancel.is_cancelled()) {
+                        st.runtime.note_stale_result();
+                        continue;
+                    }
                     let summary = format!("task join error: {e}");
                     let _ = write_step_artifact(&workspace, &goal_id, &step_id, &summary);
                     let (title, agent, run_id, clear_rid) =
@@ -2178,12 +2401,15 @@ pub async fn deploy_goal(
             && !cancel.is_cancelled()
             && should_validate_goal_after_wave(wave_idx, wave_count)
         {
-            let validation = {
+            let (validation, validation_parent_id) = {
                 let mode = st.goal.lock().await;
-                mode.plan
-                    .as_ref()
-                    .map(|p| p.validation.clone())
-                    .unwrap_or_default()
+                (
+                    mode.plan
+                        .as_ref()
+                        .map(|p| p.validation.clone())
+                        .unwrap_or_default(),
+                    mode.id.clone(),
+                )
             };
             if !validation.is_empty() && !wave_failed {
                 let checks = validation.join("\n- ");
@@ -2194,6 +2420,7 @@ pub async fn deploy_goal(
                         "Verify the completed goal against these checks:\n- {checks}\n\nRun diagnostics if helpful. Reply VERDICT: PASS or VERDICT: FAIL with reasons."
                     ),
                     "context": "fresh",
+                    "_parent_run_id": validation_parent_id,
                 });
                 let outcome = crate::subagent::execute(
                     st.clone(),
@@ -2286,8 +2513,16 @@ pub async fn deploy_goal(
             return false;
         }
         if cancel.is_cancelled() {
-            fail_goal(&mut mode, "goal cancelled");
+            cancel_goal(&mut mode, "goal cancelled");
             sync_work_state_from_prompts(&st, &mode).await;
+            drop(mode);
+            persist_goal_activity(
+                &st,
+                &goal_id,
+                crate::session::RunState::Cancelled,
+                Some("goal cancelled during deploy"),
+            )
+            .await;
             return false;
         }
         // All waves processed. Even if some steps failed (and their
@@ -2340,6 +2575,13 @@ pub async fn deploy_goal(
             "Goal deploy complete — starting follow-up turn…"
         }),
     ));
+    persist_goal_activity(
+        &st,
+        &goal_id,
+        crate::session::RunState::Completed,
+        Some("deploy workers finished"),
+    )
+    .await;
     true
 }
 
@@ -2532,8 +2774,49 @@ mod tests {
         assert!(!m.is_active());
         m.phase = GoalPhase::Failed;
         assert!(!m.is_active());
+        m.phase = GoalPhase::Cancelled;
+        assert!(!m.is_active());
         m.phase = GoalPhase::Idle;
         assert!(!m.is_active());
+    }
+
+    #[test]
+    fn goal_transition_table_rejects_invalid_jump_with_structured_error() {
+        let mut mode = base_mode();
+        mode.phase = GoalPhase::Planning;
+        let error = validate_transition(&mode.phase, &GoalPhase::Done).unwrap_err();
+        assert_eq!(error.code, "invalid_goal_transition");
+        assert_eq!(error.from, GoalPhase::Planning);
+        assert_eq!(error.to, GoalPhase::Done);
+
+        crate::protocol::begin_emit_capture();
+        assert!(!transition(
+            &mut mode,
+            GoalPhase::Done,
+            Some("invalid test jump")
+        ));
+        let captured = crate::protocol::end_emit_capture();
+        assert_eq!(
+            mode.phase,
+            GoalPhase::Planning,
+            "invalid jump mutated state"
+        );
+        let event = captured
+            .iter()
+            .find(|(kind, _)| kind == "error")
+            .map(|(_, data)| data)
+            .expect("structured error event");
+        assert_eq!(event["code"], "invalid_goal_transition");
+        assert_eq!(event["from"], "planning");
+        assert_eq!(event["to"], "done");
+    }
+
+    #[test]
+    fn goal_transition_table_allows_forward_cancel_and_explicit_reopen() {
+        assert!(validate_transition(&GoalPhase::Planning, &GoalPhase::PlanReady).is_ok());
+        assert!(validate_transition(&GoalPhase::Running, &GoalPhase::Cancelled).is_ok());
+        assert!(validate_transition(&GoalPhase::Done, &GoalPhase::Planning).is_ok());
+        assert!(validate_transition(&GoalPhase::Failed, &GoalPhase::Done).is_err());
     }
 
     #[test]
@@ -2705,7 +2988,7 @@ mod tests {
 
         m.phase = GoalPhase::Synthesizing;
         finish_synthesis(&mut m, true);
-        assert_eq!(m.phase, GoalPhase::Failed);
+        assert_eq!(m.phase, GoalPhase::Cancelled);
     }
 
     #[test]
@@ -2863,6 +3146,54 @@ mod tests {
         assert!(mode.deploy_after_turn);
         assert_eq!(mode.prompts.len(), 2);
         assert!(mode.prompts[0].task.contains("ship feature X"));
+    }
+
+    #[test]
+    fn apply_plan_appends_validation_gate_and_browser_note_to_worker_steps() {
+        let mut mode = base_mode();
+        let args = json!({
+            "summary": "two-step",
+            "steps": [
+                {"id": "a", "agent": "scout", "title": "recon", "task": "map auth"},
+                {"id": "b", "agent": "worker", "title": "impl", "task": "implement auth"}
+            ],
+            "validation": ["cargo test green"]
+        });
+        apply_plan(&mut mode, &args, &HashSet::new()).unwrap();
+        let scout = mode.prompts.iter().find(|p| p.agent == "scout").unwrap();
+        let worker = mode.prompts.iter().find(|p| p.agent == "worker").unwrap();
+
+        // Tool availability (browser group) is appended to every step so workers
+        // know they can drive a real browser instead of skipping web work.
+        assert!(scout.task.contains("# Tool availability"));
+        assert!(scout.task.contains("`browser`"));
+        assert!(worker.task.contains("# Tool availability"));
+        assert!(worker.task.contains("`browser`"));
+
+        // Goal-level validation criteria are folded into every step's task.
+        assert!(worker.task.contains("cargo test green"));
+
+        // The per-step validation gate (build + run tests, zero errors) is
+        // enforced on implementation/review agents but skipped for pure-recon.
+        assert!(worker
+            .task
+            .contains("# Validation gate (required for this step)"));
+        assert!(worker.task.contains("Running the relevant test suite"));
+        assert!(!scout
+            .task
+            .contains("# Validation gate (required for this step)"));
+    }
+
+    #[test]
+    fn goal_step_should_validate_skips_only_pure_recon() {
+        assert!(!goal_step_should_validate("scout"));
+        assert!(!goal_step_should_validate("researcher"));
+        assert!(!goal_step_should_validate("context-builder"));
+        assert!(goal_step_should_validate("worker"));
+        assert!(goal_step_should_validate("reviewer"));
+        assert!(goal_step_should_validate("delegate"));
+        assert!(goal_step_should_validate("oracle"));
+        assert!(goal_step_should_validate("custom-agent"));
     }
 
     #[test]
@@ -3148,6 +3479,50 @@ GAPS:
         );
         assert_eq!(m.phase, GoalPhase::Failed);
         assert!(!m.certified);
+    }
+
+    #[tokio::test]
+    async fn worker_timeout_cancels_child_and_returns_terminal_failure() {
+        let cancellation = CancellationToken::new();
+        let child_observer = cancellation.clone();
+        let worker = async move {
+            child_observer.cancelled().await;
+            Outcome::err("worker observed cancellation")
+        };
+        let outcome =
+            await_goal_worker(worker, &cancellation, std::time::Duration::from_millis(5)).await;
+        assert!(!outcome.ok);
+        assert!(outcome.output.contains("timed out"));
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn stale_worker_result_is_rejected_after_goal_replacement_or_cancellation() {
+        let mut mode = base_mode();
+        mode.id = "goal-current".into();
+        mode.phase = GoalPhase::Running;
+        assert!(accepts_goal_worker_result(&mode, "goal-current", false));
+        assert!(!accepts_goal_worker_result(&mode, "goal-old", false));
+        assert!(!accepts_goal_worker_result(&mode, "goal-current", true));
+        mode.phase = GoalPhase::Cancelled;
+        assert!(!accepts_goal_worker_result(&mode, "goal-current", false));
+    }
+
+    #[test]
+    fn terminal_goal_transitions_clear_active_worker_ids() {
+        let mut failed = base_mode();
+        failed.phase = GoalPhase::Running;
+        failed.active_run_ids = vec!["worker-a".into(), "worker-b".into()];
+        fail_goal(&mut failed, "worker failure");
+        assert_eq!(failed.phase, GoalPhase::Failed);
+        assert!(failed.active_run_ids.is_empty());
+
+        let mut cancelled = base_mode();
+        cancelled.phase = GoalPhase::Running;
+        cancelled.active_run_ids = vec!["worker-c".into()];
+        cancel_goal(&mut cancelled, "parent cancelled");
+        assert_eq!(cancelled.phase, GoalPhase::Cancelled);
+        assert!(cancelled.active_run_ids.is_empty());
     }
 
     #[test]

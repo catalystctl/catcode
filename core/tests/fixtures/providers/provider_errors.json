@@ -1,0 +1,6 @@
+{
+  "authentication": {"status": 401, "body": "Bearer top-secret-token rejected"},
+  "rate_limit": {"status": 429, "body": "rate limit exceeded"},
+  "server": {"status": 503, "body": "temporarily unavailable"},
+  "context": {"status": 400, "body": "maximum context length exceeded"}
+}

@@ -7,12 +7,12 @@ use crate::oauth::{LoginOutcome, OAuthPrompt, PendingOauth};
 use crate::tools::{Outcome, ToolKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 // ---- constants ----
@@ -128,6 +128,78 @@ pub const DEFAULT_PRE_TIMEOUT_MS: u64 = 5_000;
 
 /// Default timeout in milliseconds for post_* and lifecycle hooks.
 pub const DEFAULT_POST_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_PLUGIN_INPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_PLUGIN_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn validate_plugin_io(label: &str, input_len: usize) -> Result<(), String> {
+    if input_len > MAX_PLUGIN_INPUT_BYTES {
+        Err(format!(
+            "{label} input exceeds the {} byte limit",
+            MAX_PLUGIN_INPUT_BYTES
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_plugin_output(label: &str, stdout: &[u8], stderr: &[u8]) -> Result<(), String> {
+    if stdout.len() > MAX_PLUGIN_OUTPUT_BYTES || stderr.len() > MAX_PLUGIN_OUTPUT_BYTES {
+        Err(format!(
+            "{label} output exceeds the {} byte per-stream limit",
+            MAX_PLUGIN_OUTPUT_BYTES
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn read_plugin_stream_bounded<R: AsyncRead + Unpin>(
+    mut stream: Option<R>,
+    label: &'static str,
+) -> std::io::Result<Vec<u8>> {
+    let Some(stream) = stream.as_mut() else {
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > MAX_PLUGIN_OUTPUT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("plugin {label} exceeds the {MAX_PLUGIN_OUTPUT_BYTES} byte limit"),
+            ));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Wait for a plugin while draining stdout/stderr concurrently into bounded
+/// buffers. `kill_on_drop(true)` on every caller's child guarantees timeout or
+/// overflow tears down the process when the cancelled future drops it.
+async fn bounded_plugin_output(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    tokio::time::timeout(timeout, async move {
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            read_plugin_stream_bounded(stdout, "stdout"),
+            read_plugin_stream_bounded(stderr, "stderr"),
+        )?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+}
 
 /// Slash-command names reserved by the harness. Plugin commands may not reuse
 /// these (with or without a leading `/`).
@@ -174,6 +246,12 @@ const RESERVED_COMMAND_NAMES: &[&str] = &[
 struct PluginManifest {
     name: String,
     version: String,
+    #[serde(default)]
+    protocol_version: Option<u32>,
+    /// Explicit authority requested by newer plugins. Absent keeps legacy
+    /// manifests compatible by inferring the minimum set from their features.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -311,6 +389,8 @@ struct OauthManifestEntry {
 pub struct Plugin {
     pub name: String,
     pub version: String,
+    pub protocol_version: u32,
+    pub capabilities: Vec<String>,
     pub description: String,
     pub enabled: bool,
     /// Absolute path to the plugin directory on disk.
@@ -450,6 +530,104 @@ pub struct HookResult {
     pub notify: Option<String>,
     /// Optional status-bar text (`Some("")` means clear).
     pub status: Option<String>,
+}
+
+pub const PLUGIN_PROTOCOL_VERSION: u32 = 1;
+const PLUGIN_CAPABILITIES: &[&str] = &[
+    "read_workspace",
+    "write_workspace",
+    "execute_subprocess",
+    "access_network",
+    "receive_prompts",
+    "receive_tool_arguments",
+    "receive_model_responses",
+    "access_secrets",
+    "register_tools",
+    "register_commands",
+    "register_providers",
+    "register_memory_backend",
+];
+
+fn validate_manifest_capabilities(manifest: &PluginManifest) -> Result<Vec<String>, String> {
+    let protocol_version = manifest.protocol_version.unwrap_or(1);
+    if protocol_version > PLUGIN_PROTOCOL_VERSION {
+        return Err(format!(
+            "plugin protocol version {protocol_version} is newer than supported ({PLUGIN_PROTOCOL_VERSION})"
+        ));
+    }
+
+    let mut required = HashSet::<&str>::new();
+    let uses_subprocess = !manifest.hooks.is_empty()
+        || !manifest.tools.is_empty()
+        || !manifest.commands.is_empty()
+        || manifest.oauth.is_some()
+        || manifest.memory_provider.is_some();
+    if uses_subprocess {
+        required.insert("execute_subprocess");
+    }
+    for (name, hook) in &manifest.hooks {
+        if hook.pass_args {
+            required.insert("receive_tool_arguments");
+        }
+        if matches!(
+            name.as_str(),
+            "pre_input" | "pre_context" | "pre_turn" | "turn_start"
+        ) {
+            required.insert("receive_prompts");
+        }
+        if matches!(name.as_str(), "post_tool" | "turn_end" | "session_stop") {
+            required.insert("receive_model_responses");
+        }
+    }
+    if !manifest.tools.is_empty() {
+        required.insert("register_tools");
+        for tool in &manifest.tools {
+            if tool.kind.as_deref() == Some("readonly") {
+                required.insert("read_workspace");
+            } else {
+                required.insert("write_workspace");
+            }
+        }
+    }
+    if !manifest.commands.is_empty() {
+        required.insert("register_commands");
+    }
+    if manifest.oauth.is_some() {
+        required.extend(["register_providers", "access_network", "access_secrets"]);
+    }
+    if manifest.memory_provider.is_some() {
+        required.insert("register_memory_backend");
+    }
+
+    let Some(declared) = manifest.capabilities.as_ref() else {
+        let mut inferred: Vec<String> = required.into_iter().map(str::to_string).collect();
+        inferred.sort();
+        return Ok(inferred);
+    };
+    let declared_set: HashSet<&str> = declared.iter().map(String::as_str).collect();
+    let unknown: Vec<&str> = declared_set
+        .iter()
+        .copied()
+        .filter(|capability| !PLUGIN_CAPABILITIES.contains(capability))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "plugin declares unknown capabilities: {}",
+            unknown.join(", ")
+        ));
+    }
+    let mut missing: Vec<&str> = required.difference(&declared_set).copied().collect();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        return Err(format!(
+            "plugin is denied because its manifest is missing required capabilities: {}",
+            missing.join(", ")
+        ));
+    }
+    let mut validated = declared.clone();
+    validated.sort();
+    validated.dedup();
+    Ok(validated)
 }
 
 // ---- PluginManager ----
@@ -734,6 +912,8 @@ impl PluginManager {
         if manifest.name.is_empty() {
             return Err("plugin name is empty".into());
         }
+        let capabilities = validate_manifest_capabilities(&manifest)?;
+        let plugin_protocol_version = manifest.protocol_version.unwrap_or(1);
 
         // Canonicalize the plugin directory for path-confinement checks.
         let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -894,6 +1074,8 @@ impl PluginManager {
         Ok(Plugin {
             name: manifest.name,
             version: manifest.version,
+            protocol_version: plugin_protocol_version,
+            capabilities,
             description: manifest.description,
             enabled: true,
             source_path: canon_dir,
@@ -930,9 +1112,26 @@ impl PluginManager {
         }
     }
 
-    /// True when workspace-scoped plugins will actually load (trust opt-in).
+    /// True when repo-shipped workspace plugins are allowed to load. Explicitly
+    /// user-installed workspace plugins carry a marker and do not require this
+    /// blanket trust flag.
     pub fn trust_project(&self) -> bool {
         self.trust_project
+    }
+
+    /// Names of currently loaded workspace-scoped plugins. Global user-owned
+    /// plugins are excluded.
+    pub fn project_plugin_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .plugins
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| self.scope_of_path(&p.source_path) == PluginInstallScope::Workspace)
+            .map(|p| p.name.clone())
+            .collect();
+        out.sort();
+        out
     }
 
     /// Install from a local path or GitHub Release URL into the given scope.
@@ -1663,6 +1862,7 @@ impl PluginManager {
         timeout_ms: u64,
     ) -> Result<Value, String> {
         let ctx_bytes = serde_json::to_vec(&context).unwrap_or_default();
+        validate_plugin_io("oauth script", ctx_bytes.len())?;
         let mut child = match hook_command(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1691,8 +1891,9 @@ impl PluginManager {
             }
         }
         let timeout_dur = Duration::from_millis(timeout_ms);
-        match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        match bounded_plugin_output(child, timeout_dur).await {
             Ok(Ok(output)) => {
+                validate_plugin_output("oauth script", &output.stdout, &output.stderr)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(format!(
@@ -1774,6 +1975,13 @@ pub async fn execute_hook(
     // hook's own timeout so a wedged hook can't hang the turn forever; on
     // timeout kill the child and deny/skip (P1-9).
     let context_bytes = serde_json::to_vec(context).unwrap_or_default();
+    if let Err(message) = validate_plugin_io("plugin hook", context_bytes.len()) {
+        return if is_deny {
+            deny(message)
+        } else {
+            skip(message)
+        };
+    }
     if let Some(mut stdin) = child.stdin.take() {
         let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
         let write_fut = async {
@@ -1795,10 +2003,19 @@ pub async fn execute_hook(
     }
 
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    let output_result = tokio::time::timeout(timeout_dur, child.wait_with_output()).await;
+    let output_result = bounded_plugin_output(child, timeout_dur).await;
 
     match output_result {
         Ok(Ok(output)) => {
+            if let Err(message) =
+                validate_plugin_output("plugin hook", &output.stdout, &output.stderr)
+            {
+                return if is_deny {
+                    deny(message)
+                } else {
+                    skip(message)
+                };
+            }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let msg = format!(
@@ -2003,6 +2220,9 @@ pub async fn execute_plugin_tool(
         "timestamp": timestamp,
     });
     let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+    if let Err(message) = validate_plugin_io("plugin tool", ctx_bytes.len()) {
+        return Outcome::err(message);
+    }
 
     let mut child = match hook_command(&config.script)
         .stdin(std::process::Stdio::piped())
@@ -2042,8 +2262,13 @@ pub async fn execute_plugin_tool(
     }
 
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+    match bounded_plugin_output(child, timeout_dur).await {
         Ok(Ok(output)) => {
+            if let Err(message) =
+                validate_plugin_output("plugin tool", &output.stdout, &output.stderr)
+            {
+                return Outcome::err(message);
+            }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Outcome::err(format!(
@@ -2134,6 +2359,9 @@ pub async fn execute_plugin_command(
         "plugin": config.plugin_name,
     });
     let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+    if let Err(message) = validate_plugin_io("plugin command", ctx_bytes.len()) {
+        return Outcome::err(message);
+    }
 
     let mut child = match hook_command(&config.script)
         .stdin(std::process::Stdio::piped())
@@ -2171,8 +2399,13 @@ pub async fn execute_plugin_command(
     }
 
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+    match bounded_plugin_output(child, timeout_dur).await {
         Ok(Ok(output)) => {
+            if let Err(message) =
+                validate_plugin_output("plugin command", &output.stdout, &output.stderr)
+            {
+                return Outcome::err(message);
+            }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Outcome::err(format!(
@@ -2286,6 +2519,9 @@ pub async fn execute_memory_provider(
         "timestamp": timestamp,
     });
     let ctx_bytes = serde_json::to_vec(&ctx).unwrap_or_default();
+    if let Err(message) = validate_plugin_io("memory provider", ctx_bytes.len()) {
+        return MemoryProviderResult::err(message);
+    }
 
     let mut cmd = hook_command(&config.script);
     // Memory backends often need their own config (e.g. ENGRAPHIS_DB_PATH).
@@ -2339,8 +2575,13 @@ pub async fn execute_memory_provider(
     }
 
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+    match bounded_plugin_output(child, timeout_dur).await {
         Ok(Ok(output)) => {
+            if let Err(message) =
+                validate_plugin_output("memory provider", &output.stdout, &output.stderr)
+            {
+                return MemoryProviderResult::err(message);
+            }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return MemoryProviderResult::err(format!(
@@ -3472,9 +3713,49 @@ mod tests {
         let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
         assert_eq!(plugin.name, "minimal");
         assert_eq!(plugin.version, "1.0.0");
+        assert_eq!(plugin.protocol_version, 1);
+        assert!(plugin.capabilities.is_empty());
         assert_eq!(plugin.hooks.len(), 0);
         assert!(plugin.commands.is_empty());
         assert!(plugin.enabled);
+    }
+
+    #[test]
+    fn future_plugin_protocol_is_rejected() {
+        let tmp = TmpDir::new("future_protocol");
+        fs::write(
+            tmp.path.join("plugin.json"),
+            r#"{"name":"future","version":"1","protocol_version":99}"#,
+        )
+        .unwrap();
+        assert!(PluginManager::load_plugin_from_dir(&tmp.path)
+            .unwrap_err()
+            .contains("newer than supported"));
+    }
+
+    #[test]
+    fn explicit_capabilities_must_cover_registered_features() {
+        let tmp = TmpDir::new("capability_denied");
+        let plugin_dir = write_plugin_with_tool(&tmp.path, "cap_tool", "");
+        let manifest_path = plugin_dir.join("plugin.json");
+        let manifest = fs::read_to_string(&manifest_path).unwrap().replacen(
+            "\"version\": \"1.0.0\",",
+            "\"version\": \"1.0.0\",\n  \"protocol_version\": 1,\n  \"capabilities\": [\"execute_subprocess\"],",
+            1,
+        );
+        fs::write(&manifest_path, manifest).unwrap();
+        let error = PluginManager::load_plugin_from_dir(&plugin_dir).unwrap_err();
+        assert!(error.contains("missing required capabilities"));
+        assert!(error.contains("register_tools"));
+        assert!(error.contains("write_workspace"));
+    }
+
+    #[test]
+    fn plugin_io_limits_reject_oversized_payloads() {
+        assert!(validate_plugin_io("test", MAX_PLUGIN_INPUT_BYTES + 1).is_err());
+        assert!(
+            validate_plugin_output("test", &vec![0; MAX_PLUGIN_OUTPUT_BYTES + 1], &[]).is_err()
+        );
     }
 
     #[test]
@@ -5153,5 +5434,59 @@ mod tests {
         let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
         assert!(!out.ok);
         assert!(out.output.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_plugin_tool_cancellation_kills_child() {
+        let tmp = TmpDir::new("ept_cancel");
+        let started = tmp.path.join("started");
+        let completed = tmp.path.join("completed");
+        let script = tmp.path.join("cancel.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nsleep 1\ntouch '{}'\necho '{{\"ok\":true,\"output\":\"late\"}}'\n",
+                started.display(),
+                completed.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let args = json!({});
+        let mut future = Box::pin(execute_plugin_tool("ut", &tc, &args, "/ws", "s.jsonl"));
+        let started_result = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(1), async {
+                while !started.exists() {
+                    tokio::task::yield_now().await;
+                }
+            }) => result,
+            _ = &mut future => panic!("plugin completed before cancellation"),
+        };
+        started_result.expect("plugin child did not start");
+        drop(future);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !completed.exists(),
+            "dropping the plugin future must kill its child before completion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_plugin_tool_stops_reading_at_output_limit() {
+        let tmp = TmpDir::new("ept_oversized");
+        let script = tmp.path.join("oversized.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\ndd if=/dev/zero bs=1048577 count=1 2>/dev/null\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let tc = tool_config_for(script, 5000, ToolKind::Destructive);
+        let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
+        assert!(!out.ok);
+        assert!(out.output.contains("exceeds the 1048576 byte limit"));
     }
 }

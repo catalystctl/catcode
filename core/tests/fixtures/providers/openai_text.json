@@ -1,0 +1,1 @@
+{"usage":{"prompt_tokens":10,"completion_tokens":"2","prompt_tokens_details":{"cached_tokens":4}},"choices":[{"delta":{"content":"hello","reasoning_content":"think"},"finish_reason":"stop"}]}

@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::memory::{significant_tokens, MemoryEntry, MemoryStatus, Scope};
 use crate::task_fingerprint::{fingerprint_similarity, TaskFingerprint};
+use serde::Serialize;
 
 /// Spec §15 weights (sum = 1.0).
 const W_LEXICAL: f32 = 0.25;
@@ -30,6 +31,23 @@ const PROJECT_BONUS: f32 = 0.08;
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
+/// Machine-readable scoring diagnostics used by local evaluation fixtures and
+/// opt-in diagnostics. It contains no memory body or prompt text.
+#[derive(Clone, Debug, Serialize)]
+pub struct RetrievalScoreDebug {
+    pub lexical: f32,
+    pub semantic_or_sketch: f32,
+    pub recency: f32,
+    pub importance: f32,
+    pub scope_match: f32,
+    pub path_or_symbol_match: f32,
+    pub staleness_penalty: f32,
+    pub contradiction_penalty: f32,
+    pub confidence: f32,
+    pub utility: f32,
+    pub total: f32,
+}
+
 /// Score a single memory. Returns `(score, reasons)`.
 ///
 /// Uses TF-overlap for the lexical channel (no corpus DF). Prefer
@@ -39,6 +57,18 @@ pub fn score_memory(entry: &MemoryEntry, prompt: &str, fp: &TaskFingerprint) -> 
     let mem_tokens = memory_tokens(entry);
     let lexical = tf_overlap(&prompt_tokens, &mem_tokens);
     score_memory_with_lexical(entry, fp, &prompt_tokens, lexical)
+}
+
+/// Return score components without exposing the prompt or memory content.
+pub fn debug_score_memory(
+    entry: &MemoryEntry,
+    prompt: &str,
+    fp: &TaskFingerprint,
+) -> RetrievalScoreDebug {
+    let prompt_tokens = tokenize_rich(prompt);
+    let mem_tokens = memory_tokens(entry);
+    let lexical = tf_overlap(&prompt_tokens, &mem_tokens);
+    score_debug(entry, fp, &prompt_tokens, lexical)
 }
 
 /// Rank memories for a prompt + fingerprint. Deterministic order on ties (name).
@@ -189,11 +219,64 @@ fn score_memory_with_lexical(
 
     score *= status_mul;
 
+    // Repeated contradictory evidence reduces authority deterministically. A
+    // contradiction does not erase a memory, but it cannot rank as though it
+    // had uncontested evidence.
+    let contradiction_mul = contradiction_multiplier(entry);
+    if contradiction_mul < 1.0 {
+        reasons.push(format!(
+            "contradictory evidence {} (x{contradiction_mul:.2})",
+            entry.contradiction_count
+        ));
+        score *= contradiction_mul;
+    }
+
     if entry.scope == Scope::Workspace {
         score = (score + PROJECT_BONUS).min(1.0);
     }
 
     (score.clamp(0.0, 1.0), reasons)
+}
+
+fn score_debug(
+    entry: &MemoryEntry,
+    fp: &TaskFingerprint,
+    prompt_tokens: &[String],
+    lexical: f32,
+) -> RetrievalScoreDebug {
+    let symbol = symbol_overlap(entry, fp, prompt_tokens);
+    let semantic_or_sketch = fingerprint_similarity(fp, &memory_as_fingerprint(entry));
+    let path = path_overlap(entry, fp);
+    let recency = verification_recency(entry);
+    let scope_match = scope_applicability(entry);
+    let status_mul = if entry.deprecated || !entry.status.is_positive_guidance() {
+        0.0
+    } else {
+        entry.status.rank_multiplier()
+    };
+    let contradiction_mul = contradiction_multiplier(entry);
+    let (total, _) = score_memory_with_lexical(entry, fp, prompt_tokens, lexical);
+    RetrievalScoreDebug {
+        lexical,
+        semantic_or_sketch,
+        recency,
+        importance: match entry.importance {
+            crate::memory::Importance::High => 1.0,
+            crate::memory::Importance::Normal => 0.6,
+            crate::memory::Importance::Low => 0.2,
+        },
+        scope_match,
+        path_or_symbol_match: path.max(symbol),
+        staleness_penalty: 1.0 - status_mul,
+        contradiction_penalty: 1.0 - contradiction_mul,
+        confidence: entry.confidence.clamp(0.0, 1.0),
+        utility: utility_score(entry),
+        total,
+    }
+}
+
+fn contradiction_multiplier(entry: &MemoryEntry) -> f32 {
+    (1.0 / (1.0 + entry.contradiction_count as f32 * 0.25)).clamp(0.2, 1.0)
 }
 
 fn memory_tokens(entry: &MemoryEntry) -> Vec<String> {
@@ -527,6 +610,9 @@ mod tests {
             deprecated: false,
             superseded_by: None,
             schema_version: 2,
+            source_session: None,
+            source_run: None,
+            created_at: None,
             status,
             confidence: 1.0,
             support_count: 0,
