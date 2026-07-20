@@ -155,7 +155,10 @@ export interface SessionEntry {
 /** Cumulative / turn cost from core `cost_update` events. */
 export type CostUpdate = Omit<CostUpdateEvent, "type">;
 
-export type ProtocolHello = Omit<ProtocolHelloEvent, "type">;
+export type ProtocolHello = Omit<ProtocolHelloEvent, "type"> & {
+  /** Numeric wire version; absent when connected to a legacy v1 core. */
+  protocol_version?: number;
+};
 
 export interface CheckpointInfo {
   id: string;
@@ -453,7 +456,7 @@ export type CoreEvent =
   | { type: "tool_call_name"; index: number; name: string }
   | { type: "tool_call_args"; index: number; args: string }
   | { type: "tool_call"; id: string; name: string; args: string }
-  | { type: "tool_result"; id: string; ok: boolean; output: string; diff?: string; tool?: string }
+  | { type: "tool_result"; id: string; ok: boolean; status?: "success" | "denied" | "cancelled" | "timed_out" | "failed" | "stale" | "partially_completed"; output: string; diff?: string; tool?: string }
   /** User-initiated `!cmd` / `!!cmd` (PI-compatible bang bash). */
   | {
       type: "bash_execution";
@@ -463,6 +466,17 @@ export type CoreEvent =
       exclude_from_context?: boolean;
     }
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
+  | { type: "approval_expired"; request_id: string; tool_call_id?: string }
+  | { type: "run_cancelled"; run_id?: string; reason?: string }
+  | {
+      type: "runtime_status";
+      discarded_stale_results?: number;
+      resources?: unknown[];
+      pending_approvals?: number;
+      pending_asks?: number;
+      pending_sudos?: number;
+    }
+  | { type: "session_recovered"; warnings?: string[]; interrupted_runs?: string[] }
   | {
       type: "protocol_hello";
       version: string;
@@ -488,6 +502,7 @@ export type CoreEvent =
   | { type: "checkpoint_restored"; id: string; kind: string }
   | { type: "checkpoints"; checkpoints: CheckpointInfo[] }
   | { type: "worktree_ready"; run_id: string; path: string; branch?: string }
+  | { type: "worktree_seeded"; run_id: string; paths: string[] }
   | { type: "worktree_cleaned"; path: string }
   | { type: "worktree_promoted"; run_id: string; paths: string[] }
   | { type: "audit"; tool: string; decision: string; actor: string }
@@ -667,6 +682,7 @@ export type CoreCommand =
   | { type: "load_session"; path: string }
   | { type: "new_session"; path?: string }
   | { type: "stats" }
+  | { type: "runtime_status" }
   | { type: "set_config"; key: string; value: string | number | boolean }
   // ── Turn / history ──
   | { type: "undo" }

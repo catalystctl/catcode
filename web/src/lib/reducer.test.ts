@@ -1152,6 +1152,18 @@ describe("CEO / Control Center goal events", () => {
 });
 
 describe("CORE_EVENT_TYPES coverage", () => {
+  test("checked-in event fixtures match the web SDK catalog", async () => {
+    const { CORE_EVENT_TYPES } = await import("@catalyst-code/coding-agent");
+    const fixtures = (await Bun.file(
+      new URL("../../../protocol/fixtures/events-v2.jsonl", import.meta.url),
+    ).text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    expect(fixtures.map((event) => event.type)).toEqual([...CORE_EVENT_TYPES]);
+    expect(fixtures.every((event) => event.protocol_version === 2)).toBe(true);
+  });
+
   test("reducer has an explicit case for every SDK core event type", async () => {
     const { CORE_EVENT_TYPES } = await import("@catalyst-code/coding-agent");
     const src = await Bun.file(new URL("./reducer.ts", import.meta.url)).text();

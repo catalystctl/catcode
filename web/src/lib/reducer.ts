@@ -237,6 +237,7 @@ const GOAL_LASTING_PHASES = new Set([
   "replanning",
   "done",
   "failed",
+  "cancelled",
 ]);
 
 function isGoalTerminalStatus(status: string): boolean {
@@ -796,6 +797,21 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           diff: ev.diff,
         },
       };
+    case "approval_expired":
+      return {
+        ...state,
+        pendingApproval:
+          state.pendingApproval?.request_id === ev.request_id
+            ? null
+            : state.pendingApproval,
+        toasts: pushToast(state.toasts, "info", "Tool approval request expired"),
+      };
+    case "run_cancelled":
+      return finishTurn(state);
+    case "runtime_status":
+      // Requested diagnostics are currently rendered by protocol consumers and
+      // logs; explicitly accept them without growing persistent UI state.
+      return state;
     case "ask_request":
       return {
         ...state,
@@ -1417,7 +1433,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         error: ev.error ?? null,
         parent_model: ev.parent_model ?? "",
       };
-      const terminal = ev.phase === "done" || ev.phase === "failed";
+      const terminal =
+        ev.phase === "done" || ev.phase === "failed" || ev.phase === "cancelled";
       let goalIterations = state.goalIterations ?? [];
       if (goalMode.ceo_mode) {
         goalIterations = upsertGoalIteration(goalIterations, goalMode.iteration ?? 0, {
@@ -1475,7 +1492,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           title: `Goal · ${to}${wave}${counts}`,
           text: detail || msg,
           status: to,
-          ok: to !== "failed",
+          ok: to !== "failed" && to !== "cancelled",
         });
       }
       return next;
@@ -1698,6 +1715,9 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         protocolHello: {
           version: String(ev.version ?? ""),
+          protocol_version: Number(
+            (ev as unknown as Record<string, unknown>).protocol_version ?? 1,
+          ),
           min_client: String(ev.min_client ?? ""),
           capabilities: Array.isArray(ev.capabilities)
             ? ev.capabilities.map(String)
@@ -1774,6 +1794,19 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         worktrees,
         toasts: pushToast(state.toasts, "info", `Worktree ready: ${path}`),
+      };
+    }
+    case "worktree_seeded": {
+      const count = Array.isArray(ev.paths) ? ev.paths.length : 0;
+      return {
+        ...state,
+        fileChangeSeq: state.fileChangeSeq + 1,
+        recentFileChanges: [],
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Seeded ${count} file${count === 1 ? "" : "s"} into worktree`,
+        ),
       };
     }
     case "worktree_cleaned": {
@@ -1862,6 +1895,20 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         sessions: state.sessions.map((s) =>
           (s.path ?? s.name) === path || s.name === path ? { ...s, pinned } : s,
+        ),
+      };
+    }
+    case "session_recovered": {
+      const warningCount = Array.isArray(ev.warnings) ? ev.warnings.length : 0;
+      const interruptedCount = Array.isArray(ev.interrupted_runs)
+        ? ev.interrupted_runs.length
+        : 0;
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Recovered session (${interruptedCount} interrupted run${interruptedCount === 1 ? "" : "s"}${warningCount ? `, ${warningCount} warning${warningCount === 1 ? "" : "s"}` : ""})`,
         ),
       };
     }
