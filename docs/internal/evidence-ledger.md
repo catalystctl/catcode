@@ -187,9 +187,9 @@ Internal document linking every documented surface to its source evidence.
 
 | Surface | Source | Evidence | Confidence |
 |---------|--------|----------|------------|
-| Command enum | `core/src/protocol.rs` | `Command` enum with serde tags | high |
-| Event struct | `core/src/protocol.rs` | `Event` struct + constructors | high |
-| emit function | `core/src/protocol.rs` | `fn emit(ev: &Event)` | high |
+| Command enum | `core/src/protocol/commands.rs` | `Command` enum with serde tags | high |
+| Event struct | `core/src/protocol/events.rs` | `Event` struct + constructors | high |
+| emit function | `core/src/protocol/events.rs` | centralized sink-backed `emit` | high |
 
 ## Existing Documentation Audit
 

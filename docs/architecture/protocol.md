@@ -5,7 +5,9 @@ Commands flow from the frontend (TUI/web/SDK) to the core on stdin; events
 flow from the core to the frontend on stdout.
 
 This document describes every command and event type defined in the wire
-protocol. Source: `core/src/protocol.rs` (/core/src/protocol.rs).
+protocol. Commands live in `core/src/protocol/commands.rs`, common wire types in
+`common.rs`, event construction in `events.rs`, and the version/capability
+catalog in `version.rs`.
 
 ---
 
@@ -35,7 +37,22 @@ variant. Commands use `#[serde(tag = "type")]`; events use an explicit
 **Buffering:** Frontends should either flush stdin after each command or set
 line-buffered mode. The core reads stdin line-by-line with a read buffer.
 
-**Thread safety:** The core's `emit()` function locks stdout per-line.
+**Output authority:** `runtime::EventSink` is the only core component that
+writes protocol lines to stdout. It serializes each event as one locked line,
+adds lifecycle metadata, redacts recognized secret fields, and drops events
+whose run/session scope is no longer active.
+
+### Protocol version and metadata
+
+The current wire version is `2`. Every emitted event includes
+`protocol_version`. Events emitted inside a foreground run also include
+`session_id`, `run_id`, and a monotonically increasing per-run `sequence`.
+Session-owned background work includes `session_id`; child-agent events retain
+their explicit child `run_id` fields.
+
+Clients must tolerate unknown fields and unknown optional event types. This is
+what allows a v1 client to continue operating while a v2 core adds lifecycle
+metadata.
 
 ---
 
@@ -71,7 +88,7 @@ Event::new("event_name")
     .with("field", json!(value))
 ```
 
-Source: `Event` (/core/src/protocol.rs), line ~385.
+Source: `Event` (`core/src/protocol/events.rs`).
 
 ---
 
@@ -84,14 +101,24 @@ determines which variant is parsed.
 
 #### `init`
 
-Initialize a new core session. Sent once at startup. The core responds with a
-[`ready`](#ready) event containing the initial model list and config.
+Initialize a core subprocess. Sent once at startup. The core responds with a
+[`ready`](#ready) event containing the initial model list and config, followed
+by `protocol_hello` with the supported version and capabilities.
 
 ```json
-{"type": "init"}
+{
+  "type": "init",
+  "protocol_version": 2,
+  "client": {
+    "name": "catcode-tui",
+    "version": "0.2.0",
+    "capabilities": ["run_ids", "session_ids", "event_sequence"]
+  }
+}
 ```
 
-No extra fields.
+All fields other than `type` are optional. The legacy plain
+`{"type":"init"}` command remains supported.
 
 #### `reset`
 
@@ -122,8 +149,9 @@ restores the latest auto filesystem checkpoint when one exists.
 
 #### `abort`
 
-Abort the currently running turn **and** drop any queued prompt. The core emits
-`aborted` then `done`.
+Abort the currently running turn **and** drop any queued prompt. A v2 core emits
+`run_cancelled` with the cancelled identity/reason and retains the legacy
+`aborted` terminal signal.
 
 ```json
 {"type": "abort"}
@@ -145,6 +173,22 @@ Request a session statistics summary. Returns a [`stats`](#stats) event.
 ```json
 {"type": "stats"}
 ```
+
+Lifecycle diagnostics are read-only and expose coordinator-owned work:
+
+```json
+{"type": "runtime_status"}
+```
+
+The `runtime_status` response includes the active `session_id`/`run_id`, the
+number of discarded stale results, the last cancellation, registered resources
+(including whether cancellation has fired), and pending approval/ask/sudo
+counts. Resource labels are operational identifiers and never contain tool
+arguments or credentials.
+
+On startup, `session_recovered` reports ignored malformed/truncated records and
+run IDs that had a `started` record without a terminal state. Those runs are
+persisted as `interrupted`; destructive work is never restarted automatically.
 
 #### `context`
 
@@ -873,6 +917,11 @@ A tool call requested by the model.
 ```
 
 #### `tool_result`
+
+Protocol v2 adds `status` with one of `success`, `denied`, `cancelled`,
+`timed_out`, `failed`, `stale`, or `partially_completed`. The legacy `ok`
+boolean remains for compatibility. If an older executor supplies only
+`ok`/`output`, the event sink normalizes it before emission.
 
 The result of a tool execution.
 

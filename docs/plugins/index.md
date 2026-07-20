@@ -54,6 +54,18 @@ Invalid plugins are skipped with a log message but never crash the harness.
 {
   "name": "my-plugin",
   "version": "1.0.0",
+  "protocol_version": 1,
+  "capabilities": [
+    "execute_subprocess",
+    "receive_tool_arguments",
+    "write_workspace",
+    "register_tools",
+    "register_commands",
+    "register_providers",
+    "register_memory_backend",
+    "access_network",
+    "access_secrets"
+  ],
   "description": "What this plugin does",
   "system_prompt": "Optional static text injected into every system prompt.",
   "hooks": {
@@ -99,6 +111,8 @@ Invalid plugins are skipped with a log message but never crash the harness.
 |-------|------|----------|-------------|
 | `name` | string | yes | Plugin identifier (must be non-empty, unique) |
 | `version` | string | yes | Semver string |
+| `protocol_version` | integer | no | Plugin contract version; defaults to `1`. Versions newer than the core supports are rejected. |
+| `capabilities` | string[] | no | Explicit requested authority. Legacy manifests may omit it; the core infers the minimum required set for compatibility. |
 | `description` | string | no | Human-readable summary |
 | `system_prompt` | string | no | Static text appended to the system prompt every turn |
 | `hooks` | object | no | Hook point name → `{ script, timeout_ms?, pass_args? }` |
@@ -110,6 +124,22 @@ Invalid plugins are skipped with a log message but never crash the harness.
 
 **Source:** `core/src/plugins.rs`, `PluginManifest` (line 156), `ToolManifestEntry`
 (line 241), `OauthManifestEntry` (line 267), `MemoryProviderManifestEntry` (line 225).
+
+### Capability validation and resource limits
+
+When `capabilities` is present, it must include every authority implied by the
+manifest and may only use: `read_workspace`, `write_workspace`,
+`execute_subprocess`, `access_network`, `receive_prompts`,
+`receive_tool_arguments`, `receive_model_responses`, `access_secrets`,
+`register_tools`, `register_commands`, `register_providers`, and
+`register_memory_backend`. Missing or unknown capabilities reject the plugin
+before any script runs.
+
+Every hook, tool, command, OAuth action, and memory-provider invocation retains
+its configured hard timeout. JSON input is limited to 1 MiB and each captured
+stdout/stderr stream is limited to 1 MiB. Child processes use cancellation-safe
+drop behavior. These bounds protect the core, but capabilities describe and
+validate requested authority; they are not an operating-system sandbox.
 
 ---
 
@@ -354,7 +384,7 @@ Disabled plugins remain on disk but are not invoked.
 | — | `plugin_command { name, args }` | Run a plugin-declared slash command programmatically. |
 | — | `list_plugin_commands` | List all plugin-declared slash commands. |
 
-**Protocol source:** `core/src/protocol.rs` lines 221–250.
+**Protocol source:** `core/src/protocol/commands.rs`.
 
 ---
 

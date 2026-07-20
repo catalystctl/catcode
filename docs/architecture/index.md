@@ -12,7 +12,7 @@ architecture.
 
 | Component | Language | Role | Entry Point |
 |-----------|----------|------|-------------|
-| **`core/`** | Rust (async, tokio) | The engine: conversation, model streaming, the agentic tool loop with an approval gate, sessions, memory, plugins, subagents, self-learning | `core/src/main.rs` (~10.4k lines) |
+| **`core/`** | Rust (async, tokio) | The engine: conversation, model streaming, the agentic tool loop with an approval gate, sessions, memory, plugins, subagents, self-learning | `core/src/main.rs` plus `agent/`, `commands/`, `providers/`, `runtime/`, and `tooling/` |
 | **`tui/`** | Go ([Bubble Tea](https://github.com/charmbracelet/bubbletea)) | Terminal UI (`catcode` binary). Spawns `core` as a subprocess, writes commands to stdin, reads events from stdout, renders approvals and metrics | `tui/main.go` + `tui/handlers.go` |
 | **`web/`** | Next.js 15 + React 19 | Browser equivalent of the TUI — an SSE bridge to one core process. Prebuilt as a standalone tarball (no `next build` on the host) | `web/` (see `web/README.md`) |
 | **`sdk/`** | TypeScript | Thin pi-compatible wrapper (`@catalyst-code/coding-agent`) so the web frontend and other JS consumers can drive the core | `sdk/` |
@@ -43,8 +43,9 @@ otherwise it is found on `PATH` or at `CATCODE_CORE`.
 Components communicate over **newline-delimited JSON on stdio**. One JSON
 object per line, UTF-8 encoded.
 
-- **stdin:** Frontend writes `Command` (/core/src/protocol.rs) objects tagged by `type`.
-- **stdout:** Core writes `Event` (/core/src/protocol.rs) objects with a `type` field and flat data.
+- **stdin:** Frontend writes `Command` (`core/src/protocol/commands.rs`) objects tagged by `type`.
+- **stdout:** Core emits `Event` (`core/src/protocol/events.rs`) objects through
+  the coordinator-aware event sink.
 
 **Commands** include `init`, `send`, `steer`, `approve`, `set_key`, `login`,
 `logout`, `list_provider_presets`, `oauth_code`, `remember`, `forget`,
@@ -57,19 +58,21 @@ subagent/memory/session lifecycle events.
 
 Full reference: [`docs/architecture/protocol.md`](protocol.md).
 
-**Source:** `core/src/protocol.rs` (462 lines), `README.md` wire protocol section.
+**Source:** `core/src/protocol/`, `protocol.schema.json`, and the README wire protocol section.
 
 ---
 
 ## Core Subsystems
 
-The core (`core/src/`) is a flat module layout — each `.rs` file is a distinct
-subsystem. Key subsystems:
+The core uses top-level subsystems plus explicit `agent/`, `commands/`,
+`protocol/`, `providers/`, `runtime/`, and `tooling/` boundaries. Key subsystems:
 
-### Turn Loop (`main.rs`, ~10k lines)
+### Command and turn lifecycle (`main.rs`, `commands/`, `agent/`)
 
-The async stdin command loop reads `Command` objects, dispatches each to the
-appropriate handler, and emits `Event` objects. The main loop is:
+`main.rs` constructs shared state and runtime dependencies. The async stdin
+loop lives in `commands/dispatcher.rs`; model/tool iteration lives in
+`agent/turn_loop.rs`, compaction in `agent/compaction.rs`, and goal lifecycle
+integration in `agent/goal_runtime.rs`. The command flow is:
 
 1. Read command from stdin
 2. Match on command type (`send`, `steer`, `approve`, `set_key`, `login`, …)
@@ -85,7 +88,7 @@ until `finish` is called or the token budget is exhausted.
 
 **Source:** `core/src/main.rs`
 
-### Tool Dispatch (`tools.rs`, 5922 lines)
+### Tool system (`tools.rs`, `tooling/`)
 
 Every tool is defined as an OpenAI-compatible function-calling schema and
 executed by name. Tools are classified as:
@@ -99,14 +102,25 @@ executed by name. Tools are classified as:
   `web_search`, `browser/*`, `spawn`, `subagent`, `contact_supervisor`,
   `intercom`, `ask`
 
-`is_parallel_wave_tool()` distinguishes readonly tools (safe for concurrent
-execution) from mutating tools (sequential after approval gate).
+Schemas, metadata, policy, approval decisions, result statuses, and scheduling
+are separate modules under `tooling/`; git and memory/knowledge built-ins are
+separate executors. `is_parallel_wave_tool()` admits only explicitly safe tools;
+mutating tools remain sequential after the approval gate. Each admitted call
+receives a `ToolExecutionContext` containing workspace, session/run/tool-call
+identity, cancellation, approval mode, the central event capability, restricted
+secret accessors, configuration, and runtime resource registration. Sequential
+and parallel results re-check active identity before changing conversation or
+work state. Parallel waves use directly owned futures, so cancellation drops
+the tool futures and their `kill_on_drop` subprocesses instead of detaching work.
 
 **Source:** `core/src/tools.rs`
 
-### Provider Abstraction (`provider.rs`, 7850 lines)
+### Provider adapters (`provider.rs`, `providers/`)
 
-Abstracts OpenAI-compatible and Anthropic-compatible endpoints. Handles:
+Narrow adapters isolate OpenAI-compatible Chat Completions, Anthropic Messages,
+Codex Responses, and Google Code Assist request/stream semantics. Shared
+transport handles bounded SSE framing and retries; discovery and usage are
+separate modules. The provider layer handles:
 
 - Chat completion streaming over HTTP
 - Retry with exponential backoff and jitter
@@ -121,19 +135,41 @@ routing: each turn routes to the selected model's provider at runtime.
 
 **Source:** `core/src/provider.rs`
 
-### Session Persistence (`session.rs`, 611 lines)
+### Runtime ownership (`runtime/`)
+
+`RuntimeCoordinator` is the authority for current session/run identity,
+cancellation, event sequencing, stale-result rejection, and registered runtime
+resources. RAII resource leases cover session/run work and pending waiters.
+`runtime_status` returns a secret-free snapshot for diagnostics. The core builds
+its Tokio runtime with an explicit bounded 8 MiB worker stack, preventing the
+large instrumented agent-turn future from overflowing the default debug-build
+worker stack while retaining a fixed memory ceiling per worker.
+
+A session owns multiple foreground runs. `abort`, `reset`, `clear`, `new_session`,
+`load_session`, `cancel_goal`, shutdown, and steering all invalidate identity
+before awaiting bounded cleanup. Session replacement additionally cancels the
+session token. Pending approvals/asks/sudo waits are resolved, goal/subagent
+tokens are cancelled, intercom mailboxes are reset, and stale task-local event
+scopes are rejected. Only the lifecycle command emits the terminal cancellation
+event after invalidation; late child results cannot mutate state or write events.
+
+### Session Persistence (`session.rs`)
 
 Append-only JSONL conversation log. Design:
 
-- Schema-version header line (`{"_session_version": 1}`) for forward migration
+- Schema-version header line (`{"_session_version": 2}`); v1 files migrate
+  automatically and future versions are rejected
+- Append-only run start/terminal records distinguish completed, cancelled,
+  failed, and interrupted work
 - Each finalized message is appended and fsync'd at turn end
-- Crash mid-task loses at most the in-flight turn
-- `load()` replays existing sessions on startup, rejecting future versions
+- A malformed/truncated final record is reported and ignored; valid preceding
+  messages remain readable and unfinished runs become `interrupted`
+- Recovery never restarts destructive work automatically
 - Session files live under `~/.config/catalyst-code/sessions/`
 
 **Source:** `core/src/session.rs`
 
-### Memory Store (`memory.rs`, 2765 lines)
+### Memory Store (`memory.rs`)
 
 Persistent markdown-file memory store under
 `~/.config/catalyst-code/memory/<project-hash>/`. Features:
@@ -148,7 +184,14 @@ Persistent markdown-file memory store under
 
 **Source:** `core/src/memory.rs`, `core/src/embed.rs`, `core/src/learning_*.rs`
 
-### Subagent Orchestration (`subagent.rs`, 3662 lines)
+`core/src/memory_eval.rs` provides a deterministic synthetic-repository
+evaluation for exact path and symbol recall, architecture facts, user
+preferences, project/global scope, stale and contradictory facts, failure
+patterns, irrelevant suppression, and token budgets. Debug retrieval exposes
+lexical/sketch, recency, importance, scope, path/symbol, staleness, and
+contradiction components plus optional source session/run/time provenance.
+
+### Subagent Orchestration (`subagent.rs`)
 
 Nested agentic loops that share the workspace, tools, and API key but run with
 a focused system prompt and optional tool allowlist. Three execution modes:
@@ -168,12 +211,13 @@ Full guide: [`docs/guides/subagents.md`](../guides/subagents.md).
 
 **Source:** `core/src/subagent.rs`, `core/src/intercom.rs`
 
-### Goal Mode (`goal.rs`, 2473 lines)
+### Goal Mode (`goal.rs`)
 
 First-class plan-then-deploy orchestration via `/goal`. Phase machine:
 
 ```
-idle → planning → plan_ready (optional) → deploying → running → synthesizing → done|failed
+idle → planning → reviewing (CEO) → plan_ready → deploying → running
+     → verifying/replanning (CEO) or synthesizing → done|failed|cancelled
 ```
 
 The planning turn must call `goal_write_plan` with a structured plan. Deploy
@@ -196,6 +240,8 @@ and JSON response on stdout. Hook points include:
 
 Plugins can declare custom tools, OAuth providers, memory backends, and slash
 commands. Plugins from a repo load only with `--trust-project-plugins`.
+Plugins explicitly installed by the user carry an installation marker and do
+not require blanket repository trust.
 
 **Source:** `core/src/plugins.rs`
 

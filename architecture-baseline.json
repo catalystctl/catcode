@@ -1,0 +1,28 @@
+{
+  "process_spawns": {
+    "core/src/browser/headless_display.rs": 1,
+    "core/src/change_coupling.rs": 1,
+    "core/src/oauth.rs": 1,
+    "core/src/plugins.rs": 5,
+    "core/src/test_env.rs": 2,
+    "core/src/tooling/builtin/git.rs": 1,
+    "core/src/tools.rs": 3
+  },
+  "task_spawns": {
+    "core/src/fetch_tool.rs": 1,
+    "core/src/goal.rs": 1,
+    "core/src/agent/goal_runtime.rs": 3,
+    "core/src/agent/turn_loop.rs": 2,
+    "core/src/commands/dispatcher.rs": 6,
+    "core/src/main.rs": 6,
+    "core/src/provider.rs": 2,
+    "core/src/search_tool.rs": 1,
+    "core/src/subagent.rs": 1,
+    "core/src/tools.rs": 2
+  },
+  "megamodules": {
+    "core/src/main.rs": 5200,
+    "core/src/provider.rs": 4800,
+    "core/src/tools.rs": 4400
+  }
+}
