@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://catalystctl.dev/catcode/protocol.schema.json",
+  "title": "CatCode JSONL protocol v2",
+  "anyOf": [
+    { "$ref": "#/$defs/command" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "client": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "command": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "init", "set_key", "set_search_key", "set_provider",
+            "list_provider_presets", "login", "logout", "login_oauth",
+            "oauth_code", "send", "steer", "abort", "clear_queue",
+            "reset", "clear", "undo", "create_checkpoint",
+            "list_checkpoints", "restore_checkpoint", "compact",
+            "list_sessions", "load_session", "rename_session",
+            "delete_session", "pin_session", "new_session", "stats", "runtime_status",
+            "context", "usage", "approve", "set_approval", "set_config",
+            "install_plugin", "remove_plugin", "enable_plugin",
+            "disable_plugin", "list_plugins", "reload_plugins",
+            "plugin_command", "list_plugin_commands", "list_agents",
+            "refresh_memory", "save_memory", "list_memory", "forget_memory",
+            "intercom_reply", "ask_reply", "sudo_reply", "get_vision_config",
+            "set_vision_config", "list_skills", "apply_skill", "start_goal",
+            "cancel_goal", "goal_status", "approve_goal_plan", "revise_goal",
+            "user_bash"
+          ]
+        },
+        "protocol_version": { "type": "integer", "minimum": 1 },
+        "client": { "$ref": "#/$defs/client" }
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "required": ["type", "protocol_version"],
+      "properties": {
+        "type": {
+          "enum": [
+            "aborted", "agents", "approval_changed", "approval_expired",
+            "approval_request", "ask_request", "audit", "authed",
+            "bash_execution", "checkpoint_created", "checkpoint_restored",
+            "checkpoints", "compacted", "compacting", "config_changed",
+            "context_breakdown", "cost_update", "delta", "digested", "done",
+            "error", "file_change", "goal_certified", "goal_completion_summary",
+            "goal_iteration", "goal_phase", "goal_plan", "goal_review_verdict",
+            "goal_state", "goal_step_complete", "goal_step_verdict",
+            "goal_verify_verdict", "history", "http_retry", "info",
+            "intercom_message", "memory_list", "memory_saved", "metrics",
+            "models", "oauth_prompt", "plugin_commands", "plugin_disabled",
+            "plugin_enabled", "plugin_error", "plugin_installed", "plugin_removed",
+            "plugin_status", "plugins_list", "protocol_hello", "provider_changed",
+            "provider_presets", "ready", "reflecting", "reset", "run_cancelled",
+            "runtime_status", "search_key_set", "session_change_failed",
+            "session_changed", "session_deleted", "session_pinned",
+            "session_recovered", "session_renamed", "sessions", "skills", "stats",
+            "steer", "subagent_done", "subagent_message", "subagent_progress",
+            "subagent_start", "subagent_tool_call", "subagent_tool_result",
+            "sudo_request", "thinking", "tool_call", "tool_call_args",
+            "tool_call_name", "tool_call_start", "tool_result", "umans_conc",
+            "usage", "vision_config", "work_state", "worktree_cleaned",
+            "worktree_promoted", "worktree_ready", "worktree_seeded"
+          ]
+        },
+        "protocol_version": { "const": 2 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "sequence": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    }
+  }
+}
