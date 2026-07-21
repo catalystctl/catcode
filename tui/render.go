@@ -72,8 +72,8 @@ func (s *session) headerHeight() int { return lipgloss.Height(s.renderHeader()) 
 // viewChromeCache holds chrome strings built once per View so relayoutHeights
 // measure-by-render does not double-build the animated input / panels.
 type viewChromeCache struct {
-	header, footer, inputBox, activityShelf, goalPanel, mentionFlyout, positionBar string
-	headerOK, footerOK, inputOK, shelfOK, goalOK, mentionOK, posOK                 bool
+	header, footer, inputBox, activityShelf, goalPanel, mentionFlyout, positionBar, workingWave string
+	headerOK, footerOK, inputOK, shelfOK, goalOK, mentionOK, posOK, waveOK                      bool
 }
 
 func (s *session) beginViewChrome() { s.viewChrome = &viewChromeCache{} }
@@ -101,6 +101,7 @@ func (s *session) relayoutHeights() {
 	fixedExtra += s.mentionFlyoutHeight()
 	fixedExtra += s.activityShelfHeight() + s.oauthBannerHeight()
 	fixedExtra += s.goalProgressPanelHeight()
+	fixedExtra += s.workingWaveHeight()
 	// Space left for the viewport + the active-tasks panel, leaving 1 line of
 	// slack for v2's cursed renderer (it scrolls/overlaps when the view fills
 	// the terminal exactly).
@@ -935,6 +936,85 @@ func blendRGB(base, target [3]int, t float64) [3]int {
 	}
 }
 
+// workingWave animation tuning. The travel cycle is short enough to read as
+// motion at the 10 FPS busy clock; the slower breath keeps long runs from
+// looking metronomic.
+const (
+	workingWaveCycle  = 1600 * time.Millisecond // one full wave travel
+	workingWaveBreath = 2500 * time.Millisecond // amplitude breathing cycle
+)
+
+// workingWaveRamp maps a 0..1 level to a sparkline glyph.
+var workingWaveRamp = []rune{' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+
+// renderWorkingWave draws the one-line "agent is working" pulse directly above
+// the composer: a full-width sparkline whose cell heights follow two traveling
+// sine waves, colored per cell from the dim rail up to the accent at the
+// crests (aurora / audio-waveform feel). The busy clock (busyFrameTick)
+// re-renders View ~10x/s while busy, so the time-based phase animates without
+// a dedicated ticker.
+func (s *session) renderWorkingWave() string {
+	if s.viewChrome != nil && s.viewChrome.waveOK {
+		return s.viewChrome.workingWave
+	}
+	out := s.renderWorkingWaveUncached()
+	if s.viewChrome != nil {
+		s.viewChrome.workingWave = out
+		s.viewChrome.waveOK = true
+	}
+	return out
+}
+
+func (s *session) renderWorkingWaveUncached() string {
+	if !s.busy {
+		return ""
+	}
+	w := s.width
+	if w < 1 {
+		w = 1
+	}
+	cells := make([]string, w)
+	if s.motionReduced() {
+		// Static stand-in: a steady dim mid-level line, no time-based phase.
+		mid := string(workingWaveRamp[len(workingWaveRamp)/2])
+		for x := range cells {
+			cells[x] = dimStyle.Render(mid)
+		}
+		return strings.Join(cells, "")
+	}
+	phase := float64(time.Now().UnixNano()%int64(workingWaveCycle)) / float64(int64(workingWaveCycle))
+	breath := float64(time.Now().UnixNano()%int64(workingWaveBreath)) / float64(int64(workingWaveBreath))
+	amp := 0.7 + 0.3*math.Sin(2*math.Pi*breath)
+	l1 := float64(w) / 2.5
+	l2 := float64(w) / 5
+	base := hexRGB(c.railDim)
+	accent := hexRGB(c.accent)
+	for x := 0; x < w; x++ {
+		v := 0.55*math.Sin(2*math.Pi*(float64(x)/l1)-2*math.Pi*phase) +
+			0.45*math.Sin(2*math.Pi*(float64(x)/l2)+2*math.Pi*phase*0.6)
+		level := (v + 1) / 2 * amp
+		// Fade the outer ~2 cells so the wave melts into the margins.
+		if edge := math.Min(float64(x), float64(w-1-x)) / 2; edge < 1 {
+			level *= edge
+		}
+		level = math.Min(math.Max(level, 0), 1)
+		ri := int(level*float64(len(workingWaveRamp)-1) + 0.5)
+		rgb := blendRGB(base, accent, level)
+		cells[x] = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", rgb[0], rgb[1], rgb[2]))).
+			Render(string(workingWaveRamp[ri]))
+	}
+	return strings.Join(cells, "")
+}
+
+func (s *session) workingWaveHeight() int {
+	wv := s.renderWorkingWave()
+	if wv == "" {
+		return 0
+	}
+	return lipgloss.Height(wv)
+}
+
 // maxInputLines caps the input box height: a very long message shows a
 // cursor-centered window (with … markers) instead of consuming the screen.
 const maxInputLines = 5
@@ -1557,6 +1637,9 @@ func (s *session) View() tea.View {
 		}
 		if f := s.renderMentionFlyout(); f != "" {
 			parts = append(parts, f)
+		}
+		if wv := s.renderWorkingWave(); wv != "" {
+			parts = append(parts, wv)
 		}
 		parts = append(parts, s.renderInputBox(), s.renderFooter())
 		view := strings.Join(parts, "\n")
