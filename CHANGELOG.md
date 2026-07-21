@@ -2,6 +2,23 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-07-21
+
+- **feat(packaging): add Homebrew tap (cask + formula) with release automation** [1cf1193]
+  Catalyst Code is now installable via Homebrew from a `catalystctl/homebrew-catcode`
+  tap. Ships both an arch-aware (arm64/x86_64) cask (installs the per-arch `.dmg`
+  via the `binary` stanza) and a formula (raw prebuilt binary) for the standalone
+  `catcode` CLI; the optional web frontend is wired via `caveats` pointing at
+  `install-web.sh` (it needs Node + a launchd service, so it isn't a cask/formula).
+  Placeholder templates live at `packaging/homebrew/{Casks,Formula}/`; a
+  `homebrew-tap.yml` workflow renders them with the real version + per-arch sha256
+  on each `v*` release and pushes to the tap via a `HOMEBREW_TAP_TOKEN` secret
+  (gated to `v*` tags — SHA versions aren't monotonic, so `brew upgrade` can't
+  rank them). Also fixes `release.yml` so `v*` tags name artifacts with the semver
+  instead of the commit SHA — was breaking `install.sh` on tagged releases and
+  brew version↔url consistency. One-time setup: create the empty public
+  `catalystctl/homebrew-catcode` repo and add the `HOMEBREW_TAP_TOKEN` secret.
+
 ## 2026-07-12
 
 - **feat(core): compaction reliability + deferred tool-schema staging** [6a48bd4]
