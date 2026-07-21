@@ -18,6 +18,7 @@
 #   bash install.sh --status               # show the current install state
 #   bash install.sh --version 0.2.0        # pin a version
 #   bash install.sh --base-url <url>       # download from a mirror (not GitHub)
+#   bash install.sh --expose intranet      # CORS/exposure: local|intranet|public
 #   bash install.sh --build-from-source    # fall back to cargo+go+next build
 #
 # Options:
@@ -38,12 +39,26 @@
 #                         on macOS)
 #   --port <n>            web service port      (default: 49283)
 #   --host <h>            web bind host         (default: 0.0.0.0)
+#   --expose <mode>       CORS/exposure mode: local|intranet|public (default: intranet)
+#                         local=loopback only; intranet=LAN (auto-detected origin);
+#                         public=internet (requires --origin, use a TLS reverse proxy)
+#   --origin <url>        canonical origin (CATCODE_WEB_ORIGIN); overrides --expose derivation
+#                         e.g. https://code.example.com or http://192.168.1.50:49283
+#   --trusted-origins <list>  additional trusted origins for better-auth CSRF (BETTER_AUTH_TRUSTED_ORIGINS,
+#                         comma-separated; for a proxy/multi-domain setup, e.g.
+#                         https://code.example.com,https://staging.example.com)
+#   --workspace <path>    default workspace the core opens (CATALYST_CODE_WORKSPACE)
+#   --shell <path>        terminal shell for the web terminal (SHELL; default: platform)
+#   --idle-gc-ms <n>      idle live-session GC interval in ms (UMANS_WEB_IDLE_GC_MS; 0=disable)
+#   --installer-url <u>   self-update install.sh URL (CATCODE_INSTALLER_URL)
+#   --windows-installer-url <u>  self-update install.ps1 URL (CATCODE_WINDOWS_INSTALLER_URL)
 #   --skip-service        install web files only (do not write/start systemd/launchd)
 #   --force-web-service   replace a non-installer-managed catalyst-code-web unit
 #   --log-file <path>     write a log here      (default: ~/catalyst-code-install.log)
 #   --no-log              disable logging
 #   --no-color           disable ANSI colors
-#   (interactive menu also offers Customize install settings: prefix/web-dir/port/host/version/base-url)
+#   (interactive menu also offers Customize install settings: prefix/web-dir/port/expose/origin/version/base-url
+#    + an optional advanced-settings sub-prompt for workspace/shell/idle-gc/installer-urls)
 #   --dry-run            print the plan, execute nothing
 #   -h, --help           show this help
 # ============================================================
@@ -56,6 +71,8 @@ GITHUB_REPO="catalystctl/catcode"
 DEFAULT_PREFIX="/usr/local/bin"
 DEFAULT_PORT="49283"
 DEFAULT_HOST="0.0.0.0"
+DEFAULT_EXPOSE="intranet"   # local | intranet | public (see --expose)
+DEFAULT_IDLE_GC_MS="7200000"  # 2h — UMANS_WEB_IDLE_GC_MS
 STATE_FILE="/etc/catalyst-code/installer.state"
 UNIT_NAME="catalyst-code-web.service"   # systemd unit (Linux)
 LAUNCHD_LABEL="com.catalyst-code.web"   # launchd agent (macOS)
@@ -82,7 +99,22 @@ WEB_DIR_OVERRIDE=""
 REPO_OVERRIDE=""
 PREFIX="$DEFAULT_PREFIX"
 PORT="$DEFAULT_PORT"
-HOST="$DEFAULT_HOST"
+HOST=""               # resolved by resolve_expose() from --host / --expose
+# ── web-service env knobs (all adjustable; empty = omit from unit) ──
+EXPOSE_MODE="$DEFAULT_EXPOSE"
+ORIGIN_OVERRIDE=""      # --origin  (CATCODE_WEB_ORIGIN)
+WORKSPACE=""           # --workspace (CATALYST_CODE_WORKSPACE)
+TERM_SHELL=""          # --shell   (stamped as SHELL)
+IDLE_GC_MS=""          # --idle-gc-ms (UMANS_WEB_IDLE_GC_MS)
+INSTALLER_URL=""       # --installer-url (CATCODE_INSTALLER_URL)
+WIN_INSTALLER_URL=""   # --windows-installer-url (CATCODE_WINDOWS_INSTALLER_URL)
+TRUSTED_ORIGINS=""    # --trusted-origins (BETTER_AUTH_TRUSTED_ORIGINS, comma-separated)
+# CLI-intent captures: NOT persisted in state, so they survive load_state's
+# `source` and re-apply on update/reinstall/add-web (where state clobbers the
+# effective vars). parse_args sets both the effective var AND its WANT_* twin.
+WANT_EXPOSE=""; WANT_PORT=""; WANT_HOST=""; WANT_ORIGIN=""; WANT_WORKSPACE=""; WANT_SHELL=""
+WANT_IDLE_GC=""; WANT_INSTALLER_URL=""; WANT_WIN_INSTALLER_URL=""; WANT_TRUSTED_ORIGINS=""
+ORIGIN=""              # resolved canonical origin (CATCODE_WEB_ORIGIN value)
 LOG_FILE="${HOME}/catalyst-code-install.log"
 NO_COLOR_FLAG=false
 LOG_ENABLED=false
@@ -225,6 +257,127 @@ ver_ge() {
   }'
 }
 
+# ── web-service env: exposure mode + origin + bind ──────────
+# Derive the primary non-loopback IPv4 of this host (for --expose intranet's
+# auto-origin). Returns the IP on stdout, empty + non-zero on failure.
+detect_lan_ip() {
+  local ip="" iface=""
+  case "$PLATFORM" in
+    Linux)
+      # src IP used to reach the internet — most reliable primary-LAN address.
+      ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' | head -1)"
+      [[ -z "$ip" ]] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      ;;
+    Darwin)
+      iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+      [[ -n "$iface" ]] && ip="$(ipconfig getifaddr "$iface" 2>/dev/null)"
+      [[ -z "$ip" ]] && ip="$(ipconfig getifaddr en0 2>/dev/null)"
+      ;;
+  esac
+  # validate: present, IPv4-looking, not loopback / not-any.
+  if [[ -n "$ip" && "$ip" != 127.* && "$ip" != 0.* && "$ip" != 169.254.* ]]; then
+    printf '%s' "$ip"; return 0
+  fi
+  return 1
+}
+
+# Resolve bind HOST + canonical ORIGIN from EXPOSE_MODE (+ overrides).
+#   --host   (WANT_HOST)            wins over the mode-derived bind
+#   --origin (ORIGIN_OVERRIDE)       wins over the mode-derived origin
+# Precedence for HOST:  WANT_HOST → mode (local=127.0.0.1, else 0.0.0.0).
+# Precedence for ORIGIN: ORIGIN_OVERRIDE → mode derivation.
+resolve_expose() {
+  if [[ -n "${WANT_HOST:-}" ]]; then
+    HOST="$WANT_HOST"
+  else
+    case "$EXPOSE_MODE" in
+      local)    HOST="127.0.0.1" ;;
+      intranet|public) HOST="0.0.0.0" ;;
+      *) die "unknown --expose mode: $EXPOSE_MODE (use local|intranet|public)" ;;
+    esac
+  fi
+  if [[ -n "${ORIGIN_OVERRIDE:-}" ]]; then
+    ORIGIN="$ORIGIN_OVERRIDE"
+  else
+    case "$EXPOSE_MODE" in
+      local)
+        ORIGIN="http://localhost:${PORT}"
+        ;;
+      intranet)
+        local lan_ip
+        if lan_ip="$(detect_lan_ip)"; then
+          ORIGIN="http://${lan_ip}:${PORT}"
+        else
+          ORIGIN="http://localhost:${PORT}"
+          log_warn "could not auto-detect a LAN IP for --expose intranet; non-loopback auth will fail until you set --origin http://<lan-ip>:${PORT}"
+        fi
+        ;;
+      public)
+        die "--expose public requires --origin <url> (your public/tunnel URL, e.g. https://code.example.com)"
+        ;;
+    esac
+  fi
+}
+
+# Apply CLI overrides that load_state may have clobbered (WANT_* survive
+# sourcing because they are NOT written to the state file), default the
+# exposure mode, then derive bind+origin. Call once in each install action
+# dispatcher, AFTER state has been loaded (for update/reinstall/add-web) and
+# AFTER parse_args/prompt_install_options (for fresh install).
+finalize_web_env() {
+  # Bind/origin only matter for the web service. Skip for TUI-only installs so a
+  # stray --expose/--origin can't crash a non-web install, and so we don't die
+  # on `--expose public` when no web is being installed.
+  if ! $WITH_WEB; then return 0; fi
+  [[ -n "${WANT_PORT:-}" ]]           && PORT="$WANT_PORT"
+  [[ -n "${WANT_HOST:-}" ]]          && HOST="$WANT_HOST"
+  [[ -n "${WANT_EXPOSE:-}" ]]        && EXPOSE_MODE="$WANT_EXPOSE"
+  [[ -n "${WANT_ORIGIN:-}" ]]        && ORIGIN_OVERRIDE="$WANT_ORIGIN"
+  [[ -n "${WANT_WORKSPACE:-}" ]]    && WORKSPACE="$WANT_WORKSPACE"
+  [[ -n "${WANT_SHELL:-}" ]]         && TERM_SHELL="$WANT_SHELL"
+  [[ -n "${WANT_IDLE_GC:-}" ]]       && IDLE_GC_MS="$WANT_IDLE_GC"
+  [[ -n "${WANT_INSTALLER_URL:-}" ]] && INSTALLER_URL="$WANT_INSTALLER_URL"
+  [[ -n "${WANT_WIN_INSTALLER_URL:-}" ]] && WIN_INSTALLER_URL="$WANT_WIN_INSTALLER_URL"
+  [[ -n "${WANT_TRUSTED_ORIGINS:-}" ]] && TRUSTED_ORIGINS="$WANT_TRUSTED_ORIGINS"
+  [[ -z "${EXPOSE_MODE:-}" ]] && EXPOSE_MODE="$DEFAULT_EXPOSE"
+  # (Re-)derive bind+origin when a CLI override is present, or when no resolved
+  # origin exists yet (fresh install / old state). A plain update keeps the
+  # previously-resolved ORIGIN+HOST so a stable install doesn't churn.
+  if [[ -n "${ORIGIN_OVERRIDE:-}" || -n "${WANT_EXPOSE:-}" || -n "${WANT_HOST:-}" || -z "${ORIGIN:-}" ]]; then
+    resolve_expose
+  fi
+}
+
+# Emit `Environment=KEY=value` lines for the systemd unit (one per line).
+systemd_env_lines() {
+  printf 'Environment=NODE_ENV=production\n'
+  printf 'Environment=PORT=%s\n' "$PORT"
+  printf 'Environment=HOSTNAME=%s\n' "$HOST"
+  printf 'Environment=CATCODE_CORE=%s\n' "$PREFIX/catcode-core"
+  [[ -n "$ORIGIN" ]]            && printf 'Environment=CATCODE_WEB_ORIGIN=%s\n' "$ORIGIN"
+  [[ -n "$WORKSPACE" ]]         && printf 'Environment=CATALYST_CODE_WORKSPACE=%s\n' "$WORKSPACE"
+  [[ -n "$TERM_SHELL" ]]        && printf 'Environment=SHELL=%s\n' "$TERM_SHELL"
+  [[ -n "$IDLE_GC_MS" ]]        && printf 'Environment=UMANS_WEB_IDLE_GC_MS=%s\n' "$IDLE_GC_MS"
+  [[ -n "$INSTALLER_URL" ]]     && printf 'Environment=CATCODE_INSTALLER_URL=%s\n' "$INSTALLER_URL"
+  [[ -n "$WIN_INSTALLER_URL" ]] && printf 'Environment=CATCODE_WINDOWS_INSTALLER_URL=%s\n' "$WIN_INSTALLER_URL"
+  [[ -n "$TRUSTED_ORIGINS" ]] && printf 'Environment=BETTER_AUTH_TRUSTED_ORIGINS=%s\n' "$TRUSTED_ORIGINS"
+}
+
+# Emit launchd <key>/<string> pairs (4-space indent) for the EnvironmentVariables dict.
+launchd_env_pairs() {
+  printf '    <key>NODE_ENV</key>\n    <string>production</string>\n'
+  printf '    <key>PORT</key>\n    <string>%s</string>\n' "$PORT"
+  printf '    <key>HOSTNAME</key>\n    <string>%s</string>\n' "$HOST"
+  printf '    <key>CATCODE_CORE</key>\n    <string>%s</string>\n' "$PREFIX/catcode-core"
+  [[ -n "$ORIGIN" ]]            && printf '\n    <key>CATCODE_WEB_ORIGIN</key>\n    <string>%s</string>' "$ORIGIN"
+  [[ -n "$WORKSPACE" ]]         && printf '\n    <key>CATALYST_CODE_WORKSPACE</key>\n    <string>%s</string>' "$WORKSPACE"
+  [[ -n "$TERM_SHELL" ]]        && printf '\n    <key>SHELL</key>\n    <string>%s</string>' "$TERM_SHELL"
+  [[ -n "$IDLE_GC_MS" ]]        && printf '\n    <key>UMANS_WEB_IDLE_GC_MS</key>\n    <string>%s</string>' "$IDLE_GC_MS"
+  [[ -n "$INSTALLER_URL" ]]     && printf '\n    <key>CATCODE_INSTALLER_URL</key>\n    <string>%s</string>' "$INSTALLER_URL"
+  [[ -n "$WIN_INSTALLER_URL" ]] && printf '\n    <key>CATCODE_WINDOWS_INSTALLER_URL</key>\n    <string>%s</string>' "$WIN_INSTALLER_URL"
+  [[ -n "$TRUSTED_ORIGINS" ]] && printf '\n    <key>BETTER_AUTH_TRUSTED_ORIGINS</key>\n    <string>%s</string>' "$TRUSTED_ORIGINS"
+}
+
 # ── banner / box ─────────────────────────────────────────────
 print_box() {
   local title="$1"; shift
@@ -281,8 +434,16 @@ parse_args() {
       --web-dir)            [[ $# -ge 2 ]] || die "--web-dir requires a path"; WEB_DIR_OVERRIDE="$2"; shift ;;
       --repo)               [[ $# -ge 2 ]] || die "--repo requires a URL"; REPO_OVERRIDE="$2"; shift ;;
       --prefix)             [[ $# -ge 2 ]] || die "--prefix requires a path"; PREFIX="$2"; shift ;;
-      --port)               [[ $# -ge 2 ]] || die "--port requires a number"; PORT="$2"; shift ;;
-      --host)               [[ $# -ge 2 ]] || die "--host requires a value"; HOST="$2"; shift ;;
+      --port)               [[ $# -ge 2 ]] || die "--port requires a number"; PORT="$2"; WANT_PORT="$2"; shift ;;
+      --host)               [[ $# -ge 2 ]] || die "--host requires a value"; WANT_HOST="$2"; shift ;;
+      --expose)             [[ $# -ge 2 ]] || die "--expose requires a mode"; case "$2" in local|intranet|public) ;; *) die "--expose must be local|intranet|public (got: $2)";; esac; EXPOSE_MODE="$2"; WANT_EXPOSE="$2"; shift ;;
+      --origin)             [[ $# -ge 2 ]] || die "--origin requires a URL"; ORIGIN_OVERRIDE="$2"; WANT_ORIGIN="$2"; shift ;;
+      --workspace)          [[ $# -ge 2 ]] || die "--workspace requires a path"; WORKSPACE="$2"; WANT_WORKSPACE="$2"; shift ;;
+      --shell)              [[ $# -ge 2 ]] || die "--shell requires a path"; TERM_SHELL="$2"; WANT_SHELL="$2"; shift ;;
+      --idle-gc-ms)         [[ $# -ge 2 ]] || die "--idle-gc-ms requires a number"; IDLE_GC_MS="$2"; WANT_IDLE_GC="$2"; shift ;;
+      --installer-url)      [[ $# -ge 2 ]] || die "--installer-url requires a URL"; INSTALLER_URL="$2"; WANT_INSTALLER_URL="$2"; shift ;;
+      --windows-installer-url) [[ $# -ge 2 ]] || die "--windows-installer-url requires a URL"; WIN_INSTALLER_URL="$2"; WANT_WIN_INSTALLER_URL="$2"; shift ;;
+      --trusted-origins)    [[ $# -ge 2 ]] || die "--trusted-origins requires a comma-separated list"; TRUSTED_ORIGINS="$2"; WANT_TRUSTED_ORIGINS="$2"; shift ;;
       --log-file)           [[ $# -ge 2 ]] || die "--log-file requires a path"; LOG_FILE="$2"; shift ;;
       --no-log)             LOG_FILE="" ;;
       --no-color)           NO_COLOR_FLAG=true ;;
@@ -302,7 +463,7 @@ setup_log() {
   fi
   LOG_ENABLED=true
   _log "===== catalyst-code install.sh — $(date -u +%FT%TZ) ====="
-  _log "action=$ACTION dry_run=$DRY_RUN build_from_source=$BUILD_FROM_SOURCE with_web=$WITH_WEB prefix=$PREFIX port=$PORT host=$HOST"
+  _log "action=$ACTION dry_run=$DRY_RUN build_from_source=$BUILD_FROM_SOURCE with_web=$WITH_WEB prefix=$PREFIX port=$PORT host=$HOST expose=$EXPOSE_MODE origin=${ORIGIN_OVERRIDE:-<derived>}"
 }
 
 # ── sudo ─────────────────────────────────────────────────────
@@ -623,10 +784,7 @@ Wants=network-online.target
 Type=simple
 User=$INSTALL_USER
 WorkingDirectory=$WEB_DIR
-Environment=NODE_ENV=production
-Environment=PORT=$PORT
-Environment=HOSTNAME=$HOST
-Environment=CATCODE_CORE=$PREFIX/catcode-core
+$(systemd_env_lines)
 ExecStart=$RT_BIN $WEB_DIR/start.js
 Restart=on-failure
 RestartSec=3
@@ -673,14 +831,7 @@ install_web_launchd_download() {
   <string>${WEB_DIR}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>NODE_ENV</key>
-    <string>production</string>
-    <key>PORT</key>
-    <string>${PORT}</string>
-    <key>HOSTNAME</key>
-    <string>${HOST}</string>
-    <key>CATCODE_CORE</key>
-    <string>${PREFIX}/catcode-core</string>
+$(launchd_env_pairs)
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -922,9 +1073,7 @@ Wants=network-online.target
 Type=simple
 User=$INSTALL_USER
 WorkingDirectory=$REPO_DIR/web
-Environment=NODE_ENV=production
-Environment=PORT=$PORT
-Environment=CATCODE_CORE=$PREFIX/catcode-core
+$(systemd_env_lines)
 ExecStart=$exec_start
 Restart=on-failure
 RestartSec=3
@@ -972,12 +1121,7 @@ install_web_launchd_source() {
   <string>${REPO_DIR}/web</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>NODE_ENV</key>
-    <string>production</string>
-    <key>PORT</key>
-    <string>${PORT}</string>
-    <key>CATCODE_CORE</key>
-    <string>${PREFIX}/catcode-core</string>
+$(launchd_env_pairs)
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -1118,6 +1262,15 @@ ORIGIN_URL="${ORIGIN_URL:-}"
 PREFIX="$PREFIX"
 PORT="$PORT"
 HOST="$HOST"
+EXPOSE_MODE="$EXPOSE_MODE"
+ORIGIN_OVERRIDE="${ORIGIN_OVERRIDE:-}"
+ORIGIN="${ORIGIN:-}"
+WORKSPACE="${WORKSPACE:-}"
+TERM_SHELL="${TERM_SHELL:-}"
+IDLE_GC_MS="${IDLE_GC_MS:-}"
+INSTALLER_URL="${INSTALLER_URL:-}"
+WIN_INSTALLER_URL="${WIN_INSTALLER_URL:-}"
+TRUSTED_ORIGINS="${TRUSTED_ORIGINS:-}"
 RUNTIME="${RUNTIME:-}"
 WEB_DIR="${WEB_DIR:-}"
 WEB_INSTALLED="$web_flag"
@@ -1144,6 +1297,7 @@ load_state() {
 
 # ── actions ──────────────────────────────────────────────────
 do_install() {
+  finalize_web_env
   if $BUILD_FROM_SOURCE; then
     do_install_source
   else
@@ -1156,6 +1310,8 @@ do_update() {
   if ! load_state; then
     die "no previous install found at $STATE_FILE — run 'bash install.sh' first."
   fi
+  [[ "${WEB_INSTALLED:-no}" == yes ]] && WITH_WEB=true
+  finalize_web_env
   if [[ "${METHOD:-download}" == "source" ]]; then
     do_update_source
   else
@@ -1215,6 +1371,7 @@ do_add_web() {
     log_warn "web service is already installed — reinstalling it"
   fi
   WITH_WEB=true
+  finalize_web_env
   if ! $SKIP_SERVICE; then
     protect_existing_web_service
   fi
@@ -1280,6 +1437,7 @@ do_reinstall() {
   VERSION_OVERRIDE="${VERSION:-}"
   [[ "${WEB_INSTALLED:-no}" == yes ]] && WITH_WEB=true
   log_info "Reinstalling version ${VERSION:-latest} (method: ${METHOD:-download}, web: ${WEB_INSTALLED:-no})"
+  finalize_web_env
   if [[ "${METHOD:-download}" == "source" ]]; then
     do_reinstall_source
   else
@@ -1328,6 +1486,8 @@ do_status() {
   if [[ "${WEB_INSTALLED:-no}" == yes ]]; then
     log_info "Web dir:      ${WEB_DIR:-(unknown)}"
     log_info "Web address:  http://${HOST:-0.0.0.0}:${PORT:-49283}"
+    log_info "Expose:       ${EXPOSE_MODE:-(unknown)}"
+    [[ -n "${ORIGIN:-}" ]] && log_info "Origin:       ${ORIGIN}"
   fi
   log_info "Installed at: ${INSTALLED_AT:-(unknown)}"
   if [[ -x "${PREFIX:-/usr/local/bin}/catcode" ]]; then
@@ -1359,11 +1519,15 @@ summary_install() {
       svc_line="service:   $svc_id  (enabled, auto-restart)"
     fi
   fi
+  local expose_line=""
+  $WITH_WEB && expose_line="expose:    ${EXPOSE_MODE}  origin: ${ORIGIN:-<auto>}"
   print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" \
     "tui:       $PREFIX/catcode" \
     "core:      $PREFIX/catcode-core" \
     "web:       $web_line" \
+    "$expose_line" \
     "$svc_line" \
+
     "update:    catcode --update  (or bash install.sh --update)" \
     "uninstall: bash install.sh --uninstall" \
     "log:       ${LOG_FILE:-<disabled>}"
@@ -1386,10 +1550,13 @@ summary_install() {
 summary_update() {
   local web_line="(web service not installed)"
   [[ "${WEB_INSTALLED:-no}" == yes ]] && web_line="http://${HOST}:${PORT}  (restarted)"
+  local expose_line=""
+  [[ "${WEB_INSTALLED:-no}" == yes ]] && expose_line="expose: ${EXPOSE_MODE}  origin: ${ORIGIN:-<auto>}"
   print_box "✓  Updated  ${APP_NAME}  v${VERSION_DETECTED}" \
     "tui:    $PREFIX/catcode" \
     "core:   $PREFIX/catcode-core" \
     "web:    $web_line" \
+    "$expose_line" \
     "source: ${METHOD:-download} @ ${BASE_URL:-${REPO_DIR:-<unknown>}}"
   log_info "Run the TUI with:  catcode"
 }
@@ -1412,6 +1579,7 @@ summary_add_web() {
   print_box "✓  Web service added  ${APP_NAME}  v${VERSION_DETECTED}" \
     "core:      $PREFIX/catcode-core" \
     "web:       http://${HOST}:${PORT}  (running as $svc_id)" \
+    "expose:    ${EXPOSE_MODE}  origin: ${ORIGIN:-<auto>}" \
     "service:   $svc_id  (enabled, auto-restart)" \
     "update:    catcode --update  (or bash install.sh --update)" \
     "uninstall: bash install.sh --uninstall"
@@ -1463,7 +1631,7 @@ prompt_install_options() {
   case "${customize:-}" in
     y|Y|yes|YES) ;;
     *)
-      log_info "Using defaults (prefix=$PREFIX port=$PORT host=$HOST)"
+      log_info "Using defaults (prefix=$PREFIX port=$PORT expose=$EXPOSE_MODE)"
       return 0
       ;;
   esac
@@ -1496,21 +1664,54 @@ prompt_install_options() {
     while true; do
       v="$(prompt_value "Web service port" "$PORT")"
       if [[ "$v" =~ ^[0-9]+$ ]] && ((10#$v >= 1 && 10#$v <= 65535)); then
-        PORT="$v"
+        PORT="$v"; WANT_PORT="$v"
         break
       fi
       printf "  ${C_YELLOW}port must be an integer 1–65535${C_RST}\n"
     done
 
-    v="$(prompt_value "Web bind host" "$HOST")"
-    HOST="$v"
+    # Expose mode + canonical origin (drives bind host + CATCODE_WEB_ORIGIN).
+    v="$(prompt_value "Expose mode (local|intranet|public)" "${EXPOSE_MODE}")"
+    case "$v" in
+      local|intranet|public) EXPOSE_MODE="$v"; WANT_EXPOSE="$v" ;;
+      *) log_warn "invalid expose mode '$v' — keeping ${EXPOSE_MODE}" ;;
+    esac
+    if [[ "$EXPOSE_MODE" == "public" ]]; then
+      v="$(prompt_value "Public origin URL (https://…)" "${ORIGIN_OVERRIDE}")"
+      [[ -n "$v" ]] && ORIGIN_OVERRIDE="$v"
+    elif [[ "$EXPOSE_MODE" == "intranet" ]]; then
+      local lan_ip
+      if lan_ip="$(detect_lan_ip 2>/dev/null)"; then
+        log_info "Detected LAN IP: $lan_ip (origin → http://$lan_ip:$PORT)"
+      else
+        log_warn "no LAN IP detected — set the origin override below for non-loopback access"
+      fi
+      v="$(prompt_value "Origin URL override (Enter = auto-detect)" "${ORIGIN_OVERRIDE}")"
+      [[ -n "$v" ]] && ORIGIN_OVERRIDE="$v"
+    fi
+
+    # Advanced web-service envs (optional).
+    local advanced=""
+    read -rp "  ${C_CYAN}Show advanced web settings${C_RST} ${C_DIM}(workspace, shell, idle-gc, installer URLs)?${C_RST} [y/N]: " advanced || true
+    case "${advanced:-}" in
+      y|Y|yes|YES)
+        v="$(prompt_value "Default workspace (core opens here)" "${WORKSPACE}")"; WORKSPACE="$v"; WANT_WORKSPACE="$v"
+        v="$(prompt_value "Terminal shell (e.g. /bin/bash, /bin/zsh)" "${TERM_SHELL}")"; TERM_SHELL="$v"; WANT_SHELL="$v"
+        v="$(prompt_value "Idle session GC ms (0=disable)" "${IDLE_GC_MS:-$DEFAULT_IDLE_GC_MS}")"; IDLE_GC_MS="$v"; WANT_IDLE_GC="$v"
+        v="$(prompt_value "Self-update installer URL (install.sh)" "${INSTALLER_URL}")"; INSTALLER_URL="$v"; WANT_INSTALLER_URL="$v"
+        v="$(prompt_value "Self-update Windows installer URL (install.ps1)" "${WIN_INSTALLER_URL}")"; WIN_INSTALLER_URL="$v"; WANT_WIN_INSTALLER_URL="$v"
+        v="$(prompt_value "Additional trusted origins (comma-sep, for proxy/multi-domain)" "${TRUSTED_ORIGINS}")"; TRUSTED_ORIGINS="$v"; WANT_TRUSTED_ORIGINS="$v"
+        ;;
+    esac
   fi
 
   printf "\n"
-  log_ok "Will use: prefix=$PREFIX  port=$PORT  host=$HOST"
+  log_ok "Will use: prefix=$PREFIX  port=$PORT  expose=$EXPOSE_MODE"
+  [[ -n "$ORIGIN_OVERRIDE" ]] && log_ok "origin: $ORIGIN_OVERRIDE"
   [[ -n "$VERSION_OVERRIDE" ]] && log_ok "version pin: $VERSION_OVERRIDE"
   [[ -n "$BASE_URL_OVERRIDE" ]] && log_ok "base URL: $BASE_URL_OVERRIDE"
   [[ -n "$WEB_DIR_OVERRIDE" ]] && log_ok "web dir: $WEB_DIR_OVERRIDE"
+  [[ -n "$WORKSPACE" ]] && log_ok "workspace: $WORKSPACE"
 }
 
 # ── interactive menu (no args + a terminal) ──────────────────

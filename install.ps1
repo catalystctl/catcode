@@ -88,6 +88,14 @@ param(
     [int]$Port = 49283,
     [string]$BindHost = '0.0.0.0',
     [string]$WebDir = '',
+    [string]$Expose = 'intranet',
+    [string]$Origin = '',
+    [string]$Workspace = '',
+    [string]$Shell = '',
+    [string]$IdleGcMs = '',
+    [string]$InstallerUrl = '',
+    [string]$WindowsInstallerUrl = '',
+    [string]$TrustedOrigins = '',
     [switch]$Update,
     [switch]$Uninstall,
     [switch]$AddWeb,
@@ -119,6 +127,24 @@ if (-not $WebDir)     { $WebDir     = Join-Path $DataDir 'web' }
 # mirror the -WithWeb switch into a script-scoped flag (so -Update can set it
 # from the recorded install state).
 $script:WithWeb = [bool]$WithWeb
+
+# -- web-service env knobs (resolved at install time; empty = omit from env) --
+$script:Expose          = $Expose
+$script:ResolvedOrigin          = ''
+$script:OriginOverride  = $Origin
+$script:Workspace       = $Workspace
+$script:ShellVar        = $Shell         # stamped as SHELL=...
+$script:IdleGcMs        = $IdleGcMs
+$script:InstallerUrl    = $InstallerUrl
+$script:WinInstallerUrl = $WindowsInstallerUrl
+$script:TrustedOrigins = $TrustedOrigins
+$script:ResolvedHost    = ''             # bind host derived from -Expose/-BindHost
+# which params were explicitly passed (so update/reinstall/add-web restore the
+# rest from saved state instead of falling back to param defaults).
+$CliParams = @{}; foreach ($k in $PSBoundParameters.Keys) { $CliParams[$k] = $true }
+# loaded install state (null for a fresh install); Finalize-WebEnv restores
+# saved env values from it so an update keeps the installed config.
+$script:State = $null
 
 # -- helpers --------------------------------------------------
 function W-Info($t) { if ($NoColor) { Write-Host "  $t" } else { Write-Host "  $t" -ForegroundColor Cyan } }
@@ -165,6 +191,15 @@ function Show-Help {
     -WithWeb            also install the web frontend service
     -Port <n>           web service port          (default: 49283)
     -BindHost <h>       web bind host             (default: 0.0.0.0)
+    -Expose <mode>      CORS/exposure: local|intranet|public (default: intranet)
+    -Origin <url>       canonical origin (CATCODE_WEB_ORIGIN); overrides -Expose
+    -Workspace <path>   default workspace the core opens
+    -Shell <path>       terminal shell for the web terminal
+    -IdleGcMs <n>       idle live-session GC interval ms (0=disable)
+    -InstallerUrl <u>   self-update install.sh URL
+    -WindowsInstallerUrl <u>  self-update install.ps1 URL
+    -TrustedOrigins <list>  additional trusted origins for better-auth CSRF (BETTER_AUTH_TRUSTED_ORIGINS,
+                            comma-separated; for a proxy/multi-domain setup)
     -WebDir <path>      web bundle install dir    (default: %LOCALAPPDATA%\catalyst-code\web)
     -AddWeb             add the web service to an existing install
     -Update             re-download latest + reinstall (+ restart the web service)
@@ -212,6 +247,93 @@ function Resolve-Release {
     } else {
         $script:Base = "https://github.com/$Repo/releases/download/$($script:Tag)"
     }
+}
+
+# -- web-service env: exposure mode + origin + bind ---------------
+# Primary non-loopback IPv4 (for -Expose intranet's auto-origin). Returns $null on failure.
+function Get-LanIp {
+    try {
+        # prefer the interface that actually has a default gateway (the real LAN)
+        $ip = (Get-NetIPConfiguration -ErrorAction Stop |
+               Where-Object { $_.IPv4DefaultGateway } |
+               Select-Object -First 1).IPv4Address.IPAddress
+        if ($ip -and $ip -ne '127.0.0.1' -and $ip -notlike '169.254.*') { return $ip }
+    } catch {}
+    try {
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+               Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } |
+               Select-Object -First 1).IPAddress
+        if ($ip -and $ip -ne '127.0.0.1') { return $ip }
+    } catch {}
+    return $null
+}
+
+# Derive bind $script:ResolvedHost + canonical $script:ResolvedOrigin from $script:Expose
+# (+ -BindHost / -Origin overrides). Mirrors install.sh resolve_expose().
+function Resolve-Expose {
+    if ($CliParams.ContainsKey('BindHost') -and $BindHost) {
+        $script:ResolvedHost = $BindHost
+    } elseif ($script:Expose -eq 'local') {
+        $script:ResolvedHost = '127.0.0.1'
+    } elseif ($script:Expose -eq 'intranet' -or $script:Expose -eq 'public') {
+        $script:ResolvedHost = '0.0.0.0'
+    } else {
+        Die "unknown -Expose mode: $($script:Expose) (use local|intranet|public)"
+    }
+    if ($script:OriginOverride) {
+        $script:ResolvedOrigin = $script:OriginOverride
+    } elseif ($script:Expose -eq 'local') {
+        $script:ResolvedOrigin = "http://localhost:$Port"
+    } elseif ($script:Expose -eq 'intranet') {
+        $lan = Get-LanIp
+        if ($lan) {
+            $script:ResolvedOrigin = "http://${lan}:$Port"
+        } else {
+            $script:ResolvedOrigin = "http://localhost:$Port"
+            W-Warn "could not auto-detect a LAN IP for -Expose intranet; non-loopback auth will fail until you set -Origin http://<lan-ip>:$Port"
+        }
+    } elseif ($script:Expose -eq 'public') {
+        Die '-Expose public requires -Origin <url> (your public/tunnel URL, e.g. https://code.example.com)'
+    }
+}
+
+# Restore saved env values from state for params NOT passed on this run, then
+# derive bind+origin. Mirrors install.sh finalize_web_env(). $st may be $null
+# (fresh install). No-op when the web service is not in scope.
+function Finalize-WebEnv($st) {
+    if (-not $script:WithWeb) { return }
+    if ($st) {
+        if (-not $CliParams.ContainsKey('Port') -and $st.port)              { $script:Port = $st.port }
+        if (-not $CliParams.ContainsKey('Expose') -and $st.expose)         { $script:Expose = $st.expose }
+        if (-not $CliParams.ContainsKey('Origin') -and $st.origin_override){ $script:OriginOverride = $st.origin_override }
+        if (-not $CliParams.ContainsKey('Origin') -and $st.origin)        { $script:ResolvedOrigin = $st.origin }
+        if (-not $CliParams.ContainsKey('Workspace') -and $st.workspace)  { $script:Workspace = $st.workspace }
+        if (-not $CliParams.ContainsKey('Shell') -and $st.shell)           { $script:ShellVar = $st.shell }
+        if (-not $CliParams.ContainsKey('IdleGcMs') -and $st.idle_gc_ms)   { $script:IdleGcMs = $st.idle_gc_ms }
+        if (-not $CliParams.ContainsKey('InstallerUrl') -and $st.installer_url)        { $script:InstallerUrl = $st.installer_url }
+        if (-not $CliParams.ContainsKey('WindowsInstallerUrl') -and $st.windows_installer_url) { $script:WinInstallerUrl = $st.windows_installer_url }
+        if (-not $CliParams.ContainsKey('TrustedOrigins') -and $st.trusted_origins) { $script:TrustedOrigins = $st.trusted_origins }
+        if (-not $CliParams.ContainsKey('BindHost') -and $st.host)         { $script:ResolvedHost = $st.host }
+    }
+    # (Re-)derive bind+origin when a CLI override is present, or when no
+    # resolved origin exists yet (fresh install / old state). A plain update
+    # keeps the previously-resolved ORIGIN+HOST so a stable install doesn't churn.
+    if ($script:OriginOverride -or $CliParams.ContainsKey('Expose') -or $CliParams.ContainsKey('BindHost') -or -not $script:ResolvedOrigin) {
+        Resolve-Expose
+    }
+}
+
+# KEY=value strings for the service env block (NSSM AppEnvironmentExtra / task `set`).
+function Get-EnvPairs {
+    $pairs = @('NODE_ENV=production', "PORT=$Port", "HOSTNAME=$($script:ResolvedHost)", "CATCODE_CORE=$script:CoreExe")
+    if ($script:ResolvedOrigin)         { $pairs += "CATCODE_WEB_ORIGIN=$($script:ResolvedOrigin)" }
+    if ($script:Workspace)      { $pairs += "CATALYST_CODE_WORKSPACE=$($script:Workspace)" }
+    if ($script:ShellVar)       { $pairs += "SHELL=$($script:ShellVar)" }
+    if ($script:IdleGcMs)       { $pairs += "UMANS_WEB_IDLE_GC_MS=$($script:IdleGcMs)" }
+    if ($script:InstallerUrl)   { $pairs += "CATCODE_INSTALLER_URL=$($script:InstallerUrl)" }
+    if ($script:WinInstallerUrl){ $pairs += "CATCODE_WINDOWS_INSTALLER_URL=$($script:WinInstallerUrl)" }
+    if ($script:TrustedOrigins) { $pairs += "BETTER_AUTH_TRUSTED_ORIGINS=$($script:TrustedOrigins)" }
+    return $pairs
 }
 
 # download <Base>/<Name> + <Name>.sha256, verify the checksum. Returns the file path.
@@ -388,7 +510,8 @@ function Install-NssmService {
     & $nssm install $SvcName $RTExe (Join-Path $WebDir 'start.js') *> $null
     if ($LASTEXITCODE -ne 0) { Die "nssm install failed (exit $LASTEXITCODE)" }
     & $nssm set $SvcName AppDirectory $WebDir *> $null
-    & $nssm set $SvcName AppEnvironmentExtra "NODE_ENV=production" "PORT=$Port" "HOSTNAME=$BindHost" "CATCODE_CORE=$script:CoreExe" *> $null
+    $envPairs = Get-EnvPairs
+    & $nssm set $SvcName AppEnvironmentExtra $envPairs *> $null
     & $nssm set $SvcName AppStdout $LogPath *> $null
     & $nssm set $SvcName AppStderr $LogPath *> $null
     & $nssm set $SvcName AppRotateFiles 1 *> $null
@@ -404,19 +527,15 @@ function Install-NssmService {
 # --- scheduled-task fallback (zero-dependency) ------------------------------
 function Write-Wrapper {
     # restart-loop wrapper: re-launches `node start.js` 3s after it exits.
-    $cmd = @(
-        '@echo off',
-        "set NODE_ENV=production",
-        "set PORT=$Port",
-        "set HOSTNAME=$BindHost",
-        "set CATCODE_CORE=$script:CoreExe",
+    $setLines = Get-EnvPairs | ForEach-Object { "set $_" }
+    $cmd = (@('@echo off') + $setLines + @(
         ':loop',
         "cd /d `"$WebDir`"",
         "`"$RTExe`" `"$WebDir\start.js`"",
         'echo [%date% %time%] web exited, restarting in 3s...',
         'timeout /t 3 /nobreak >nul',
         'goto loop'
-    ) -join "`r`n"
+    )) -join "`r`n"
     if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
     [System.IO.File]::WriteAllText($WrapperPath, $cmd)
 }
@@ -513,7 +632,16 @@ function Save-State([bool]$WebInstalled) {
         install_dir  = $InstallDir
         web_dir      = $WebDir
         port         = $Port
-        host         = $BindHost
+        host         = if ($script:ResolvedHost) { $script:ResolvedHost } else { $BindHost }
+        expose       = $script:Expose
+        origin_override = $script:OriginOverride
+        origin       = $script:ResolvedOrigin
+        workspace    = $script:Workspace
+        shell        = $script:ShellVar
+        idle_gc_ms   = $script:IdleGcMs
+        installer_url = $script:InstallerUrl
+        windows_installer_url = $script:WinInstallerUrl
+        trusted_origins = $script:TrustedOrigins
         installed_at = $installedAt
     }
     if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
@@ -524,7 +652,16 @@ function Save-State([bool]$WebInstalled) {
         'METHOD="download"',
         ('PREFIX="' + $InstallDir + '"'),
         ('PORT="' + $Port + '"'),
-        ('HOST="' + $BindHost + '"'),
+        ('HOST="' + (if ($script:ResolvedHost) { $script:ResolvedHost } else { $BindHost }) + '"'),
+        ('EXPOSE_MODE="' + $script:Expose + '"'),
+        ('ORIGIN_OVERRIDE="' + $script:OriginOverride + '"'),
+        ('ORIGIN="' + $script:ResolvedOrigin + '"'),
+        ('WORKSPACE="' + $script:Workspace + '"'),
+        ('TERM_SHELL="' + $script:ShellVar + '"'),
+        ('IDLE_GC_MS="' + $script:IdleGcMs + '"'),
+        ('INSTALLER_URL="' + $script:InstallerUrl + '"'),
+        ('WIN_INSTALLER_URL="' + $script:WinInstallerUrl + '"'),
+        ('TRUSTED_ORIGINS="' + $script:TrustedOrigins + '"'),
         ('WEB_DIR="' + $WebDir + '"'),
         ('WEB_INSTALLED="' + $webFlag + '"'),
         'UNIT_NAME="CatalystCodeWeb"',
@@ -558,19 +695,29 @@ function Load-State {
         web_dir      = if ($map['WEB_DIR']) { $map['WEB_DIR'] } else { $WebDir }
         port         = if ($map['PORT']) { [int]$map['PORT'] } else { $Port }
         host         = if ($map['HOST']) { $map['HOST'] } else { $BindHost }
+        expose       = $map['EXPOSE_MODE']
+        origin_override = $map['ORIGIN_OVERRIDE']
+        origin       = $map['ORIGIN']
+        workspace    = $map['WORKSPACE']
+        shell        = $map['TERM_SHELL']
+        idle_gc_ms   = $map['IDLE_GC_MS']
+        installer_url = $map['INSTALLER_URL']
+        windows_installer_url = $map['WIN_INSTALLER_URL']
+        trusted_origins = $map['TRUSTED_ORIGINS']
         installed_at = $map['INSTALLED_AT']
     }
 }
 
 # -- summaries ------------------------------------------------
 function Summary-Install {
-    $webLine = if ($script:WithWeb) { "http://${BindHost}:$Port  (service: NSSM or Scheduled Task)" } else { '(not installed - re-run with -WithWeb)' }
+    $webLine = if ($script:WithWeb) { "http://$($script:ResolvedHost):$Port  (service: NSSM or Scheduled Task)" } else { '(not installed - re-run with -WithWeb)' }
     Write-Host ''
     Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host '  OK  Installed  Catalyst Code  v' -NoNewline -ForegroundColor Green
     Write-Host "$($script:Ver)" -ForegroundColor Green
     Write-Host "    binary:  $InstallDir\catcode.exe" -ForegroundColor Green
     Write-Host "    web:     $webLine" -ForegroundColor Green
+    if ($script:WithWeb) { Write-Host "    expose:  $($script:Expose)  origin: $($script:ResolvedOrigin)" -ForegroundColor Green }
     Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host ''
     Write-Host '  Open a NEW PowerShell window (so PATH reloads) and run:' -ForegroundColor Green
@@ -603,9 +750,10 @@ function Do-Install {
     Write-Host '  Catalyst Code - installer (Windows)' -ForegroundColor Cyan
     Write-Host '  mode: download (prebuilt, no compile)' -ForegroundColor DarkGray
     Resolve-Release
+    Finalize-WebEnv $script:State
     Write-Host "  version: $($script:Ver)   base: $($script:Base)" -ForegroundColor DarkGray
     Write-Host "  install: $InstallDir" -ForegroundColor DarkGray
-    if ($script:WithWeb) { Write-Host "  web:     $WebDir (port $Port, host $BindHost)" -ForegroundColor DarkGray }
+    if ($script:WithWeb) { Write-Host "  web:     $WebDir (port $Port, expose $($script:Expose), origin $($script:ResolvedOrigin))" -ForegroundColor DarkGray }
 
     if ($DryRun) {
         W-Info '[dry-run] would download + install catcode.exe'
@@ -632,9 +780,12 @@ function Do-Update {
     Write-Host '  Catalyst Code - update' -ForegroundColor Cyan
     $st = Load-State
     if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first." }
+    $script:State = $st
+    if ($st.with_web -eq 'yes') { $script:WithWeb = $true }
     W-Info "Previous install: v$($st.version) (web: $($st.with_web))"
 
     Resolve-Release
+    Finalize-WebEnv $st
     Write-Host "  version: $($script:Ver)   base: $($script:Base)" -ForegroundColor DarkGray
 
     if ($DryRun) {
@@ -742,7 +893,7 @@ function Prompt-InstallOptions {
     Write-Host ''
     $customize = Read-Host '  Customize install settings (paths, port, version)? [y/N]'
     if ($customize -notmatch '^(?i)y(es)?$') {
-        W-Info "Using defaults (install=$InstallDir port=$Port host=$BindHost)"
+        W-Info "Using defaults (install=$InstallDir port=$Port expose=$($script:Expose))"
         return
     }
 
@@ -773,11 +924,37 @@ function Prompt-InstallOptions {
             Write-Host '  port must be an integer 1-65535' -ForegroundColor Yellow
         }
 
-        $script:BindHost = Prompt-Value 'Web bind host' $BindHost
+        # Expose mode + canonical origin (drives bind host + CATCODE_WEB_ORIGIN).
+        $script:Expose = Prompt-Value 'Expose mode (local|intranet|public)' $script:Expose
+        if ($script:Expose -notmatch '^(local|intranet|public)$') {
+            W-Warn "invalid expose mode '$($script:Expose)' - using intranet"
+            $script:Expose = 'intranet'
+        }
+        if ($script:Expose -eq 'public') {
+            $script:OriginOverride = Prompt-Value 'Public origin URL (https://...)' $script:OriginOverride
+        } elseif ($script:Expose -eq 'intranet') {
+            $lan = Get-LanIp
+            if ($lan) { W-Info "Detected LAN IP: $lan (origin -> http://${lan}:$($script:Port))" }
+            else { W-Warn 'no LAN IP detected - set the origin override below for non-loopback access' }
+            $ov = Prompt-Value 'Origin URL override (Enter = auto-detect)' $script:OriginOverride
+            if ($ov) { $script:OriginOverride = $ov }
+        }
+
+        # Advanced web-service envs (optional).
+        $advanced = Read-Host '  Show advanced web settings (workspace, shell, idle-gc, installer URLs)? [y/N]'
+        if ($advanced -match '^(?i)y(es)?$') {
+            $script:Workspace     = Prompt-Value 'Default workspace (core opens here)' $script:Workspace
+            $script:ShellVar      = Prompt-Value 'Terminal shell (e.g. powershell, cmd)' $script:ShellVar
+            $script:IdleGcMs      = Prompt-Value 'Idle session GC ms (0=disable)' $(if ($script:IdleGcMs) { $script:IdleGcMs } else { '7200000' })
+            $script:InstallerUrl = Prompt-Value 'Self-update installer URL (install.sh)' $script:InstallerUrl
+            $script:WinInstallerUrl = Prompt-Value 'Self-update Windows installer URL (install.ps1)' $script:WinInstallerUrl
+            $script:TrustedOrigins = Prompt-Value 'Additional trusted origins (comma-sep, for proxy/multi-domain)' $script:TrustedOrigins
+        }
     }
 
     Write-Host ''
-    W-Ok "Will use: install=$($script:InstallDir)  port=$($script:Port)  host=$($script:BindHost)"
+    W-Ok "Will use: install=$($script:InstallDir)  port=$($script:Port)  expose=$($script:Expose)"
+    if ($script:OriginOverride) { W-Ok "origin: $($script:OriginOverride)" }
     if ($script:Version) { W-Ok "version pin: $($script:Version)" }
     if ($script:BaseUrl) { W-Ok "base URL: $($script:BaseUrl)" }
     if ($wantWeb) { W-Ok "web dir: $($script:WebDir)" }
@@ -790,9 +967,11 @@ function Do-AddWeb {
     if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first to install catcode." }
     if ($st.with_web -eq 'yes') { W-Warn 'web service is already installed - reinstalling it' }
     $script:WithWeb = $true
+    $script:State = $st
     # pin to the installed version unless one was explicitly given
     if (-not $Version) { $Version = $st.version }
     Resolve-Release
+    Finalize-WebEnv $st
     Write-Host "  version: $($script:Ver)   base: $($script:Base)" -ForegroundColor DarkGray
     Write-Host "  install: $InstallDir" -ForegroundColor DarkGray
 
@@ -812,6 +991,7 @@ function Do-Reinstall {
     $st = Load-State
     if (-not $st) { Die "no previous install found at $StateFile - run install.ps1 first." }
     W-Info "Reinstalling v$($st.version) (web: $($st.with_web))"
+    $script:State = $st
     if (-not $Version) { $Version = $st.version }
     if ($st.with_web -eq 'yes') { $script:WithWeb = $true }
     Do-Install
@@ -832,6 +1012,8 @@ function Do-Status {
     if ($st.with_web -eq 'yes') {
         W-Info "Web dir:      $($st.web_dir)"
         W-Info "Web address:  http://localhost:$($st.port)"
+        if ($st.expose)   { W-Info "Expose:       $($st.expose)" }
+        if ($st.origin)   { W-Info "Origin:       $($st.origin)" }
     }
     if ($st.installed_at) { W-Info "Installed at: $($st.installed_at)" }
     $exe = Join-Path $st.install_dir 'catcode.exe'
@@ -846,6 +1028,7 @@ function Summary-AddWeb {
     Write-Host "$($script:Ver)" -ForegroundColor Green
     Write-Host "    core:  $InstallDir\catcode-core.exe" -ForegroundColor Green
     Write-Host "    web:   http://localhost:$Port" -ForegroundColor Green
+    Write-Host "    expose:  $($script:Expose)  origin: $($script:ResolvedOrigin)" -ForegroundColor Green
     Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host "  logs:  $env:LOCALAPPDATA\catalyst-code\catalyst-code-web.log" -ForegroundColor DarkGray
 }

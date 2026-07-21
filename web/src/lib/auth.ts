@@ -22,6 +22,12 @@ const SECRET_PATH = path.join(CONFIG_DIR, "auth-secret");
 // isn't in trustedOrigins, so BOTH ports must be listed — for localhost AND
 // 127.0.0.1 (the service binds to 127.0.0.1; either address may be in the
 // URL bar). Set CATCODE_WEB_ORIGIN to add a tunnel / custom domain.
+// For MULTIPLE origins (e.g. behind a proxy serving several domains, or a
+// domain + a direct LAN IP), set BETTER_AUTH_TRUSTED_ORIGINS (comma-separated);
+// better-auth unions it with the list below (helpers.mjs getTrustedOrigins),
+// so no code change is needed here. The installer exposes this as
+// --trusted-origins. Passkey rpID stays bound to the single CATCODE_WEB_ORIGIN
+// hostname (a WebAuthn limitation); CSRF/cookie auth works for every trusted origin.
 const SYSTEMD_ORIGIN = "http://localhost:49283";
 const DEV_ORIGIN = "http://localhost:3000";
 const ORIGIN = process.env.CATCODE_WEB_ORIGIN || SYSTEMD_ORIGIN;
