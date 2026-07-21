@@ -60,7 +60,14 @@ jobs:
         run: |
           version="$VERSION_OVERRIDE"
           if [[ -z "$version" ]]; then
-            version="$(git rev-parse --short HEAD)"
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              # vX.Y.Z release: name artifacts with the semver (not the commit
+              # SHA) so they line up with the tag, install.sh, and the
+              # Homebrew cask/formula in catalystctl/homebrew-catcode.
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="$(git rev-parse --short HEAD)"
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -124,7 +131,14 @@ jobs:
         run: |
           version="$VERSION_OVERRIDE"
           if [[ -z "$version" ]]; then
-            version="$(git rev-parse --short HEAD)"
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              # vX.Y.Z release: name artifacts with the semver (not the commit
+              # SHA) so they line up with the tag, install.sh, and the
+              # Homebrew cask/formula in catalystctl/homebrew-catcode.
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="$(git rev-parse --short HEAD)"
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -183,7 +197,14 @@ jobs:
         run: |
           version="$VERSION_OVERRIDE"
           if [[ -z "$version" ]]; then
-            version="$(git rev-parse --short HEAD)"
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              # vX.Y.Z release: name artifacts with the semver (not the commit
+              # SHA) so they line up with the tag, install.sh, and the
+              # Homebrew cask/formula in catalystctl/homebrew-catcode.
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="$(git rev-parse --short HEAD)"
+            fi
           fi
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="$GITHUB_REF_NAME"

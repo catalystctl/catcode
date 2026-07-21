@@ -172,6 +172,23 @@ Other options:
 
 </details>
 
+**Homebrew (macOS)**
+
+If you use [Homebrew](https://brew.sh), install from our tap (no compiler, no admin):
+
+```bash
+brew tap catalystctl/catcode
+brew install catcode            # formula — `brew upgrade` keeps it current
+# …or, if you prefer a cask:
+brew install --cask catcode
+```
+
+Both install the same standalone `catcode` binary (the Rust core is embedded,
+so it is one self-contained file). The tap auto-updates on every release, so
+`brew upgrade catcode` pulls the latest. The optional web frontend needs Node
+and a background service, so it is **not** part of the package — install it
+with the `install-web.sh` one-liner above.
+
 **Updating**
 
 Use `catcode --update` to refresh the CLI. When the web frontend was installed (`install.sh --with-web` on Linux/macOS, or `install.ps1 -WithWeb` on Windows), that command also refreshes `catcode-core` and the web bundle, then restarts the service (systemd / launchd / NSSM / Scheduled Task). `bash install.sh --update` (Unix) or `install.ps1 -Update` (Windows) does the same. From the web UI: Settings → About → **Update CLI + frontend**.

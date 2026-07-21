@@ -1,0 +1,140 @@
+name: Homebrew tap
+
+# After a versioned (vX.Y.Z) release is published, render the cask + formula
+# with the real version + per-arch sha256 and push them to the
+# catalystctl/homebrew-catcode tap. Requires a PAT with `repo` scope stored as
+# the HOMEBREW_TAP_TOKEN secret in this repo.
+#
+# One-time setup:
+#   1. Create an empty PUBLIC repo: github.com/catalystctl/homebrew-catcode
+#      (just `git init` an empty repo — no README needed; this workflow seeds it).
+#   2. Make a fine-grained PAT on catalystctl/homebrew-catcode with
+#      "Contents: read+write", or a classic PAT with `repo` scope.
+#   3. Add it as the HOMEBREW_TAP_TOKEN secret in catalystctl/catcode.
+#
+# After that, every `v*` release auto-updates the tap. Users install with:
+#   brew tap catalystctl/catcode
+#   brew install catcode            # …or: brew install --cask catcode
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to the tap (e.g. v0.2.0)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: true
+
+jobs:
+  publish-tap:
+    # Only render for versioned (vX.Y.Z) releases. SHA/dev builds would produce
+    # non-monotonic versions that `brew upgrade` cannot rank, so they are
+    # intentionally skipped. workflow_dispatch validates the `v` prefix below.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag + version
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          [[ "$tag" == v* ]] || { echo "error: tag '$tag' must start with 'v' (e.g. v0.2.0) — SHA/dev releases are not published to the tap" >&2; exit 1; }
+          version="${tag#v}"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p assets
+          # Four per-arch assets: standalone binaries (formula) + .dmg (cask).
+          gh release download "$TAG" --repo catalystctl/catcode --dir assets \
+            --pattern 'catcode-*-macos-arm64' \
+            --pattern 'catcode-*-macos-x86_64' \
+            --pattern 'catcode-*-macos-arm64.dmg' \
+            --pattern 'catcode-*-macos-x86_64.dmg'
+          ls -la assets
+
+      - name: Compute sha256
+        id: sha
+        shell: bash
+        run: |
+          cd assets
+          arm_bin="$(ls catcode-*-macos-arm64 | grep -v '\.dmg$')"
+          intel_bin="$(ls catcode-*-macos-x86_64 | grep -v '\.dmg$')"
+          arm_dmg="$(ls catcode-*-macos-arm64.dmg)"
+          intel_dmg="$(ls catcode-*-macos-x86_64.dmg)"
+          for f in "$arm_bin" "$intel_bin" "$arm_dmg" "$intel_dmg"; do
+            [[ -f "$f" ]] || { echo "error: missing asset $f" >&2; exit 1; }
+          done
+          hash() { sha256sum "$1" | awk '{print $1}'; }
+          {
+            echo "arm_bin_sha=$(hash "$arm_bin")"
+            echo "intel_bin_sha=$(hash "$intel_bin")"
+            echo "arm_dmg_sha=$(hash "$arm_dmg")"
+            echo "intel_dmg_sha=$(hash "$intel_dmg")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render cask + formula
+        shell: bash
+        run: |
+          bash packaging/homebrew/render.sh \
+            "${{ steps.tag.outputs.version }}" \
+            "${{ steps.sha.outputs.arm_bin_sha }}" \
+            "${{ steps.sha.outputs.intel_bin_sha }}" \
+            "${{ steps.sha.outputs.arm_dmg_sha }}" \
+            "${{ steps.sha.outputs.intel_dmg_sha }}" \
+            tap-out
+
+      - name: Publish to catalystctl/homebrew-catcode
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        shell: bash
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "HOMEBREW_TAP_TOKEN secret is not set — skipping tap publish." >&2
+            echo "Create it (PAT with repo/contents-write on catalystctl/homebrew-catcode) and re-run." >&2
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/catalystctl/homebrew-catcode.git" tap-repo
+          mkdir -p tap-repo/Casks tap-repo/Formula
+          cp tap-out/Casks/catcode.rb  tap-repo/Casks/catcode.rb
+          cp tap-out/Formula/catcode.rb tap-repo/Formula/catcode.rb
+          # Seed the tap README on first publish only (don't clobber later edits).
+          [ -f tap-repo/README.md ] || cp packaging/homebrew/tap-README.md tap-repo/README.md
+          cd tap-repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git commit -m "catcode ${VERSION}"; then
+            git push
+          else
+            echo "nothing to commit (tap already up to date)"
+          fi
+
+      - name: Summary
+        shell: bash
+        run: |
+          cat <<EOF
+          Published catcode ${{ steps.tag.outputs.version }} to the tap:
+            brew tap catalystctl/catcode
+            brew install catcode          # formula
+            brew install --cask catcode   # cask
+          EOF
