@@ -5,7 +5,7 @@ description: Stage and commit all working-tree changes (tracked + untracked) wit
 
 # git-commit-all
 
-When the user says "commit all," "commit everything," "please commit all in git status," or similar, stage ALL working-tree changes (modified, new, deleted) and create a single commit with a descriptive message. When they ALSO say "push" ("commit git status and push", "commit and push"), follow the commit with a push to the remote (step 6 below).
+When the user says "commit all," "commit everything," "please commit all in git status," or similar, stage ALL working-tree changes (modified, new, deleted) and create a single commit with a descriptive message. When they ALSO say "push" ("commit git status and push", "commit and push"), follow the commit with a push to the remote (step 8 below).
 
 ## When to use
 
@@ -37,13 +37,14 @@ Do NOT use for:
    - Keep the subject line ≤72 chars; body wraps at 72
 5. **Commit**: `git commit -m "<message>"`
 6. **Show the commit**: `git log -1 --oneline`
-7. **Push (only if the user asked to push)**:
+7. **Update CHANGELOG.md** (standing rule — always on a commit/push, even if the log looks behind): after the substantive commit exists (you need its SHA), add a bullet under the day's `## YYYY-MM-DD` section — create a NEW top section if the day changed (newest first). Write a descriptive narrative of what + why (not the raw commit subject), with the abbreviated SHA in brackets `[abbrev]`. Commit the changelog SEPARATELY as `docs(changelog): …` — do NOT amend the feature commit (that changes its SHA and breaks the `[abbrev]` self-reference). See the `changelog-structure-convention` memory for the day-by-day format. Skip if the repo has no CHANGELOG.md, or the change is itself a docs/changelog-only tweak.
+8. **Push (only if the user asked to push)**:
    - Current branch: `git rev-parse --abbrev-ref HEAD` (if it prints `HEAD`, you're in detached HEAD — abort and tell the user to checkout a branch first).
    - If the branch has an upstream (`git rev-parse --abbrev-ref @{u}` succeeds): `git push`.
    - If it has NO upstream: `git push -u origin <branch>` (sets upstream on first push).
    - On non-fast-forward rejection: `git pull --rebase origin <branch>` then `git push`.
    - Report the range pushed (`<old>..<new>  <branch> -> <branch>`) and, if the repo has workflows triggered on push, list them (`gh run list -L 3 -R <owner/repo>`) so the user sees what the push kicked off.
-8. **Watch CI to green (when the user said "get it live" / was fixing CI)**: a push that says "get those changes live" or that fixes a red CI isn't done at `git push` — the point is a GREEN run. After pushing, capture the newest run id from the `gh run list` output above, then watch it to completion:
+9. **Watch CI to green (when the user said "get it live" / was fixing CI)**: a push that says "get those changes live" or that fixes a red CI isn't done at `git push` — the point is a GREEN run. After pushing, capture the newest run id from the `gh run list` output above, then watch it to completion:
    - `gh run watch <run-id> --repo <owner/repo> --exit-status` (blocks until the run finishes; exits non-zero if any job failed).
    - On success: confirm green with a one-line summary (`gh run view <run-id> --repo <owner/repo>`, list the ✓ jobs).
    - On failure: `gh run view --job <failed-job-id> --repo <owner/repo> --log-failed` to read the failing step's log, diagnose, fix, commit, push again, and re-watch. Loop until green (cap a few rounds — if a job is structurally broken, surface it to the user instead of flailing).
