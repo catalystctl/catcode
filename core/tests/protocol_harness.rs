@@ -623,8 +623,22 @@ impl CoreHarness {
                 approval,
                 "--trust-project-plugins",
             ])
-            .env_remove("UMANS_ACTIVE_PROVIDER")
-            .env_remove("UMANS_PROVIDERS")
+            // Self-contained provider: core's first-run init stages a default
+            // config (with a default provider) into ~/.config/catalyst-code
+            // when that dir is absent — as in CI's clean HOME — and that staged
+            // provider then takes precedence over the mock this harness points
+            // at via --base-url (the legacy base_url path only applies when NO
+            // providers are configured). Inject the mock as an explicit provider
+            // so the harness is independent of the host's global config / first-run
+            // staging, on the dev box and in CI alike.
+            .env(
+                "UMANS_PROVIDERS",
+                format!(
+                    r#"[{{"name":"protocol_harness","kind":"openai","base_url":"{base_url}","api_key_env":"PROTOCOL_HARNESS_KEY"}}]"#
+                ),
+            )
+            .env("UMANS_ACTIVE_PROVIDER", "protocol_harness")
+            .env("PROTOCOL_HARNESS_KEY", "test-key")
             .env("PATH", harness_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
