@@ -4,6 +4,36 @@ All notable changes to **Catalyst Code** (formerly Umans Harness), day by day fr
 
 ## 2026-07-22
 
+- **feat(provider): add custom providers at runtime with model-discovery preview + per-model overrides** [ea0ed70, 2de1cb0, a78a6fc, 0e806e3, c4e0d29]
+  Add custom providers at runtime with a model-discovery preview step. New
+  `add_custom_provider` + `discover_provider_models` commands (protocol fixtures,
+  core dispatcher) add a provider with full config.json parity (name, wire kind,
+  base URL, API key/env, headers, context-window override) and probe its `/models`
+  endpoint. config.rs gains per-model `models_override` (`{id, context_window,
+  max_tokens, reasoning, thinking_levels}`) applied by provider.rs after discovery
+  + models.dev (an explicit per-model value wins). Both UIs expose the flow — a
+  web `CustomProviderModal` and a TUI multi-field modal — each with a discover
+  step that fetches models and lets the user refine per-model caps before
+  committing. Skills updated to note `models_override` is now config-supported.
+
+- **feat(plugins): OAuth env_passthrough for plugin OAuth scripts** [bb13a89]
+  PluginOauthConfig gains `env_passthrough`: non-secret env var names forwarded
+  to plugin OAuth scripts (the harness otherwise scrubs the environment, so
+  undeclared vars never reach the script).
+
+- **fix(tui): ask select option cycling + reasoning render cache + toggle tests** [18e41ab, 1dffb79]
+  Fix the ask-tool select question where the user couldn't pick a different
+  option: select questions render as an inline picker and arrow/h/l keys forward
+  to huh so its internal `selected` cursor (the View's source of truth) moves and
+  the bound value syncs — previously `cycleSelect` mutated only the bound value,
+  which huh never re-reads, so the displayed option stayed stuck on the first.
+  Also caches per-block pre-decoration renders (keyed by width + theme) so
+  toggles/focus/tool results stay cheap with a large expanded reasoning block,
+  plus tests for the ctrl+t reasoning expand/collapse (finalized + streaming).
+
+- **style(grep): rustfmt drift on grep enrichment** [2baa3f4]
+  rustfmt drift on the grep enrichment (fmt-only; exposed by `cargo fmt --all`).
+
 - **feat(grep): enrich grep tool with -v/-F/-w/-A/-B, glob negation, multi-file paths** [be0174c]
   A session audit (661 sessions) showed the agent reached for bash grep/rg 1.75×
   more than the native grep tool — driven by missing flags (-v/-F/-w/-A), the
