@@ -382,7 +382,37 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
 		s.refresh()
 
-	case "delta":
+	case "provider_models_preview":
+		// A discover_provider_models result (preview for the add-custom-provider
+		// form). Only act when that modal is open; otherwise ignore.
+		if s.modal.kind != modalCustomProvider {
+			return nil
+		}
+		var models []modelInfo
+		if raw := ev.get("models"); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &models)
+		} else {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(ev.Raw, &m); err == nil {
+				if raw, ok := m["models"]; ok {
+					_ = json.Unmarshal(raw, &models)
+				}
+			}
+		}
+		d := &s.customProvider
+		d.previewModels = models
+		d.discovering = false
+		if len(models) == 0 {
+			s.modal.loadError = "no models discovered — check the base URL / key / kind"
+		} else {
+			cpSeedModelCaps(d)
+			d.field = cpFieldModels
+			d.modelCursor = 0
+			d.modelField = cpCapContext
+			s.modal.loadError = ""
+			s.logInfo(fmt.Sprintf("%d model(s) discovered — refine caps or submit", len(models)))
+		}
+		s.refresh()
 		if s.cur == nil || s.cur.kind != blkAssistant {
 			s.push(blkAssistant)
 		}
@@ -1835,6 +1865,11 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		for _, b := range s.blocks {
 			if b.kind == blkThinking {
 				b.collapsed = !s.thinkExpanded
+				// collapsed state changed: the cached render (pill ↔ full markdown)
+				// is stale, so drop it for a fresh render. Other finalized blocks
+				// keep their cached render across the rebuild.
+				b.renderStr = ""
+				b.renderLen = 0
 			}
 		}
 		s.invalidateAll()
@@ -2229,7 +2264,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return s.handleSkillCommand(parts)
 		}
 		switch parts[0] {
-		case "/login":
+		case "/login", "/provider":
 			s.openLoginPicker()
 			return nil
 		case "/search-key":
@@ -2325,7 +2360,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/reset":
 			s.openDestructiveConfirm("reset", "", "wipe the conversation and its session file")
 			return nil
-		case "/abort":
+		case "/abort", "/stop":
 			s.queuedNext = false
 			s.queued = nil
 			s.sendCore(map[string]any{"type": "abort"})
@@ -2357,7 +2392,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				s.logError("usage: /approval never|destructive|always")
 			}
 			return nil
-		case "/reasoning":
+		case "/reasoning", "/thinking":
 			if len(parts) >= 2 {
 				level := parts[1]
 				levels := s.thinkingLevels()
@@ -2603,7 +2638,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.sendCore(map[string]any{"type": "refresh_memory"})
 			s.logSuccess("memory saved")
 			return nil
-		case "/memory":
+		case "/memory", "/memories":
 			// Open the memory picker (enter forgets); falls back to a log line
 			// only when the list is empty.
 			s.requestMemoryPicker()
@@ -2642,7 +2677,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			// delegation — no core command needed.
 			task := "Reflect on the work done in this session so far. Identify: (1) any convention, architecture fact, decision, or gotcha worth persisting so future sessions don't rediscover it, and (2) any repetitive pattern you performed more than once that should become a reusable skill under `.catalyst-code/skills/`. Use the `memory` tool (action: append if a topic memory exists, else save) to persist durable facts only — skip transient task state. If you wrote a skill, name it. Finish with a two-line summary: what you learned and what you persisted."
 			return s.sendDelegation(task, "/reflect")
-		case "/sessions":
+		case "/sessions", "/resume":
 			s.openSessionsPicker()
 			s.modal.loading = true
 			if !s.sendCore(map[string]any{"type": "list_sessions"}) {
@@ -2735,7 +2770,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/vision":
 			s.requestVisionPicker()
 			return nil
-		case "/plugin-remove":
+		case "/plugin-remove", "/plugin-uninstall":
 			if len(parts) >= 2 {
 				s.openDestructiveConfirm("plugin-remove", parts[1], "uninstall plugin "+parts[1]+" and remove its files")
 				return nil

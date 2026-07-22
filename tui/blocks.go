@@ -64,7 +64,8 @@ type block struct {
 	hasOk       bool            // blkTool: true once a result landed (distinguishes in-flight)
 	renderW     int             // P1-12: width the streaming block was last rendered at
 	renderLen   int             // P1-12: text length at last render (throttle)
-	renderStr   string          // P1-12: cached render of the streaming block
+	renderStr   string          // cached render (pre-decoration) keyed by renderW + renderTheme
+	renderTheme string          // activeTheme.name when renderStr was produced (theme invalidation)
 	renderStart int             // first rendered transcript line (zero based)
 	renderEnd   int             // last rendered transcript line (inclusive)
 	approval    approvalBlockState
@@ -120,17 +121,18 @@ func (s *session) push(kind blockKind) *block {
 	return b
 }
 
-// invalidateAll drops the render cache (used on resize / collapse-toggle,
-// where cached wrapped renders are stale).
+// invalidateAll drops the prefix render cache so the transcript rebuilds from
+// block 0 on the next renderBlocks. Per-block cached renders (renderStr, keyed
+// by width + theme) are deliberately preserved: immutable post-finalize blocks
+// (assistant/thinking/user) skip Glamour+lipgloss on rebuild, so toggles, focus
+// moves, and tool results stay cheap even with a large expanded reasoning
+// block. Width changes invalidate via the renderW key; theme changes via
+// renderTheme; content changes (toggles) clear the affected block's renderStr
+// explicitly at the mutation site.
 func (s *session) invalidateAll() {
 	s.cache.Reset()
 	s.cacheIdx = 0
 	s.cacheLines = 0
-	for _, b := range s.blocks {
-		if b != nil {
-			b.renderStr = ""
-		}
-	}
 	for _, b := range s.blocks {
 		if b != nil {
 			b.renderStart, b.renderEnd = 0, -1
@@ -571,8 +573,12 @@ func (s *session) refresh() {
 	if base != s.transcriptBase || s.transcriptPlain == nil {
 		s.transcriptBase = base
 		s.transcriptPlain = plainTranscriptLines(base)
+		// SetContent re-splits the entire transcript (strings.Split + line
+		// normalization in bubbles/viewport). Skip it when content is byte-
+		// identical — e.g. spinner/stream ticks that left the live block
+		// unchanged, or repeated layout()/refresh calls.
+		s.viewport.SetContent(base)
 	}
-	s.viewport.SetContent(s.transcriptBase)
 	if s.follow {
 		s.viewport.GotoBottom()
 	}
@@ -722,8 +728,13 @@ func releaseAfterCache(b *block) {
 	if b == nil {
 		return
 	}
-	b.renderStr = ""
-	b.renderLen = 0
+	// Preserve the cached render for immutable blocks (assistant/thinking/user)
+	// so a later invalidateAll rebuild skips Glamour+lipgloss. Tool/approve cards
+	// mutate with results/approval state and never cache, so drop any stale copy.
+	if !blockRenderCacheable(b) {
+		b.renderStr = ""
+		b.renderLen = 0
+	}
 	switch b.kind {
 	case blkTool, blkApprove:
 		if len(b.args) > maxCachedToolArgs {
@@ -807,22 +818,57 @@ func (s *session) logRaw(styled string) {
 // text grows by >= streamBatch bytes or a newline / width change forces a fresh
 // full render. Every actual render is a complete re-render of the current text,
 // so this is purely a frequency cap (<= streamBatch bytes of display latency),
-// not a correctness compromise. Finalized blocks render fully once and are
-// cached upstream in renderBlocks.
+// not a correctness compromise.
+//
+// Finalized blocks additionally cache their full render (Glamour + lipgloss
+// output, PRE-decoration) keyed by (width, theme). invalidateAll drops only the
+// prefix cache, not these per-block renders, so a rebuild after a toggle, focus
+// move, or tool result skips Glamour+lipgloss entirely and re-applies only the
+// cheap focus/key-hint decoration (which depends on transient focus state, not
+// block content). This keeps a large expanded reasoning block (hundreds of
+// lines) from being re-styled on every rebuild. Only immutable post-finalize
+// kinds are cached; tool/approve cards mutate with in-flight elapsed time,
+// results, and approval state, so they always re-render.
 func (s *session) renderBlock(b *block, w int) string {
 	if b == s.cur && (b.kind == blkAssistant || b.kind == blkThinking) {
 		text := b.text.String()
-		force := w != b.renderW || strings.HasSuffix(text, "\n") || b.renderStr == ""
+		force := w != b.renderW || strings.HasSuffix(text, "\n") ||
+			b.renderStr == "" || b.renderTheme != activeTheme.name
 		if !force && len(text)-b.renderLen < streamBatch {
-			return b.renderStr
+			return s.decorateFocusedBlock(b, s.renderKeyHints(b.renderStr))
 		}
-		out := s.decorateFocusedBlock(b, s.renderKeyHints(s.renderBlockFull(b, w)))
+		out := s.renderBlockFull(b, w)
 		b.renderW = w
 		b.renderStr = out
 		b.renderLen = len(text)
-		return out
+		b.renderTheme = activeTheme.name
+		return s.decorateFocusedBlock(b, s.renderKeyHints(out))
 	}
-	return s.decorateFocusedBlock(b, s.renderKeyHints(s.renderBlockFull(b, w)))
+	if blockRenderCacheable(b) && b.renderStr != "" &&
+		b.renderW == w && b.renderTheme == activeTheme.name {
+		return s.decorateFocusedBlock(b, s.renderKeyHints(b.renderStr))
+	}
+	out := s.renderBlockFull(b, w)
+	if blockRenderCacheable(b) {
+		b.renderW = w
+		b.renderStr = out
+		b.renderLen = len(b.text.String())
+		b.renderTheme = activeTheme.name
+	}
+	return s.decorateFocusedBlock(b, s.renderKeyHints(out))
+}
+
+// blockRenderCacheable reports whether a finalized block's rendered output is a
+// pure function of (content, width, theme) and never mutates after finalize —
+// so it can be cached across invalidateAll rebuilds. Tool/approve blocks are
+// excluded: their cards change with in-flight elapsed time, tool results, and
+// approval decisions, so they must re-render each visit.
+func blockRenderCacheable(b *block) bool {
+	switch b.kind {
+	case blkAssistant, blkThinking, blkUser:
+		return true
+	}
+	return false
 }
 
 func (s *session) decorateFocusedBlock(b *block, out string) string {

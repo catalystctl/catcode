@@ -101,9 +101,17 @@ func parseAskRequest(requestID string, raw json.RawMessage) *askPrompt {
 			if q.allowCustom {
 				opts = append(opts, huh.NewOption("Custom…", askCustomSentinel))
 			}
+			// Inline renders the select as a single-line "‹ option ›" picker.
+			// Required for key handling, not just looks: huh enables Left/Right
+			// (and disables Up/Down) on a select only when inline, so ←/→ cycle
+			// the option natively. With a non-inline select Left/Right are disabled,
+			// and mutating the bound value can never move huh's private `selected`
+			// cursor that the View renders from — so the display stayed stuck on
+			// the first option and the user could never pick another.
 			sel := huh.NewSelect[string]().
 				Title(q.prompt).
 				Key(q.id).
+				Inline(true).
 				Options(opts...).
 				Value(&out.fieldValues[qIdx])
 			if q.required {
@@ -193,6 +201,47 @@ func (a *askPrompt) syncFocusFromForm() {
 	a.focusIdx = a.focusedQuestionIndex()
 }
 
+// focusedOnCustom reports whether form focus is on this question's custom
+// text input (the `_custom` field), used to route keys between the inline
+// picker and the custom-answer box.
+func (a *askPrompt) focusedOnCustom() bool {
+	if a.form == nil || a.focusIdx < 0 || a.focusIdx >= len(a.questions) {
+		return false
+	}
+	f := a.form.GetFocusedField()
+	if f == nil {
+		return false
+	}
+	return f.GetKey() == a.questions[a.focusIdx].id+"_custom"
+}
+
+// advanceField moves form focus by one field (NextField/PrevField) and keeps
+// focusIdx in sync. Used to step between a select and its `_custom` input.
+func (a *askPrompt) advanceField(delta int) {
+	if a.form == nil {
+		return
+	}
+	var m huh.Model
+	var cmd tea.Cmd
+	if delta >= 0 {
+		m, cmd = a.form.Update(huh.NextField())
+	} else {
+		m, cmd = a.form.Update(huh.PrevField())
+	}
+	if f, ok := m.(*huh.Form); ok {
+		a.form = f
+	}
+	_ = cmd
+	a.syncFocusFromForm()
+}
+
+// isAskCycleKey reports whether msg is a select-cycling key (←/→/h/l or
+// their rebound equivalents).
+func (s *session) isAskCycleKey(msg tea.KeyPressMsg) bool {
+	return s.kbAny(msg, "cycle_left", "cycle_left_alt", "cycle_right", "cycle_right_alt") ||
+		msg.String() == "left" || msg.String() == "right" || msg.String() == "h" || msg.String() == "l"
+}
+
 // jumpToQuestion moves form focus to the primary field of target (by question
 // index). Select+allowCustom inserts an extra huh field, so we cannot step by
 // question-count alone — advance Next/PrevField until the focused question matches.
@@ -239,33 +288,6 @@ func (a *askPrompt) jumpToQuestion(target int) {
 		_ = cmd
 	}
 	a.focusIdx = a.focusedQuestionIndex()
-}
-
-func (a *askPrompt) cycleSelect(delta int) {
-	if a.focusIdx < 0 || a.focusIdx >= len(a.questions) {
-		return
-	}
-	q := &a.questions[a.focusIdx]
-	if q.qtype != "select" {
-		return
-	}
-	opts := append([]string(nil), q.options...)
-	if q.allowCustom {
-		opts = append(opts, askCustomSentinel)
-	}
-	if len(opts) == 0 {
-		return
-	}
-	cur := a.fieldValues[a.focusIdx]
-	idx := 0
-	for i, o := range opts {
-		if o == cur {
-			idx = i
-			break
-		}
-	}
-	idx = (idx + delta + len(opts)) % len(opts)
-	a.fieldValues[a.focusIdx] = opts[idx]
 }
 
 // answers builds the {id: answer} object for ask_reply, including only
@@ -368,22 +390,37 @@ func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return s, nil
 	}
 	q := &a.questions[a.focusIdx]
-	if q.qtype == "select" && a.fieldValues[a.focusIdx] != askCustomSentinel {
-		if s.kbAny(msg, "cycle_left", "cycle_left_alt") || msg.String() == "left" || msg.String() == "h" {
-			a.cycleSelect(-1)
-			return s, nil
-		}
-		if s.kbAny(msg, "cycle_right", "cycle_right_alt") || msg.String() == "right" || msg.String() == "l" {
-			a.cycleSelect(1)
-			return s, nil
-		}
-		if msg.String() != "tab" && msg.String() != "shift+tab" && !s.kb(msg, "field_next") && !s.kb(msg, "field_prev") {
-			// Let text keys through only for custom-input follow-up.
-			if a.fieldValues[a.focusIdx] != askCustomSentinel {
+	onCustomInput := a.focusedOnCustom()
+	// Select questions render as a single-line inline picker (‹ option ›).
+	// ←/→/h/l cycle it: forward to huh so its internal `selected` cursor —
+	// the View's source of truth — moves and the bound value syncs. The old
+	// cycleSelect mutated only the bound value, which huh never re-reads, so
+	// the cursor (and display) stayed stuck on the first option and no other
+	// option could be picked.
+	if q.qtype == "select" {
+		if s.isAskCycleKey(msg) {
+			if onCustomInput {
+				// ←/→ on the custom text input exits custom mode and returns
+				// focus to the picker (stepping its cursor off "Custom…").
+				a.advanceField(-1)
+				s.pumpHuhAsk(msg)
 				return s, nil
 			}
+			s.pumpHuhAsk(msg)
+			// Landing on "Custom…" (allowCustom) enters its text input so the
+			// user can type a value instead of picking a listed option.
+			if q.allowCustom && a.fieldValues[a.focusIdx] == askCustomSentinel {
+				a.advanceField(1)
+			}
+			return s, nil
+		}
+		// Swallow stray keys on the picker so letters don't start huh's filter
+		// mode; they're meaningless for a select. (Custom input falls through.)
+		if !onCustomInput {
+			return s, nil
 		}
 	}
+	// Text question, or the custom text input: forward typing/edits to huh.
 	s.pumpHuhAsk(msg)
 	return s, nil
 }

@@ -272,3 +272,100 @@ func TestAskJumpSkipsCustomField(t *testing.T) {
 		t.Fatalf("after jumpToQuestion(0) focus=%d, want 0", got)
 	}
 }
+
+// TestAskSelectCycling guards the fix for "can't select a different option":
+// the inline select must actually advance its cursor (and the bound value) on
+// arrow keys. Before the fix, cycleSelect mutated only the bound value, never
+// huh's private `selected` cursor that the View renders from, so the displayed
+// option never changed no matter how many times the user pressed Right.
+func TestAskSelectCycling(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.keybinds = defaultKeybinds()
+	s.layout()
+
+	s.handleCoreEvent(askRequestEvent(t, "ask-1",
+		`[{"id":"color","prompt":"Which color?","type":"select","options":["Red","Green","Blue"],"required":true}]`))
+	a := s.pendingAsk
+	if a == nil {
+		t.Fatal("setup: ask_request did not set pendingAsk")
+	}
+
+	rendered := stripANSI(s.renderAskBox())
+	if !strings.Contains(rendered, "Red") {
+		t.Fatalf(`initial render should show the first option "Red"; got: %s`, rendered)
+	}
+
+	// Right advances the inline picker to the next option.
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	rendered = stripANSI(s.renderAskBox())
+	if !strings.Contains(rendered, "Green") {
+		t.Fatalf(`after Right the picker should show "Green"; got: %s`, rendered)
+	}
+	if strings.Contains(rendered, "Red") {
+		t.Fatalf(`after Right the picker should no longer show "Red"; got: %s`, rendered)
+	}
+
+	// The bound value (what would be submitted) must follow the cursor.
+	obj, missing := a.answers()
+	if len(missing) != 0 || obj["color"] != "Green" {
+		t.Fatalf("after Right answers=%v missing=%v, want color=Green", obj, missing)
+	}
+
+	// Right again -> Blue, then Right wraps back to Red.
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if obj, _ := a.answers(); obj["color"] != "Blue" {
+		t.Fatalf("after 2x Right want color=Blue, got %v", obj)
+	}
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if obj, _ := a.answers(); obj["color"] != "Red" {
+		t.Fatalf("after 3x Right (wrap) want color=Red, got %v", obj)
+	}
+
+	// Left goes back to Blue.
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyLeft})
+	if obj, _ := a.answers(); obj["color"] != "Blue" {
+		t.Fatalf("after Left want color=Blue, got %v", obj)
+	}
+}
+
+// TestAskSelectAllowCustom verifies the allowCustom path made reachable by the
+// fix: cycling onto the "Custom" sentinel focuses its text input (so the user
+// can type), and Left/Right exit custom mode back to the option list.
+func TestAskSelectAllowCustom(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.keybinds = defaultKeybinds()
+	s.layout()
+
+	s.handleCoreEvent(askRequestEvent(t, "ask-1",
+		`[{"id":"pick","prompt":"Pick one","type":"select","options":["A","B"],"allowCustom":true,"required":true}]`))
+	a := s.pendingAsk
+	if a == nil {
+		t.Fatal("setup: ask_request did not set pendingAsk")
+	}
+	// Options are [A, B, "Custom" sentinel]. Start on A; two Rights land on Custom.
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyRight}) // A -> B
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyRight}) // B -> Custom
+	if a.fieldValues[0] != askCustomSentinel {
+		t.Fatalf("after cycling to Custom, fieldValues=%q want sentinel", a.fieldValues[0])
+	}
+	if !a.focusedOnCustom() {
+		t.Fatal("landing on Custom should focus the custom text input")
+	}
+	// Typing reaches the custom input (bound to customValues), not the picker.
+	s.handleKey(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	if a.customValues[0] != "z" {
+		t.Fatalf("typed char should go to customValues, got %q", a.customValues[0])
+	}
+	// Left exits custom mode back to the picker, stepping the cursor off Custom.
+	s.handleKey(tea.KeyPressMsg{Code: tea.KeyLeft})
+	if a.focusedOnCustom() {
+		t.Fatal("Left should exit custom mode back to the picker")
+	}
+	if a.fieldValues[0] == askCustomSentinel {
+		t.Fatalf("Left should step the picker off Custom, got fieldValues=%q", a.fieldValues[0])
+	}
+}
