@@ -72,6 +72,50 @@ pub enum Command {
     /// user code (or redirect URL) from a prior `oauth_prompt`.
     #[serde(rename = "oauth_code")]
     OauthCode { code: String },
+    /// Add (or update) a custom provider with full config parity: same fields
+    /// `parse_provider` reads from config.json (`name`, `kind`, `base_url`,
+    /// `api_key` | `api_key_env`, `headers`, `context_window`). Inserted or
+    /// replaced in the providers list, made the active/fallback provider,
+    /// persisted to config.json, and models are re-discovered so the new
+    /// provider's models appear immediately. `headers` accepts the same shapes
+    /// as config.json: an object {"K":"V"} or an array of ["K","V"] pairs.
+    #[serde(rename = "add_custom_provider")]
+    AddCustomProvider {
+        name: String,
+        base_url: String,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        headers: Option<serde_json::Value>,
+        #[serde(default)]
+        context_window: Option<u32>,
+        /// Per-model capability overrides (same shape as config.json
+        /// `models_override`): an object keyed by model id, or an array of
+        /// `{id, context_window?, max_tokens?, reasoning?, thinking_levels?}`.
+        /// Applied to matching discovered models after discovery + enrichment.
+        #[serde(default)]
+        models_override: Option<serde_json::Value>,
+    },
+    /// Discover models from an endpoint WITHOUT persisting a provider. Takes a
+    /// base URL + wire kind + optional API key/headers (enough to call the
+    /// endpoint's model-list path), runs the normal discovery + models.dev
+    /// enrichment, and emits a `provider_models_preview` event with the model
+    /// list. Used by the add-custom-provider flow so the user can see (and
+    /// refine caps for) the models an endpoint exposes before committing.
+    #[serde(rename = "discover_provider_models")]
+    DiscoverProviderModels {
+        base_url: String,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        headers: Option<serde_json::Value>,
+    },
     #[serde(rename = "send")]
     Send {
         prompt: String,

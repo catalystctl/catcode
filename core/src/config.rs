@@ -399,6 +399,29 @@ impl std::fmt::Display for ProviderKind {
     }
 }
 
+/// A per-model capability override: refines a single discovered model's
+/// context window, max output tokens, reasoning flag, and/or advertised
+/// thinking levels. Applied AFTER discovery + models.dev enrichment + the
+/// per-provider `context_window` override, so an explicit per-model value wins
+/// over everything else. Every field is optional — only the ones present are
+/// applied; the rest fall through to the discovered/curated/default caps.
+/// This lets a user hand-tune a model the endpoint under-reports (e.g. a local
+/// server listing bare ids, or a gateway whose `/v1/models` omits caps) without
+/// a code change, while leaving other models on the 200k/8k flat defaults.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelOverride {
+    pub id: String,
+    /// Force this model's context window (tokens).
+    pub context_window: Option<u32>,
+    /// Force this model's max output tokens.
+    pub max_tokens: Option<u32>,
+    /// Force whether the model supports extended thinking/reasoning.
+    pub reasoning: Option<bool>,
+    /// Force the advertised reasoning effort levels (e.g. ["low","medium","high"]).
+    /// An empty vec clears the levels (model declares none); `None` leaves them.
+    pub thinking_levels: Option<Vec<String>>,
+}
+
 /// A configured provider as it appears in the config file/env (no resolved
 /// runtime key). `api_key` is a literal (user-owned config only, never a
 /// project-local file); `api_key_env` names an env var to read instead.
@@ -413,6 +436,17 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     /// Extra HTTP headers appended to every request (e.g. `HTTP-Referer`).
     pub headers: Vec<(String, String)>,
+    /// Optional per-provider context-window override (tokens). When set, every
+    /// model discovered from this provider is forced to this window — for
+    /// local servers (e.g. LM Studio) whose `/v1/models` returns bare ids
+    /// without a context field, so the harness doesn't oversend past the
+    /// model's actual loaded context. `None` = use the discovered/curated cap.
+    pub context_window: Option<u32>,
+    /// Optional per-model capability overrides. Applied to matching model ids
+    /// after discovery + models.dev + the per-provider `context_window`. Lets
+    /// the user hand-tune reasoning levels / context / output for individual
+    /// models the endpoint under-reports. Empty = no per-model refinement.
+    pub models_override: Vec<ModelOverride>,
 }
 
 /// A provider fully resolved for an API call: kind, base URL, the effective API
@@ -431,6 +465,14 @@ pub struct ResolvedProvider {
     /// instead of `x-api-key` (plugin subscription OAuth). Set by
     /// `oauth::enrich_oauth` when a plugin token is injected.
     pub oauth: bool,
+    /// Per-provider context-window override carried from `ProviderConfig` so
+    /// `discover_models` can force it onto every discovered model. `None` =
+    /// use the discovered/curated context.
+    pub context_window: Option<u32>,
+    /// Per-model capability overrides carried from `ProviderConfig` so
+    /// `discover_models` can refine individual models after discovery. Applied
+    /// in `apply_models_override` (after `apply_context_window_override`).
+    pub models_override: Vec<ModelOverride>,
 }
 
 impl ResolvedProvider {
@@ -454,6 +496,8 @@ impl ResolvedProvider {
             api_key,
             headers: Vec::new(),
             oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
         }
     }
 }
@@ -583,6 +627,8 @@ impl ProviderPreset {
             api_key,
             api_key_env,
             headers: Vec::new(),
+            context_window: None,
+            models_override: Vec::new(),
         }
     }
 }
@@ -608,6 +654,8 @@ pub fn preset_provider_configs(p: &ProviderPreset, api_key: Option<String>) -> V
             api_key: api_key_lit.clone(),
             api_key_env: api_key_env.clone(),
             headers: Vec::new(),
+            context_window: None,
+            models_override: Vec::new(),
         };
         vec![
             make("opencode-go", ProviderKind::OpenAI),
@@ -639,6 +687,37 @@ pub fn provider_to_json(p: &ProviderConfig) -> Value {
             .map(|(k, v)| (k, Value::String(v)))
             .collect();
         o.insert("headers".into(), Value::Object(h));
+    }
+    if let Some(ctx) = p.context_window {
+        o.insert("context_window".into(), json!(ctx));
+    }
+    if !p.models_override.is_empty() {
+        let arr: Vec<Value> = p
+            .models_override
+            .iter()
+            .map(model_override_to_json)
+            .collect();
+        o.insert("models_override".into(), json!(arr));
+    }
+    Value::Object(o)
+}
+
+/// Serialize a `ModelOverride` back to JSON for persistence. Only writes
+/// non-default fields so the file stays readable.
+fn model_override_to_json(m: &ModelOverride) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), json!(m.id));
+    if let Some(ctx) = m.context_window {
+        o.insert("context_window".into(), json!(ctx));
+    }
+    if let Some(max) = m.max_tokens {
+        o.insert("max_tokens".into(), json!(max));
+    }
+    if let Some(r) = m.reasoning {
+        o.insert("reasoning".into(), json!(r));
+    }
+    if let Some(levels) = &m.thinking_levels {
+        o.insert("thinking_levels".into(), json!(levels));
     }
     Value::Object(o)
 }
@@ -795,6 +874,8 @@ impl Config {
             api_key,
             headers: p.headers.clone(),
             oauth: false,
+            context_window: p.context_window,
+            models_override: p.models_override.clone(),
         }
     }
 }
@@ -1593,14 +1674,95 @@ pub fn parse_provider(v: &Value) -> Option<ProviderConfig> {
         .or_else(|| v.get("apiKeyEnv"))
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
+    let context_window = v
+        .get("context_window")
+        .or_else(|| v.get("contextWindow"))
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32);
     let headers = parse_headers(v.get("headers"));
+    let models_override =
+        parse_models_override(v.get("models_override").or_else(|| v.get("modelsOverride")));
     Some(ProviderConfig {
         name,
         kind,
         base_url,
         api_key,
         api_key_env,
+        context_window,
         headers,
+        models_override,
+    })
+}
+
+/// Parse a `models_override` value into per-model capability overrides. Accepts
+/// an object keyed by model id (`{"gpt-4o": {"context_window": 128000}}`) or an
+/// array of `{id, context_window?, max_tokens?, reasoning?, thinking_levels?}`.
+/// Each field is optional; only present ones are applied during discovery.
+pub fn parse_models_override(v: Option<&Value>) -> Vec<ModelOverride> {
+    let Some(v) = v else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(obj) = v.as_object() {
+        for (id, val) in obj {
+            if let Some(ov) = parse_one_model_override(Some(val), id.clone()) {
+                out.push(ov);
+            }
+        }
+        return out;
+    }
+    if let Some(arr) = v.as_array() {
+        for entry in arr {
+            let id = entry
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(ov) = parse_one_model_override(Some(entry), id) {
+                out.push(ov);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a single model override object (without its id, taken separately).
+fn parse_one_model_override(v: Option<&Value>, id: String) -> Option<ModelOverride> {
+    let v = v?;
+    let context_window = v
+        .get("context_window")
+        .or_else(|| v.get("contextWindow"))
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32);
+    let max_tokens = v
+        .get("max_tokens")
+        .or_else(|| v.get("maxTokens"))
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32);
+    let reasoning = v.get("reasoning").and_then(|x| x.as_bool());
+    let thinking_levels = v
+        .get("thinking_levels")
+        .or_else(|| v.get("thinkingLevels"))
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        });
+    if context_window.is_none()
+        && max_tokens.is_none()
+        && reasoning.is_none()
+        && thinking_levels.is_none()
+    {
+        return None;
+    }
+    Some(ModelOverride {
+        id,
+        context_window,
+        max_tokens,
+        reasoning,
+        thinking_levels,
     })
 }
 
@@ -1773,6 +1935,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_provider_reads_context_window() {
+        let v = json!({
+            "name": "lmstudio",
+            "base_url": "http://localhost:1234/v1",
+            "kind": "openai",
+            "context_window": 32768
+        });
+        let p = parse_provider(&v).unwrap();
+        assert_eq!(p.context_window, Some(32_768));
+        // camelCase alias also accepted.
+        let v2 = json!({"name": "x", "base_url": "http://x/v1", "contextWindow": 8192});
+        assert_eq!(parse_provider(&v2).unwrap().context_window, Some(8_192));
+        // absent -> None (use discovered/curated caps).
+        let v3 = json!({"name": "y", "base_url": "http://y/v1"});
+        assert_eq!(parse_provider(&v3).unwrap().context_window, None);
+    }
+
+    #[test]
+    fn resolve_provider_carries_context_window() {
+        let mut c = Config::default();
+        c.providers.push(ProviderConfig {
+            name: "lmstudio".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "http://localhost:1234/v1".into(),
+            api_key: None,
+            api_key_env: None,
+            headers: Vec::new(),
+            context_window: Some(32_768),
+            models_override: Vec::new(),
+        });
+        c.active_provider = Some("lmstudio".into());
+        let keys = std::collections::HashMap::new();
+        let r = c.resolve_provider(&keys);
+        assert_eq!(r.context_window, Some(32_768));
+    }
+
+    #[test]
     fn parse_provider_requires_name_and_url() {
         assert!(parse_provider(&json!({"base_url": "x"})).is_none()); // no name
         assert!(parse_provider(&json!({"name": "x"})).is_none()); // no base_url
@@ -1835,6 +2034,8 @@ mod tests {
             api_key: Some("config-key".into()),
             api_key_env: Some(env.into()),
             headers: vec![("h".into(), "v".into())],
+            context_window: None,
+            models_override: Vec::new(),
         });
         // active_provider None -> first configured provider.
         let mut keys = std::collections::HashMap::new();

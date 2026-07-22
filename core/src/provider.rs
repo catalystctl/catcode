@@ -3669,6 +3669,92 @@ mod tests {
     }
 
     #[test]
+    fn apply_context_window_override_forces_local_context() {
+        // Simulates a gemma model served by LM Studio: its `/v1/models` returns
+        // bare ids, so openai_model_caps() has no gemma branch and falls to the
+        // 200k default — which would oversend past a 32k loaded context.
+        let provider = ResolvedProvider {
+            name: "lmstudio".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "http://localhost:1234/v1".into(),
+            api_key: None,
+            headers: Vec::new(),
+            oauth: false,
+            context_window: Some(32_768),
+            models_override: Vec::new(),
+        };
+        let mut models = vec![openai_model_caps("gemma-3-12b-it", "Gemma 3 12B")];
+        assert_eq!(models[0].context_window, 200_000); // no gemma branch -> default
+        apply_context_window_override(&provider, &mut models);
+        assert_eq!(models[0].context_window, 32_768);
+        // No override on the provider leaves discovered caps untouched.
+        let none_provider = ResolvedProvider {
+            context_window: None,
+            ..provider
+        };
+        let mut m2 = vec![openai_model_caps("gemma-3-12b-it", "Gemma 3 12B")];
+        apply_context_window_override(&none_provider, &mut m2);
+        assert_eq!(m2[0].context_window, 200_000);
+    }
+
+    #[test]
+    fn apply_models_override_refines_individual_models() {
+        // A bare-id endpoint (e.g. LM Studio) leaves models on the 200k/8k
+        // flat default. Per-model overrides refine ONLY the matched id + the
+        // fields set; everything else keeps discovered/default caps.
+        use crate::config::ModelOverride;
+        let provider = ResolvedProvider {
+            name: "lmstudio".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "http://localhost:1234/v1".into(),
+            api_key: None,
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: vec![
+                ModelOverride {
+                    id: "gemma-3-12b-it".into(),
+                    context_window: Some(32_768),
+                    max_tokens: Some(4_096),
+                    reasoning: Some(true),
+                    thinking_levels: Some(vec!["low".into(), "high".into()]),
+                },
+                // An override for a model NOT in the discovered list is a no-op.
+                ModelOverride {
+                    id: "nonexistent".into(),
+                    context_window: Some(999_999),
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut models = vec![
+            openai_model_caps("gemma-3-12b-it", "Gemma 3 12B"),
+            openai_model_caps("qwen3-8b", "Qwen3 8B"),
+        ];
+        assert_eq!(models[0].context_window, 200_000); // no gemma branch -> default
+        apply_models_override(&provider, &mut models);
+        // Matched model refined on every field.
+        assert_eq!(models[0].context_window, 32_768);
+        assert_eq!(models[0].max_tokens, 4_096);
+        assert!(models[0].reasoning);
+        assert_eq!(models[0].thinking_levels, vec!["low", "high"]);
+        // Unmatched model keeps its discovered/default caps (the 200k default).
+        assert_eq!(models[1].context_window, 200_000);
+        // An empty thinking_levels vec clears reasoning (model declares none).
+        let p2 = ResolvedProvider {
+            models_override: vec![ModelOverride {
+                id: "qwen3-8b".into(),
+                thinking_levels: Some(Vec::new()),
+                ..Default::default()
+            }],
+            ..provider
+        };
+        apply_models_override(&p2, &mut models);
+        assert!(!models[1].reasoning);
+        assert!(models[1].thinking_levels.is_empty());
+    }
+
+    #[test]
     fn apply_live_model_fields_reads_cursor_reasoning_metadata() {
         let mut info = openai_model_caps("cursor-model", "Cursor Model");
         apply_live_model_fields(
@@ -4218,6 +4304,8 @@ mod tests {
             api_key: Some("test-key".into()),
             headers: Vec::new(),
             oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
         }
     }
 
@@ -4521,6 +4609,8 @@ mod tests {
             api_key: Some("test-key".into()),
             headers: Vec::new(),
             oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
         };
         let mut timer = TurnTimer::new();
         let result = stream_turn_anthropic(
@@ -4613,6 +4703,8 @@ mod tests {
             api_key: None, // /models/info is public
             headers: Vec::new(),
             oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
         };
         let models = discover_models_force_refresh(&client, &provider).await;
         assert!(

@@ -810,6 +810,172 @@ pub(crate) async fn run() {
                 }
                 state.refresh_models(&client).await;
             }
+            Command::AddCustomProvider {
+                name,
+                base_url,
+                kind,
+                api_key,
+                api_key_env,
+                headers,
+                context_window,
+                models_override,
+            } => {
+                // Add or update a custom provider with full config parity (same
+                // fields hand-editing config.json supports). Validates, inserts/
+                // replaces in cfg.providers, makes it the active/fallback,
+                // persists, and re-aggregates models so its models join /models.
+                let name = name.trim().to_string();
+                let base_url = base_url.trim().to_string();
+                if name.is_empty() || base_url.is_empty() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!("add_custom_provider: name and base_url are required"),
+                    ));
+                    return;
+                }
+                let kind = kind
+                    .as_deref()
+                    .map(config::ProviderKind::parse)
+                    .unwrap_or_default();
+                let api_key = api_key
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let api_key_env = api_key_env
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let headers = config::parse_headers(headers.as_ref());
+                let models_override = config::parse_models_override(models_override.as_ref());
+                let pc = config::ProviderConfig {
+                    name: name.clone(),
+                    kind,
+                    base_url,
+                    api_key: api_key.clone(),
+                    api_key_env,
+                    headers,
+                    context_window,
+                    models_override,
+                };
+                let existed;
+                {
+                    let mut cfg = state.cfg.write().await;
+                    if let Some(i) = cfg.providers.iter().position(|x| x.name == name) {
+                        cfg.providers[i] = pc.clone();
+                        existed = true;
+                    } else {
+                        cfg.providers.push(pc.clone());
+                        existed = false;
+                    }
+                }
+                // Seed the runtime key so the immediate turn works without a
+                // restart. An env-var-only provider resolves its key at request
+                // time; clearing a previously-seeded key on update (no literal
+                // key this time) is handled by `resolved_provider` falling back
+                // to config, so only write/remove the runtime slot explicitly.
+                {
+                    let mut keys = state.api_keys.write().await;
+                    match &api_key {
+                        Some(k) => {
+                            keys.insert(name.clone(), k.clone());
+                        }
+                        None => {
+                            keys.remove(&name);
+                        }
+                    }
+                }
+                *state.active_provider.write().await = Some(name.clone());
+                {
+                    let cfg = state.cfg.read().await;
+                    if let Err(e) = config::save_providers_config(&cfg.providers, Some(&name)) {
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!(format!(
+                                "provider '{name}' added for this session (could not persist to config.json: {e})"
+                            )),
+                        ));
+                    }
+                }
+                state.logger.log(
+                    "add_custom_provider",
+                    json!({ "provider": pc.name, "kind": pc.kind.as_str(), "base_url": pc.base_url, "has_key": api_key.is_some(), "updated": existed }),
+                );
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(if existed {
+                        format!("updated provider '{name}'.")
+                    } else {
+                        format!("added provider '{name}'.")
+                    }),
+                ));
+                let rp = state.resolved_provider_enriched().await;
+                emit(
+                    &Event::new("provider_changed")
+                        .with("provider", json!(rp.name))
+                        .with("kind", json!(rp.kind.as_str()))
+                        .with("base_url", json!(rp.base_url))
+                        .with("has_key", json!(rp.api_key.is_some())),
+                );
+                if rp.api_key.is_some() {
+                    emit(
+                        &Event::new("authed")
+                            .with("ok", json!(true))
+                            .with("provider", json!(rp.name)),
+                    );
+                }
+                state.refresh_models(&client).await;
+            }
+            Command::DiscoverProviderModels {
+                base_url,
+                kind,
+                api_key,
+                headers,
+            } => {
+                // Discover models from an endpoint WITHOUT persisting a
+                // provider: build a throwaway ResolvedProvider, run the normal
+                // discovery + models.dev enrichment, and emit a preview event.
+                // Used by the add-custom-provider flow so the user can see (and
+                // refine caps for) the models an endpoint exposes before
+                // committing. The result is NOT added to /models — only a preview.
+                let base_url = base_url.trim().to_string();
+                if base_url.is_empty() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!("discover_provider_models: base_url is required"),
+                    ));
+                    return;
+                }
+                let kind = kind
+                    .as_deref()
+                    .map(config::ProviderKind::parse)
+                    .unwrap_or_default();
+                let api_key = api_key
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let headers = config::parse_headers(headers.as_ref());
+                let rp = config::ResolvedProvider {
+                    name: "__preview__".to_string(),
+                    kind,
+                    base_url: base_url.clone(),
+                    api_key,
+                    headers,
+                    oauth: false,
+                    context_window: None,
+                    models_override: Vec::new(),
+                };
+                emit(&Event::new("info").with(
+                    "message",
+                    json!(format!("discovering models from {base_url}…")),
+                ));
+                let models = provider::discover_models(&client, &rp).await;
+                state.logger.log(
+                    "discover_provider_models",
+                    json!({ "base_url": base_url, "count": models.len() }),
+                );
+                emit(
+                    &Event::new("provider_models_preview")
+                        .with("models", json!(models))
+                        .with("base_url", json!(base_url)),
+                );
+            }
             Command::LoginOauth { preset } => {
                 // Plugin-declared subscription OAuth only. Built-in vendor
                 // OAuth was removed from core — install a plugin that declares

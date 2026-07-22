@@ -236,12 +236,15 @@ pub async fn discover_models(
     provider: &ResolvedProvider,
 ) -> Vec<ModelInfo> {
     let cache_key = provider_cache_key(provider);
-    match provider.kind {
+    let mut models = match provider.kind {
         ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, false).await,
         ProviderKind::Anthropic => {
             discover_models_anthropic(client, provider, &cache_key, false).await
         }
-    }
+    };
+    apply_context_window_override(provider, &mut models);
+    apply_models_override(provider, &mut models);
+    models
 }
 
 /// Like [`discover_models`], but bypasses the fresh-cache (TTL) early return so a
@@ -255,10 +258,66 @@ pub async fn discover_models_force_refresh(
     provider: &ResolvedProvider,
 ) -> Vec<ModelInfo> {
     let cache_key = provider_cache_key(provider);
-    match provider.kind {
+    let mut models = match provider.kind {
         ProviderKind::OpenAI => discover_models_openai(client, provider, &cache_key, true).await,
         ProviderKind::Anthropic => {
             discover_models_anthropic(client, provider, &cache_key, true).await
+        }
+    };
+    apply_context_window_override(provider, &mut models);
+    apply_models_override(provider, &mut models);
+    models
+}
+
+/// Apply a provider's optional `context_window` override to every discovered
+/// model. Local OpenAI-compatible servers (e.g. LM Studio) return bare
+/// `/v1/models` ids with no context field, so without this a gemma model would
+/// fall to the 200k curated default and the harness would oversend past the
+/// model's actual loaded context (causing context-overflow errors). An explicit
+/// `context_window` on the provider config wins over discovered/curated caps.
+pub(crate) fn apply_context_window_override(provider: &ResolvedProvider, models: &mut [ModelInfo]) {
+    if let Some(ctx) = provider.context_window {
+        for m in models {
+            m.context_window = ctx;
+            // Keep max output below the (possibly reduced) context so there is
+            // room for the prompt; mirrors apply_live_model_fields.
+            if m.max_tokens >= ctx {
+                m.max_tokens = (ctx / 4).max(1);
+            }
+        }
+    }
+}
+
+/// Apply a provider's optional per-model `models_override` list. Each override
+/// matches a discovered model by id and refines only the fields it sets
+/// (context_window / max_tokens / reasoning / thinking_levels). Applied AFTER
+/// discovery + models.dev enrichment + the per-provider `context_window`
+/// override, so an explicit per-model value wins over everything else. Models
+/// with no matching override keep their discovered/curated/default caps
+/// (the 200k / 8k flat default when nothing else applies).
+pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [ModelInfo]) {
+    for ov in &provider.models_override {
+        let Some(m) = models.iter_mut().find(|m| m.id == ov.id) else {
+            continue;
+        };
+        if let Some(ctx) = ov.context_window {
+            m.context_window = ctx;
+        }
+        if let Some(max) = ov.max_tokens {
+            m.max_tokens = max;
+        }
+        if let Some(r) = ov.reasoning {
+            m.reasoning = r;
+        }
+        if let Some(levels) = &ov.thinking_levels {
+            m.thinking_levels = levels.clone();
+            // Advertise reasoning iff there are effort levels; an empty vec
+            // clears both (model declares no thinking).
+            if levels.is_empty() {
+                m.reasoning = false;
+            } else {
+                m.reasoning = true;
+            }
         }
     }
 }

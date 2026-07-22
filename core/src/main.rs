@@ -1065,6 +1065,8 @@ pub fn resolve_provider_from_config(
         api_key,
         headers: p.headers.clone(),
         oauth: false,
+        context_window: p.context_window,
+        models_override: p.models_override.clone(),
     }
 }
 
