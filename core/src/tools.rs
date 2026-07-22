@@ -667,8 +667,14 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         .get("case_insensitive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let invert = args.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fixed_string = args.get("fixed_string").and_then(|v| v.as_bool()).unwrap_or(false);
+    let invert = args
+        .get("invert")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let fixed_string = args
+        .get("fixed_string")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let word = args.get("word").and_then(|v| v.as_bool()).unwrap_or(false);
     // fixed_string escapes regex metacharacters so symbols like `foo.bar()`
     // match literally; word wraps in word boundaries (\b...\b).
@@ -1221,7 +1227,10 @@ fn glob_filter_passes(globs: &[String], rel: &str, base: &str) -> bool {
             None => includes.push(g.as_str()),
         }
     }
-    let any_match = |pats: &[&str]| pats.iter().any(|p| glob_match(p, rel) || glob_match(p, base));
+    let any_match = |pats: &[&str]| {
+        pats.iter()
+            .any(|p| glob_match(p, rel) || glob_match(p, base))
+    };
     let inc_ok = includes.is_empty() || any_match(&includes);
     let exc_ok = !any_match(&excludes);
     inc_ok && exc_ok
@@ -3690,11 +3699,7 @@ mod tests {
         let (root, cfg) = tmp_ws();
         // 'a.b' as regex would match 'axb' too; -F must match the literal only.
         fs::write(root.join("a.txt"), "a.b\naxb\n").unwrap();
-        let o = execute(
-            "grep",
-            &json!({"pattern":"a.b","fixed_string":true}),
-            &cfg,
-        );
+        let o = execute("grep", &json!({"pattern":"a.b","fixed_string":true}), &cfg);
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains(":1:a.b"), "{}", o.output);
         assert!(!o.output.contains("axb"), "{}", o.output);
@@ -3720,7 +3725,11 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains(":2:MARK"), "{}", o.output);
         assert!(o.output.contains("a.txt-3-l3"), "{}", o.output);
-        assert!(!o.output.contains("l1"), "no before-line expected: {}", o.output);
+        assert!(
+            !o.output.contains("l1"),
+            "no before-line expected: {}",
+            o.output
+        );
     }
 
     #[test]
@@ -3736,7 +3745,11 @@ mod tests {
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains(":3:MARK"), "{}", o.output);
         assert!(o.output.contains("a.txt-2-l2"), "{}", o.output);
-        assert!(!o.output.contains("l4"), "no after-line expected: {}", o.output);
+        assert!(
+            !o.output.contains("l4"),
+            "no after-line expected: {}",
+            o.output
+        );
     }
 
     #[test]
@@ -3751,7 +3764,11 @@ mod tests {
         );
         assert!(o.ok, "{}", o.output);
         assert!(o.output.contains(":3:MARK"), "{}", o.output);
-        assert!(o.output.contains("b0"), "before side should keep context:2: {}", o.output);
+        assert!(
+            o.output.contains("b0"),
+            "before side should keep context:2: {}",
+            o.output
+        );
     }
 
     #[test]
