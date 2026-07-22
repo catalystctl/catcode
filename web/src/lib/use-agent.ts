@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { reduce, initialState } from "./reducer";
-import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, ModelInfo } from "./types";
+import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, CustomProviderDraft, ModelInfo } from "./types";
 
 // ponytail: localStorage persistence for UI preferences (model/thinking/approval).
 // try/catch guards SSR + disabled-storage; failing silently is fine.
@@ -53,6 +53,12 @@ export interface AgentApi {
   setKey: (key: string) => Promise<void>;
   setProvider: (name: string) => Promise<void>;
   login: (preset: string, key?: string) => Promise<void>;
+  /** Add or update a custom provider with full config.json parity. */
+  addCustomProvider: (draft: CustomProviderDraft) => Promise<void>;
+  /** Discover models from an endpoint (preview, no persist) for the custom-provider form. */
+  discoverProviderModels: (base_url: string, kind: "openai" | "anthropic", api_key?: string) => Promise<void>;
+  /** Clear the provider-models preview (when the modal closes). */
+  clearProviderModelsPreview: () => void;
   loginOauth: (preset: string) => Promise<void>;
   logout: (provider: string) => Promise<void>;
   listProviderPresets: () => Promise<void>;
@@ -546,6 +552,55 @@ export function useAgent(): AgentApi {
     },
     [send],
   );
+
+  // Add or update a custom provider (name/kind/base_url/key|env/headers/ctx)
+  // — the same fields hand-editing config.json supports. The core persists to
+  // config.json, makes it the active provider, and re-discovers models.
+  const addCustomProvider = useCallback(
+    async (d: CustomProviderDraft) => {
+      const headers: Record<string, string> = {};
+      for (const line of d.headersText.split(/\n+/)) {
+        const i = line.indexOf(":");
+        if (i <= 0) continue;
+        const k = line.slice(0, i).trim();
+        const v = line.slice(i + 1).trim();
+        if (k && v) headers[k] = v;
+      }
+      const ctx = parseInt(d.contextWindow.trim(), 10);
+      await send({
+        type: "add_custom_provider",
+        name: d.name.trim(),
+        base_url: d.base_url.trim(),
+        kind: d.kind,
+        api_key: d.apiKey.trim() || undefined,
+        api_key_env: d.apiKeyEnv.trim() || undefined,
+        headers: Object.keys(headers).length ? headers : undefined,
+        context_window: Number.isFinite(ctx) && ctx > 0 ? ctx : undefined,
+        models_override: d.modelsOverride.length ? d.modelsOverride : undefined,
+      });
+      // Refresh the preset/picker list (logged-in/configured flags).
+      await post({ type: "list_provider_presets" });
+    },
+    [send, post],
+  );
+
+  // Discover models from an endpoint WITHOUT persisting a provider — a preview
+  // for the add-custom-provider form. The core emits provider_models_preview.
+  const discoverProviderModels = useCallback(
+    async (base_url: string, kind: "openai" | "anthropic", api_key?: string) => {
+      await send({
+        type: "discover_provider_models",
+        base_url: base_url.trim(),
+        kind,
+        api_key: api_key?.trim() || undefined,
+      });
+    },
+    [send],
+  );
+
+  const clearProviderModelsPreview = useCallback(() => {
+    setState((s) => reduce(s, { type: "_clear_provider_models_preview" }));
+  }, []);
 
   // Start this app's OAuth subscription login (browser / device-code).
   const loginOauth = useCallback(
@@ -1191,6 +1246,9 @@ export function useAgent(): AgentApi {
       setKey,
       setProvider,
       login,
+      addCustomProvider,
+      discoverProviderModels,
+      clearProviderModelsPreview,
       loginOauth,
       logout,
       listProviderPresets,

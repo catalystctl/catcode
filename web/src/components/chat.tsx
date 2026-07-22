@@ -27,6 +27,7 @@ import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalProgressPanel } from "./goal-modal";
 import { ControlCenterPanel } from "./control-center";
 import { ProviderLoginModal } from "./provider-login-modal";
+import { CustomProviderModal } from "./custom-provider-modal";
 import { DiagnosticsModal } from "./diagnostics-modal";
 import { ErrorBoundary } from "./error-boundary";
 import { AppDialogHost, useAppDialog } from "./app-dialog";
@@ -98,9 +99,11 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<
-    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "control" | "login" | "logout" | "diagnostics"
+    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "control" | "login" | "logout" | "custom-provider" | "diagnostics"
   >(null);
   const [images, setImages] = useState<string[]>([]);
+  // True while `discover_provider_models` is in flight (custom-provider modal).
+  const [discovering, setDiscovering] = useState(false);
   // Keep the server and first client render deterministic. The inline script in
   // layout.tsx applies the persisted value before paint; after hydration we
   // adopt that value into React state. Reading localStorage in the initializer
@@ -130,6 +133,11 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
       // Storage may be unavailable; drawer behavior remains functional.
     }
   }, [restoredDrawerWorkspace, sidebarOpen, state.workspace]);
+
+  // A discovery result landed → stop the spinner (the modal advances to step 2).
+  useEffect(() => {
+    if (state.providerModelsPreview) setDiscovering(false);
+  }, [state.providerModelsPreview]);
 
   // Refs so the edit/regenerate/command callbacks can stay stable (empty deps)
   // — this keeps <Message> memoized: only the streaming message re-renders on
@@ -979,7 +987,24 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onLoginSaved={(id) => void agent.login(id)}
           onSwitchProvider={(id) => void agent.setProvider(id)}
           onLogout={(id) => void agent.logout(id)}
+          onAddCustom={() => setModal("custom-provider")}
           onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "custom-provider" && (
+        <CustomProviderModal
+          previewModels={agent.state.providerModelsPreview}
+          discovering={discovering}
+          onDiscover={(url, kind, key) => {
+            setDiscovering(true);
+            void agent.discoverProviderModels(url, kind, key);
+          }}
+          onSubmit={(draft) => void agent.addCustomProvider(draft)}
+          onClose={() => {
+            setModal(null);
+            agent.clearProviderModelsPreview();
+            setDiscovering(false);
+          }}
         />
       )}
 

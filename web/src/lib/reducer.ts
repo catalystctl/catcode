@@ -36,6 +36,7 @@ export const initialState: AgentState = {
   workspace: "",
   projects: [],
   providerPresets: [],
+  providerModelsPreview: null,
   selectedModel: null,
   thinkingLevel: "medium",
   messages: [],
@@ -631,6 +632,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, toasts: state.toasts.filter((t) => t.id !== ev.id) };
     case "_set_switching":
       return { ...state, switching: ev.switching };
+    case "_clear_provider_models_preview":
+      return { ...state, providerModelsPreview: null };
     case "_goal_approve_optimistic": {
       if (!state.goalMode || state.goalMode.phase !== "plan_ready") return state;
       const goalMode = { ...state.goalMode, auto_deploy: true };
@@ -703,6 +706,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
     case "provider_presets":
       return { ...state, providerPresets: ev.presets ?? [] };
+    case "provider_models_preview":
+      return { ...state, providerModelsPreview: ev.models ?? [] };
     case "authed":
       return { ...state, authed: ev.ok, pendingOauth: null };
     case "provider_changed":

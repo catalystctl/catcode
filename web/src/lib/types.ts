@@ -52,6 +52,32 @@ export interface ProviderPreset {
   supportsOauth?: boolean;
 }
 
+/** A per-model capability override (mirrors the core's ModelOverride). */
+export interface ModelOverride {
+  id: string;
+  context_window?: number;
+  max_tokens?: number;
+  reasoning?: boolean;
+  thinking_levels?: string[];
+}
+
+/** Fields for the add_custom_provider form — full config.json parity. */
+export interface CustomProviderDraft {
+  name: string;
+  kind: "openai" | "anthropic";
+  base_url: string;
+  /** Literal API key stored in the 0600 config (wins over apiKeyEnv). */
+  apiKey: string;
+  /** Env var NAME holding the key (read at request time). */
+  apiKeyEnv: string;
+  /** Extra HTTP headers, one `Key: value` per line. */
+  headersText: string;
+  /** Optional per-provider context-window override (tokens). */
+  contextWindow: string;
+  /** Per-model caps overrides discovered via the discover step. */
+  modelsOverride: ModelOverride[];
+}
+
 export interface ReadyPayload extends SDKReadyPayload {
   type: "ready";
   models: ModelInfo[];
@@ -447,6 +473,7 @@ export type CoreEvent =
   | ReadyPayload
   | { type: "models"; models: ModelInfo[] }
   | { type: "provider_presets"; presets: ProviderPreset[] }
+  | { type: "provider_models_preview"; models: ModelInfo[]; base_url: string }
   | { type: "authed"; ok: boolean; provider: string }
   | { type: "provider_changed"; provider: string; kind: string; base_url: string; has_key: boolean }
   | { type: "approval_changed"; mode: string } // "destructive" | "always" | "<kind>:always"
@@ -675,6 +702,24 @@ export type CoreCommand =
   | { type: "set_provider"; name: string }
   | { type: "list_provider_presets" }
   | { type: "login"; preset: string; api_key?: string }
+  | {
+      type: "add_custom_provider";
+      name: string;
+      base_url: string;
+      kind?: string;
+      api_key?: string;
+      api_key_env?: string;
+      headers?: Record<string, string>;
+      context_window?: number;
+      models_override?: ModelOverride[];
+    }
+  | {
+      type: "discover_provider_models";
+      base_url: string;
+      kind?: string;
+      api_key?: string;
+      headers?: Record<string, string>;
+    }
   | { type: "login_oauth"; preset: string }
   | { type: "logout"; provider: string }
   | { type: "oauth_code"; code: string }
@@ -763,7 +808,8 @@ export type SyntheticEvent =
   | { type: "_session_title"; name: string; title: string }
   /** Client-side undo: drop the last turn locally; next `reset` keeps messages. */
   | { type: "_undo_local" }
-  | { type: "_goal_approve_optimistic" };
+  | { type: "_goal_approve_optimistic" }
+  | { type: "_clear_provider_models_preview" };
 
 export type AgentEvent = CoreEvent | SyntheticEvent;
 
@@ -893,6 +939,9 @@ export interface AgentState {
   /** First-party provider presets (Umans, OpenCode Go, OpenRouter) from the
    * core, used by the /login + /logout pickers. */
   providerPresets: ProviderPreset[];
+  /** Models discovered by `discover_provider_models` (a preview for the
+   * add-custom-provider flow); null when no preview is active. */
+  providerModelsPreview: ModelInfo[] | null;
   selectedModel: string | null;
   thinkingLevel: string;
   messages: UIMessage[];

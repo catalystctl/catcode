@@ -45,6 +45,13 @@ export const ChevronLeft = (p: P) => (
   </svg>
 );
 
+export const ArrowLeftIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M19 12H5" />
+    <path d="M12 19l-7-7 7-7" />
+  </svg>
+);
+
 export const HomeIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M3 10.5L12 3l9 7.5" />

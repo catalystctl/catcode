@@ -9,7 +9,7 @@ import type { ProviderPreset } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
-import { CheckIcon, XIcon, ShieldIcon } from "./icons";
+import { CheckIcon, XIcon, ShieldIcon, PlusIcon } from "./icons";
 
 interface Props {
   presets: ProviderPreset[];
@@ -19,6 +19,8 @@ interface Props {
   onLoginSaved: (presetId: string) => void;
   onSwitchProvider: (presetId: string) => void;
   onLogout: (presetId: string) => void;
+  /** Open the custom-provider form (any OpenAI/Anthropic-compatible endpoint). */
+  onAddCustom: () => void;
   onClose: () => void;
 }
 
@@ -30,6 +32,7 @@ export function ProviderLoginModal({
   onLoginSaved,
   onSwitchProvider,
   onLogout,
+  onAddCustom,
   onClose,
 }: Props) {
   const closeRef = useOutsideClose(onClose);
@@ -72,31 +75,52 @@ export function ProviderLoginModal({
               {mode === "logout" ? "Not logged into any provider." : "No provider presets available."}
             </p>
           ) : (
-            list.map((p) => {
-              const active = selected === p.id;
-              return (
-                <button
-                  key={p.id}
-                  onClick={() => {
-                    setSelected(p.id);
-                    setKeyInput("");
-                  }}
-                  className={`flex w-full items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-colors ${
-                    active
-                      ? "border-accent/40 bg-accent/10"
-                      : "border-ink-700/70 bg-ink-900/70 hover:border-ink-600 hover:bg-ink-850"
-                  }`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 text-[13px] font-medium text-ink-100">
-                      {p.loggedIn && <CheckIcon width={12} height={12} className="text-success" />}
-                      {p.label}
+            <>
+              {list.map((p) => {
+                const active = selected === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      setSelected(p.id);
+                      setKeyInput("");
+                    }}
+                    className={`flex w-full items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-colors ${
+                      active
+                        ? "border-accent/40 bg-accent/10"
+                        : "border-ink-700/70 bg-ink-900/70 hover:border-ink-600 hover:bg-ink-850"
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 text-[13px] font-medium text-ink-100">
+                        {p.loggedIn && <CheckIcon width={12} height={12} className="text-success" />}
+                        {p.label}
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-ink-500">{p.description}</div>
                     </div>
-                    <div className="mt-0.5 text-[11px] text-ink-500">{p.description}</div>
+                  </button>
+                );
+              })}
+              {mode === "login" && (
+                <button
+                  onClick={() => {
+                    onAddCustom();
+                  }}
+                  className="flex w-full items-start gap-2.5 rounded-xl border border-dashed border-ink-700/70 bg-ink-900/40 px-3.5 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-accent/5"
+                >
+                  <div className="flex min-w-0 flex-1 items-start gap-2">
+                    <PlusIcon width={14} height={14} className="mt-0.5 shrink-0 text-accent-soft" />
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-medium text-ink-100">Add custom provider…</div>
+                      <div className="mt-0.5 text-[11px] text-ink-500">
+                        Any OpenAI- or Anthropic-compatible endpoint — full config parity
+                        (name · base URL · key or env var · headers · context window).
+                      </div>
+                    </div>
                   </div>
                 </button>
-              );
-            })
+              )}
+            </>
           )}
         </div>
 
