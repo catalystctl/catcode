@@ -380,6 +380,13 @@ struct OauthManifestEntry {
     /// Timeout for the token (resolve/refresh) action (default 30s).
     #[serde(default)]
     token_timeout_ms: Option<u64>,
+    /// Non-secret env var names the harness forwards to this provider's
+    /// scripts (e.g. `ACME_OAUTH_HOST` for a self-hosted auth server). The
+    /// harness otherwise scrubs the environment, so plugin-specific config
+    /// knobs must be declared here. Names containing KEY/TOKEN/SECRET/
+    /// PASSWORD are rejected — passthrough must never defeat env scrubbing.
+    #[serde(default)]
+    env_passthrough: Vec<String>,
 }
 
 // ---- public types ----
@@ -484,6 +491,9 @@ pub struct PluginOauthConfig {
     pub scripts: HashMap<String, PathBuf>,
     pub login_timeout_ms: u64,
     pub token_timeout_ms: u64,
+    /// Non-secret env var names forwarded to this provider's scripts
+    /// (validated in `load_oauth_entry`; values taken from the harness env).
+    pub env_passthrough: Vec<String>,
 }
 
 impl PluginOauthConfig {
@@ -1566,6 +1576,8 @@ impl PluginManager {
             api_key: None,
             api_key_env: None,
             headers: cfg.headers.clone(),
+            context_window: None,
+            models_override: Vec::new(),
         })
     }
 
@@ -1598,7 +1610,12 @@ impl PluginManager {
                 let ctx =
                     self.oauth_action_ctx("clear", provider_id, &cfg.token_path.to_string_lossy());
                 let _ = self
-                    .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
+                    .execute_oauth_script(
+                        script,
+                        ctx,
+                        cfg.token_timeout_ms,
+                        &oauth_script_env(&cfg),
+                    )
                     .await;
             }
         }
@@ -1631,15 +1648,32 @@ impl PluginManager {
         }
         let script = cfg.script_for("token")?;
         let ctx = self.oauth_action_ctx("token", provider_id, &cfg.token_path.to_string_lossy());
-        let resp = self
-            .execute_oauth_script(script, ctx, cfg.token_timeout_ms)
+        // Log failures instead of swallowing them: a silently-failing token
+        // script surfaces to the user as an unexplained "run /login" prompt.
+        let resp = match self
+            .execute_oauth_script(script, ctx, cfg.token_timeout_ms, &oauth_script_env(&cfg))
             .await
-            .ok()?;
-        let token = resp
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[plugins] oauth token script for '{provider_id}' failed: {e}");
+                return None;
+            }
+        };
+        let token = match resp
             .get("access_token")
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
-            .map(String::from)?;
+            .map(String::from)
+        {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[plugins] oauth token script for '{provider_id}' returned no access_token (re-login may be required)"
+                );
+                return None;
+            }
+        };
         let headers = parse_oauth_token_headers(resp.get("headers"));
         let now = now_secs();
         let exp = resp
@@ -1701,6 +1735,7 @@ impl PluginManager {
                     cfg.script_for("login").ok_or("no login script")?,
                     ctx,
                     cfg.login_timeout_ms,
+                    &oauth_script_env(&cfg),
                 )
                 .await?;
             let url = resp
@@ -1752,6 +1787,7 @@ impl PluginManager {
                     cfg.script_for("complete").ok_or("no complete script")?,
                     ctx,
                     cfg.login_timeout_ms,
+                    &oauth_script_env(&cfg),
                 )
                 .await?;
             if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1776,6 +1812,7 @@ impl PluginManager {
                     cfg.script_for("login").ok_or("no login script")?,
                     ctx,
                     cfg.login_timeout_ms,
+                    &oauth_script_env(&cfg),
                 )
                 .await?;
             let url = resp
@@ -1819,7 +1856,7 @@ impl PluginManager {
             ctx["pending"] = p.clone();
         }
         let resp = self
-            .execute_oauth_script(script, ctx, cfg.login_timeout_ms)
+            .execute_oauth_script(script, ctx, cfg.login_timeout_ms, &oauth_script_env(&cfg))
             .await?;
         if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             let err = resp
@@ -1860,10 +1897,11 @@ impl PluginManager {
         script: &Path,
         context: Value,
         timeout_ms: u64,
+        extra_env: &[(String, String)],
     ) -> Result<Value, String> {
         let ctx_bytes = serde_json::to_vec(&context).unwrap_or_default();
         validate_plugin_io("oauth script", ctx_bytes.len())?;
-        let mut child = match hook_command(script)
+        let mut child = match hook_command_with_env(script, extra_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2842,6 +2880,23 @@ fn load_oauth_entry(
     }
 
     let label = entry.label.unwrap_or_else(|| provider_id.clone());
+    // Validate declared env passthrough: names only, well-formed, and never
+    // secret-looking — the whole point of env scrubbing is that plugin
+    // scripts can't see API keys/tokens.
+    for name in &entry.env_passthrough {
+        let well_formed = !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.chars().next().unwrap_or('0').is_ascii_digit();
+        let upper = name.to_ascii_uppercase();
+        let secret_like = ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+            .iter()
+            .any(|w| upper.contains(w));
+        if !well_formed || secret_like {
+            return Err(format!(
+                "oauth provider '{provider_id}' env_passthrough entry '{name}' is invalid or secret-looking (KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL names are not allowed)"
+            ));
+        }
+    }
     Ok(PluginOauthConfig {
         provider_id,
         label,
@@ -2853,6 +2908,7 @@ fn load_oauth_entry(
         scripts,
         login_timeout_ms: entry.login_timeout_ms.unwrap_or(120_000),
         token_timeout_ms: entry.token_timeout_ms.unwrap_or(30_000),
+        env_passthrough: entry.env_passthrough,
     })
 }
 
@@ -2944,6 +3000,12 @@ fn python_interpreter() -> String {
 /// `.py` uses python, and `.sh`/`.bash` use `bash` (Git Bash/WSL) when present.
 /// `CATALYST_CODE_SHELL` overrides the interpreter for `.sh`/`.bash`.
 fn hook_command(script: &Path) -> Command {
+    hook_command_with_env(script, &[])
+}
+
+/// Like [`hook_command`], plus extra `(name, value)` env pairs the caller has
+/// already vetted (e.g. a plugin OAuth provider's declared `env_passthrough`).
+fn hook_command_with_env(script: &Path, extra_env: &[(String, String)]) -> Command {
     let ext = script
         .extension()
         .and_then(|e| e.to_str())
@@ -3019,7 +3081,21 @@ fn hook_command(script: &Path) -> Command {
             c.env(key, v);
         }
     }
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
     c
+}
+
+/// Resolve a plugin OAuth provider's declared (validated) `env_passthrough`
+/// values from the current process env. Unset vars are skipped. Only names
+/// the manifest declared — and `load_oauth_entry` vetted as non-secret —
+/// ever reach the script.
+fn oauth_script_env(cfg: &PluginOauthConfig) -> Vec<(String, String)> {
+    cfg.env_passthrough
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
+        .collect()
 }
 
 /// Sidecar written next to an installed plugin so a future auto-updater can
