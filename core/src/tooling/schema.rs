@@ -288,13 +288,14 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents (regex). Default output: path:line:content. Use glob/type to scope, case_insensitive for -i, output_mode files_with_matches|count|content, head_limit/offset to page, context for -C windows.",
+                "description": "Search file contents (regex). Output already includes line numbers (path:line:content) — no need for `grep -n`. Prefer this over bash grep/rg: it covers -n/-r/-i/-l/-c/-C and paginates via head_limit/offset (replaces `| head`/`| wc -l`). Use glob/type to scope, output_mode files_with_matches (=-l) or count (=-c), context (=-C), after/before (=-A/-B), invert (=-v), fixed_string (=-F, literal), word (=-w). NOTE: path is workspace-confined (no `..`/absolute) — use bash only for paths outside the workspace or shell composition (grep|grep, grep|xargs).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "Rust regex" },
-                        "path": { "type": "string", "description": "directory or file to search (relative); default workspace root" },
-                        "glob": { "type": "string", "description": "only files matching this glob (e.g. **/*.rs)" },
+                        "path": { "type": "string", "description": "directory or file to search (relative); default workspace root. For multiple files/dirs use `paths` instead." },
+                        "paths": { "type": "array", "items": { "type": "string" }, "description": "search this specific set of files/dirs (multi-file input, relative). When set, `path` is ignored and the rg fast-path is skipped." },
+                        "glob": { "type": ["string", "array"], "items": { "type": "string" }, "description": "file glob(s) to include — a string or array. Prefix with `!` to EXCLUDE (e.g. [\"**/*.rs\", \"!**/*test*\"])." },
                         "type": { "type": "string", "description": "language/file-type shortcut (rs, go, py, js, ts, …) — filters by extension" },
                         "case_insensitive": { "type": "boolean", "description": "case-insensitive match (default false)" },
                         "output_mode": {
@@ -304,7 +305,12 @@ fn definitions_uncached() -> Vec<Value> {
                         },
                         "head_limit": { "type": "integer", "description": "max matches (content) or files (other modes); default 50" },
                         "offset": { "type": "integer", "description": "skip first N matches/files (pagination)" },
-                        "context": { "type": "integer", "description": "lines before+after each match (content mode, like grep -C). 0 = match line only." }
+                        "context": { "type": "integer", "description": "lines before+after each match (content mode, like grep -C). 0 = match line only. Prefer after/before for asymmetric context." },
+                        "after": { "type": "integer", "description": "lines AFTER each match (content mode, like grep -A). 0 = none." },
+                        "before": { "type": "integer", "description": "lines BEFORE each match (content mode, like grep -B). 0 = none." },
+                        "invert": { "type": "boolean", "description": "invert match (like grep -v): emit/count non-matching lines. With files_with_matches, returns files with NO match (like grep -L)." },
+                        "fixed_string": { "type": "boolean", "description": "treat pattern as a literal string, not regex (like grep -F / fgrep). Avoids escaping dots/parens in symbols like `foo.bar()`." },
+                        "word": { "type": "boolean", "description": "whole-word match only (like grep -w)." }
                     },
                     "required": ["pattern"]
                 }

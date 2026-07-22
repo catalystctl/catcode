@@ -424,12 +424,16 @@ fn grep_via_rg(
     root: &std::path::Path,
     cfg: &Config,
     case_insensitive: bool,
-    glob_pat: Option<&str>,
+    globs: &[String],
     type_exts: Option<&[&str]>,
     output_mode: &str,
     head_limit: usize,
     skip: usize,
-    context: usize,
+    after: usize,
+    before: usize,
+    invert: bool,
+    fixed_string: bool,
+    word: bool,
 ) -> Option<Outcome> {
     use std::process::{Command, Stdio};
     // Probe once: if rg isn't on PATH, skip forever for this process.
@@ -460,6 +464,21 @@ fn grep_via_rg(
     if case_insensitive {
         cmd.arg("-i");
     }
+    if fixed_string {
+        cmd.arg("--fixed-strings");
+    }
+    if word {
+        cmd.arg("-w");
+    }
+    // rg `-l -v` lists files with ≥1 non-matching line (almost every file) —
+    // rarely what a caller wants. Fall back to the pure-Rust walker so
+    // files_with_matches + invert means grep -L (files with NO match).
+    if invert && output_mode == "files_with_matches" {
+        return None;
+    }
+    if invert {
+        cmd.arg("-v");
+    }
     match output_mode {
         "files_with_matches" => {
             cmd.arg("-l");
@@ -468,12 +487,15 @@ fn grep_via_rg(
             cmd.arg("--count");
         }
         _ => {
-            if context > 0 {
-                cmd.arg("-C").arg(context.to_string());
+            if after > 0 {
+                cmd.arg("-A").arg(after.to_string());
+            }
+            if before > 0 {
+                cmd.arg("-B").arg(before.to_string());
             }
         }
     }
-    if let Some(g) = glob_pat {
+    for g in globs {
         cmd.arg("--glob").arg(g);
     }
     if let Some(exts) = type_exts {
@@ -645,8 +667,25 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         .get("case_insensitive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let invert = args.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
+    let fixed_string = args.get("fixed_string").and_then(|v| v.as_bool()).unwrap_or(false);
+    let word = args.get("word").and_then(|v| v.as_bool()).unwrap_or(false);
+    // fixed_string escapes regex metacharacters so symbols like `foo.bar()`
+    // match literally; word wraps in word boundaries (\b...\b).
+    let effective_pattern = {
+        let base = if fixed_string {
+            regex::escape(pattern)
+        } else {
+            pattern.to_string()
+        };
+        if word {
+            format!(r"\b(?:{base})\b")
+        } else {
+            base
+        }
+    };
     let re = {
-        let mut b = regex::RegexBuilder::new(pattern);
+        let mut b = regex::RegexBuilder::new(&effective_pattern);
         b.case_insensitive(case_insensitive);
         match b.build() {
             Ok(r) => r,
@@ -654,10 +693,26 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         }
     };
     let input = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let glob_pat = args
-        .get("glob")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+    // `glob` accepts a single string or an array; entries prefixed with `!`
+    // are exclusions (e.g. ["**/*.rs", "!**/*test*"]). rg honors `!` natively;
+    // the pure-Rust walker mirrors it via glob_filter_passes.
+    let globs: Vec<String> = match args.get("glob") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    // `paths` searches a specific set of files/dirs (multi-file input). When
+    // set, `path` is ignored and the rg fast-path is skipped (multiple roots).
+    let paths: Vec<String> = match args.get("paths") {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
     let type_exts = match args
         .get("type")
         .and_then(|v| v.as_str())
@@ -687,33 +742,68 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         .clamp(1, 500) as usize;
     let skip = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let after_raw = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let before_raw = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // Merge symmetric (context) with asymmetric (after/before) by taking the
+    // max per side: context:2 == -C2; after:5 == -A5; context:2 + after:5 == -B2 -A5.
+    let after = after_raw.max(context);
+    let before = before_raw.max(context);
 
-    let root = if input.is_empty() {
-        cfg.workspace.clone()
+    // Resolve search roots. `paths[]` (multi-file/dir) takes precedence over
+    // `path`; when set we skip the rg fast-path (it takes a single root) and
+    // scan directly with the pure-Rust walker.
+    let mut direct_files: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let single_dir_root: Option<std::path::PathBuf> = if !paths.is_empty() {
+        for p in &paths {
+            match resolve_ws(cfg, p) {
+                Ok(r) => {
+                    if r.is_file() {
+                        direct_files.push(r);
+                    } else {
+                        dirs.push(r);
+                    }
+                }
+                Err(e) => return Outcome::err(e),
+            }
+        }
+        None
     } else {
-        match resolve_ws(cfg, input) {
-            Ok(p) => p,
-            Err(e) => return Outcome::err(e),
+        let root = if input.is_empty() {
+            cfg.workspace.clone()
+        } else {
+            match resolve_ws(cfg, input) {
+                Ok(p) => p,
+                Err(e) => return Outcome::err(e),
+            }
+        };
+        if root.is_file() {
+            direct_files.push(root);
+            None
+        } else {
+            dirs.push(root.clone());
+            Some(root)
         }
     };
 
-    // Single-file path: search just that file (pure Rust — no rg spawn).
-    let single_file = root.is_file();
-
-    // Directory search: prefer ripgrep when available (gitignore, binary skip,
+    // Single-directory search: prefer ripgrep (gitignore, binary skip,
     // parallelism). Fall back to the pure-Rust walker when rg is missing.
-    if !single_file {
+    if let Some(rd) = &single_dir_root {
         if let Some(out) = grep_via_rg(
             pattern,
-            &root,
+            rd,
             cfg,
             case_insensitive,
-            glob_pat,
+            &globs,
             type_exts,
             output_mode,
             head_limit,
             skip,
-            context,
+            after,
+            before,
+            invert,
+            fixed_string,
+            word,
         ) {
             return out;
         }
@@ -726,11 +816,6 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         std::collections::HashMap::new();
     let mut file_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let mut dirs: Vec<std::path::PathBuf> = if single_file {
-        Vec::new()
-    } else {
-        vec![root.clone()]
-    };
     let mut seen = 0u32;
     let mut capped = false;
     // How many *emitted* units we've collected (matches or files, depending on mode).
@@ -748,12 +833,10 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
             .unwrap_or(p)
             .display()
             .to_string();
-        if let Some(g) = glob_pat {
-            if !glob_match(g, &rel) {
-                let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !glob_match(g, base) {
-                    return false;
-                }
+        if !globs.is_empty() {
+            let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !glob_filter_passes(&globs, &rel, base) {
+                return false;
             }
         }
         if p.extension()
@@ -776,11 +859,15 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         if content.contains('\0') {
             return false;
         }
-        let mut file_hit = false;
         let mut n_in_file = 0usize;
+        let mut any_raw_match = false;
         for (i, line) in content.lines().enumerate() {
-            if re.is_match(line) {
-                file_hit = true;
+            let raw = re.is_match(line);
+            if raw {
+                any_raw_match = true;
+            }
+            // XOR with invert: emit non-matching lines when invert is set (-v).
+            if invert != raw {
                 n_in_file += 1;
                 if output_mode == "content" {
                     records.push((rel.clone(), i, line.to_string()));
@@ -795,21 +882,35 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
                 }
             }
         }
-        if file_hit && output_mode != "content" {
-            if !file_order.iter().any(|f| f == &rel) {
-                file_order.push(rel.clone());
-            }
-            file_counts.insert(rel, n_in_file);
-            if file_order.len() >= collect_cap {
-                return true;
+        // Non-content file inclusion:
+        //  - count: files with ≥1 emitted (matching, or non-matching under -v) line.
+        //  - files_with_matches: normal → any match; invert → NO match (grep -L).
+        if output_mode != "content" {
+            let include = if output_mode == "files_with_matches" {
+                invert != any_raw_match
+            } else {
+                n_in_file > 0
+            };
+            if include {
+                if !file_order.iter().any(|f| f == &rel) {
+                    file_order.push(rel.clone());
+                }
+                file_counts.insert(rel, n_in_file);
+                if file_order.len() >= collect_cap {
+                    return true;
+                }
             }
         }
         false
     };
 
-    if single_file {
-        capped = scan_file(&root);
-    } else {
+    for f in &direct_files {
+        if scan_file(f) {
+            capped = true;
+            break;
+        }
+    }
+    if !capped {
         while let Some(dir) = dirs.pop() {
             if seen > 5000 || capped {
                 break;
@@ -908,7 +1009,7 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         entry.push(*i);
     }
 
-    if context == 0 {
+    if after == 0 && before == 0 {
         let mut out: Vec<String> = Vec::with_capacity(records.len());
         for (rel, i, line) in &records {
             out.push(format!("{rel}:{}:{}", i + 1, line));
@@ -938,8 +1039,8 @@ fn grep(pattern: &str, args: &Value, cfg: &Config) -> Outcome {
         let idxs = page_per_file.get(rel).cloned().unwrap_or_default();
         let mut windows: Vec<(usize, usize)> = Vec::new();
         for &i in &idxs {
-            let wstart = i.saturating_sub(context);
-            let wend = (i + context).min(lines.len().saturating_sub(1));
+            let wstart = i.saturating_sub(before);
+            let wend = (i + after).min(lines.len().saturating_sub(1));
             match windows.last_mut() {
                 Some(last) if wstart <= last.1 + 1 => last.1 = last.1.max(wend),
                 _ => windows.push((wstart, wend)),
@@ -1105,6 +1206,25 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     expand_braces(pattern)
         .into_iter()
         .any(|p| glob_match_one(&p, name))
+}
+
+/// Apply a set of include/exclude globs (rg `--glob` semantics). A file passes
+/// when it matches at least one inclusion (or there are no inclusions) AND does
+/// not match any exclusion. Entries prefixed with `!` are exclusions. Each glob
+/// is tested against both the workspace-relative path and the bare basename.
+fn glob_filter_passes(globs: &[String], rel: &str, base: &str) -> bool {
+    let mut includes: Vec<&str> = Vec::new();
+    let mut excludes: Vec<&str> = Vec::new();
+    for g in globs {
+        match g.strip_prefix('!') {
+            Some(ex) => excludes.push(ex),
+            None => includes.push(g.as_str()),
+        }
+    }
+    let any_match = |pats: &[&str]| pats.iter().any(|p| glob_match(p, rel) || glob_match(p, base));
+    let inc_ok = includes.is_empty() || any_match(&includes);
+    let exc_ok = !any_match(&excludes);
+    inc_ok && exc_ok
 }
 
 fn glob_match_one(pattern: &str, name: &str) -> bool {
@@ -3505,6 +3625,201 @@ mod tests {
         assert!(o.output.contains("match5"));
         assert!(!o.output.contains("match2\n") && !o.output.contains(":2:match2"));
         assert!(o.output.contains("offset=5") || o.output.contains("cap reached"));
+    }
+
+    #[test]
+    fn grep_invert_excludes_matching_lines() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        // Directory search exercises the rg path; -v emits non-matching lines.
+        let o = execute("grep", &json!({"pattern":"beta","invert":true}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.txt:1:alpha"), "{}", o.output);
+        assert!(o.output.contains("a.txt:3:gamma"), "{}", o.output);
+        assert!(!o.output.contains(":2:beta"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_invert_single_file_pure_rust() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        // Single-file path uses the pure-Rust walker (no rg spawn).
+        let o = execute(
+            "grep",
+            &json!({"pattern":"beta","path":"a.txt","invert":true}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.txt:1:alpha"), "{}", o.output);
+        assert!(o.output.contains("a.txt:3:gamma"), "{}", o.output);
+        assert!(!o.output.contains(":2:beta"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_invert_files_without_match_is_dash_l() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "match\nother\n").unwrap();
+        fs::write(root.join("b.txt"), "nope\nother\n").unwrap();
+        // files_with_matches + invert == grep -L: files with NO match.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"match","output_mode":"files_with_matches","invert":true}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("b.txt"), "{}", o.output);
+        assert!(!o.output.contains("a.txt"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_invert_count_mode() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "x\ny\nz\n").unwrap();
+        // count + invert: 3 lines total, 1 matches 'y' → 2 non-matching.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"y","output_mode":"count","invert":true}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.txt:2"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_fixed_string_matches_literal_dots() {
+        let (root, cfg) = tmp_ws();
+        // 'a.b' as regex would match 'axb' too; -F must match the literal only.
+        fs::write(root.join("a.txt"), "a.b\naxb\n").unwrap();
+        let o = execute(
+            "grep",
+            &json!({"pattern":"a.b","fixed_string":true}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains(":1:a.b"), "{}", o.output);
+        assert!(!o.output.contains("axb"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_word_match() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "cat\ncategory\nconcatenate\n").unwrap();
+        let o = execute("grep", &json!({"pattern":"cat","word":true}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains(":1:cat"), "{}", o.output);
+        assert!(!o.output.contains("category"), "{}", o.output);
+        assert!(!o.output.contains("concatenate"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_after_context_asymmetric() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "l1\nMARK\nl3\nl4\n").unwrap();
+        // after:1 (no before) → match + 1 line after only.
+        let o = execute("grep", &json!({"pattern":"MARK","after":1}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains(":2:MARK"), "{}", o.output);
+        assert!(o.output.contains("a.txt-3-l3"), "{}", o.output);
+        assert!(!o.output.contains("l1"), "no before-line expected: {}", o.output);
+    }
+
+    #[test]
+    fn grep_before_context_single_file_pure_rust() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "l1\nl2\nMARK\nl4\n").unwrap();
+        // Single-file path exercises the pure-Rust context renderer with before only.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"MARK","path":"a.txt","before":1}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains(":3:MARK"), "{}", o.output);
+        assert!(o.output.contains("a.txt-2-l2"), "{}", o.output);
+        assert!(!o.output.contains("l4"), "no after-line expected: {}", o.output);
+    }
+
+    #[test]
+    fn grep_context_and_after_compose() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.txt"), "b0\nb1\nMARK\na1\na2\n").unwrap();
+        // context:2 alone == -C2; after:1 should not shrink the before side below 2.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"MARK","context":2,"after":1}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains(":3:MARK"), "{}", o.output);
+        assert!(o.output.contains("b0"), "before side should keep context:2: {}", o.output);
+    }
+
+    #[test]
+    fn grep_glob_array_excludes_with_negation() {
+        let (root, cfg) = tmp_ws();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "match\n").unwrap();
+        fs::write(root.join("src/a_test.rs"), "match\n").unwrap();
+        fs::write(root.join("src/b.rs"), "match\n").unwrap();
+        // Directory search (rg path): include **/*.rs, exclude **/*test*.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"match","glob":["**/*.rs","!**/*test*"]}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.rs"), "{}", o.output);
+        assert!(o.output.contains("b.rs"), "{}", o.output);
+        assert!(!o.output.contains("a_test.rs"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_glob_string_still_works() {
+        // Backward compat: glob as a plain string (not array).
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.rs"), "match\n").unwrap();
+        fs::write(root.join("a.txt"), "match\n").unwrap();
+        let o = execute("grep", &json!({"pattern":"match","glob":"**/*.rs"}), &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.rs"), "{}", o.output);
+        assert!(!o.output.contains("a.txt"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_paths_multi_file() {
+        let (root, cfg) = tmp_ws();
+        fs::write(root.join("a.go"), "match\n").unwrap();
+        fs::write(root.join("b.go"), "match\n").unwrap();
+        fs::write(root.join("c.go"), "match\n").unwrap();
+        // paths[] forces the pure-Rust walker (no rg) and searches exactly these files.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"match","paths":["a.go","b.go"]}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.go"), "{}", o.output);
+        assert!(o.output.contains("b.go"), "{}", o.output);
+        assert!(!o.output.contains("c.go"), "{}", o.output);
+    }
+
+    #[test]
+    fn grep_paths_dir_with_glob_negation_pure_rust() {
+        let (root, cfg) = tmp_ws();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "match\n").unwrap();
+        fs::write(root.join("src/a_test.rs"), "match\n").unwrap();
+        fs::write(root.join("src/b.rs"), "match\n").unwrap();
+        // paths=[dir] skips rg → exercises the pure-Rust walker's glob_filter_passes.
+        let o = execute(
+            "grep",
+            &json!({"pattern":"match","paths":["src"],"glob":["**/*.rs","!**/*test*"]}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("a.rs"), "{}", o.output);
+        assert!(o.output.contains("b.rs"), "{}", o.output);
+        assert!(!o.output.contains("a_test.rs"), "{}", o.output);
     }
 
     #[test]
