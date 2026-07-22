@@ -2,6 +2,28 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-07-22
+
+- **feat(grep): enrich grep tool with -v/-F/-w/-A/-B, glob negation, multi-file paths** [be0174c]
+  A session audit (661 sessions) showed the agent reached for bash grep/rg 1.75×
+  more than the native grep tool — driven by missing flags (-v/-F/-w/-A), the
+  `| head` pagination habit, and outside-workspace paths. Added `invert` (-v;
+  content/count emit non-matching lines, files_with_matches+invert = grep -L),
+  `fixed_string` (-F; literal match via regex::escape), `word` (-w), and
+  `after`/`before` (-A/-B, merged with `context`/`-C`) to both the rg path and
+  the pure-Rust fallback. `glob` now accepts a string or array with `!`-prefixed
+  exclusions (rg --glob semantics, mirrored in pure-Rust via glob_filter_passes),
+  and a new `paths[]` param searches a specific set of files/dirs (skipping the
+  rg fast-path for multiple roots). Schema description rewritten to surface that
+  output already includes line numbers and covers -n/-l/-c/-i/-C, nudging off
+  `| head`/`grep -n`. Workspace confinement unchanged. 21/21 grep tests pass.
+
+- **docs(skills): add audit-tool-usage-from-sessions skill** [eef7dee]
+  Reusable workflow for diagnosing why the agent prefers bash over a native tool
+  by auditing session tool_use logs — parse assistant tool_calls, classify bash
+  search invocations by reason (PIPE/OUTSIDE_WS/FLAG_V/…), then fix real gaps in
+  the native tool and surface already-supported features in the schema.
+
 ## 2026-07-21
 
 - **feat(packaging): add Homebrew tap (cask + formula) with release automation** [1cf1193]
