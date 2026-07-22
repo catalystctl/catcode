@@ -57,6 +57,7 @@ const (
 	modalGoalPlan           // plan-ready review (approve / revise / cancel)
 	modalPluginInstallScope // global vs workspace after /plugin-install path
 	modalSearchKey          // pick Exa/Tavily to set/clear its web_search API key
+	modalCustomProvider     // multi-field add-custom-provider form (config parity)
 	modalRestartConfirm     // restart core to apply launch-only settings
 	modalConfirm            // destructive action confirmation (cancel selected by default)
 )
@@ -79,6 +80,107 @@ type goalDraft struct {
 	listCursor       int            // cursor within models/providers/model-conc lists
 	editing          bool           // free-text capture for goal field
 }
+
+// customProviderDraft is the multi-field form state for modalCustomProvider.
+// Field parity with a config.json `providers[]` entry (name, kind, base_url,
+// api_key | api_key_env, headers, context_window).
+// cpModelCaps holds the editable per-model caps (prefilled from discovery).
+type cpModelCaps struct {
+	contextWindow  string
+	maxTokens      string
+	thinkingLevels string
+	reasoning      bool
+}
+
+// Per-model cap sub-fields (used when cpFieldModels is focused).
+const (
+	cpCapContext = iota
+	cpCapOutput
+	cpCapLevels
+	cpCapReasoning
+)
+
+const cpCapCount = cpCapReasoning + 1
+
+type customProviderDraft struct {
+	name          string
+	kind          string // "openai" | "anthropic"
+	baseURL       string
+	apiKey        string
+	apiKeyEnv     string
+	headers       string // one "Key: value" per line
+	contextWindow string
+	field         int  // focused field id (cpField*)
+	editing       bool // free-text capture for the focused field
+	// Discover step: models fetched from the endpoint + their editable caps.
+	previewModels []modelInfo
+	modelCaps     map[string]*cpModelCaps
+	modelCursor   int  // focused model in the list
+	modelField    int  // focused cap sub-field (cpCap*)
+	discovering   bool // a discover request is in flight
+}
+
+const (
+	cpFieldName = iota
+	cpFieldKind
+	cpFieldBaseURL
+	cpFieldAPIKey
+	cpFieldAPIKeyEnv
+	cpFieldHeaders
+	cpFieldContextWindow
+	cpFieldDiscover
+	cpFieldModels
+	cpFieldSubmit
+)
+
+// cpTextFields are the fields edited via the free-text capture buffer.
+func cpIsTextField(f int) bool {
+	switch f {
+	case cpFieldName, cpFieldBaseURL, cpFieldAPIKey, cpFieldAPIKeyEnv, cpFieldHeaders, cpFieldContextWindow:
+		return true
+	}
+	return false
+}
+
+// cpFieldValue returns the current value of a text field.
+func (d *customProviderDraft) fieldValue(f int) string {
+	switch f {
+	case cpFieldName:
+		return d.name
+	case cpFieldBaseURL:
+		return d.baseURL
+	case cpFieldAPIKey:
+		return d.apiKey
+	case cpFieldAPIKeyEnv:
+		return d.apiKeyEnv
+	case cpFieldHeaders:
+		return d.headers
+	case cpFieldContextWindow:
+		return d.contextWindow
+	}
+	return ""
+}
+
+// cpSetField writes the committed edit-buffer value back into the draft.
+func (d *customProviderDraft) setField(f int, v string) {
+	switch f {
+	case cpFieldName:
+		d.name = v
+	case cpFieldBaseURL:
+		d.baseURL = v
+	case cpFieldAPIKey:
+		d.apiKey = v
+	case cpFieldAPIKeyEnv:
+		d.apiKeyEnv = v
+	case cpFieldHeaders:
+		d.headers = v
+	case cpFieldContextWindow:
+		d.contextWindow = v
+	}
+}
+
+// cpFieldCount is the number of navigable fields (0..cpFieldSubmit).
+const cpFieldCount = cpFieldSubmit + 1
 
 const (
 	goalFieldGoal    = iota
@@ -817,6 +919,12 @@ func (s *session) providerItems() []listItem {
 		}
 		items = append(items, listItem{label: label, desc: "switch · configured", meta: name, meta2: "provider"})
 	}
+	// Trailing entry: open the add-custom-provider form (full config parity).
+	items = append(items, listItem{
+		label: "+ Add custom provider…",
+		desc:  "any OpenAI/Anthropic-compatible endpoint · name · base URL · key or env · headers · context window",
+		meta2: "custom",
+	})
 	return items
 }
 
@@ -1042,13 +1150,13 @@ func (s *session) closeModal() {
 
 func (s *session) commandItems() []listItem {
 	items := []listItem{
-		{group: "Provider", label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic)"},
+		{group: "Provider", label: "/login", desc: "log in / switch provider (OpenAI · Gemini · Anthropic) · alias: /provider"},
 		{group: "Provider", label: "/logout", desc: "log out of a provider"},
 		{group: "Provider", label: "/oauth-code", desc: "paste OAuth code (SSH/headless Google login)"},
 		{group: "Provider", label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily, paste modal)"},
 		{group: "Provider", label: "/model", desc: "switch model"},
 		{group: "Session", label: "/approval", desc: "auto-approve · ask destructive · ask every tool"},
-		{group: "Session", label: "/reasoning", desc: "set reasoning effort (per model)"},
+		{group: "Session", label: "/reasoning", desc: "set reasoning effort (per model) · alias: /thinking"},
 		{group: "Session", label: "/theme", desc: "switch colour theme"},
 		{group: "Session", label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
 		{group: "Session", label: "/auto-compact", desc: "auto context compaction on/off"},
@@ -1062,13 +1170,13 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/clear", desc: "clear view (keep session file)"},
 		{group: "Session", label: "/undo", desc: "drop last turn (keeps prior history)"},
 		{group: "Session", label: "/compact", desc: "force compaction (modal for optional instructions)"},
-		{group: "Session", label: "/sessions", desc: "open session picker"},
+		{group: "Session", label: "/sessions", desc: "open session picker · alias: /resume"},
 		{group: "Session", label: "/new", desc: "start a fresh session file"},
 		{group: "Session", label: "/stats", desc: "token + turn totals"},
 		{group: "Session", label: "/status", desc: "model, policy, performance, and UI state"},
 		{group: "Session", label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{group: "Session", label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
-		{group: "Session", label: "/abort", desc: "stop running turn (or Esc)"},
+		{group: "Session", label: "/abort", desc: "stop running turn (or Esc) · alias: /stop"},
 		{group: "Session", label: "/exit", desc: "quit the app (alias: /quit)"},
 		{group: "Session", label: "/steer", desc: "steer an in-flight turn (modal)"},
 		{group: "Session", label: "/settings", desc: "settings hub (dedicated modals per option)"},
@@ -1080,7 +1188,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/vision", desc: "configure vision models & handoff target"},
 		{group: "Agent", label: "/plugin-install", desc: "install path/URL · prompts global vs workspace"},
 		{group: "Agent", label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
-		{group: "Agent", label: "/plugin-remove", desc: "uninstall a plugin (picker)"},
+		{group: "Agent", label: "/plugin-remove", desc: "uninstall a plugin (picker) · alias: /plugin-uninstall"},
 		{group: "Agent", label: "/plugin-reload", desc: "re-scan plugin directories"},
 		{group: "Agent", label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
 		{group: "Agent", label: "/run", desc: "delegate to a subagent (single) — modal"},
@@ -1091,7 +1199,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Agent", label: "/subagents-doctor", desc: "subagent setup diagnostics"},
 		{group: "Agent", label: "/subagents-status", desc: "show active subagent runs"},
 		{group: "Agent", label: "/remember", desc: "save a memory note (modal)"},
-		{group: "Agent", label: "/memory", desc: "list / forget saved memories (picker)"},
+		{group: "Agent", label: "/memory", desc: "list / forget saved memories (picker) · alias: /memories"},
 		{group: "Agent", label: "/forget", desc: "forget a memory (picker)"},
 		{group: "Agent", label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
 		{group: "Agent", label: "/reflect", desc: "reflect on this session, persist durable learnings"},
@@ -1539,6 +1647,9 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// through the single-field value-edit commit path.
 	if s.modal.kind == modalGoal {
 		return s.handleGoalKey(msg)
+	}
+	if s.modal.kind == modalCustomProvider {
+		return s.handleCustomProviderKey(msg)
 	}
 	if s.modal.kind == modalGoalPlan {
 		return s.handleGoalPlanKey(msg)
@@ -2544,6 +2655,9 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 		s.logInfo("switching provider: " + name)
 		s.closeModal()
 		return s, nil
+	case "custom":
+		s.openCustomProviderModal()
+		return s, nil
 	}
 	s.closeModal()
 	return s, nil
@@ -3196,6 +3310,8 @@ func (s *session) renderModalBody() string {
 		return s.renderValueEditModal()
 	case modalGoal:
 		return s.renderGoalModal()
+	case modalCustomProvider:
+		return s.renderCustomProviderModal()
 	case modalGoalPlan:
 		return s.renderGoalPlanModal()
 	case modalHelp:
@@ -4317,4 +4433,568 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// Add custom provider (modalCustomProvider)
+//
+// A multi-field form with full config.json providers[] parity: name, wire
+// kind, base URL, API key or env var, extra headers, context window. Submit
+// sends `add_custom_provider` to the core, which persists to config.json,
+// makes the provider active, and re-discovers models.
+
+func (s *session) openCustomProviderModal() {
+	s.modal = newModal()
+	s.modal.kind = modalCustomProvider
+	s.customProvider = customProviderDraft{kind: "openai", field: cpFieldName, modelField: cpCapContext}
+	s.modal.loadError = ""
+}
+
+// cpFieldOrder is the navigation order for the form.
+var cpFieldOrder = []int{
+	cpFieldName, cpFieldKind, cpFieldBaseURL, cpFieldAPIKey, cpFieldAPIKeyEnv,
+	cpFieldHeaders, cpFieldContextWindow, cpFieldDiscover, cpFieldModels, cpFieldSubmit,
+}
+
+// cpNextField moves focus by delta (±1) within cpFieldOrder.
+func cpNextField(cur, delta int) int {
+	idx := 0
+	for i, f := range cpFieldOrder {
+		if f == cur {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta + len(cpFieldOrder)) % len(cpFieldOrder)
+	return cpFieldOrder[idx]
+}
+
+func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	d := &s.customProvider
+	key := msg.String()
+
+	// Ctrl+Enter submits from anywhere.
+	if key == "ctrl+enter" || key == "ctrl+j" {
+		return s.submitCustomProvider()
+	}
+
+	// While capturing free text for a field, route keys to the edit buffer.
+	if d.editing {
+		switch key {
+		case "esc":
+			// Keep typed text (commit to draft/model cap), leave capture.
+			cpCommitEdit(d, s.modal.editBuf.Value())
+			d.editing = false
+			s.modal.editing = false
+			return s, nil
+		case "enter":
+			cpCommitEdit(d, strings.TrimSpace(s.modal.editBuf.Value()))
+			d.editing = false
+			s.modal.editing = false
+			// Stay on the models list after editing a cap (don't jump away).
+			if d.field != cpFieldModels {
+				d.field = cpNextField(d.field, 1)
+			}
+			s.modal.loadError = ""
+			return s, nil
+		}
+		s.modal.loadError = ""
+		var cmd tea.Cmd
+		s.modal.editBuf, cmd = s.modal.editBuf.Update(msg)
+		return s, cmd
+	}
+
+	switch {
+	case s.kb(msg, "close"):
+		s.closeModal()
+		return s, nil
+	case key == "up" || s.kbAny(msg, "nav_up", "nav_up_alt"):
+		if d.field == cpFieldModels && len(d.previewModels) > 0 {
+			if d.modelCursor > 0 {
+				d.modelCursor--
+			}
+			return s, nil
+		}
+		d.field = cpNextField(d.field, -1)
+		s.modal.loadError = ""
+		return s, nil
+	case key == "down" || key == "tab" || s.kbAny(msg, "nav_down", "nav_down_alt"):
+		if d.field == cpFieldModels && len(d.previewModels) > 0 {
+			if d.modelCursor+1 < len(d.previewModels) {
+				d.modelCursor++
+			}
+			return s, nil
+		}
+		d.field = cpNextField(d.field, 1)
+		s.modal.loadError = ""
+		return s, nil
+	case key == "left":
+		switch d.field {
+		case cpFieldKind:
+			d.kind = "openai"
+		case cpFieldModels:
+			d.modelField = (d.modelField + cpCapCount - 1) % cpCapCount
+		}
+		return s, nil
+	case key == "right":
+		switch d.field {
+		case cpFieldKind:
+			d.kind = "anthropic"
+		case cpFieldModels:
+			d.modelField = (d.modelField + 1) % cpCapCount
+		}
+		return s, nil
+	case key == "enter" || s.kb(msg, "select"):
+		switch d.field {
+		case cpFieldSubmit:
+			return s.submitCustomProvider()
+		case cpFieldKind:
+			// Toggle the wire protocol segment.
+			if d.kind == "anthropic" {
+				d.kind = "openai"
+			} else {
+				d.kind = "anthropic"
+			}
+			return s, nil
+		case cpFieldDiscover:
+			return s.discoverCustomProviderModels()
+		case cpFieldModels:
+			// Edit the focused model's focused cap. Text caps use the buffer;
+			// reasoning toggles directly.
+			if len(d.previewModels) == 0 {
+				return s, nil
+			}
+			if d.modelField == cpCapReasoning {
+				if c := d.modelCaps[d.previewModels[d.modelCursor].ID]; c != nil {
+					c.reasoning = !c.reasoning
+				}
+				return s, nil
+			}
+			cpBeginCapEdit(d, s)
+			return s, nil
+		}
+		// Begin free-text capture for the focused text field.
+		if cpIsTextField(d.field) {
+			d.editing = true
+			s.modal.editing = true
+			s.modal.editBuf.SetValue(d.fieldValue(d.field))
+			s.modal.editBuf.Placeholder = cpPlaceholder(d.field)
+			s.modal.editBuf.Focus()
+			s.modal.editBuf.CursorEnd()
+		}
+		return s, nil
+	}
+	return s, nil
+}
+
+// cpCommitEdit writes the committed edit-buffer value back to the draft — either
+// a top-level text field or the focused model's focused cap.
+func cpCommitEdit(d *customProviderDraft, v string) {
+	if d.field == cpFieldModels && len(d.previewModels) > 0 {
+		if c := d.modelCaps[d.previewModels[d.modelCursor].ID]; c != nil {
+			switch d.modelField {
+			case cpCapContext:
+				c.contextWindow = v
+			case cpCapOutput:
+				c.maxTokens = v
+			case cpCapLevels:
+				c.thinkingLevels = v
+			}
+		}
+		return
+	}
+	d.setField(d.field, v)
+}
+
+// cpBeginCapEdit starts free-text capture for the focused model's focused cap.
+func cpBeginCapEdit(d *customProviderDraft, s *session) {
+	var cur string
+	if c := d.modelCaps[d.previewModels[d.modelCursor].ID]; c != nil {
+		switch d.modelField {
+		case cpCapContext:
+			cur = c.contextWindow
+		case cpCapOutput:
+			cur = c.maxTokens
+		case cpCapLevels:
+			cur = c.thinkingLevels
+		}
+	}
+	d.editing = true
+	s.modal.editing = true
+	s.modal.editBuf.SetValue(cur)
+	ph := "e.g. 128000"
+	if d.modelField == cpCapOutput {
+		ph = "e.g. 8192"
+	} else if d.modelField == cpCapLevels {
+		ph = "low, medium, high"
+	}
+	s.modal.editBuf.Placeholder = ph
+	s.modal.editBuf.Focus()
+	s.modal.editBuf.CursorEnd()
+}
+
+// cpSeedModelCaps prefills the editable per-model caps from the discovered
+// models (so the user sees the values the harness will use as defaults).
+func cpSeedModelCaps(d *customProviderDraft) {
+	if d.modelCaps == nil {
+		d.modelCaps = map[string]*cpModelCaps{}
+	}
+	for _, m := range d.previewModels {
+		if _, ok := d.modelCaps[m.ID]; ok {
+			continue
+		}
+		d.modelCaps[m.ID] = &cpModelCaps{
+			contextWindow:  strconv.FormatUint(uint64(m.ContextWindow), 10),
+			maxTokens:      strconv.FormatUint(uint64(m.MaxTokens), 10),
+			thinkingLevels: strings.Join(m.ThinkingLevels, ", "),
+			reasoning:      m.Reasoning,
+		}
+	}
+}
+
+// discoverCustomProviderModels validates the endpoint then asks the core to
+// discover models from it (a preview — no provider is persisted yet).
+func (s *session) discoverCustomProviderModels() (tea.Model, tea.Cmd) {
+	d := &s.customProvider
+	if err := d.validate(); err != "" {
+		s.modal.loadError = err
+		return s, nil
+	}
+	cmd := map[string]any{
+		"type":     "discover_provider_models",
+		"base_url": strings.TrimSpace(d.baseURL),
+		"kind":     d.kind,
+	}
+	if k := strings.TrimSpace(d.apiKey); k != "" {
+		cmd["api_key"] = k
+	}
+	s.sendCore(cmd)
+	d.discovering = true
+	s.modal.loadError = ""
+	s.logInfo("discovering models from " + strings.TrimSpace(d.baseURL) + "…")
+	return s, nil
+}
+
+// cpBuildOverrides builds the models_override payload: only models whose caps
+// the user changed from the discovered baseline are included, so the config
+// stays clean and unchanged models fall through to discovery/flat defaults.
+func cpBuildOverrides(d *customProviderDraft) []map[string]any {
+	var out []map[string]any
+	for _, m := range d.previewModels {
+		c := d.modelCaps[m.ID]
+		if c == nil {
+			continue
+		}
+		ctx, _ := strconv.Atoi(strings.TrimSpace(c.contextWindow))
+		max, _ := strconv.Atoi(strings.TrimSpace(c.maxTokens))
+		levels := cpParseLevels(c.thinkingLevels)
+		ctxChanged := ctx > 0 && uint32(ctx) != m.ContextWindow
+		maxChanged := max > 0 && uint32(max) != m.MaxTokens
+		reasonChanged := c.reasoning != m.Reasoning
+		levelsChanged := strings.Join(levels, ",") != strings.Join(m.ThinkingLevels, ",")
+		if !ctxChanged && !maxChanged && !reasonChanged && !levelsChanged {
+			continue
+		}
+		ov := map[string]any{"id": m.ID}
+		if ctxChanged {
+			ov["context_window"] = ctx
+		}
+		if maxChanged {
+			ov["max_tokens"] = max
+		}
+		if reasonChanged {
+			ov["reasoning"] = c.reasoning
+		}
+		if levelsChanged {
+			ov["thinking_levels"] = levels
+		}
+		out = append(out, ov)
+	}
+	return out
+}
+
+// cpParseLevels splits a comma/space-separated levels string into a slice.
+func cpParseLevels(s string) []string {
+	var out []string
+	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func cpPlaceholder(f int) string {
+	switch f {
+	case cpFieldName:
+		return "my-provider"
+	case cpFieldBaseURL:
+		return "https://api.example.com/v1"
+	case cpFieldAPIKey:
+		return "sk-…"
+	case cpFieldAPIKeyEnv:
+		return "MY_PROVIDER_API_KEY"
+	case cpFieldHeaders:
+		return "Key: value (one per line)"
+	case cpFieldContextWindow:
+		return "e.g. 128000"
+	}
+	return ""
+}
+
+// cpValidate returns a user-facing error, or "" when the draft is valid.
+func (d *customProviderDraft) validate() string {
+	if strings.TrimSpace(d.name) == "" {
+		return "Name is required (a unique slug, e.g. my-provider)."
+	}
+	u := strings.TrimSpace(d.baseURL)
+	if !(strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")) {
+		return "Base URL must be an http(s) URL, including the version segment (e.g. /v1)."
+	}
+	if cw := strings.TrimSpace(d.contextWindow); cw != "" {
+		if n, err := strconv.Atoi(cw); err != nil || n <= 0 {
+			return "Context window must be a positive number, or blank."
+		}
+	}
+	for _, line := range cpHeaderLines(d.headers) {
+		if strings.Index(line, ":") <= 0 {
+			return "Each header must be Key: value."
+		}
+	}
+	return ""
+}
+
+// cpHeaderLines splits a headers draft into individual entries. The edit
+// buffer is single-line, so both newlines and ";" act as separators.
+func cpHeaderLines(raw string) []string {
+	var out []string
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == ';' }) {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func (s *session) submitCustomProvider() (tea.Model, tea.Cmd) {
+	d := &s.customProvider
+	if err := d.validate(); err != "" {
+		s.modal.loadError = err
+		return s, nil
+	}
+	// Parse headers "Key: value" entries into an object the core can consume.
+	var headers map[string]any
+	for _, line := range cpHeaderLines(d.headers) {
+		i := strings.Index(line, ":")
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.TrimSpace(line[i+1:])
+		if k == "" || v == "" {
+			continue
+		}
+		if headers == nil {
+			headers = map[string]any{}
+		}
+		headers[k] = v
+	}
+	cmd := map[string]any{
+		"type":     "add_custom_provider",
+		"name":     strings.TrimSpace(d.name),
+		"base_url": strings.TrimSpace(d.baseURL),
+		"kind":     d.kind,
+	}
+	if k := strings.TrimSpace(d.apiKey); k != "" {
+		cmd["api_key"] = k
+		// Persist the key on the TUI side so it survives restart.
+		if s.settings.ProviderKeys == nil {
+			s.settings.ProviderKeys = map[string]string{}
+		}
+		s.settings.ProviderKeys[strings.TrimSpace(d.name)] = k
+		_ = s.settings.save()
+	}
+	if e := strings.TrimSpace(d.apiKeyEnv); e != "" {
+		cmd["api_key_env"] = e
+	}
+	if headers != nil {
+		cmd["headers"] = headers
+	}
+	if cw := strings.TrimSpace(d.contextWindow); cw != "" {
+		if n, err := strconv.Atoi(cw); err == nil && n > 0 {
+			cmd["context_window"] = n
+		}
+	}
+	if ov := cpBuildOverrides(d); len(ov) > 0 {
+		cmd["models_override"] = ov
+	}
+	s.sendCore(cmd)
+	s.logInfo("adding provider " + strings.TrimSpace(d.name) + "…")
+	s.closeModal()
+	return s, nil
+}
+
+func (s *session) renderCustomProviderModal() string {
+	w := s.modalWidth(78)
+	d := s.customProvider
+	inner := max(1, w-4)
+
+	row := func(idx int, label, value string) string {
+		marker := "  "
+		labelStyle := dimStyle
+		if d.field == idx {
+			marker = "▸ "
+			labelStyle = accentStyle
+		}
+		lbl := fmt.Sprintf("%-14s", label)
+		if value == "" {
+			return labelStyle.Render(marker + lbl)
+		}
+		return labelStyle.Render(marker+lbl) + " " + value
+	}
+	section := func(title string) string {
+		rule := strings.Repeat("─", max(1, inner-len([]rune(title))-3))
+		return dimStyle.Render("  " + title + " " + rule)
+	}
+
+	// value renders a text field's current value (masked for the key), showing
+	// the live edit buffer while capturing.
+	textVal := func(idx int, mask bool) string {
+		v := d.fieldValue(idx)
+		if d.editing && d.field == idx {
+			v = s.modal.editBuf.Value()
+		}
+		if mask && v != "" {
+			return strings.Repeat("•", len(v))
+		}
+		return v
+	}
+
+	var lines []string
+	lines = append(lines, accentStyle.Render("◆ Add custom provider"))
+	lines = append(lines, dimStyle.Render("  Full config parity — name · kind · base URL · key or env · headers · context window"))
+	lines = append(lines, separatorStyle.Render(strings.Repeat("─", inner)))
+
+	// ── Endpoint ────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Endpoint"))
+	lines = append(lines, row(cpFieldName, "Name", baseStyle.Render(textVal(cpFieldName, false))))
+	kindSel := 0
+	if d.kind == "anthropic" {
+		kindSel = 1
+	}
+	lines = append(lines, row(cpFieldKind, "Protocol",
+		goalSegment([]string{"OpenAI-compat", "Anthropic"}, kindSel, d.field == cpFieldKind)))
+	if d.field == cpFieldKind {
+		lines = append(lines, dimStyle.Render("    ←/→ cycle · OpenAI = /chat/completions · Anthropic = /v1/messages"))
+	}
+	lines = append(lines, row(cpFieldBaseURL, "Base URL", baseStyle.Render(textVal(cpFieldBaseURL, false))))
+	if d.field == cpFieldBaseURL {
+		lines = append(lines, dimStyle.Render("    include the version segment — paths are appended directly"))
+	}
+
+	// ── Auth ─────────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Auth"))
+	lines = append(lines, row(cpFieldAPIKey, "API key", baseStyle.Render(textVal(cpFieldAPIKey, true))))
+	if d.field == cpFieldAPIKey {
+		lines = append(lines, dimStyle.Render("    stored in the 0600 user config · wins over env var"))
+	}
+	lines = append(lines, row(cpFieldAPIKeyEnv, "Env var", baseStyle.Render(textVal(cpFieldAPIKeyEnv, false))))
+	if d.field == cpFieldAPIKeyEnv {
+		lines = append(lines, dimStyle.Render("    secret stays in your environment · read at request time"))
+	}
+
+	// ── Advanced ─────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Advanced"))
+	hdrVal := textVal(cpFieldHeaders, false)
+	hdrShown := hdrVal
+	if n := len(cpHeaderLines(hdrVal)); n > 1 {
+		hdrShown = fmt.Sprintf("%d headers", n)
+	}
+	lines = append(lines, row(cpFieldHeaders, "Headers", baseStyle.Render(hdrShown)))
+	if d.field == cpFieldHeaders && !d.editing {
+		lines = append(lines, dimStyle.Render("    one Key: value per line · enter to edit"))
+	}
+	lines = append(lines, row(cpFieldContextWindow, "Context win", baseStyle.Render(textVal(cpFieldContextWindow, false))))
+	if d.field == cpFieldContextWindow {
+		lines = append(lines, dimStyle.Render("    optional · force every discovered model to this window (tokens)"))
+	}
+
+	// ── Discover ─────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Models"))
+	discoverVal := dimStyle.Render("enter to fetch models from the endpoint")
+	if d.discovering {
+		discoverVal = accentStyle.Render("discovering…")
+	} else if len(d.previewModels) > 0 {
+		discoverVal = successStyle.Render(fmt.Sprintf("%d model(s) found · enter to refine", len(d.previewModels)))
+	}
+	lines = append(lines, row(cpFieldDiscover, "Discover", discoverVal))
+	if d.field == cpFieldDiscover {
+		lines = append(lines, dimStyle.Render("    fetches the endpoint's model list so you can refine caps"))
+	}
+
+	// Discovered models with editable per-model caps.
+	if len(d.previewModels) > 0 {
+		capLabels := []string{"Ctx", "Out", "Levels", "Think"}
+		for i, m := range d.previewModels {
+			focused := d.field == cpFieldModels && d.modelCursor == i
+			marker := "  "
+			nameStyle := dimStyle
+			if focused {
+				marker = "▸ "
+				nameStyle = accentStyle
+			}
+			lines = append(lines, nameStyle.Render(fmt.Sprintf("%s%s", marker, m.ID)))
+			c := d.modelCaps[m.ID]
+			if c == nil {
+				c = &cpModelCaps{}
+			}
+			vals := []string{c.contextWindow, c.maxTokens, c.thinkingLevels, ""}
+			if c.reasoning {
+				vals[3] = "on"
+			} else {
+				vals[3] = "off"
+			}
+			for ci, lbl := range capLabels {
+				capFocused := focused && d.modelField == ci
+				v := vals[ci]
+				// Show the live edit buffer for the focused cap while editing.
+				if capFocused && d.editing && d.field == cpFieldModels {
+					v = s.modal.editBuf.Value()
+				}
+				mark := "  "
+				style := dimStyle
+				if capFocused {
+					mark = "▸ "
+					style = accentStyle
+				}
+				lines = append(lines, style.Render(fmt.Sprintf("      %s%-7s %s", mark, lbl, v)))
+			}
+		}
+		if d.field == cpFieldModels {
+			lines = append(lines, dimStyle.Render("    ↑/↓ model · ←/→ cap · enter edit/toggle"))
+		}
+	}
+
+	// ── Submit ───────────────────────────────────────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, section("Finish"))
+	submitVal := ""
+	if d.field == cpFieldSubmit {
+		submitVal = accentStyle.Render("enter / ctrl+enter to add provider")
+	}
+	lines = append(lines, row(cpFieldSubmit, "Add provider", submitVal))
+
+	if s.modal.loadError != "" {
+		lines = append(lines, "")
+		lines = append(lines, errStyle.Render("  ✗ "+s.modal.loadError))
+	}
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render("  ↑/↓ move · enter edit · esc close · ctrl+enter submit"))
+
+	return modalBox(w, strings.Join(lines, "\n"))
 }

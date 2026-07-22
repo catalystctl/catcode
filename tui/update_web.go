@@ -544,12 +544,47 @@ func restartWebServiceWindows(unitName string) error {
 	return fmt.Errorf("could not restart Windows web service (tried nssm/%s, sc, schtasks/%s)", name, windowsTaskName)
 }
 
+// updateSiblingCore refreshes the catcode-core binary installed next to the
+// TUI executable when this build relies on it (no embedded core) and the
+// sibling exists. A missing sibling is fine ($CATCODE_CORE / dev layouts) and
+// is skipped quietly. There is no version stamp on the core binary, so this
+// always reinstalls from the release asset — cheap insurance against skew.
+func updateSiblingCore(rel *ghRelease) error {
+	if embeddedCoreAvailable {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil // can't locate ourselves; nothing safe to do
+	}
+	if rp, e := filepath.EvalSymlinks(exe); e == nil {
+		exe = rp
+	}
+	coreDest := filepath.Join(filepath.Dir(exe), "catcode-core"+coreExeSuffix())
+	if _, err := os.Stat(coreDest); err != nil {
+		return nil // no sibling core installed; nothing to keep in sync
+	}
+	fmt.Printf("Updating catcode-core → %s\n", coreDest)
+	if err := installBinaryAsset(rel, coreAssetName(rel.TagName), coreDest); err != nil {
+		return err
+	}
+	fmt.Printf("  ✓ updated catcode-core → %s\n", rel.TagName)
+	return nil
+}
+
 // updateCompanionComponents refreshes catcode-core + web bundle when the web
 // frontend is installed. Returns whether web was touched.
 func updateCompanionComponents(rel *ghRelease) (updatedWeb bool, err error) {
 	webDir, unitName, ok := detectWebInstall()
 	if !ok {
 		fmt.Println("Web frontend: not installed (skipping)")
+		// No web service, but on builds without an embedded core the TUI still
+		// shells out to the sibling catcode-core. Refreshing only the CLI here
+		// silently skews a new TUI against a stale core (missing protocol +
+		// provider/plugin fixes), so keep the sibling in sync too.
+		if err := updateSiblingCore(rel); err != nil {
+			return false, fmt.Errorf("catcode-core: %w", err)
+		}
 		return false, nil
 	}
 

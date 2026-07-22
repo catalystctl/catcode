@@ -20,6 +20,9 @@ import (
 //go:embed embed/catcode-core
 var embeddedCore []byte
 
+// embeddedCoreAvailable reports whether a core is compiled into this binary.
+const embeddedCoreAvailable = true
+
 // embeddedCoreHash caches the SHA-256 of the embedded core (computed once).
 var embeddedCoreHash string
 

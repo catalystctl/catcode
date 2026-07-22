@@ -175,7 +175,8 @@ type session struct {
 	providers       []string
 	providerHasKey  bool
 	providerPresets []providerPreset
-	pendingLogin    string // preset id awaiting a pasted API key in the /login modal
+	pendingLogin    string              // preset id awaiting a pasted API key in the /login modal
+	customProvider  customProviderDraft // multi-field add-custom-provider form (modalCustomProvider)
 
 	// Goal mode: draft form for the multi-field /goal modal, plus the last
 	// goal_state snapshot from the core (drives status + plan-ready review).
