@@ -87,3 +87,4 @@
 {"type":"worktree_promoted","protocol_version":2}
 {"type":"worktree_ready","protocol_version":2}
 {"type":"worktree_seeded","protocol_version":2}
+{"type":"provider_models_preview","protocol_version":2,"models":[{"id":"fixture-model","name":"Fixture Model","reasoning":true,"context_window":200000,"max_tokens":8192,"thinking_levels":["low","medium","high"],"vision":false,"provider":"__preview__"}],"base_url":"https://api.fixture.example/v1"}

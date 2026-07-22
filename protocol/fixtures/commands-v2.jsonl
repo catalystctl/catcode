@@ -57,3 +57,5 @@
 {"type":"approve_goal_plan"}
 {"type":"revise_goal","feedback":"revise","model":"mock-model"}
 {"type":"user_bash","command":"true","exclude_from_context":true}
+{"type":"add_custom_provider","name":"fixture-provider","base_url":"https://api.fixture.example/v1","kind":"openai","api_key":"fixture","api_key_env":"FIXTURE_API_KEY","headers":{"X-Org":"fixture"},"context_window":200000}
+{"type":"discover_provider_models","base_url":"https://api.fixture.example/v1","kind":"openai","api_key":"fixture"}
