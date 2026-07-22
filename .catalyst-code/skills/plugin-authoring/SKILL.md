@@ -506,6 +506,11 @@ Fields:
 - `login_timeout_ms` (optional, default 120000): timeout for `login` +
   `complete`.
 - `token_timeout_ms` (optional, default 30000): timeout for `token` + `clear`.
+- `env_passthrough` (optional): non-secret env var names the harness forwards
+  to your scripts (e.g. `["ACME_OAUTH_HOST"]` for a self-hosted auth server).
+  The harness otherwise scrubs the environment, so undeclared vars never reach
+  the script. Names containing KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are
+  rejected at load time — passthrough must never defeat env scrubbing.
 
 #### Script action contract
 
@@ -555,6 +560,13 @@ min). Optional `headers` are merged onto every request for that provider
 (plugin wins on name conflicts) and cached with the token — use this for
 per-user identity headers such as ChatGPT's `chatgpt-account-id`. This runs
 on the per-turn hot path, so it is cached until near expiry.
+
+Concurrency: several harness processes (TUI, web service, a second TUI) can
+invoke `token` at the same time, and providers commonly rotate refresh tokens.
+Write `token_path` ATOMICALLY (temp file + rename) and serialize the refresh
+(e.g. `flock` on a sidecar lock, then re-check freshness before refreshing) —
+a truncated read or a lost refresh-token rotation surfaces to the user as an
+unexplained "run /login" prompt.
 
 **`clear`** — delete any credentials + extra state you manage. The harness
 ALSO deletes `token_path`, so this is optional (use it for sidecar files).

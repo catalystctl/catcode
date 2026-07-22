@@ -45,7 +45,7 @@ Read the provider's API docs. You need:
 5. **Per-model caps** — does the discovery response include context_window /
    max_output_tokens / reasoning / vision per model? If yes → great (config-only
    with a known shape). If the endpoint returns bare ids only → you'll need a
-   curated overrides table (code, or the proposed `models_override` config field).
+   curated overrides table (code, or per-model `models_override` config entries).
 
 ## Step 1 — Decision tree (config-only vs code change)
 
@@ -61,8 +61,8 @@ Look at the **sample model-discovery JSON** from step 0.4:
   table for known families (gpt-5/o-series/gpt-4.1/gpt-4o/gemini) and flat
   defaults for unknown ids.
   → **config-only IF** your models are known families OR you accept flat default
-  caps (200k ctx / 65k out). Else needs `models_override` (proposed) or a code
-  branch.
+  caps (200k ctx / 65k out). Else set per-model `models_override` entries
+  (now config-supported) or add a code branch.
 
 - **Shape C — Anthropic `/v1/models`**: `{ "data":[ {"id":..,"display_name":..} ] }`.
   → **config-only** with `kind:"anthropic"`. Caps come from a static Claude table.
@@ -112,11 +112,17 @@ Then: use `/login` to paste the API key, add the provider via config with a
 literal `api_key`, or set `api_key_env` and export the named env var (read at
 request time). A fresh install with no configured provider stays signed out.
 
-**What you CANNOT do via config today** (these are the gaps — see the review's
-proposed schema): override the model-discovery *endpoint path*, declare a custom
-*response schema/field paths*, supply per-model *capability overrides*, or point
-at a *usage/billing endpoint*. If you need any of those, use the code-change
-path (or wait for the proposed config extension).
+**Per-model capability overrides ARE now config-supported** via the
+`models_override` field (a `Vec<ModelOverride>` of `{id, context_window?,
+max_tokens?, reasoning?, thinking_levels?}`). Applied by `apply_models_override`
+after discovery + models.dev + the per-provider `context_window`, so an explicit
+per-model value wins over everything. The add-custom-provider UIs (web + TUI)
+also expose a `discover_provider_models` preview step that fetches the
+endpoint's models and lets the user refine these caps before committing.
+
+**What you still CANNOT do via config**: override the model-discovery *endpoint
+path*, declare a custom *response schema/field paths*, or point at a
+*usage/billing endpoint*. If you need any of those, use the code-change path.
 
 ## Step 3 — Code-change path (Shape D, or custom wire/discovery)
 
@@ -179,8 +185,9 @@ in `config.rs`. For a new vendor, follow the plugin-authoring skill instead.
   + `preset_provider_configs` expands to two configs (opencode-go +
   opencode-go-anthropic). ~400 lines of provider.rs.
 - This is the ceiling of what "add a provider" costs today when discovery is
-  non-standard. The proposed `models_override` + `models.schema:"custom"` config
-  fields (see review) would shrink most of this to JSON.
+  non-standard. Per-model `models_override` (now config-supported) shrinks the
+  *caps* gap to JSON, but a non-standard discovery *endpoint/schema* still needs
+  a code branch.
 
 ## Pitfalls
 
