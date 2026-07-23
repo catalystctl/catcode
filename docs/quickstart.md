@@ -12,8 +12,7 @@ Get Catalyst Code running and send your first prompt in under two minutes.
 - **curl + coreutils** on Unix (`sha256sum` is used by the installer).
 - **No compiler required** — the installer downloads prebuilt binaries.
 
-For the web frontend, you also need **Node.js** or **Bun** to _run_ the service
-(not to build it).
+For the web frontend, you also need **Node.js 22.13+** to run the service.
 
 ---
 

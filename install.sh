@@ -487,7 +487,7 @@ ensure_sudo() {
 }
 
 # ── runtime detection ────────────────────────────────────────
-# mode=run   (default): prefer Node to execute the prebuilt start.js
+# mode=run   (default): require Node to execute the prebuilt start.js
 # mode=build: prefer bun/npm for `install` / `run build` (source path)
 detect_runtime() {
   local mode="${1:-run}"
@@ -501,18 +501,16 @@ detect_runtime() {
       die "neither bun nor npm found — install one to BUILD the web frontend (https://bun.sh or https://nodejs.org)"
     fi
   else
-    # Prefer Node for the prebuilt Next standalone server; both Node and Bun run
-    # the same bundled JavaScript (no native rebuilds required).
+    # Authentication uses node:sqlite, so Bun is not a compatible server
+    # runtime even though it can install dependencies and run unit tests.
     if have node; then
       RUNTIME="node"; RT_BIN="$(command -v node)"; RT="node"
       local node_ver; node_ver="$(node -v | tr -d 'v')"
       if ! ver_ge "22.13.0" "$node_ver"; then
         die "Node.js >= 22.13.0 is required (found v${node_ver}); the web frontend uses node:sqlite"
       fi
-    elif have bun; then
-      RUNTIME="bun"; RT_BIN="$(command -v bun)"; RT="bun"
     else
-      die "neither node nor bun found — install one to run the web frontend (https://nodejs.org or https://bun.sh)"
+      die "Node.js >= 22.13.0 is required to run the web frontend (https://nodejs.org)"
     fi
   fi
   log_ok "Web runtime ($mode): $RUNTIME ($RT_BIN)"

@@ -12,11 +12,11 @@ gives you the terminal UI; add the web frontend for browser-based access.
 |-------------|-------|
 | **OS** | Linux (x86_64 or arm64), macOS (arm64 or x86_64), Windows (x86_64) |
 | **curl + coreutils** | Needed by the Unix installers (`sha256sum` for integrity check) |
-| **Node.js or Bun** | Only to **run** the web frontend service (not to build it) |
+| **Node.js 22.13+** | Required to run or build the web frontend (`node:sqlite`) |
 | **Rust (stable) + Go 1.24+** | Only needed when building from source |
 
 The TUI has **zero host dependencies** beyond what the installer downloads.
-The web service only needs a Node or Bun runtime.
+The web service requires Node.js 22.13+.
 
 ---
 
@@ -193,7 +193,7 @@ sudo systemctl status  catalyst-code-web.service
 ```
 
 The unit runs the prebuilt Next.js standalone server (`start.js`) under the
-detected runtime (Node or Bun). Service user is the user who ran the installer.
+detected Node.js runtime. Service user is the user who ran the installer.
 Managed units are annotated with `# Managed-by: install.sh`.
 
 ### macOS (launchd)
@@ -209,7 +209,7 @@ launchctl load   ~/Library/LaunchAgents/com.catalyst-code.web.plist
 ```
 
 The agent runs at login and auto-restarts on crash. It runs the prebuilt
-standalone server (`start.js`) under Node or Bun.
+standalone server (`start.js`) under Node.js 22.13+.
 
 ### Windows (NSSM or Scheduled Task)
 
@@ -379,10 +379,11 @@ Requires Rust (stable) and Go 1.24+.
 
 ```bash
 cd sdk && bun install && bun run build   # → sdk/dist/
-cd ../web && bun install && bun run build # Next.js build
+cd ../web && npm install && npm run build # Next.js build
 ```
 
-Requires Bun or npm + Node.js.
+Requires Node.js 22.13+ and npm. Bun may still be used for dependency
+installation and unit tests.
 
 ### Manual run (no service wrapper)
 
@@ -395,7 +396,7 @@ After building, run the dev core directly from the TUI:
 For the web frontend:
 
 ```bash
-cd web && PORT=49283 CATCODE_CORE=/path/to/catcode-core bun run start
+cd web && PORT=49283 CATCODE_CORE=/path/to/catcode-core npm run start
 ```
 
 ### Full installer (source path)

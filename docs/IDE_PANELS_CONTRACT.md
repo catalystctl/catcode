@@ -663,9 +663,9 @@ server.listen(port, hostname, () => console.log(`> ready on http://${hostname}:$
 ```jsonc
 {
   "scripts": {
-    "dev": "bun run src/server.ts",          // Bun runs TS natively; starts Next dev + WS
-    "build": "next build && tsc -p tsconfig.server.json",  // build .next + compile server.ts → server.js
-    "start": "node server.js",               // production custom server (compiled)
+    "dev": "node scripts/require-node.mjs && node --import tsx src/server/server.ts",
+    "build": "node scripts/require-node.mjs && node node_modules/next/dist/bin/next build",
+    "start": "node scripts/require-node.mjs && NODE_ENV=production node --import tsx src/server/server.ts",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
@@ -674,7 +674,7 @@ server.listen(port, hostname, () => console.log(`> ready on http://${hostname}:$
 ```
 
 - `tsconfig.server.json`: extends the base `tsconfig.json`, `noEmit:false`, `outDir:"."`, `module:"nodenext"`, `moduleResolution:"nodenext"` (NOT `"bundler"` — Node must resolve the emitted ESM), includes only `src/server/server.ts` (+ its imports), emits `server.js` at the web root. Imports of `next`/`ws`/`better-sqlite3`/`@catalyst-code/coding-agent` stay external (resolved from the shipped `node_modules`). `server.ts` uses **relative imports** (see §7.1) so the emitted file is Node-resolvable with no alias-rewrite step.
-- `dev` uses Bun (runs TS directly, no compile). If a host has only Node+npm (no Bun), `dev` falls back to `node --import tsx src/server.ts` — add `tsx` to devDeps as a fallback runner. (Bun is the documented primary runtime per `release-web.sh`.)
+- `dev`, `build`, and `start` require Node.js 22.13+ because authentication imports `node:sqlite`. Bun remains usable for installation and `bun test`, but is not a supported server runtime.
 
 ### 7.3 `next.config.mjs` changes
 
@@ -747,8 +747,8 @@ If compiling/shipping the custom server destabilizes the release, fall back to a
 
 ### 9.1 Overall (hard gates)
 - [ ] `cd web && bun run typecheck` (`tsc --noEmit`) passes with **zero** errors.
-- [ ] `cd web && bun run build` (`next build && tsc -p tsconfig.server.json`) succeeds and produces `.next/` + `web/server.js`.
-- [ ] `cd web && bun run dev` boots the custom server; `http://localhost:3000` loads the IDE shell.
+- [ ] `cd web && npm run build` succeeds and produces `.next/`.
+- [ ] `cd web && npm run dev` boots the custom server; `http://localhost:3000` loads the IDE shell.
 - [ ] Existing chat is **fully functional**: streaming, approval gate, composer, tool calls, memory panel, subagents panel, session switching — all work unchanged.
 - [ ] All 4 panels render and are switchable via the activity bar; sidebar/main/bottom panels are resizable; copilot dock is collapsible.
 - [ ] Every new route requires `getSession` (401 without cookie) and confines paths (400 on `..` escape).
@@ -795,7 +795,7 @@ If compiling/shipping the custom server destabilizes the release, fall back to a
 7. `/api/preview` + `preview.tsx` (§4.4, §5.5).
 8. `server.ts` + `/api/terminal` WS + `terminal.tsx` (§4.5, §7.1, §5.3).
 9. `package.json` scripts + `next.config.mjs` + `release-web.sh` (§6, §7.2-7.4).
-10. Puppeteer smoke test (§9.1) + `bun run typecheck` + `bun run build` green.
+10. Puppeteer smoke test (§9.1) + `npm run typecheck` + `npm run build` green.
 
 ---
 

@@ -40,7 +40,7 @@ Custom providers can be added via `config.json` with any `base_url` and protocol
 |-----------|-----------|-----------------|
 | `core/` | Rust (stable) | 1.82 |
 | `tui/` | Go | 1.25.0 |
-| `web/` | Node.js or Bun | Node ≥ 20, Bun ≥ 1.x |
+| `web/` | Node.js | Node ≥ 22.13 |
 | `sdk/` | TypeScript / Node.js | Node ≥ 20 |
 
 ## Browser Compatibility (Web Frontend)

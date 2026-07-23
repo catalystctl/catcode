@@ -127,17 +127,19 @@ if ($dlCode -eq 0) {
     Pass "bad download fails loudly (exit $dlCode) without silent close"
 }
 
-# ── 6. Install-WebBundle prefers Windows-specific web bundle ─
+# ── 6. Install-WebBundle uses the universal cross-platform web tarball ─
+# (The Windows installer fetches the same catcode-web-*.tar.gz asset the
+#  Linux/macOS installers use, then validates it with Assert-WebBundle.)
 $src = Get-Content -LiteralPath $Installer -Raw
-if ($src -notmatch 'Windows web bundle') {
-    Fail 'Install-WebBundle does not prefer a Windows-specific web bundle'
+if ($src -notmatch 'catcode-web-.*\.tar\.gz') {
+    Fail 'Install-WebBundle does not fetch the universal catcode-web-*.tar.gz bundle'
 } else {
-    Pass 'Install-WebBundle prefers Windows-specific web bundle'
+    Pass 'Install-WebBundle fetches the universal cross-platform web tarball'
 }
-if ($src -notmatch 'Installing native modules for this platform') {
-    Fail 'Install-WebBundle is missing native-module fallback rebuild step'
+if ($src -notmatch 'Assert-WebBundle') {
+    Fail 'Install-WebBundle does not validate the extracted bundle (Assert-WebBundle)'
 } else {
-    Pass 'Install-WebBundle will rebuild native modules as fallback'
+    Pass 'Install-WebBundle validates the extracted web bundle'
 }
 
 # ── 7. Host survives scriptblock-wrapped Die ──────────────────
@@ -163,6 +165,22 @@ try {
     $env:LOCALAPPDATA = $prevLA
     $env:USERPROFILE = $prevUP
     Remove-Item -LiteralPath $tmpHome -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ── 8. No `if` used in expression position (irm | iex / pwsh -File) ─────────
+# `if` is a STATEMENT, not an expression. Inside plain parens as an operand
+# (e.g. `('HOST="' + (if ($x) { $a } else { $b }) + '"')`) PowerShell parses
+# `if` as a COMMAND NAME and throws CommandNotFoundException ("The term 'if'
+# is not recognized") at RUNTIME. ParseFile passes, so this hides until
+# Save-State builds the shell-format state file — and it breaks irm|iex AND
+# pwsh -File. Safe forms: `$v = if(){}`, `key = if(){}` (hashtable), `$(if …)`.
+foreach ($path in @($Installer, $Shim)) {
+    $raw = Get-Content -LiteralPath $path -Raw
+    if ($raw -match '(?<!\$)\(\s*if\s*\(') {
+        Fail "$(Split-Path -Leaf $path): 'if' used inside () in expression position -> CommandNotFoundException at runtime; use `$v = if(){} or `$(if ...)"
+    } else {
+        Pass "$(Split-Path -Leaf $path): no expression-position 'if' (safe under irm|iex)"
+    }
 }
 
 Write-Host ''

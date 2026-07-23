@@ -22,7 +22,7 @@ architecture.
 ### Process Model
 
 The TUI and web frontend each **spawn one `core` process per session**. The
-frontend is a `catcode` Go binary (TUI) or a Next.js Node/Bun service (web).
+frontend is a `catcode` Go binary (TUI) or a Next.js Node.js service (web).
 Each core process is a long-lived tokio async runtime that reads commands from
 stdin and writes events to stdout. When using the embedded build
 (`-tags embed_core`), the core binary is compiled into the TUI binary itself;

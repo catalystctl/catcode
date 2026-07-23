@@ -30,8 +30,8 @@ terminal, the browser, or from your own code.
 | [Updating](../README.md#updating) | `catcode --update` or Settings → About → Update |
 
 > **Prerequisites:** Linux / macOS / Windows. `curl` + coreutils. No compiler
-> unless building from source. Web frontend needs Node or Bun to *run* the
-> service (not to build it). To build from source: Rust (stable) + Go 1.25+.
+> unless building from source. The web frontend needs Node.js 22.13+ to run.
+> To build from source: Rust (stable) + Go 1.25+.
 
 ---
 

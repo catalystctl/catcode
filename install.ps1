@@ -410,8 +410,8 @@ $script:RT = $null
 $script:RTExe = $null
 
 function Detect-Runtime {
-    # Prefer Node for the prebuilt Next standalone server; both Node and Bun run
-    # the same bundled JavaScript (no native rebuilds required).
+    # Authentication uses node:sqlite, so Bun is not a compatible server
+    # runtime even though it can install dependencies and run unit tests.
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
         $nodeVer = (& node --version) -replace '^v',''
@@ -420,9 +420,7 @@ function Detect-Runtime {
         }
         $script:RT = 'node'; $script:RTExe = $node.Source; return
     }
-    $bun = Get-Command bun -ErrorAction SilentlyContinue
-    if ($bun) { $script:RT = 'bun'; $script:RTExe = $bun.Source; return }
-    Die 'neither node nor bun found - install one to RUN the web frontend (https://nodejs.org or https://bun.sh)'
+    Die 'Node.js >= 22.13.0 is required to run the web frontend (https://nodejs.org)'
 }
 
 # --- resolve release version + base URL ------------------------------------
@@ -626,13 +624,18 @@ function Uninstall-WebService {
 function Save-State([bool]$WebInstalled) {
     $installedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $webFlag = if ($WebInstalled) { 'yes' } else { 'no' }
+    # NOTE: keep this as an assignment-RHS `if` (a statement). Do NOT inline it
+    # inside (...) as an operand (e.g. `('X=' + (if ...) + ...)`): in expression
+    # position PowerShell parses `if` as a COMMAND NAME and throws
+    # "The term 'if' is not recognized" at runtime under irm|iex AND pwsh -File.
+    $stateHost = if ($script:ResolvedHost) { $script:ResolvedHost } else { $BindHost }
     $st = [ordered]@{
         version      = $script:Ver
         with_web     = $webFlag
         install_dir  = $InstallDir
         web_dir      = $WebDir
         port         = $Port
-        host         = if ($script:ResolvedHost) { $script:ResolvedHost } else { $BindHost }
+        host         = $stateHost
         expose       = $script:Expose
         origin_override = $script:OriginOverride
         origin       = $script:ResolvedOrigin
@@ -652,7 +655,7 @@ function Save-State([bool]$WebInstalled) {
         'METHOD="download"',
         ('PREFIX="' + $InstallDir + '"'),
         ('PORT="' + $Port + '"'),
-        ('HOST="' + (if ($script:ResolvedHost) { $script:ResolvedHost } else { $BindHost }) + '"'),
+        ('HOST="' + $stateHost + '"'),
         ('EXPOSE_MODE="' + $script:Expose + '"'),
         ('ORIGIN_OVERRIDE="' + $script:OriginOverride + '"'),
         ('ORIGIN="' + $script:ResolvedOrigin + '"'),

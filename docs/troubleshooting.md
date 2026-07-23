@@ -55,11 +55,11 @@ After `| iex`, the shell exits because the installer runs `exit`.
 
 ### Windows installer fails with missing dependencies
 
-**Likely cause:** The web frontend requires Node.js or Bun for runtime
+**Likely cause:** The web frontend requires Node.js 22.13+ for runtime
 execution, or the MSI installer requires Windows Installer service.
 
 **Fix:**
-- Install Node.js or Bun first (the web bundle is prebuilt; only the runtime
+- Install Node.js 22.13+ first (the web bundle is prebuilt; only the runtime
   is needed).
 - For the standalone `.exe`, no runtime is needed — download the
   `catcode-<ver>-windows-x86_64.exe` from [releases](https://github.com/catalystctl/catcode/releases).
@@ -526,21 +526,22 @@ instead of `ws://`.
 - Or use the TUI instead of the web frontend — the TUI connects directly over
   stdio, avoiding the issue entirely.
 
-### Node.js / Bun not found
+### Node.js not found or too old
 
-**Symptom:** The web service fails to start because Node.js or Bun is missing.
+**Symptom:** The web service fails to start because Node.js is missing or older than 22.13.
 
 **Cause:** The prebuilt web bundle needs a JavaScript runtime to serve files
 (statically, with the API proxy). The runtime is not bundled with the
 installer.
 
 **Check:**
-- `node --version` or `bun --version`
+- `node --version`
 - The preset install path for the web server binary.
 
 **Fix:**
-- Install Node.js (>=18) or Bun. Either works.
-- The installer checks for these at setup time and warns if neither is found.
+- Install Node.js 22.13 or newer. Bun cannot run this server because
+  authentication uses Node's built-in `node:sqlite` module.
+- The installer validates the Node version during setup.
 - Fall back to the TUI-only install (`install.sh` without `--with-web`).
 
 ---
