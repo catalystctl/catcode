@@ -14,7 +14,10 @@ import {
   prepareSandboxCommand,
   resetSandboxCommand,
 } from "./commands";
-import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, CustomProviderDraft, ModelInfo } from "./types";
+import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, CustomProviderDraft, LiveSessionStatus, ModelInfo, NotificationItem } from "./types";
+import { setTabBadge, desktopNotify, isDesktopEnabled, attentionLabel } from "./notifications";
+
+let notifSeq = 0;
 
 // ponytail: localStorage persistence for UI preferences (model/thinking/approval).
 // try/catch guards SSR + disabled-storage; failing silently is fine.
@@ -71,13 +74,20 @@ export interface AgentApi {
   setThinking: (level: string) => void;
   setApproval: (mode: "never" | "destructive" | "always") => Promise<void>;
   newSession: () => Promise<void>;
-  loadSession: (path: string) => Promise<void>;
+  loadSession: (path: string, workspace?: string) => Promise<void>;
   listSessions: () => Promise<void>;
   compact: (instructions?: string) => Promise<void>;
   reset: () => Promise<void>;
   stats: () => Promise<void>;
   context: () => Promise<void>;
   dismissToast: (id: string) => void;
+  // ── Cross-session notifications ──
+  /** Mark a single feed notification read (e.g. on click). */
+  dismissNotification: (id: string) => void;
+  /** Mark every feed notification read (e.g. when the bell opens). */
+  markAllNotificationsRead: () => void;
+  /** Clear the entire feed. */
+  clearNotifications: () => void;
   // ── Subagent / intercom ──
   intercomReply: (reply: string) => Promise<void>;
   // ── Ask tool ──
@@ -189,6 +199,16 @@ export function useAgent(): AgentApi {
   const undoBusyRef = useRef(false);
   /** Suppress repeated 502 toasts while EventSource hammers reconnect. */
   const lastStreamErrToastRef = useRef(0);
+  /** Previous liveSessions map — used to detect background-session transitions
+   *  (finished / needs attention) for the notification feed. Reset to null on
+   *  (re)connect so the first status after a snapshot primes without flooding. */
+  const prevLiveRef = useRef<Record<string, LiveSessionStatus> | null>(null);
+  /** Notification ids already surfaced to the desktop, so a refreshed (deduped)
+   *  unread item doesn't re-fire an OS notification. */
+  const seenNotifIdsRef = useRef<Set<string>>(new Set());
+  /** Stable ref to loadSession so desktop-notification click handlers navigate
+   *  without re-running the notifications effect. */
+  const loadSessionRef = useRef<(path: string, workspace?: string) => void>(() => {});
   useEffect(() => {
     if (state.workspace) workspaceRef.current = state.workspace;
     if (state.currentSessionFile) activeRef.current = state.currentSessionFile;
@@ -269,6 +289,9 @@ export function useAgent(): AgentApi {
         // Functional merge: preserve in-flight client undo (and its trimmed
         // transcript) so a reconnect mid-undo can't lose pendingUndo and then
         // wipe messages on the following reset.
+        // Prime the liveSessions diff so reconnect/switch doesn't flood the feed
+        // with transitions that happened while disconnected.
+        prevLiveRef.current = null;
         setState((s) => {
           // Keep client trim only while undo is still in flight on the server
           // (snapshot still has the longer pre-undo transcript). Once the server
@@ -283,6 +306,10 @@ export function useAgent(): AgentApi {
             thinkingLevel: t ?? snap.thinkingLevel,
             selectedModel:
               m && snap.models.some((x) => x.id === m) ? m : snap.selectedModel,
+            // Preserve the client-only notification feed (snap has none — the
+            // server never populates it). liveSessions comes from snap (the
+            // bridge seeds it on subscribe).
+            notifications: s.notifications,
           };
         });
       } else {
@@ -311,6 +338,70 @@ export function useAgent(): AgentApi {
     const t = lsGet("umans:thinking");
     if (t) setState((s) => reduce(s, { type: "_set_thinking", level: t }));
   }, []);
+
+  // ── Cross-session notifications ──
+  // Detect background-session transitions from the liveSessions map and append
+  // feed items (a background session finished its turn, or now needs the user).
+  // The currently-viewed session is never notified — its attention UI is already
+  // inline. prevLiveRef is reset on (re)connect so the first status after a
+  // snapshot primes without emitting a flood of stale transitions.
+  useEffect(() => {
+    const next = state.liveSessions ?? {};
+    const prev = prevLiveRef.current;
+    prevLiveRef.current = next;
+    if (!prev) return; // priming after (re)connect
+    const viewed = state.currentSessionFile;
+    const items: NotificationItem[] = [];
+    for (const [file, s] of Object.entries(next)) {
+      const before = prev[file];
+      if (!before) continue; // newly observed this run — prime
+      if (file === viewed) continue; // never notify about the viewed session
+      const attentionEntered = !before.needsAttention && s.needsAttention;
+      const finished = before.streaming && !s.streaming && !s.needsAttention;
+      if (!attentionEntered && !finished) continue;
+      items.push({
+        id: `n_${Date.now().toString(36)}_${(notifSeq++).toString(36)}`,
+        sessionFile: file,
+        workspace: s.workspace,
+        title: s.title ?? file.split(/[\\/]/).pop() ?? file,
+        kind: attentionEntered ? "attention" : "finished",
+        attentionKind: attentionEntered ? s.attentionKind : undefined,
+        ts: Date.now(),
+        read: false,
+      });
+    }
+    if (items.length) {
+      setState((st) => reduce(st, { type: "_add_notifications", items }));
+    }
+  }, [state.liveSessions]);
+
+  // Drive the tab badge + OS desktop notifications from the feed. New (unseen)
+  // items fire a desktop notification when the user opted in; the tab badge
+  // always reflects the unread count (no permission needed).
+  useEffect(() => {
+    const unread = state.notifications.filter((n) => !n.read);
+    const hasAttention = unread.some((n) => n.kind === "attention");
+    setTabBadge(unread.length, hasAttention);
+
+    const seen = seenNotifIdsRef.current;
+    const fresh = state.notifications.filter((n) => !seen.has(n.id));
+    if (fresh.length && isDesktopEnabled()) {
+      for (const n of fresh) {
+        const body =
+          n.kind === "attention"
+            ? attentionLabel(n.attentionKind)
+            : "finished its turn";
+        desktopNotify({
+          title: n.title || "Session",
+          body,
+          tag: `session:${n.sessionFile}:${n.kind}`,
+          requireInteraction: n.kind === "attention",
+          onClick: () => loadSessionRef.current(n.sessionFile, n.workspace),
+        });
+      }
+    }
+    seenNotifIdsRef.current = new Set(state.notifications.map((n) => n.id));
+  }, [state.notifications]);
 
   const post = useCallback(
     async (
@@ -665,12 +756,23 @@ export function useAgent(): AgentApi {
     if (r.session) switchToSession(r.session, r.workspace);
   }, [post, switchToSession]);
   const loadSession = useCallback(
-    (path: string): Promise<void> => {
-      switchToSession(path);
+    (path: string, workspace?: string): Promise<void> => {
+      switchToSession(path, workspace);
+      // Opening a session clears its pending notifications (they're now seen).
+      setState((s) => ({
+        ...s,
+        notifications: s.notifications.map((n) =>
+          n.sessionFile === path ? { ...n, read: true } : n,
+        ),
+      }));
       return Promise.resolve();
     },
     [switchToSession],
   );
+  // Keep the ref current so desktop-notification click handlers can navigate.
+  useEffect(() => {
+    loadSessionRef.current = loadSession;
+  }, [loadSession]);
   const listSessions = useCallback(() => fire({ type: "list_sessions" }), [fire]);
   const compact = useCallback(
     (instructions?: string) =>
@@ -732,6 +834,17 @@ export function useAgent(): AgentApi {
 
   const dismissToast = useCallback((id: string) => {
     setState((s) => reduce(s, { type: "_dismiss_toast", id }));
+  }, []);
+
+  // ── Cross-session notifications ──
+  const dismissNotification = useCallback((id: string) => {
+    setState((s) => reduce(s, { type: "_dismiss_notification", id }));
+  }, []);
+  const markAllNotificationsRead = useCallback(() => {
+    setState((s) => reduce(s, { type: "_mark_notifications_read" }));
+  }, []);
+  const clearNotifications = useCallback(() => {
+    setState((s) => reduce(s, { type: "_clear_notifications" }));
   }, []);
 
   // ── Subagent / intercom ──
@@ -1287,6 +1400,9 @@ export function useAgent(): AgentApi {
       stats,
       context,
       dismissToast,
+      dismissNotification,
+      markAllNotificationsRead,
+      clearNotifications,
       intercomReply,
       askReply,
       sudoReply,

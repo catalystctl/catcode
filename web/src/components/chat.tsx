@@ -208,7 +208,10 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     if (el) el.scrollTop = el.scrollHeight;
   }, [state.messages, state.goalMode, state.goalPlan, autoScroll, streamTick]);
 
-  // When a HITL gate appears: stop stick-to-bottom and bring the gate into view.
+  // When a HITL gate appears: stop stick-to-bottom. The gate is pinned above
+  // the composer (outside the scroll area) so it's always visible — no need to
+  // scroll it into view. When the gate is dismissed (e.g. the user approved),
+  // resume following the agent's output so the response isn't stranded off-screen.
   useEffect(() => {
     const hasGate = !!(
       state.pendingApproval ||
@@ -222,9 +225,10 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     );
     if (hasGate && !hadHitlGateRef.current) {
       setAutoScroll(false);
-      requestAnimationFrame(() => {
-        hitlGateRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      });
+    } else if (!hasGate && hadHitlGateRef.current) {
+      setAutoScroll(true);
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
     }
     hadHitlGateRef.current = hasGate;
   }, [
@@ -660,7 +664,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const activeFile = ide.state.openTabs.find((tab) => tab.id === ide.state.activeTabId && tab.kind === "file")?.target ?? null;
 
   return (
-    <div className={`chat-panel relative flex min-h-0 min-w-0 ${docked ? "h-full" : "h-[100dvh]"} w-full overflow-hidden bg-ink-950 bg-grid text-ink-100`}>
+    <div className={`chat-panel relative flex min-h-0 min-w-0 ${docked ? "h-full" : "h-[100dvh]"} w-full overflow-hidden bg-ink-950 text-ink-100`}>
       <Sidebar
         embedded={docked}
         open={sidebarOpen}
@@ -668,6 +672,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         switching={switching}
         workspace={state.workspace}
         streamingSessionFile={state.streaming ? state.currentSessionFile : null}
+        liveSessions={state.liveSessions}
         sessions={state.sessions}
         currentSessionFile={state.currentSessionFile}
         stats={state.stats}
@@ -733,6 +738,11 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onOpenIde={!docked ? () => ide.setUiMode("ide") : undefined}
           onOpenSettings={!docked ? openSettings : undefined}
           onOpenProjects={!docked ? openProjects : undefined}
+          notifications={state.notifications}
+          onOpenNotification={(n) => agent.loadSession(n.sessionFile, n.workspace)}
+          onDismissNotification={agent.dismissNotification}
+          onMarkAllNotificationsRead={agent.markAllNotificationsRead}
+          onClearNotifications={agent.clearNotifications}
         />
 
         {state.workState && <WorkStatePanel ws={state.workState} compact={!!docked} />}
@@ -743,95 +753,6 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         {/* Messages — flex sibling; composer stays below so it never clips */}
         <div className="relative min-h-0 flex-1">
         <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto overflow-x-hidden">
-          {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
-          {!switching && (
-            <div ref={hitlGateRef} className={`mx-auto w-full ${docked ? "max-w-none" : "max-w-3xl"}`}>
-              {state.pendingApproval && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                  <Approval approval={state.pendingApproval} onApprove={agent.approve} />
-                </div>
-              )}
-              {state.pendingIntercom && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                  <IntercomPrompt
-                    prompt={state.pendingIntercom}
-                    onReply={agent.intercomReply}
-                    onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
-                  />
-                </div>
-              )}
-              {state.pendingAsk && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                  <AskFlyout
-                    prompt={state.pendingAsk}
-                    onSubmit={(answers) => agent.askReply(answers)}
-                    onSkip={() => agent.askReply(null)}
-                  />
-                </div>
-              )}
-              {state.pendingSudo && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                  <SudoPrompt
-                    prompt={state.pendingSudo}
-                    onApprove={(password) => agent.sudoReply(true, password)}
-                    onDecline={() => agent.sudoReply(false)}
-                  />
-                </div>
-              )}
-              {state.pendingOauth && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                  <OauthPromptBanner
-                    prompt={state.pendingOauth}
-                    onSubmit={agent.submitOauthCode}
-                    onDismiss={agent.dismissOauth}
-                  />
-                </div>
-              )}
-              {state.goalMode &&
-                state.goalMode.phase === "plan_ready" &&
-                !state.goalMode.auto_deploy && (
-                  <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                    <GoalPlanBanner
-                      goal={state.goalMode.goal}
-                      summary={state.goalPlan?.summary}
-                      steps={
-                        state.goalMode.prompts.map((p) => ({
-                          agent: p.agent,
-                          title: p.title || p.step_id,
-                        })) || []
-                      }
-                      onApprove={() => void agent.approveGoalPlan()}
-                      onRevise={() => {
-                        void dialogApi.current
-                          .prompt({
-                            title: "Revise plan",
-                            message: "What should change in the plan?",
-                            multiline: true,
-                            required: true,
-                            confirmLabel: "Revise",
-                          })
-                          .then((fb) => {
-                            if (fb?.trim()) void agent.reviseGoal(fb.trim());
-                          });
-                      }}
-                      onCancel={() => void agent.cancelGoal()}
-                    />
-                  </div>
-                )}
-              {state.goalMode &&
-                state.goalMode.phase !== "idle" &&
-                (state.goalMode.phase !== "plan_ready" ||
-                  state.goalMode.auto_deploy) && (
-                  <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
-                    <GoalProgressPanel
-                      goalMode={state.goalMode}
-                      onCancel={() => void agent.cancelGoal()}
-                    />
-                  </div>
-                )}
-            </div>
-          )}
-
           {empty || switching ? (
             <EmptyState
               workspace={state.workspace}
@@ -852,7 +773,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
-            <div className={`mx-auto w-full ${docked ? "max-w-none py-3" : "max-w-3xl py-4"}`}>
+            <div className={`mx-auto w-full ${docked ? "max-w-none py-3" : "max-w-[46rem] py-5"}`}>
               <ErrorBoundary label="message list">
                 {state.messages.map((m, i) => (
                   <Message
@@ -879,12 +800,101 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 const el = scrollRef.current;
                 if (el) el.scrollTop = el.scrollHeight;
               }}
-              className="chat-jump-pill pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-accent/40 bg-ink-900/95 px-3.5 py-1.5 text-[12px] font-medium text-ink-100 shadow-lg shadow-black/40 backdrop-blur hover:border-accent/60 hover:bg-ink-850"
+              className="chat-jump-pill pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-sm border border-ink-700 bg-ink-900 px-3 py-1.5 font-mono text-[11px] text-ink-200 transition-colors hover:border-accent/60 hover:text-ink-100"
             >
-              ↓ Jump to latest
+              <span className="text-accent-soft" aria-hidden="true">↓</span> Jump to latest
             </button>
           )}
         </div>
+
+        {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
+        {!switching && (
+          <div ref={hitlGateRef} className={`shrink-0 mx-auto w-full ${docked ? "max-w-none" : "max-w-3xl"}`}>
+            {state.pendingApproval && (
+              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <Approval approval={state.pendingApproval} onApprove={agent.approve} />
+              </div>
+            )}
+            {state.pendingIntercom && (
+              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <IntercomPrompt
+                  prompt={state.pendingIntercom}
+                  onReply={agent.intercomReply}
+                  onDismiss={() => agent.intercomReply("(skipped — no decision provided)")}
+                />
+              </div>
+            )}
+            {state.pendingAsk && (
+              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <AskFlyout
+                  prompt={state.pendingAsk}
+                  onSubmit={(answers) => agent.askReply(answers)}
+                  onSkip={() => agent.askReply(null)}
+                />
+              </div>
+            )}
+            {state.pendingSudo && (
+              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <SudoPrompt
+                  prompt={state.pendingSudo}
+                  onApprove={(password) => agent.sudoReply(true, password)}
+                  onDecline={() => agent.sudoReply(false)}
+                />
+              </div>
+            )}
+            {state.pendingOauth && (
+              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <OauthPromptBanner
+                  prompt={state.pendingOauth}
+                  onSubmit={agent.submitOauthCode}
+                  onDismiss={agent.dismissOauth}
+                />
+              </div>
+            )}
+            {state.goalMode &&
+              state.goalMode.phase === "plan_ready" &&
+              !state.goalMode.auto_deploy && (
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                  <GoalPlanBanner
+                    goal={state.goalMode.goal}
+                    summary={state.goalPlan?.summary}
+                    steps={
+                      state.goalMode.prompts.map((p) => ({
+                        agent: p.agent,
+                        title: p.title || p.step_id,
+                      })) || []
+                    }
+                    onApprove={() => void agent.approveGoalPlan()}
+                    onRevise={() => {
+                      void dialogApi.current
+                        .prompt({
+                          title: "Revise plan",
+                          message: "What should change in the plan?",
+                          multiline: true,
+                          required: true,
+                          confirmLabel: "Revise",
+                        })
+                        .then((fb) => {
+                          if (fb?.trim()) void agent.reviseGoal(fb.trim());
+                        });
+                    }}
+                    onCancel={() => void agent.cancelGoal()}
+                  />
+                </div>
+              )}
+            {state.goalMode &&
+              state.goalMode.phase !== "idle" &&
+              (state.goalMode.phase !== "plan_ready" ||
+                state.goalMode.auto_deploy) && (
+                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                  <GoalProgressPanel
+                    goalMode={state.goalMode}
+                    onCancel={() => void agent.cancelGoal()}
+                  />
+                </div>
+              )}
+          </div>
+        )}
 
         <Composer
           ref={composerRef}
@@ -1059,57 +1069,45 @@ function EmptyState({
   adaptive?: boolean;
   onPick: (t: string) => void;
 }) {
-  // HITL + empty: shrink hero so approval/ask stay visible without scrolling past chrome.
+  // HITL + empty: shrink the panel so approval/ask stay visible without scrolling past chrome.
   const hitlCompact = !!compact;
   const dockedEmpty = !!adaptive;
+  const padX = dockedEmpty ? "px-3" : "px-4 sm:px-6";
   return (
     <div
-      className={`chat-empty-hero flex flex-col items-center justify-center text-center ${
+      className={`relative flex min-w-0 flex-col ${
         dockedEmpty
           ? hitlCompact
-            ? "min-h-0 px-3 py-3"
-            : "min-h-full px-4 py-6"
-          : "px-6"
-      } ${
-        hitlCompact && !dockedEmpty
-          ? "min-h-0 py-6"
-          : dockedEmpty
-            ? ""
-            : "h-full py-12"
+            ? "min-h-0"
+            : "min-h-full"
+          : hitlCompact
+            ? "min-h-0"
+            : "h-full"
       }`}
     >
-      <div className={`${dockedEmpty ? (hitlCompact ? "mb-2" : "mb-4") : "mb-6"} chat-empty-mark`}>
-        <BrandMark
-          size={dockedEmpty ? (hitlCompact ? 28 : 36) : 56}
-          className={dockedEmpty ? "rounded-xl" : "rounded-2xl shadow-glow"}
-        />
+      {/* Section header — IDE panel idiom */}
+      <div className={`flex items-center border-b border-ink-800 ${padX} ${hitlCompact ? "py-1.5" : "py-2"}`}>
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-500">Get started</span>
       </div>
-      <h1
-        className={`font-display ${
-          dockedEmpty ? (hitlCompact ? "text-sm" : "text-[15px]") : "text-[1.65rem]"
-        } font-semibold tracking-tight text-ink-100`}
-      >
-        {dockedEmpty ? "What should we work on?" : "Catalyst Code"}
-      </h1>
-      <p
-        className={`${
-          dockedEmpty ? "mt-1 max-w-xs text-[11px]" : "mt-2.5 max-w-md text-[14px]"
-        } leading-relaxed text-ink-400`}
-      >
+
+      {/* Workspace line */}
+      <div className={`flex items-center gap-2 border-b border-ink-800/60 ${padX} ${hitlCompact ? "py-1.5" : "py-2"}`}>
         {switching ? (
-          "Loading session…"
+          <span className="truncate font-mono text-[11px] text-ink-400">Loading session…</span>
         ) : (
           <>
-            {dockedEmpty ? "Working in " : "Build, debug, and explore — powered by "}
-            <span className="font-mono text-accent-soft">
+            <BrandMark size={14} className="shrink-0 rounded-sm" />
+            <span className="truncate font-mono text-[11px] text-accent-soft">
               {basename(workspace) || workspace || "this workspace"}
             </span>
-            .{connected && !dockedEmpty ? " Pick a start below, or just type." : !connected ? " Connecting…" : ""}
+            {!connected && <span className="ml-auto font-mono text-[10px] text-ink-600">connecting…</span>}
           </>
         )}
-      </p>
+      </div>
+
+      {/* Example prompts — full-width flat rows, file-explorer style */}
       {!switching && !(dockedEmpty && hitlCompact) && (
-        <div className={`${dockedEmpty ? "mt-5 grid-cols-2 gap-1.5" : "mt-8 gap-2"} grid w-full max-w-lg`}>
+        <div className="flex w-full flex-col">
           {EXAMPLES.map((ex) => (
             <button
               key={ex.label}
@@ -1118,14 +1116,24 @@ function EmptyState({
                 if (!canSend) return;
                 onPick(ex.prompt);
               }}
-              className={`group flex items-center rounded-xl border border-ink-800/80 bg-ink-900/30 text-left text-ink-300 transition-all duration-150 hover:border-accent/40 hover:bg-ink-850/80 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40 ${dockedEmpty ? "gap-2 px-2.5 py-2" : "gap-3 px-4 py-3.5 text-[13px]"}`}
+              className={`group flex w-full items-center gap-2 border-b border-l-2 border-ink-800/60 border-l-transparent text-left transition-colors hover:border-l-accent hover:bg-ink-900 disabled:cursor-not-allowed disabled:opacity-40 ${padX} ${hitlCompact || dockedEmpty ? "py-1.5" : "py-2"}`}
             >
-              <SparkIcon width={dockedEmpty ? 12 : 14} height={dockedEmpty ? 12 : 14} className="shrink-0 text-ink-500 transition-colors group-hover:text-accent-soft" />
-              <span className="min-w-0 flex-1"><span className="block font-medium text-ink-200">{ex.label}</span>{!dockedEmpty && <span className="mt-0.5 block text-[11px] text-ink-500">{ex.detail}</span>}</span>
-              {!dockedEmpty && <SendIcon width={13} height={13} className="shrink-0 text-ink-600 transition-colors group-hover:text-accent-soft" />}
+              <SparkIcon width={12} height={12} className="shrink-0 text-ink-500 transition-colors group-hover:text-accent-soft" />
+              <span className="shrink-0 text-[12px] text-ink-200">{ex.label}</span>
+              {!dockedEmpty && <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-ink-500">{ex.detail}</span>}
+              {!dockedEmpty && (
+                <SendIcon width={12} height={12} className="shrink-0 text-ink-700 transition-colors group-hover:text-accent-soft" />
+              )}
             </button>
           ))}
         </div>
+      )}
+      {!switching && !dockedEmpty && (
+        <p className={`${padX} py-2 font-mono text-[10px] text-ink-600`}>
+          Type <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-400">/</kbd> for commands{" "}
+          <span className="text-ink-700">·</span>{" "}
+          <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-400">@</kbd> for files
+        </p>
       )}
     </div>
   );
@@ -1135,25 +1143,20 @@ function AgentActivity({ compact, activity, hasWorkState }: { compact: boolean; 
   const label = activity?.trim() || (hasWorkState ? "Working through the plan" : "Understanding your request");
   return (
     <div
-      className={`mx-auto flex w-full items-center gap-2 border-b border-ink-800/80 text-[10px] text-ink-500 ${
-        compact
-          ? "max-w-none px-2 py-1"
-          : "max-w-3xl px-4 py-1.5 sm:px-6"
+      className={`flex h-6 w-full items-center gap-2 border-b border-ink-800 bg-ink-925 ${
+        compact ? "px-2" : "px-4"
       }`}
       role="status"
       aria-live="polite"
     >
-      <span className="relative flex h-1.5 w-1.5 shrink-0">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-40" />
-        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-accent" />
-      </span>
-      <span className="min-w-0 flex-1 truncate text-ink-400">{label}</span>
+      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-none bg-accent-soft" />
+      <span className="min-w-0 flex-1 truncate font-mono text-[10px] uppercase tracking-wider text-ink-400">{label}</span>
       {!compact && (
-        <span className="ml-auto hidden items-center gap-1.5 text-ink-600 sm:flex" aria-label="Agent activity stages">
+        <span className="ml-auto hidden items-center gap-1.5 font-mono text-[10px] text-ink-600 sm:flex" aria-label="Agent activity stages">
           <span className="text-accent-soft">Understand</span>
-          <span>→</span>
+          <span className="text-ink-700">→</span>
           <span className={hasWorkState ? "text-accent-soft" : ""}>Work</span>
-          <span>→</span>
+          <span className="text-ink-700">→</span>
           <span>Respond</span>
         </span>
       )}
@@ -1187,14 +1190,14 @@ function KeyOverlay({
       >
         <button
           onClick={onDismiss}
-          className="absolute right-3 top-3 rounded-md p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="absolute right-3 top-3 rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
           aria-label="Dismiss"
           title="Dismiss (use /login to enter a key later)"
         >
           <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
         </button>
         <div className="mb-4 flex items-center gap-3">
-          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent/15 text-accent-soft">
+          <span className="flex h-10 w-10 items-center justify-center rounded-sm bg-accent/15 text-accent-soft">
             <ShieldIcon width={18} height={18} />
           </span>
           <div>
@@ -1211,12 +1214,12 @@ function KeyOverlay({
             if (e.key === "Enter") onSubmit();
           }}
           placeholder="sk-..."
-          className="w-full rounded-xl border border-ink-700 bg-ink-950 px-3.5 py-2.5 font-mono text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none focus:shadow-glow"
+          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3.5 py-2.5 font-mono text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
         />
         <button
           onClick={onSubmit}
           disabled={busy || !value.trim()}
-          className="mt-3 w-full rounded-xl bg-accent py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+          className="mt-3 w-full rounded-sm bg-accent py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
         >
           {busy ? "Connecting…" : "Connect"}
         </button>

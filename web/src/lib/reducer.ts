@@ -17,6 +17,8 @@ import type {
   GoalMsg,
   GoalPrompt,
   IntercomEntry,
+  LiveSessionStatus,
+  NotificationItem,
   ReadyPayload,
   SandboxMode,
   SandboxNetworkMode,
@@ -66,6 +68,8 @@ export const initialState: AgentState = {
   umansConc: null,
   sessions: [],
   currentSessionFile: null,
+  liveSessions: {},
+  notifications: [],
   stats: null,
   toasts: [],
   memories: [],
@@ -650,6 +654,43 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, switching: ev.switching };
     case "_clear_provider_models_preview":
       return { ...state, providerModelsPreview: null };
+    case "_add_notifications": {
+      // Client-only: append feed items emitted by useAgent's liveSessions diff.
+      // Dedup per session+kind: refresh (bump ts) an existing UNREAD item for
+      // the same session+kind rather than stacking duplicates, so a session
+      // repeatedly hitting approval doesn't spam the bell.
+      const merged = [...state.notifications];
+      for (const item of ev.items) {
+        const idx = merged.findIndex(
+          (n) => !n.read && n.sessionFile === item.sessionFile && n.kind === item.kind,
+        );
+        if (idx >= 0) {
+          merged[idx] = {
+            ...merged[idx],
+            ts: item.ts,
+            attentionKind: item.attentionKind ?? merged[idx].attentionKind,
+          };
+        } else {
+          merged.push(item);
+        }
+      }
+      const trimmed = merged.length > 50 ? merged.slice(merged.length - 50) : merged;
+      return { ...state, notifications: trimmed };
+    }
+    case "_dismiss_notification":
+      return {
+        ...state,
+        notifications: state.notifications.map((n) =>
+          n.id === ev.id ? { ...n, read: true } : n,
+        ),
+      };
+    case "_mark_notifications_read":
+      return {
+        ...state,
+        notifications: state.notifications.map((n) => ({ ...n, read: true })),
+      };
+    case "_clear_notifications":
+      return { ...state, notifications: [] };
     case "_goal_approve_optimistic": {
       if (!state.goalMode || state.goalMode.phase !== "plan_ready") return state;
       const goalMode = { ...state.goalMode, auto_deploy: true };
@@ -916,6 +957,16 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         currentSessionFile:
           state.currentSessionFile ?? sorted[0]?.path ?? sorted[0]?.name ?? null,
       };
+    }
+    case "session_status": {
+      // Bridge-synthesized snapshot of every live session's status, fanned to ALL
+      // sessions (cross-workspace). Keyed by absolute session-file path so the
+      // sidebar can look up a session's live badge. Notifications are derived
+      // client-side from transitions (useAgent), NOT here, so a fresh
+      // hydration never spams the feed.
+      const liveSessions: Record<string, LiveSessionStatus> = {};
+      for (const s of ev.sessions) liveSessions[s.sessionFile] = s;
+      return { ...state, liveSessions };
     }
     case "stats":
       return {

@@ -20,6 +20,9 @@ export interface HarnessSettings {
   baseUrl?: string;
   provider?: string;
   approval?: ApprovalMode;
+  /** Web-only: show OS desktop notifications for cross-session events.
+   *  Stored alongside TUI settings; the TUI ignores the key. */
+  desktopNotifications?: boolean;
 }
 
 function settingsPath(): string {
@@ -50,6 +53,7 @@ export function loadSettings(): HarnessSettings {
     else if (typeof s.active_provider === "string" && s.active_provider) out.provider = s.active_provider;
     const approval = asApproval(s.approval);
     if (approval) out.approval = approval;
+    if (typeof s.desktop_notifications === "boolean") out.desktopNotifications = s.desktop_notifications;
     return out;
   } catch {
     return {};
@@ -69,6 +73,27 @@ export function saveApproval(mode: ApprovalMode): void {
     doc = {};
   }
   doc.approval = mode;
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.settings.${process.pid}.${Date.now()}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+/** Merge-write the web-only desktop_notifications flag into settings.json
+ *  (atomic replace). Stored under a `web`-namespaced key the TUI ignores. */
+export function saveDesktopNotifications(enabled: boolean): void {
+  const path = settingsPath();
+  let doc: Record<string, unknown> = {};
+  try {
+    if (existsSync(path)) {
+      doc = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      if (!doc || typeof doc !== "object") doc = {};
+    }
+  } catch {
+    doc = {};
+  }
+  doc.desktop_notifications = enabled;
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.settings.${process.pid}.${Date.now()}.tmp`);

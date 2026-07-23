@@ -22,7 +22,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname, relative, normalize, sep } from "node:path";
 import { resolveCoreBinary, configDir } from "@catalyst-code/coding-agent";
-import type { AgentState, CoreCommand, CoreEvent, ProjectEntry, ReadyPayload } from "@/lib/types";
+import type { AgentEvent, AgentState, CoreCommand, CoreEvent, LiveSessionStatus, ProjectEntry, ReadyPayload } from "@/lib/types";
 import { loadTitles, setTitle } from "@/lib/session-titles";
 import { loadProjects, touchProject, removeProject } from "@/lib/projects";
 import { LiveSession, type SessionCallbacks, type SessionEnv } from "./live-session";
@@ -163,7 +163,28 @@ class HarnessBridge {
       onDead: () => {
         /* left in the map; next ensure() respawns */
       },
+      onStatusChange: () => this.broadcastStatus(),
+      onStatusSnapshot: () => this.statusList(),
     };
+  }
+
+  /** Snapshot of every live session's status (source of truth for the
+   *  cross-session session_status broadcast + fresh-subscriber seeding). */
+  private statusList(): LiveSessionStatus[] {
+    return [...this.sessions.values()].map((s) => s.status());
+  }
+
+  /** Fan a session_status snapshot to EVERY live session (all workspaces), so a
+   *  client viewing any session/project learns about every other live session's
+   *  streaming / attention state. Global like broadcastProjects, not
+   *  workspace-scoped like broadcastSessions. */
+  private broadcastStatus(): void {
+    if (this.disposed) return;
+    const sessions = this.statusList();
+    const ev: CoreEvent = { type: "session_status", sessions };
+    for (const s of this.sessions.values()) {
+      s.inject(ev as unknown as AgentEvent);
+    }
   }
 
   /** Find or create the LiveSession for a session file. Does NOT start it. */
@@ -297,6 +318,9 @@ class HarnessBridge {
     for (const s of this.sessions.values()) {
       if (s.workspace === workspace) s.refreshSessions();
     }
+    // The deleted session left the live map — re-broadcast status so clients
+    // drop its sidebar badge / feed entry.
+    this.broadcastStatus();
     return { session: resolveSessionFile(workspace), workspace };
   }
 
@@ -312,11 +336,15 @@ class HarnessBridge {
   private gcIdle(): void {
     if (this.disposed) return;
     const now = Date.now();
+    let reaped = false;
     for (const [file, s] of this.sessions) {
       if (!s.isIdle(now)) continue;
       this.sessions.delete(file);
       void s.dispose();
+      reaped = true;
     }
+    // A reaped session leaves the live map — re-broadcast so clients drop it.
+    if (reaped) this.broadcastStatus();
   }
 
   // ── Lifecycle ──

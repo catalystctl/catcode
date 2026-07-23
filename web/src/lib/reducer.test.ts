@@ -148,6 +148,105 @@ describe("sessions", () => {
     expect(s.sessions[0].title).toBe("My Session");
     expect(s.sessions[0].messages).toBe(5);
   });
+
+  test("indexes bridge session-status snapshots by absolute session path", () => {
+    const state = reduce(initialState, {
+      type: "session_status",
+      sessions: [
+        {
+          sessionFile: "/sessions/a.jsonl",
+          workspace: "/project-a",
+          title: "Background task",
+          streaming: true,
+          running: true,
+          needsAttention: false,
+          viewers: 0,
+          lastEventAt: 123,
+        },
+      ],
+    });
+    expect(state.liveSessions["/sessions/a.jsonl"]).toMatchObject({
+      workspace: "/project-a",
+      streaming: true,
+      running: true,
+    });
+  });
+});
+
+describe("notifications", () => {
+  test("_add_notifications appends feed items", () => {
+    const s = reduce(initialState, {
+      type: "_add_notifications",
+      items: [
+        {
+          id: "n1",
+          sessionFile: "/a.jsonl",
+          workspace: "/p",
+          title: "Session A",
+          kind: "attention",
+          attentionKind: "approval",
+          ts: 1,
+          read: false,
+        },
+      ],
+    });
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].title).toBe("Session A");
+  });
+
+  test("_add_notifications dedups by session+kind (refresh, not stack)", () => {
+    let s = reduce(initialState, {
+      type: "_add_notifications",
+      items: [
+        { id: "n1", sessionFile: "/a.jsonl", workspace: "/p", title: "A", kind: "attention", ts: 1, read: false },
+      ],
+    });
+    s = reduce(s, {
+      type: "_add_notifications",
+      items: [
+        { id: "n2", sessionFile: "/a.jsonl", workspace: "/p", title: "A", kind: "attention", ts: 2, read: false },
+      ],
+    });
+    // Same session+kind while still unread -> refresh (bump ts), not a duplicate.
+    expect(s.notifications.filter((n) => n.sessionFile === "/a.jsonl")).toHaveLength(1);
+    expect(s.notifications[0].ts).toBe(2);
+  });
+
+  test("_dismiss_notification marks one read", () => {
+    let s = reduce(initialState, {
+      type: "_add_notifications",
+      items: [
+        { id: "n1", sessionFile: "/a.jsonl", workspace: "/p", title: "A", kind: "finished", ts: 1, read: false },
+        { id: "n2", sessionFile: "/b.jsonl", workspace: "/p", title: "B", kind: "attention", ts: 2, read: false },
+      ],
+    });
+    s = reduce(s, { type: "_dismiss_notification", id: "n1" });
+    expect(s.notifications.find((n) => n.id === "n1")?.read).toBe(true);
+    expect(s.notifications.find((n) => n.id === "n2")?.read).toBe(false);
+  });
+
+  test("_mark_notifications_read marks all read", () => {
+    let s = reduce(initialState, {
+      type: "_add_notifications",
+      items: [
+        { id: "n1", sessionFile: "/a.jsonl", workspace: "/p", title: "A", kind: "finished", ts: 1, read: false },
+        { id: "n2", sessionFile: "/b.jsonl", workspace: "/p", title: "B", kind: "attention", ts: 2, read: false },
+      ],
+    });
+    s = reduce(s, { type: "_mark_notifications_read" });
+    expect(s.notifications.every((n) => n.read)).toBe(true);
+  });
+
+  test("_clear_notifications empties the feed", () => {
+    let s = reduce(initialState, {
+      type: "_add_notifications",
+      items: [
+        { id: "n1", sessionFile: "/a.jsonl", workspace: "/p", title: "A", kind: "finished", ts: 1, read: false },
+      ],
+    });
+    s = reduce(s, { type: "_clear_notifications" });
+    expect(s.notifications).toEqual([]);
+  });
 });
 
 describe("session rename overlay", () => {
@@ -1296,7 +1395,7 @@ describe("CORE_EVENT_TYPES coverage", () => {
     // Synthetic events (underscore-prefixed) are not core wire events.
     const coreEvents = allCases.filter((c) => !c.startsWith("_"));
     // Bridge-generated events (not core wire events); correctly absent from CORE_EVENT_TYPES.
-    const bridgeEvents = new Set(["projects", "workspace_changed"]);
+    const bridgeEvents = new Set(["projects", "workspace_changed", "session_status"]);
     // Core wire events emitted by the new Microsandbox subsystem. The SDK
     // catalog (@catalyst-code/coding-agent CORE_EVENT_TYPES) lags the core
     // until the SDK is updated; documented here as a known gap so this coverage

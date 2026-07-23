@@ -7,7 +7,8 @@
 //     stats, with a live token/turn readout.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { SessionEntry, Stats } from "@/lib/types";
+import type { LiveSessionStatus, SessionEntry, Stats } from "@/lib/types";
+import { attentionLabel } from "@/lib/notifications";
 import { relativeTime, basename, formatTokens } from "@/lib/format";
 import {
   readSessionPreferences,
@@ -43,6 +44,10 @@ interface Props {
   onConfirmDelete?: (title: string) => Promise<boolean>;
   /** Session path/name currently producing output. */
   streamingSessionFile?: string | null;
+  /** Live status of every currently-live session (bridge-synthesized), keyed by
+   *  absolute session-file path. Drives per-session streaming + needs-attention
+   *  badges for background sessions (not just the viewed one). */
+  liveSessions?: Record<string, LiveSessionStatus>;
 }
 
 export function Sidebar(props: Props) {
@@ -168,7 +173,7 @@ export function Sidebar(props: Props) {
       {/* Mobile backdrop */}
       {props.open && (
         <div
-          className={`${props.embedded ? "absolute" : "fixed"} inset-0 z-20 bg-black/50 backdrop-blur-sm ${props.embedded ? "" : "lg:hidden"}`}
+          className={`${props.embedded ? "absolute" : "fixed"} inset-0 z-20 bg-black/50 ${props.embedded ? "" : "lg:hidden"}`}
           onClick={props.onClose}
         />
       )}
@@ -177,7 +182,7 @@ export function Sidebar(props: Props) {
         // before React hydrates. The attribute is harmless but otherwise
         // produces a false-positive hydration mismatch in development.
         suppressHydrationWarning
-        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-[19rem] max-w-[88%] flex-col border-r border-ink-800/80 bg-ink-925/98 shadow-2xl shadow-black/30 backdrop-blur-xl transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto lg:shadow-none"} ${
+        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-[19rem] max-w-[88%] flex-col border-r border-ink-800 bg-ink-925 transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto lg:shadow-none"} ${
           props.open
             ? "translate-x-0 pointer-events-auto"
             : props.embedded
@@ -186,42 +191,35 @@ export function Sidebar(props: Props) {
         }`}
       >
         {/* ── Sessions header ── */}
-        <div className="flex items-center justify-between px-3 pb-2 pt-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-accent/12 text-accent-soft">
-                <HistoryIcon width={14} height={14} />
-              </span>
-              <div>
-                <h2 className="text-[13px] font-semibold leading-tight text-ink-100">Chat history</h2>
-                <p className="mt-0.5 text-[10px] leading-tight text-ink-500">
-                  {props.sessions.length} {props.sessions.length === 1 ? "conversation" : "conversations"}
-                </p>
-              </div>
-            </div>
+        <div className="flex items-center justify-between border-b border-ink-800 px-2 py-2">
+          <div className="flex min-w-0 items-baseline gap-2">
+            <h2 className="text-[10px] font-mono uppercase tracking-wider text-ink-500">Chat history</h2>
+            <span className="font-mono text-[10px] text-ink-600">
+              {props.sessions.length} {props.sessions.length === 1 ? "conversation" : "conversations"}
+            </span>
           </div>
           <button
             onClick={props.onClose}
-            className={`rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 ${props.embedded ? "" : "lg:hidden"}`}
+            className={`flex h-6 w-6 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 ${props.embedded ? "" : "lg:hidden"}`}
             aria-label="Close chat history"
           >
-            <XIcon width={16} height={16} />
+            <XIcon width={14} height={14} />
           </button>
         </div>
 
-        <div className="px-3 pb-2 pt-1">
+        <div className="px-2 pb-2 pt-2">
           <button
             onClick={props.onNewSession}
             disabled={props.switching}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-accent px-3 py-2.5 text-[13px] font-semibold text-white shadow-sm transition-all hover:bg-accent-soft hover:shadow-glow disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex w-full items-center gap-2 rounded-sm border border-ink-700 bg-ink-900 px-2 py-1.5 text-[11px] font-mono text-ink-200 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <PlusIcon width={15} height={15} /> New chat
+            <PlusIcon width={13} height={13} /> New chat
           </button>
         </div>
 
-        <div className="px-3 pb-2">
+        <div className="px-2 pb-2">
           <div className="relative">
-            <SearchIcon width={13} height={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-500" />
+            <SearchIcon width={12} height={12} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-ink-500" />
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -233,13 +231,13 @@ export function Sidebar(props: Props) {
               }}
               placeholder="Search chats…"
               aria-label="Search chat history"
-              className="w-full rounded-xl border border-ink-800 bg-ink-950/70 py-2 pl-8 pr-8 text-[12px] text-ink-200 outline-none transition-colors placeholder:text-ink-500 focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
+              className="w-full rounded-sm border border-ink-800 bg-ink-900 py-1.5 pl-7 pr-7 font-mono text-[11px] text-ink-200 outline-none transition-colors placeholder:text-ink-500 focus:border-ink-600"
             />
             {query && (
               <button
                 type="button"
                 onClick={() => setQuery("")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-200"
+                className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200"
                 aria-label="Clear search"
               >
                 <XIcon width={11} height={11} />
@@ -249,9 +247,9 @@ export function Sidebar(props: Props) {
         </div>
 
         {/* ── Session list ── */}
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        <div className="min-h-0 flex-1 overflow-y-auto pb-2">
           {filtered.length === 0 ? (
-            <div className="mx-1 mt-3 rounded-xl border border-dashed border-ink-800 px-4 py-8 text-center">
+            <div className="mx-2 mt-3 border border-dashed border-ink-800 px-4 py-8 text-center">
               <HistoryIcon width={20} height={20} className="mx-auto mb-2 text-ink-600" />
               <p className="text-[12px] font-medium text-ink-300">
                 {props.sessions.length === 0 ? "No conversations yet" : "No conversations found"}
@@ -265,13 +263,13 @@ export function Sidebar(props: Props) {
           ) : (
             grouped.map((group) => (
               <section key={group.label} className="mb-2 last:mb-0">
-                <div className="sticky top-0 z-10 flex items-center justify-between bg-ink-925/95 px-2 pb-1.5 pt-2 backdrop-blur">
-                  <h3 className="text-[10px] font-semibold uppercase tracking-[0.12em] text-ink-500">
+                <div className="sticky top-0 z-10 flex items-center justify-between border-b border-ink-800/50 bg-ink-925 px-2 pb-1 pt-3">
+                  <h3 className="text-[10px] font-mono uppercase tracking-wider text-ink-500">
                     {group.label}
                   </h3>
-                  <span className="text-[10px] tabular-nums text-ink-600">{group.sessions.length}</span>
+                  <span className="font-mono text-[10px] tabular-nums text-ink-600">{group.sessions.length}</span>
                 </div>
-                <ul className="space-y-1">
+                <ul className="divide-y divide-ink-800/50">
               {group.sessions.map((s) => {
                 const visibleIndex = visibleSessions.findIndex((entry) => entry.name === s.name);
                 const cur = props.currentSessionFile;
@@ -286,6 +284,9 @@ export function Sidebar(props: Props) {
                 const isPinned = pinned.includes(s.name);
                 const isArchived = archived.includes(s.name);
                 const isStreaming = matchesSession(props.streamingSessionFile, s);
+                const liveStatus = (s.path && props.liveSessions?.[s.path]) || undefined;
+                const showStreaming = isStreaming || !!liveStatus?.streaming;
+                const needsAttention = !!liveStatus?.needsAttention;
                 return (
                   <li key={s.name} className="group relative">
                     <button
@@ -298,16 +299,13 @@ export function Sidebar(props: Props) {
                       onClick={() => !isRenaming && props.onLoadSession(s.path ?? s.name)}
                       onKeyDown={(event) => handleSessionKeyDown(event, visibleIndex)}
                       aria-current={active ? "page" : undefined}
-                      className={`relative flex w-full items-start gap-2.5 overflow-hidden rounded-xl border px-2.5 py-2 text-left transition-all disabled:cursor-wait disabled:opacity-60 ${
+                      className={`relative flex w-full items-start gap-2 overflow-hidden rounded-none border-l-2 px-2 py-1.5 text-left transition-colors disabled:cursor-wait disabled:opacity-60 ${
                         active
-                          ? "border-accent/25 bg-accent/10 text-ink-100 shadow-sm"
-                          : "border-transparent text-ink-300 hover:border-ink-800 hover:bg-ink-900"
+                          ? "border-accent bg-ink-900 text-ink-100"
+                          : "border-transparent text-ink-300 hover:bg-ink-900 hover:text-ink-100"
                       }`}
                     >
-                      {active && <span className="absolute inset-y-2 left-0 w-0.5 rounded-r bg-accent" />}
-                      <span className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg ${active ? "bg-accent/15 text-accent-soft" : "bg-ink-850 text-ink-500"}`}>
-                        <SparkIcon width={12} height={12} />
-                      </span>
+                      <SparkIcon width={12} height={12} className={`mt-0.5 shrink-0 ${active ? "text-accent-soft" : "text-ink-500"}`} />
                       <div className="min-w-0 flex-1">
                         {isRenaming ? (
                           <input
@@ -332,16 +330,25 @@ export function Sidebar(props: Props) {
                               }
                               commitRename();
                             }}
-                            className="w-full rounded border border-accent/40 bg-ink-950 px-1.5 py-0.5 text-[11px] text-ink-100 focus:outline-none"
+                            className="w-full rounded-sm border border-accent/40 bg-ink-950 px-1.5 py-0.5 font-mono text-[11px] text-ink-100 focus:outline-none"
                           />
                         ) : (
                           <>
-                            <div className="line-clamp-2 pr-7 text-[12px] font-medium leading-4 text-ink-100" title={displayTitle}>
+                            <div className="line-clamp-2 pr-6 text-[12px] font-medium leading-4 text-ink-100" title={displayTitle}>
                               {displayTitle}
                             </div>
-                            <div className="flex items-center gap-1.5 text-[10px] leading-4 text-ink-500">
-                              {isStreaming && (
-                                <><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" aria-hidden="true" /><span className="sr-only">Generating</span></>
+                            <div className="flex items-center gap-1.5 font-mono text-[10px] leading-4 text-ink-500">
+                              {showStreaming && (
+                                <><span className="h-1.5 w-1.5 animate-pulse rounded-none bg-accent" aria-hidden="true" /><span className="sr-only">Generating</span></>
+                              )}
+                              {needsAttention && (
+                                <span
+                                  className="flex items-center gap-0.5 text-danger"
+                                  title={liveStatus?.attentionKind ? attentionLabel(liveStatus.attentionKind) : "Needs your attention"}
+                                >
+                                  <span className="h-1.5 w-1.5 rounded-none bg-danger" aria-hidden="true" />
+                                  <span className="sr-only">Needs your attention</span>
+                                </span>
                               )}
                               <span>{relativeTime((s.mtime ?? 0) * 1000)}</span>
                               {s.messages != null && (
@@ -364,7 +371,7 @@ export function Sidebar(props: Props) {
                             setMenuAbove(e.currentTarget.getBoundingClientRect().bottom + 170 > window.innerHeight);
                             setOpenMenu((current) => current === s.name ? null : s.name);
                           }}
-                          className="rounded-md bg-ink-925/90 p-1 text-ink-500 opacity-100 shadow-sm backdrop-blur hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                          className="flex h-5 w-5 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
                           title="Conversation actions"
                           aria-label={`Actions for ${displayTitle}`}
                           aria-haspopup="menu"
@@ -373,7 +380,7 @@ export function Sidebar(props: Props) {
                           <MoreIcon width={13} height={13} />
                         </button>
                         {openMenu === s.name && (
-                          <div role="menu" aria-label={`Actions for ${displayTitle}`} className={`absolute right-0 z-30 w-36 rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-xl ${menuAbove ? "bottom-7" : "top-7"}`}>
+                          <div role="menu" aria-label={`Actions for ${displayTitle}`} className={`absolute right-0 z-30 w-36 rounded-sm border border-ink-700 bg-ink-900 py-1 shadow-elev-2 ${menuAbove ? "bottom-6" : "top-6"}`}>
                             <SessionMenuItem icon={<PencilIcon width={12} height={12} />} label="Rename" onClick={() => { setOpenMenu(null); startRename(s); }} />
                             <SessionMenuItem icon={<PinIcon width={12} height={12} />} label={isPinned ? "Unpin" : "Pin"} onClick={() => {
                               setPinned((items) => isPinned ? items.filter((name) => name !== s.name) : [s.name, ...items]);
@@ -385,7 +392,7 @@ export function Sidebar(props: Props) {
                               if (!isArchived) setPinned((items) => items.filter((name) => name !== s.name));
                               setOpenMenu(null);
                             }} />
-                            <div className="my-1 border-t border-ink-700" />
+                            <div className="my-1 border-t border-ink-800" />
                             <SessionMenuItem danger icon={<TrashIcon width={12} height={12} />} label="Delete" onClick={async () => {
                               setOpenMenu(null);
                               const ok = props.onConfirmDelete
@@ -411,21 +418,21 @@ export function Sidebar(props: Props) {
         </div>
 
         {/* ── Footer: quick actions + stats ── */}
-        <div className="border-t border-ink-800/80 bg-ink-950/45 p-2.5">
-          <div className="grid grid-cols-5 gap-1">
+        <div className="border-t border-ink-800 bg-ink-925 p-2">
+          <div className="grid grid-cols-5 gap-px">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
             <ActionBtn icon={<SparkIcon width={13} height={13} />} label="Agents" onClick={() => props.onOpenPanel("subagents")} />
             <ActionBtn icon={<BoltIcon width={13} height={13} />} label="Control" onClick={() => props.onOpenPanel("control")} />
             <ActionBtn icon={<HelpIcon width={13} height={13} />} label="Help" onClick={() => props.onOpenPanel("help")} />
           </div>
-          <div className="mt-2 grid grid-cols-3 gap-1 border-t border-ink-800/70 pt-2">
+          <div className="mt-1 grid grid-cols-3 gap-px border-t border-ink-800/50 pt-1">
             <CompactAction icon={<TrashIcon width={12} height={12} />} label="Reset" onClick={props.onReset} danger />
             <CompactAction icon={<CompactIcon width={12} height={12} />} label="Compact" onClick={props.onCompact} />
             <CompactAction icon={<HistoryIcon width={12} height={12} />} label="Usage" onClick={props.onStats} />
           </div>
           {props.stats && (
-            <div className="mt-2 flex items-center justify-between rounded-lg bg-ink-900/70 px-2.5 py-1.5 font-mono text-[10px] text-ink-400">
+            <div className="mt-1 flex items-center justify-between rounded-sm border border-ink-800 bg-ink-900 px-2 py-1 font-mono text-[10px] text-ink-500">
               <span>{props.stats.turns} turns</span>
               <span className="text-ink-600">·</span>
               <span>{formatTokens(props.stats.tokens_total)} tokens</span>
@@ -451,7 +458,7 @@ function ActionBtn({
   return (
     <button
       onClick={onClick}
-      className="flex flex-col items-center gap-1 rounded-lg py-1.5 text-[10px] text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
+      className="flex flex-col items-center gap-1 rounded-sm py-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
     >
       {icon}
       {label}
@@ -474,7 +481,7 @@ function CompactAction({
     <button
       type="button"
       onClick={onClick}
-      className={`flex items-center justify-center gap-1.5 rounded-lg px-1.5 py-1.5 text-[10px] transition-colors ${danger ? "text-ink-500 hover:bg-danger/10 hover:text-danger" : "text-ink-500 hover:bg-ink-850 hover:text-ink-200"}`}
+      className={`flex items-center justify-center gap-1.5 rounded-sm px-1.5 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors ${danger ? "text-ink-500 hover:bg-ink-800 hover:text-danger" : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"}`}
     >
       {icon}
       {label}
@@ -498,7 +505,7 @@ function SessionMenuItem({
       type="button"
       role="menuitem"
       onClick={onClick}
-      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11px] transition-colors ${danger ? "text-danger hover:bg-danger/10" : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"}`}
+      className={`flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] transition-colors ${danger ? "text-danger hover:bg-ink-800" : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"}`}
     >
       {icon}
       {label}

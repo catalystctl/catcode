@@ -19,7 +19,7 @@
 
 import { CoreProcess, CORE_EVENT_TYPES, isKnownCoreEventType } from "@catalyst-code/coding-agent";
 import { reduce, initialState } from "@/lib/reducer";
-import type { AgentEvent, AgentState, CoreCommand, CoreEvent, ReadyPayload } from "@/lib/types";
+import type { AgentEvent, AgentState, AttentionKind, CoreCommand, CoreEvent, LiveSessionStatus, ReadyPayload } from "@/lib/types";
 import { loadTitles } from "@/lib/session-titles";
 import { loadSettings, saveApproval } from "./settings-file";
 
@@ -41,6 +41,12 @@ export interface SessionCallbacks {
   onReady: (workspace: string) => void;
   /** This session's core died unexpectedly (bridge may log / allow respawn). */
   onDead: (sessionFile: string) => void;
+  /** This session's live status changed (attention/streaming transition, or it
+   *  just became ready) — the bridge re-broadcasts a session_status snapshot to
+   *  every live session so a client viewing another session/project sees it. */
+  onStatusChange: () => void;
+  /** Snapshot of every live session's status (for seeding a fresh subscriber). */
+  onStatusSnapshot: () => LiveSessionStatus[];
 }
 
 type Sink = (ev: CoreEvent) => void;
@@ -96,6 +102,48 @@ export class LiveSession {
 
   get sinkCount(): number {
     return this.sinks.size;
+  }
+
+  /** Whether this session is currently blocked on a human gate. */
+  private attentionActive(): boolean {
+    const s = this.state;
+    return !!(
+      s.pendingApproval ||
+      s.pendingAsk ||
+      s.pendingSudo ||
+      s.pendingIntercom ||
+      s.pendingOauth
+    );
+  }
+
+  /** Live status snapshot of this session (for the cross-session
+   *  session_status broadcast). */
+  status(): LiveSessionStatus {
+    const s = this.state;
+    const attentionKind: AttentionKind | undefined =
+      s.pendingApproval
+        ? "approval"
+        : s.pendingAsk
+          ? "ask"
+          : s.pendingSudo
+            ? "sudo"
+            : s.pendingIntercom
+              ? "intercom"
+              : s.pendingOauth
+                ? "oauth"
+                : undefined;
+    const entry = s.sessions.find((e) => (e.path ?? e.name) === this.sessionFile);
+    return {
+      sessionFile: this.sessionFile,
+      workspace: this.workspace,
+      title: entry?.title ?? entry?.name,
+      streaming: s.streaming,
+      running: this.isRunning,
+      needsAttention: !!attentionKind,
+      attentionKind,
+      viewers: this.sinkCount,
+      lastEventAt: this.lastActivity,
+    };
   }
 
   /** Spawn the core (if needed) and resolve once `ready` has been reduced. */
@@ -247,8 +295,22 @@ export class LiveSession {
       this.cb.onReady(this.workspace);
     }
 
+    const prevAttention = this.attentionActive();
+    const prevStreaming = this.state.streaming;
     this.state = reduce(this.state, ev);
     this.fanout(ev);
+
+    // Cross-session status transition: re-broadcast a session_status snapshot to
+    // every live session so a client viewing another session/project learns this
+    // one just finished or now needs attention. `ready` also fires so a freshly
+    // started session appears in every client's live map.
+    if (
+      prevAttention !== this.attentionActive() ||
+      prevStreaming !== this.state.streaming ||
+      ev.type === "ready"
+    ) {
+      this.cb.onStatusChange();
+    }
 
     // After a turn ends, refresh the session list + stats (mtimes / counts may
     // have changed) so every sibling's sidebar stays current.
@@ -271,6 +333,13 @@ export class LiveSession {
   /** Capture a snapshot, then register the live sink so no event can arrive
    *  at the client before `_snapshot` (callers should send snapshot first). */
   subscribe(fn: Sink): { snapshot: AgentState; unsubscribe: () => void } {
+    // Seed the cross-session live-session map so a freshly-connecting client
+    // hydrates it immediately (not only on the next status change). No fanout —
+    // only the about-to-be-captured snapshot needs the current map.
+    const status = this.cb.onStatusSnapshot();
+    if (status.length) {
+      this.state = reduce(this.state, { type: "session_status", sessions: status });
+    }
     const snapshot: AgentState = structuredClone(this.state);
     this.sinks.add(fn);
     return { snapshot, unsubscribe: () => this.sinks.delete(fn) };

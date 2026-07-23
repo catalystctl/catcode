@@ -32,9 +32,16 @@ import {
   DownloadIcon,
   WarningIcon,
   TerminalIcon,
+  BellIcon,
 } from "./icons";
 import { ModelPicker } from "./model-picker";
 import { AccountSecurity } from "./account-security";
+import {
+  desktopPermission,
+  requestDesktopPermission,
+  setDesktopEnabled,
+  type DesktopPermission,
+} from "@/lib/notifications";
 import { VersionInfoPanel } from "./version-info";
 
 interface Props {
@@ -72,7 +79,7 @@ interface Props {
   onSetUiMode?: (mode: "ide" | "chat") => void;
 }
 
-type SectionId = "appearance" | "model" | "agent" | "safety" | "vision" | "account" | "about";
+type SectionId = "appearance" | "model" | "agent" | "safety" | "vision" | "notifications" | "account" | "about";
 
 const SECTIONS: Array<{
   id: SectionId;
@@ -85,6 +92,7 @@ const SECTIONS: Array<{
   { id: "agent", label: "Agent", hint: "Timeouts & compaction", icon: CompactIcon },
   { id: "safety", label: "Safety", hint: "Approvals & sandbox", icon: ShieldIcon },
   { id: "vision", label: "Vision", hint: "Image handoff", icon: EyeIcon },
+  { id: "notifications", label: "Notifications", hint: "Cross-session alerts", icon: BellIcon },
   { id: "account", label: "Account", hint: "Login & security", icon: UserIcon },
   { id: "about", label: "About", hint: "Build & updates", icon: HelpIcon },
 ];
@@ -126,7 +134,7 @@ function SectionHeading({ title, desc }: { title: string; desc?: string }) {
 
 function FieldLabel({ children }: { children: ReactNode }) {
   return (
-    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+    <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-ink-500">
       {children}
     </div>
   );
@@ -134,7 +142,7 @@ function FieldLabel({ children }: { children: ReactNode }) {
 
 function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`rounded-xl border border-ink-800 bg-ink-950/40 p-4 ${className}`}>
+    <div className={`rounded-sm border border-ink-800 bg-ink-900 p-4 ${className}`}>
       {children}
     </div>
   );
@@ -153,20 +161,20 @@ function ChoiceButton({
 }) {
   const activeClass =
     tone === "success"
-      ? "border-success/40 bg-success/10 text-success"
+      ? "border-ink-700 border-l-2 border-l-success bg-ink-900 text-success"
       : tone === "warning"
-        ? "border-warning/40 bg-warning/10 text-warning"
+        ? "border-ink-700 border-l-2 border-l-warning bg-ink-900 text-warning"
         : tone === "neutral"
           ? "border-ink-600 bg-ink-850 text-ink-100"
-          : "border-accent/45 bg-accent/12 text-accent-soft";
+          : "border-ink-700 border-l-2 border-l-accent bg-ink-900 text-accent-soft";
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`flex w-full items-center gap-3 rounded-xl border px-3.5 py-3 text-left transition-colors ${
+      className={`flex w-full items-center gap-3 rounded-sm border px-3.5 py-3 text-left transition-colors ${
         active
           ? activeClass
-          : "border-ink-800 bg-ink-925/50 text-ink-300 hover:border-ink-700 hover:bg-ink-850"
+          : "border-ink-800 bg-ink-900 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
       }`}
     >
       {children}
@@ -192,19 +200,19 @@ function ToggleRow({
       role="switch"
       aria-checked={on}
       onClick={() => onChange(!on)}
-      className="flex w-full items-center justify-between gap-4 rounded-xl border border-ink-800 bg-ink-950/40 px-3.5 py-3 text-left transition-colors hover:border-ink-700"
+      className="flex w-full items-center justify-between gap-4 rounded-sm border border-ink-800 bg-ink-900 px-3.5 py-3 text-left transition-colors hover:border-ink-600"
     >
       <div className="min-w-0">
         <div className="text-[13px] font-medium text-ink-100">{label}</div>
         <div className="mt-0.5 text-[11px] leading-relaxed text-ink-500">{description}</div>
       </div>
       <span
-        className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+        className={`relative h-5 w-9 shrink-0 rounded-sm transition-colors ${
           on ? "bg-accent" : "bg-ink-700"
         }`}
       >
         <span
-          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+          className={`absolute top-0.5 h-4 w-4 rounded-sm bg-white transition-transform ${
             on ? "translate-x-4" : "translate-x-0.5"
           }`}
         />
@@ -225,7 +233,7 @@ function StatusFact({
 }) {
   return (
     <div className="flex min-w-0 items-baseline justify-between gap-3">
-      <span className="shrink-0 text-[11px] uppercase tracking-wide text-ink-500">{label}</span>
+      <span className="shrink-0 font-mono text-[10px] uppercase tracking-wider text-ink-500">{label}</span>
       <span
         className={`min-w-0 truncate text-right text-[12px] text-ink-200 ${mono ? "font-mono" : ""}`}
         title={typeof value === "string" ? value : undefined}
@@ -252,7 +260,7 @@ function CopyCommandButton({ command }: { command: string }) {
         );
       }}
       title="Copy command"
-      className="flex shrink-0 items-center gap-1 rounded-md border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+      className="flex shrink-0 items-center gap-1 rounded-sm border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
     >
       {copied ? (
         <CheckIcon width={12} height={12} className="text-success" />
@@ -304,7 +312,7 @@ function SandboxStatusPanel({
       {/* Status banner */}
       <div className="flex items-center gap-2">
         <span
-          className={`h-2 w-2 shrink-0 rounded-full ${
+          className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-none ${
             requestedMicrosandbox
               ? status.ready
                 ? "bg-success"
@@ -328,14 +336,14 @@ function SandboxStatusPanel({
 
       {/* Error */}
       {status.error ? (
-        <div className="flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-[12px] text-danger">
+        <div className="flex items-start gap-2 rounded-sm border border-danger/40 bg-ink-900 px-3 py-2 text-[12px] text-danger">
           <WarningIcon width={14} height={14} className="mt-0.5 shrink-0" />
           <span className="min-w-0 break-words">{status.error}</span>
         </div>
       ) : null}
 
       {/* Facts */}
-      <div className="space-y-1.5 rounded-lg border border-ink-800/80 bg-ink-925/60 px-3 py-2.5">
+      <div className="space-y-1.5 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2.5">
         <StatusFact
           label="Platform"
           value={
@@ -373,7 +381,7 @@ function SandboxStatusPanel({
         <div className="space-y-2">
           {report.checks.length > 0 ? (
             <div className="space-y-1.5">
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-ink-500">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 Preflight checks
               </div>
               {report.checks.map((c) => {
@@ -381,13 +389,13 @@ function SandboxStatusPanel({
                 return (
                   <div
                     key={c.code}
-                    className="flex items-start gap-2 rounded-lg border border-ink-800/80 bg-ink-925/60 px-2.5 py-2"
+                    className="flex items-start gap-2 rounded-sm border border-ink-800 bg-ink-900 px-2.5 py-2"
                   >
-                    <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
+                    <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-none ${meta.dot}`} />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline gap-2">
                         <span className="text-[12px] font-medium text-ink-100">{c.title}</span>
-                        <span className={`text-[10px] uppercase tracking-wide ${meta.className}`}>
+                        <span className={`font-mono text-[10px] uppercase tracking-wider ${meta.className}`}>
                           {meta.label}
                         </span>
                       </div>
@@ -402,23 +410,23 @@ function SandboxStatusPanel({
           ) : null}
           {report.actions.length > 0 ? (
             <div className="space-y-1.5">
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-ink-500">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 Setup actions
               </div>
               {report.actions.map((a: SandboxSetupAction, i) => (
                 <div
                   key={`${a.title}-${i}`}
-                  className="space-y-1.5 rounded-lg border border-ink-800/80 bg-ink-925/60 px-2.5 py-2"
+                  className="space-y-1.5 rounded-sm border border-ink-800 bg-ink-900 px-2.5 py-2"
                 >
                   <div className="flex items-baseline gap-2">
                     <span className="text-[12px] font-medium text-ink-100">{a.title}</span>
                     {a.requires_admin ? (
-                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-warning">
+                      <span className="rounded-sm border border-warning/40 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-warning">
                         admin
                       </span>
                     ) : null}
                     {a.requires_reboot ? (
-                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-warning">
+                      <span className="rounded-sm border border-warning/40 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-warning">
                         reboot
                       </span>
                     ) : null}
@@ -428,7 +436,7 @@ function SandboxStatusPanel({
                   </p>
                   {a.command ? (
                     <div className="flex items-center gap-2">
-                      <code className="min-w-0 flex-1 truncate rounded bg-ink-950 px-2 py-1 font-mono text-[11px] text-ink-300">
+                      <code className="min-w-0 flex-1 truncate rounded-sm bg-ink-950 px-2 py-1 font-mono text-[11px] text-ink-300">
                         {a.command}
                       </code>
                       <CopyCommandButton command={a.command} />
@@ -456,7 +464,7 @@ function SandboxStatusPanel({
         <button
           type="button"
           onClick={onRecheck}
-          className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:bg-ink-850 hover:text-ink-100"
+          className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
         >
           <RefreshIcon width={13} height={13} />
           Recheck environment
@@ -465,7 +473,7 @@ function SandboxStatusPanel({
           type="button"
           onClick={onPrepare}
           disabled={!!status.preparePhase}
-          className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+          className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
         >
           <DownloadIcon width={13} height={13} />
           {status.preparePhase ? "Preparing…" : "Prepare runtime & image"}
@@ -475,7 +483,7 @@ function SandboxStatusPanel({
             <button
               type="button"
               onClick={onReset}
-              className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
+              className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
             >
               <RefreshIcon width={13} height={13} />
               Reset sandbox
@@ -483,7 +491,7 @@ function SandboxStatusPanel({
             <button
               type="button"
               onClick={onDisable}
-              className="ml-auto rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-400 transition-colors hover:border-danger/40 hover:text-danger"
+              className="ml-auto rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-400 transition-colors hover:border-danger/60 hover:text-danger"
             >
               Disable sandboxing
             </button>
@@ -518,6 +526,64 @@ export function SettingsModal(props: Props) {
   const [draftCurated, setDraftCurated] = useState<string[]>(() => curatedIds);
   const [draftPreferred, setDraftPreferred] = useState<string | null>(() => preferredId);
   const [draftEnabled, setDraftEnabled] = useState(enabledFromConfig);
+
+  // ── Desktop notifications (web-only opt-in) ──
+  const [desktopPref, setDesktopPref] = useState(false);
+  const [perm, setPerm] = useState<DesktopPermission>(
+    typeof window !== "undefined" ? desktopPermission() : "denied",
+  );
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/notifications", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        setDesktopPref(!!data.desktopNotifications);
+      })
+      .catch(() => {});
+    // OS permission can change in browser/site settings without any event —
+    // re-check when the tab regains focus.
+    const onFocus = () => setPerm(desktopPermission());
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+  // Desktop is effectively on only when opted in AND OS permission is granted.
+  // Sync the shared module flag that useAgent reads when firing notifications.
+  useEffect(() => {
+    setDesktopEnabled(desktopPref && perm === "granted");
+  }, [desktopPref, perm]);
+  const toggleDesktop = async (on: boolean) => {
+    if (on && perm !== "granted") {
+      const result = await requestDesktopPermission();
+      setPerm(result);
+      if (result !== "granted") {
+        setDesktopPref(false);
+        try {
+          await fetch("/api/notifications", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ desktopNotifications: false }),
+          });
+        } catch {
+          /* non-fatal */
+        }
+        return;
+      }
+    }
+    setDesktopPref(on);
+    try {
+      await fetch("/api/notifications", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ desktopNotifications: on }),
+      });
+    } catch {
+      /* non-fatal */
+    }
+  };
 
   useEffect(() => {
     setDraftCurated(curatedIds);
@@ -594,7 +660,7 @@ export function SettingsModal(props: Props) {
       >
         <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3.5 sm:px-5">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent/15 text-accent-soft">
+            <div className="flex h-8 w-8 items-center justify-center rounded-sm border border-ink-800 bg-ink-900 text-accent-soft">
               <BoltIcon width={16} height={16} />
             </div>
             <div>
@@ -604,7 +670,7 @@ export function SettingsModal(props: Props) {
           </div>
           <button
             onClick={props.onClose}
-            className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close settings"
           >
             <XIcon width={18} height={18} />
@@ -626,10 +692,10 @@ export function SettingsModal(props: Props) {
                   type="button"
                   onClick={() => setSection(s.id)}
                   aria-current={active ? "page" : undefined}
-                  className={`flex min-w-[7.5rem] items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors sm:min-w-0 ${
+                  className={`flex min-w-[7.5rem] items-center gap-2.5 rounded-sm border-l-2 px-2.5 py-2 text-left transition-colors sm:min-w-0 ${
                     active
-                      ? "bg-accent/15 text-ink-100"
-                      : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
+                      ? "border-l-accent bg-ink-850 text-ink-100"
+                      : "border-l-transparent text-ink-400 hover:bg-ink-850 hover:text-ink-200"
                   }`}
                 >
                   <Icon
@@ -684,10 +750,10 @@ export function SettingsModal(props: Props) {
                             disabled={!props.onSetUiMode}
                             onClick={() => props.onSetUiMode?.(id)}
                             aria-pressed={active}
-                            className={`flex items-start gap-3 rounded-xl border px-3 py-3 text-left transition-colors ${
+                            className={`flex items-start gap-3 rounded-sm border px-3 py-3 text-left transition-colors ${
                               active
-                                ? "border-accent/50 bg-accent/15 text-ink-100"
-                                : "border-ink-800 bg-ink-900/60 text-ink-300 hover:border-ink-700 hover:bg-ink-850"
+                                ? "border-ink-700 border-l-2 border-l-accent bg-ink-900 text-ink-100"
+                                : "border-ink-800 bg-ink-900 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
                             } disabled:cursor-not-allowed disabled:opacity-50`}
                           >
                             <Icon width={18} height={18} className="mt-0.5 shrink-0 text-accent-soft" />
@@ -712,7 +778,7 @@ export function SettingsModal(props: Props) {
                 />
                 <div className="flex min-h-[18rem] flex-1 flex-col">
                   <FieldLabel>Default model</FieldLabel>
-                  <div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-ink-800 bg-ink-925">
+                  <div className="min-h-0 flex-1 overflow-hidden rounded-sm border border-ink-800 bg-ink-900">
                     <ModelPicker
                       models={props.models}
                       selectedModel={props.selectedModel}
@@ -732,10 +798,10 @@ export function SettingsModal(props: Props) {
                             key={lv}
                             type="button"
                             onClick={() => props.onSelectThinking(lv)}
-                            className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-medium capitalize transition-colors ${
+                            className={`flex items-center gap-1.5 rounded-sm border px-3 py-1.5 text-[12px] font-medium capitalize transition-colors ${
                               active
-                                ? "border-accent/50 bg-accent/15 text-accent-soft"
-                                : "border-ink-800 bg-ink-900/60 text-ink-300 hover:border-ink-700 hover:bg-ink-850"
+                                ? "border-accent/60 bg-ink-850 text-accent-soft"
+                                : "border-ink-800 bg-ink-900 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
                             }`}
                           >
                             <BrainIcon width={12} height={12} />
@@ -784,13 +850,13 @@ export function SettingsModal(props: Props) {
                         onKeyDown={(e) => {
                           if (e.key === "Enter") applyTimeout();
                         }}
-                        className="w-28 rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 focus:border-accent/50 focus:outline-none"
+                        className="w-28 rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 focus:border-accent/60 focus:outline-none"
                       />
                       <span className="text-[12px] text-ink-500">seconds</span>
                       <button
                         type="button"
                         onClick={applyTimeout}
-                        className="ml-auto rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft"
+                        className="ml-auto rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
                       >
                         Apply
                       </button>
@@ -899,7 +965,7 @@ export function SettingsModal(props: Props) {
                           return (
                             <div
                               key={m.id}
-                              className="flex items-center gap-2 rounded-lg border border-ink-800/80 bg-ink-925/60 px-2.5 py-2"
+                              className="flex items-center gap-2 rounded-sm border border-ink-800 bg-ink-900 px-2.5 py-2"
                             >
                               <label
                                 className={`flex min-w-0 flex-1 items-center gap-2 ${
@@ -917,7 +983,7 @@ export function SettingsModal(props: Props) {
                                   {m.name || m.id}
                                 </span>
                                 {m.vision && (
-                                  <span className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
+                                  <span className="shrink-0 rounded-sm bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-ink-400">
                                     vision
                                   </span>
                                 )}
@@ -927,9 +993,9 @@ export function SettingsModal(props: Props) {
                                 title="Preferred handoff target"
                                 disabled={!draftEnabled || !included}
                                 onClick={() => setDraftPreferred(m.id)}
-                                className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                                className={`rounded-sm px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                                   preferred
-                                    ? "bg-accent/15 text-accent-soft"
+                                    ? "bg-ink-800 text-accent-soft"
                                     : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"
                                 }`}
                               >
@@ -944,7 +1010,7 @@ export function SettingsModal(props: Props) {
                       type="button"
                       onClick={() => saveVision()}
                       disabled={!draftEnabled}
-                      className="mt-3 w-full rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+                      className="mt-3 w-full rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
                     >
                       Save vision config
                     </button>
@@ -953,6 +1019,48 @@ export function SettingsModal(props: Props) {
               </div>
             )}
 
+            {section === "notifications" && (
+              <div className="space-y-5">
+                <SectionHeading
+                  title="Notifications"
+                  desc="Get notified — in-app and on your desktop — when another session finishes its turn or needs your attention, even while you're working in a different session or project."
+                />
+                <div>
+                  <FieldLabel>Desktop notifications</FieldLabel>
+                  <div className="space-y-2">
+                    <ToggleRow
+                      label="Desktop notifications"
+                      description={
+                        perm === "denied"
+                          ? "Blocked in your browser. Re-enable notifications for this site in browser settings to turn this on."
+                          : "Show an OS notification when a background session finishes or needs you. The in-app bell and tab badge always work, even when this is off."
+                      }
+                      on={desktopPref && perm === "granted"}
+                      onChange={(on) => void toggleDesktop(on)}
+                    />
+                    {perm === "default" && (
+                      <p className="px-1 text-[11px] text-ink-500">
+                        Enabling will ask your browser for permission to show notifications.
+                      </p>
+                    )}
+                    {perm === "denied" && (
+                      <p className="px-1 text-[11px] text-warning">
+                        Permission was denied. Re-enable it in your browser&apos;s site notifications settings, then toggle again.
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="rounded-sm border border-ink-800 bg-ink-900 px-3.5 py-3">
+                  <div className="text-[12px] font-medium text-ink-100">How it works</div>
+                  <ul className="mt-1.5 space-y-1 text-[11px] leading-relaxed text-ink-500">
+                    <li>• The bell in the header lists unread background-session events.</li>
+                    <li>• The browser tab shows a count badge (⚠ when a session is blocked).</li>
+                    <li>• Desktop notifications fire only for sessions you aren&apos;t viewing.</li>
+                    <li>• Click a notification or feed item to jump straight to that session.</li>
+                  </ul>
+                </div>
+              </div>
+            )}
             {section === "account" && (
               <div>
                 <SectionHeading
@@ -982,7 +1090,7 @@ export function SettingsModal(props: Props) {
           <button
             type="button"
             onClick={props.onClose}
-            className="rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-300 hover:bg-ink-850 hover:text-ink-100"
+            className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 hover:text-ink-100"
           >
             Done
           </button>

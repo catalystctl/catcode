@@ -198,6 +198,47 @@ export interface SessionEntry {
   pinned?: boolean;
 }
 
+/** What kind of human-gate a session is blocked on (mirrors AgentState.pending*). */
+export type AttentionKind = "approval" | "ask" | "sudo" | "intercom" | "oauth";
+
+/** Live status of a session, synthesized by the bridge from each LiveSession's
+ *  runtime state (NOT from disk). Broadcast cross-session so a client viewing one
+ *  session can see every other live session's streaming/attention state and be
+ *  notified when a background session finishes or needs the user. */
+export interface LiveSessionStatus {
+  /** Absolute session-file path (matches SessionEntry.path / currentSessionFile). */
+  sessionFile: string;
+  workspace: string;
+  /** Display title (best-effort; client may re-resolve from its sessions list). */
+  title?: string;
+  /** A turn is currently streaming output. */
+  streaming: boolean;
+  /** The backing core process is running. */
+  running: boolean;
+  /** True when the agent is blocked on a human gate (approval/ask/sudo/intercom/oauth). */
+  needsAttention: boolean;
+  attentionKind?: AttentionKind;
+  /** Number of SSE subscribers currently viewing this session. */
+  viewers: number;
+  /** Epoch ms of the last status-relevant activity. */
+  lastEventAt: number;
+}
+
+/** A cross-session notification item in the in-app feed. Derived client-side
+ *  from LiveSessionStatus transitions (a background session entered an attention
+ *  state, or finished a turn) — never emitted for the currently-viewed session. */
+export interface NotificationItem {
+  id: string;
+  sessionFile: string;
+  workspace: string;
+  title: string;
+  /** "attention" = agent blocked on a human gate; "finished" = a turn completed. */
+  kind: "attention" | "finished";
+  attentionKind?: AttentionKind;
+  ts: number;
+  read: boolean;
+}
+
 /** Cumulative / turn cost from core `cost_update` events. */
 export type CostUpdate = Omit<CostUpdateEvent, "type">;
 
@@ -713,6 +754,7 @@ export type CoreEvent =
   | { type: "agents"; agents: AgentInfo[] }
   | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
+  | { type: "session_status"; sessions: LiveSessionStatus[] }
   | Stats
   | { type: "history"; messages: unknown[]; tokens_in?: number }
   | { type: "done" }
@@ -917,7 +959,13 @@ export type SyntheticEvent =
   /** Client-side undo: drop the last turn locally; next `reset` keeps messages. */
   | { type: "_undo_local" }
   | { type: "_goal_approve_optimistic" }
-  | { type: "_clear_provider_models_preview" };
+  | { type: "_clear_provider_models_preview" }
+  // Cross-session notification feed (client-only; derived in useAgent from
+  // LiveSessionStatus transitions, never dispatched server-side).
+  | { type: "_add_notifications"; items: NotificationItem[] }
+  | { type: "_dismiss_notification"; id: string }
+  | { type: "_mark_notifications_read" }
+  | { type: "_clear_notifications" };
 
 export type AgentEvent = CoreEvent | SyntheticEvent;
 
@@ -1069,6 +1117,13 @@ export interface AgentState {
   umansConc: UmansConc | null;
   sessions: SessionEntry[];
   currentSessionFile: string | null;
+  /** Live status of every currently-live session (bridge-synthesized,
+   *  cross-session). Keyed by absolute session-file path. Drives sidebar live
+   *  badges + the notification feed (via transitions detected in useAgent). */
+  liveSessions: Record<string, LiveSessionStatus>;
+  /** Cross-session notification feed (background session finished / needs
+   *  attention). Client-only; derived from liveSessions transitions. */
+  notifications: NotificationItem[];
   stats: Stats | null;
   toasts: Toast[];
   memories: MemoryEntry[];

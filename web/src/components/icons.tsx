@@ -195,6 +195,20 @@ export const MenuIcon = (p: P) => (
   </svg>
 );
 
+export const BellIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+    <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+  </svg>
+);
+
+export const CheckDoubleIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M2 12l4 4 8-9" />
+    <path d="M11 19l1.5 1.5L21 11" />
+  </svg>
+);
+
 export const DotIcon = (p: P) => (
   <svg {...base(p)} width={8} height={8}>
     <circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" />
