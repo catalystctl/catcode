@@ -7,6 +7,7 @@ import type * as Monaco from "monaco-editor";
 import { GlobeIcon } from "@/components/icons";
 import { useIdeContext } from "@/lib/ide-context";
 import { registerEditorModel } from "@/lib/editor-model-registry";
+import { reconcileSavedSnapshot, SerializedTaskQueue } from "@/lib/editor-save-state";
 import { canPreviewFile } from "@/lib/preview-support";
 import type { IdeTab } from "@/lib/types";
 import { currentMonacoTheme, loadMonaco } from "./monaco-loader";
@@ -17,6 +18,10 @@ type MonacoApi = typeof Monaco;
 
 /** Last disk/saved snapshot per workspace path — survives editor remounts. */
 const lastSavedByPath = new Map<string, string>();
+
+function savedSnapshotKey(workspace: string, path: string): string {
+  return `${workspace}\0${path}`;
+}
 
 function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
   const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -84,6 +89,7 @@ export function Editor({
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const contentRef = useRef("");
   const savedRef = useRef("");
+  const saveQueueRef = useRef<SerializedTaskQueue | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -93,24 +99,30 @@ export function Editor({
 
   useMonacoTheme(!isImage);
 
-  const save = useCallback(async () => {
-    setSaving(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/file", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: tab.target, content: contentRef.current, workspace }),
+  const save = useCallback(() => {
+    // Snapshot exactly what this invocation intends to write. Saves are
+    // serialized so reverse-order responses can never make the disk and the
+    // editor disagree about which snapshot won.
+    const submitted = contentRef.current;
+    const snapshotKey = savedSnapshotKey(workspace, tab.target);
+    saveQueueRef.current ??= new SerializedTaskQueue((pending) => setSaving(pending > 0));
+    return saveQueueRef.current
+      .enqueue(async () => {
+        setError(null);
+        const response = await fetch("/api/file", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: tab.target, content: submitted, workspace }),
+        });
+        if (!response.ok) throw new Error(`Failed to save (${response.status})`);
+        const result = reconcileSavedSnapshot(submitted, contentRef.current);
+        savedRef.current = result.saved;
+        lastSavedByPath.set(snapshotKey, result.saved);
+        markDirty(tab.id, result.dirty);
+      })
+      .catch((reason: unknown) => {
+        setError(reason instanceof Error ? reason.message : String(reason));
       });
-      if (!response.ok) throw new Error(`Failed to save (${response.status})`);
-      savedRef.current = contentRef.current;
-      lastSavedByPath.set(tab.target, contentRef.current);
-      markDirty(tab.id, false);
-    } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
   }, [markDirty, tab.id, tab.target, workspace]);
   const saveRef = useRef(save);
   saveRef.current = save;
@@ -169,13 +181,15 @@ export function Editor({
             uri,
           );
           savedRef.current = model.getValue();
-          lastSavedByPath.set(tab.target, savedRef.current);
+          lastSavedByPath.set(savedSnapshotKey(workspace, tab.target), savedRef.current);
           markDirty(tab.id, false);
         } else {
           savedRef.current = tab.dirty
-            ? (lastSavedByPath.get(tab.target) ?? model.getValue())
+            ? (lastSavedByPath.get(savedSnapshotKey(workspace, tab.target)) ?? model.getValue())
             : model.getValue();
-          if (!tab.dirty) lastSavedByPath.set(tab.target, savedRef.current);
+          if (!tab.dirty) {
+            lastSavedByPath.set(savedSnapshotKey(workspace, tab.target), savedRef.current);
+          }
         }
 
         registerEditorModel(tab.id, () => {
@@ -293,7 +307,7 @@ export function Editor({
         );
         contentRef.current = next;
         savedRef.current = next;
-        lastSavedByPath.set(tab.target, next);
+        lastSavedByPath.set(savedSnapshotKey(workspace, tab.target), next);
         markDirty(tab.id, false);
         setDiskChanged(false);
       } catch {

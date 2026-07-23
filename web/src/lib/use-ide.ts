@@ -54,10 +54,12 @@ const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 function sanitizeTerminals(value: unknown): TerminalSession[] {
   if (!Array.isArray(value)) return [];
   const out: TerminalSession[] = [];
+  const seen = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const raw = item as Partial<TerminalSession>;
     if (typeof raw.id !== "string" || !SESSION_ID_RE.test(raw.id)) continue;
+    if (seen.has(raw.id)) continue;
     // Dead shells are not restored — a refresh after exit should not spawn a
     // replacement PTY under the old tab. Live ones reattach to the server.
     if (raw.alive === false || typeof raw.exitCode === "number") continue;
@@ -68,6 +70,7 @@ function sanitizeTerminals(value: unknown): TerminalSession[] {
       alive: true,
       exitCode: null,
     });
+    seen.add(raw.id);
   }
   return out;
 }
@@ -99,6 +102,131 @@ const DEFAULTS: IdeLayoutState = {
   uiMode: "ide",
 };
 
+const MOVABLE_PANELS: MovablePanelId[] = ["chat", "terminal", "git", "preview", "screen"];
+const DOCK_POSITIONS: DockPosition[] = ["left", "right", "bottom", "main"];
+const IDE_PANELS: IdePanelId[] = ["explorer", "git", "terminal", "preview", "screen"];
+
+type ViewportSize = { width: number; height: number };
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Validate persisted state as untrusted, versionless input and repair geometry
+ * against the viewport that will render it. Exported for regression tests.
+ */
+export function sanitizePersistedLayout(
+  value: unknown,
+  viewport: ViewportSize = { width: 1366, height: 768 },
+): Partial<IdeLayoutState> {
+  if (!value || typeof value !== "object") return {};
+  const raw = value as Record<string, unknown>;
+  const locationsRaw =
+    raw.panelLocations && typeof raw.panelLocations === "object"
+      ? raw.panelLocations as Record<string, unknown>
+      : {};
+  const visibilityRaw =
+    raw.panelVisibility && typeof raw.panelVisibility === "object"
+      ? raw.panelVisibility as Record<string, unknown>
+      : {};
+  const activeRaw =
+    raw.activeDockPanels && typeof raw.activeDockPanels === "object"
+      ? raw.activeDockPanels as Record<string, unknown>
+      : {};
+
+  const panelLocations = { ...DEFAULTS.panelLocations };
+  const panelVisibility = { ...DEFAULTS.panelVisibility };
+  for (const panel of MOVABLE_PANELS) {
+    const location = locationsRaw[panel];
+    if (DOCK_POSITIONS.includes(location as DockPosition)) {
+      panelLocations[panel] = location as DockPosition;
+    }
+    if (typeof visibilityRaw[panel] === "boolean") {
+      panelVisibility[panel] = visibilityRaw[panel] as boolean;
+    }
+  }
+
+  const activeDockPanels = { ...DEFAULTS.activeDockPanels };
+  for (const position of DOCK_POSITIONS) {
+    const requested = activeRaw[position];
+    const valid =
+      MOVABLE_PANELS.includes(requested as MovablePanelId) &&
+      panelVisibility[requested as MovablePanelId] &&
+      panelLocations[requested as MovablePanelId] === position;
+    activeDockPanels[position] = valid
+      ? requested as MovablePanelId
+      : (MOVABLE_PANELS.find(
+          (panel) => panelVisibility[panel] && panelLocations[panel] === position,
+        ) ?? null);
+  }
+
+  const sidebarCollapsed =
+    typeof raw.sidebarCollapsed === "boolean" ? raw.sidebarCollapsed : DEFAULTS.sidebarCollapsed;
+  const width = Math.max(320, finiteNumber(viewport.width, 1366));
+  const height = Math.max(320, finiteNumber(viewport.height, 768));
+  // Reserve a usable editor plus the one-pixel separators on both sides.
+  const mainReserve = 244;
+  const rightVisible = MOVABLE_PANELS.some(
+    (panel) => panelVisibility[panel] && panelLocations[panel] === "right",
+  );
+  const sidebarMax = Math.max(
+    160,
+    Math.min(640, width - 48 - (rightVisible ? 320 : 0) - mainReserve),
+  );
+  const sidebarWidth = clamp(
+    finiteNumber(raw.sidebarWidth, DEFAULTS.sidebarWidth),
+    160,
+    sidebarMax,
+  );
+  const copilotMax = Math.max(
+    320,
+    Math.min(900, width - 48 - (sidebarCollapsed ? 0 : sidebarWidth) - mainReserve),
+  );
+  const bottomMax = Math.max(120, Math.min(800, height - 260));
+
+  const terminals = sanitizeTerminals(raw.terminals);
+  const expandedDirs = Array.isArray(raw.expandedDirs)
+    ? [...new Set(raw.expandedDirs.filter((path): path is string => typeof path === "string"))]
+    : DEFAULTS.expandedDirs;
+
+  return {
+    activePanel: IDE_PANELS.includes(raw.activePanel as IdePanelId)
+      ? raw.activePanel as IdePanelId
+      : DEFAULTS.activePanel,
+    sidebarWidth,
+    sidebarCollapsed,
+    bottomPanelHeight: clamp(
+      finiteNumber(raw.bottomPanelHeight, DEFAULTS.bottomPanelHeight),
+      120,
+      bottomMax,
+    ),
+    bottomPanelVisible:
+      typeof raw.bottomPanelVisible === "boolean"
+        ? raw.bottomPanelVisible
+        : DEFAULTS.bottomPanelVisible,
+    copilotVisible:
+      typeof raw.copilotVisible === "boolean" ? raw.copilotVisible : panelVisibility.chat,
+    copilotWidth: clamp(
+      finiteNumber(raw.copilotWidth, DEFAULTS.copilotWidth),
+      320,
+      copilotMax,
+    ),
+    panelLocations,
+    panelVisibility,
+    activeDockPanels,
+    leftDockWidth: clamp(
+      finiteNumber(raw.leftDockWidth, DEFAULTS.leftDockWidth),
+      260,
+      Math.max(260, Math.min(720, width - 288)),
+    ),
+    expandedDirs,
+    terminals,
+    activeTerminalId: sanitizeActiveTerminalId(raw.activeTerminalId, terminals),
+    uiMode: raw.uiMode === "chat" || raw.uiMode === "ide" ? raw.uiMode : DEFAULTS.uiMode,
+  };
+}
+
 function loadPersisted(key: string): Partial<IdeLayoutState> {
   if (typeof window === "undefined") return {};
   try {
@@ -107,23 +235,10 @@ function loadPersisted(key: string): Partial<IdeLayoutState> {
       (key !== STORAGE_KEY ? window.localStorage.getItem(STORAGE_KEY) : null);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    const out: Partial<IdeLayoutState> = {};
-    for (const k of PERSISTED) {
-      if (k === "terminals" || k === "activeTerminalId") continue;
-      if (k in parsed) (out as Record<string, unknown>)[k] = parsed[k];
-    }
-    const terminals = sanitizeTerminals((parsed as IdeLayoutState).terminals);
-    out.terminals = terminals;
-    out.activeTerminalId = sanitizeActiveTerminalId(
-      (parsed as IdeLayoutState).activeTerminalId,
-      terminals,
-    );
-    // Invalid / missing uiMode falls through to DEFAULTS via shallow merge.
-    if (out.uiMode !== "ide" && out.uiMode !== "chat") {
-      delete out.uiMode;
-    }
-    return out;
+    return sanitizePersistedLayout(parsed, {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
   } catch {
     return {};
   }
@@ -172,6 +287,7 @@ export interface IdeApi {
   closeTerminal: (id: string) => void;
   setActiveTerminal: (id: string) => void;
   setTerminalExit: (id: string, code: number) => void;
+  setTerminalUnavailable: (id: string) => void;
   // ── git ──
   setGitStatus: (s: GitStatus | null) => void;
   refreshGit: () => void;
@@ -219,6 +335,35 @@ export function useIde(workspace?: string): IdeApi {
     });
     setRestoredKey(key);
   }, [key]);
+
+  // A layout saved on a large monitor must remain reachable after moving the
+  // browser to a smaller display, even without a reload.
+  useEffect(() => {
+    let frame = 0;
+    const repairForViewport = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        setState((current) => {
+          const repaired = sanitizePersistedLayout(current, {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          });
+          return {
+            ...current,
+            sidebarWidth: repaired.sidebarWidth ?? current.sidebarWidth,
+            copilotWidth: repaired.copilotWidth ?? current.copilotWidth,
+            bottomPanelHeight: repaired.bottomPanelHeight ?? current.bottomPanelHeight,
+            leftDockWidth: repaired.leftDockWidth ?? current.leftDockWidth,
+          };
+        });
+      });
+    };
+    window.addEventListener("resize", repairForViewport);
+    return () => {
+      window.removeEventListener("resize", repairForViewport);
+      cancelAnimationFrame(frame);
+    };
+  }, []);
 
   // Persist the persisted subset whenever it changes. Debounce so continuous
   // resize drags don't sync-write localStorage on every pointermove (jank +
@@ -660,6 +805,15 @@ export function useIde(workspace?: string): IdeApi {
     }));
   }, []);
 
+  const setTerminalUnavailable = useCallback((id: string) => {
+    setState((s) => ({
+      ...s,
+      terminals: s.terminals.map((t) =>
+        t.id === id ? { ...t, alive: false, exitCode: null } : t,
+      ),
+    }));
+  }, []);
+
   const setGitStatus = useCallback((g: GitStatus | null) => {
     setState((s) => ({ ...s, gitStatus: g }));
   }, []);
@@ -768,6 +922,7 @@ export function useIde(workspace?: string): IdeApi {
       closeTerminal,
       setActiveTerminal,
       setTerminalExit,
+      setTerminalUnavailable,
       setGitStatus,
       refreshGit,
       setPreview,
@@ -813,6 +968,7 @@ export function useIde(workspace?: string): IdeApi {
       closeTerminal,
       setActiveTerminal,
       setTerminalExit,
+      setTerminalUnavailable,
       setGitStatus,
       refreshGit,
       setPreview,

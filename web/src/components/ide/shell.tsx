@@ -6,6 +6,7 @@ import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
 import { IdeContext, useIdeContext, type AttachToChatFn } from "@/lib/ide-context";
 import { useIsMobile } from "@/lib/use-media-query";
+import { allowWorkspaceSwitch } from "@/lib/workspace-switch";
 import { ChatInner } from "@/components/chat";
 import type {
   DockPosition,
@@ -188,6 +189,18 @@ export function IdeShell() {
     };
   }, [paletteOpen, paletteQuery, workspace]);
 
+  const requestWorkspaceSwitch = useCallback((path: string): boolean => {
+    const allowed = allowWorkspaceSwitch(
+      workspace,
+      path,
+      ide.state.openTabs,
+      (message) => window.confirm(message),
+    );
+    if (!allowed) return false;
+    void agent.switchWorkspace(path);
+    return true;
+  }, [agent, ide.state.openTabs, workspace]);
+
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const ensureIde = () => {
       if (ide.state.uiMode !== "ide") ide.setUiMode("ide");
@@ -276,10 +289,10 @@ export function IdeShell() {
         },
       })),
       ...agent.state.sessions.map((session) => ({ id: `chat:${session.path ?? session.name}`, label: session.title || session.name, detail: `${session.messages ?? 0} messages`, group: "Chats" as const, run: () => void agent.loadSession(session.path ?? session.name) })),
-      ...agent.state.projects.map((project) => ({ id: `project:${project.path}`, label: project.name, detail: project.path, group: "Projects" as const, run: () => void agent.switchWorkspace(project.path) })),
+      ...agent.state.projects.map((project) => ({ id: `project:${project.path}`, label: project.name, detail: project.path, group: "Projects" as const, run: () => requestWorkspaceSwitch(project.path) })),
       ...agent.state.models.map((model) => ({ id: `model:${model.id}`, label: model.name || model.id, detail: model.provider ? `${model.provider} · ${model.id}` : model.id, group: "Models" as const, run: () => agent.setModel(model.id) })),
     ];
-  }, [agent, chatOnly, focusMode, ide, isMobile, openProjects, openSettings, paletteFiles]);
+  }, [agent, chatOnly, focusMode, ide, isMobile, openProjects, openSettings, paletteFiles, requestWorkspaceSwitch]);
 
   // When a file is opened from the explorer on mobile, jump to the editor.
   useEffect(() => {
@@ -459,7 +472,7 @@ export function IdeShell() {
             projects={agent.state.projects}
             switching={agent.state.switching}
             mobile={isMobile}
-            onSwitchWorkspace={(path) => void agent.switchWorkspace(path)}
+            onSwitchWorkspace={requestWorkspaceSwitch}
             onRemoveProject={(path) => void agent.removeProject(path)}
             onClose={() => setProjectSwitcherOpen(false)}
           />
@@ -574,6 +587,7 @@ function MobileShell({
               onClose={ide.closeTerminal}
               onSelect={ide.setActiveTerminal}
               onExit={ide.setTerminalExit}
+              onUnavailable={ide.setTerminalUnavailable}
             />
           )}
           {mobileView === "preview" && (
@@ -961,6 +975,7 @@ function PanelContent({
       onClose={ide.closeTerminal}
       onSelect={ide.setActiveTerminal}
       onExit={ide.setTerminalExit}
+      onUnavailable={ide.setTerminalUnavailable}
     />
   );
 }

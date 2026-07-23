@@ -20,7 +20,8 @@ interface ProjectSwitcherProps {
   projects: ProjectEntry[];
   switching: boolean;
   mobile?: boolean;
-  onSwitchWorkspace: (path: string) => void;
+  /** Return false when the switch was cancelled (for example by a dirty-file guard). */
+  onSwitchWorkspace: (path: string) => boolean | void;
   onRemoveProject: (path: string) => void;
   onClose: () => void;
 }
@@ -139,7 +140,7 @@ export function ProjectSwitcher({
   const switchTo = (path: string) => {
     const next = path.trim();
     if (!next) return;
-    onSwitchWorkspace(next);
+    if (onSwitchWorkspace(next) === false) return;
     onClose();
   };
 

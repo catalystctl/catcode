@@ -20,6 +20,7 @@ import { spawn, type IPty } from "zigpty";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { getSession } from "../lib/auth";
 import { loadProjects } from "../lib/projects";
+import { terminalSessionKey } from "../lib/terminal-protocol";
 import { getBridge } from "./core-bridge";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -61,6 +62,8 @@ interface OpenMsg {
   type: "open";
   sessionId: string;
   workspace?: string;
+  /** Reattach only; never create a replacement shell for a lost session. */
+  attachOnly?: boolean;
   cwd?: string;
   cols?: number;
   rows?: number;
@@ -68,7 +71,7 @@ interface OpenMsg {
 interface DataMsg { type: "data"; data: string; }
 interface ResizeMsg { type: "resize"; cols: number; rows: number; }
 interface PingMsg { type: "ping"; }
-interface TerminateMsg { type: "terminate"; sessionId: string; }
+interface TerminateMsg { type: "terminate"; sessionId: string; workspace?: string; }
 type ClientMsg = OpenMsg | DataMsg | ResizeMsg | PingMsg | TerminateMsg;
 
 function send(ws: WebSocket, msg: Record<string, unknown>): void {
@@ -101,10 +104,6 @@ interface TerminalProcess {
 
 const terminals = new Map<string, TerminalProcess>();
 
-function terminalKey(ownerId: string, workspace: string, sessionId: string): string {
-  return `${ownerId}:${workspace}:${sessionId}`;
-}
-
 function validSessionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 }
@@ -125,13 +124,6 @@ function authorizedWorkspace(candidate: string | undefined): string {
     throw new Error("unauthorized workspace");
   }
   return requested;
-}
-
-function findOwnedTerminal(ownerId: string, sessionId: string): TerminalProcess | undefined {
-  for (const session of terminals.values()) {
-    if (session.ownerId === ownerId && session.id === sessionId) return session;
-  }
-  return undefined;
 }
 
 function broadcast(session: TerminalProcess, msg: Record<string, unknown>): void {
@@ -192,7 +184,7 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
     LINES: String(rows),
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 
-  const key = terminalKey(ownerId, workspace, msg.sessionId);
+  const key = terminalSessionKey(ownerId, workspace, msg.sessionId);
   const terminal: TerminalProcess = {
     key,
     id: msg.sessionId,
@@ -241,9 +233,19 @@ function handleTerminal(ws: WebSocket, ownerId: string): void {
     if (!attached) {
       if (msg.type === "terminate") {
         if (!validSessionId(msg.sessionId)) { fail(ws, "invalid terminal session ID"); return; }
-        const existing = findOwnedTerminal(ownerId, msg.sessionId);
+        let workspace: string;
+        try {
+          workspace = authorizedWorkspace(msg.workspace);
+        } catch (err) {
+          fail(ws, `failed to terminate terminal: ${String(err)}`);
+          return;
+        }
+        const existing = terminals.get(terminalSessionKey(ownerId, workspace, msg.sessionId));
         if (existing) destroyTerminal(existing);
-        else { send(ws, { type: "terminated" }); ws.close(); }
+        // The control socket is not in existing.clients, so acknowledge and
+        // close it explicitly whether or not a matching PTY existed.
+        send(ws, { type: "terminated" });
+        ws.close();
         return;
       }
       if (msg.type !== "open" || !validSessionId(msg.sessionId)) {
@@ -257,7 +259,12 @@ function handleTerminal(ws: WebSocket, ownerId: string): void {
         fail(ws, `failed to open terminal: ${String(err)}`);
         return;
       }
-      const key = terminalKey(ownerId, workspace, msg.sessionId);
+      const key = terminalSessionKey(ownerId, workspace, msg.sessionId);
+      if (msg.attachOnly && !terminals.has(key)) {
+        send(ws, { type: "missing", sessionId: msg.sessionId });
+        ws.close();
+        return;
+      }
       try {
         attached = terminals.get(key) ?? createTerminal(ownerId, msg);
       } catch (err) {

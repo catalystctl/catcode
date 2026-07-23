@@ -10,8 +10,9 @@
 // bundle chunk. It is intentionally self-contained (props, not a shared
 // IdeContext) so it can be wired up before/without the rest of the IDE shell.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Terminal as GhosttyTerminal } from "ghostty-web";
+import { terminalOpenEnvelope, terminalTerminateEnvelope } from "@/lib/terminal-protocol";
 
 // ── WS message envelopes (mirror web/src/server/server.ts, contract §4.5) ──
 type ServerMsg =
@@ -19,7 +20,10 @@ type ServerMsg =
   | { type: "exit"; code: number }
   | { type: "ready"; sessionId: string }
   | { type: "terminated" }
+  | { type: "missing"; sessionId: string }
   | { type: "pong" };
+
+type ConnectionState = "initializing" | "connecting" | "connected" | "reconnecting" | "failed";
 
 let ghosttyReady: Promise<void> | null = null;
 
@@ -29,11 +33,19 @@ function terminalSocketUrl(): string {
 }
 
 /** Explicitly terminate a persistent server-side PTY, including when detached. */
-function terminateTerminalSession(sessionId: string): void {
+function terminateTerminalSession(sessionId: string, workspace: string): void {
   const socket = new WebSocket(terminalSocketUrl());
-  socket.onopen = () => socket.send(JSON.stringify({ type: "terminate", sessionId }));
-  socket.onmessage = () => socket.close();
-  socket.onerror = () => socket.close();
+  const timeout = window.setTimeout(() => socket.close(), 3000);
+  const finish = () => {
+    window.clearTimeout(timeout);
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+  };
+  socket.onopen = () => socket.send(JSON.stringify(terminalTerminateEnvelope(sessionId, workspace)));
+  socket.onmessage = finish;
+  socket.onclose = () => window.clearTimeout(timeout);
+  socket.onerror = finish;
 }
 
 // ── Local TerminalSession type ─────────────────────────────────────────────
@@ -62,6 +74,8 @@ export interface TerminalProps {
   cwd?: string;
   /** Called when the shell process exits with a code. */
   onExit?: (code: number) => void;
+  /** Called when the server confirms that the persistent PTY no longer exists. */
+  onUnavailable?: () => void;
 }
 
 /**
@@ -69,9 +83,10 @@ export interface TerminalProps {
  * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
-export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
+export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
+  const [connectionState, setConnectionState] = useState<ConnectionState>("initializing");
 
   // Keep latest values in refs so the effect only re-runs when the session id
   // changes (one renderer + WS attachment per session), not on parent renders.
@@ -81,12 +96,18 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
   cwdRef.current = cwd;
   const onExitRef = useRef(onExit);
   onExitRef.current = onExit;
+  const onUnavailableRef = useRef(onUnavailable);
+  onUnavailableRef.current = onUnavailable;
 
   useEffect(() => {
     let disposed = false;
     let term: GhosttyTerminal | null = null;
     let ws: WebSocket | null = null;
     let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attachedOnce = false;
+    let ended = false;
+    let reconnectAttempts = 0;
 
     (async () => {
       // Dynamic import keeps Ghostty's renderer + WASM out of the server and
@@ -120,34 +141,69 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
       termRef.current = term;
       term.focus();
 
-      ws = new WebSocket(terminalSocketUrl());
-      ws.onopen = () => {
-        ws!.send(
-          JSON.stringify({
-            type: "open",
-            sessionId,
-            workspace: workspaceRef.current,
-            cwd: cwdRef.current ?? "",
-            cols: term!.cols,
-            rows: term!.rows,
-          }),
-        );
+      const connect = (attachOnly: boolean) => {
+        if (disposed || ended || !term) return;
+        setConnectionState(attachOnly ? "reconnecting" : "connecting");
+        const socket = new WebSocket(terminalSocketUrl());
+        ws = socket;
+        socket.onopen = () => {
+          socket.send(
+            JSON.stringify(
+              terminalOpenEnvelope(
+                sessionId,
+                workspaceRef.current,
+                cwdRef.current ?? "",
+                term!.cols,
+                term!.rows,
+                attachOnly,
+              ),
+            ),
+          );
+        };
+        socket.onmessage = (ev) => {
+          const str =
+            typeof ev.data === "string"
+              ? ev.data
+              : new TextDecoder().decode(ev.data as ArrayBuffer);
+          let m: ServerMsg;
+          try {
+            m = JSON.parse(str) as ServerMsg;
+          } catch {
+            return;
+          }
+          if (m.type === "ready") {
+            attachedOnce = true;
+            reconnectAttempts = 0;
+            setConnectionState("connected");
+          } else if (m.type === "data") {
+            term!.write(m.data);
+          } else if (m.type === "exit") {
+            ended = true;
+            onExitRef.current?.(m.code);
+          } else if (m.type === "terminated" || m.type === "missing") {
+            ended = true;
+            setConnectionState("failed");
+            onUnavailableRef.current?.();
+          }
+        };
+        socket.onerror = () => {
+          /* onclose owns retry and status transitions */
+        };
+        socket.onclose = () => {
+          if (disposed || ended || socket !== ws) return;
+          reconnectAttempts += 1;
+          if (reconnectAttempts > 6) {
+            ended = true;
+            setConnectionState("failed");
+            onUnavailableRef.current?.();
+            return;
+          }
+          setConnectionState("reconnecting");
+          const delay = Math.min(10_000, 500 * 2 ** (reconnectAttempts - 1));
+          reconnectTimer = setTimeout(() => connect(attachedOnce), delay);
+        };
       };
-      ws.onmessage = (ev) => {
-        const str =
-          typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data as ArrayBuffer);
-        let m: ServerMsg;
-        try {
-          m = JSON.parse(str) as ServerMsg;
-        } catch {
-          return;
-        }
-        if (m.type === "data") term!.write(m.data);
-        else if (m.type === "exit") onExitRef.current?.(m.code);
-      };
-      ws.onerror = () => {
-        /* surfaced via onclose; nothing else to do */
-      };
+      connect(false);
 
       // stdin: every Ghostty-encoded keystroke → the real PTY.
       const onDataDisp = term.onData((data) => {
@@ -175,6 +231,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
         onDataDisp.dispose();
         onResizeDisp.dispose();
         if (pingTimer) clearInterval(pingTimer);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
       };
     })();
 
@@ -186,6 +243,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
         ws.onopen = null;
         ws.onmessage = null;
         ws.onerror = null;
+        ws.onclose = null;
         try {
           ws.close();
         } catch {
@@ -201,7 +259,25 @@ export function Terminal({ sessionId, workspace, cwd, onExit }: TerminalProps) {
     };
   }, [sessionId]);
 
-  return <div ref={containerRef} className="h-full w-full overflow-hidden bg-[#080a0f]" />;
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-[#080a0f]">
+      <div ref={containerRef} className="h-full w-full" />
+      {connectionState !== "connected" ? (
+        <div
+          className="pointer-events-none absolute right-2 top-2 rounded bg-ink-900/90 px-2 py-1 text-[11px] text-ink-300"
+          role="status"
+        >
+          {connectionState === "initializing"
+            ? "Initializing terminal…"
+            : connectionState === "connecting"
+              ? "Connecting…"
+              : connectionState === "reconnecting"
+                ? "Reconnecting…"
+                : "Terminal unavailable"}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 // ── Presentational panel (tab strip + active terminal) ─────────────────────
@@ -217,6 +293,7 @@ export interface TerminalPanelProps {
   onClose: (id: string) => void;
   onSelect: (id: string) => void;
   onExit: (id: string, code: number) => void;
+  onUnavailable: (id: string) => void;
 }
 
 export function TerminalPanel({
@@ -227,6 +304,7 @@ export function TerminalPanel({
   onClose,
   onSelect,
   onExit,
+  onUnavailable,
 }: TerminalPanelProps) {
   const active = sessions.find((s) => s.id === activeId) ?? null;
 
@@ -267,14 +345,14 @@ export function TerminalPanel({
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                terminateTerminalSession(s.id);
+                terminateTerminalSession(s.id, workspace);
                 onClose(s.id);
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   e.stopPropagation();
-                  terminateTerminalSession(s.id);
+                  terminateTerminalSession(s.id, workspace);
                   onClose(s.id);
                 }
               }}
@@ -296,14 +374,30 @@ export function TerminalPanel({
         </button>
       </div>
       <div className="relative min-h-0 flex-1 p-1">
-        {active ? (
+        {active?.alive ? (
           <Terminal
             key={active.id}
             sessionId={active.id}
             workspace={workspace}
             cwd={active.cwd}
             onExit={(code) => onExit(active.id, code)}
+            onUnavailable={() => onUnavailable(active.id)}
           />
+        ) : active ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-ink-400">
+            <span>
+              {active.exitCode === null
+                ? "This terminal session is no longer available."
+                : `Terminal exited with code ${active.exitCode}.`}
+            </span>
+            <button
+              type="button"
+              onClick={onNew}
+              className="rounded border border-ink-700 px-3 py-1.5 text-ink-300 hover:bg-ink-800"
+            >
+              Open a new terminal
+            </button>
+          </div>
         ) : (
           <div className="flex h-full items-center justify-center">
             <button
