@@ -2911,6 +2911,9 @@ pub(crate) async fn run() {
     // P0-H3: true process/session teardown (once). Distinct from per-turn
     // `session_stop` used by telemetry plugins.
     dispatch_lifecycle(&state, "session_shutdown").await;
+    // Stop the active sandbox (microVM) cleanly so no guest process outlives the
+    // core. Best-effort: a hard kill already reaps the msb runtime subprocess.
+    crate::sandbox::shutdown().await;
     // Clean up our presence record so peers don't see a stale session. Best
     // effort — a kill -9 / crash leaves a stale file that `read_peers` reaps
     // by mtime, so this is an optimization (instant disappearance), not a

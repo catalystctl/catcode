@@ -22,10 +22,9 @@ pub trait PlatformProbe: Send + Sync {
     fn apple_silicon(&self) -> bool;
     /// Windows: Windows Hypervisor Platform state.
     fn whp(&self) -> WhpState;
-    /// Windows: a restart is pending for a WHP enable.
-    fn restart_pending(&self) -> bool;
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvmState {
     NotApplicable,
@@ -35,6 +34,7 @@ pub enum KvmState {
     PermissionDenied,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtCapability {
     NotApplicable,
@@ -42,6 +42,7 @@ pub enum VirtCapability {
     Absent,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhpState {
     NotApplicable,
@@ -109,15 +110,12 @@ impl PlatformProbe for RealProbe {
             WhpState::NotApplicable
         }
     }
-    fn restart_pending(&self) -> bool {
-        // The WHP restart-pending check is folded into whp() on Windows.
-        false
-    }
 }
 
 /// Injectable probe for tests — mirrors [`RealProbe`] but with fixed fields so
 /// preflight logic can be exercised without real virtualization. Construct via
 /// [`FakeProbe::linux_ready`] etc. or by setting fields directly.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct FakeProbe {
     pub os: &'static str,
@@ -129,6 +127,7 @@ pub struct FakeProbe {
     pub whp: WhpState,
 }
 
+#[cfg(test)]
 impl FakeProbe {
     pub fn linux_ready() -> Self {
         Self {
@@ -154,6 +153,7 @@ impl FakeProbe {
     }
 }
 
+#[cfg(test)]
 impl PlatformProbe for FakeProbe {
     fn os(&self) -> &'static str {
         self.os
@@ -175,9 +175,6 @@ impl PlatformProbe for FakeProbe {
     }
     fn whp(&self) -> WhpState {
         self.whp
-    }
-    fn restart_pending(&self) -> bool {
-        matches!(self.whp, WhpState::RestartPending)
     }
 }
 
@@ -589,7 +586,6 @@ fn warn(code: &str, title: &str, detail: impl Into<String>) -> SandboxPreflightC
 }
 
 /// Public re-export for the [`ExecutionBackend::status`] default and manager.
-pub use super::error::SandboxPreflightReport as PreflightReport;
 
 pub(crate) fn action(
     title: &str,

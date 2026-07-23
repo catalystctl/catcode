@@ -202,26 +202,6 @@ async fn bounded_plugin_output(
 }
 
 /// Normalized plugin/hook run result (host or microVM). `std::process::Output`
-/// is awkward to construct cross-platform from a guest exit code, so plugin_run
-/// returns this plain struct instead.
-pub(crate) struct PluginRunOutput {
-    pub success: bool,
-    pub exit_code: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-/// How a plugin/hook run failed (so each caller can map to deny/skip/error).
-pub(crate) enum PluginRunError {
-    SpawnFailed(String),
-    StdinTimeout(String),
-    Timeout,
-    WaitFailed(String),
-    /// Sandboxing backend error (setup-required, missing image, …). Never a host
-    /// fallback — the caller surfaces it as a fail-closed error.
-    Backend(String),
-}
-
 /// Run a plugin/hook/oauth/memory-provider script. When sandboxing is enabled
 /// the script executes inside the microVM via the shared execution backend
 /// (never directly on the host); the script directory is mounted read-only
@@ -3043,14 +3023,13 @@ fn python_interpreter() -> String {
 /// Build the command to run a hook script, selecting the right interpreter by
 /// extension so plugins work cross-platform. On Unix a shebang handles `*.sh`;
 /// on Windows `.bat`/`.cmd`/`.exe` launch directly, `.ps1` uses powershell,
-/// `.py` uses python, and `.sh`/`.bash` use `bash` (Git Bash/WSL) when present.
+/// Builds the `tokio::process::Command` for a plugin script: the interpreter is
+/// selected by extension — `.ps1` uses PowerShell, `.py` uses python, and
+/// `.sh`/`.bash` use `bash` (Git Bash/WSL) when present.
 /// `CATALYST_CODE_SHELL` overrides the interpreter for `.sh`/`.bash`.
-fn hook_command(script: &Path) -> Command {
-    hook_command_with_env(script, &[])
-}
-
-/// Like [`hook_command`], plus extra `(name, value)` env pairs the caller has
-/// already vetted (e.g. a plugin OAuth provider's declared `env_passthrough`).
+///
+/// `extra_env` are `(name, value)` pairs the caller has already vetted (e.g. a
+/// plugin OAuth provider's declared `env_passthrough`).
 fn hook_command_with_env(script: &Path, extra_env: &[(String, String)]) -> Command {
     let ext = script
         .extension()

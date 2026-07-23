@@ -6,6 +6,7 @@
 //! docs can reference it.
 
 /// What CatCode may do automatically during sandbox setup (user-space only).
+#[allow(dead_code)]
 pub const MAY_AUTOMATE: &[&str] = &[
     "Download verified Microsandbox runtime assets into the CatCode cache",
     "Create CatCode cache directories",
@@ -15,6 +16,7 @@ pub const MAY_AUTOMATE: &[&str] = &[
 ];
 
 /// What CatCode must NOT do automatically (requires explicit user action).
+#[allow(dead_code)]
 pub const MUST_NOT_AUTOMATE: &[&str] = &[
     "Change BIOS/UEFI settings",
     "Enable Windows features without explicit user action",

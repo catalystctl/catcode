@@ -37,39 +37,6 @@ pub fn select_backend(cfg: Arc<Config>) -> Arc<dyn ExecutionBackend> {
     }
 }
 
-/// Wrapper exposing the higher-level lifecycle ops on the active backend.
-#[derive(Clone)]
-pub struct SandboxManager {
-    backend: Arc<dyn ExecutionBackend>,
-}
-
-impl SandboxManager {
-    pub fn new(backend: Arc<dyn ExecutionBackend>) -> Self {
-        Self { backend }
-    }
-    pub fn from_config(cfg: Arc<Config>) -> Self {
-        Self::new(select_backend(cfg))
-    }
-    pub fn backend(&self) -> &Arc<dyn ExecutionBackend> {
-        &self.backend
-    }
-    pub fn is_sandboxed(&self) -> bool {
-        self.backend.is_sandboxed()
-    }
-    pub async fn status(&self) -> SandboxPreflightReport {
-        self.backend.status().await
-    }
-    pub async fn prepare(&self) -> Result<(), ExecutionError> {
-        self.backend.prepare().await
-    }
-    pub async fn reset(&self) -> Result<(), ExecutionError> {
-        self.backend.reset().await
-    }
-    pub async fn shutdown(&self) {
-        self.backend.shutdown().await;
-    }
-}
-
 /// Fail-closed backend used when sandboxing is requested but the `microsandbox`
 /// feature was not compiled in. Every execute returns a structured setup-required
 /// error; it never runs on the host.
@@ -79,9 +46,6 @@ struct UnsupportedSandboxBackend;
 #[cfg(not(feature = "microsandbox"))]
 #[async_trait::async_trait]
 impl ExecutionBackend for UnsupportedSandboxBackend {
-    fn label(&self) -> &'static str {
-        "microsandbox"
-    }
     fn is_sandboxed(&self) -> bool {
         true
     }
@@ -159,7 +123,7 @@ mod tests {
         let cfg = Config::default(); // sandbox = None
         let backend = select_backend(Arc::new(cfg));
         assert!(!backend.is_sandboxed());
-        assert_eq!(backend.label(), "host");
+        assert!(!backend.is_sandboxed());
     }
 
     /// Real-VM integration: only runs when CATCODE_TEST_MICROSANDBOX=1 is set.

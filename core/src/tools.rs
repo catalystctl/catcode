@@ -15,13 +15,6 @@ pub use crate::test_env::execute_test_env;
 
 /// Description shown to the model for the `bash` tool. OS-selected so the
 /// model emits matching syntax: PowerShell on Windows, bash on Unix. The
-/// tool NAME stays `bash` for wire compatibility (TUI/web/SDK); on Windows it
-/// executes the command through PowerShell (`shell_argv` below).
-#[cfg(target_os = "windows")]
-pub(crate) const BASH_TOOL_DESC_FALLBACK: &str = "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.";
-#[cfg(not(target_os = "windows"))]
-pub(crate) const BASH_TOOL_DESC_FALLBACK: &str = "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.";
-
 /// Model-facing description of the `bash` tool. When sandboxing is enabled the
 /// guest is always Linux `bash`, so Windows users are no longer told to emit
 /// PowerShell. Delegates to the sandbox policy (single source of truth).

@@ -123,8 +123,6 @@ pub enum ExecPurpose {
     Diagnostics,
     Git,
     Plugin,
-    TestEnv,
-    Generic,
 }
 
 impl ExecPurpose {
@@ -274,8 +272,6 @@ pub fn is_secret_var(name: &str) -> bool {
 
 /// Workspace mount point inside the guest.
 pub const GUEST_WORKSPACE: &str = "/workspace";
-/// Private guest home directory (never the host home).
-pub const GUEST_HOME: &str = "/home/catcode";
 
 /// Translate a workspace-relative path (`""` = workspace root) into the cwd for
 /// the active backend. Sandboxed → `/workspace[/rel]`; host →
@@ -313,40 +309,6 @@ pub fn effective_cwd(cfg: &Config, rel: &str) -> Result<PathBuf, String> {
 }
 
 /// Resolve a host workspace path to its guest equivalent (used when a caller
-/// already holds a canonical host path under the workspace). Returns None if
-/// the path is not inside the workspace (host home / `/etc` / …), enforcing
-/// confinement even under `Approval::Never`.
-pub fn host_to_guest_path(cfg: &Config, host: &Path) -> Option<PathBuf> {
-    let ws = cfg
-        .workspace
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| cfg.workspace.clone());
-    let host = host
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| host.to_path_buf());
-    let rel = host.strip_prefix(&ws).ok()?;
-    if rel
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    let mut g = PathBuf::from(GUEST_WORKSPACE);
-    g.push(rel);
-    Some(g)
-}
-
-/// Translate a [`SandboxNetworkMode`] into a human label for status reporting.
-pub fn network_label(mode: SandboxNetworkMode) -> &'static str {
-    match mode {
-        SandboxNetworkMode::None => "none (no network interface)",
-        SandboxNetworkMode::Restricted => "restricted",
-        SandboxNetworkMode::Allowlist => "allowlist",
-    }
-}
-
 /// The model-facing description of the `bash` tool for the active shell. When
 /// sandboxed, Windows users are told the guest is Linux `bash` (not PowerShell).
 pub fn bash_tool_description() -> &'static str {
@@ -357,10 +319,4 @@ pub fn bash_tool_description() -> &'static str {
         ShellKind::Posix => "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.",
         ShellKind::PowerShell => "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.",
     }
-}
-
-/// Sandbox mode requested by config (without touching the global backend — used
-/// during preflight before the backend is initialized).
-pub fn config_requests_sandbox(cfg: &Config) -> bool {
-    matches!(cfg.sandbox, Sandbox::Microsandbox)
 }

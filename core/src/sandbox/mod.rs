@@ -90,9 +90,5 @@ pub async fn shutdown() {
     execution_backend().shutdown().await;
 }
 
-pub use backend::{ExecRequest, ExecResult, HostExecutionBackend};
-pub use error::{
-    CheckStatus, ExecutionError, SandboxPreflightCheck, SandboxPreflightReport, SandboxSetupAction,
-};
-pub use manager::{select_backend, SandboxManager};
-pub use policy::{is_sandbox_enabled as is_enabled, ShellKind};
+pub use backend::ExecRequest;
+pub use error::ExecutionError;

@@ -183,7 +183,7 @@ impl MicrosandboxExecutionBackend {
     /// Apply the configured network mode to the builder.
     fn apply_network(
         &self,
-        mut builder: microsandbox::sandbox::SandboxBuilder,
+        builder: microsandbox::sandbox::SandboxBuilder,
     ) -> microsandbox::sandbox::SandboxBuilder {
         match self.cfg.sandbox_network_mode {
             SandboxNetworkMode::None => builder.disable_network(),
@@ -260,9 +260,6 @@ impl MicrosandboxExecutionBackend {
 
 #[async_trait]
 impl ExecutionBackend for MicrosandboxExecutionBackend {
-    fn label(&self) -> &'static str {
-        "microsandbox"
-    }
     fn is_sandboxed(&self) -> bool {
         true
     }
@@ -284,24 +281,31 @@ impl ExecutionBackend for MicrosandboxExecutionBackend {
         let max_err = request.max_stderr_bytes;
         let stdin_bytes = request.stdin.clone();
 
-        let mut handle = {
-            let mut b = microsandbox::sandbox::ExecOptionsBuilder::default()
-                .args(args.iter().map(|a| a.as_str()))
-                .cwd(cwd.as_str())
-                .envs(env_iter.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .timeout(timeout);
-            b = match &stdin_bytes {
-                Some(data) => b.stdin_bytes(data.clone()),
-                None => b.stdin_null(),
-            };
-            match sb.exec_stream_with(program.clone(), |b| b).await {
-                Ok(h) => h,
-                Err(e) => {
-                    // Spawn failure in the guest — likely a missing executable.
-                    self.unhealthy
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    return Err(self.map_exec_error(&e));
-                }
+        let mut handle = match sb
+            .exec_stream_with(program.clone(), move |b| {
+                // Configure the builder the SDK hands us — args, guest cwd,
+                // guest env, timeout (SIGKILL on expiry), and stdin payload.
+                // Returning `b` unmodified would run the program with default
+                // options: no args/cwd/env/timeout/stdin.
+                let mut b = b
+                    .args(args.iter().map(|a| a.as_str()))
+                    .cwd(cwd.as_str())
+                    .envs(env_iter.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                    .timeout(timeout);
+                b = match &stdin_bytes {
+                    Some(data) => b.stdin_bytes(data.clone()),
+                    None => b.stdin_null(),
+                };
+                b
+            })
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // Spawn failure in the guest — likely a missing executable.
+                self.unhealthy
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(self.map_exec_error(&e));
             }
         };
 

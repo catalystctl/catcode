@@ -75,12 +75,6 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
-impl ExecResult {
-    pub fn success(&self) -> bool {
-        self.exit_code == Some(0)
-    }
-}
-
 /// A unified async execution interface. Implementations must guarantee that a
 /// dropped [`ExecRequest`] future terminates the guest process and its
 /// descendants (the microVM backend does this explicitly via the SDK control
@@ -107,10 +101,6 @@ pub trait ExecutionBackend: Send + Sync {
     }
     /// Cleanly stop the backing sandbox (no-op for the host backend).
     async fn shutdown(&self) {}
-    /// `"host"` or `"microsandbox"`.
-    fn label(&self) -> &'static str {
-        "host"
-    }
     /// Whether this backend runs commands inside a microVM.
     fn is_sandboxed(&self) -> bool {
         false

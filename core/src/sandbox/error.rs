@@ -31,17 +31,6 @@ pub enum CheckStatus {
     Info,
 }
 
-impl CheckStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CheckStatus::Pass => "pass",
-            CheckStatus::Fail => "fail",
-            CheckStatus::Warn => "warn",
-            CheckStatus::Info => "info",
-        }
-    }
-}
-
 /// A user-actionable setup step (administrator or user-space).
 #[derive(Clone, Debug, Serialize)]
 pub struct SandboxSetupAction {
@@ -105,11 +94,6 @@ pub enum ExecutionError {
     #[error("command timed out after {0:?} and was killed")]
     Timeout(std::time::Duration),
 
-    /// The command was cancelled (dropped future / abort). Same kill semantics
-    /// as [`ExecutionError::Timeout`].
-    #[error("command was cancelled")]
-    Cancelled,
-
     /// The sandbox failed to initialize or execute (boot failure, guest agent
     /// unavailable, image pull failure, …). Carries a stable code.
     #[error("sandbox error ({code}): {message}")]
@@ -120,10 +104,6 @@ pub enum ExecutionError {
     /// execute on the host.
     #[error("sandbox setup required")]
     SetupRequired { report: SandboxPreflightReport },
-
-    /// Sandbox reset was requested after an unhealthy execution.
-    #[error("sandbox was reset after an unhealthy execution; retry the command")]
-    Resetting,
 
     /// Generic I/O or runtime error.
     #[error("{0}")]
@@ -150,19 +130,6 @@ impl ExecutionError {
                  See docs/guides/sandbox.md for the image strategy and the list of bundled tools."
             ),
         }
-    }
-
-    /// Whether this error means "do not fall back to the host under any
-    /// circumstances" — i.e. it must surface as a setup-required / sandbox
-    /// error rather than a transient host-execution failure.
-    pub fn is_fail_closed(&self) -> bool {
-        matches!(
-            self,
-            ExecutionError::SetupRequired { .. }
-                | ExecutionError::Sandbox { .. }
-                | ExecutionError::MissingExecutable { .. }
-                | ExecutionError::Resetting
-        )
     }
 
     /// A single-line user-facing summary suitable for a tool `Outcome::err`.
