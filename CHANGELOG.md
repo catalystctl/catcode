@@ -2,7 +2,54 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-07-23
+
+- **feat(sandbox): replace Firejail/Seatbelt/unshare with a Microsandbox microVM backend** [c8add8c]
+  The legacy sandbox backends are removed. Agent-controlled workloads — `bash`,
+  `git_status`/`git_diff`/`git_log`/`git_add`/`git_commit`, `diagnostics`, plugin
+  hooks/tools/commands/memory-providers, and subagent command execution — now
+  run inside a **Microsandbox microVM** when sandboxing is enabled, driven by the
+  official `microsandbox` Rust SDK (crate pinned at 0.6.6). The SDK boots a
+  lightweight Linux guest on Linux via KVM, on Apple Silicon macOS, and on
+  Windows via the Windows Hypervisor Platform (WHP). No external `msb` CLI,
+  Docker, Podman, Firejail, WSL, or persistent daemon is required; the SDK
+  downloads its own runtime (`msb` + `libkrunfw`) into a CatCode cache on first
+  use. Intel macOS is unsupported.
+  - `Sandbox` enum is now just `None` / `Microsandbox`. Legacy values
+    (`firejail`, `fj`, `seatbelt`, `macos`, `sandbox-exec`) migrate to
+    `Microsandbox` with a deprecation notice — never silently to `none`.
+  - `--sandbox none|microsandbox` (env `CATALYST_CODE_SANDBOX`). `--no-network` /
+    `CATALYST_CODE_NO_NETWORK` kept for backward-compat and now enforced through
+    Microsandbox network policy instead of `unshare`.
+  - New config fields: `sandbox`, `sandbox_image`, `sandbox_cpus`,
+    `sandbox_memory_mb`, `sandbox_disk_mb`, `sandbox_idle_timeout_secs`,
+    `sandbox_network_mode` (`none`/`restricted`/`allowlist`),
+    `sandbox_network_allowlist`, `sandbox_allow_private_networks`,
+    `sandbox_env_allowlist`.
+  - The guest does **not** inherit the host environment (minimal guest env;
+    secrets like `*_TOKEN`/`*_SECRET`/`AWS_*`/`GITHUB_TOKEN`/`SSH_AUTH_SOCK` denied
+    by default). The workspace mounts writable at `/workspace`; the host home,
+    `~/.ssh`, and the Docker/SSH-agent sockets are not mounted.
+  - **Fail-closed:** if sandboxing is requested but unavailable, commands do not
+    run on the host and a structured setup-required error is returned.
+  - Platform preflight returns exact setup guidance (Linux `/dev/kvm` checks +
+    `modprobe`/`usermod`/relogin; Apple-Silicon-only macOS; Windows WHP
+    `Enable-WindowsOptionalFeature` + restart) with stable machine-readable codes.
+  - The effective shell description is part of the `ready` state so the TUI, web,
+    SDK, and model prompt agree (Windows users are not told to generate
+    PowerShell when the sandbox is on).
+  - `Approval::Never` is independent of sandbox confinement and no longer means
+    "arbitrary host filesystem access."
+  - Default sandbox image: `ghcr.io/catalystctl/catcode-sandbox:0.1` — a
+    multi-arch (amd64+arm64) polyglot developer image (bash, coreutils,
+    findutils, grep, sed, awk, git, curl, ca-certificates, jq, ripgrep, tar,
+    gzip, xz, unzip, build-essential + Rust/Node/Python/Go). Image definition at
+    `sandbox/Dockerfile`; license notices in `THIRD_PARTY_NOTICES.md`.
+  - Removed: all Firejail profiles, Seatbelt profiles, `sandbox-exec` invocation,
+    `unshare -n`, and related tests/docs. See `docs/guides/sandbox.md`.
+
 ## 2026-07-22
+
 
 - **feat(provider): add custom providers at runtime with model-discovery preview + per-model overrides** [ea0ed70, 2de1cb0, a78a6fc, 0e806e3, c4e0d29]
   Add custom providers at runtime with a model-discovery preview step. New
