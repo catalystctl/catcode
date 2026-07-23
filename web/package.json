@@ -7,12 +7,16 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "node --import tsx src/server/server.ts",
-    "build": "node node_modules/next/dist/bin/next build && node scripts/write-version.mjs",
-    "start": "NODE_ENV=production node --import tsx src/server/server.ts",
+    "dev": "node scripts/require-node.mjs && node --import tsx src/server/server.ts",
+    "build": "node scripts/require-node.mjs && node node_modules/next/dist/bin/next build && node scripts/write-version.mjs",
+    "start": "node scripts/require-node.mjs && NODE_ENV=production node --import tsx src/server/server.ts",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:unit": "bun test",
+    "test:e2e": "node scripts/frontend-regression.mjs && node scripts/terminal-regression.mjs",
+    "test:e2e:frontend": "node scripts/frontend-regression.mjs",
+    "test:e2e:terminal": "node scripts/terminal-regression.mjs",
     "audit:mobile": "node scripts/mobile-audit.mjs",
     "postinstall": "node scripts/fix-sdk-link.mjs"
   },

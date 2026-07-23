@@ -59,10 +59,9 @@ async function login(page) {
     console.log("No AUDIT_EMAIL/AUDIT_PASSWORD — skipping authenticated routes.");
     return false;
   }
-  // Prefer localhost — better-auth trusts it; 127.0.0.1 is also listed but
-  // cookies/baseURL can disagree depending on how the server was started.
-  const loginBase = BASE.replace("127.0.0.1", "localhost");
-  await page.goto(`${loginBase}/login`, { waitUntil: "networkidle2", timeout: 30000 });
+  // Keep the login origin identical to the requested audit origin so
+  // host-scoped auth cookies remain available for the audited routes.
+  await page.goto(`${BASE}/login`, { waitUntil: "networkidle2", timeout: 30000 });
   await page.waitForSelector('input[type="email"]', { timeout: 10000 });
   await page.evaluate((email, password) => {
     const setNative = (sel, val) => {
@@ -159,11 +158,13 @@ async function main() {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
   const findings = [];
+  let authenticated = false;
 
   try {
     // Shared login context so cookies persist across viewports.
     const boot = await browser.newPage();
     const authed = await login(boot);
+    authenticated = authed;
     const cookies = authed ? await boot.cookies() : [];
     await boot.close();
 
@@ -218,6 +219,7 @@ async function main() {
   const overflowCount = findings.filter((f) => f.overflowX).length;
   const missingNav = findings.filter(
     (f) =>
+      authenticated &&
       f.route === "/" &&
       ["iphone-se", "iphone-14", "pixel-7", "tablet"].includes(f.viewport) &&
       !f.bottomNav,
@@ -227,7 +229,7 @@ async function main() {
   const summary = {
     at: new Date().toISOString(),
     base: BASE,
-    authed: !!(EMAIL && PASSWORD),
+    authed: authenticated,
     overflowCount,
     missingNav,
     findings: findings.map(({ bodyText, ...rest }) => rest),

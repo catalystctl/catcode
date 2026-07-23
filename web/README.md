@@ -35,19 +35,25 @@ Open `http://localhost:49283` after installation.
 
 ```bash
 cd web
-bun install                 # or: npm install / pnpm install
+npm install                 # Bun may also be used to install dependencies
 
-bun run dev                 # http://localhost:3000  (NODE_ENV=development matters — see below)
+npm run dev                 # http://localhost:3000  (NODE_ENV=development matters — see below)
 # production:
-bun run build && bun run start
+npm run build && npm run start
 ```
 
 > The dev script runs `next dev`. If your shell exports `NODE_ENV=production`,
-> start the dev server with it overridden: `NODE_ENV=development bun run dev`.
+> start the dev server with it overridden: `NODE_ENV=development npm run dev`.
 > `next dev` expects development mode; a production `NODE_ENV` corrupts the build.
 
-**Runtime.** This project runs on [Bun](https://bun.sh) (`bun install`, `bun run`).
-It also works under Node — just replace `bun` with `node`/`npm run`.
+**Runtime.** Building and running the web server requires **Node.js 22.13+**
+because authentication uses Node's built-in `node:sqlite` module. Bun remains
+supported for dependency installation and `bun test`, but `bun run dev`,
+`bun run build`, and `bun run start` require a real Node executable on `PATH`;
+they fail early with an actionable message when only Bun's `node` shim exists.
+
+See [TESTING.md](TESTING.md) for the fast CI suite, authenticated browser
+regressions, responsive audit, and the remaining platform-specific test matrix.
 
 ## The core binary
 

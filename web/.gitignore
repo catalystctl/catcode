@@ -38,6 +38,11 @@ next-env.d.ts
 # local mobile audit screenshots / reports
 .mobile-audit/
 
+# generated frontend regression evidence; keep the machine-readable audit
+# findings tracked while ignoring reproducible screenshots, traces, and fixtures
+/.frontend-audit/*
+!/.frontend-audit/findings.json
+
 # catalyst-code core debug log
 debug.jsonl
 
