@@ -2326,9 +2326,11 @@ fn build_reflect_text(recurring: &[(usize, String)]) -> String {
          (2) If you just performed a reusable workflow, consider writing a skill under \n\
          `.catalyst-code/skills/<name>/SKILL.md` (run `list_dir .catalyst-code/skills/` \n\
          first to extend rather than duplicate). \n\
-         After reflecting (or if nothing to save), write your final completion summary \n\
-         to the user and call `finish` — it should be the last message. If you already \n\
-         wrote a summary above, do not repeat it; just save memories and call `finish`.",
+         After reflecting: if you have NOT yet answered the user this turn, write your \n\
+         final completion summary now, then call `finish`. If you HAVE already given \n\
+         your answer (in any prior message this turn), do NOT write any new user-facing \n\
+         text — your existing answer above is the final message; save any remaining \n\
+         memories (tool calls only) and call `finish` with no content.",
     );
     if !recurring.is_empty() {
         s.push_str("\n\nRecurring patterns detected (performed 2+ times across sessions):");

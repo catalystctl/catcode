@@ -1,5 +1,25 @@
 use crate::*;
 
+/// Minimum assistant text length that counts as a delivered user-facing answer
+/// (vs. a bare `finish` or a trivial ack). When the model finishes WITH an
+/// answer at least this long, the auto-reflect gate skips its reflection
+/// continuation so the answer stays the last message the user reads.
+const AUTO_REFLECT_ANSWER_MIN_CHARS: usize = 80;
+
+/// Whether the assistant message already carries a substantive text answer to
+/// the user (vs. a bare `finish`, a tool-only turn, or a trivial ack like
+/// "Done."). When true, the auto-reflect gate skips its reflection continuation:
+/// re-streaming a reflection *after* the answer is already delivered makes the
+/// model emit an empty/minimal second `finish`, burying the real answer as the
+/// last message the user reads ("the model gave no final message"). The answer
+/// above IS the final message; the model can still persist durable memories
+/// mid-task before finishing.
+fn assistant_delivered_answer(msg: &Message) -> bool {
+    msg.content_text()
+        .map(|s| s.trim().chars().count() >= AUTO_REFLECT_ANSWER_MIN_CHARS)
+        .unwrap_or(false)
+}
+
 pub(crate) async fn run_turn(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -1745,10 +1765,22 @@ pub(crate) async fn run_turn(
                             )
                             .await
                             {
-                                reflected = true;
-                                outcome.output = nudge;
-                                recurrence = rec;
-                                do_reflect = true;
+                                // If the model already delivered its answer
+                                // alongside this `finish` (it ignored "do not
+                                // summarize first"), don't re-stream a reflection
+                                // — the model would emit an empty/minimal second
+                                // `finish`, burying the real answer as the last
+                                // message the user reads ("the model gave no
+                                // final message"). The answer above IS the final
+                                // message. The episode + pattern-log side effects
+                                // already ran in maybe_reflect_prompt above; the
+                                // model can persist durable memories mid-task.
+                                if !assistant_delivered_answer(&assistant_msg) {
+                                    reflected = true;
+                                    outcome.output = nudge;
+                                    recurrence = rec;
+                                    do_reflect = true;
+                                }
                             }
                         }
                         if do_reflect {
@@ -1930,10 +1962,20 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        reflected = true;
-                        reflect_prompt = p;
-                        recurrence = rec;
-                        do_reflect = true;
+                        // If the model already delivered its answer in this
+                        // natural completion, don't re-stream a reflection —
+                        // the model would emit an empty/minimal `finish` next,
+                        // burying the real answer ("the model gave no final
+                        // message"). The answer above IS the final message.
+                        // Episode + pattern-log side effects already ran in
+                        // maybe_reflect_prompt; the model can persist durable
+                        // memories mid-task before finishing.
+                        if !assistant_delivered_answer(&assistant_msg) {
+                            reflected = true;
+                            reflect_prompt = p;
+                            recurrence = rec;
+                            do_reflect = true;
+                        }
                     }
                 }
                 if do_reflect {
@@ -1966,5 +2008,49 @@ pub(crate) async fn run_turn(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_reflect_answer_tests {
+    use super::*;
+    use crate::message::Content;
+
+    fn assistant(content: Option<&str>) -> Message {
+        Message::Assistant {
+            name: None,
+            content: content.map(String::from),
+            thinking: None,
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn bare_finish_is_not_an_answer() {
+        // A `finish` with no text content must still trigger auto-reflect so the
+        // model gets a chance to write its summary + persist memories.
+        assert!(!assistant_delivered_answer(&assistant(None)));
+        assert!(!assistant_delivered_answer(&assistant(Some("   \n  "))));
+    }
+
+    #[test]
+    fn trivial_ack_is_not_an_answer() {
+        // Short acknowledgments ("Done.", "calling finish") should NOT suppress
+        // the reflection continuation.
+        assert!(!assistant_delivered_answer(&assistant(Some("Done."))));
+        assert!(!assistant_delivered_answer(&assistant(Some(
+            "Saved memory — calling finish."
+        ))));
+    }
+
+    #[test]
+    fn substantive_answer_suppresses_reflection() {
+        // A real completion summary must remain the final message — re-streaming
+        // a reflection would bury it under an empty second finish.
+        let answer = "Verified the state. Here's the honest answer:\n\
+            Use `brew tap catalystctl/catcode` then `brew install catcode`. \
+            Note: the tap repo returns 404 today — it is built but not yet live.";
+        assert!(answer.chars().count() >= AUTO_REFLECT_ANSWER_MIN_CHARS);
+        assert!(assistant_delivered_answer(&assistant(Some(answer))));
     }
 }
