@@ -78,8 +78,9 @@ Key highlights:
   turn to its endpoint. Other vendors ship as plugins (API key and/or OAuth).
 * **Human-in-the-loop safety** — destructive tools (`bash`, `write_file`,
   `edit`, …) require consent under the default `destructive` mode. Restricted
-  paths (`.env`, `.git`, `.ssh`) are gated for reads *and* writes. Optional Linux
-  hard sandbox: `--sandbox firejail --no-network`.
+  paths (`.env`, `.git`, `.ssh`) are gated for reads *and* writes. Optional
+  cross-platform microVM sandbox via Microsandbox: `--sandbox microsandbox
+  --no-network`.
 * **Workspace confinement** — every file op resolves against a workspace root;
   absolute paths, `..`, and symlink escapes are rejected. `bash` runs with
   `cwd = workspace`.
@@ -113,8 +114,9 @@ Get up and running in under a minute — no clone, no compiler.
 
 ### Prerequisites
 
-* **Linux / macOS / Windows** (the hard sandbox is Linux-only; on macOS/Windows
-  leave it `none`).
+* **Linux / macOS / Windows**. The optional microVM sandbox runs on Linux
+  via KVM, Apple Silicon macOS, and Windows via the Windows Hypervisor Platform;
+  Intel macOS is unsupported (leave it `none`).
 * `curl` + coreutils (always). No compiler unless you build from source.
 * For the web frontend: a [Node](https://nodejs.org) or [Bun](https://bun.sh)
   runtime to *run* the service (not to build it).
@@ -454,7 +456,7 @@ peers over an in-process intercom bus.
 - [x] Plugin system (hooks + custom tools, no MCP)
 - [x] Plugin OAuth providers (ChatGPT, SuperGrok, …)
 - [x] Plugin slash commands, notify/status, and `/plugin-reload`
-- [x] macOS seatbelt sandbox mode (Windows remains denylist-only)
+- [x] Cross-platform Microsandbox microVM sandbox (Linux KVM, Apple Silicon macOS, Windows WHP) replacing Firejail/Seatbelt
 - [x] Git worktree isolation for parallel subagents + shadow promote
 - [x] Hybrid filesystem checkpoints + Undo restores disk
 - [x] `file_change` / `protocol_hello` / richer approvals / audit sidecar
@@ -554,12 +556,17 @@ Artifacts land in `dist/` with `.sha256` checksums.
 * **No fixed turn cap** — the ceiling is the session token budget
   (`--max-session-tokens`, `0` = unlimited). The model can call `finish` to exit
   cleanly or `spawn` a nested agent.
-* **Hard security boundary** — pass `--sandbox firejail --no-network` (or set it
-  in the TUI settings). The denylist is a tripwire on top; workspace confinement
-  covers file paths, but `bash` is only sandboxed when `--sandbox` is set.
-  Sandboxing is **Linux-only**.
-* **Windows bash** — the agent's `bash` tool needs bash on PATH (Git Bash or
-  WSL); chat and the file tools work without it.
+* **Hard security boundary** — pass `--sandbox microsandbox --no-network`
+  (or set it in the TUI settings). The denylist is a tripwire on top; workspace
+  confinement covers file paths, but `bash` (and `git`, diagnostics, and plugin
+  scripts) are only isolated when `--sandbox` is set. Agent workloads then run
+  inside a Microsandbox microVM on Linux (KVM), Apple Silicon macOS, and Windows
+  (WHP). No external `msb` CLI, Docker, Podman, Firejail, or WSL is required.
+  Intel macOS is unsupported. See [`docs/guides/sandbox.md`](docs/guides/sandbox.md).
+* **Windows bash** — when sandboxing is enabled, `bash` runs inside the Linux
+  guest, so no host shell is needed. When sandboxing is disabled, the `bash`
+  tool uses the host's native shell (PowerShell on Windows). Chat and the file
+  tools work without it.
 
 </details>
 

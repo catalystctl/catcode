@@ -23,6 +23,10 @@ pub(crate) async fn run() {
     // Explicit auth only — do not scan env vars or third-party OAuth stores.
     // Users must `/login` with an API key or complete this app's OAuth flow.
     let _ = config::auto_login_env_presets(&mut cfg);
+    // Install the process-global sandbox execution backend from the loaded
+    // config (host when sandbox=none, Microsandbox microVM when enabled). The
+    // microVM itself boots lazily on the first agent-controlled exec.
+    crate::sandbox::init_from_config(std::sync::Arc::new(cfg.clone()));
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
@@ -399,6 +403,21 @@ pub(crate) async fn run() {
                         .with("context_compact_at", json!(cfg.context_compact_at))
                         .with("context_digest_at", json!(cfg.context_digest_at))
                         .with("sandbox", json!(cfg.sandbox.as_str()))
+                        .with(
+                            "shell",
+                            json!(crate::sandbox::policy::effective_shell_kind().as_str()),
+                        )
+                        .with("sandboxImage", json!(cfg.sandbox_image))
+                        .with("sandboxCpus", json!(cfg.sandbox_cpus))
+                        .with("sandboxMemoryMb", json!(cfg.sandbox_memory_mb))
+                        .with(
+                            "sandboxNetworkMode",
+                            json!(cfg.sandbox_network_mode.as_str()),
+                        )
+                        .with(
+                            "sandboxReady",
+                            json!(crate::sandbox::sandbox_status().await.ready),
+                        )
                         .with("resumed_messages", json!(conv_len))
                         .with("plugins", json!(loaded_plugins))
                         .with("plugins_skipped", json!(skipped_unavailable.clone())),
@@ -1183,6 +1202,43 @@ pub(crate) async fn run() {
                     &Event::new("config_changed")
                         .with("key", json!(out_key))
                         .with("value", json!(out_val)),
+                );
+            }
+            Command::GetSandboxStatus => {
+                let report = crate::sandbox::sandbox_status().await;
+                emit(
+                    &Event::new("sandbox_status")
+                        .with("mode", json!(state.cfg.read().await.sandbox.as_str()))
+                        .with("report", serde_json::to_value(&report).unwrap_or_default()),
+                );
+            }
+            Command::PrepareSandbox => {
+                emit(
+                    &Event::new("sandbox_prepare_progress")
+                        .with("phase", json!("downloading-runtime-and-image")),
+                );
+                match crate::sandbox::prepare_sandbox().await {
+                    Ok(()) => {
+                        let report = crate::sandbox::sandbox_status().await;
+                        emit(
+                            &Event::new("sandbox_ready")
+                                .with("ready", json!(report.ready))
+                                .with("report", serde_json::to_value(&report).unwrap_or_default()),
+                        );
+                    }
+                    Err(e) => {
+                        emit(&Event::new("sandbox_error").with("error", json!(e.user_message())));
+                    }
+                }
+            }
+            Command::ResetSandbox => {
+                let _ = crate::sandbox::reset_sandbox().await;
+                let report = crate::sandbox::sandbox_status().await;
+                emit(
+                    &Event::new("sandbox_status")
+                        .with("mode", json!(state.cfg.read().await.sandbox.as_str()))
+                        .with("reset", json!(true))
+                        .with("report", serde_json::to_value(&report).unwrap_or_default()),
                 );
             }
             Command::Reset => {

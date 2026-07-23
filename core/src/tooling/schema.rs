@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::tooling::metadata;
-use crate::tools::BASH_TOOL_DESC;
+use crate::tools::bash_tool_desc;
 use serde_json::{json, Value};
 
 pub fn is_core_tool(name: &str) -> bool {
@@ -332,7 +332,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": BASH_TOOL_DESC,
+                "description": bash_tool_desc(),
                 "parameters": {
                     "type": "object",
                     "properties": {

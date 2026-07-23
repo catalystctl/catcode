@@ -18,9 +18,16 @@ pub use crate::test_env::execute_test_env;
 /// tool NAME stays `bash` for wire compatibility (TUI/web/SDK); on Windows it
 /// executes the command through PowerShell (`shell_argv` below).
 #[cfg(target_os = "windows")]
-pub(crate) const BASH_TOOL_DESC: &str = "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.";
+pub(crate) const BASH_TOOL_DESC_FALLBACK: &str = "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.";
 #[cfg(not(target_os = "windows"))]
-pub(crate) const BASH_TOOL_DESC: &str = "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.";
+pub(crate) const BASH_TOOL_DESC_FALLBACK: &str = "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.";
+
+/// Model-facing description of the `bash` tool. When sandboxing is enabled the
+/// guest is always Linux `bash`, so Windows users are no longer told to emit
+/// PowerShell. Delegates to the sandbox policy (single source of truth).
+pub(crate) fn bash_tool_desc() -> &'static str {
+    crate::sandbox::policy::bash_tool_description()
+}
 
 pub use crate::tooling::policy::{classify, is_parallel_wave_tool};
 pub use crate::tooling::scheduler::execute_parallel_wave;
@@ -1557,149 +1564,117 @@ pub async fn execute_bash(
 
     // Sudo handling: sudo by default reads the password from /dev/tty (the
     // controlling terminal), which garbles the TUI's rendering. We never let
-    // sudo reach /dev/tty. Three modes:
-    //   Password(pw)  → redefine sudo to use `-S` (read pw from stdin).
-    //   NonInteractive → redefine sudo to use `-n` (fail if pw needed).
-    //   None          → clean error if sudo detected (caller must prompt).
+    // sudo reach /dev/tty. The `sudo() { command sudo -S "$@"; }` redefinition
+    // is POSIX-shell syntax and only applies on the HOST (a microVM guest has
+    // no host sudo). Inside the sandbox, sudo is rejected outright.
     let uses_sudo = command_uses_sudo(command);
-    // The `sudo() { command sudo -S "$@"; }` redefinition is POSIX-shell
-    // syntax; it is a no-op (and would be a syntax error) under PowerShell.
-    // On Windows/PowerShell we pass the command through verbatim — Windows
-    // sudo (when present) handles its own UAC elevation. `command_uses_sudo`
-    // already returns false on non-POSIX shells, so `uses_sudo` is false there
-    // and this block is inert; the guard is defensive.
-    let run_command = match &sudo_auth {
-        SudoAuth::Password(_) if uses_sudo && shell_is_posix() => {
-            format!(r#"sudo() {{ command sudo -S "$@"; }}; {command}"#)
+    let sandboxed = crate::sandbox::is_sandbox_enabled();
+    let run_command = if sandboxed {
+        if uses_sudo {
+            return Outcome::err(
+                "sudo is not supported inside the sandbox microVM. The guest runs as a\
+                 \nconfined user without host privileges; run the command without sudo, or\
+                 \ndisable sandboxing with `--sandbox none`.",
+            );
         }
-        SudoAuth::NonInteractive if uses_sudo && shell_is_posix() => {
-            format!(r#"sudo() {{ command sudo -n "$@"; }}; {command}"#)
-        }
-        _ => {
-            if uses_sudo {
-                return Outcome::err(
-                    "this command uses sudo, which requires interactive approval. \
-                     The user must approve it in the main session — ask them to run it \
-                     manually, or re-run without sudo.",
-                );
-            }
-            command.to_string()
-        }
-    };
-
-    // Build the argv. If a sandbox is configured, we exec the sandbox wrapper
-    // instead of bash directly; the wrapper runs bash -c <command> inside.
-    // ponytail: firejail profile is generated per-run into a temp file so the
-    // workspace whitelist is always the current cfg.workspace. One file per
-    // call is wasteful under load but correct; cache if it ever matters.
-    let (_profile, mut cmd) = build_bash_command(&run_command, cfg);
-
-    cmd.current_dir(&cfg.workspace);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    // When feeding a sudo password, stdin must be piped; otherwise null (the
-    // command can't read from the TUI and shouldn't block on stdin).
-    let feeding_password = matches!(&sudo_auth, SudoAuth::Password(_) if uses_sudo);
-    if feeding_password {
-        cmd.stdin(std::process::Stdio::piped());
+        command.to_string()
     } else {
-        cmd.stdin(std::process::Stdio::null());
-    }
-    cmd.kill_on_drop(true);
-    // P1-8: don't leak the parent environment (LD_PRELOAD, LD_LIBRARY_PATH,
-    // UMANS_*, arbitrary PATH/HOME overrides) into the shell — even inside a
-    // sandbox these could subvert tool execution. Keep only the essentials.
-    //
-    // PowerShell (Windows) is the exception: it and its .NET cmdlets depend on
-    // SystemRoot, PATHEXT, USERPROFILE, TEMP, APPDATA, … which env_clear would
-    // strip and break (and the ICU/globalization stack hard-fails without
-    // them). LD_PRELOAD-style injection isn't a Windows concern, so PowerShell
-    // inherits the parent env; the denylist + approval gate still apply.
-    if shell_is_posix() {
-        cmd.env_clear();
-        cmd.env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-        );
-        if let Ok(home) = std::env::var("HOME") {
-            cmd.env("HOME", home);
-        }
-        if let Ok(tmp) = std::env::var("TMPDIR") {
-            cmd.env("TMPDIR", tmp);
-        }
-        if let Ok(user) = std::env::var("USER") {
-            cmd.env("USER", user);
-        }
-    }
-
-    let mut child: tokio::process::Child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let hint = match cfg.sandbox {
-                crate::config::Sandbox::Firejail if e.kind() == std::io::ErrorKind::NotFound => {
-                    " (is firejail installed and on PATH?)"
+        match &sudo_auth {
+            SudoAuth::Password(_) if uses_sudo && shell_is_posix() => {
+                format!(r#"sudo() {{ command sudo -S "$@"; }}; {command}"#)
+            }
+            SudoAuth::NonInteractive if uses_sudo && shell_is_posix() => {
+                format!(r#"sudo() {{ command sudo -n "$@"; }}; {command}"#)
+            }
+            _ => {
+                if uses_sudo {
+                    return Outcome::err(
+                        "this command uses sudo, which requires interactive approval. \
+                         The user must approve it in the main session — ask them to run it \
+                         manually, or re-run without sudo.",
+                    );
                 }
-                _ => "",
-            };
-            return Outcome::err(format!("bash failed to spawn: {e}{hint}"));
+                command.to_string()
+            }
         }
     };
 
-    // Feed the sudo password on stdin (then close it) so `sudo -S` reads it
-    // instead of blocking on /dev/tty. Done before the timeout wait so sudo
-    // unblocks immediately. The stdin handle drops at end of block → EOF.
-    if uses_sudo {
-        if let SudoAuth::Password(pw) = &sudo_auth {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(format!("{pw}\n").as_bytes()).await;
-                // stdin drops here → the pipe closes; the command sees EOF.
-            }
-        }
-    }
+    // Build the argv. The active shell decides the form: POSIX `bash -c <cmd>`
+    // (the guest is always Linux `bash` when sandboxed) or PowerShell on a
+    // Windows host. The execution backend decides WHERE it runs (host or
+    // microVM); tools never spawn tokio::process::Command directly anymore.
+    let (program, args) = crate::sandbox::policy::shell_argv(&run_command);
 
     // Per-call timeout override (the bash tool's `timeout` arg): clamp to
     // [1, max_bash_timeout_secs] so a model can buy more time for a slow
-    // build/test but can't escalate past the configured ceiling. None falls
-    // back to the default bash timeout.
+    // build/test but can't escalate past the configured ceiling.
     let secs = match timeout_override {
         Some(t) => t.clamp(1, cfg.max_bash_timeout_secs.max(1)),
         None => cfg.bash_timeout_secs,
     };
     let timeout = std::time::Duration::from_secs(secs);
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    match result {
-        Ok(Ok(o)) => {
+
+    // Stdin: the sudo password (host path) when feeding sudo; otherwise null.
+    let feeding_password = !sandboxed && uses_sudo && matches!(&sudo_auth, SudoAuth::Password(_));
+    let stdin = if feeding_password {
+        if let SudoAuth::Password(pw) = &sudo_auth {
+            Some(format!("{pw}\n").into_bytes())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let proc_env =
+        crate::sandbox::policy::build_process_env(cfg, crate::sandbox::policy::ExecPurpose::Bash);
+    let cwd =
+        crate::sandbox::policy::effective_cwd(cfg, "").unwrap_or_else(|_| cfg.workspace.clone());
+    let req = crate::sandbox::ExecRequest {
+        program,
+        args,
+        cwd,
+        env: proc_env.env,
+        inherit_parent_env: proc_env.inherit_parent,
+        stdin,
+        timeout,
+        ..Default::default()
+    };
+
+    match crate::sandbox::execution_backend().execute(req).await {
+        Ok(r) => {
             let mut combined = String::new();
-            if !o.stdout.is_empty() {
-                combined.push_str(&String::from_utf8_lossy(&o.stdout));
+            if !r.stdout.is_empty() {
+                combined.push_str(&String::from_utf8_lossy(&r.stdout));
             }
-            if !o.stderr.is_empty() {
+            if !r.stderr.is_empty() {
                 if !combined.is_empty() {
                     combined.push_str("\n--- stderr ---\n");
                 }
-                combined.push_str(&String::from_utf8_lossy(&o.stderr));
+                combined.push_str(&String::from_utf8_lossy(&r.stderr));
             }
-            let ok = o.status.success();
             if combined.is_empty() {
                 combined.push_str("(no output)");
             }
-            // ponytail: 32KB cap. When over cap, keep the tail (where errors
-            // usually are) AND salvage error/warning lines from the dropped
-            // head — a compile error in the middle of a huge build log would
-            // otherwise vanish entirely under a pure tail truncation.
             const CAP: usize = 32_768;
             if combined.len() > CAP {
                 combined = smart_truncate(&combined, CAP);
             }
-            Outcome {
-                ok,
-                output: combined,
-                diff: None,
+            if r.timed_out {
+                Outcome {
+                    ok: false,
+                    output: format!("bash timed out after {secs}s (killed)\n{combined}"),
+                    diff: None,
+                }
+            } else {
+                Outcome {
+                    ok: r.exit_code == Some(0),
+                    output: combined,
+                    diff: None,
+                }
             }
         }
-        Ok(Err(e)) => Outcome::err(format!("bash wait failed: {e}")),
-        Err(_) => Outcome::err(format!("bash timed out after {secs}s (killed)")),
+        Err(e) => Outcome::err(e.user_message()),
     }
 }
 
@@ -1710,7 +1685,7 @@ pub async fn execute_bash(
 /// else Windows PowerShell). Override with `CATALYST_CODE_SHELL` (e.g. `bash`
 /// for Git-Bash/WSL users on Windows, `zsh`, `pwsh`, or a full path) — mirrors
 /// the plugin hook-launcher convention in plugins.rs.
-fn resolve_shell() -> String {
+pub(crate) fn resolve_shell() -> String {
     if let Ok(s) = std::env::var("CATALYST_CODE_SHELL") {
         let s = s.trim();
         if !s.is_empty() {
@@ -1736,7 +1711,7 @@ fn resolve_shell() -> String {
 /// False for PowerShell (`powershell`/`pwsh`). Keyed on the resolved shell
 /// (not the host OS) so a WSL `bash` on Windows still behaves as bash and a
 /// `pwsh` override on Linux behaves as PowerShell.
-fn shell_is_posix() -> bool {
+pub(crate) fn shell_is_posix() -> bool {
     let stem = std::path::Path::new(&resolve_shell())
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
@@ -1752,7 +1727,7 @@ fn shell_is_posix() -> bool {
 /// `powershell -NoProfile -NonInteractive -Command <command>` (`-NonInteractive`
 /// prevents `Read-Host` from hanging the agent loop; `-NoProfile` skips the
 /// user profile for a clean, fast startup).
-fn shell_argv(command: &str) -> (String, Vec<String>) {
+pub(crate) fn shell_argv(command: &str) -> (String, Vec<String>) {
     let prog = resolve_shell();
     let stem = std::path::Path::new(&prog)
         .file_stem()
@@ -1795,230 +1770,9 @@ fn which(prog: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn pwsh_available() -> bool {
+pub(crate) fn pwsh_available() -> bool {
     static CACHED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| which("pwsh"));
     *CACHED
-}
-
-/// Build the tokio Command for a bash invocation, applying the configured
-/// sandbox. Returns (optional temp profile path, Command). The profile path
-/// is kept alive for the lifetime of the returned Command via the temp file.
-fn build_bash_command(
-    command: &str,
-    cfg: &Config,
-) -> (Option<std::path::PathBuf>, tokio::process::Command) {
-    // Windows has no firejail / unshare / sandbox-exec — the sandbox config is a
-    // Unix concept and is ignored. Run the native PowerShell (or a
-    // CATALYST_CODE_SHELL override) directly. (Windows users who want bash
-    // should run the Unix build under WSL.)
-    #[cfg(target_os = "windows")]
-    {
-        let _ = cfg;
-        let (prog, args) = shell_argv(command);
-        let mut c = tokio::process::Command::new(prog);
-        for a in args {
-            c.arg(a);
-        }
-        return (None, c);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        use crate::config::Sandbox;
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        static PROFILE_CACHE: std::sync::LazyLock<
-            Mutex<HashMap<(String, bool), std::path::PathBuf>>,
-        > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-        match cfg.sandbox {
-            Sandbox::None => {
-                if cfg.no_network {
-                    let (prog, args) = shell_argv(command);
-                    let mut c = tokio::process::Command::new("unshare");
-                    c.arg("-n").arg(prog);
-                    for a in args {
-                        c.arg(a);
-                    }
-                    return (None, c);
-                }
-                let (prog, args) = shell_argv(command);
-                let mut c = tokio::process::Command::new(prog);
-                for a in args {
-                    c.arg(a);
-                }
-                (None, c)
-            }
-            Sandbox::Firejail => {
-                // Cache the firejail profile by (workspace_path, no_network) so we
-                // don't generate and write a temp file per bash call.
-                let ws_key = cfg.workspace.display().to_string();
-                let mut cache = PROFILE_CACHE.lock().unwrap();
-                if let Some(cached_path) = cache.get(&(ws_key.clone(), cfg.no_network)) {
-                    if cached_path.exists() {
-                        let (prog, args) = shell_argv(command);
-                        let mut c = tokio::process::Command::new("firejail");
-                        c.arg("--quiet").arg("--profile").arg(cached_path).arg(prog);
-                        for a in args {
-                            c.arg(a);
-                        }
-                        return (Some(cached_path.clone()), c);
-                    }
-                }
-                // Not cached or file missing — generate fresh.
-                let profile = firejail_profile(&cfg.workspace, cfg.no_network);
-                // Include no_network in the filename so a net/non-net session
-                // pair cannot overwrite each other's profile on disk.
-                let path = std::env::temp_dir().join(format!(
-                    "catalyst-code-fj-{:x}-{}.profile",
-                    fxhash(&ws_key),
-                    if cfg.no_network { "nonet" } else { "net" }
-                ));
-                let _ = std::fs::write(&path, &profile);
-                cache.insert((ws_key, cfg.no_network), path.clone());
-                let (prog, args) = shell_argv(command);
-                let mut c = tokio::process::Command::new("firejail");
-                c.arg("--quiet").arg("--profile").arg(&path).arg(prog);
-                for a in args {
-                    c.arg(a);
-                }
-                (Some(path), c)
-            }
-            // macOS: sandbox-exec with a seatbelt profile. On non-macOS hosts the
-            // binary is usually absent — fall through to the plain shell (denylist
-            // still applies). Windows has no equivalent; selecting seatbelt there
-            // is a no-op.
-            Sandbox::Seatbelt => {
-                #[cfg(target_os = "macos")]
-                {
-                    let ws_key = cfg.workspace.display().to_string();
-                    let cache_key = format!("sb:{ws_key}:{}", cfg.no_network);
-                    let mut cache = PROFILE_CACHE.lock().unwrap();
-                    let path = if let Some(cached_path) =
-                        cache.get(&(cache_key.clone(), cfg.no_network))
-                    {
-                        if cached_path.exists() {
-                            cached_path.clone()
-                        } else {
-                            let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
-                            let path = std::env::temp_dir().join(format!(
-                                "catalyst-code-sb-{:x}-{}.sb",
-                                fxhash(&ws_key),
-                                if cfg.no_network { "nonet" } else { "net" }
-                            ));
-                            let _ = std::fs::write(&path, &profile);
-                            cache.insert((cache_key, cfg.no_network), path.clone());
-                            path
-                        }
-                    } else {
-                        let profile = seatbelt_profile(&cfg.workspace, cfg.no_network);
-                        let path = std::env::temp_dir().join(format!(
-                            "catalyst-code-sb-{:x}-{}.sb",
-                            fxhash(&ws_key),
-                            if cfg.no_network { "nonet" } else { "net" }
-                        ));
-                        let _ = std::fs::write(&path, &profile);
-                        cache.insert((cache_key, cfg.no_network), path.clone());
-                        path
-                    };
-                    let (prog, args) = shell_argv(command);
-                    let mut c = tokio::process::Command::new("sandbox-exec");
-                    c.arg("-f").arg(&path).arg(prog);
-                    for a in args {
-                        c.arg(a);
-                    }
-                    return (Some(path), c);
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = &PROFILE_CACHE;
-                    let (prog, args) = shell_argv(command);
-                    let mut c = tokio::process::Command::new(prog);
-                    for a in args {
-                        c.arg(a);
-                    }
-                    (None, c)
-                }
-            }
-        }
-    }
-}
-
-/// A simple FNV-1a hash of a string, used for deterministic profile filenames.
-/// Unix-only (firejail/seatbelt profile caching); not referenced on Windows.
-#[cfg(not(target_os = "windows"))]
-fn fxhash(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// A firejail profile that whitelists the workspace (read+write), the shell
-/// and its libs, /tmp, and nothing else. With no_network, drops net entirely.
-#[cfg(not(target_os = "windows"))]
-fn firejail_profile(workspace: &std::path::Path, no_network: bool) -> String {
-    let ws = workspace.display();
-    let mut s = String::new();
-    s.push_str("# auto-generated by catalyst-code-core\n");
-    s.push_str("# ponytail: whitelist the workspace + shell paths; deny everything else.\n");
-    // Shell + coreutils locations
-    for p in [
-        "/usr",
-        "/bin",
-        "/lib",
-        "/lib64",
-        "/etc/alternatives",
-        "/dev/null",
-    ] {
-        s.push_str(&format!("read-only {p}\n"));
-    }
-    // Workspace is read-write
-    s.push_str(&format!("whitelist {ws}\n"));
-    s.push_str("read-write {ws}\n");
-    // /tmp for scratch (firejail private-tmp)
-    s.push_str("read-write /tmp\n");
-    s.push_str("whitelist /tmp\n");
-    if no_network {
-        s.push_str("net none\n");
-    } else {
-        // still drop raw sockets etc.
-        s.push_str("protocol unix,inet,inet6\n");
-    }
-    s.push_str("caps.drop all\n");
-    s.push_str("seccomp\n");
-    s.push_str("noroot\n");
-    s.push_str("private-tmp\n");
-    s
-}
-
-/// macOS seatbelt (sandbox-exec) profile: allow bash + workspace R/W; optionally
-/// deny network. Keep permissive enough that coreutils and dylibs still load.
-/// Residual risk (intentional): `(allow file-read*)` lets sandboxed bash read
-/// host secrets outside the workspace; write+network confinement is the primary
-/// control. Do not mirror firejail's FHS read allowlist — it breaks
-/// Homebrew/Xcode/nix layouts on macOS.
-#[cfg(target_os = "macos")]
-fn seatbelt_profile(workspace: &std::path::Path, no_network: bool) -> String {
-    let ws = workspace.display();
-    let mut s = String::new();
-    s.push_str("(version 1)\n");
-    s.push_str("(deny default)\n");
-    s.push_str("(allow process*)\n");
-    s.push_str("(allow sysctl-read)\n");
-    s.push_str("(allow mach*)\n");
-    s.push_str("(allow file-read*)\n");
-    s.push_str(&format!(
-        "(allow file-write* (subpath \"{ws}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
-    ));
-    s.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
-    if no_network {
-        s.push_str("(deny network*)\n");
-    } else {
-        s.push_str("(allow network*)\n");
-    }
-    s
 }
 
 // ---- search/replace edit ----
@@ -2457,6 +2211,16 @@ pub(crate) async fn dispatch_bulk_inner(name: &str, inner_args: &Value, cfg: &Co
         execute_web_search(inner_args, cfg).await
     } else if name == "diagnostics" {
         execute_diagnostics(inner_args, cfg).await
+    } else if crate::sandbox::is_sandbox_enabled()
+        && matches!(
+            name,
+            "git_status" | "git_diff" | "git_log" | "git_add" | "git_commit"
+        )
+    {
+        // Sandboxed: built-in git runs inside the microVM via the shared
+        // execution backend (never directly on the host). The host path
+        // (execute() -> git_exec) still applies when sandboxing is off.
+        crate::tooling::builtin::git::git_dispatch(name, inner_args, cfg).await
     } else {
         // Sync tools: offload so concurrent bulk inners don't block the runtime.
         let name = name.to_string();
@@ -2794,7 +2558,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     // shell pipeline, so their syntax must match the active shell (bash on
     // Unix, PowerShell on Windows) and is routed through `shell_argv` like
     // the `bash` tool so the OS gets matching semantics.
-    let posix = shell_is_posix();
+    let posix = crate::sandbox::policy::effective_shell_kind().is_posix();
     let (cmd, label): (Vec<String>, &str) = if target.join("Cargo.toml").exists() {
         (
             vec![
@@ -2836,72 +2600,53 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
             "no recognized project marker (Cargo.toml/package.json/go.mod/pyproject.toml)",
         );
     };
-    let mut c = tokio::process::Command::new(&cmd[0]);
-    c.args(&cmd[1..]);
-    c.current_dir(&target);
-    c.stdin(std::process::Stdio::null());
-    c.stdout(std::process::Stdio::piped());
-    c.stderr(std::process::Stdio::piped());
-    // Kill the checker if its future is dropped (e.g. /abort cancels the turn
-    // via the outer select) AND bound it with a timeout — previously
-    // `c.output().await` had neither, so a wedged `cargo check`/`tsc`/`go build`
-    // stalled the whole agent and /abort couldn't interrupt it.
-    c.kill_on_drop(true);
-    // Mirror the `bash` tool's env hygiene: on POSIX shells drop the parent
-    // env (no LD_PRELOAD / proxy leak) and re-add only what a checker needs;
-    // on PowerShell/Windows INHERIT the parent env — checkers (cargo/node/go)
-    // and .NET depend on SystemRoot/PATHEXT/USERPROFILE/APPDATA which
-    // env_clear would strip and break. Diagnostics runs a fixed checker (not
-    // model-controlled bash), so the bash denylist doesn't apply.
-    if shell_is_posix() {
-        c.env_clear();
-        if let Ok(p) = std::env::var("PATH") {
-            c.env("PATH", p);
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            c.env("HOME", home);
-        }
-        if let Ok(tmp) = std::env::var("TMPDIR") {
-            c.env("TMPDIR", tmp);
-        }
-        for k in [
-            "CARGO_HOME",
-            "RUSTUP_HOME",
-            "GOPATH",
-            "GOCACHE",
-            "GOTMPDIR",
-            "NODE_PATH",
-            "npm_config_cache",
-        ] {
-            if let Ok(v) = std::env::var(k) {
-                c.env(k, v);
-            }
-        }
-    }
-    let child = match c.spawn() {
-        Ok(ch) => ch,
-        Err(e) => return Outcome::err(format!("{label} failed to run: {e}")),
-    };
     let timeout = std::time::Duration::from_secs(cfg.diag_timeout_secs.max(5));
-    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Outcome::err(format!("{label} wait failed: {e}")),
-        Err(_) => {
-            return Outcome::err(format!(
-                "{label} timed out after {}s (killed)",
-                timeout.as_secs()
-            ))
-        }
+    // Resolve the workspace-relative path so the cwd is correct for the active
+    // backend (host path on the host; /workspace/<rel> in the microVM).
+    let rel = target
+        .strip_prefix(&cfg.workspace)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    let cwd =
+        crate::sandbox::policy::effective_cwd(cfg, rel).unwrap_or_else(|_| cfg.workspace.clone());
+    let proc_env = crate::sandbox::policy::build_process_env(
+        cfg,
+        crate::sandbox::policy::ExecPurpose::Diagnostics,
+    );
+    // Diagnostics runs a fixed checker (not model-controlled bash), so the
+    // bash denylist doesn't apply. When sandboxed the checker runs in the
+    // guest; a missing toolchain surfaces an actionable image error and NEVER
+    // falls back to the host compiler.
+    let req = crate::sandbox::ExecRequest {
+        program: cmd[0].clone(),
+        args: cmd[1..].to_vec(),
+        cwd,
+        env: proc_env.env,
+        inherit_parent_env: proc_env.inherit_parent,
+        stdin: None,
+        timeout,
+        ..Default::default()
     };
-    let mut s = String::new();
-    if !out.stdout.is_empty() {
-        s.push_str(&String::from_utf8_lossy(&out.stdout));
+    let r = match crate::sandbox::execution_backend().execute(req).await {
+        Ok(r) => r,
+        Err(e) => return Outcome::err(format!("{label} failed: {}", e.user_message())),
+    };
+    if r.timed_out {
+        return Outcome::err(format!(
+            "{label} timed out after {}s (killed)",
+            timeout.as_secs()
+        ));
     }
-    if !out.stderr.is_empty() {
+    let mut s = String::new();
+    if !r.stdout.is_empty() {
+        s.push_str(&String::from_utf8_lossy(&r.stdout));
+    }
+    if !r.stderr.is_empty() {
         if !s.is_empty() {
             s.push_str("\n--- stderr ---\n");
         }
-        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        s.push_str(&String::from_utf8_lossy(&r.stderr));
     }
     if s.is_empty() {
         s.push_str("(no diagnostics — clean)");
@@ -2914,7 +2659,7 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     }
     // ponytail: diagnostics "ok" is true only when the checker exits 0.
     Outcome {
-        ok: out.status.success(),
+        ok: r.exit_code == Some(0),
         output,
         diff: None,
     }
@@ -4124,20 +3869,6 @@ mod tests {
         let o = execute("finish", &json!({}), &cfg);
         assert!(o.ok);
         assert_eq!(o.output, FINISH_SENTINEL);
-    }
-
-    #[test]
-    fn firejail_profile_whitelists_workspace() {
-        let (_root, cfg) = tmp_ws();
-        let p = firejail_profile(&cfg.workspace, false);
-        assert!(p.contains("whitelist"), "{}", p);
-        assert!(p.contains(&cfg.workspace.display().to_string()), "{}", p);
-        assert!(p.contains("caps.drop all"));
-        assert!(p.contains("seccomp"));
-        assert!(p.contains("protocol unix,inet,inet6")); // network allowed
-        let pn = firejail_profile(&cfg.workspace, true);
-        assert!(pn.contains("net none")); // network dropped
-        assert!(!pn.contains("protocol unix"));
     }
 
     #[test]

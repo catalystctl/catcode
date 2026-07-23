@@ -143,13 +143,21 @@ type session struct {
 		Description string `json:"description"`
 		Plugin      string `json:"plugin"`
 	} // plugin-declared slash commands (drives /{name} palette + dispatch)
-	pluginStatus             string // last plugin_status text (footer); empty = clear
-	memoryList               []memoryEntry
-	pendingMemoryPicker      bool   // open memory picker once list_memory arrives
-	pendingPluginPicker      bool   // open plugin picker once plugins_list arrives
-	pluginPickerMode         string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
-	coreBashTimeout          int
-	coreAutoCompact          bool
+	pluginStatus        string // last plugin_status text (footer); empty = clear
+	memoryList          []memoryEntry
+	pendingMemoryPicker bool   // open memory picker once list_memory arrives
+	pendingPluginPicker bool   // open plugin picker once plugins_list arrives
+	pluginPickerMode    string // pluginModeToggle | pluginModeRemove (for plugins_list → modal)
+	coreBashTimeout     int
+	coreAutoCompact     bool
+	// Sandbox runtime state (effective mode reported by the core via the
+	// `ready` + sandbox_* events). Distinct from settings.Sandbox (the desired
+	// mode): this is what the core actually resolved, surfaced in the status
+	// panel so the TUI/web/CLI/model prompt all agree. pendingSandboxEnable is
+	// set when the user picks Microsandbox and we are awaiting a preflight
+	// reply before persisting (fail-closed: never save "none" on their behalf).
+	sandboxStatus            *sandboxStatusSnap
+	pendingSandboxEnable     bool
 	ctxBreakdown             *contextBreakdown
 	usageReport              *usageReport // last /usage reply (provider plan limits)
 	usageBars                []progress.Model
@@ -277,6 +285,9 @@ func initialSession() *session {
 	}
 	if s.settings.loadError != nil {
 		s.logError(s.settings.loadError.Error())
+	}
+	if v := s.settings.migratedSandbox; v != "" {
+		s.logInfo(fmt.Sprintf("sandbox setting %q migrated to microsandbox (firejail/seatbelt backends were removed)", v))
 	}
 	s.keybinds = effectiveKeybinds(s.settings.Keybinds)
 	s.recentCommands = append([]string(nil), s.settings.RecentCommands...)

@@ -135,11 +135,16 @@ func releaseSessionClaim() {
 // ---------------------------------------------------------------------------
 
 type settingsStore struct {
-	path          string
-	onSaveError   func(error) `json:"-"`
-	loadError     error       `json:"-"`
-	APIKey        string      `json:"api_key,omitempty"`
-	SelectedModel string      `json:"model,omitempty"`
+	path        string
+	onSaveError func(error) `json:"-"`
+	loadError   error       `json:"-"`
+	// migratedSandbox holds the pre-migration sandbox value when a deprecated
+	// backend (firejail/seatbelt/...) was found on disk and rewritten to
+	// microsandbox, so the UI can surface a one-time deprecation notice. Not
+	// persisted (the migrated value is written back on the next save).
+	migratedSandbox string `json:"-"`
+	APIKey          string `json:"api_key,omitempty"`
+	SelectedModel   string `json:"model,omitempty"`
 	// Approval is intentionally NOT omitempty — an empty value must not drop the
 	// key on save (that looked like a "settings reset" after restart).
 	Approval        string `json:"approval"`
@@ -149,7 +154,7 @@ type settingsStore struct {
 	AttachDir     string `json:"attach_dir,omitempty"`
 	ThinkExpanded bool   `json:"think_expanded,omitempty"`
 	// Production knobs (item 3/7): passed to the core on launch.
-	Sandbox          string `json:"sandbox,omitempty"` // none | firejail | seatbelt
+	Sandbox          string `json:"sandbox,omitempty"` // none | microsandbox
 	NoNetwork        bool   `json:"no_network,omitempty"`
 	IdleTimeout      int    `json:"idle_timeout,omitempty"`       // seconds (also written as idle_timeout_secs for core)
 	MaxSessionTokens int    `json:"max_session_tokens,omitempty"` // 0=unlimited
@@ -323,7 +328,14 @@ func loadSettingsFrom(path string) *settingsStore {
 	}
 	s.ThinkExpanded = onDisk.ThinkExpanded
 	if onDisk.Sandbox != "" {
-		s.Sandbox = onDisk.Sandbox
+		norm, deprecated := normalizeSandboxValue(onDisk.Sandbox)
+		if norm == "" {
+			norm = "none"
+		}
+		s.Sandbox = norm
+		if deprecated {
+			s.migratedSandbox = onDisk.Sandbox
+		}
 	}
 	s.NoNetwork = onDisk.NoNetwork
 	if onDisk.IdleTimeout > 0 {

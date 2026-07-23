@@ -7,8 +7,8 @@ terminal, the browser, or from your own code.
 - **Multi-provider** — log into Umans, OpenCode Go, OpenRouter, or a plugin
   OAuth (ChatGPT, SuperGrok, …) and route any turn to any model.
 - **Safe by default** — workspace confinement, destructive-tool approval gate,
-  restricted-path protection, optional Linux sandbox (`firejail` / macOS
-  `seatbelt`).
+  restricted-path protection, optional cross-platform microVM sandbox via
+  Microsandbox (Linux KVM, Apple Silicon macOS, Windows WHP).
 - **Pluggable** — hooks (pre/post/lifecycle/pre_turn), custom tools, custom
   slash commands, custom memory backends, plugin-declared OAuth — no recompile.
 - **Subagents + intercom** — delegate to focused child agents (`scout`,
@@ -154,7 +154,7 @@ Enter these in the TUI chat prompt or the web UI:
 | `/cancel-goal` | Abort the current goal |
 | `/settings` | Open the settings hub |
 | `/theme` | Choose a theme |
-| `/sandbox` | Set sandbox mode (`none` · `firejail` · `seatbelt`) |
+| `/sandbox` | Set sandbox mode (`none` · `microsandbox`) |
 | `/help` | List all available commands |
 | `/skill:<name>` | Apply a skill |
 | `/plugin-install <source>` | Install a plugin |
@@ -371,8 +371,10 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 - **Approval gate** — three modes: `never` (auto-approve), `destructive` (ask
   for bash/write/edit — default), `always` (ask for every tool)
 - **Restricted paths** — `.env`, `.git`, `.ssh` gated for both reads and writes
-- **Sandbox** — optional Linux `firejail` (`--sandbox firejail --no-network`) or
-  macOS `seatbelt`; defaults to `none` (denylist tripwire only)
+- **Sandbox** — optional Microsandbox microVM (`--sandbox microsandbox`, or
+  `--no-network` to block guest egress); defaults to `none` (denylist tripwire
+  only). Runs on Linux (KVM), Apple Silicon macOS, and Windows (WHP). See
+  [Sandbox Guide](guides/sandbox.md).
 - **Plugin permissions** — hooks can deny, allow, or override built-in tools
 
 [Architecture deep dive](architecture/) · [Security model](../README.md#security-notes)
@@ -423,6 +425,7 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 | [Glossary](reference/glossary.md) | Project terminology |
 | [Exit codes](reference/exit-codes.md) | Core and CLI exit codes |
 | [Compatibility](reference/compatibility.md) | Supported platforms and providers |
+| [Sandbox Guide](guides/sandbox.md) | Microsandbox microVM setup, network/env policy, troubleshooting |
 
 **Internal / advanced documents:**
 

@@ -13,7 +13,7 @@
 | **Plugin** | An extension loaded from `.catalyst-code/plugins/<name>/plugin.json` that can register hooks, custom tools, OAuth providers, memory providers, and slash commands. |
 | **Plugin scope** | Where a plugin is installed: `global` (`~/.catalyst-code/plugins/`, every workspace) or `workspace` (this repo's `.catalyst-code/plugins/`, project only). |
 | **Provider** | A configured AI model endpoint (e.g. Umans, OpenCode Go, OpenRouter, or a custom OpenAI/Anthropic-compatible endpoint). Multiple providers can be logged in simultaneously. |
-| **Sandbox** | Optional Linux (`firejail`) or macOS (`seatbelt`) process sandbox for bash commands. Wraps the shell in a restricted environment with a writable workspace profile. |
+| **Sandbox** | Optional Microsandbox microVM that isolates agent-controlled process execution (bash, git, diagnostics, plugin scripts). Runs a separate Linux kernel + filesystem root on Linux (KVM), Apple Silicon macOS, and Windows (WHP). The host environment and credentials are not inherited. See [Sandbox Guide](../guides/sandbox.md). |
 | **SDK** | The TypeScript package (`@catalyst-code/coding-agent`) that wraps the core binary's JSONL protocol into a pi-coding-agent-compatible API. |
 | **Session** | An append-only JSONL file recording every message in a conversation. Auto-resumed on restart. Schema-versioned for forward compatibility. |
 | **Skill** | An advisory prompt fragment stored at `.catalyst-code/skills/<name>/SKILL.md` with YAML frontmatter. Applied via `/skill:<name>` to guide the model on recurring task patterns. |

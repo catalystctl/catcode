@@ -564,7 +564,9 @@ Prevent the AI from degrading itself, without strangling it:
 |                  | already be enabled/disabled per-name.                            |
 | Trust levels     | Two tiers by construction: **advisory** (skills = prompts, low    |
 |                  | blast radius) vs **executable** (plugins = code, already gated). |
-| Sandbox execution| **Exists.** `--sandbox firejail` + `--no-network` for bash.       |
+| Sandbox execution| **Exists.** `--sandbox microsandbox` + `--no-network` runs  |
+|                  | agent workloads (bash, git, diagnostics, plugins) inside a         |
+|                  | Microsandbox microVM. Separate kernel + filesystem root.          |
 | Canary / staged  | **Deferred** for skills (advisory → no blast radius). The plugin   |
 | rollouts         | enable/disable toggle is the staged-rollout mechanism for code.  |
 

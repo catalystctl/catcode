@@ -175,8 +175,17 @@ func TestToggleCommandsWithArgs(t *testing.T) {
 	}
 
 	s.handleUserLine("/sandbox firejail")
-	if s.settings.Sandbox != "firejail" {
-		t.Errorf("sandbox = %q, want firejail", s.settings.Sandbox)
+	// Deprecated backends migrate to microsandbox and start the fail-closed
+	// enable flow (status check). The setting is NOT persisted until the core
+	// reports the environment ready.
+	if s.settings.Sandbox != "none" {
+		t.Errorf("sandbox = %q, want none (not persisted until ready)", s.settings.Sandbox)
+	}
+	if !s.pendingSandboxEnable {
+		t.Error("/sandbox firejail should set pendingSandboxEnable")
+	}
+	if s.modal.kind != modalSandboxStatus {
+		t.Errorf("modal = %v, want modalSandboxStatus", s.modal.kind)
 	}
 
 	s.handleUserLine("/auto-compact off")

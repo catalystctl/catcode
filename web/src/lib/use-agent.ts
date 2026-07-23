@@ -9,6 +9,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { reduce, initialState } from "./reducer";
+import {
+  getSandboxStatusCommand,
+  prepareSandboxCommand,
+  resetSandboxCommand,
+} from "./commands";
 import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, CustomProviderDraft, ModelInfo } from "./types";
 
 // ponytail: localStorage persistence for UI preferences (model/thinking/approval).
@@ -147,6 +152,13 @@ export interface AgentApi {
   createCheckpoint: (label?: string, paths?: string[]) => Promise<void>;
   listCheckpoints: () => Promise<void>;
   restoreCheckpoint: (id: string) => Promise<void>;
+  // ── Sandbox (Microsandbox) ──
+  /** Re-run preflight; the core replies with a `sandbox_status` event. */
+  getSandboxStatus: () => Promise<void>;
+  /** Begin user-space runtime/image prep (`prepare_sandbox`). */
+  prepareSandbox: () => Promise<void>;
+  /** Reset an unhealthy sandbox (`reset_sandbox`). */
+  resetSandbox: () => Promise<void>;
   // ── Connection ──
   reconnect: () => void;
   // ── Utility ──
@@ -1104,6 +1116,18 @@ export function useAgent(): AgentApi {
     [fire],
   );
 
+  // ── Sandbox (Microsandbox) ──
+  // Thin fire-and-forget wrappers over the typed command builders in
+  // commands.ts. The core replies asynchronously via sandbox_status /
+  // sandbox_prepare_progress / sandbox_ready / sandbox_error events, which the
+  // reducer folds into state.sandbox.
+  const getSandboxStatus = useCallback(
+    () => fire(getSandboxStatusCommand()),
+    [fire],
+  );
+  const prepareSandbox = useCallback(() => fire(prepareSandboxCommand()), [fire]);
+  const resetSandbox = useCallback(() => fire(resetSandboxCommand()), [fire]);
+
   // ── Usage ──
   const usage = useCallback(
     (model?: string) => fire({ type: "usage", ...(model ? { model } : {}) }),
@@ -1302,6 +1326,9 @@ export function useAgent(): AgentApi {
       createCheckpoint,
       listCheckpoints,
       restoreCheckpoint,
+      getSandboxStatus,
+      prepareSandbox,
+      resetSandbox,
       reconnect,
       copyLastReply,
       exportTranscript,

@@ -90,6 +90,10 @@ export {
   type AskRequestEvent,
   type SudoRequestEvent,
   type MetricsEvent,
+  type SandboxStatusEvent,
+  type SandboxPrepareProgressEvent,
+  type SandboxReadyEvent,
+  type SandboxErrorEvent,
 } from "./core-events.js";
 
 // Theme
@@ -215,4 +219,27 @@ export {
 } from "./sdk.js";
 
 // Low-level process bridge (advanced usage / testing).
-export { CoreProcess, type CoreProcessOptions, type ReadyPayload, type CoreCommand } from "./core-process.js";
+export {
+  CoreProcess,
+  SandboxCommandError,
+  type CoreProcessOptions,
+  type ReadyPayload,
+  type CoreCommand,
+} from "./core-process.js";
+
+// Sandbox (Microsandbox migration) — typed config + status + preflight report.
+export type {
+  SandboxMode,
+  SandboxOption,
+  SandboxLegacyAlias,
+  SandboxNetworkMode,
+  SandboxConfig,
+  SandboxPreflightCheck,
+  SandboxPreflightCheckStatus,
+  SandboxPreflightReport,
+  SandboxSetupAction,
+  SandboxStatus,
+  SandboxReady,
+  SandboxError,
+} from "./sandbox.js";
+export { normalizeSandboxMode } from "./sandbox.js";

@@ -75,8 +75,8 @@ core [OPTIONS]
 | `--max-bash-timeout <SECS>` | integer | `600` | `CATALYST_CODE_MAX_BASH_TIMEOUT` | Ceiling for the bash tool's per-call `timeout` override. |
 | `--fetch-timeout <SECS>` | integer | `20` | `CATALYST_CODE_FETCH_TIMEOUT` | Wall-clock timeout for the `fetch` tool. |
 | `--diag-timeout <SECS>` | integer | `120` | `CATALYST_CODE_DIAG_TIMEOUT` | Diagnostics tool (`cargo check`/`tsc`/`go build`) timeout. |
-| `--sandbox <MODE>` | enum | `none` | `CATALYST_CODE_SANDBOX` | Sandbox for bash: `none`, `firejail` (Linux), `seatbelt` (macOS). |
-| `--no-network` | flag | `false` | `CATALYST_CODE_NO_NETWORK=1` | Block bash network egress via `unshare -n`. |
+| `--sandbox <MODE>` | enum | `none` | `CATALYST_CODE_SANDBOX` | Sandbox for agent workloads: `none`, `microsandbox` (runs bash/git/diagnostics/plugins in a Microsandbox microVM on Linux KVM, Apple Silicon macOS, Windows WHP). Legacy `firejail`/`seatbelt` migrate to `microsandbox`. |
+| `--no-network` | flag | `false` | `CATALYST_CODE_NO_NETWORK=1` | Block guest network egress (Microsandbox network policy). |
 | `--trust-project-plugins` | flag | `false` | `CATALYST_CODE_TRUST_PROJECT_PLUGINS=1` | Load project-scoped plugins (`.catalyst-code/plugins`). Off by default for safety. |
 | `--idle-timeout <SECS>` | integer | `120` | `CATALYST_CODE_IDLE_TIMEOUT` | SSE idle timeout. |
 | `--max-session-tokens <N>` | integer | `0` (unlimited) | `CATALYST_CODE_MAX_SESSION_TOKENS` | Hard session token budget. `0` = unlimited. |
@@ -106,9 +106,14 @@ These configuration keys can only be set via environment variable or config file
 
 | CLI value | Aliases | Effective Mode |
 |---|---|---|
-| `none` | `""` (empty) | No sandboxing |
-| `firejail` | `fj` | Firejail (Linux) |
-| `seatbelt` | `macos` | macOS sandbox-exec |
+| `none` | `off`, `false`, `disabled` | No sandboxing (host execution) |
+| `microsandbox` | `msb`, `on`, `true`, `enabled` | Microsandbox microVM |
+| (legacy) `firejail` | `fj` | migrated to `microsandbox` (deprecation notice) |
+| (legacy) `seatbelt` | `macos`, `sandbox-exec` | migrated to `microsandbox` (deprecation notice) |
+
+See the [Sandbox Guide](../guides/sandbox.md) for platform requirements. Legacy
+values never silently downgrade to `none`; if the environment cannot run
+Microsandbox, the sandbox fails closed.
 
 ### Approval Mode Values
 
@@ -174,7 +179,7 @@ core --workspace /path/to/project --approval never
 ### Restrict workspace and enable sandbox
 
 ```bash
-core --workspace /home/user/project --sandbox firejail
+core --workspace /home/user/project --sandbox microsandbox
 ```
 
 ### Set provider and model from environment
@@ -185,10 +190,10 @@ export UMANS_ACTIVE_PROVIDER="openai"
 core --model gpt-4o
 ```
 
-### Disable network and auto-approve (isolated evaluation)
+### Disable network and run fully isolated (auto-approve, no egress)
 
 ```bash
-core --no-network --approval never --workspace /tmp/sandbox
+core --sandbox microsandbox --no-network --approval never --workspace /tmp/sandbox
 ```
 
 ### Check for TUI update

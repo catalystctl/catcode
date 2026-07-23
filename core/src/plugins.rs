@@ -201,6 +201,210 @@ async fn bounded_plugin_output(
     .await
 }
 
+/// Normalized plugin/hook run result (host or microVM). `std::process::Output`
+/// is awkward to construct cross-platform from a guest exit code, so plugin_run
+/// returns this plain struct instead.
+pub(crate) struct PluginRunOutput {
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// How a plugin/hook run failed (so each caller can map to deny/skip/error).
+pub(crate) enum PluginRunError {
+    SpawnFailed(String),
+    StdinTimeout(String),
+    Timeout,
+    WaitFailed(String),
+    /// Sandboxing backend error (setup-required, missing image, …). Never a host
+    /// fallback — the caller surfaces it as a fail-closed error.
+    Backend(String),
+}
+
+/// Run a plugin/hook/oauth/memory-provider script. When sandboxing is enabled
+/// the script executes inside the microVM via the shared execution backend
+/// (never directly on the host); the script directory is mounted read-only
+/// (workspace plugins live under /workspace, global plugins under
+/// /catcode-plugins). Host secrets are never inherited. The context payload
+/// travels over stdin; stdout carries the response.
+///
+/// Returns the SAME shape as [`bounded_plugin_output`] so the existing
+/// deny/skip/error match arms in the callers are unchanged.
+async fn plugin_run(
+    script: &std::path::Path,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<std::io::Result<std::process::Output>, std::io::Error> {
+    if crate::sandbox::is_sandbox_enabled() {
+        return plugin_run_sandboxed(script, stdin, timeout, extra_env).await;
+    }
+    // Host path: spawn with the minimal env, write stdin, bound the wait.
+    let mut child = match hook_command_with_env(script, extra_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Err(std::io::Error::other(format!(
+                "failed to spawn script {:?}: {e}",
+                script
+            ))))
+        }
+    };
+    if !stdin.is_empty() {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let stdin_timeout = Duration::from_millis(timeout.as_millis().max(1000) as u64);
+            let write_fut = async {
+                use tokio::io::AsyncWriteExt;
+                let _ = child_stdin.write_all(&stdin).await;
+                let _ = child_stdin.shutdown().await;
+            };
+            if tokio::time::timeout(stdin_timeout, write_fut)
+                .await
+                .is_err()
+            {
+                let _ = child.start_kill();
+                // Model a stdin timeout as an elapsed timeout so the caller's
+                // existing `Err(_)` arm (deny/skip/error on timeout) handles it.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "plugin execution timed out",
+                ));
+            }
+        }
+    }
+    match bounded_plugin_output(child, timeout).await {
+        Ok(Ok(o)) => Ok(Ok(o)),
+        Ok(Err(e)) => Ok(Err(e)),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "plugin execution timed out",
+        )),
+    }
+}
+
+/// Construct a `std::process::Output` from a guest exit code cross-platform.
+fn output_from_exit(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    };
+    #[cfg(not(unix))]
+    let status = {
+        // On non-Unix the only guest is Linux (sandboxed), so this branch is
+        // unreachable in practice; fall back to a best-effort status.
+        std::process::ExitStatus::default()
+    };
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// Sandboxed plugin/hook run: translate the script path to its guest location,
+/// pick the guest interpreter (Linux guest — no PowerShell), and exec via the
+/// shared backend. Never falls back to the host on a backend error.
+async fn plugin_run_sandboxed(
+    script: &std::path::Path,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<std::io::Result<std::process::Output>, std::io::Error> {
+    use crate::sandbox::policy;
+    let cfg = crate::sandbox::config();
+    let cfg = cfg.as_ref();
+    // Translate the host script path to its guest mount point.
+    let ws = cfg
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.workspace.clone());
+    let plugin_dir = cfg
+        .plugin_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.plugin_dir.clone());
+    let script_canon = match script.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(Err(std::io::Error::other(format!(
+                "script {:?} not found: {e}",
+                script
+            ))))
+        }
+    };
+    let guest_path = if let Ok(rel) = script_canon.strip_prefix(&ws) {
+        std::path::PathBuf::from("/workspace").join(rel)
+    } else if plugin_dir.exists() {
+        if let Ok(rel) = script_canon.strip_prefix(&plugin_dir) {
+            std::path::PathBuf::from("/catcode-plugins").join(rel)
+        } else {
+            return Ok(Err(std::io::Error::other(format!(
+                "script {:?} is not under the workspace or the global plugin dir; it cannot run in the sandbox",
+                script
+            ))));
+        }
+    } else {
+        return Ok(Err(std::io::Error::other(format!(
+            "script {:?} is not under the workspace and no global plugin dir is mounted",
+            script
+        ))));
+    };
+    let gp = guest_path.display().to_string();
+    // Pick the guest interpreter from the extension (guest is Linux).
+    let ext = script
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (program, args): (String, Vec<String>) = match ext.as_str() {
+        "sh" | "bash" => ("bash".to_string(), vec![gp]),
+        "py" => ("python3".to_string(), vec![gp]),
+        "ps1" | "bat" | "cmd" | "exe" | "com" => {
+            return Ok(Err(std::io::Error::other(format!(
+                "script {:?} is a Windows-only type (.{ext}); the sandbox guest is Linux. \
+                 Re-implement the plugin as a .sh or .py script.",
+                script
+            ))));
+        }
+        _ => ("sh".to_string(), vec![gp]),
+    };
+    let proc_env = policy::build_process_env(cfg, policy::ExecPurpose::Plugin);
+    let mut env = proc_env.env;
+    for (k, v) in extra_env {
+        if !policy::is_secret_var(k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    let cwd = policy::effective_cwd(cfg, "").unwrap_or_else(|_| cfg.workspace.clone());
+    let req = crate::sandbox::ExecRequest {
+        program,
+        args,
+        cwd,
+        env,
+        inherit_parent_env: false,
+        stdin: Some(stdin),
+        timeout,
+        ..Default::default()
+    };
+    match crate::sandbox::execution_backend().execute(req).await {
+        Ok(r) => {
+            let code = r.exit_code.unwrap_or(127);
+            Ok(Ok(output_from_exit(code, r.stdout, r.stderr)))
+        }
+        Err(crate::sandbox::ExecutionError::Timeout(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "plugin execution timed out",
+        )),
+        Err(e) => Ok(Err(std::io::Error::other(e.user_message()))),
+    }
+}
+
 /// Slash-command names reserved by the harness. Plugin commands may not reuse
 /// these (with or without a leading `/`).
 const RESERVED_COMMAND_NAMES: &[&str] = &[
@@ -1993,25 +2197,6 @@ pub async fn execute_hook(
 
     // Spawn the hook script.
     let script_path = &config.script;
-    let mut child = match hook_command(script_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to spawn hook script {:?}: {e}", script_path);
-            return if is_deny { deny(msg) } else { skip(msg) };
-        }
-    };
-
-    // Write the context JSON to stdin, then close it so the script can proceed.
-    // The write can block indefinitely if a hook with pass_args doesn't drain
-    // its stdin (a >64KB payload exceeds the pipe buffer). Bound it by the
-    // hook's own timeout so a wedged hook can't hang the turn forever; on
-    // timeout kill the child and deny/skip (P1-9).
     let context_bytes = serde_json::to_vec(context).unwrap_or_default();
     if let Err(message) = validate_plugin_io("plugin hook", context_bytes.len()) {
         return if is_deny {
@@ -2020,28 +2205,12 @@ pub async fn execute_hook(
             skip(message)
         };
     }
-    if let Some(mut stdin) = child.stdin.take() {
-        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
-        let write_fut = async {
-            let _ = stdin.write_all(&context_bytes).await;
-            let _ = stdin.shutdown().await;
-        };
-        if tokio::time::timeout(stdin_timeout, write_fut)
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            let msg = format!(
-                "hook '{}' did not consume stdin within {}ms",
-                hook_name,
-                stdin_timeout.as_millis()
-            );
-            return if is_deny { deny(msg) } else { skip(msg) };
-        }
-    }
-
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    let output_result = bounded_plugin_output(child, timeout_dur).await;
+    // Sandboxed (microVM) or host: plugin_run routes through the shared
+    // execution backend when sandboxing is enabled, translating the script
+    // path to its guest mount and denying host secrets. Same return shape as
+    // bounded_plugin_output, so the deny/skip/error match arms are unchanged.
+    let output_result = plugin_run(script_path, context_bytes, timeout_dur, &[]).await;
 
     match output_result {
         Ok(Ok(output)) => {
@@ -2262,45 +2431,8 @@ pub async fn execute_plugin_tool(
         return Outcome::err(message);
     }
 
-    let mut child = match hook_command(&config.script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Outcome::err(format!(
-                "plugin tool '{}' failed to spawn handler: {e}",
-                tool_name
-            ))
-        }
-    };
-
-    // Write the args context to stdin, bounded by the tool's timeout so a
-    // handler that never drains its stdin can't hang the turn forever.
-    if let Some(mut stdin) = child.stdin.take() {
-        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
-        let write_fut = async {
-            let _ = stdin.write_all(&ctx_bytes).await;
-            let _ = stdin.shutdown().await;
-        };
-        if tokio::time::timeout(stdin_timeout, write_fut)
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            return Outcome::err(format!(
-                "plugin tool '{}' handler did not consume stdin within {}ms",
-                tool_name,
-                stdin_timeout.as_millis()
-            ));
-        }
-    }
-
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match bounded_plugin_output(child, timeout_dur).await {
+    match plugin_run(&config.script, ctx_bytes, timeout_dur, &[]).await {
         Ok(Ok(output)) => {
             if let Err(message) =
                 validate_plugin_output("plugin tool", &output.stdout, &output.stderr)
@@ -2401,43 +2533,8 @@ pub async fn execute_plugin_command(
         return Outcome::err(message);
     }
 
-    let mut child = match hook_command(&config.script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Outcome::err(format!(
-                "plugin command '{}' failed to spawn handler: {e}",
-                config.name
-            ))
-        }
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
-        let write_fut = async {
-            let _ = stdin.write_all(&ctx_bytes).await;
-            let _ = stdin.shutdown().await;
-        };
-        if tokio::time::timeout(stdin_timeout, write_fut)
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            return Outcome::err(format!(
-                "plugin command '{}' handler did not consume stdin within {}ms",
-                config.name,
-                stdin_timeout.as_millis()
-            ));
-        }
-    }
-
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match bounded_plugin_output(child, timeout_dur).await {
+    match plugin_run(&config.script, ctx_bytes, timeout_dur, &[]).await {
         Ok(Ok(output)) => {
             if let Err(message) =
                 validate_plugin_output("plugin command", &output.stdout, &output.stderr)
@@ -2561,59 +2658,8 @@ pub async fn execute_memory_provider(
         return MemoryProviderResult::err(message);
     }
 
-    let mut cmd = hook_command(&config.script);
-    // Memory backends often need their own config (e.g. ENGRAPHIS_DB_PATH).
-    // Re-inject Engraphis-related env after hook_command's env_clear.
-    for key in [
-        "ENGRAPHIS_DB_PATH",
-        "ENGRAPHIS_EMBED_MODEL",
-        "ENGRAPHIS_EMBED_DIM",
-        "ENGRAPHIS_EXTRACTOR",
-        "ENGRAPHIS_WORKSPACES",
-        "PYTHONPATH",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-
-    let mut child = match cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return MemoryProviderResult::err(format!(
-                "memory_provider '{}' failed to spawn: {e}",
-                config.plugin_name
-            ))
-        }
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let stdin_timeout = Duration::from_millis(config.timeout_ms.max(1000));
-        let write_fut = async {
-            let _ = stdin.write_all(&ctx_bytes).await;
-            let _ = stdin.shutdown().await;
-        };
-        if tokio::time::timeout(stdin_timeout, write_fut)
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            return MemoryProviderResult::err(format!(
-                "memory_provider '{}' did not consume stdin within {}ms",
-                config.plugin_name,
-                stdin_timeout.as_millis()
-            ));
-        }
-    }
-
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match bounded_plugin_output(child, timeout_dur).await {
+    match plugin_run(&config.script, ctx_bytes, timeout_dur, &[]).await {
         Ok(Ok(output)) => {
             if let Err(message) =
                 validate_plugin_output("memory provider", &output.stdout, &output.stderr)

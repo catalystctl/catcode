@@ -366,11 +366,15 @@ The approval request surfaces as a TUI modal or web dialog. The user can reply
 
 ### Optional Sandbox
 
-- **Linux:** `--sandbox firejail` — runs `bash` inside Firejail
-- **macOS:** `--sandbox seatbelt` — seatbelt sandbox for bash
-- **Windows:** denylist-only (no sandbox)
-- `--no-network` — blocks network access for bash/fetch
-- Sandboxing is **Linux-only** for hard security; the denylist is a tripwire
+- **Linux:** `--sandbox microsandbox` — runs agent workloads inside a
+  Microsandbox microVM using KVM
+- **macOS:** `--sandbox microsandbox` — Apple Silicon virtualization (Intel
+  macOS unsupported)
+- **Windows:** `--sandbox microsandbox` — Windows Hypervisor Platform (preview)
+- `--no-network` — blocks guest network egress via Microsandbox network policy
+- The sandbox is a real isolation boundary (separate kernel + filesystem root);
+  the denylist is only a tripwire. It fails closed when unavailable — it never
+  falls back to host execution. See the [Sandbox Guide](../guides/sandbox.md).
 
 ### Plugin Trust
 

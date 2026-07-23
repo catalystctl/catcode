@@ -60,4 +60,6 @@ Write-Host "Done. Open a NEW PowerShell window (so PATH reloads) and run:" -Fore
 Write-Host "    catcode" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "First run inside catcode:  /login   then pick a model with /model"
-Write-Host "Tip: the agent's bash tool needs bash on PATH (Git Bash or WSL)."
+Write-Host "Tip: with the Microsandbox enabled (--sandbox microsandbox), the bash tool"
+Write-Host "runs inside a Linux guest, so no host shell is needed. With the sandbox off,"
+Write-Host "it uses the host's native shell (PowerShell on Windows). See docs/guides/sandbox.md."

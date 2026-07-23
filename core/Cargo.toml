@@ -2,7 +2,7 @@
 name = "catalyst-code-core"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 description = "OpenAI-compatible coding agent core with native Umans provider"
 
 [[bin]]
@@ -23,6 +23,13 @@ rand = "0.8"
 libc = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 bytes = "1"
+# Sandbox: official Microsandbox Rust SDK (embeddable microVM). Gated behind
+# the `microsandbox` feature (default on) so the SDK's heavy dep tree is only
+# pulled when sandboxing is compiled in. ALL SDK types live behind CatCode-owned
+# abstractions in `core/src/sandbox/` — never call the SDK directly from tools.
+async-trait = "0.1"
+thiserror = "1"
+microsandbox = { version = "0.6.6", optional = true, default-features = false, features = ["net", "prebuilt"] }
 wry = { version = "0.53", optional = true }
 tao = { version = "0.34", optional = true }
 # Linux screenshot: WebKitGTK get_snapshot → cairo PNG (versions aligned with wry 0.53).
@@ -33,8 +40,12 @@ glib = { version = "0.18", optional = true }
 gio = { version = "0.18", optional = true }
 
 [features]
-default = []
+default = ["microsandbox"]
 native-browser = ["dep:wry", "dep:tao", "dep:webkit2gtk", "dep:cairo", "dep:gio", "dep:gtk", "dep:glib"]
+# Microsandbox microVM sandboxing (Linux/KVM, Apple Silicon macOS, Windows/WHP).
+# The SDK downloads its own runtime (msb + libkrunfw) on first use; no external
+# CLI/daemon is required. Disable to build a sandbox-less core.
+microsandbox = ["dep:microsandbox"]
 
 [dev-dependencies]
 filetime = "0.2"

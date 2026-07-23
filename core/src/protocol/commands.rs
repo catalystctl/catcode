@@ -240,6 +240,19 @@ pub enum Command {
     /// Values are coerced from the JSON type (string or number).
     #[serde(rename = "set_config")]
     SetConfig { key: String, value: Value },
+    /// Get the current sandbox status (mode, readiness, platform checks,
+    /// setup actions). Emits a `sandbox_status` event.
+    #[serde(rename = "get_sandbox_status")]
+    GetSandboxStatus,
+    /// Download/verify Microsandbox runtime assets + pull the configured OCI
+    /// image (user-space only; never runs sudo or enables OS features). Emits
+    /// `sandbox_prepare_progress` then `sandbox_ready` / `sandbox_error`.
+    #[serde(rename = "prepare_sandbox")]
+    PrepareSandbox,
+    /// Stop and recreate the active sandbox (e.g. after it went unhealthy).
+    /// Emits a `sandbox_status` event.
+    #[serde(rename = "reset_sandbox")]
+    ResetSandbox,
     /// Plugin lifecycle commands. `install_plugin.path` accepts a local
     /// directory **or** a GitHub Release source (`owner/repo[@tag]`, full
     /// github.com URL). Release installs download the source `.zip`.

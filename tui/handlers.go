@@ -244,6 +244,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 					))
 				}
 			}
+			s.applyReadySandboxFields(m)
 		}
 		// Bind a pre-provider-era global key to the provider reported at startup.
 		// This must happen before any later switch can change activeProvider.
@@ -328,6 +329,35 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		}
 		s.reauthActiveProvider()
 		s.layout()
+
+	case "sandbox_status":
+		// {mode, report} — the core's preflight reply; refreshes the status
+		// panel and resolves a pending enable request.
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			s.onSandboxStatusEvent(m)
+		}
+
+	case "sandbox_prepare_progress":
+		// {phase} — runtime/image download progress.
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			s.onSandboxPrepareProgressEvent(m)
+		}
+
+	case "sandbox_ready":
+		// {ready, report} — preparation finished (or an admin step still pending).
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			s.onSandboxReadyEvent(m)
+		}
+
+	case "sandbox_error":
+		// {error} — a setup/runtime failure. Fail-closed: never fall back to host.
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			s.onSandboxErrorEvent(m)
+		}
 
 	case "authed":
 		// Honor ok=false (e.g. future unauth signals); default missing ok to true.
@@ -2453,16 +2483,42 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			return nil
 		case "/sandbox":
 			if len(parts) >= 2 {
-				mode := parts[1]
-				if sandboxModeAvailable(mode) {
-					s.settings.Sandbox = mode
-					_ = s.settings.save()
-					s.logInfo(fmt.Sprintf("sandbox: %s", mode))
-					s.offerCoreRestart("sandbox mode")
-				} else if mode == "firejail" || mode == "seatbelt" {
-					s.logError(fmt.Sprintf("sandbox %s is unavailable on this operating system", mode))
+				sub := strings.ToLower(parts[1])
+				switch sub {
+				case "status":
+					s.requestSandboxStatus()
+					return nil
+				case "enable", "on":
+					s.requestSandboxEnable()
+					return nil
+				case "disable", "off":
+					s.setSandboxNone()
+					return nil
+				case "setup", "prepare":
+					s.requestSandboxPrepare()
+					return nil
+				case "recheck", "check":
+					s.requestSandboxStatus()
+					return nil
+				case "reset":
+					s.requestSandboxReset()
+					return nil
+				}
+				// Otherwise treat the argument as a sandbox value (none | microsandbox
+				// | a deprecated backend alias). Deprecated backends are migrated to
+				// microsandbox so the user's intent to enable sandboxing is preserved.
+				mode, deprecated := normalizeSandboxValue(parts[1])
+				if mode == "" {
+					s.logError("usage: /sandbox [status|enable|disable|setup|recheck|reset] | none | microsandbox")
+					return nil
+				}
+				if deprecated {
+					s.logInfo(fmt.Sprintf("sandbox %q is deprecated; migrating to microsandbox", parts[1]))
+				}
+				if mode == "none" {
+					s.setSandboxNone()
 				} else {
-					s.logError("usage: /sandbox none|firejail|seatbelt")
+					s.requestSandboxEnable()
 				}
 				return nil
 			}
@@ -2722,6 +2778,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				"Status",
 				"model: " + model + " · provider: " + provider,
 				"approval: " + approvalModeLabel(s.approvalMode()) + " · reasoning: " + effort,
+				"sandbox: " + s.sandboxEffectiveLabel(),
 				"theme: " + activeTheme.name + " · mouse: on",
 			}
 			if metrics := s.renderMetrics(); metrics != "" {

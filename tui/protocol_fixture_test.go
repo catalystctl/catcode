@@ -29,8 +29,8 @@ func TestRustCommandFixturesRemainGoCompatible(t *testing.T) {
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if count != 59 {
-		t.Fatalf("got %d command fixtures, want 59", count)
+	if count != 64 {
+		t.Fatalf("got %d command fixtures, want 64", count)
 	}
 }
 
@@ -63,7 +63,7 @@ func TestRustEventFixturesRemainGoCompatible(t *testing.T) {
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(seen) != 89 {
-		t.Fatalf("got %d event fixtures, want 89", len(seen))
+	if len(seen) != 94 {
+		t.Fatalf("got %d event fixtures, want 94", len(seen))
 	}
 }

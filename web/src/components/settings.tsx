@@ -9,6 +9,11 @@ import type { ModelInfo, ReadyPayload, VisionConfig } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import type {
+  SandboxCheckStatus,
+  SandboxRuntimeStatus,
+  SandboxSetupAction,
+} from "@/lib/types";
 import {
   CheckIcon,
   XIcon,
@@ -22,6 +27,11 @@ import {
   HelpIcon,
   LayoutIdeIcon,
   LayoutChatIcon,
+  CopyIcon,
+  RefreshIcon,
+  DownloadIcon,
+  WarningIcon,
+  TerminalIcon,
 } from "./icons";
 import { ModelPicker } from "./model-picker";
 import { AccountSecurity } from "./account-security";
@@ -40,7 +50,15 @@ interface Props {
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
   onSetBashTimeout: (secs: number) => void;
   onSetAutoCompact: (on: boolean) => void;
-  onSetSandbox: (mode: "none" | "firejail" | "seatbelt") => void;
+  onSetSandbox: (mode: "none" | "microsandbox") => void;
+  /** Live sandbox runtime status (source of truth for readiness/setup). */
+  sandboxStatus: SandboxRuntimeStatus;
+  /** Re-run preflight (sends get_sandbox_status). */
+  onRecheckSandbox: () => void;
+  /** Begin user-space runtime/image preparation (sends prepare_sandbox). */
+  onPrepareSandbox: () => void;
+  /** Reset an unhealthy sandbox (sends reset_sandbox). */
+  onResetSandbox: () => void;
   visionConfig: VisionConfig | null;
   onSetVisionConfig: (
     vision_model: string | null,
@@ -78,11 +96,23 @@ const APPROVAL_HELP: Record<string, string> = {
   destructive: "Ask before bash commands and file edits",
   always: "Confirm every tool call before it runs",
 };
-const SANDBOX_MODES: Array<"none" | "firejail" | "seatbelt"> = ["none", "firejail", "seatbelt"];
+const SANDBOX_MODES: Array<"none" | "microsandbox"> = ["none", "microsandbox"];
 const SANDBOX_HELP: Record<string, string> = {
-  none: "Denylist tripwire only — no OS sandbox",
-  firejail: "Wrap bash in firejail (Linux)",
-  seatbelt: "sandbox-exec seatbelt profile (macOS)",
+  none: "Disabled — agent bash runs on the host (denylist tripwire only)",
+  microsandbox: "Run agent bash, git, diagnostics & plugins in a Linux microVM",
+};
+const SANDBOX_LABEL: Record<string, string> = {
+  none: "Disabled",
+  microsandbox: "Microsandbox",
+};
+const CHECK_STATUS_META: Record<
+  SandboxCheckStatus,
+  { label: string; className: string; dot: string }
+> = {
+  pass: { label: "Pass", className: "text-success", dot: "bg-success" },
+  fail: { label: "Fail", className: "text-danger", dot: "bg-danger" },
+  warn: { label: "Warning", className: "text-warning", dot: "bg-warning" },
+  info: { label: "Info", className: "text-ink-400", dot: "bg-ink-500" },
 };
 
 function SectionHeading({ title, desc }: { title: string; desc?: string }) {
@@ -180,6 +210,287 @@ function ToggleRow({
         />
       </span>
     </button>
+  );
+}
+
+/** One row of a labeled key/value status fact (platform, image, …). */
+function StatusFact({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex min-w-0 items-baseline justify-between gap-3">
+      <span className="shrink-0 text-[11px] uppercase tracking-wide text-ink-500">{label}</span>
+      <span
+        className={`min-w-0 truncate text-right text-[12px] text-ink-200 ${mono ? "font-mono" : ""}`}
+        title={typeof value === "string" ? value : undefined}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/** Copy-to-clipboard button for a setup command. */
+function CopyCommandButton({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard?.writeText(command).then(
+          () => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1400);
+          },
+          () => {},
+        );
+      }}
+      title="Copy command"
+      className="flex shrink-0 items-center gap-1 rounded-md border border-ink-700 px-2 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+    >
+      {copied ? (
+        <CheckIcon width={12} height={12} className="text-success" />
+      ) : (
+        <CopyIcon width={12} height={12} />
+      )}
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+/** Structured Microsandbox status + setup-guidance panel. Mirrors the TUI:
+ *  current status, platform, readiness, active image, CPU/memory, network mode,
+ *  effective shell, preflight checks, copyable setup actions, recheck/prepare/
+ *  reset/disable actions, and a core-restart hint. The core is the source of
+ *  truth — no OS detection is duplicated here (platform/arch come from the
+ *  report, shell from the ready payload). */
+function SandboxStatusPanel({
+  status,
+  onRecheck,
+  onPrepare,
+  onReset,
+  onDisable,
+}: {
+  status: SandboxRuntimeStatus;
+  onRecheck: () => void;
+  onPrepare: () => void;
+  onReset: () => void;
+  onDisable: () => void;
+}) {
+  const report = status.report;
+  const requestedMicrosandbox = status.mode === "microsandbox";
+  const notReady = requestedMicrosandbox && !status.ready;
+
+  // Effective shell hint: when the microsandbox is on, the guest is always
+  // Linux bash ("posix") — even on Windows — so the agent must not be told to
+  // generate PowerShell. Reflect that explicitly here.
+  const shellHint =
+    status.mode === "microsandbox"
+      ? status.shell === "powershell"
+        ? "Linux bash (guest)"
+        : "Linux bash (posix guest)"
+      : status.shell === "powershell"
+        ? "Host PowerShell"
+        : "Host bash (posix)";
+
+  return (
+    <Card className="space-y-3">
+      {/* Status banner */}
+      <div className="flex items-center gap-2">
+        <span
+          className={`h-2 w-2 shrink-0 rounded-full ${
+            requestedMicrosandbox
+              ? status.ready
+                ? "bg-success"
+                : "bg-warning"
+              : "bg-ink-600"
+          }`}
+        />
+        <span className="text-[12px] font-medium text-ink-100">
+          {requestedMicrosandbox
+            ? status.ready
+              ? "Microsandbox ready"
+              : "Microsandbox not ready"
+            : "Sandboxing disabled"}
+        </span>
+        {status.preparePhase ? (
+          <span className="ml-auto truncate text-[11px] text-ink-500" title={status.preparePhase}>
+            {status.preparePhase}…
+          </span>
+        ) : null}
+      </div>
+
+      {/* Error */}
+      {status.error ? (
+        <div className="flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-[12px] text-danger">
+          <WarningIcon width={14} height={14} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">{status.error}</span>
+        </div>
+      ) : null}
+
+      {/* Facts */}
+      <div className="space-y-1.5 rounded-lg border border-ink-800/80 bg-ink-925/60 px-3 py-2.5">
+        <StatusFact
+          label="Platform"
+          value={
+            report
+              ? `${report.platform} · ${report.architecture}`
+              : status.ready
+                ? "detected by core"
+                : "run Recheck to detect"
+          }
+        />
+        <StatusFact label="Shell" value={shellHint} />
+        <StatusFact
+          label="Image"
+          value={status.image ?? (requestedMicrosandbox ? "default (pending)" : "—")}
+          mono
+        />
+        <StatusFact
+          label="CPU / memory"
+          value={
+            status.cpus != null && status.memoryMb != null
+              ? `${status.cpus} vCPU · ${status.memoryMb} MiB`
+              : requestedMicrosandbox
+                ? "defaults (pending)"
+                : "—"
+          }
+        />
+        <StatusFact
+          label="Network"
+          value={status.networkMode ?? (requestedMicrosandbox ? "restricted (default)" : "—")}
+        />
+      </div>
+
+      {/* Setup-required guidance (checks + actions) */}
+      {notReady && report ? (
+        <div className="space-y-2">
+          {report.checks.length > 0 ? (
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-ink-500">
+                Preflight checks
+              </div>
+              {report.checks.map((c) => {
+                const meta = CHECK_STATUS_META[c.status] ?? CHECK_STATUS_META.info;
+                return (
+                  <div
+                    key={c.code}
+                    className="flex items-start gap-2 rounded-lg border border-ink-800/80 bg-ink-925/60 px-2.5 py-2"
+                  >
+                    <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-[12px] font-medium text-ink-100">{c.title}</span>
+                        <span className={`text-[10px] uppercase tracking-wide ${meta.className}`}>
+                          {meta.label}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 break-words text-[11px] leading-relaxed text-ink-400">
+                        {c.detail}
+                      </p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          {report.actions.length > 0 ? (
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-ink-500">
+                Setup actions
+              </div>
+              {report.actions.map((a: SandboxSetupAction, i) => (
+                <div
+                  key={`${a.title}-${i}`}
+                  className="space-y-1.5 rounded-lg border border-ink-800/80 bg-ink-925/60 px-2.5 py-2"
+                >
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-[12px] font-medium text-ink-100">{a.title}</span>
+                    {a.requires_admin ? (
+                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-warning">
+                        admin
+                      </span>
+                    ) : null}
+                    {a.requires_reboot ? (
+                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-warning">
+                        reboot
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="break-words text-[11px] leading-relaxed text-ink-400">
+                    {a.explanation}
+                  </p>
+                  {a.command ? (
+                    <div className="flex items-center gap-2">
+                      <code className="min-w-0 flex-1 truncate rounded bg-ink-950 px-2 py-1 font-mono text-[11px] text-ink-300">
+                        {a.command}
+                      </code>
+                      <CopyCommandButton command={a.command} />
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Restart hint: a mode change requires the core to (re)run preflight +
+          reconfigure execution routing. */}
+      {requestedMicrosandbox && !status.ready && !status.preparePhase ? (
+        <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-ink-500">
+          <TerminalIcon width={12} height={12} className="mt-0.5 shrink-0" />
+          Agent commands stay on hold until the sandbox is ready. A core restart
+          may be required after enabling virtualization.
+        </p>
+      ) : null}
+
+      {/* Actions */}
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={onRecheck}
+          className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-200 transition-colors hover:bg-ink-850 hover:text-ink-100"
+        >
+          <RefreshIcon width={13} height={13} />
+          Recheck environment
+        </button>
+        <button
+          type="button"
+          onClick={onPrepare}
+          disabled={!!status.preparePhase}
+          className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+        >
+          <DownloadIcon width={13} height={13} />
+          {status.preparePhase ? "Preparing…" : "Prepare runtime & image"}
+        </button>
+        {requestedMicrosandbox ? (
+          <>
+            <button
+              type="button"
+              onClick={onReset}
+              className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
+            >
+              <RefreshIcon width={13} height={13} />
+              Reset sandbox
+            </button>
+            <button
+              type="button"
+              onClick={onDisable}
+              className="ml-auto rounded-lg border border-ink-700 px-3 py-1.5 text-[12px] font-medium text-ink-400 transition-colors hover:border-danger/40 hover:text-danger"
+            >
+              Disable sandboxing
+            </button>
+          </>
+        ) : null}
+      </div>
+    </Card>
   );
 }
 
@@ -523,7 +834,7 @@ export function SettingsModal(props: Props) {
                   </div>
                 </div>
                 <div>
-                  <FieldLabel>Bash sandbox</FieldLabel>
+                  <FieldLabel>Sandbox</FieldLabel>
                   <div className="space-y-2">
                     {SANDBOX_MODES.map((mode) => {
                       const active = (props.sandbox || "none") === mode;
@@ -536,16 +847,26 @@ export function SettingsModal(props: Props) {
                         >
                           <ShieldIcon width={15} height={15} className="shrink-0" />
                           <div className="min-w-0">
-                            <div className="text-[13px] font-medium capitalize">{mode}</div>
+                            <div className="text-[13px] font-medium">{SANDBOX_LABEL[mode]}</div>
                             <div className="text-[11px] text-ink-500">{SANDBOX_HELP[mode]}</div>
                           </div>
                         </ChoiceButton>
                       );
                     })}
                   </div>
+                  <div className="mt-3">
+                    <SandboxStatusPanel
+                      status={props.sandboxStatus}
+                      onRecheck={props.onRecheckSandbox}
+                      onPrepare={props.onPrepareSandbox}
+                      onReset={props.onResetSandbox}
+                      onDisable={() => props.onSetSandbox("none")}
+                    />
+                  </div>
                   <p className="mt-2 text-[11px] leading-relaxed text-ink-500">
-                    Hard isolation for agent bash. Requires firejail (Linux) or seatbelt (macOS)
-                    when enabled.
+                    When enabled, agent bash, git, diagnostics and plugin scripts
+                    run inside a Linux microVM via the Microsandbox Rust SDK —
+                    no Docker, Firejail, or external CLI required.
                   </p>
                 </div>
               </div>

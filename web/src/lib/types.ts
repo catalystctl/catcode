@@ -88,8 +88,28 @@ export interface ReadyPayload extends SDKReadyPayload {
    * headroom for the selected model requires it. */
   context_compact_at?: number;
   context_digest_at?: number;
-  /** Bash hard sandbox: `"none"` | `"firejail"` | `"seatbelt"`. */
+  /** Bash hard sandbox mode: `"none"` | `"microsandbox"`. Legacy values
+   *  ("firejail", "seatbelt") are migrated to "microsandbox" by the core with a
+   *  deprecation notice — only "none" | "microsandbox" ever reaches the UI. */
   sandbox?: string;
+  /** Effective guest shell: `"bash"` (Linux bash, including inside the
+   *  microsandbox guest) or `"powershell"` (host PowerShell on Windows when
+   *  sandboxing is off). Drives command-generation hints so Windows users are
+   *  not told to generate PowerShell while the agent runs in a Linux microVM. */
+  shell?: string;
+  /** Active OCI image reference for the microsandbox guest. */
+  sandboxImage?: string;
+  /** CPU limit for the microsandbox guest. */
+  sandboxCpus?: number;
+  /** Memory limit (MiB) for the microsandbox guest. */
+  sandboxMemoryMb?: number;
+  /** Network policy mode for the microsandbox guest
+   *  ("none" | "restricted" | "allowlist"). */
+  sandboxNetworkMode?: string;
+  /** True when the microsandbox guest is ready to run agent workloads. This is
+   *  the source of truth for sandbox readiness, independent of the configured
+   *  mode — a requested-but-not-ready sandbox must NOT run commands on host. */
+  sandboxReady?: boolean;
   plugins_skipped?: string[];
 }
 
@@ -197,6 +217,82 @@ export interface CheckpointInfo {
 }
 
 export type WorktreeInfo = Omit<WorktreeReadyEvent, "type">;
+
+// ─── Sandbox (Microsandbox) ─────────────────────────────────────────────────
+// The Rust core is the single source of truth for platform detection,
+// readiness, and setup guidance — the UI never duplicates OS-detection logic.
+// These types mirror the core's preflight report + status events.
+
+/** Effective sandbox mode. The core migrates legacy "firejail"/"seatbelt"
+ *  values to "microsandbox" (with a deprecation notice), so only these two
+ *  values ever reach the UI. */
+export type SandboxMode = "none" | "microsandbox";
+
+/** Network policy for the microsandbox guest. */
+export type SandboxNetworkMode = "none" | "restricted" | "allowlist";
+
+/** Status of a single preflight check (stable, machine-readable). */
+export type SandboxCheckStatus = "pass" | "fail" | "warn" | "info";
+
+/** One preflight check in a sandbox status report. */
+export interface SandboxPreflightCheck {
+  /** Stable machine-readable code (e.g. "kvm_device_missing"). */
+  code: string;
+  title: string;
+  status: SandboxCheckStatus;
+  detail: string;
+}
+
+/** A user-facing setup/remediation action from a preflight report. */
+export interface SandboxSetupAction {
+  title: string;
+  explanation: string;
+  /** Copyable setup command, or null when no command applies (e.g. a BIOS step). */
+  command: string | null;
+  requires_admin: boolean;
+  requires_reboot: boolean;
+}
+
+/** Structured preflight report from the core. `platform`/`architecture` are
+ *  the source of truth for OS detection in the UI — do not re-derive them. */
+export interface SandboxPreflightReport {
+  requested: boolean;
+  supported: boolean;
+  ready: boolean;
+  platform: string;
+  architecture: string;
+  checks: SandboxPreflightCheck[];
+  actions: SandboxSetupAction[];
+}
+
+/** Live sandbox runtime status kept in `AgentState.sandbox`. Synthesized from
+ *  the `ready` payload (source of truth for readiness) and the four
+ *  sandbox_* events. */
+export interface SandboxRuntimeStatus {
+  /** Effective sandbox mode from the core. */
+  mode: SandboxMode;
+  /** True when the guest is ready to run agent workloads (from `ready`/
+   *  `sandbox_ready`). When the mode is "microsandbox" but this is false,
+   *  agent commands must NOT execute on the host. */
+  ready: boolean;
+  /** Active OCI image reference, when known. */
+  image: string | null;
+  /** CPU limit. */
+  cpus: number | null;
+  /** Memory limit (MiB). */
+  memoryMb: number | null;
+  /** Network policy mode. */
+  networkMode: SandboxNetworkMode | null;
+  /** Effective guest shell ("bash" | "powershell"), when known. */
+  shell: "bash" | "powershell" | null;
+  /** Latest preflight report (from `sandbox_status`). Null until the first
+   *  `get_sandbox_status` / `sandbox_status` arrives. */
+  report: SandboxPreflightReport | null;
+  /** Latest prepare phase (e.g. "downloading_runtime"), null when idle. */
+  preparePhase: string | null;
+  /** Last sandbox error message, null when none. */
+  error: string | null;
+}
 
 export type FileChangeRecord = Omit<FileChangeEvent, "type"> & { ts: number };
 
@@ -672,7 +768,15 @@ export type CoreEvent =
   | ({ type: "goal_plan" } & GoalPlan)
   | { type: "goal_phase"; from: string; to: string; message?: string; wave?: number; step_count?: number; done_count?: number }
   // ── Skills ──
-  | { type: "skills"; skills: SkillInfo[] };
+  | { type: "skills"; skills: SkillInfo[] }
+  // ── Sandbox (Microsandbox) ──
+  // Core wire events emitted by the sandbox subsystem. Not yet in the SDK's
+  // CORE_EVENT_TYPES catalog (the SDK lags the core); the reducer.test.ts
+  // "gap" set documents them so the coverage test stays green.
+  | { type: "sandbox_status"; mode: SandboxMode; report: SandboxPreflightReport }
+  | { type: "sandbox_prepare_progress"; phase: string }
+  | { type: "sandbox_ready"; ready: boolean; report?: SandboxPreflightReport }
+  | { type: "sandbox_error"; error: string };
 
 /** Core commands (client → server → core stdin). A typed subset. */
 export type CoreCommand =
@@ -790,7 +894,11 @@ export type CoreCommand =
   | { type: "cancel_goal" }
   | { type: "goal_status" }
   | { type: "approve_goal_plan" }
-  | { type: "revise_goal"; feedback: string; model: string; reasoning_effort?: string };
+  | { type: "revise_goal"; feedback: string; model: string; reasoning_effort?: string }
+  // ── Sandbox (Microsandbox) ──
+  | { type: "get_sandbox_status" }
+  | { type: "prepare_sandbox" }
+  | { type: "reset_sandbox" };
 
 /** Synthetic events produced by the bridge/client (not from the core). */
 export type SyntheticEvent =
@@ -927,6 +1035,10 @@ export interface ProjectEntry {
 
 export interface AgentState {
   ready: ReadyPayload | null;
+  /** Live sandbox (Microsandbox) runtime status. Synthesized from the `ready`
+   *  payload + sandbox_* events; `ready.sandboxReady` is the source of truth
+   *  for whether agent commands may run. */
+  sandbox: SandboxRuntimeStatus;
   models: ModelInfo[];
   authed: boolean | null;
   provider: string;

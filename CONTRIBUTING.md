@@ -66,13 +66,26 @@ CI runs all of the above, so run them locally first to save a round-trip.
 
 - File tools confine paths to the workspace (`..`/absolute/symlink escapes are
   rejected). Don't add a path-handling tool that bypasses `workspace::resolve`.
-- The `bash` tool runs under an optional sandbox (`--sandbox firejail`,
-  `--no-network`). Treat the denylist as a tripwire, not a sandbox.
+- The `bash` tool runs under an optional microVM sandbox (`--sandbox
+  microsandbox`, `--no-network`). Treat the denylist as a tripwire, not a
+  sandbox. When sandboxing is enabled, the denial-of-host-access is real
+  (separate kernel + filesystem root).
 - Secrets: never log API keys or OAuth tokens. The `set_key` path logs only the
   provider name, never the key. Config files holding keys are written `0600`.
 - Plugins from a repo's `.catalyst-code/plugins/` load only with an explicit
   `--trust-project-plugins` opt-in — never read that flag from a config file a
   repo could ship.
+
+### Sandbox subsystem
+
+The Microsandbox integration lives in `core/src/sandbox/` (backend, manager,
+preflight, setup, policy, error) behind a `microsandbox` cargo feature that is
+**on by default**. All Microsandbox SDK calls are isolated behind CatCode-owned
+abstractions (a `ExecutionBackend` trait with `HostExecutionBackend` /
+`MicrosandboxExecutionBackend` implementations) — do **not** call the SDK or
+spawn `msb`/`firejail`/`sandbox-exec`/`unshare` directly from tools, plugins, git
+helpers, or diagnostics. Add a new agent-controlled workload by routing it
+through the shared sandbox execution layer.
 
 ## Commit messages
 

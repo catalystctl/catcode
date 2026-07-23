@@ -54,8 +54,8 @@ All flags and their equivalent environment variables:
 | `--max-bash-timeout <SECS>` | `CATALYST_CODE_MAX_BASH_TIMEOUT` | `600` | Ceiling for the bash tool's per-call `timeout` override |
 | `--fetch-timeout <SECS>` | `CATALYST_CODE_FETCH_TIMEOUT` | `20` | Wall-clock timeout for the `fetch` tool |
 | `--diag-timeout <SECS>` | `CATALYST_CODE_DIAG_TIMEOUT` | `120` | Diagnostics tool timeout (cargo check / tsc / go build) |
-| `--sandbox <MODE>` | `CATALYST_CODE_SANDBOX` | `none` | `none` / `firejail` (wraps bash in a sandbox) |
-| `--no-network` | `CATALYST_CODE_NO_NETWORK=1` | `false` | Block bash network egress (`unshare -n`) |
+| `--sandbox <MODE>` | `CATALYST_CODE_SANDBOX` | `none` | `none` / `microsandbox` (runs agent workloads in a Microsandbox microVM) |
+| `--no-network` | `CATALYST_CODE_NO_NETWORK=1` | `false` | Block guest network egress (Microsandbox network policy) |
 | `--trust-project-plugins` | `CATALYST_CODE_TRUST_PROJECT_PLUGINS=1` | `false` | Load project-scoped plugins (`.catalyst-code/plugins`). Off by default for safety. **Cannot** be set from config files — only env/CLI. |
 | `--idle-timeout <SECS>` | `CATALYST_CODE_IDLE_TIMEOUT` | `120` | SSE idle timeout in seconds |
 | `--max-session-tokens <N>` | `CATALYST_CODE_MAX_SESSION_TOKENS` | `0` (unlimited) | Hard session token budget |
@@ -100,7 +100,11 @@ Settings files are JSON with this structure:
     "approval": "destructive",
     "bash_timeout": 60,
     "sandbox": "none",
-    "no_network": true
+    "no_network": true,
+    "sandbox_image": "ghcr.io/catalystctl/catcode-sandbox:0.1",
+    "sandbox_cpus": 2,
+    "sandbox_memory_mb": 2048,
+    "sandbox_network_mode": "restricted"
   }
 }
 ```
@@ -129,9 +133,35 @@ Defined by the `Sandbox` (/core/src/config.rs) enum:
 
 | Value | Effect |
 |-------|--------|
-| `none` (default) | No sandboxing; denylist tripwire only. |
-| `firejail` (or `fj`) | Wrap bash in `firejail` with a writable-workspace profile (Linux only). |
-| `seatbelt` (or `macos` / `sandbox-exec`) | macOS `sandbox-exec` profile whitelisting the workspace. |
+| `none` (default) | No sandboxing; denylist tripwire only. Commands run on the host. |
+| `microsandbox` (or `msb` / `on` / `true` / `enabled`) | Run agent workloads (bash, git, diagnostics, plugin scripts, subagent commands) inside a Microsandbox microVM. Linux via KVM, Apple Silicon macOS, Windows via WHP. |
+
+### Legacy value migration
+
+Old `firejail` / `fj` / `seatbelt` / `macos` / `sandbox-exec` values are still
+accepted for backward compatibility and migrate to `microsandbox` (never to
+`none`) with a deprecation notice. The user's intention to enable sandboxing is
+preserved; if the environment cannot run Microsandbox, CatCode fails closed.
+
+### Sandbox configuration
+
+See the [Sandbox Guide](../guides/sandbox.md) for platform setup, network
+policy, environment-variable policy, and troubleshooting. Key fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sandbox_image` | `ghcr.io/catalystctl/catcode-sandbox:0.1` | OCI image the guest boots from |
+| `sandbox_cpus` | `2` | vCPUs |
+| `sandbox_memory_mb` | `2048` | Guest RAM (MiB) |
+| `sandbox_disk_mb` | `8192` | Writable guest disk (MiB) |
+| `sandbox_idle_timeout_secs` | `900` | Idle teardown timeout |
+| `sandbox_network_mode` | `restricted` | `none` / `restricted` / `allowlist` |
+| `sandbox_network_allowlist` | `[]` | Hosts permitted under `allowlist` |
+| `sandbox_allow_private_networks` | `false` | Permit RFC 1918 / link-local |
+| `sandbox_env_allowlist` | `[]` | Extra env vars forwarded to the guest |
+
+All values are validated (positive/capped CPUs, safe min/max memory & disk,
+non-empty image, valid env var names).
 
 ---
 
@@ -256,8 +286,8 @@ All config fields with their types and defaults.
 | `audit_log` | bool | `false` | Append-only security audit sidecar |
 | `session_file` | string/null | `null` | Path to JSONL session file |
 | `default_model` | string/null | `null` | Default model ID |
-| `sandbox` | enum | `none` | `none` / `firejail` / `seatbelt` |
-| `no_network` | bool | `false` | Block bash network egress |
+| `sandbox` | enum | `none` | `none` / `microsandbox` (legacy `firejail`/`seatbelt` migrate to `microsandbox`) |
+| `no_network` | bool | `false` | Block guest network egress (Microsandbox policy) |
 | `idle_timeout_secs` | number | `120` | SSE idle timeout |
 | `max_session_tokens` | number | `0` (unlimited) | Hard session token budget |
 | `summarize_on_compact` | bool | `true` | Use model call to summarize dropped turns |
@@ -322,7 +352,8 @@ the defaults but before env/CLI.
   files (not project-scoped settings). Project configs should use
   `api_key_env` to reference an environment variable instead.
 - The **`bash_deny`** list is a tripwire, not a security boundary. Use
-  `--sandbox firejail` for real isolation.
+  `--sandbox microsandbox` for real isolation (a separate microVM kernel +
+  filesystem root). See [Sandbox Guide](../guides/sandbox.md).
 - **`debug_log`** records full tool arguments (file contents, bash commands)
   which may include secrets. Off by default, rotates at 64 MiB. Enable only
   when debugging.

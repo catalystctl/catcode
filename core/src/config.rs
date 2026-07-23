@@ -79,26 +79,112 @@ pub fn parse_permission_rule(s: &str, behavior: PermissionBehavior) -> Option<Pe
     })
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/**
+ * Sandbox execution mode.
+ *
+ * Replaces the legacy Firejail (Linux) / Seatbelt (macOS `sandbox-exec`) /
+ * `unshare -n` trio with a single Microsandbox microVM backend that runs on
+ * Linux/KVM, Apple-Silicon macOS, and Windows/WHP. The user never installs
+ * Docker, Podman, Firejail, WSL, the `msb` CLI, or a persistent daemon — the
+ * embedded SDK downloads its own runtime on first use.
+ */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sandbox {
-    None,     // no sandboxing (default; denylist tripwire only)
-    Firejail, // wrap bash in `firejail` with a writable-workspace profile (Linux)
-    Seatbelt, // macOS sandbox-exec profile whitelisting the workspace
+    /// No sandboxing: agent-controlled workloads run directly on the host
+    /// (denylist + approval gate still apply). Selected only when the user
+    /// explicitly disables sandboxing.
+    None,
+    /// Run agent-controlled workloads inside a Microsandbox microVM. The
+    /// microVM is created lazily on the first workload and reused for the
+    /// session so package installs / build caches persist.
+    Microsandbox,
 }
 
 impl Sandbox {
+    /// Parse a sandbox setting string. Aliases:
+    ///   none, off, false, disabled        -> None
+    ///   microsandbox, msb, on, true, enabled -> Microsandbox
+    /// Legacy values (migrated, not silently downgraded to None):
+    ///   firejail, fj, seatbelt, macos, sandbox-exec -> Microsandbox
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "firejail" | "fj" => Sandbox::Firejail,
-            "seatbelt" | "macos" | "sandbox-exec" => Sandbox::Seatbelt,
+            "microsandbox" | "msb" | "on" | "true" | "enabled" | "enable" => Sandbox::Microsandbox,
+            "firejail" | "fj" | "seatbelt" | "macos" | "sandbox-exec" => Sandbox::Microsandbox,
             _ => Sandbox::None,
+        }
+    }
+    /// Whether `s` is a legacy backend alias (firejail/seatbelt) that we migrate
+    /// to `Microsandbox`. Returns the legacy backend name for the deprecation
+    /// notice, or `None` for current/`none` values.
+    pub fn legacy_alias(s: &str) -> Option<&'static str> {
+        match s.to_ascii_lowercase().as_str() {
+            "firejail" | "fj" => Some("firejail"),
+            "seatbelt" | "macos" | "sandbox-exec" => Some("seatbelt"),
+            _ => None,
         }
     }
     pub fn as_str(&self) -> &'static str {
         match self {
             Sandbox::None => "none",
-            Sandbox::Firejail => "firejail",
-            Sandbox::Seatbelt => "seatbelt",
+            Sandbox::Microsandbox => "microsandbox",
+        }
+    }
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Sandbox::Microsandbox)
+    }
+}
+
+/// Parse a sandbox setting, emitting a deprecation notice when the user passed
+/// a legacy (firejail/seatbelt) value. Returns the resolved mode. The legacy
+/// value is preserved as an *intention to enable sandboxing* — it is never
+/// silently converted to `none`.
+pub fn parse_sandbox_setting(raw: &str) -> Sandbox {
+    if let Some(legacy) = Sandbox::legacy_alias(raw) {
+        eprintln!(
+            "[catalyst-code] deprecation: the '{legacy}' sandbox backend has been replaced by \
+             Microsandbox. Continuing with sandbox=microsandbox. Update your config to \
+             \"sandbox\": \"microsandbox\" to silence this notice."
+        );
+    }
+    Sandbox::parse(raw)
+}
+
+/// Network egress policy for the Microsandbox guest. Translates the legacy
+/// `--no-network` flag (now `None`) and adds restrictive modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxNetworkMode {
+    /// No network interface at all (guest cannot reach anything). This is the
+    /// mode used when `--no-network` / `CATALYST_CODE_NO_NETWORK` is set.
+    None,
+    /// Default: network up, but cloud-metadata addresses, host-only services,
+    /// and (by default) private network ranges are blocked. Public package
+    /// registries and source hosts are permitted.
+    Restricted,
+    /// Network up; only hosts/CIDRs in `sandbox_network_allowlist` are
+    /// reachable.
+    Allowlist,
+}
+
+impl SandboxNetworkMode {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "allowlist" | "allow" => SandboxNetworkMode::Allowlist,
+            "none" | "off" | "disabled" => SandboxNetworkMode::None,
+            _ => SandboxNetworkMode::Restricted,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxNetworkMode::None => "none",
+            SandboxNetworkMode::Restricted => "restricted",
+            SandboxNetworkMode::Allowlist => "allowlist",
+        }
+    }
+    pub fn from_no_network(no_network: bool) -> Self {
+        if no_network {
+            SandboxNetworkMode::None
+        } else {
+            SandboxNetworkMode::Restricted
         }
     }
 }
@@ -141,8 +227,30 @@ pub struct Config {
     pub session_file: Option<PathBuf>,
     pub default_model: Option<String>,
     // --- production knobs (items 3,4,7) ---
-    pub sandbox: Sandbox,                     // --sandbox firejail wraps bash
-    pub no_network: bool,                     // --no-network: unshare -n on bash
+    pub sandbox: Sandbox, // Microsandbox microVM (or none)
+    pub no_network: bool, // legacy --no-network: maps to sandbox_network_mode=None
+    /// OCI image for the Microsandbox guest. Default is a CatCode-maintained
+    /// polyglot developer image published via GHCR.
+    pub sandbox_image: String,
+    /// vCPUs for the guest (1..=16).
+    pub sandbox_cpus: u8,
+    /// Guest memory in MiB (256..=16384).
+    pub sandbox_memory_mb: u32,
+    /// Writable overlay disk size in MiB for the guest rootfs (256..=65536).
+    pub sandbox_disk_mb: u32,
+    /// Idle timeout before an unused sandbox is stopped (seconds). Reused for
+    /// the session otherwise so build caches persist.
+    pub sandbox_idle_timeout_secs: u64,
+    /// Network egress policy for the guest.
+    pub sandbox_network_mode: SandboxNetworkMode,
+    /// Allowlist of domains/CIDRs for `allowlist` mode (and as an explicit
+    /// permit set in `restricted` mode).
+    pub sandbox_network_allowlist: Vec<String>,
+    /// Whether to permit guest access to private network ranges (RFC1918/loopback).
+    pub sandbox_allow_private_networks: bool,
+    /// Extra host environment variables to pass into the guest (in addition to
+    /// the minimal default guest env). Secrets are denied regardless.
+    pub sandbox_env_allowlist: Vec<String>,
     pub idle_timeout_secs: u64,               // per-chunk SSE idle timeout
     pub max_session_tokens: u64,              // hard session token budget (0 = unlimited)
     pub summarize_on_compact: bool,           // use a model call to summarize dropped turns
@@ -911,6 +1019,15 @@ impl Default for Config {
             default_model: None,
             sandbox: Sandbox::None,
             no_network: false,
+            sandbox_image: DEFAULT_SANDBOX_IMAGE.to_string(),
+            sandbox_cpus: DEFAULT_SANDBOX_CPUS,
+            sandbox_memory_mb: DEFAULT_SANDBOX_MEMORY_MB,
+            sandbox_disk_mb: DEFAULT_SANDBOX_DISK_MB,
+            sandbox_idle_timeout_secs: DEFAULT_SANDBOX_IDLE_TIMEOUT_SECS,
+            sandbox_network_mode: SandboxNetworkMode::Restricted,
+            sandbox_network_allowlist: Vec::new(),
+            sandbox_allow_private_networks: false,
+            sandbox_env_allowlist: Vec::new(),
             idle_timeout_secs: 120, // some reasoning models think >60s before first token
             max_session_tokens: 0,
             summarize_on_compact: true,
@@ -939,6 +1056,23 @@ impl Default for Config {
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Default Microsandbox guest image — a CatCode-maintained polyglot developer
+/// image (bash, coreutils, git, curl, jq, ripgrep, tar, build-essential, plus
+/// Rust/Node/Python/Go toolchains) published via GHCR. Pinned by tag; releases
+/// record the resolved digest. Override with `sandbox_image`.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/catalystctl/catcode-sandbox:0.1";
+pub const DEFAULT_SANDBOX_CPUS: u8 = 2;
+pub const DEFAULT_SANDBOX_MEMORY_MB: u32 = 2048;
+pub const DEFAULT_SANDBOX_DISK_MB: u32 = 8192;
+pub const DEFAULT_SANDBOX_IDLE_TIMEOUT_SECS: u64 = 900;
+/// Hard caps for sandbox resource validation.
+pub const SANDBOX_MIN_CPUS: u8 = 1;
+pub const SANDBOX_MAX_CPUS: u8 = 16;
+pub const SANDBOX_MIN_MEMORY_MB: u32 = 256;
+pub const SANDBOX_MAX_MEMORY_MB: u32 = 16384;
+pub const SANDBOX_MIN_DISK_MB: u32 = 256;
+pub const SANDBOX_MAX_DISK_MB: u32 = 65536;
 pub const HELP: &str = "\
 catalyst-code-core — OpenAI-compatible coding agent core (native Umans)
 
@@ -953,8 +1087,13 @@ OPTIONS:
       --max-bash-timeout <SECS>  Ceiling for the bash tool's per-call `timeout` override [env: CATALYST_CODE_MAX_BASH_TIMEOUT]
       --fetch-timeout <SECS>    Wall-clock timeout for the `fetch` tool [env: CATALYST_CODE_FETCH_TIMEOUT]
       --diag-timeout <SECS>     Diagnostics tool (cargo check/tsc/go build) timeout in seconds [env: CATALYST_CODE_DIAG_TIMEOUT]
-      --sandbox <MODE>          none | firejail  (wraps bash in a sandbox) [env: CATALYST_CODE_SANDBOX]
-      --no-network             Block bash network egress (unshare -n) [env: CATALYST_CODE_NO_NETWORK=1]
+      --sandbox <MODE>          none | microsandbox  (run agent workloads in a Microsandbox microVM) [env: CATALYST_CODE_SANDBOX]
+      --sandbox-image <REF>      OCI image for the sandbox guest [env: CATALYST_CODE_SANDBOX_IMAGE]
+      --sandbox-cpus <N>         Guest vCPUs (1..16) [env: CATALYST_CODE_SANDBOX_CPUS]
+      --sandbox-memory-mb <N>    Guest memory in MiB [env: CATALYST_CODE_SANDBOX_MEMORY_MB]
+      --sandbox-disk-mb <N>      Guest writable overlay in MiB [env: CATALYST_CODE_SANDBOX_DISK_MB]
+      --sandbox-network <MODE>   none | restricted | allowlist  [env: CATALYST_CODE_SANDBOX_NETWORK]
+      --no-network               Backward-compat: deny all guest network (sets sandbox-network=none) [env: CATALYST_CODE_NO_NETWORK=1]
       --trust-project-plugins  Allow repo-shipped .catalyst-code/plugins scripts to load [env: CATALYST_CODE_TRUST_PROJECT_PLUGINS=1]
       --idle-timeout <SECS>    SSE idle timeout in seconds [env: CATALYST_CODE_IDLE_TIMEOUT]
       --max-session-tokens <N> Hard session token budget (0=unlimited) [env: CATALYST_CODE_MAX_SESSION_TOKENS]
@@ -994,6 +1133,12 @@ pub fn load() -> Config {
     let mut cli_provider: Option<String> = None;
     let mut cli_sandbox: Option<Sandbox> = None;
     let mut cli_no_network: Option<bool> = None;
+    let mut cli_sandbox_image: Option<String> = None;
+    let mut cli_sandbox_cpus: Option<u8> = None;
+    let mut cli_sandbox_memory: Option<u32> = None;
+    let mut cli_sandbox_disk: Option<u32> = None;
+    let mut cli_sandbox_network: Option<SandboxNetworkMode> = None;
+    let mut cli_sandbox_env_allowlist: Option<Vec<String>> = None;
     let mut cli_idle_timeout: Option<u64> = None;
     let mut cli_max_session_tokens: Option<u64> = None;
 
@@ -1075,11 +1220,46 @@ pub fn load() -> Config {
             }
             "--sandbox" => {
                 if let Some(v) = take_val(&mut i) {
-                    cli_sandbox = Some(Sandbox::parse(&v));
+                    cli_sandbox = Some(parse_sandbox_setting(&v));
                 }
             }
             "--no-network" => {
                 cli_no_network = Some(true);
+            }
+            "--sandbox-image" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_image = Some(v);
+                }
+            }
+            "--sandbox-cpus" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_cpus = v.parse().ok();
+                }
+            }
+            "--sandbox-memory-mb" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_memory = v.parse().ok();
+                }
+            }
+            "--sandbox-disk-mb" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_disk = v.parse().ok();
+                }
+            }
+            "--sandbox-network" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_network = Some(SandboxNetworkMode::parse(&v));
+                }
+            }
+            "--sandbox-env-allowlist" => {
+                if let Some(v) = take_val(&mut i) {
+                    cli_sandbox_env_allowlist = Some(
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                }
             }
             "--idle-timeout" => {
                 if let Some(v) = take_val(&mut i) {
@@ -1196,11 +1376,41 @@ pub fn load() -> Config {
         c.session_file = Some(PathBuf::from(v));
     }
     if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX") {
-        c.sandbox = Sandbox::parse(&v);
+        c.sandbox = parse_sandbox_setting(&v);
     }
     if let Ok(v) = std::env::var("CATALYST_CODE_NO_NETWORK") {
         let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
         c.no_network = on;
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_IMAGE") {
+        if !v.trim().is_empty() {
+            c.sandbox_image = v;
+        }
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_CPUS") {
+        if let Ok(n) = v.parse::<u8>() {
+            c.sandbox_cpus = n;
+        }
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_MEMORY_MB") {
+        if let Ok(n) = v.parse::<u32>() {
+            c.sandbox_memory_mb = n;
+        }
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_DISK_MB") {
+        if let Ok(n) = v.parse::<u32>() {
+            c.sandbox_disk_mb = n;
+        }
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_NETWORK") {
+        c.sandbox_network_mode = SandboxNetworkMode::parse(&v);
+    }
+    if let Ok(v) = std::env::var("CATALYST_CODE_SANDBOX_ENV_ALLOWLIST") {
+        c.sandbox_env_allowlist = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     if let Ok(v) = std::env::var("CATALYST_CODE_IDLE_TIMEOUT") {
         if let Ok(n) = v.parse::<u64>() {
@@ -1303,6 +1513,24 @@ pub fn load() -> Config {
     if let Some(v) = cli_no_network {
         c.no_network = v;
     }
+    if let Some(v) = cli_sandbox_image {
+        c.sandbox_image = v;
+    }
+    if let Some(v) = cli_sandbox_cpus {
+        c.sandbox_cpus = v;
+    }
+    if let Some(v) = cli_sandbox_memory {
+        c.sandbox_memory_mb = v;
+    }
+    if let Some(v) = cli_sandbox_disk {
+        c.sandbox_disk_mb = v;
+    }
+    if let Some(v) = cli_sandbox_network {
+        c.sandbox_network_mode = v;
+    }
+    if let Some(v) = cli_sandbox_env_allowlist {
+        c.sandbox_env_allowlist = v;
+    }
     if let Some(v) = cli_idle_timeout {
         c.idle_timeout_secs = v;
     }
@@ -1311,6 +1539,7 @@ pub fn load() -> Config {
     }
 
     normalize_context_thresholds(&mut c);
+    normalize_sandbox_config(&mut c);
 
     c.bash_deny_regex_compiled = c
         .bash_deny_regex
@@ -1363,6 +1592,13 @@ fn strip_untrusted_keys(v: &mut Value, path: &std::path::Path) {
         "approval",
         "sandbox",
         "no_network",
+        "sandbox_image",
+        "sandbox_network_mode",
+        "sandbox_network_allowlist",
+        "sandbox_allow_private_networks",
+        "sandbox_cpus",
+        "sandbox_memory_mb",
+        "sandbox_disk_mb",
         "fetch_allowlist",
         "bash_deny",
         "bash_deny_regex",
@@ -1424,10 +1660,52 @@ fn apply_json(c: &mut Config, v: &Value) {
             .collect();
     }
     if let Some(x) = s("sandbox") {
-        c.sandbox = Sandbox::parse(&x);
+        c.sandbox = parse_sandbox_setting(&x);
     }
     if let Some(b) = v.get("no_network").and_then(|x| x.as_bool()) {
         c.no_network = b;
+    }
+    if let Some(x) = s("sandbox_image") {
+        if !x.trim().is_empty() {
+            c.sandbox_image = x;
+        }
+    }
+    if let Some(n) = v.get("sandbox_cpus").and_then(|x| x.as_u64()) {
+        c.sandbox_cpus = n.clamp(SANDBOX_MIN_CPUS as u64, SANDBOX_MAX_CPUS as u64) as u8;
+    }
+    if let Some(n) = v.get("sandbox_memory_mb").and_then(|x| x.as_u64()) {
+        c.sandbox_memory_mb =
+            n.clamp(SANDBOX_MIN_MEMORY_MB as u64, SANDBOX_MAX_MEMORY_MB as u64) as u32;
+    }
+    if let Some(n) = v.get("sandbox_disk_mb").and_then(|x| x.as_u64()) {
+        c.sandbox_disk_mb = n.clamp(SANDBOX_MIN_DISK_MB as u64, SANDBOX_MAX_DISK_MB as u64) as u32;
+    }
+    if let Some(n) = v.get("sandbox_idle_timeout_secs").and_then(|x| x.as_u64()) {
+        c.sandbox_idle_timeout_secs = n;
+    }
+    if let Some(x) = s("sandbox_network_mode") {
+        c.sandbox_network_mode = SandboxNetworkMode::parse(&x);
+    }
+    if let Some(arr) = v
+        .get("sandbox_network_allowlist")
+        .and_then(|x| x.as_array())
+    {
+        c.sandbox_network_allowlist = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+    }
+    if let Some(b) = v
+        .get("sandbox_allow_private_networks")
+        .and_then(|x| x.as_bool())
+    {
+        c.sandbox_allow_private_networks = b;
+    }
+    if let Some(arr) = v.get("sandbox_env_allowlist").and_then(|x| x.as_array()) {
+        c.sandbox_env_allowlist = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(b) = v.get("idle_timeout_secs").and_then(|x| x.as_u64()) {
         c.idle_timeout_secs = b;
@@ -1611,6 +1889,61 @@ fn apply_json(c: &mut Config, v: &Value) {
     }
     if let Some(name) = v.get("active_provider").and_then(|x| x.as_str()) {
         c.active_provider = Some(name.to_string());
+    }
+}
+
+/// Reconcile sandbox-related config after all layers are applied:
+/// - `--no-network` / `CATALYST_CODE_NO_NETWORK` wins and forces the network
+///   mode to `None` (deny all guest network). It is kept as a backward-compat
+///   alias only; the real enforcement is the Microsandbox network policy.
+/// - clamp resource limits to safe bounds and validate env-allowlist names.
+///   Invalid values fall back to defaults with a notice rather than panicking.
+pub fn normalize_sandbox_config(c: &mut Config) {
+    if c.no_network {
+        c.sandbox_network_mode = SandboxNetworkMode::None;
+    }
+    if c.sandbox_cpus < SANDBOX_MIN_CPUS || c.sandbox_cpus > SANDBOX_MAX_CPUS {
+        eprintln!(
+            "[catalyst-code] invalid sandbox_cpus {}; using default {}",
+            c.sandbox_cpus, DEFAULT_SANDBOX_CPUS
+        );
+        c.sandbox_cpus = DEFAULT_SANDBOX_CPUS;
+    }
+    if c.sandbox_memory_mb < SANDBOX_MIN_MEMORY_MB || c.sandbox_memory_mb > SANDBOX_MAX_MEMORY_MB {
+        eprintln!(
+            "[catalyst-code] invalid sandbox_memory_mb {}; using default {}",
+            c.sandbox_memory_mb, DEFAULT_SANDBOX_MEMORY_MB
+        );
+        c.sandbox_memory_mb = DEFAULT_SANDBOX_MEMORY_MB;
+    }
+    if c.sandbox_disk_mb < SANDBOX_MIN_DISK_MB || c.sandbox_disk_mb > SANDBOX_MAX_DISK_MB {
+        eprintln!(
+            "[catalyst-code] invalid sandbox_disk_mb {}; using default {}",
+            c.sandbox_disk_mb, DEFAULT_SANDBOX_DISK_MB
+        );
+        c.sandbox_disk_mb = DEFAULT_SANDBOX_DISK_MB;
+    }
+    if c.sandbox_image.trim().is_empty() {
+        c.sandbox_image = DEFAULT_SANDBOX_IMAGE.to_string();
+    }
+    // Env-allowlist entries must be valid identifier-ish names (letters, digits,
+    // underscore; first char non-digit). Drop invalid ones with a notice.
+    let orig = c.sandbox_env_allowlist.len();
+    c.sandbox_env_allowlist.retain(|name| {
+        let valid = !name.is_empty()
+            && name.chars().enumerate().all(|(i, ch)| {
+                (ch.is_ascii_alphanumeric() || ch == '_') && !(i == 0 && ch.is_ascii_digit())
+            });
+        if !valid {
+            eprintln!(
+                "[catalyst-code] ignored invalid sandbox_env_allowlist entry {:?}",
+                name
+            );
+        }
+        valid
+    });
+    if c.sandbox_env_allowlist.len() != orig {
+        // no-op: notices emitted above
     }
 }
 
@@ -1813,15 +2146,100 @@ mod tests {
 
     #[test]
     fn sandbox_parse() {
-        assert_eq!(Sandbox::parse("firejail"), Sandbox::Firejail);
-        assert_eq!(Sandbox::parse("fj"), Sandbox::Firejail);
-        assert_eq!(Sandbox::parse("seatbelt"), Sandbox::Seatbelt);
-        assert_eq!(Sandbox::parse("macos"), Sandbox::Seatbelt);
+        // Current aliases.
+        assert_eq!(Sandbox::parse("microsandbox"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("msb"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("on"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("true"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("enabled"), Sandbox::Microsandbox);
         assert_eq!(Sandbox::parse("none"), Sandbox::None);
+        assert_eq!(Sandbox::parse("off"), Sandbox::None);
+        assert_eq!(Sandbox::parse("false"), Sandbox::None);
+        assert_eq!(Sandbox::parse("disabled"), Sandbox::None);
         assert_eq!(Sandbox::parse(""), Sandbox::None);
-        assert_eq!(Sandbox::Firejail.as_str(), "firejail");
-        assert_eq!(Sandbox::Seatbelt.as_str(), "seatbelt");
+        // Legacy values migrate to Microsandbox (preserving intent), never none.
+        assert_eq!(Sandbox::parse("firejail"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("fj"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("seatbelt"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("macos"), Sandbox::Microsandbox);
+        assert_eq!(Sandbox::parse("sandbox-exec"), Sandbox::Microsandbox);
+        // Legacy-alias detection for the deprecation notice.
+        assert_eq!(Sandbox::legacy_alias("firejail"), Some("firejail"));
+        assert_eq!(Sandbox::legacy_alias("seatbelt"), Some("seatbelt"));
+        assert_eq!(Sandbox::legacy_alias("microsandbox"), None);
+        assert_eq!(Sandbox::Microsandbox.as_str(), "microsandbox");
         assert_eq!(Sandbox::None.as_str(), "none");
+        assert!(Sandbox::Microsandbox.is_enabled());
+        assert!(!Sandbox::None.is_enabled());
+    }
+
+    #[test]
+    fn no_network_flag_forces_sandbox_network_none() {
+        let mut c = Config::default();
+        c.no_network = true;
+        c.sandbox_network_mode = SandboxNetworkMode::Restricted;
+        normalize_sandbox_config(&mut c);
+        assert_eq!(c.sandbox_network_mode, SandboxNetworkMode::None);
+    }
+
+    #[test]
+    fn invalid_resource_limits_clamp_to_defaults() {
+        let mut c = Config::default();
+        c.sandbox_cpus = 0;
+        c.sandbox_memory_mb = 10;
+        c.sandbox_disk_mb = 0;
+        normalize_sandbox_config(&mut c);
+        assert_eq!(c.sandbox_cpus, DEFAULT_SANDBOX_CPUS);
+        assert_eq!(c.sandbox_memory_mb, DEFAULT_SANDBOX_MEMORY_MB);
+        assert_eq!(c.sandbox_disk_mb, DEFAULT_SANDBOX_DISK_MB);
+        // Caps above max also clamp.
+        c.sandbox_cpus = SANDBOX_MAX_CPUS + 1;
+        c.sandbox_memory_mb = SANDBOX_MAX_MEMORY_MB + 1;
+        c.sandbox_disk_mb = SANDBOX_MAX_DISK_MB + 1;
+        normalize_sandbox_config(&mut c);
+        assert_eq!(c.sandbox_cpus, DEFAULT_SANDBOX_CPUS);
+        assert_eq!(c.sandbox_memory_mb, DEFAULT_SANDBOX_MEMORY_MB);
+        assert_eq!(c.sandbox_disk_mb, DEFAULT_SANDBOX_DISK_MB);
+    }
+
+    #[test]
+    fn empty_image_falls_back_to_default() {
+        let mut c = Config::default();
+        c.sandbox_image = "   ".to_string();
+        normalize_sandbox_config(&mut c);
+        assert_eq!(c.sandbox_image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[test]
+    fn invalid_env_allowlist_entries_dropped() {
+        let mut c = Config::default();
+        c.sandbox_env_allowlist = vec![
+            "VALID_NAME".to_string(),
+            "ALSO-VALID".to_string(),     // hyphen rejected
+            "1LEADING_DIGIT".to_string(), // leading digit rejected
+            "".to_string(),               // empty rejected
+            "GOOD_TOO".to_string(),
+        ];
+        normalize_sandbox_config(&mut c);
+        assert_eq!(c.sandbox_env_allowlist, vec!["VALID_NAME", "GOOD_TOO"]);
+    }
+
+    #[test]
+    fn network_mode_parses_aliases() {
+        assert_eq!(SandboxNetworkMode::parse("none"), SandboxNetworkMode::None);
+        assert_eq!(
+            SandboxNetworkMode::parse("restricted"),
+            SandboxNetworkMode::Restricted
+        );
+        assert_eq!(
+            SandboxNetworkMode::parse("allowlist"),
+            SandboxNetworkMode::Allowlist
+        );
+        // Unknown -> restricted (safe default).
+        assert_eq!(
+            SandboxNetworkMode::parse("bogus"),
+            SandboxNetworkMode::Restricted
+        );
     }
 
     #[test]
@@ -1885,7 +2303,7 @@ mod tests {
                 None => std::env::remove_var(&k),
             }
         }
-        assert_eq!(c.sandbox, Sandbox::Firejail);
+        assert_eq!(c.sandbox, Sandbox::Microsandbox);
         assert!(c.no_network);
         assert_eq!(c.idle_timeout_secs, 42);
         assert_eq!(c.max_session_tokens, 123456);

@@ -51,6 +51,7 @@ mod provider;
 mod providers;
 mod rejected_approaches;
 mod runtime;
+mod sandbox;
 mod search_tool;
 mod session;
 mod skill_metrics;

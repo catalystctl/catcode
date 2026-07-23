@@ -18,6 +18,10 @@ import type {
   GoalPrompt,
   IntercomEntry,
   ReadyPayload,
+  SandboxMode,
+  SandboxNetworkMode,
+  SandboxPreflightReport,
+  SandboxRuntimeStatus,
   SubagentChatItem,
   SubagentRunView,
   Toast,
@@ -27,6 +31,18 @@ import type {
 
 export const initialState: AgentState = {
   ready: null,
+  sandbox: {
+    mode: "none",
+    ready: false,
+    image: null,
+    cpus: null,
+    memoryMb: null,
+    networkMode: null,
+    shell: null,
+    report: null,
+    preparePhase: null,
+    error: null,
+  },
   models: [],
   authed: null,
   provider: "",
@@ -681,6 +697,20 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           `Skipped project plugin(s): ${skipped.join(", ")} (need --trust-project-plugins or reinstall)`,
         );
       }
+      // The ready payload is the source of truth for sandbox readiness: it
+      // carries the effective mode, sandboxReady, image/resource limits,
+      // network mode, and the effective guest shell. Normalize legacy values
+      // defensively (the core already migrates "firejail"/"seatbelt" →
+      // "microsandbox"); only "none"|"microsandbox" reach here.
+      const sbMode: SandboxMode = ev.sandbox === "microsandbox" ? "microsandbox" : "none";
+      const sbShell =
+        ev.shell === "bash" || ev.shell === "powershell" ? ev.shell : null;
+      const sbNetwork: SandboxNetworkMode | null =
+        ev.sandboxNetworkMode === "none" ||
+        ev.sandboxNetworkMode === "restricted" ||
+        ev.sandboxNetworkMode === "allowlist"
+          ? ev.sandboxNetworkMode
+          : null;
       return {
         ...state,
         ready: ev,
@@ -691,6 +721,19 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         approvalMode: ev.approval,
         workspace: ev.workspace,
         providerPresets: ev.providerPresets ?? state.providerPresets,
+        sandbox: {
+          mode: sbMode,
+          ready: ev.sandboxReady === true,
+          image: ev.sandboxImage ?? null,
+          cpus: ev.sandboxCpus ?? null,
+          memoryMb: ev.sandboxMemoryMb ?? null,
+          networkMode: sbNetwork,
+          shell: sbShell,
+          report: state.sandbox.report,
+          // A fresh ready may follow a reset; clear a stale prepare/error state.
+          preparePhase: null,
+          error: null,
+        },
         toasts,
       };
     }
@@ -1333,6 +1376,13 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
     case "config_changed": {
       // Patch ready so Settings / header reflect the live value immediately.
+      const sandboxChanged = ev.key === "sandbox";
+      const nextSandboxMode: SandboxMode =
+        sandboxChanged && String(ev.value) === "microsandbox"
+          ? "microsandbox"
+          : sandboxChanged
+            ? "none"
+            : state.sandbox.mode;
       const ready = state.ready
         ? {
             ...state.ready,
@@ -1348,13 +1398,84 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
                     ev.value === "1",
                 }
               : {}),
-            ...(ev.key === "sandbox" ? { sandbox: String(ev.value) } : {}),
+            ...(sandboxChanged ? { sandbox: String(ev.value) } : {}),
           }
         : state.ready;
+      // When the mode flips, the core re-runs preflight and will re-emit
+      // sandbox_ready/sandbox_status. Until then a requested-but-unready
+      // microsandbox must not be treated as ready — clear readiness so the
+      // Safety panel can show the setup-required state.
+      const sandbox: SandboxRuntimeStatus = sandboxChanged
+        ? {
+            ...state.sandbox,
+            mode: nextSandboxMode,
+            ready: nextSandboxMode === "none" ? true : state.sandbox.ready,
+            // A mode change invalidates any stale error/prepare-phase.
+            preparePhase: nextSandboxMode === "none" ? null : state.sandbox.preparePhase,
+            error: null,
+          }
+        : state.sandbox;
       return {
         ...state,
         ready,
+        sandbox,
         toasts: pushToast(state.toasts, "info", `${ev.key} → ${ev.value}`),
+      };
+    }
+
+    // ── Sandbox (Microsandbox) ──
+    case "sandbox_status": {
+      // Full preflight report + effective mode. The core is the single source
+      // of truth for platform/support/readiness — store verbatim.
+      const report: SandboxPreflightReport = ev.report;
+      return {
+        ...state,
+        sandbox: {
+          ...state.sandbox,
+          mode: ev.mode,
+          ready: report.ready,
+          report,
+          // A fresh status clears a transient prepare-phase / error.
+          preparePhase: null,
+          error: null,
+        },
+      };
+    }
+    case "sandbox_prepare_progress": {
+      // Runtime/image download streaming phase. Keep the latest phase so the
+      // Safety panel can show live progress; never clears readiness on its own.
+      return {
+        ...state,
+        sandbox: { ...state.sandbox, preparePhase: ev.phase },
+      };
+    }
+    case "sandbox_ready": {
+      // Terminal prepare result (or an out-of-band readiness flip). `ready` is
+      // the source of truth; carry the optional fresh report if present.
+      const report = ev.report ?? state.sandbox.report;
+      return {
+        ...state,
+        sandbox: {
+          ...state.sandbox,
+          ready: ev.ready,
+          report,
+          preparePhase: null,
+          error: ev.ready ? null : state.sandbox.error,
+        },
+      };
+    }
+    case "sandbox_error": {
+      // A setup/boot/runtime failure. The core fail-closed: no host fallback.
+      // Surface the structured error + a toast so it is not silently missed.
+      return {
+        ...state,
+        sandbox: {
+          ...state.sandbox,
+          ready: false,
+          preparePhase: null,
+          error: ev.error,
+        },
+        toasts: pushToast(state.toasts, "error", ev.error),
       };
     }
 

@@ -34,6 +34,8 @@ Notes
 -----
 - The workspace is the directory you launch catcode from; rerun from another
   folder to work on a different project.
-- Sandboxing (--sandbox firejail / --no-network) is Linux-only; leave /sandbox
-  set to none.
-- The agent's bash tool needs bash on PATH (present by default on macOS).
+- Sandboxing (`--sandbox microsandbox`) uses the Apple virtualization
+  framework on Apple Silicon — no external package needed. Intel Macs are
+  unsupported; leave /sandbox set to none. See docs/guides/sandbox.md.
+- The agent's bash tool needs bash on PATH (present by default on macOS); when
+  the sandbox is enabled it runs inside the Linux guest instead.

@@ -13,7 +13,34 @@ import { openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { resolveCoreBinary, configDir, ensureDir } from "./config.js";
 import type { CoreEvent } from "./core-events.js";
+import {
+  normalizeSandboxMode,
+  type SandboxConfig,
+  type SandboxMode,
+  type SandboxOption,
+  type SandboxStatus,
+  type SandboxReady,
+  type SandboxPreflightReport,
+  type SandboxPreflightCheck,
+  type SandboxPreflightCheckStatus,
+  type SandboxSetupAction,
+} from "./sandbox.js";
 import { VERSION } from "./version.js";
+
+export type {
+  SandboxMode,
+  SandboxOption,
+  SandboxLegacyAlias,
+  SandboxNetworkMode,
+  SandboxConfig,
+  SandboxPreflightCheck,
+  SandboxPreflightCheckStatus,
+  SandboxPreflightReport,
+  SandboxSetupAction,
+  SandboxStatus,
+  SandboxReady,
+  SandboxError,
+} from "./sandbox.js";
 
 export type { CoreEvent } from "./core-events.js";
 export {
@@ -42,6 +69,10 @@ export {
   type AskRequestEvent,
   type SudoRequestEvent,
   type MetricsEvent,
+  type SandboxStatusEvent,
+  type SandboxPrepareProgressEvent,
+  type SandboxReadyEvent,
+  type SandboxErrorEvent,
 } from "./core-events.js";
 
 export interface CoreProcessOptions {
@@ -53,8 +84,29 @@ export interface CoreProcessOptions {
   baseUrl?: string;
   apiKey?: string;
   debugLog?: string;
-  sandbox?: "none" | "firejail";
+  /**
+   * Sandbox mode for agent-controlled workloads. Operational values are
+   * `"none"` (run on the host) and `"microsandbox"` (run inside a
+   * Microsandbox microVM). Legacy spellings (firejail/fj/seatbelt/macos/
+   * sandbox-exec) are accepted for source compatibility and normalized to
+   * `"microsandbox"` with a deprecation notice — they are never emitted to
+   * the core. Undefined omits `--sandbox` (core default).
+   */
+  sandbox?: SandboxOption;
+  /**
+   * Backward-compat: deny all guest network. Implemented by the core through
+   * Microsandbox network policy (`sandbox-network=none`), not `unshare`.
+   */
   noNetwork?: boolean;
+  /**
+   * Typed sandbox resource/network/image configuration. Fields with a core
+   * CLI flag are emitted (`--sandbox-image`, `--sandbox-cpus`,
+   * `--sandbox-memory-mb`, `--sandbox-disk-mb`, `--sandbox-network`,
+   * `--sandbox-env-allowlist`). Fields without a CLI flag (networkAllowlist,
+   * allowPrivateNetworks, idleTimeoutSecs) are documented in {@link SandboxConfig}
+   * and must be set via the core config file / `CATALYST_CODE_*` env.
+   */
+  sandboxConfig?: SandboxConfig;
   maxSessionTokens?: number;
   idleTimeout?: number;
   trustProjectPlugins?: boolean;
@@ -77,10 +129,27 @@ export interface ReadyPayload {
   providers: string[];
   bash_timeout_secs: number;
   resumed_messages: number;
+  // ── Sandbox status (Microsandbox migration) ──
+  /** Effective sandbox mode: "none" | "microsandbox". */
+  sandbox?: SandboxMode | string;
+  /** Effective shell kind emitted by the core: "bash" | "powershell". */
+  shell?: string;
+  /** Active sandbox OCI image reference (when sandboxed). */
+  sandboxImage?: string;
+  /** Guest vCPU limit. */
+  sandboxCpus?: number;
+  /** Guest memory limit in MiB. */
+  sandboxMemoryMb?: number;
+  /** Guest network egress policy: "none" | "restricted" | "allowlist". */
+  sandboxNetworkMode?: string;
+  /** Whether the sandbox is ready to execute commands right now. */
+  sandboxReady?: boolean;
 }
 
 export interface PendingRequest {
   matchType: string | string[];
+  /** Optional event type(s) that should REJECT this request (e.g. an error event). */
+  errorMatchType?: string | string[];
   resolve: (ev: CoreEvent) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout | null;
@@ -189,7 +258,25 @@ export class CoreProcess {
     if (o.provider) args.push("--provider", o.provider);
     if (o.baseUrl) args.push("--base-url", o.baseUrl);
     if (o.noNetwork) args.push("--no-network");
-    if (o.sandbox && o.sandbox !== "none") args.push("--sandbox", o.sandbox);
+    // Sandbox mode: normalize legacy aliases (firejail/seatbelt/…) to
+    // "microsandbox" with a deprecation notice. The SDK NEVER emits a legacy
+    // value to the core — only "none" or "microsandbox" reach the wire.
+    const sandboxMode = normalizeSandboxMode(o.sandbox);
+    if (sandboxMode && sandboxMode !== "none") args.push("--sandbox", sandboxMode);
+    // Typed sandbox config → recognized core CLI flags. Fields without a CLI
+    // flag (networkAllowlist, allowPrivateNetworks, idleTimeoutSecs) are
+    // intentionally NOT emitted here; see SandboxConfig docs.
+    const sc = o.sandboxConfig;
+    if (sc) {
+      if (sc.image) args.push("--sandbox-image", sc.image);
+      if (typeof sc.cpus === "number") args.push("--sandbox-cpus", String(sc.cpus));
+      if (typeof sc.memoryMb === "number") args.push("--sandbox-memory-mb", String(sc.memoryMb));
+      if (typeof sc.diskMb === "number") args.push("--sandbox-disk-mb", String(sc.diskMb));
+      if (sc.networkMode) args.push("--sandbox-network", sc.networkMode);
+      if (sc.envAllowlist && sc.envAllowlist.length > 0) {
+        args.push("--sandbox-env-allowlist", sc.envAllowlist.join(","));
+      }
+    }
     if (typeof o.maxSessionTokens === "number" && o.maxSessionTokens > 0) {
       args.push("--max-session-tokens", String(o.maxSessionTokens));
     }
@@ -214,6 +301,16 @@ export class CoreProcess {
     }
 
     // Dispatch to one-shot request waiters first (oldest match wins).
+    // An error-match type takes precedence and rejects the request.
+    const errIdx = this.pending.findIndex(
+      (p) => p.errorMatchType !== undefined && matchesType(ev.type, p.errorMatchType),
+    );
+    if (errIdx >= 0) {
+      const [req] = this.pending.splice(errIdx, 1);
+      if (req.timer) clearTimeout(req.timer);
+      req.reject(new SandboxCommandError(ev));
+      // Still fall through to broadcast so stream listeners see the error event.
+    }
     const idx = this.pending.findIndex((p) => matchesType(ev.type, p.matchType));
     if (idx >= 0) {
       const [req] = this.pending.splice(idx, 1);
@@ -244,10 +341,12 @@ export class CoreProcess {
     command: CoreCommand,
     matchType: string | string[],
     timeoutMs = 30000,
+    errorMatchType?: string | string[],
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const req: PendingRequest = {
         matchType,
+        errorMatchType,
         resolve: resolve as (ev: CoreEvent) => void,
         reject,
         timer: null,
@@ -266,6 +365,72 @@ export class CoreProcess {
         reject(err);
       }
     });
+  }
+
+  // ── Sandbox lifecycle commands (Microsandbox migration) ──
+  // These send the new protocol commands and await the matching terminal
+  // events. They NEVER assume that requesting microsandbox mode guarantees
+  // activation — callers must inspect the returned report / ready flag.
+
+  /**
+   * Request the current sandbox status (mode + preflight report). Sends
+   * `get_sandbox_status` and awaits `sandbox_status`.
+   */
+  async getSandboxStatus(timeoutMs = 30000): Promise<SandboxStatus> {
+    const ev = await this.request<CoreEvent>(
+      { type: "get_sandbox_status" },
+      "sandbox_status",
+      timeoutMs,
+    );
+    return normalizeSandboxStatusEvent(ev);
+  }
+
+  /**
+   * Prepare the sandbox runtime/image assets (first-use download). Sends
+   * `prepare_sandbox` and awaits `sandbox_ready` (success) or `sandbox_error`
+   * (failure). Progress events (`sandbox_prepare_progress`) stream to listeners
+   * during preparation; pass an `onProgress` callback to observe them.
+   */
+  async prepareSandbox(
+    timeoutMs = 300000,
+    onProgress?: (phase: string) => void,
+  ): Promise<SandboxReady> {
+    let unsub: (() => void) | undefined;
+    if (onProgress) {
+      unsub = this.on((ev) => {
+        if (ev.type === "sandbox_prepare_progress" && typeof ev.phase === "string") {
+          try {
+            onProgress(ev.phase as string);
+          } catch {
+            /* progress callback errors are non-fatal */
+          }
+        }
+      });
+    }
+    try {
+      const ev = await this.request<CoreEvent>(
+        { type: "prepare_sandbox" },
+        "sandbox_ready",
+        timeoutMs,
+        "sandbox_error",
+      );
+      return normalizeSandboxReadyEvent(ev);
+    } finally {
+      unsub?.();
+    }
+  }
+
+  /**
+   * Reset an unhealthy sandbox. Sends `reset_sandbox` and awaits `sandbox_status`
+   * (the core emits `sandbox_status` with `reset: true` after resetting).
+   */
+  async resetSandbox(timeoutMs = 60000): Promise<SandboxStatus> {
+    const ev = await this.request<CoreEvent>(
+      { type: "reset_sandbox" },
+      "sandbox_status",
+      timeoutMs,
+    );
+    return normalizeSandboxStatusEvent(ev);
   }
 
   /** Subscribe to the event stream. Returns an unsubscribe function. */
@@ -330,4 +495,87 @@ export class CoreProcess {
 
 function matchesType(type: string, matchType: string | string[]): boolean {
   return Array.isArray(matchType) ? matchType.includes(type) : type === matchType;
+}
+
+/**
+ * Error raised when a sandbox command's terminal `sandbox_error` event arrives
+ * (e.g. `prepare_sandbox` failed). Carries the core's human-readable message,
+ * which never contains secret values. A setup-required failure surfaces here;
+ * callers should treat it as "do not execute on the host" and may re-query via
+ * {@link CoreProcess.getSandboxStatus} for the full structured report.
+ */
+export class SandboxCommandError extends Error {
+  /** Raw error event (type === "sandbox_error"). */
+  readonly event: CoreEvent;
+  constructor(event: CoreEvent) {
+    const msg =
+      typeof event.error === "string" ? event.error : "sandbox command failed";
+    super(msg);
+    this.name = "SandboxCommandError";
+    this.event = event;
+  }
+}
+
+/** Coerce a wire `mode` string to the strict {@link SandboxMode} union. */
+function coerceSandboxMode(mode: unknown): SandboxMode {
+  return mode === "microsandbox" ? "microsandbox" : "none";
+}
+
+/** Best-effort coercion of a report-shaped value into the typed interface. */
+function coerceReport(raw: unknown): SandboxPreflightReport | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const checks = Array.isArray(r.checks) ? (r.checks as unknown[]).map(coerceCheck) : [];
+  const actions = Array.isArray(r.actions) ? (r.actions as unknown[]).map(coerceAction) : [];
+  return {
+    requested: Boolean(r.requested),
+    supported: Boolean(r.supported),
+    ready: Boolean(r.ready),
+    platform: typeof r.platform === "string" ? r.platform : "",
+    architecture: typeof r.architecture === "string" ? r.architecture : "",
+    checks,
+    actions,
+  };
+}
+
+function coerceCheck(raw: unknown): SandboxPreflightCheck {
+  const c = (raw ?? {}) as Record<string, unknown>;
+  const status: SandboxPreflightCheckStatus =
+    c.status === "pass" || c.status === "fail" || c.status === "warn" || c.status === "info"
+      ? (c.status as SandboxPreflightCheckStatus)
+      : "info";
+  return {
+    code: typeof c.code === "string" ? c.code : "",
+    title: typeof c.title === "string" ? c.title : "",
+    status,
+    detail: typeof c.detail === "string" ? c.detail : "",
+  };
+}
+
+function coerceAction(raw: unknown): SandboxSetupAction {
+  const a = (raw ?? {}) as Record<string, unknown>;
+  return {
+    title: typeof a.title === "string" ? a.title : "",
+    explanation: typeof a.explanation === "string" ? a.explanation : "",
+    command: a.command == null ? null : String(a.command),
+    requires_admin: Boolean(a.requires_admin),
+    requires_reboot: Boolean(a.requires_reboot),
+  };
+}
+
+/** Normalize a `sandbox_status` event into the typed {@link SandboxStatus}. */
+function normalizeSandboxStatusEvent(ev: CoreEvent): SandboxStatus {
+  return {
+    mode: coerceSandboxMode(ev.mode),
+    report: coerceReport(ev.report),
+    reset: typeof ev.reset === "boolean" ? (ev.reset as boolean) : undefined,
+  };
+}
+
+/** Normalize a `sandbox_ready` event into the typed {@link SandboxReady}. */
+function normalizeSandboxReadyEvent(ev: CoreEvent): SandboxReady {
+  return {
+    ready: Boolean(ev.ready),
+    report: coerceReport(ev.report),
+  };
 }

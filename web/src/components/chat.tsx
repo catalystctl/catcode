@@ -348,9 +348,24 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         }
         case "sandbox": {
           const mode = (args ?? "").trim().toLowerCase();
-          if (mode === "none" || mode === "firejail" || mode === "seatbelt") {
-            return void a.setConfig("sandbox", mode);
-          }
+          // Accept the new aliases. Legacy "firejail"/"seatbelt"/"fj"/"macos"/
+          // "sandbox-exec" map to microsandbox (the core migrates + warns);
+          // "none"/"off"/"disabled"/"false" disable it.
+          const disabled =
+            mode === "none" || mode === "off" || mode === "disabled" || mode === "false";
+          const microsandbox =
+            mode === "microsandbox" ||
+            mode === "msb" ||
+            mode === "on" ||
+            mode === "true" ||
+            mode === "enabled" ||
+            mode === "firejail" ||
+            mode === "fj" ||
+            mode === "seatbelt" ||
+            mode === "macos" ||
+            mode === "sandbox-exec";
+          if (disabled) return void a.setConfig("sandbox", "none");
+          if (microsandbox) return void a.setConfig("sandbox", "microsandbox");
           void a.getVisionConfig();
           return openSettingsRef.current();
         }

@@ -98,8 +98,8 @@ loaded. Defined by `deferred_tool_names()` (/core/src/tools.rs).
 | `bulk_write` | Write many files in one call. Each entry `{path, content}`; parents created, existing files overwritten. | Destructive |
 | `bulk_edit` | Apply search/replace edits to many files. Each entry `{path, edits}` (same shape as `edit`). Per-file atomic; failed search fails only that file. | Destructive |
 | `diagnostics` | Run the project's type checker/compiler (cargo check, tsc --noEmit, go build, py_compile). Returns diagnostics. | ReadOnly |
-| `fetch` | Fetch a URL over HTTP(S); HTML is lightly stripped to text. Bounded to `fetch_max_bytes` (default 256 KiB). Works under `--no-network`. Host allowlist may restrict domains. | ReadOnly |
-| `web_search` | Web search. Prefers Exa / Tavily APIs (with round-robin load balancing + quota tracking). Falls back to public SearXNG, DDG, and Mojeek scrapes. Honors `--no-network` / `fetch_allowlist`. | ReadOnly |
+| `fetch` | Fetch a URL over HTTP(S); HTML is lightly stripped to text. Bounded to `fetch_max_bytes` (default 256 KiB). Works under `--no-network` (runs on the host control plane, not the guest). Host allowlist may restrict domains. | ReadOnly |
+| `web_search` | Web search. Prefers Exa / Tavily APIs (with round-robin load balancing + quota tracking). Falls back to public SearXNG, DDG, and Mojeek scrapes. Honors `--no-network` / `fetch_allowlist` (host-side, not the guest network policy). | ReadOnly |
 | `workspace_activity` | List other active catalyst-code sessions in this workspace (separate processes). Returns goals, current work, recently touched files. Read-only awareness tool. | ReadOnly |
 
 ### Git Tools

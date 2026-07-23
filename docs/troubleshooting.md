@@ -298,31 +298,44 @@ escapes are rejected.
 
 ### "sandbox not available" or sandbox execution fails
 
-**Symptom:** `bash` tool calls fail with a sandbox-related error.
+**Symptom:** `bash` / `git` / `diagnostics` tool calls fail with a sandbox-related
+error, or enabling the sandbox shows a setup-required message.
 
-**Likely cause:** The configured sandbox (`firejail`, `seatbelt`) is not
-installed on the system.
+**Likely cause:** Microsandbox preflight found the environment is not ready
+(missing virtualization, `/dev/kvm` permissions, Windows Hypervisor Platform
+off, runtime/image not downloaded, or an unsupported platform like Intel macOS).
 
 **Check:**
-- Check the sandbox configuration:
+- Run the preflight from the TUI/web `/sandbox` settings or:
+  ```text
+  /sandbox status
+  /sandbox recheck
   ```
-  /set sandbox none
-  ```
-- Verify the sandbox binary exists:
+  The report lists each check's status and the exact remediation command.
+- Linux quick check:
   ```bash
-  which firejail   # Linux
-  which sandbox-exec  # macOS
+  test -r /dev/kvm && test -w /dev/kvm && echo "KVM is ready"
+  ```
+- Windows:
+  ```powershell
+  Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
   ```
 
 **Fix:**
-- Set sandbox to `none` if you don't need it (the default):
+- Follow the platform-specific setup in the [Sandbox Guide](../guides/sandbox.md)
+  (enable VT-x/AMD-V in BIOS, `sudo usermod -aG kvm "$USER"` + relogin on Linux,
+  `Enable-WindowsOptionalFeature ... HypervisorPlatform` on Windows).
+- Run `/sandbox setup` to prepare the user-space runtime + image assets (no admin
+  install), then `/sandbox recheck`.
+- If the platform cannot run Microsandbox (e.g. Intel macOS), explicitly disable
+  sandboxing:
   ```bash
   catcode --sandbox none
   ```
-  or at runtime: `/set sandbox none`
-- Install firejail: `apt install firejail` or `brew install firejail`
-- On macOS, sandbox-exec is built-in but the default remains `none` unless
-  configured.
+  or at runtime: `/sandbox disable`
+
+CatCode fails **closed**: it never silently runs commands on the host when the
+sandbox is requested but unavailable.
 
 ### Tool hangs or times out
 

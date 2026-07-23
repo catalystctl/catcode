@@ -120,6 +120,10 @@ export function IdeShell() {
     setProjectSwitcherOpen(false);
     setSettingsOpen(true);
     void agent.getVisionConfig();
+    // Refresh the preflight report so the Safety panel shows live status/setup
+    // guidance the moment it opens (the report otherwise only arrives after an
+    // explicit Recheck).
+    void agent.getSandboxStatus();
   }, [agent]);
   const openProjects = useCallback(() => {
     setSettingsOpen(false);
@@ -476,6 +480,10 @@ export function IdeShell() {
             onSetBashTimeout={(secs) => void agent.setConfig("bash_timeout_secs", secs)}
             onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
             onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
+            sandboxStatus={agent.state.sandbox}
+            onRecheckSandbox={() => void agent.getSandboxStatus()}
+            onPrepareSandbox={() => void agent.prepareSandbox()}
+            onResetSandbox={() => void agent.resetSandbox()}
             visionConfig={agent.state.visionConfig}
             onSetVisionConfig={(visionModel, visionModels, enabled) =>
               void agent.setVisionConfig(visionModel, visionModels, enabled)

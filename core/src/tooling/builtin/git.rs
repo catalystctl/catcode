@@ -275,4 +275,151 @@ pub(crate) fn git_commit(args: &Value, cfg: &Config) -> Outcome {
     git_exec(cfg, &refs)
 }
 
+// ---- sandboxed (microVM) git path ----
+// When sandboxing is enabled, built-in git runs inside the microVM via the
+// shared execution backend (never directly on the host). The argv is built by
+// the same validation as the host path (workspace-relative pathspecs, no `..`),
+// so command input cannot reach outside the mounted workspace.
+
+/// Build the full git argv (program `git` + subcommand + validated args) shared
+/// by the host and sandboxed paths. Returns `Err` for invalid args.
+pub(crate) fn git_argv(name: &str, args: &Value) -> Result<Vec<String>, String> {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "git_status" => {
+            let p = git_rel_path(path)?;
+            let mut v = vec![
+                "git".to_string(),
+                "status".into(),
+                "--short".into(),
+                "--branch".into(),
+            ];
+            if !p.is_empty() {
+                v.push("--".into());
+                v.push(p);
+            }
+            Ok(v)
+        }
+        "git_diff" => {
+            let staged = args
+                .get("staged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let p = git_rel_path(path)?;
+            let mut v = vec!["git".to_string(), "diff".into(), "--no-color".into()];
+            if staged {
+                v.push("--staged".into());
+            }
+            if !p.is_empty() {
+                v.push("--".into());
+                v.push(p);
+            }
+            Ok(v)
+        }
+        "git_log" => {
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20)
+                .min(1000);
+            let p = git_rel_path(path)?;
+            let mut v = vec![
+                "git".to_string(),
+                "log".into(),
+                "--oneline".into(),
+                format!("-n{limit}"),
+            ];
+            if !p.is_empty() {
+                v.push("--".into());
+                v.push(p);
+            }
+            Ok(v)
+        }
+        "git_add" => {
+            let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
+                return Err("git_add requires a 'paths' array".into());
+            };
+            if paths.is_empty() {
+                return Err("git_add requires a non-empty 'paths' array".into());
+            }
+            let mut v = vec!["git".to_string(), "add".into(), "--".into()];
+            for p in paths {
+                let Some(ps) = p.as_str() else {
+                    return Err("git_add: every path must be a string".into());
+                };
+                v.push(git_rel_path(ps)?);
+            }
+            Ok(v)
+        }
+        "git_commit" => {
+            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+            if message.trim().is_empty() {
+                return Err("git_commit requires a non-empty 'message'".into());
+            }
+            let mut v = vec![
+                "git".to_string(),
+                "commit".into(),
+                "-m".into(),
+                message.to_string(),
+            ];
+            if all {
+                v.push("--all".into());
+            }
+            Ok(v)
+        }
+        other => Err(format!("unknown git tool: {other}")),
+    }
+}
+
+/// Async sandboxed git execution: runs the validated argv inside the active
+/// sandbox via the shared execution backend. GIT_PAGER/PAGER/HOME are set in
+/// the guest base env; git identity comes from explicit CatCode settings, never
+/// from the host's ~/.gitconfig or ~/.ssh.
+pub(crate) async fn git_dispatch(name: &str, args: &Value, cfg: &Config) -> Outcome {
+    let argv = match git_argv(name, args) {
+        Ok(a) => a,
+        Err(e) => return Outcome::err(e),
+    };
+    let proc_env =
+        crate::sandbox::policy::build_process_env(cfg, crate::sandbox::policy::ExecPurpose::Git);
+    let cwd =
+        crate::sandbox::policy::effective_cwd(cfg, "").unwrap_or_else(|_| cfg.workspace.clone());
+    let req = crate::sandbox::ExecRequest {
+        program: argv[0].clone(),
+        args: argv[1..].to_vec(),
+        cwd,
+        env: proc_env.env,
+        inherit_parent_env: proc_env.inherit_parent,
+        stdin: None,
+        timeout: std::time::Duration::from_secs(30),
+        ..Default::default()
+    };
+    match crate::sandbox::execution_backend().execute(req).await {
+        Ok(r) => {
+            let stdout = String::from_utf8_lossy(&r.stdout);
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            let body = if !stdout.trim().is_empty() {
+                stdout.into_owned()
+            } else if !stderr.trim().is_empty() {
+                stderr.into_owned()
+            } else {
+                "(no output)".to_string()
+            };
+            const CAP: usize = 32_768;
+            let body = if body.len() > CAP {
+                crate::tools::smart_truncate(&body, CAP)
+            } else {
+                body
+            };
+            if r.exit_code == Some(0) {
+                Outcome::ok(body)
+            } else {
+                Outcome::err(body)
+            }
+        }
+        Err(e) => Outcome::err(e.user_message()),
+    }
+}
+
 // ---- memory tool (agent-callable wrapper over crate::memory) ----

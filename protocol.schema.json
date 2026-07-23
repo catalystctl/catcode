@@ -37,7 +37,8 @@
             "intercom_reply", "ask_reply", "sudo_reply", "get_vision_config",
             "set_vision_config", "list_skills", "apply_skill", "start_goal",
             "cancel_goal", "goal_status", "approve_goal_plan", "revise_goal",
-            "user_bash"
+            "user_bash", "add_custom_provider", "discover_provider_models",
+            "get_sandbox_status", "prepare_sandbox", "reset_sandbox"
           ]
         },
         "protocol_version": { "type": "integer", "minimum": 1 },
@@ -73,7 +74,9 @@
             "sudo_request", "thinking", "tool_call", "tool_call_args",
             "tool_call_name", "tool_call_start", "tool_result", "umans_conc",
             "usage", "vision_config", "work_state", "worktree_cleaned",
-            "worktree_promoted", "worktree_ready", "worktree_seeded"
+            "worktree_promoted", "worktree_ready", "worktree_seeded",
+            "provider_models_preview", "sandbox_error",
+            "sandbox_prepare_progress", "sandbox_ready", "sandbox_status"
           ]
         },
         "protocol_version": { "const": 2 },

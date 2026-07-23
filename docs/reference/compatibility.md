@@ -4,11 +4,16 @@
 
 | Platform | TUI | Web | Hard sandbox | Installer |
 |----------|:---:|:---:|:------------:|:---------:|
-| Linux (x86_64) | ✅ | ✅ | `firejail` | `install.sh` (systemd) |
-| Linux (aarch64) | ✅ | ✅ | `firejail` | `install.sh` (systemd) |
-| macOS (x86_64) | ✅ | ✅ | `seatbelt` | `install.sh` (launchd) |
-| macOS (arm64) | ✅ | ✅ | `seatbelt` | `install.sh` (launchd) |
-| Windows (x86_64) | ✅ | ✅ | — | `install.ps1` (NSSM / Scheduled Task) |
+| Linux (x86_64) | ✅ | ✅ | Microsandbox (KVM) | `install.sh` (systemd) |
+| Linux (aarch64) | ✅ | ✅ | Microsandbox (KVM) | `install.sh` (systemd) |
+| macOS (x86_64) | ✅ | ✅ | — (Intel unsupported) | `install.sh` (launchd) |
+| macOS (arm64) | ✅ | ✅ | Microsandbox | `install.sh` (launchd) |
+| Windows (x86_64) | ✅ | ✅ | Microsandbox (WHP, preview) | `install.ps1` (NSSM / Scheduled Task) |
+
+The sandbox runs agent workloads inside a Microsandbox microVM. It requires
+hardware virtualization and (on Linux) `/dev/kvm`; on Intel macOS it is
+unsupported. When unavailable, CatCode fails closed rather than running on the
+host. See the [Sandbox Guide](../guides/sandbox.md).
 
 ## Provider Compatibility
 

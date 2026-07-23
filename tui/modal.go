@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -47,6 +46,7 @@ const (
 	modalUsage // provider plan / rate-limit usage (/usage)
 	modalApproval
 	modalSandbox
+	modalSandboxStatus // status / preflight / setup panel
 	modalAutoCompact
 	modalNoNetwork
 	modalFooterMetrics
@@ -520,14 +520,16 @@ func (s *session) searchKeyItems() []listItem {
 	}
 }
 
-// openSandboxPicker lists sandbox modes (none | firejail | seatbelt).
+// openSandboxPicker lists sandbox modes (none | microsandbox). The legacy
+// firejail/seatbelt backends were removed; microsandbox is cross-platform
+// (Linux KVM · Apple Silicon macOS · Windows WHP), so the selector is never
+// gated on the host OS — readiness comes from the core's preflight report.
 func (s *session) openSandboxPicker() {
 	s.modal = newModal()
 	s.modal.kind = modalSandbox
 	s.modal.cursor = 0
-	modes := []string{"none", "firejail", "seatbelt"}
-	for i, m := range modes {
-		if m == s.settings.Sandbox {
+	for i, it := range s.sandboxItems() {
+		if it.meta == s.settings.Sandbox {
 			s.modal.cursor = i
 			break
 		}
@@ -1160,7 +1162,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/theme", desc: "switch colour theme"},
 		{group: "Session", label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
 		{group: "Session", label: "/auto-compact", desc: "auto context compaction on/off"},
-		{group: "Session", label: "/sandbox", desc: "sandbox mode (none · firejail · seatbelt)"},
+		{group: "Session", label: "/sandbox", desc: "sandbox mode (none · microsandbox)"},
 		{group: "Session", label: "/no-network", desc: "block network in sandbox on/off"},
 		{group: "Session", label: "/footer-metrics", desc: "show model, TPS, and TTFT in footer"},
 		{group: "Session", label: "/reduced-motion", desc: "disable spring animations"},
@@ -1368,37 +1370,20 @@ func approvalModeLabel(mode string) string {
 
 func (s *session) sandboxItems() []listItem {
 	modes := []struct {
-		mode, desc string
+		mode, label, desc string
 	}{
-		{"none", "no sandbox"},
-		{"firejail", "firejail sandbox (Linux)"},
-		{"seatbelt", "seatbelt / sandbox-exec (macOS)"},
+		{"none", "Disabled", "no sandbox — commands run directly on the host"},
+		{"microsandbox", "Microsandbox", "Linux microVM (KVM · Apple Silicon · Windows WHP)"},
 	}
 	items := make([]listItem, len(modes))
 	for i, m := range modes {
 		desc := m.desc
-		if !sandboxModeAvailable(m.mode) {
-			desc = "unavailable on " + runtime.GOOS + " · " + desc
-		}
 		if m.mode == s.settings.Sandbox {
 			desc = "current · " + desc
 		}
-		items[i] = listItem{label: m.mode, desc: desc}
+		items[i] = listItem{label: m.label, desc: desc, meta: m.mode}
 	}
 	return items
-}
-
-func sandboxModeAvailable(mode string) bool {
-	switch mode {
-	case "none":
-		return true
-	case "firejail":
-		return runtime.GOOS == "linux"
-	case "seatbelt":
-		return runtime.GOOS == "darwin"
-	default:
-		return false
-	}
 }
 
 // toggleItems builds a two-option on/off list with "current" marked.
@@ -1689,6 +1674,8 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return s.handleHelpKey(msg)
 	case modalContext, modalUsage:
 		return s.handleHelpKey(msg)
+	case modalSandboxStatus:
+		return s.handleSandboxStatusKey(msg)
 	}
 	return s, nil
 }
@@ -2421,16 +2408,16 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	case modalSandbox:
 		items := s.sandboxItems()
 		if abs >= 0 && abs < len(items) {
-			mode := items[abs].label
-			if !sandboxModeAvailable(mode) {
-				s.modal.loadError = fmt.Sprintf("%s sandbox is unavailable on %s", mode, runtime.GOOS)
+			mode := items[abs].meta // "none" | "microsandbox"
+			s.closeModal()
+			if mode == "microsandbox" {
+				// Fail-closed enable: ask the core for a preflight report and only
+				// persist the setting once the environment is ready. Never silently
+				// save "none" on the user's behalf.
+				s.requestSandboxEnable()
 				return s, nil
 			}
-			s.settings.Sandbox = mode
-			_ = s.settings.save()
-			s.logInfo(fmt.Sprintf("sandbox: %s", mode))
-			s.closeModal()
-			s.offerCoreRestart("sandbox mode")
+			s.setSandboxNone()
 			return s, nil
 		}
 		s.closeModal()
@@ -3282,6 +3269,8 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Set Search API Key", s.searchKeyItems(), false)
 	case modalSandbox:
 		return s.renderListModal("Sandbox", s.sandboxItems(), false)
+	case modalSandboxStatus:
+		return s.renderSandboxStatusModal()
 	case modalAutoCompact:
 		return s.renderListModal("Auto Compact", s.autoCompactItems(), false)
 	case modalNoNetwork:

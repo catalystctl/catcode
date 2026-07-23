@@ -6,8 +6,9 @@ Get Catalyst Code running and send your first prompt in under two minutes.
 
 ## Prerequisites
 
-- **Linux, macOS, or Windows** — the hard sandbox is Linux-only; on macOS and
-  Windows leave it `none`.
+- **Linux, macOS, or Windows**. The optional microVM sandbox runs on Linux
+  via KVM, Apple Silicon macOS, and Windows via the Windows Hypervisor Platform;
+  Intel macOS is unsupported (leave it `none`).
 - **curl + coreutils** on Unix (`sha256sum` is used by the installer).
 - **No compiler required** — the installer downloads prebuilt binaries.
 
@@ -211,7 +212,7 @@ process and streams events to the browser over SSE. You can:
   every tool).
 - `/goal` — open goal mode for multi-step objectives with subagent concurrency
 - `/settings` — configure theme, sandbox, mouse wheel, and more
-- `/sandbox firejail --no-network` — enable Linux hard sandboxing
+- `/sandbox microsandbox --no-network` — enable the Microsandbox microVM sandbox
 - `!catcode --update` — check for and apply updates (or use
   Settings → About → Update in the web UI)
 

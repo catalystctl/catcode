@@ -4,6 +4,8 @@
 // This replaces the duplicated SLASH set (composer.tsx) + onCommand switch
 // (chat.tsx) so they can never drift apart.
 
+import type { CoreCommand } from "./types";
+
 export interface CommandDef {
   /** The full slash token, e.g. "/reset". */
   label: string;
@@ -34,7 +36,7 @@ export const COMMANDS: CommandDef[] = [
   { label: "/model", desc: "switch model", category: "config", action: "model" },
   { label: "/reasoning", desc: "set reasoning effort", category: "config", action: "reasoning" },
   { label: "/approval", desc: "never · destructive · always", category: "config", action: "approval" },
-  { label: "/sandbox", desc: "none · firejail · seatbelt (bash hard sandbox)", category: "config", action: "sandbox" },
+  { label: "/sandbox", desc: "none · microsandbox (bash hard sandbox)", category: "config", action: "sandbox" },
   { label: "/auto-compact", desc: "toggle auto context compaction", category: "config", action: "auto-compact" },
   { label: "/bash-timeout", desc: "set bash tool timeout (seconds)", category: "config", action: "bash-timeout" },
   { label: "/settings", desc: "open settings modal", category: "config", action: "settings" },
@@ -72,6 +74,27 @@ export const COMMANDS: CommandDef[] = [
 
 /** Quick lookup by label. */
 export const COMMAND_BY_LABEL = new Map(COMMANDS.map((c) => [c.label, c]));
+
+// ── Sandbox (Microsandbox) core-command builders ───────────────────────────
+// Typed constructors for the three sandbox control commands the web sends to
+// the core. Kept here (next to the slash catalog) so the command surface stays
+// in one place; consumed by use-agent.ts.
+
+/** Ask the core to (re)run preflight and emit `sandbox_status` with the report. */
+export function getSandboxStatusCommand(): CoreCommand {
+  return { type: "get_sandbox_status" };
+}
+
+/** Begin user-space runtime/image preparation; the core streams
+ *  `sandbox_prepare_progress` then `sandbox_ready`/`sandbox_error`. */
+export function prepareSandboxCommand(): CoreCommand {
+  return { type: "prepare_sandbox" };
+}
+
+/** Reset an unhealthy sandbox; the core tears down + recreates the guest. */
+export function resetSandboxCommand(): CoreCommand {
+  return { type: "reset_sandbox" };
+}
 
 /** Fuzzy-filter commands by a query (matches label or desc, case-insensitive). */
 export function filterCommands(query: string): CommandDef[] {

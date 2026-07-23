@@ -6,7 +6,8 @@
     "core/src/plugins.rs": 5,
     "core/src/test_env.rs": 2,
     "core/src/tooling/builtin/git.rs": 1,
-    "core/src/tools.rs": 3
+    "core/src/tools.rs": 3,
+    "core/src/sandbox/backend.rs": 1
   },
   "task_spawns": {
     "core/src/fetch_tool.rs": 1,

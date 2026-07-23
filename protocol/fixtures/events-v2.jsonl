@@ -88,3 +88,7 @@
 {"type":"worktree_ready","protocol_version":2}
 {"type":"worktree_seeded","protocol_version":2}
 {"type":"provider_models_preview","protocol_version":2,"models":[{"id":"fixture-model","name":"Fixture Model","reasoning":true,"context_window":200000,"max_tokens":8192,"thinking_levels":["low","medium","high"],"vision":false,"provider":"__preview__"}],"base_url":"https://api.fixture.example/v1"}
+{"type":"sandbox_status","protocol_version":2,"mode":"microsandbox","report":{"requested":true,"supported":true,"ready":true,"platform":"linux","architecture":"x86_64","checks":[],"actions":[]}}
+{"type":"sandbox_prepare_progress","protocol_version":2,"phase":"downloading-runtime-and-image"}
+{"type":"sandbox_ready","protocol_version":2,"ready":true,"report":{"requested":true,"supported":true,"ready":true,"platform":"linux","architecture":"x86_64","checks":[],"actions":[]}}
+{"type":"sandbox_error","protocol_version":2,"error":"sandbox setup required"}

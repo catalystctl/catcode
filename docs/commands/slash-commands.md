@@ -259,18 +259,23 @@ Accepts `on`/`off`, `true`/`false`, `1`/`0`.
 
 ### `/sandbox`
 
-Set the bash sandbox mode.
+Inspect and control the Microsandbox microVM sandbox.
 
 **Syntax:**
 
 ```text
-/sandbox                  # open picker
-/sandbox none
-/sandbox firejail          # Linux
-/sandbox seatbelt          # macOS
+/sandbox                 # open status / settings view
+/sandbox status          # show platform, image, limits, readiness
+/sandbox enable          # enable Microsandbox (runs preflight first)
+/sandbox disable         # explicitly disable (set to none)
+/sandbox setup           # prepare user-space runtime/image assets
+/sandbox recheck         # re-run preflight after setup
+/sandbox reset           # destroy and recreate an unhealthy sandbox
 ```
 
-Changes require a core restart; the TUI prompts to restart.
+Enabling requires a healthy preflight (Linux KVM, Apple Silicon macOS, or
+Windows WHP). Changes that need a core restart prompt to restart. See the
+[Sandbox Guide](../guides/sandbox.md).
 
 ### `/no-network`
 
