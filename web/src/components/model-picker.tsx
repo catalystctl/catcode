@@ -89,7 +89,7 @@ export function ModelPicker({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search models…"
-            className="w-full rounded-lg border border-ink-700 bg-ink-950 py-1.5 pl-8 pr-7 text-[12px] text-ink-100 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none"
+            className="w-full rounded-sm border border-ink-700 bg-ink-950 py-1.5 pl-8 pr-7 text-[12px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
           />
           {query && (
             <button
@@ -142,8 +142,8 @@ export function ModelPicker({
                   onSelect(mo.id);
                   onClose?.();
                 }}
-                className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-ink-850 ${
-                  active ? "bg-accent/10" : ""
+                className={`flex w-full items-center gap-2.5 border-l-2 px-3 py-2 text-left transition-colors hover:bg-ink-850 ${
+                  active ? "border-l-accent bg-ink-850" : "border-l-transparent"
                 } ${i > 0 ? "border-t border-ink-800/50" : ""}`}
               >
                 <ModelIcon
@@ -162,7 +162,7 @@ export function ModelPicker({
                   </div>
                   <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-ink-500">
                     {mo.provider && (
-                      <span className="rounded bg-ink-800 px-1 text-[9px] text-ink-400">
+                      <span className="rounded-sm bg-ink-800 px-1 font-mono text-[10px] uppercase text-ink-400">
                         {prettyProvider(mo.provider)}
                       </span>
                     )}
@@ -203,10 +203,10 @@ function ProviderChip({
   return (
     <button
       onClick={onClick}
-      className={`rounded-md border px-2 py-0.5 text-[10px] font-medium capitalize transition-colors ${
+      className={`rounded-sm border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
         active
-          ? "border-accent/50 bg-accent/15 text-accent-soft"
-          : "border-ink-700/70 bg-ink-900/70 text-ink-400 hover:border-ink-600 hover:text-ink-200"
+          ? "border-accent/60 bg-ink-850 text-accent-soft"
+          : "border-ink-700 bg-ink-900 text-ink-400 hover:border-ink-600 hover:text-ink-200"
       }`}
     >
       {label}
@@ -235,7 +235,7 @@ export function ModelPopover({
       <div
         ref={closeRef}
         role="menu"
-        className="absolute right-0 z-30 mt-1 w-80 overflow-hidden rounded-xl border border-ink-700 bg-ink-900 shadow-2xl shadow-black/40 animate-fade-in"
+        className="absolute right-0 z-30 mt-1 w-80 overflow-hidden rounded-sm border border-ink-700 bg-ink-900 shadow-elev-2 animate-fade-in"
       >
         <ModelPicker
           models={models}

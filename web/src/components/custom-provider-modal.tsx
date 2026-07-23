@@ -97,7 +97,7 @@ export function CustomProviderModal({
     touched && !ok ? <p className="mt-1 text-[11px] text-danger">{msg}</p> : null;
 
   const inputCls =
-    "w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none";
+    "w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none";
 
   const discover = () => {
     setTouched(true);
@@ -161,7 +161,7 @@ export function CustomProviderModal({
             {step === "models" && (
               <button
                 onClick={() => setStep("endpoint")}
-                className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
                 aria-label="Back to endpoint"
               >
                 <ArrowLeftIcon width={15} height={15} />
@@ -171,13 +171,13 @@ export function CustomProviderModal({
             <h2 className="text-[15px] font-semibold text-ink-100">
               {step === "models" ? "Refine model caps" : "Add custom provider"}
             </h2>
-            <span className="ml-1 rounded-full bg-ink-800 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-ink-400">
+            <span className="ml-1 rounded-sm bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-ink-400">
               {step === "models" ? "2 / 2" : "1 / 2"}
             </span>
           </div>
           <button
             onClick={onClose}
-            className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -188,7 +188,7 @@ export function CustomProviderModal({
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+                <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                   Name <span className="text-danger">*</span>
                 </label>
                 <input
@@ -201,10 +201,10 @@ export function CustomProviderModal({
                 {fieldErr(nameOk, "A unique slug (e.g. my-provider).")}
               </div>
               <div>
-                <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+                <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                   Wire protocol
                 </label>
-                <div className="flex overflow-hidden rounded-lg border border-ink-700">
+                <div className="flex overflow-hidden rounded-sm border border-ink-700">
                   {KINDS.map((k) => (
                     <button
                       key={k.id}
@@ -212,7 +212,7 @@ export function CustomProviderModal({
                       title={k.hint}
                       className={`flex-1 px-2 py-2 text-[12px] font-medium transition-colors ${
                         draft.kind === k.id
-                          ? "bg-accent/15 text-accent-soft"
+                          ? "bg-ink-800 text-accent-soft"
                           : "bg-ink-950 text-ink-400 hover:bg-ink-850"
                       }`}
                     >
@@ -227,7 +227,7 @@ export function CustomProviderModal({
             </div>
 
             <div>
-              <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 Base URL <span className="text-danger">*</span>
               </label>
               <input
@@ -244,7 +244,7 @@ export function CustomProviderModal({
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+                <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                   API key
                 </label>
                 <input
@@ -260,7 +260,7 @@ export function CustomProviderModal({
                 </p>
               </div>
               <div>
-                <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+                <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                   …or env var name
                 </label>
                 <input
@@ -276,7 +276,7 @@ export function CustomProviderModal({
             </div>
 
             <div>
-              <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 Extra headers <span className="normal-case text-ink-600">(optional)</span>
               </label>
               <textarea
@@ -291,7 +291,7 @@ export function CustomProviderModal({
             </div>
 
             <div>
-              <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 Context window <span className="normal-case text-ink-600">(optional, tokens)</span>
               </label>
               <input
@@ -324,7 +324,7 @@ export function CustomProviderModal({
               return (
                 <div
                   key={m.id}
-                  className="rounded-xl border border-ink-700/70 bg-ink-900/70 px-3.5 py-3"
+                  className="rounded-sm border border-ink-800 bg-ink-900 px-3.5 py-3"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="min-w-0">
@@ -345,7 +345,7 @@ export function CustomProviderModal({
                   </div>
                   <div className="mt-2.5 grid grid-cols-3 gap-2">
                     <div>
-                      <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-ink-600">
+                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                         Context
                       </label>
                       <input
@@ -358,7 +358,7 @@ export function CustomProviderModal({
                       />
                     </div>
                     <div>
-                      <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-ink-600">
+                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                         Output
                       </label>
                       <input
@@ -371,7 +371,7 @@ export function CustomProviderModal({
                       />
                     </div>
                     <div>
-                      <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-ink-600">
+                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                         Effort levels
                       </label>
                       <input
@@ -396,14 +396,14 @@ export function CustomProviderModal({
             <div className="flex items-center gap-2">
               <button
                 onClick={submit}
-                className="rounded-lg border border-ink-700 bg-ink-850 px-3.5 py-2 text-[13px] font-medium text-ink-100 hover:bg-ink-800"
+                className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800"
               >
                 Add without discovering
               </button>
               <button
                 onClick={discover}
                 disabled={!endpointValid || discovering}
-                className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white hover:bg-accent-soft disabled:opacity-40"
+                className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft disabled:opacity-40"
               >
                 {discovering ? "Discovering…" : "Discover models →"}
               </button>
@@ -411,7 +411,7 @@ export function CustomProviderModal({
           ) : (
             <button
               onClick={submit}
-              className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white hover:bg-accent-soft"
+              className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
             >
               Add provider
             </button>

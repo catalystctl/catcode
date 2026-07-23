@@ -94,6 +94,12 @@ export function GitPanel({ compact }: { compact?: boolean }) {
   const { workspace, ide } = useIdeContext();
   const { confirm, prompt, dialog } = useAppDialog();
   const status = ide.state.gitStatus;
+  const {
+    setGitStatus,
+    openDiff,
+    openPatch,
+    selectEditor,
+  } = ide;
   const [tab, setTab] = useState<Tab>("changes");
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -110,7 +116,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
         if (!response.ok) {
           throw new Error(typeof data.error === "string" ? data.error : "Failed to load Git repository");
         }
-        ide.setGitStatus(data as GitStatus);
+        setGitStatus(data as GitStatus);
         setError(null);
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Network error");
@@ -118,7 +124,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
         if (!silent) setLoading(false);
       }
     },
-    [ide, workspace],
+    [setGitStatus, workspace],
   );
 
   useEffect(() => {
@@ -155,7 +161,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
         if (!response.ok) {
           throw new Error(typeof data.error === "string" ? data.error : `${action} failed`);
         }
-        if (data.status) ide.setGitStatus(data.status as GitStatus);
+        if (data.status) setGitStatus(data.status as GitStatus);
         setError(null);
         setResult(`${actionLabel(action)} completed`);
         setSelected(null);
@@ -167,37 +173,37 @@ export function GitPanel({ compact }: { compact?: boolean }) {
         setBusy(false);
       }
     },
-    [ide, workspace],
+    [setGitStatus, workspace],
   );
 
   const fetchDiff = useCallback(
     async (entry: GitStatusEntry) => {
       setSelected(entry.path);
       // Open in the main editor as a Monaco DiffEditor (unified / split / collapse).
-      ide.openDiff(entry.path, { staged: entry.staged });
-      ide.selectEditor();
+      openDiff(entry.path, { staged: entry.staged });
+      selectEditor();
     },
-    [ide],
+    [openDiff, selectEditor],
   );
 
   const fetchCommit = useCallback(
     async (oid: string, label: string) => {
       setSelected(oid);
       setTab("history");
-      ide.openPatch("commit", oid, label);
-      ide.selectEditor();
+      openPatch("commit", oid, label);
+      selectEditor();
     },
-    [ide],
+    [openPatch, selectEditor],
   );
 
   const fetchStash = useCallback(
     async (ref: string) => {
       setSelected(ref);
       setTab("stashes");
-      ide.openPatch("stash", ref, ref);
-      ide.selectEditor();
+      openPatch("stash", ref, ref);
+      selectEditor();
     },
-    [ide],
+    [openPatch, selectEditor],
   );
 
   const totalChanges = status?.entries.length ?? 0;

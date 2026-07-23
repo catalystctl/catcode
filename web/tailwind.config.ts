@@ -67,7 +67,9 @@ const config: Config = {
         "pulse-ring": "pulse-ring 1.4s ease-out infinite",
       },
       boxShadow: {
-        glow: "0 0 0 1px rgba(207,138,89,0.25), 0 0 24px -6px rgba(207,138,89,0.45)",
+        glow: "0 0 0 1px rgb(var(--accent) / 0.28), 0 0 26px -6px rgb(var(--accent) / 0.5)",
+        "elev-1": "0 1px 2px rgb(0 0 0 / 0.25), 0 2px 8px -2px rgb(0 0 0 / 0.3)",
+        "elev-2": "0 2px 6px rgb(0 0 0 / 0.28), 0 10px 28px -8px rgb(0 0 0 / 0.4)",
       },
     },
   },

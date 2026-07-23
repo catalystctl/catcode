@@ -35,8 +35,8 @@ export function AccountSecurity() {
 // ── Account info ──────────────────────────────────────────────
 function AccountInfo({ email, name }: { email?: string | null; name?: string | null }) {
   return (
-    <div className="rounded-xl border border-ink-800 bg-ink-950/50 px-4 py-3">
-      <div className="text-[11px] font-medium uppercase tracking-wider text-ink-500">Account</div>
+    <div className="rounded-sm border border-ink-800 bg-ink-900 px-4 py-3">
+      <div className="font-mono text-[10px] uppercase tracking-wider text-ink-500">Account</div>
       <div className="mt-1 text-[13px] font-medium text-ink-100">{name || email || "—"}</div>
       {email && email !== name && (
         <div className="text-[11px] text-ink-500">{email}</div>
@@ -113,7 +113,7 @@ function PasskeyManager({
   return (
     <div>
       <SectionLabel>Passkeys</SectionLabel>
-      <div className="overflow-hidden rounded-xl border border-ink-800">
+      <div className="overflow-hidden rounded-sm border border-ink-800 bg-ink-900">
         {passkeys.length === 0 && (
           <div className="px-3 py-2.5 text-[12px] text-ink-500">No passkeys registered.</div>
         )}
@@ -135,14 +135,14 @@ function PasskeyManager({
             </div>
             <button
               onClick={() => deletePasskey(pk.id)}
-              className="rounded-md px-2 py-1 text-[11px] text-ink-500 hover:bg-ink-800 hover:text-red-400"
+              className="rounded-sm px-2 py-1 text-[11px] text-ink-500 hover:bg-ink-800 hover:text-danger"
             >
               Remove
             </button>
           </div>
         ))}
       </div>
-      {error && <p className="mt-1.5 text-[11px] text-red-400">{error}</p>}
+      {error && <p className="mt-1.5 text-[11px] text-danger">{error}</p>}
       <button onClick={addPasskey} disabled={loading} className="auth-btn-ghost mt-2">
         {loading ? "…" : "+ Add passkey"}
       </button>
@@ -267,13 +267,13 @@ function TotpManager({
     return (
       <div>
         <SectionLabel>Backup codes</SectionLabel>
-        <div className="rounded-xl border border-ink-800 bg-ink-950/50 p-4">
+        <div className="rounded-sm border border-ink-800 bg-ink-900 p-4">
           <p className="mb-2 text-[12px] text-ink-400">
             Save these one-time codes somewhere safe. Each can substitute for a TOTP code once.
           </p>
           <div className="grid grid-cols-2 gap-1 font-mono text-[12px] text-ink-200">
             {shownBackupCodes.map((c, i) => (
-              <div key={i} className="rounded bg-ink-900 px-2 py-1">{c}</div>
+              <div key={i} className="rounded-sm bg-ink-950 px-2 py-1">{c}</div>
             ))}
           </div>
           <button onClick={() => setShownBackupCodes(null)} className="auth-btn-primary mt-3">
@@ -289,12 +289,12 @@ function TotpManager({
     return (
       <div>
         <SectionLabel>Two-factor (TOTP)</SectionLabel>
-        <div className="rounded-xl border border-ink-800 bg-ink-950/50 p-4">
+        <div className="rounded-sm border border-ink-800 bg-ink-900 p-4">
           <p className="mb-3 text-[12px] text-ink-400">
             Scan this QR with your authenticator app (Google Authenticator, Authy, 1Password…),
             then enter the 6-digit code it shows.
           </p>
-          <div className="mb-3 flex justify-center rounded-lg bg-white p-3">
+          <div className="mb-3 flex justify-center rounded-sm bg-white p-3">
             <QRCodeSVG value={setupUri} size={160} />
           </div>
           <form onSubmit={verifyAndEnable} className="space-y-2">
@@ -309,7 +309,7 @@ function TotpManager({
               placeholder="000000"
               autoComplete="one-time-code"
             />
-            {error && <p className="text-[11px] text-red-400">{error}</p>}
+            {error && <p className="text-[11px] text-danger">{error}</p>}
             <button type="submit" disabled={loading} className="auth-btn-primary">
               {loading ? "Verifying…" : "Enable"}
             </button>
@@ -333,9 +333,9 @@ function TotpManager({
   return (
     <div>
       <SectionLabel>Two-factor (TOTP)</SectionLabel>
-      <div className="rounded-xl border border-ink-800 bg-ink-950/50 px-4 py-3">
+      <div className="rounded-sm border border-ink-800 bg-ink-900 px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className={`h-2 w-2 rounded-full ${enabled ? "bg-success" : "bg-ink-600"}`} />
+          <span className={`h-1.5 w-1.5 rounded-none ${enabled ? "bg-success" : "bg-ink-600"}`} />
           <span className="text-[12px] font-medium text-ink-100">
             {enabled ? "Enabled" : "Not enabled"}
           </span>
@@ -351,7 +351,7 @@ function TotpManager({
               <button onClick={regenerateBackupCodes} disabled={loading} className="auth-btn-ghost">
                 New backup codes
               </button>
-              <button onClick={disable} disabled={loading} className="auth-btn-ghost text-red-400">
+              <button onClick={disable} disabled={loading} className="auth-btn-ghost text-danger">
                 Disable
               </button>
             </>
@@ -361,7 +361,7 @@ function TotpManager({
             </button>
           )}
         </div>
-        {error && <p className="mt-1.5 text-[11px] text-red-400">{error}</p>}
+        {error && <p className="mt-1.5 text-[11px] text-danger">{error}</p>}
       </div>
     </div>
   );
@@ -407,7 +407,7 @@ function ChangePassword() {
   return (
     <div>
       <SectionLabel>Change password</SectionLabel>
-      <form onSubmit={onSubmit} className="space-y-2 rounded-xl border border-ink-800 bg-ink-950/50 p-3">
+      <form onSubmit={onSubmit} className="space-y-2 rounded-sm border border-ink-800 bg-ink-900 p-3">
         <input
           type="password"
           required
@@ -435,7 +435,7 @@ function ChangePassword() {
           placeholder="Confirm new password"
           autoComplete="new-password"
         />
-        {error && <p className="text-[11px] text-red-400">{error}</p>}
+        {error && <p className="text-[11px] text-danger">{error}</p>}
         {done && <p className="text-[11px] text-success">Password updated.</p>}
         <button type="submit" disabled={loading} className="auth-btn-primary">
           {loading ? "Updating…" : "Update password"}
@@ -456,7 +456,7 @@ function SignOut({ onDone }: { onDone: () => void }) {
         onDone();
       }}
       disabled={loading}
-      className="auth-btn-ghost text-red-400"
+      className="auth-btn-ghost text-danger"
     >
       {loading ? "Signing out…" : "Sign out"}
     </button>
@@ -465,7 +465,7 @@ function SignOut({ onDone }: { onDone: () => void }) {
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">
+    <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-ink-500">
       {children}
     </div>
   );

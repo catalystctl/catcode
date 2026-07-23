@@ -562,51 +562,53 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   };
 
   return (
-    <div className={`relative border-t border-ink-800/60 bg-ink-950/90 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2.5 backdrop-blur-md ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
+    <div className={`relative border-t border-ink-800 bg-ink-925 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 ${compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"}`}>
       <div className={`mx-auto ${compact ? "max-w-none" : "max-w-3xl"}`}>
         {hitlOpen && (
-          <p className="mb-1.5 px-1 text-[11px] text-accent-soft" role="status">
+          <p className="mb-2 flex items-center gap-1.5 border-l-2 border-accent/60 bg-ink-900 px-2 py-1 font-mono text-[11px] uppercase tracking-wider text-ink-400" role="status">
+            <span className="h-1.5 w-1.5 animate-pulse bg-accent-soft" aria-hidden="true" />
             Answer the request above to continue
           </p>
         )}
         {followUpQueued && (
-          <div className="mb-1.5 flex items-center gap-1.5 px-1">
-            <span
-              className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[11px] font-medium text-accent-soft"
-              title="A follow-up is queued for after this turn"
-            >
-              queued
-              {onClearQueue && (
-                <button
-                  type="button"
-                  onClick={onClearQueue}
-                  className="ml-0.5 text-ink-400 hover:text-ink-100"
-                  title="Clear queue (Esc)"
-                  aria-label="Clear queued follow-up"
-                >
-                  ×
-                </button>
-              )}
-            </span>
+          <div
+            className="mb-2 flex items-center gap-1.5 border-l-2 border-accent/60 bg-ink-900 px-2 py-1 font-mono text-[11px] text-ink-400"
+            title="A follow-up is queued for after this turn"
+          >
+            <span className="h-1.5 w-1.5 bg-accent-soft" aria-hidden="true" />
+            queued
+            {onClearQueue && (
+              <button
+                type="button"
+                onClick={onClearQueue}
+                className="ml-1 rounded-sm px-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                title="Clear queue (Esc)"
+                aria-label="Clear queued follow-up"
+              >
+                ×
+              </button>
+            )}
           </div>
         )}
         {(activeFile || referencedFiles.length > 0) && (
-          <div className="mb-1.5 flex min-w-0 flex-wrap items-center gap-1.5 px-1" aria-label="Prompt context">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-600">Context</span>
+          <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1.5 px-1" aria-label="Prompt context">
+            <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">Context</span>
             {activeFile && (
               <button
                 type="button"
                 onClick={() => setText((current) => referencedFiles.includes(activeFile) ? current : `${current.trimEnd()}${current.trim() ? " " : ""}@${activeFile} `)}
-                className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-ink-800 bg-ink-900/70 px-2 py-0.5 text-[10px] text-ink-400 hover:border-accent/30 hover:text-ink-200"
+                className="inline-flex max-w-[220px] items-center gap-1 rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-300 transition-colors hover:border-accent/60 hover:text-ink-100"
                 title={`Active editor: ${activeFile}. Click to include it in the prompt.`}
               >
-                <span className="text-accent-soft">●</span><span className="truncate">{activeFile}</span><span className="text-ink-600">+ include</span>
+                <span className="h-1.5 w-1.5 shrink-0 bg-accent-soft" aria-hidden="true" />
+                <span className="truncate">{activeFile}</span>
+                <span className="shrink-0 text-ink-500">+ include</span>
               </button>
             )}
             {referencedFiles.map((path) => (
-              <span key={path} className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-accent/20 bg-accent/5 px-2 py-0.5 text-[10px] text-accent-soft" title={`Referenced file: ${path}`}>
+              <span key={path} className="inline-flex max-w-[220px] items-center gap-1 rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-300" title={`Referenced file: ${path}`}>
                 <span className="truncate">@{path}</span>
-                <button type="button" onClick={() => removeReference(path)} className="text-ink-500 hover:text-ink-100" aria-label={`Remove ${path} from prompt context`}>×</button>
+                <button type="button" onClick={() => removeReference(path)} className="shrink-0 rounded-sm px-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100" aria-label={`Remove ${path} from prompt context`}>×</button>
               </span>
             ))}
           </div>
@@ -639,10 +641,8 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             // attribute mismatch while preserving SSR for the composer.
             suppressHydrationWarning
             className={
-              "composer-shell flex flex-wrap items-end gap-1.5 rounded-2xl p-2 transition-[box-shadow,border-color] duration-200 " +
-              (streaming
-                ? "composer-inflight"
-                : "border border-ink-700/50 bg-ink-900/90 shadow-lg shadow-black/15 focus-within:border-accent/50 focus-within:shadow-glow")
+              "composer-shell flex flex-wrap items-end gap-1.5 rounded-sm border border-ink-700 bg-ink-950 p-2 transition-colors duration-200 focus-within:border-accent/60 " +
+              (streaming ? "composer-inflight" : "")
             }
           >
             <ImageAttach ref={attachRef} images={images} onAdd={onAddImage} onRemove={onRemoveImage} />
@@ -667,61 +667,66 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                       : "Message the agent…  (/ for commands, @ for files)"
                   : "Connecting…"
               }
-              className="max-h-40 min-w-[8rem] flex-1 resize-none bg-transparent px-2 py-1.5 text-[16px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:outline-none disabled:opacity-50 sm:max-h-60 sm:text-[14px]"
+              className="max-h-40 min-w-[8rem] flex-1 resize-none bg-transparent px-2.5 py-1.5 text-[16px] leading-relaxed text-ink-100 placeholder:text-ink-600 focus:outline-none disabled:opacity-50 sm:max-h-60 sm:text-[14px]"
             />
             {streaming ? (
-              <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+              <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
                 {text.trim() && (
                   <>
                     <button
                       onClick={submit}
                       disabled={hitlOpen || !connected || (!canSend && !(text.trim().startsWith("/") || text.trim().startsWith("!")))}
-                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-accent/40 bg-accent/10 px-3 text-[13px] font-medium text-accent-soft transition-colors hover:bg-accent/20 disabled:opacity-40"
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
                       title="Queue follow-up (Enter)"
+                      aria-label="Queue follow-up"
                     >
-                      <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Queue</span>
+                      <SendIcon width={14} height={14} />
                     </button>
                     <button
                       onClick={submitSteer}
                       disabled={hitlOpen || !connected || !canSend}
-                      className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/10 px-3 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40"
                       title="Steer in-flight turn (Ctrl+Enter)"
+                      aria-label="Steer in-flight turn"
                     >
-                      {compact && <span aria-hidden="true">↗</span>}
-                      <span className={compact ? "sr-only" : ""}>Steer</span>
+                      <span aria-hidden="true">↗</span>
                     </button>
                   </>
                 )}
                 <button
                   onClick={onAbort}
-                  className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl border border-danger/40 bg-danger/10 px-3 text-[13px] font-medium text-danger transition-colors hover:bg-danger/20"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm text-danger transition-colors hover:bg-ink-800"
+                  title="Stop"
+                  aria-label="Stop"
                 >
-                  <StopIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Stop</span>
+                  <StopIcon width={14} height={14} />
                 </button>
               </div>
             ) : (
               <button
                 onClick={submit}
                 disabled={disabled || (!text.trim() && images.length === 0)}
-                className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3.5 text-[13px] font-semibold text-white transition-all hover:bg-accent-soft hover:shadow-glow disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 disabled:shadow-none"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
+                title="Send (Enter)"
+                aria-label="Send message"
               >
-                <SendIcon width={14} height={14} /> <span className={compact ? "hidden" : ""}>Send</span>
+                <SendIcon width={14} height={14} />
               </button>
             )}
           </div>
         </div>
-        <div className={`mt-1.5 items-center justify-between px-1 text-[11px] text-ink-500 ${compact ? "hidden" : "flex"}`}>
+        <div className={`mt-2 items-center justify-between px-1.5 font-mono text-[10px] text-ink-500 ${compact ? "hidden" : "flex"}`}>
           <span className="flex items-center gap-1.5">
             <BoltIcon width={11} height={11} className="text-accent-soft" />
-            <span className="font-mono">{modelLabel}</span>
-            <span className="text-ink-600">·</span>
+            <span className="text-ink-400">{modelLabel}</span>
+            <span className="text-ink-700">·</span>
             <span>think: {thinkingLevel}</span>
             {flyoutOpen && (
               <>
                 <span className="text-ink-600">·</span>
                 <span className="text-accent-soft">
-                  <kbd className="rounded bg-ink-800 px-1 font-mono text-[10px]">↑↓</kbd> select{" "}
-                  <kbd className="ml-1 rounded bg-ink-800 px-1 font-mono text-[10px]">↵</kbd> confirm
+                  <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 font-mono text-[10px]">↑↓</kbd> select{" "}
+                  <kbd className="ml-1 rounded-sm border border-ink-700 bg-ink-900 px-1 font-mono text-[10px]">↵</kbd> confirm
                 </span>
               </>
             )}
@@ -729,17 +734,17 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           <span className="hidden sm:inline">
             {streaming ? (
               <>
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> queue ·{" "}
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd> steer ·{" "}
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> queue ·{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd> steer ·{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
                 {followUpQueued ? "clear queue" : "stop"}
               </>
             ) : (
               <>
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> send ·{" "}
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Shift+↵</kbd> newline ·{" "}
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">/</kbd>{" "}
-                <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">@</kbd>
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> send ·{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">Shift+↵</kbd> newline ·{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">/</kbd>{" "}
+                <kbd className="rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px]">@</kbd>
               </>
             )}
           </span>

@@ -8,7 +8,7 @@ export function Diff({ diff, className }: { diff: string; className?: string }) 
   const lines = diff.split("\n");
   return (
     <pre
-      className={`overflow-x-auto rounded-lg border border-ink-800 bg-ink-950 p-3 text-[12px] leading-relaxed ${
+      className={`overflow-x-auto rounded-none border border-ink-800 bg-ink-950 p-3 font-mono text-[12px] leading-relaxed ${
         className ?? ""
       }`}
     >

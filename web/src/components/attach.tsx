@@ -73,7 +73,7 @@ export const ImageAttach = forwardRef<ImageAttachHandle, Props>(function ImageAt
           disabled={busy}
           aria-label="Attach image"
           title="Attach image"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 disabled:opacity-50"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-50"
         >
           <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
@@ -91,13 +91,13 @@ export const ImageAttach = forwardRef<ImageAttachHandle, Props>(function ImageAt
           <img
             src={src}
             alt={`attachment ${i + 1}`}
-            className="h-12 w-12 rounded-md border border-ink-700 object-cover"
+            className="h-12 w-12 rounded-sm border border-ink-700 object-cover"
           />
           <button
             type="button"
             onClick={() => onRemove(i)}
             aria-label={`Remove attachment ${i + 1}`}
-            className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-ink-700 bg-ink-950 text-ink-300 opacity-100 transition-opacity hover:bg-danger/80 hover:text-white sm:opacity-0 sm:group-hover/img:opacity-100 sm:focus-within:opacity-100"
+            className="absolute -right-1.5 -top-1.5 flex h-[18px] w-[18px] items-center justify-center rounded-sm border border-ink-700 bg-ink-900 text-ink-300 opacity-100 transition-colors hover:bg-danger hover:text-white sm:opacity-0 sm:group-hover/img:opacity-100 sm:focus-within:opacity-100"
           >
             <XIcon width={10} height={10} />
           </button>
@@ -117,7 +117,7 @@ export const ImageAttach = forwardRef<ImageAttachHandle, Props>(function ImageAt
         disabled={busy}
         aria-label="Attach image"
         title="Attach image"
-        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md border border-dashed border-ink-700 text-ink-400 transition-colors hover:border-ink-600 hover:text-ink-100 disabled:opacity-50"
+        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-sm border border-dashed border-ink-700 text-ink-500 transition-colors hover:border-accent/60 hover:text-accent-soft disabled:opacity-50"
       >
         <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 5v14M5 12h14" />

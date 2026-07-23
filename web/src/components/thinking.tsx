@@ -1,10 +1,11 @@
 "use client";
 
-// Thinking — a collapsible reasoning block. While the assistant is streaming
-// and has produced thinking but no text yet, show an animated "thinking" state.
+// Thinking — a flat collapsible reasoning block: a left-border rail with a mono
+// header label. While the assistant is streaming and has produced thinking but
+// no text yet, show an animated "thinking" state.
 
 import { useEffect, useRef, useState } from "react";
-import { BrainIcon, ChevronRight } from "./icons";
+import { ChevronRight } from "./icons";
 
 export function Thinking({ text, active }: { text: string; active?: boolean }) {
   const [open, setOpen] = useState(false);
@@ -30,37 +31,31 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
   const showShimmer = active && !text;
 
   return (
-    <div className="my-1.5">
+    <div className="my-1.5 border-l-2 border-ink-700 pl-2">
       <button
         onClick={() => {
           userToggledRef.current = true;
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex items-center gap-1.5 rounded-md px-1 py-0.5 -ml-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-900/60 hover:text-ink-300"
+        className="flex items-center gap-1.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-ink-300"
       >
         <ChevronRight
           width={11}
           height={11}
           className={`shrink-0 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
         />
-        <BrainIcon width={12} height={12} className={showShimmer ? "text-accent-soft" : "text-ink-500"} />
         {showShimmer ? (
-          <span className="flex items-center gap-1 text-accent-soft">
-            thinking
-            <span className="inline-flex gap-0.5" aria-hidden="true">
-              <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft [animation-delay:-0.3s]" />
-              <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft [animation-delay:-0.15s]" />
-              <span className="h-1 w-1 animate-bounce rounded-full bg-accent-soft" />
-            </span>
-          </span>
+          <span className="shimmer-text">Thinking…</span>
+        ) : active ? (
+          <span className="text-accent-soft">reasoning</span>
         ) : (
-          <span>reasoning{text ? ` · ${text.length.toLocaleString()}` : ""}</span>
+          <span>reasoning{text ? ` · ${text.length.toLocaleString()} chars` : ""}</span>
         )}
       </button>
       {open && text && (
-        <div className="mt-1 ml-4 max-h-80 overflow-auto border-l border-ink-800/60 pl-3 py-1.5">
-          <p className="whitespace-pre-wrap break-words font-mono text-[11px] italic leading-relaxed text-ink-400">
+        <div className="mt-1 max-h-80 overflow-auto pr-1">
+          <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink-400">
             {text}
           </p>
         </div>

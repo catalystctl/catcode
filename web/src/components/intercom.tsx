@@ -76,18 +76,20 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
       role="alertdialog"
       aria-modal="true"
       aria-label="Subagent needs a decision"
-      className="my-3 overflow-hidden rounded-xl border border-warning/30 bg-warning/[0.04]"
+      className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925"
     >
-      <div className="flex items-center gap-2 border-b border-warning/20 px-4 py-2.5">
-        <QuestionIcon width={15} height={15} className="text-warning" />
-        <span className="text-sm font-semibold text-ink-100">Subagent needs a decision</span>
-        <span className="ml-auto flex items-center gap-1.5 rounded-full bg-ink-850 px-2 py-0.5">
+      <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-2.5">
+        <QuestionIcon width={14} height={14} className="shrink-0 text-accent-soft" />
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-400">
+          Subagent needs a decision
+        </span>
+        <span className="ml-auto flex min-w-0 items-center gap-1.5 rounded-sm border border-ink-800 bg-ink-950 px-1.5 py-0.5">
           <span className="text-xs">↳</span>
-          <span className="font-mono text-[12px] font-medium text-ink-200">{prompt.from}</span>
+          <span className="truncate font-mono text-[11px] text-ink-200">{prompt.from}</span>
         </span>
       </div>
       <div className="px-4 py-3">
-        <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-ink-800 bg-ink-950 p-2.5 text-[12px] leading-relaxed text-ink-200">
+        <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-sm border border-ink-800 bg-ink-950 p-2.5 font-mono text-[11px] leading-relaxed text-ink-200">
           <code>{prompt.message}</code>
         </pre>
         <textarea
@@ -97,25 +99,25 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
           placeholder="Reply to the subagent…"
-          className="mb-3 w-full resize-none rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] leading-relaxed text-ink-100 placeholder:text-ink-500 focus:border-accent/50 focus:outline-none focus:shadow-glow"
+          className="mb-3 w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] leading-relaxed text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent/50 focus:outline-none"
         />
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={send}
             disabled={!text.trim()}
-            className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
           >
-            <SendIcon width={14} height={14} /> Send reply
+            <SendIcon width={13} height={13} /> Send reply
           </button>
           <button
             onClick={onDismiss}
-            className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
+            className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
           >
-            <XIcon width={14} height={14} /> Skip
+            <XIcon width={13} height={13} /> Skip
           </button>
-          <span className="ml-auto hidden text-[11px] text-ink-600 sm:inline">
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> reply ·{" "}
-            <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Esc</kbd> skip
+          <span className="ml-auto hidden font-mono text-[10px] text-ink-500 sm:inline">
+            <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> reply ·{" "}
+            <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Esc</kbd> skip
           </span>
         </div>
       </div>
@@ -148,11 +150,13 @@ export function SubagentPanel({ log, onClose }: PanelProps) {
         aria-modal="true"
         aria-label="Subagent activity"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
-          <span className="text-[15px] font-semibold text-ink-100">Subagent activity</span>
+        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
+          <span className="text-[11px] font-mono uppercase tracking-wider text-ink-400">
+            Subagent activity
+          </span>
           <button
             onClick={onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -168,7 +172,7 @@ export function SubagentPanel({ log, onClose }: PanelProps) {
               {entries.map((e) => (
                 <li
                   key={e.id}
-                  className="rounded-lg px-2.5 py-2 transition-colors hover:bg-ink-850/60"
+                  className="rounded-sm px-2.5 py-2 transition-colors hover:bg-ink-900"
                 >
                   <div className="flex items-center gap-2">
                     <DotIcon className={KIND_COLOR[e.kind]} />
@@ -178,7 +182,7 @@ export function SubagentPanel({ log, onClose }: PanelProps) {
                     {e.to && (
                       <span className="font-mono text-[11px] text-ink-600">→ {e.to}</span>
                     )}
-                    <span className="ml-auto text-[10px] text-ink-600">
+                    <span className="ml-auto font-mono text-[10px] text-ink-600">
                       {relativeTime(e.ts)}
                     </span>
                   </div>

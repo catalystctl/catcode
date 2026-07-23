@@ -62,7 +62,7 @@ export function ProviderLoginModal({
           </div>
           <button
             onClick={onClose}
-            className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -85,10 +85,10 @@ export function ProviderLoginModal({
                       setSelected(p.id);
                       setKeyInput("");
                     }}
-                    className={`flex w-full items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-left transition-colors ${
+                    className={`flex w-full items-start gap-2.5 rounded-sm border px-3.5 py-2.5 text-left transition-colors ${
                       active
-                        ? "border-accent/40 bg-accent/10"
-                        : "border-ink-700/70 bg-ink-900/70 hover:border-ink-600 hover:bg-ink-850"
+                        ? "border-ink-700 border-l-2 border-l-accent bg-ink-900"
+                        : "border-ink-800 bg-ink-900 hover:border-ink-600"
                     }`}
                   >
                     <div className="min-w-0 flex-1">
@@ -106,7 +106,7 @@ export function ProviderLoginModal({
                   onClick={() => {
                     onAddCustom();
                   }}
-                  className="flex w-full items-start gap-2.5 rounded-xl border border-dashed border-ink-700/70 bg-ink-900/40 px-3.5 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-accent/5"
+                  className="flex w-full items-start gap-2.5 rounded-sm border border-dashed border-ink-700 bg-ink-900 px-3.5 py-2.5 text-left transition-colors hover:border-ink-500"
                 >
                   <div className="flex min-w-0 flex-1 items-start gap-2">
                     <PlusIcon width={14} height={14} className="mt-0.5 shrink-0 text-accent-soft" />
@@ -132,7 +132,7 @@ export function ProviderLoginModal({
                   onSwitchProvider(current.id);
                   onClose();
                 }}
-                className="w-full rounded-lg bg-accent px-3.5 py-2 text-[13px] font-semibold text-white hover:bg-accent-soft"
+                className="w-full rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
               >
                 Switch to {current.label}
               </button>
@@ -143,7 +143,7 @@ export function ProviderLoginModal({
                   onLoginSaved(current.id);
                   onClose();
                 }}
-                className="w-full rounded-lg bg-accent px-3.5 py-2 text-[13px] font-semibold text-white hover:bg-accent-soft"
+                className="w-full rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
               >
                 Use saved credentials
               </button>
@@ -154,13 +154,13 @@ export function ProviderLoginModal({
                   onLoginOauth(current.id);
                   onClose();
                 }}
-                className="w-full rounded-lg border border-accent/40 bg-accent/10 px-3.5 py-2 text-[13px] font-semibold text-accent-soft hover:bg-accent/20"
+                className="w-full rounded-sm border border-accent/50 px-2.5 py-1 text-[11px] font-medium text-accent-soft hover:bg-ink-800"
               >
                 Continue with OAuth
               </button>
             )}
             <div>
-              <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
                 {current.loggedIn ? "Override API key" : "API key"}
                 {current.supportsOauth && !current.loggedIn ? " (optional)" : ""}
               </label>
@@ -170,7 +170,7 @@ export function ProviderLoginModal({
                 value={keyInput}
                 onChange={(e) => setKeyInput(e.target.value)}
                 placeholder={current.envVar || "sk-…"}
-                className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none"
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && keyInput.trim()) {
                     onLoginKey(current.id, keyInput.trim());
@@ -186,7 +186,7 @@ export function ProviderLoginModal({
                 onLoginKey(current.id, keyInput.trim());
                 onClose();
               }}
-              className="w-full rounded-lg border border-ink-700 bg-ink-850 px-3.5 py-2 text-[13px] font-medium text-ink-100 hover:bg-ink-800 disabled:opacity-40"
+              className="w-full rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 disabled:opacity-40"
             >
               Save API key
             </button>
@@ -200,7 +200,7 @@ export function ProviderLoginModal({
                 onLogout(current.id);
                 onClose();
               }}
-              className="w-full rounded-lg border border-danger/40 bg-danger/10 px-3.5 py-2 text-[13px] font-semibold text-danger hover:bg-danger/20"
+              className="w-full rounded-sm border border-danger/40 px-2.5 py-1 text-[11px] font-medium text-danger hover:bg-ink-800"
             >
               Log out of {current.label}
             </button>

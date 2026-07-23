@@ -123,13 +123,13 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
     onChange: (v: string) => void,
   ) => (
     <label className="block">
-      <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+      <span className="mb-1 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
         {label}
       </span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-ink-700 bg-ink-950 px-2 py-1.5 text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
+        className="w-full rounded-sm border border-ink-700 bg-ink-950 px-2 py-1.5 text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
       >
         <option value="">(default)</option>
         {modelOpts.map((m) => (
@@ -158,7 +158,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           </div>
           <button
             onClick={onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -167,7 +167,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
 
         <div className="flex-1 space-y-3 overflow-y-auto p-4">
           <label className="block">
-            <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+            <span className="mb-1 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Goal
             </span>
             <textarea
@@ -175,14 +175,14 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               placeholder="Describe what you want the harness to plan and deploy…"
-              className="w-full resize-none rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none"
+              className="w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
               autoFocus
             />
           </label>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="block">
-              <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+              <span className="mb-1 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
                 Concurrency
               </span>
               <input
@@ -195,11 +195,11 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                   setConcurrency(next);
                   setMaxTasks((current) => Math.max(current, next));
                 }}
-                className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
               />
             </label>
             <label className="block">
-              <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+              <span className="mb-1 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
                 Max tasks
               </span>
               <input
@@ -212,7 +212,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                   setMaxTasks(next);
                   setConcurrency((current) => Math.min(current, next));
                 }}
-                className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
               />
             </label>
           </div>
@@ -224,7 +224,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           </p>
 
           <div>
-            <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+            <span className="mb-1.5 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Providers <span className="normal-case text-ink-600">(empty = all)</span>
             </span>
             <div className="flex flex-wrap gap-1.5">
@@ -238,9 +238,9 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                     key={p}
                     type="button"
                     onClick={() => toggle(selectedProviders, p, setSelectedProviders)}
-                    className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                    className={`rounded-sm border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
                       on
-                        ? "border-accent/50 bg-accent/15 text-accent-soft"
+                        ? "border-accent bg-ink-900 text-accent-soft"
                         : "border-ink-700 bg-ink-950 text-ink-400 hover:border-ink-600"
                     }`}
                   >
@@ -252,7 +252,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           </div>
 
           <div>
-            <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+            <span className="mb-1.5 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Models <span className="normal-case text-ink-600">(empty = all)</span>
             </span>
             <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto">
@@ -263,9 +263,9 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                     key={m.id}
                     type="button"
                     onClick={() => toggle(selectedModels, m.id, setSelectedModels)}
-                    className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                    className={`rounded-sm border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
                       on
-                        ? "border-accent/50 bg-accent/15 text-accent-soft"
+                        ? "border-accent bg-ink-900 text-accent-soft"
                         : "border-ink-700 bg-ink-950 text-ink-400 hover:border-ink-600"
                     }`}
                     title={m.provider ? `${m.id} [${m.provider}]` : m.id}
@@ -277,12 +277,12 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
             </div>
           </div>
 
-          <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2">
+          <label className="flex cursor-pointer items-center gap-2 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2">
             <input
               type="checkbox"
               checked={reviewBeforeDeploy}
               onChange={(e) => setReviewBeforeDeploy(e.target.checked)}
-              className="rounded border-ink-600"
+              className="rounded-sm border-ink-600"
             />
             <span className="text-[12px] text-ink-200">
               Review plan before deploy
@@ -292,12 +292,12 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
             </span>
           </label>
 
-          <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-ink-800 bg-ink-925/40 px-3 py-2">
+          <label className="flex cursor-pointer items-center gap-2 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2">
             <input
               type="checkbox"
               checked={advanced}
               onChange={(e) => setAdvanced(e.target.checked)}
-              className="rounded border-ink-600"
+              className="rounded-sm border-ink-600"
             />
             <span className="text-[12px] text-ink-200">
               Advanced
@@ -308,14 +308,14 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           </label>
 
           {advanced && (
-            <div className="space-y-3 rounded-xl border border-ink-800 bg-ink-950/50 p-3">
+            <div className="space-y-3 rounded-sm border border-ink-800 bg-ink-900 p-3">
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                 {roleSelect("Planner", plannerModel, setPlannerModel)}
                 {roleSelect("Worker", workerModel, setWorkerModel)}
                 {roleSelect("Reviewer", reviewerModel, setReviewerModel)}
               </div>
               <div>
-                <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-ink-500">
+                <span className="mb-1.5 block text-[10px] font-mono uppercase tracking-wider text-ink-500">
                   Per-model concurrency{" "}
                   <span className="normal-case text-ink-600">
                     (max {Math.min(concurrency, maxTasks)}; empty = global)
@@ -348,7 +348,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                             return next;
                           });
                         }}
-                        className="w-16 rounded-lg border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-[12px] text-ink-200 focus:border-accent/50 focus:outline-none"
+                        className="w-16 rounded-sm border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
                       />
                     </div>
                   ))}
@@ -362,7 +362,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg px-3 py-1.5 text-[12px] text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="rounded-sm px-2.5 py-1 text-[11px] text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
           >
             Cancel
           </button>
@@ -370,7 +370,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
             type="button"
             onClick={submit}
             disabled={!goal.trim()}
-            className="rounded-lg bg-accent px-4 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
           >
             Start goal
           </button>
@@ -397,15 +397,18 @@ export function GoalPlanBanner({
   onCancel: () => void;
 }) {
   return (
-    <div className="mx-auto mb-3 w-full max-w-3xl rounded-xl border border-accent/30 bg-accent/10 px-4 py-3">
-      <div className="mb-1 text-[12px] font-semibold text-accent-soft">Goal plan ready</div>
-      <div className="mb-1 text-[13px] text-ink-100">{goal}</div>
+    <div className="mx-auto mb-3 w-full max-w-3xl rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925 px-4 py-3">
+      <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-ink-400">
+        Goal plan ready
+      </div>
+      <div className="mb-1 text-[12px] text-ink-200">{goal}</div>
       {summary && <p className="mb-2 text-[12px] text-ink-400">{summary}</p>}
       {steps.length > 0 && (
         <ul className="mb-3 space-y-0.5 text-[12px] text-ink-300">
           {steps.map((s, i) => (
             <li key={i}>
-              {i + 1}. <span className="text-ink-500">[{s.agent}]</span> {s.title}
+              {i + 1}. <span className="font-mono text-[11px] text-ink-500">[{s.agent}]</span>{" "}
+              {s.title}
             </li>
           ))}
         </ul>
@@ -414,21 +417,21 @@ export function GoalPlanBanner({
         <button
           type="button"
           onClick={onApprove}
-          className="rounded-lg bg-accent px-3 py-1 text-[12px] font-semibold text-white hover:bg-accent-soft"
+          className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
         >
           Approve & deploy
         </button>
         <button
           type="button"
           onClick={onRevise}
-          className="rounded-lg border border-ink-700 bg-ink-950 px-3 py-1 text-[12px] text-ink-200 hover:border-ink-600"
+          className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
         >
           Revise
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-lg px-3 py-1 text-[12px] text-ink-500 hover:text-ink-200"
+          className="rounded-sm px-2.5 py-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200"
         >
           Cancel goal
         </button>
@@ -470,16 +473,16 @@ export function GoalProgressPanel({
   };
 
   return (
-    <div className="rounded-lg border border-ink-800 bg-ink-925/70 px-3 py-2.5 text-[12px]">
+    <div className="rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925 px-3 py-2.5 text-[12px]">
       <div className="flex items-center gap-2">
-        <span className="font-mono uppercase tracking-wide text-accent-soft">
+        <span className="font-mono text-[10px] uppercase tracking-wider text-accent-soft">
           {phase === "plan_ready" && goalMode.auto_deploy
             ? "starting"
             : phase === "done" && goalMode.certified
               ? "certified"
               : phase}
         </span>
-        <span className="text-ink-500">
+        <span className="font-mono text-[10px] text-ink-500">
           {done}/{prompts.length || "?"}
           {running > 0 ? ` · ${running} running` : ""}
         </span>
@@ -488,14 +491,14 @@ export function GoalProgressPanel({
           <button
             type="button"
             onClick={onCancel}
-            className="shrink-0 text-ink-500 hover:text-rose-400"
+            className="shrink-0 rounded-sm px-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-danger"
           >
             cancel
           </button>
         )}
       </div>
       {prompts.length > 0 && (
-        <ul className="mt-2 max-h-48 space-y-1.5 overflow-y-auto border-t border-ink-800/80 pt-2">
+        <ul className="mt-2 max-h-48 space-y-1.5 overflow-y-auto border-t border-ink-800 pt-2">
           {prompts.map((p) => {
             const summary = (p.summary ?? "").trim();
             const blurb =

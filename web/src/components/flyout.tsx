@@ -39,7 +39,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
 
   if (items.length === 0) {
     return (
-      <div className="absolute bottom-full left-0 right-0 z-40 mb-1.5 max-h-64 overflow-auto rounded-xl border border-ink-700/90 bg-ink-900/95 p-2.5 text-[12px] text-ink-500 shadow-2xl shadow-black/40 backdrop-blur-sm animate-fade-in">
+      <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-sm border border-ink-700 bg-ink-900 px-2 py-2 font-mono text-[11px] text-ink-500 shadow-elev-2 animate-fade-in">
         {emptyHint ?? "No matches"}
       </div>
     );
@@ -48,7 +48,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
   return (
     <div
       ref={listRef}
-      className="absolute bottom-full left-0 right-0 z-40 mb-1.5 max-h-64 overflow-auto rounded-xl border border-ink-700/90 bg-ink-900/95 p-1 shadow-2xl shadow-black/40 backdrop-blur-sm animate-fade-in"
+      className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-sm border border-ink-700 bg-ink-900 py-1 shadow-elev-2 animate-fade-in"
       role="listbox"
     >
       {items.map((item, i) => (
@@ -63,21 +63,23 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
             onSelect(i);
           }}
           onMouseEnter={() => onHover(i)}
-          className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left transition-colors ${
-            i === selectedIndex ? "bg-accent/15 text-ink-100" : "text-ink-300 hover:bg-ink-850"
+          className={`flex w-full items-center gap-2 border-l-2 px-2 py-1 text-left text-[11px] transition-colors ${
+            i === selectedIndex
+              ? "border-accent bg-ink-800 text-ink-100"
+              : "border-transparent text-ink-300 hover:bg-ink-850"
           }`}
         >
           {item.icon && <span className="shrink-0 text-ink-400">{item.icon}</span>}
           <div className="min-w-0 flex-1">
-            <div className="truncate font-mono text-[12px] font-medium text-ink-100">
+            <div className="truncate font-mono text-[11px] text-ink-100">
               {item.label}
             </div>
             {item.desc && (
-              <div className="truncate text-[10.5px] leading-snug text-ink-500">{item.desc}</div>
+              <div className="truncate text-[10px] leading-snug text-ink-500">{item.desc}</div>
             )}
           </div>
           {item.badge && (
-            <span className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
+            <span className="shrink-0 rounded-sm border border-ink-700 bg-ink-950 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-ink-500">
               {item.badge}
             </span>
           )}

@@ -55,7 +55,7 @@ export function DiagnosticsModal({
         aria-modal="true"
         aria-label="Diagnostics"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+        <div className="flex items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <HistoryIcon width={16} height={16} className="text-accent-soft" />
             <h2 className="text-[15px] font-semibold text-ink-100">Diagnostics</h2>
@@ -63,7 +63,7 @@ export function DiagnosticsModal({
           <div className="flex items-center gap-1">
             <button
               onClick={onRefresh}
-              className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
               title="Refresh stats, context, usage, and checkpoints"
               aria-label="Refresh"
             >
@@ -71,7 +71,7 @@ export function DiagnosticsModal({
             </button>
             <button
               onClick={onClose}
-              className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
               aria-label="Close"
             >
               <XIcon width={16} height={16} />
@@ -83,7 +83,7 @@ export function DiagnosticsModal({
           <section>
             <SectionTitle>Session stats</SectionTitle>
             {stats ? (
-              <div className="grid grid-cols-2 gap-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3 font-mono text-[11px]">
+              <div className="grid grid-cols-2 gap-2 rounded-sm border border-ink-800 bg-ink-900 p-3 font-mono text-[11px]">
                 <Stat label="turns" value={String(stats.turns)} />
                 <Stat label="messages" value={String(stats.messages)} />
                 <Stat label="tokens in" value={formatTokens(stats.tokens_in)} />
@@ -99,7 +99,7 @@ export function DiagnosticsModal({
           <section>
             <SectionTitle>Cost</SectionTitle>
             {cost ? (
-              <div className="grid grid-cols-2 gap-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3 font-mono text-[11px]">
+              <div className="grid grid-cols-2 gap-2 rounded-sm border border-ink-800 bg-ink-900 p-3 font-mono text-[11px]">
                 {cost.estimated_usd != null && (
                   <Stat
                     label="est. USD"
@@ -132,18 +132,18 @@ export function DiagnosticsModal({
                 <button
                   type="button"
                   onClick={onCreateCheckpoint}
-                  className="rounded-md border border-ink-700 px-2 py-0.5 text-[10px] text-ink-300 hover:border-ink-500 hover:text-ink-100"
+                  className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 hover:text-ink-100"
                 >
                   Create
                 </button>
               )}
             </div>
             {checkpoints.length > 0 ? (
-              <div className="space-y-1.5 rounded-xl border border-ink-800 bg-ink-925/40 p-2">
+              <div className="space-y-1.5 rounded-sm border border-ink-800 bg-ink-900 p-2">
                 {checkpoints.slice(0, 12).map((c) => (
                   <div
                     key={String(c.id)}
-                    className="flex items-center justify-between gap-2 rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-1.5 text-[11px]"
+                    className="flex items-center justify-between gap-2 rounded-sm border border-ink-800 bg-ink-950 px-2.5 py-1.5 text-[11px]"
                   >
                     <div className="min-w-0">
                       <div className="truncate font-medium text-ink-200">
@@ -158,7 +158,7 @@ export function DiagnosticsModal({
                       <button
                         type="button"
                         onClick={() => onRestoreCheckpoint(String(c.id))}
-                        className="shrink-0 rounded-md border border-ink-700 px-2 py-0.5 text-[10px] text-ink-300 hover:border-accent/40 hover:text-accent-soft"
+                        className="shrink-0 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 hover:text-ink-100"
                       >
                         Restore
                       </button>
@@ -174,7 +174,7 @@ export function DiagnosticsModal({
           {protocolHello && (
             <section>
               <SectionTitle>Protocol</SectionTitle>
-              <div className="rounded-xl border border-ink-800 bg-ink-925/40 p-3 font-mono text-[11px] text-ink-400">
+              <div className="rounded-sm border border-ink-800 bg-ink-900 p-3 font-mono text-[11px] text-ink-400">
                 <div>v{protocolHello.version}</div>
                 {protocolHello.capabilities.length > 0 && (
                   <div className="mt-1 text-[10px] text-ink-500">
@@ -188,7 +188,7 @@ export function DiagnosticsModal({
           <section>
             <SectionTitle>Context breakdown</SectionTitle>
             {context ? (
-              <div className="space-y-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3">
+              <div className="space-y-2 rounded-sm border border-ink-800 bg-ink-900 p-3">
                 <div className="flex items-baseline justify-between gap-2">
                   <span className="font-mono text-[12px] text-ink-200">
                     {context.total_tokens.toLocaleString()} /{" "}
@@ -196,9 +196,9 @@ export function DiagnosticsModal({
                   </span>
                   <span className="text-[11px] font-medium text-accent-soft">{context.pct}%</span>
                 </div>
-                <div className="h-1.5 overflow-hidden rounded-full bg-ink-800">
+                <div className="h-1.5 overflow-hidden rounded-sm bg-ink-800">
                   <div
-                    className="h-full rounded-full bg-accent"
+                    className="h-full bg-accent"
                     style={{ width: `${Math.min(100, Math.max(0, context.pct))}%` }}
                   />
                 </div>
@@ -226,13 +226,13 @@ export function DiagnosticsModal({
                 </div>
                 {(context.top_consumers?.length ?? 0) > 0 && (
                   <div className="mt-2 space-y-1.5">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-500">
+                    <div className="text-[10px] font-mono uppercase tracking-wider text-ink-500">
                       Top consumers
                     </div>
                     {context.top_consumers.slice(0, 8).map((c) => (
                       <div
                         key={`${c.role}-${c.index}`}
-                        className="rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-1.5"
+                        className="rounded-sm border border-ink-800 bg-ink-950 px-2.5 py-1.5"
                       >
                         <div className="flex items-center justify-between gap-2 text-[11px]">
                           <span className="font-medium text-ink-200">
@@ -260,11 +260,11 @@ export function DiagnosticsModal({
           <section>
             <SectionTitle>Provider usage</SectionTitle>
             {usage ? (
-              <div className="space-y-2 rounded-xl border border-ink-800 bg-ink-925/40 p-3">
+              <div className="space-y-2 rounded-sm border border-ink-800 bg-ink-900 p-3">
                 <div className="flex flex-wrap items-center gap-2 text-[12px]">
                   <span className="font-medium text-ink-100">{usage.provider}</span>
                   {usage.plan && (
-                    <span className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-400">
+                    <span className="rounded-sm bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-400">
                       {usage.plan}
                     </span>
                   )}
@@ -283,7 +283,7 @@ export function DiagnosticsModal({
                     {usage.windows.map((w) => (
                       <div
                         key={w.id || w.label}
-                        className="flex items-center justify-between gap-2 rounded-lg border border-ink-800/70 bg-ink-950/40 px-2.5 py-1.5 text-[11px]"
+                        className="flex items-center justify-between gap-2 rounded-sm border border-ink-800 bg-ink-950 px-2.5 py-1.5 text-[11px]"
                       >
                         <span className="text-ink-300">{w.label || w.id}</span>
                         <span className="font-mono text-ink-400">
@@ -306,7 +306,7 @@ export function DiagnosticsModal({
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-500">
+    <div className="mb-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500">
       {children}
     </div>
   );
@@ -314,7 +314,7 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
 
 function Empty({ children }: { children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-dashed border-ink-800 px-3 py-4 text-center text-[12px] text-ink-500">
+    <div className="rounded-sm border border-dashed border-ink-800 px-3 py-4 text-center text-[12px] text-ink-500">
       {children}
     </div>
   );

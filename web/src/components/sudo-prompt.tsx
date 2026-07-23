@@ -50,17 +50,19 @@ export function SudoPrompt({ prompt, onApprove, onDecline }: Props) {
       role="alertdialog"
       aria-modal="true"
       aria-label="Sudo command requested"
-      className="rounded-xl border border-warning/50 bg-ink-900/95 p-4 shadow-lg backdrop-blur"
+      className="rounded-sm border border-ink-700 border-l-2 border-l-warning bg-ink-925 p-4"
     >
       <div className="mb-2 flex items-center gap-2">
-        <span className="text-[13px] font-semibold text-warning">Sudo command requested</span>
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-400">
+          Sudo command requested
+        </span>
       </div>
-      <p className="mb-3 text-[12px] text-ink-400">
+      <p className="mb-3 text-[12px] text-ink-200">
         The agent wants to run a command that needs sudo. Enter your password to approve, or
         decline (the command will <strong>not</strong> run).
       </p>
-      <div className="mb-3 rounded-lg border border-ink-700 bg-ink-950 px-3 py-2">
-        <code className="break-all text-[12px] text-ink-200">{prompt.command}</code>
+      <div className="mb-3 rounded-sm border border-ink-800 bg-ink-950 px-2.5 py-1.5">
+        <code className="break-all font-mono text-[11px] text-ink-200">{prompt.command}</code>
       </div>
       <div className="mb-3">
         <input
@@ -71,7 +73,7 @@ export function SudoPrompt({ prompt, onApprove, onDecline }: Props) {
           onKeyDown={handleKeyDown}
           placeholder="Enter your sudo password…"
           autoComplete="off"
-          className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-warning/50 focus:outline-none"
+          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 text-[12px] text-ink-100 placeholder:text-ink-600 transition-colors focus:border-warning/50 focus:outline-none"
         />
       </div>
       <div className="flex items-center justify-between gap-2">
@@ -79,18 +81,18 @@ export function SudoPrompt({ prompt, onApprove, onDecline }: Props) {
           <button
             onClick={() => password.trim() && onApprove(password)}
             disabled={!password.trim()}
-            className="rounded-lg border border-warning/40 bg-warning/10 px-4 py-1.5 text-[13px] font-medium text-warning transition-colors hover:bg-warning/20 disabled:opacity-40"
+            className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
           >
             Approve
           </button>
           <button
             onClick={onDecline}
-            className="rounded-lg border border-ink-700 bg-ink-800 px-4 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:bg-ink-700"
+            className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
           >
             Decline
           </button>
         </div>
-        <span className="text-[11px] text-ink-500">auto-close in {remaining}s</span>
+        <span className="font-mono text-[10px] text-ink-500">auto-close in {remaining}s</span>
       </div>
     </div>
   );

@@ -7,7 +7,7 @@
 
 import { useEffect } from "react";
 import type { Toast } from "@/lib/types";
-import { CheckIcon, XIcon, WarningIcon } from "./icons";
+import { XIcon } from "./icons";
 
 const TTL = 5000;
 
@@ -46,25 +46,25 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
 
   const cfg =
     toast.kind === "error"
-      ? { icon: <XIcon width={14} height={14} />, ring: "border-danger/30", tint: "bg-danger/10", text: "text-danger" }
+      ? { bar: "border-l-danger", dot: "bg-danger" }
       : toast.kind === "success"
-        ? { icon: <CheckIcon width={14} height={14} />, ring: "border-success/30", tint: "bg-success/10", text: "text-success" }
-        : { icon: <WarningIcon width={14} height={14} />, ring: "border-accent/20", tint: "bg-accent/[0.06]", text: "text-accent-soft" };
+        ? { bar: "border-l-success", dot: "bg-success" }
+        : { bar: "border-l-accent", dot: "bg-accent" };
 
   return (
     <div
-      className={`pointer-events-auto flex items-start gap-2 rounded-xl border ${cfg.ring} ${cfg.tint} px-3 py-2.5 backdrop-blur animate-fade-in`}
+      className={`pointer-events-auto flex items-center gap-2 rounded-sm border border-ink-700 border-l-2 ${cfg.bar} bg-ink-900 py-1.5 pl-2 pr-1.5 shadow-elev-2 animate-fade-in`}
     >
-      <span className={`mt-0.5 shrink-0 ${cfg.text}`}>{cfg.icon}</span>
-      <p className="flex-1 break-words text-[12px] leading-snug text-ink-200 sm:break-normal">
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-none ${cfg.dot}`} aria-hidden />
+      <p className="flex-1 break-words text-[11px] leading-snug text-ink-200 sm:break-normal">
         {toast.message}
       </p>
       <button
         onClick={() => onDismiss(toast.id)}
         aria-label="Dismiss notification"
-        className="shrink-0 text-ink-500 hover:text-ink-100"
+        className="shrink-0 rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
       >
-        <XIcon width={13} height={13} />
+        <XIcon width={12} height={12} />
       </button>
     </div>
   );

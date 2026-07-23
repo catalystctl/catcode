@@ -64,14 +64,9 @@ function StateBadge({ state }: { state: string }) {
   const pulse = state === "running";
   return (
     <span className={`inline-flex items-center gap-1.5 ${s.text}`}>
-      <span className={`relative flex h-2 w-2`}>
-        {pulse && (
-          <span
-            className={`absolute inline-flex h-full w-full animate-ping rounded-full ${s.dot} opacity-60`}
-          />
-        )}
-        <span className={`relative inline-flex h-2 w-2 rounded-full ${s.dot}`} />
-      </span>
+      <span
+        className={`h-1.5 w-1.5 rounded-none ${s.dot} ${pulse ? "animate-pulse" : ""}`}
+      />
       <span className="text-[11px] font-medium">{s.label}</span>
     </span>
   );
@@ -93,7 +88,7 @@ export function RunCard({ run, onClick }: { run: SubagentRunView; onClick: () =>
   return (
     <button
       onClick={onClick}
-      className="group w-full rounded-xl border border-ink-800 bg-ink-900/40 px-3.5 py-3 text-left transition-all hover:border-accent/40 hover:bg-ink-850"
+      className="group w-full rounded-sm border border-ink-800 bg-ink-900 px-3.5 py-3 text-left transition-colors hover:border-ink-600 hover:bg-ink-850"
     >
       <div className="flex items-center gap-2">
         <span className="font-mono text-[12px] font-semibold text-accent-soft">
@@ -136,7 +131,7 @@ function ChatMessage({ item }: { item: SubagentChatItem }) {
           {isUser ? "Task" : "Assistant"}
         </span>
       </div>
-      <pre className="whitespace-pre-wrap break-words rounded-lg border border-ink-800 bg-ink-950/60 p-2.5 text-[12.5px] leading-relaxed text-ink-200">
+      <pre className="whitespace-pre-wrap break-words rounded-sm border border-ink-800 bg-ink-950 p-2.5 text-[12.5px] leading-relaxed text-ink-200">
         <code>{item.content}</code>
       </pre>
     </div>
@@ -155,11 +150,11 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
     out || (!pending && name === "finish" ? "This turn has finished" : "");
 
   return (
-    <div className="mt-3 rounded-lg border border-ink-800 bg-ink-950/40">
+    <div className="mt-3 rounded-sm border border-ink-800 bg-ink-900">
       <button
         onClick={() => showArgs && setOpen((o) => !o)}
         className={`flex w-full items-center gap-2 px-3 py-2 text-left ${
-          showArgs ? "hover:bg-ink-850/60" : "cursor-default"
+          showArgs ? "hover:bg-ink-850" : "cursor-default"
         }`}
       >
         <span className="text-[13px]">{toolIcon(name)}</span>
@@ -210,10 +205,10 @@ export function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () =>
   const title = run.agent ?? run.mode;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center gap-2 border-b border-ink-800/80 px-4 py-3">
+      <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-3">
         <button
           onClick={onBack}
-          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[13px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[13px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
         >
           <ChevronRight width={14} height={14} className="rotate-180" />
           Back
@@ -223,7 +218,7 @@ export function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () =>
           <StateBadge state={run.state} />
         </span>
       </div>
-      <div className="border-b border-ink-800/60 px-4 py-2.5">
+      <div className="border-b border-ink-800 px-4 py-2.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-500">
           <span>{formatMs(run.elapsedMs)}</span>
           <span className="text-ink-700">·</span>
@@ -237,8 +232,8 @@ export function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () =>
           <p className="mt-1.5 line-clamp-2 text-[12px] leading-relaxed text-ink-300">{run.task}</p>
         )}
         {run.state !== "running" && run.summary && (
-          <div className="mt-2 rounded-lg border border-ink-800 bg-ink-950/60 px-2.5 py-2">
-            <div className="font-mono text-[10px] uppercase tracking-wide text-ink-500">
+          <div className="mt-2 rounded-sm border border-ink-800 bg-ink-900 px-2.5 py-2">
+            <div className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
               final
             </div>
             <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed text-ink-200">
@@ -319,11 +314,11 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
         aria-modal="true"
         aria-label="Subagents"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
+        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
           <div className="flex items-center gap-2">
             <span className="text-[15px] font-semibold text-ink-100">Subagents</span>
             {runningCount > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
+              <span className="flex items-center gap-1.5 rounded-sm bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
                 <DotIcon className="text-warning" /> {runningCount} running
               </span>
             )}
@@ -332,7 +327,7 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
             {onRefreshAgents && (
               <button
                 onClick={onRefreshAgents}
-                className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
                 aria-label="Refresh agents"
                 title="Refresh available agents"
               >
@@ -341,7 +336,7 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
             )}
             <button
               onClick={onClose}
-              className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
               aria-label="Close"
             >
               <XIcon width={16} height={16} />
@@ -353,8 +348,8 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
           <RunDetail run={selected} onBack={() => setSelectedId(null)} />
         ) : (
           <div className="flex-1 overflow-y-auto p-3">
-            <div className="mb-3 rounded-xl border border-ink-800 bg-ink-950/50 px-3 py-2.5">
-              <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-ink-500">
+            <div className="mb-3 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2.5">
+              <div className="mb-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500">
                 Available agents
               </div>
               <div className="flex flex-wrap gap-1.5">
@@ -362,7 +357,7 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
                   <code
                     key={a.name}
                     title={a.description || a.source}
-                    className="rounded-md bg-ink-850 px-1.5 py-0.5 font-mono text-[11px] text-accent-soft"
+                    className="rounded-sm bg-ink-850 px-1.5 py-0.5 font-mono text-[11px] text-accent-soft"
                   >
                     {a.name}
                   </code>

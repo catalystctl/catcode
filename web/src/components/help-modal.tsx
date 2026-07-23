@@ -40,7 +40,7 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           <h2 id="help-modal-title" className="text-[15px] font-semibold text-ink-100">Help & Keybindings</h2>
           <button
             onClick={onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -49,13 +49,13 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
         <div className="overflow-y-auto px-5 py-4">
           {/* Keybindings */}
           <div className="mb-5">
-            <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">
+            <div className="mb-2 text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Keyboard
             </div>
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
               {KEYBINDS.map(([key, desc]) => (
                 <div key={key} className="flex items-center gap-2 text-[12px]">
-                  <kbd className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
+                  <kbd className="shrink-0 rounded-sm bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
                     {key}
                   </kbd>
                   <span className="text-ink-400">{desc}</span>
@@ -65,7 +65,7 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           </div>
           {/* Commands */}
           <div>
-            <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-ink-500">
+            <div className="mb-2 text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Slash Commands
             </div>
             <div className="space-y-0.5">

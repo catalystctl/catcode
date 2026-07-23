@@ -111,21 +111,21 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
   return (
     <div
       ref={trapRef}
-      className="my-3 overflow-hidden rounded-xl border border-accent/25 bg-accent/[0.03]"
+      className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925"
       role="dialog"
       aria-modal="true"
       aria-label="Agent questions"
     >
-      <div className="flex items-center gap-2 border-b border-accent/15 px-4 py-2.5">
-        <HelpIcon width={15} height={15} className="shrink-0 text-accent-soft" aria-hidden />
-        <span className="text-sm font-semibold text-ink-100">
+      <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-2.5">
+        <HelpIcon width={14} height={14} className="shrink-0 text-accent-soft" aria-hidden />
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-400">
           {prompt.questions.length === 1
             ? "The agent has a question"
             : `The agent has ${prompt.questions.length} questions`}
         </span>
         <button
           onClick={onSkip}
-          className="ml-auto rounded-md p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="ml-auto rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
           aria-label="Skip"
         >
           <XIcon width={16} height={16} />
@@ -155,7 +155,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                   <span className="flex-1">{q.prompt}</span>
                   {req && <span className="text-danger">*</span>}
                   {!req && (
-                    <span className="text-[10px] uppercase tracking-wide text-ink-600">
+                    <span className="font-mono text-[10px] uppercase tracking-wide text-ink-600">
                       optional
                     </span>
                   )}
@@ -170,7 +170,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                           key={opt}
                           type="button"
                           onClick={() => pickOption(q, opt)}
-                          className={`rounded-lg border px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                          className={`rounded-sm border px-2.5 py-1 text-[11px] font-medium transition-colors ${
                             selected
                               ? "border-accent bg-accent/15 text-accent-soft"
                               : "border-ink-700 bg-ink-950 text-ink-300 hover:border-accent/40 hover:text-ink-100"
@@ -185,7 +185,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                       <button
                         type="button"
                         onClick={() => toggleCustom(q)}
-                        className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                        className={`flex items-center gap-1 rounded-sm border px-2.5 py-1 text-[11px] font-medium transition-colors ${
                           isCustom
                             ? "border-accent bg-accent/15 text-accent-soft"
                             : "border-ink-700 bg-ink-950 text-ink-400 hover:border-accent/40 hover:text-ink-100"
@@ -215,7 +215,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                       }
                     }}
                     placeholder={q.placeholder ?? (isCustom ? "Type a custom answer…" : "Type your answer…")}
-                    className="w-full rounded-lg border border-ink-700 bg-ink-950 px-3 py-1.5 text-[13px] text-ink-100 placeholder:text-ink-500 focus:border-accent/50 focus:outline-none focus:shadow-glow"
+                    className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 text-[12px] text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent/50 focus:outline-none"
                   />
                 )}
               </div>
@@ -224,32 +224,32 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-t border-ink-800/80 px-4 py-2.5">
+      <div className="flex flex-wrap items-center gap-2 border-t border-ink-800 px-4 py-2.5">
         <button
           onClick={submit}
-          className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft"
+          className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
         >
-          <SendIcon width={14} height={14} /> Submit
+          <SendIcon width={13} height={13} /> Submit
         </button>
         <button
           onClick={onSkip}
-          className="flex items-center gap-1.5 rounded-lg border border-ink-700 px-3.5 py-1.5 text-[13px] font-medium text-ink-300 transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
+          className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
         >
-          <XIcon width={14} height={14} /> Skip
+          <XIcon width={13} height={13} /> Skip
         </button>
-        <span className="ml-auto hidden text-[11px] text-ink-600 sm:inline">
+        <span className="ml-auto hidden font-mono text-[10px] text-ink-500 sm:inline">
           {hasTextField ? (
             <>
-              <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}
+              <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}
               submit ·{" "}
             </>
           ) : (
             <>
-              <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd>{" "}
+              <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Ctrl+↵</kbd>{" "}
               submit ·{" "}
             </>
           )}
-          <kbd className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
+          <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Esc</kbd>{" "}
           skip
         </span>
       </div>

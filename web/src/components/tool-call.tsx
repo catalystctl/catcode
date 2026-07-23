@@ -1,13 +1,13 @@
 "use client";
 
-// ToolCall — a collapsible card for a single tool invocation: name + args
+// ToolCall — a flat panel section for a single tool invocation: name + args
 // (syntax-highlighted JSON) + the execution result (mono, scrollable, with an
-// optional diff pane). Shows a spinner while awaiting the result.
+// optional diff pane). A square status dot marks running / ok / error.
 
 import { useEffect, useRef, useState } from "react";
 import type { UIToolCall } from "@/lib/types";
 import { isDangerousTool, prettyArgs, toolIcon, truncate } from "@/lib/format";
-import { ChevronRight, CheckIcon, XIcon, CopyIcon } from "./icons";
+import { ChevronRight, CheckIcon, CopyIcon } from "./icons";
 import { Diff } from "./diff";
 
 export function ToolCallCard({ tc }: { tc: UIToolCall }) {
@@ -38,78 +38,78 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   };
 
   return (
-    <div
-      className={`my-0.5 overflow-hidden rounded-md border transition-colors ${
-        running
-          ? "border-ink-800/50 bg-ink-925/25"
-          : isError
-            ? "border-danger/25 bg-ink-925/30"
-            : "border-ink-800/40 bg-transparent hover:bg-ink-925/30"
-      }`}
-    >
+    <div className="overflow-hidden rounded-none border border-ink-800 bg-ink-950 transition-colors duration-150">
       <button
         onClick={() => {
           userToggledRef.current = true;
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left transition-colors hover:bg-ink-850/40"
+        className="flex w-full items-center gap-2 bg-ink-925 px-2 py-1 text-left transition-colors hover:bg-ink-900"
       >
         <ChevronRight
-          width={12}
-          height={12}
+          width={11}
+          height={11}
           className={`shrink-0 text-ink-600 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
         />
-        <span className="shrink-0 text-[13px] opacity-80">{toolIcon(tc.name)}</span>
-        <span className="font-mono text-[12px] font-medium text-ink-200">{tc.name || "tool"}</span>
+        <span className="shrink-0 text-[12px] leading-none opacity-90">{toolIcon(tc.name)}</span>
+        <span className="font-mono text-[11px] text-ink-200">{tc.name || "tool"}</span>
         {danger && (
-          <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-warning">
+          <span className="rounded-sm border border-warning/40 px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-warning">
             destructive
           </span>
         )}
-        <span className="ml-0.5 min-w-0 flex-1 truncate font-mono text-[10px] text-ink-600">
-          {truncate(tc.argString || JSON.stringify(tc.args), 64)}
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-ink-500">
+          {truncate(tc.argString || JSON.stringify(tc.args), 72)}
         </span>
-        <span className="ml-auto flex shrink-0 items-center gap-1">
+        <span className="ml-auto flex shrink-0 items-center">
           {running ? (
-            <span className="flex items-center gap-1 text-[10px] text-accent-soft">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent-soft" />
+            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-warning">
+              <span className="h-1.5 w-1.5 animate-pulse bg-warning" aria-hidden="true" />
               running
             </span>
           ) : unknown ? (
-            <span className="flex items-center gap-1 text-[10px] text-ink-600">
-              <span className="h-1 w-1 rounded-full bg-ink-600" />
+            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-ink-500">
+              <span className="h-1.5 w-1.5 bg-ink-600" aria-hidden="true" />
               loaded
             </span>
           ) : ok ? (
-            <span className="flex items-center gap-1 text-[10px] text-success">
-              <CheckIcon width={11} height={11} /> ok
+            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-success">
+              <span className="h-1.5 w-1.5 bg-success" aria-hidden="true" />
+              ok
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-[10px] text-danger">
-              <XIcon width={11} height={11} /> error
+            <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-danger">
+              <span className="h-1.5 w-1.5 bg-danger" aria-hidden="true" />
+              error
             </span>
           )}
         </span>
       </button>
 
       {open && (
-        <div className="border-t border-ink-800/50 bg-ink-950/80">
+        <div className="border-t border-ink-800 bg-ink-950">
           {tc.argString && (
             <div className="px-3 py-2">
-              <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">arguments</div>
-              <pre className="overflow-x-auto text-[12px] leading-relaxed text-ink-200">
+              <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">
+                arguments
+              </div>
+              <pre className="overflow-x-auto font-mono text-[11px] leading-relaxed text-ink-300">
                 <code>{prettyArgs(tc.args)}</code>
               </pre>
             </div>
           )}
           {tc.result && (
-            <div className="border-t border-ink-800/70 px-3 py-2">
+            <div className={`px-3 py-2 ${tc.argString ? "border-t border-ink-800" : ""}`}>
               <div className="mb-1 flex items-center justify-between">
-                <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">result</span>
+                <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
+                  result
+                </span>
                 <button
                   onClick={copy}
-                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                  className={`flex items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                    copied ? "text-success" : "text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+                  }`}
                 >
                   {copied ? <CheckIcon width={11} height={11} /> : <CopyIcon width={11} height={11} />}
                   {copied ? "Copied" : "Copy"}
@@ -117,8 +117,8 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
               </div>
               {tc.result.diff && <Diff diff={tc.result.diff} />}
               <pre
-                className={`mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed ${
-                  ok || unknown ? "text-ink-200" : "text-danger"
+                className={`mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed ${
+                  ok || unknown ? "text-ink-300" : "text-danger"
                 }`}
               >
                 {tc.result.output ||
