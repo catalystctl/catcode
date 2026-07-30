@@ -1563,21 +1563,118 @@ pub fn build_verify_prompt(mode: &GoalMode) -> String {
     crate::goal_ceo::verify_prompt(mode)
 }
 
+/// Per-step inline budget in the wrap-up prompt (chars). Raised from 1200 so a
+/// synthesis/research goal has enough inline signal without forcing the model
+/// to re-read every artifact. The total is bounded by WRAPUP_TOTAL_BUDGET.
+const WRAPUP_STEP_BUDGET: usize = 3_000;
+/// Hard ceiling on the combined inline step text in the wrap-up prompt so a
+/// large goal (many steps) cannot blow the parent's context window. Steps past
+/// this point get a one-line pointer to their artifact instead of full text.
+const WRAPUP_TOTAL_BUDGET: usize = 20_000;
+
+/// Build the prior-step output context to inject into a dependent step's
+/// prompt. `depends_on` was previously ordering + skip-on-failure ONLY — a
+/// dependent step received its static `task` with zero output from the steps it
+/// depended on, so sequential/dependency-driven goals were structurally broken.
+///
+/// Waves run in topological order, so by the time a dependent step's wave
+/// starts its dependencies have settled and their summaries live in
+/// `mode.prompts`. We inject each dependency's summary (capped per-dep and
+/// total) plus a pointer to its full artifact so the step can read more if the
+/// inline digest is insufficient.
+///
+/// Returns None when there is nothing to inject (no deps, or no dep ran).
+pub(crate) fn build_dependency_context(mode: &GoalMode, deps: &[String]) -> Option<String> {
+    const PER_DEP_BUDGET: usize = 2_000;
+    const TOTAL_BUDGET: usize = 8_000;
+
+    if deps.is_empty() {
+        return None;
+    }
+    let mut sections: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    for dep_id in deps {
+        let Some(dep) = mode.prompts.iter().find(|p| &p.step_id == dep_id) else {
+            continue;
+        };
+        // Only inject outputs from steps that actually ran. A Pending/Skipped
+        // dependency contributes nothing.
+        if !matches!(dep.status, DeployStatus::Done | DeployStatus::Failed) {
+            continue;
+        }
+        let title = if dep.title.is_empty() {
+            dep.step_id.clone()
+        } else {
+            dep.title.clone()
+        };
+        let raw = dep
+            .summary
+            .as_deref()
+            .unwrap_or("(step produced no written output)");
+        let summary = truncate_str(raw, PER_DEP_BUDGET);
+        let artifact = format!(
+            ".catalyst-code/goal-ux/artifacts/{}/{}.md",
+            mode.id, dep.step_id
+        );
+        let section = format!(
+            "### Prior step: {title} (id: {dep_id}, status: {status})\n{summary}\n\nFull output: {artifact}",
+            status = dep.status.as_str()
+        );
+        total += section.len();
+        sections.push(section);
+        if total >= TOTAL_BUDGET {
+            break;
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let joined = sections.join("\n\n");
+    Some(truncate_str(&joined, TOTAL_BUDGET))
+}
+
+/// Wrap a step's static `task` with the outputs of its `depends_on` steps.
+/// No-op (returns the task unchanged) when there is nothing to inject.
+pub(crate) fn inject_dependency_context(task: &str, mode: &GoalMode, deps: &[String]) -> String {
+    match build_dependency_context(mode, deps) {
+        Some(ctx) => format!(
+            "{task}\n\n--- Prior step outputs (from steps this step depends on) ---\n{ctx}\n\n--- End prior step outputs ---\n\nThe outputs above are the results of steps this task depends on. Use them as input for your work. If the inline digest is insufficient, read the full output files referenced above."
+        ),
+        None => task.to_string(),
+    }
+}
+
 /// Prompt for the parent wrap-up turn after deploy waves finish.
 pub fn build_wrapup_prompt(mode: &GoalMode) -> String {
     let mut steps = String::new();
+    let mut running_total: usize = 0;
     for p in &mode.prompts {
         let title = if p.title.is_empty() {
             p.step_id.clone()
         } else {
             p.title.clone()
         };
-        let summary = nonempty_step_summary(p.summary.as_deref().unwrap_or(""));
-        let summary = truncate_str(&summary, 1200);
         let artifact = format!(
             ".catalyst-code/goal-ux/artifacts/{}/{}.md",
             mode.id, p.step_id
         );
+        let summary = if running_total >= WRAPUP_TOTAL_BUDGET {
+            // Past the total inline budget: list the step with a pointer only,
+            // so the wrap-up still enumerates every step without blowing context.
+            format!("[output omitted to save context — read full output: {artifact}]")
+        } else {
+            // Use the RAW summary (not nonempty_step_summary, which pre-caps at
+            // 1600) so WRAPUP_STEP_BUDGET (3000) is the real inline budget.
+            let raw = p.summary.as_deref().unwrap_or("");
+            let raw = if raw.trim().is_empty() {
+                "(step finished with no written summary)"
+            } else {
+                raw
+            };
+            let capped = truncate_str(raw, WRAPUP_STEP_BUDGET);
+            running_total += capped.len();
+            capped
+        };
         steps.push_str(&format!(
             "- [{status}] {title} ({agent}): {summary}
   full output: {artifact}
@@ -2172,6 +2269,16 @@ pub async fn deploy_goal(
             }
             let run_id_task = run_id.clone();
             let parent_goal_id = goal_id.clone();
+            // Inject prior-step outputs into this step's prompt so a dependent
+            // step receives its dependencies' results (depends_on was
+            // previously ordering + skip-on-failure ONLY). Computed here, before
+            // the spawn, because the dependency summaries live in mode.prompts
+            // and the topo wave guarantees deps have settled by now.
+            let augmented_task = {
+                let mode = st.goal.lock().await;
+                let deps = deps_by_id.get(&p.step_id).cloned().unwrap_or_default();
+                inject_dependency_context(&p.task, &mode, &deps)
+            };
             handles.push((
                 step_id_outer,
                 tokio::spawn(async move {
@@ -2223,7 +2330,7 @@ pub async fn deploy_goal(
                     }
                     let mut args = json!({
                         "agent": p.agent,
-                        "task": p.task,
+                        "task": augmented_task,
                         "context": "fresh",
                         "run_id": run_id_task,
                         "_parent_run_id": parent_goal_id,
@@ -2918,10 +3025,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapup_prompt_keeps_1200_char_step_budget() {
+    fn wrapup_prompt_keeps_step_budget_and_total_cap() {
         let mut m = base_mode();
         m.goal = "g".into();
-        let big = "y".repeat(3000);
+        let big = "y".repeat(5000);
         m.prompts = vec![DeployPrompt {
             step_id: "a".into(),
             agent: "worker".into(),
@@ -2933,9 +3040,120 @@ mod tests {
             title: "do".into(),
         }];
         let p = build_wrapup_prompt(&m);
-        // Summary in wrap-up is truncated to 1200 (+ellipsis), not the full 3000.
+        // Summary in wrap-up is truncated to WRAPUP_STEP_BUDGET (3000), not the
+        // full 5000.
         assert!(!p.contains(&big));
-        assert!(p.contains(&("y".repeat(1200) + "…")));
+        assert!(p.contains(&("y".repeat(3_000) + "…")));
+    }
+
+    #[test]
+    fn wrapup_prompt_omits_steps_past_total_budget() {
+        let mut m = base_mode();
+        m.goal = "g".into();
+        // 15 steps × 3000-char summaries = 45k > WRAPUP_TOTAL_BUDGET (20k).
+        let big = "z".repeat(4_000);
+        let mut prompts = Vec::new();
+        for i in 0..15 {
+            prompts.push(DeployPrompt {
+                step_id: format!("s{i}"),
+                agent: "worker".into(),
+                task: "t".into(),
+                model: None,
+                status: DeployStatus::Done,
+                run_id: None,
+                summary: Some(big.clone()),
+                title: format!("step {i}"),
+            });
+        }
+        m.prompts = prompts;
+        let p = build_wrapup_prompt(&m);
+        // Later steps should have been omitted with a pointer instead of full text.
+        assert!(p.contains("[output omitted to save context"));
+    }
+
+    #[test]
+    fn dependency_context_injects_prior_step_output() {
+        let mut m = base_mode();
+        m.goal = "build module".into();
+        m.prompts = vec![
+            DeployPrompt {
+                step_id: "design".into(),
+                agent: "planner".into(),
+                task: "design the module".into(),
+                model: None,
+                status: DeployStatus::Done,
+                run_id: None,
+                summary: Some("The module should expose foo() and bar().".into()),
+                title: "design phase".into(),
+            },
+            DeployPrompt {
+                step_id: "implement".into(),
+                agent: "worker".into(),
+                task: "implement the module".into(),
+                model: None,
+                status: DeployStatus::Pending,
+                run_id: None,
+                summary: None,
+                title: "impl phase".into(),
+            },
+        ];
+        // The implement step depends on design.
+        let deps = vec!["design".to_string()];
+        let task = inject_dependency_context("implement the module", &m, &deps);
+        // The prior step's summary must be present in the augmented task.
+        assert!(task.contains("The module should expose foo() and bar()."));
+        assert!(task.contains("Prior step outputs"));
+        assert!(task.contains("design phase"));
+        // The original task text is preserved.
+        assert!(task.starts_with("implement the module"));
+    }
+
+    #[test]
+    fn dependency_context_noop_without_deps() {
+        let mut m = base_mode();
+        m.prompts = vec![DeployPrompt {
+            step_id: "a".into(),
+            agent: "worker".into(),
+            task: "t".into(),
+            model: None,
+            status: DeployStatus::Done,
+            run_id: None,
+            summary: Some("done".into()),
+            title: "a".into(),
+        }];
+        // No depends_on → task returned unchanged.
+        let task = inject_dependency_context("do work", &m, &[]);
+        assert_eq!(task, "do work");
+    }
+
+    #[test]
+    fn dependency_context_skips_unran_deps() {
+        let mut m = base_mode();
+        m.prompts = vec![
+            DeployPrompt {
+                step_id: "a".into(),
+                agent: "worker".into(),
+                task: "t".into(),
+                model: None,
+                status: DeployStatus::Pending, // hasn't run yet
+                run_id: None,
+                summary: None,
+                title: "a".into(),
+            },
+            DeployPrompt {
+                step_id: "b".into(),
+                agent: "worker".into(),
+                task: "t".into(),
+                model: None,
+                status: DeployStatus::Skipped, // skipped
+                run_id: None,
+                summary: Some("skipped".into()),
+                title: "b".into(),
+            },
+        ];
+        // Neither dep ran → no injection, task unchanged.
+        let task = inject_dependency_context("do work", &m, &["a".into(), "b".into()]);
+        assert_eq!(task, "do work");
     }
 
     #[test]

@@ -108,6 +108,7 @@ mod tests {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         }
     }
 

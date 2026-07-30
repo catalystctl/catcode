@@ -55,6 +55,27 @@ pub fn compact_signature(raw: &str) -> String {
     out.chars().take(240).collect()
 }
 
+/// True if output looks like a real diagnostic (compile/type/test error) worth
+/// remembering, vs. a non-diagnostic failure (typo, missing file, exit 1 from
+/// a grep). Keeps the failure atlas focused on recurring *technical* failures.
+pub fn looks_like_diagnostic_output(s: &str) -> bool {
+    let l = s.to_lowercase();
+    l.contains("error[")
+        || l.contains("error:")
+        || l.contains("error e")
+        || l.contains("panicked")
+        || l.contains("panic:")
+        || l.contains("traceback")
+        || l.contains("exception")
+        || l.contains("test failed")
+        || l.contains("tests failed")
+        || l.contains("failed to compile")
+        || l.contains("cannot find")
+        || l.contains("undefined reference")
+        || l.contains("does not compile")
+        || l.contains("syntax error")
+}
+
 /// Record (or bump) a diagnostic signature for a project.
 pub fn record_diagnostic(project_id: &str, class: &str, raw_or_sig: &str) {
     let sig = compact_signature(raw_or_sig);

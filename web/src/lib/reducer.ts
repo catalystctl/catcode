@@ -901,6 +901,10 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       // Requested diagnostics are currently rendered by protocol consumers and
       // logs; explicitly accept them without growing persistent UI state.
       return state;
+    case "stuck_nudge":
+      // Core self-corrected a stuck loop by injecting a steering system
+      // message; no persistent UI state to grow (it steers the model, not the UI).
+      return state;
     case "ask_request":
       return {
         ...state,

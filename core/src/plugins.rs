@@ -130,6 +130,10 @@ pub const DEFAULT_PRE_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_POST_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_PLUGIN_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_PLUGIN_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Maximum size of a prompt-backed command's template file (and its rendered
+/// output). Keeps a misconfigured `prompt_file` from blowing up the agent
+/// context. 256 KiB is generous for a research protocol yet bounded.
+pub const MAX_PROMPT_COMMAND_BYTES: usize = 256 * 1024;
 
 fn validate_plugin_io(label: &str, input_len: usize) -> Result<(), String> {
     if input_len > MAX_PLUGIN_INPUT_BYTES {
@@ -464,12 +468,29 @@ struct PluginManifest {
 }
 
 /// A slash-command declared in a plugin manifest (the `commands` array).
+///
+/// A command is either **script-backed** (`script` → run an executable, show
+/// its output) or **prompt-backed** (`prompt_file` → render a template and
+/// submit it as a normal agent turn). Exactly one of `script`/`prompt_file`
+/// must be set. `mode` is optional and inferred when absent.
 #[derive(Deserialize, Debug, Clone)]
 struct CommandManifestEntry {
     name: String,
     #[serde(default)]
     description: String,
-    script: String,
+    /// Executable handler script (script-backed commands). Mutually exclusive
+    /// with `prompt_file`.
+    #[serde(default)]
+    script: Option<String>,
+    /// Prompt template file (prompt-backed commands) rendered and submitted as
+    /// an agent turn. Path-confined to the plugin directory (no absolute
+    /// paths, no `..`). Mutually exclusive with `script`.
+    #[serde(default)]
+    prompt_file: Option<String>,
+    /// Optional explicit mode: `"script"` or `"agent_turn"`. Inferred from
+    /// which of `script`/`prompt_file` is set when absent.
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -644,13 +665,37 @@ pub struct ToolConfig {
     pub plugin_name: String,
 }
 
+/// How a plugin slash command is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandMode {
+    /// Run an executable handler script; its `output` is shown to the user.
+    Script,
+    /// Render a prompt template and submit it as a normal agent turn (the same
+    /// path as a user `send`). Lets a command like `/deep-research` drive a
+    /// full agent loop without a script or recompile.
+    AgentTurn,
+}
+
+impl CommandMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommandMode::Script => "script",
+            CommandMode::AgentTurn => "agent_turn",
+        }
+    }
+}
+
 /// Configuration for one plugin-declared slash command.
 #[derive(Clone, Debug)]
 pub struct CommandConfig {
     pub name: String,
     pub description: String,
-    /// Absolute path to the executable handler script.
-    pub script: PathBuf,
+    /// How the command is executed (script vs. agent-turn prompt).
+    pub mode: CommandMode,
+    /// Absolute path to the executable handler script (script-backed commands).
+    pub script: Option<PathBuf>,
+    /// Absolute path to the prompt template file (prompt-backed commands).
+    pub prompt_file: Option<PathBuf>,
     /// Hard timeout in milliseconds for a single command invocation.
     pub timeout_ms: u64,
     /// Plugin that owns this command.
@@ -753,7 +798,13 @@ fn validate_manifest_capabilities(manifest: &PluginManifest) -> Result<Vec<Strin
     let mut required = HashSet::<&str>::new();
     let uses_subprocess = !manifest.hooks.is_empty()
         || !manifest.tools.is_empty()
-        || !manifest.commands.is_empty()
+        || manifest.commands.iter().any(|c| {
+            c.script
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+        })
         || manifest.oauth.is_some()
         || manifest.memory_provider.is_some();
     if uses_subprocess {
@@ -1233,11 +1284,60 @@ impl PluginManager {
                     "command '{name}' collides with a reserved builtin slash command"
                 ));
             }
-            let canon_script = validate_plugin_script(&canon_dir, &c.script)?;
+            // A command is either script-backed (`script`) or prompt-backed
+            // (`prompt_file` -> agent turn). Exactly one must be set.
+            let has_script = c
+                .script
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let has_prompt = c
+                .prompt_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let mode = match (has_script, has_prompt, c.mode.as_deref()) {
+                (true, false, None | Some("script")) => CommandMode::Script,
+                (false, true, None | Some("agent_turn")) => CommandMode::AgentTurn,
+                (true, true, _) => {
+                    return Err(format!(
+                        "command '{name}' declares both `script` and `prompt_file`; use exactly one"
+                    ));
+                }
+                (false, false, _) => {
+                    return Err(format!(
+                        "command '{name}' declares neither `script` nor `prompt_file`; set one"
+                    ));
+                }
+                (true, false, Some(m)) => {
+                    return Err(format!(
+                        "command '{name}' has `script` but mode=\"{m}\" (expected \"script\")"
+                    ));
+                }
+                (false, true, Some(m)) => {
+                    return Err(format!(
+                        "command '{name}' has `prompt_file` but mode=\"{m}\" (expected \"agent_turn\")"
+                    ));
+                }
+            };
+            let (script, prompt_file) = match mode {
+                CommandMode::Script => {
+                    let s = validate_plugin_script(&canon_dir, c.script.as_deref().unwrap())?;
+                    (Some(s), None)
+                }
+                CommandMode::AgentTurn => {
+                    let p = validate_prompt_file(&canon_dir, c.prompt_file.as_deref().unwrap())?;
+                    (None, Some(p))
+                }
+            };
             commands_vec.push(CommandConfig {
                 name: name.to_string(),
                 description: c.description.clone(),
-                script: canon_script,
+                mode,
+                script,
+                prompt_file,
                 timeout_ms: c.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS),
                 plugin_name: manifest.name.clone(),
             });
@@ -1570,6 +1670,7 @@ impl PluginManager {
                     "name": c.name,
                     "description": c.description,
                     "plugin": p.name,
+                    "mode": c.mode.as_str(),
                 }));
             }
         }
@@ -1762,6 +1863,7 @@ impl PluginManager {
             headers: cfg.headers.clone(),
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         })
     }
 
@@ -2490,6 +2592,81 @@ pub async fn execute_plugin_tool(
 /// Stdout JSON:
 /// `{ "ok": true|false, "output": "...", "notify"?: "...", "status"?: "..." }`
 /// Non-JSON stdout is accepted as output text with `ok=true`.
+/// Substitute the supported `{{token}}` placeholders in a command template.
+///
+/// Tokens are matched as `{{key}}` or `{{ key }}` (whitespace-tolerant),
+/// case-sensitively. Supported keys: `args`, `workspace`, `session_id`,
+/// `timestamp`, `plugin`, `command`. Unknown `{{...}}` sequences are left
+/// verbatim so template authors can use literal double-braces freely.
+pub fn render_command_template(
+    template: &str,
+    args: &str,
+    workspace: &str,
+    session_id: &str,
+    timestamp: u64,
+    plugin: &str,
+    command: &str,
+) -> String {
+    let ts = timestamp.to_string();
+    template
+        .replace("{{ args }}", args)
+        .replace("{{args}}", args)
+        .replace("{{ workspace }}", workspace)
+        .replace("{{workspace}}", workspace)
+        .replace("{{ session_id }}", session_id)
+        .replace("{{session_id}}", session_id)
+        .replace("{{ timestamp }}", &ts)
+        .replace("{{timestamp}}", &ts)
+        .replace("{{ plugin }}", plugin)
+        .replace("{{plugin}}", plugin)
+        .replace("{{ command }}", command)
+        .replace("{{command}}", command)
+}
+
+/// Render a prompt-backed command's template file with the invocation context
+/// and return the prompt text to submit as an agent turn. Reads the
+/// `prompt_file` resolved at load time (path-confined to the plugin dir) and
+/// substitutes `{{args}}`, `{{workspace}}`, `{{session_id}}`, `{{timestamp}}`,
+/// `{{plugin}}`, `{{command}}`. The rendered output is capped at
+/// `MAX_PROMPT_COMMAND_BYTES`.
+pub fn render_prompt_command(
+    config: &CommandConfig,
+    args: &str,
+    workspace: &str,
+    session_id: &str,
+) -> Result<String, String> {
+    let prompt_file = config
+        .prompt_file
+        .as_ref()
+        .ok_or_else(|| format!("command '{}' is not prompt-backed", config.name))?;
+    let template = std::fs::read_to_string(prompt_file).map_err(|e| {
+        format!(
+            "prompt_file {:?} for command '{}' could not be read: {e}",
+            prompt_file, config.name
+        )
+    })?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rendered = render_command_template(
+        &template,
+        args,
+        workspace,
+        session_id,
+        timestamp,
+        &config.plugin_name,
+        &config.name,
+    );
+    if rendered.len() > MAX_PROMPT_COMMAND_BYTES {
+        return Err(format!(
+            "rendered prompt for command '{}' exceeds the {} byte limit",
+            config.name, MAX_PROMPT_COMMAND_BYTES
+        ));
+    }
+    Ok(rendered)
+}
+
 pub async fn execute_plugin_command(
     config: &CommandConfig,
     args: &str,
@@ -2513,8 +2690,14 @@ pub async fn execute_plugin_command(
         return Outcome::err(message);
     }
 
+    let Some(script) = config.script.as_ref() else {
+        return Outcome::err(format!(
+            "plugin command '{}' is not script-backed",
+            config.name
+        ));
+    };
     let timeout_dur = Duration::from_millis(config.timeout_ms);
-    match plugin_run(&config.script, ctx_bytes, timeout_dur, &[]).await {
+    match plugin_run(script, ctx_bytes, timeout_dur, &[]).await {
         Ok(Ok(output)) => {
             if let Err(message) =
                 validate_plugin_output("plugin command", &output.stdout, &output.stderr)
@@ -2838,6 +3021,59 @@ fn validate_plugin_script(canon_dir: &Path, script_rel: &str) -> Result<PathBuf,
         return Err(format!(
             "script {:?} is not executable (try chmod +x)",
             script_rel
+        ));
+    }
+    Ok(canon)
+}
+
+/// Validate a prompt-backed command's template file: path-confined to the
+/// plugin directory (no absolute paths, no `..`), exists, is a regular file,
+/// and within the size limit. Returns the canonical absolute path. Unlike
+/// `validate_plugin_script` the file need not be executable — it is read as
+/// text and rendered, not spawned.
+fn validate_prompt_file(canon_dir: &Path, prompt_rel: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(prompt_rel);
+    if rel.is_absolute() {
+        return Err(format!(
+            "prompt_file {:?} must be relative to the plugin directory",
+            prompt_rel
+        ));
+    }
+    {
+        use std::path::Component;
+        for comp in rel.components() {
+            if let Component::ParentDir = comp {
+                return Err(format!(
+                    "prompt_file {:?} escapes the plugin directory",
+                    prompt_rel
+                ));
+            }
+        }
+    }
+    let abs = canon_dir.join(rel);
+    let canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+    if !canon.starts_with(canon_dir) {
+        return Err(format!(
+            "prompt_file {:?} escapes the plugin directory",
+            prompt_rel
+        ));
+    }
+    let meta = std::fs::metadata(&canon).map_err(|_| {
+        format!(
+            "prompt_file {:?} does not exist or is unreadable",
+            prompt_rel
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(format!(
+            "prompt_file {:?} is not a regular file",
+            prompt_rel
+        ));
+    }
+    if meta.len() as usize > MAX_PROMPT_COMMAND_BYTES {
+        return Err(format!(
+            "prompt_file {:?} exceeds the {} byte limit",
+            prompt_rel, MAX_PROMPT_COMMAND_BYTES
         ));
     }
     Ok(canon)
@@ -3909,7 +4145,11 @@ mod tests {
         assert_eq!(greet.description, "Say hello");
         assert_eq!(greet.timeout_ms, 12_000);
         assert_eq!(greet.plugin_name, "cmd-plugin");
-        assert_eq!(greet.script, std::fs::canonicalize(&script).unwrap());
+        assert_eq!(greet.mode, CommandMode::Script);
+        assert_eq!(
+            greet.script.as_ref().unwrap(),
+            &std::fs::canonicalize(&script).unwrap()
+        );
 
         let ping = plugin.commands.iter().find(|c| c.name == "ping").unwrap();
         assert_eq!(ping.timeout_ms, DEFAULT_POST_TIMEOUT_MS);
@@ -5589,5 +5829,339 @@ mod tests {
         let out = execute_plugin_tool("ut", &tc, &json!({}), "/ws", "s.jsonl").await;
         assert!(!out.ok);
         assert!(out.output.contains("exceeds the 1048576 byte limit"));
+    }
+
+    // ---- prompt-backed command (agent_turn) tests ----
+
+    fn write_prompt_file(dir: &Path, rel: &str, content: &str) -> PathBuf {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_prompt_backed_command() {
+        let tmp = TmpDir::new("load_prompt_cmd");
+        write_prompt_file(&tmp.path, "prompts/research.md", "Research: {{args}}");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [
+    { "name": "deep-research", "description": "Deep research", "prompt_file": "prompts/research.md" }
+  ]
+}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        assert_eq!(plugin.commands.len(), 1);
+        let c = &plugin.commands[0];
+        assert_eq!(c.name, "deep-research");
+        assert_eq!(c.mode, CommandMode::AgentTurn);
+        assert!(c.script.is_none());
+        let pf = c.prompt_file.as_ref().expect("prompt_file set");
+        assert!(pf.ends_with("prompts/research.md"));
+    }
+
+    #[test]
+    fn load_rejects_missing_prompt_file() {
+        let tmp = TmpDir::new("missing_prompt");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "prompts/missing.md" } ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_prompt_file_traversal() {
+        let tmp = TmpDir::new("traversal_prompt");
+        write_prompt_file(&tmp.path, "prompts/ok.md", "x");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "../escape.md" } ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_absolute_prompt_file() {
+        let tmp = TmpDir::new("abs_prompt");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "/etc/passwd" } ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("must be relative"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_both_script_and_prompt_file() {
+        let tmp = TmpDir::new("both_cmd");
+        let scripts = tmp.path.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        write_hook_script(&scripts, "greet.sh", r#"{"ok":true}"#, 0);
+        write_prompt_file(&tmp.path, "prompts/p.md", "x");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [
+    { "name": "deep-research", "script": "scripts/greet.sh", "prompt_file": "prompts/p.md" }
+  ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("both"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_neither_script_nor_prompt_file() {
+        let tmp = TmpDir::new("neither_cmd");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research" } ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_mode_mismatch() {
+        let tmp = TmpDir::new("mode_mismatch");
+        write_prompt_file(&tmp.path, "prompts/p.md", "x");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [
+    { "name": "deep-research", "prompt_file": "prompts/p.md", "mode": "script" }
+  ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("mode="), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_oversized_prompt_file() {
+        let tmp = TmpDir::new("oversize_prompt");
+        let big = "a".repeat(MAX_PROMPT_COMMAND_BYTES + 1);
+        write_prompt_file(&tmp.path, "prompts/big.md", &big);
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "prompts/big.md" } ]
+}"#,
+        );
+        let err = PluginManager::load_plugin_from_dir(&tmp.path).unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn script_command_still_loads_as_script_mode() {
+        // Backward compatibility: a script-backed command loads with mode=Script.
+        let tmp = TmpDir::new("script_compat");
+        let scripts = tmp.path.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        write_hook_script(&scripts, "greet.sh", r#"{"ok":true,"output":"hi"}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "cmd",
+  "version": "1.0.0",
+  "commands": [ { "name": "greet", "script": "scripts/greet.sh" } ]
+}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let c = &plugin.commands[0];
+        assert_eq!(c.mode, CommandMode::Script);
+        assert!(c.script.is_some());
+        assert!(c.prompt_file.is_none());
+    }
+
+    #[test]
+    fn command_definitions_include_mode() {
+        // PluginManager scans a plugins *directory* for plugin subdirs, so the
+        // plugin must live in a subdir of the tmp plugins dir (not directly).
+        let tmp = TmpDir::new("cmd_defs_mode");
+        let plugin_dir = tmp.path.join("dr");
+        let scripts = plugin_dir.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        write_hook_script(&scripts, "greet.sh", r#"{"ok":true}"#, 0);
+        write_prompt_file(&plugin_dir, "prompts/p.md", "Research {{args}}");
+        write_manifest(
+            &plugin_dir,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [
+    { "name": "greet", "script": "scripts/greet.sh" },
+    { "name": "deep-research", "prompt_file": "prompts/p.md" }
+  ]
+}"#,
+        );
+        let mgr = PluginManager::new(tmp.path.clone(), PathBuf::from("/ws"), true);
+        let defs = mgr.command_definitions();
+        let greet = defs.iter().find(|d| d["name"] == "greet").expect("greet");
+        assert_eq!(greet["mode"], "script");
+        let dr = defs
+            .iter()
+            .find(|d| d["name"] == "deep-research")
+            .expect("deep-research");
+        assert_eq!(dr["mode"], "agent_turn");
+    }
+
+    #[test]
+    fn render_command_template_substitutes_all_tokens() {
+        let tmpl = "cmd={{command}} plugin={{plugin}} ws={{workspace}} sid={{session_id}} ts={{timestamp}} args=[{{args}}] spaced={{ args }}";
+        let out = render_command_template(
+            tmpl,
+            "query",
+            "/ws",
+            "s.jsonl",
+            1700000000,
+            "dr",
+            "deep-research",
+        );
+        assert!(out.contains("cmd=deep-research"));
+        assert!(out.contains("plugin=dr"));
+        assert!(out.contains("ws=/ws"));
+        assert!(out.contains("sid=s.jsonl"));
+        assert!(out.contains("ts=1700000000"));
+        assert!(out.contains("args=[query]"));
+        assert!(out.contains("spaced=query"));
+    }
+
+    #[test]
+    fn render_command_template_leaves_unknown_tokens_verbatim() {
+        let tmpl = "keep {{unknown}} and {{not_a_token}} as-is";
+        let out = render_command_template(tmpl, "a", "w", "s", 1, "p", "c");
+        assert!(out.contains("{{unknown}}"));
+        assert!(out.contains("{{not_a_token}}"));
+    }
+
+    #[test]
+    fn render_prompt_command_reads_file_and_substitutes() {
+        let tmp = TmpDir::new("render_prompt_cmd");
+        write_prompt_file(
+            &tmp.path,
+            "prompts/r.md",
+            "Research request: {{args}}\nWorkspace: {{workspace}}",
+        );
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "prompts/r.md" } ]
+}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let cfg = &plugin.commands[0];
+        let rendered =
+            render_prompt_command(cfg, "compare vLLM vs SGLang", "/ws", "s.jsonl").unwrap();
+        assert!(rendered.contains("Research request: compare vLLM vs SGLang"));
+        assert!(rendered.contains("Workspace: /ws"));
+    }
+
+    #[test]
+    fn render_prompt_command_empty_args_substitutes_empty() {
+        // Empty args is allowed at render time; the dispatcher emits a usage
+        // message before starting the turn. The template substitutes "".
+        let tmp = TmpDir::new("render_empty_args");
+        write_prompt_file(&tmp.path, "prompts/r.md", "Request: [{{args}}]");
+        write_manifest(
+            &tmp.path,
+            r#"{
+  "name": "dr",
+  "version": "1.0.0",
+  "commands": [ { "name": "deep-research", "prompt_file": "prompts/r.md" } ]
+}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let cfg = &plugin.commands[0];
+        let rendered = render_prompt_command(cfg, "", "/ws", "s.jsonl").unwrap();
+        assert_eq!(rendered, "Request: []");
+    }
+
+    #[test]
+    fn bundled_deep_research_plugin_loads_as_agent_turn() {
+        // Integration test: the real deep-research plugin shipped in the repo
+        // must load with two prompt-backed (agent_turn) commands and a valid,
+        // path-confined prompt_file. Locates the plugin relative to the crate.
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".catalyst-code/plugins/deep-research");
+        if !plugin_dir.join("plugin.json").exists() {
+            eprintln!("skipped: deep-research plugin not found at {plugin_dir:?}");
+            return;
+        }
+        let plugin = PluginManager::load_plugin_from_dir(&plugin_dir)
+            .unwrap_or_else(|e| panic!("deep-research plugin failed to load: {e}"));
+        assert_eq!(plugin.name, "deep-research");
+        assert_eq!(
+            plugin.commands.len(),
+            2,
+            "expected deep-research + research alias"
+        );
+        for c in &plugin.commands {
+            assert_eq!(
+                c.mode,
+                CommandMode::AgentTurn,
+                "command {} not agent_turn",
+                c.name
+            );
+            assert!(
+                c.script.is_none(),
+                "command {} should have no script",
+                c.name
+            );
+            let pf = c.prompt_file.as_ref().expect("prompt_file set");
+            assert!(pf.ends_with("prompts/deep-research.md"));
+            assert!(pf.starts_with(&plugin_dir.canonicalize().unwrap()));
+        }
+        // The alias and the primary command share the same prompt file.
+        let dr = plugin
+            .commands
+            .iter()
+            .find(|c| c.name == "deep-research")
+            .unwrap();
+        let alias = plugin
+            .commands
+            .iter()
+            .find(|c| c.name == "research")
+            .unwrap();
+        assert_eq!(dr.prompt_file, alias.prompt_file);
+        // Rendering the real prompt with sample args must succeed and embed the args.
+        let rendered = render_prompt_command(dr, "compare vLLM vs SGLang", "/ws", "s.jsonl")
+            .unwrap_or_else(|e| panic!("render failed: {e}"));
+        assert!(rendered.contains("compare vLLM vs SGLang"));
+        assert!(rendered.contains("deep-research"));
     }
 }

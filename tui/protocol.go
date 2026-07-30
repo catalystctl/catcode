@@ -62,9 +62,10 @@ type approvalPrompt struct {
 	requestID  string
 	tool       string
 	args       string
-	diff       string // unified-diff preview for write/edit/patch (empty for other tools)
-	expanded   bool   // full diff is visible; toggled by the tool-output keybind
-	diffScroll int    // first rendered row of the expanded diff window
+	diff       string    // unified-diff preview for write/edit/patch (empty for other tools)
+	expanded   bool      // full diff is visible; toggled by the tool-output keybind
+	diffScroll int       // first rendered row of the expanded diff window
+	receivedAt time.Time // when the request arrived (banner shows elapsed waiting)
 }
 
 type subProgressEntry struct {

@@ -169,7 +169,10 @@ func parseAskRequest(requestID string, raw json.RawMessage) *askPrompt {
 
 	form := huh.NewForm(huh.NewGroup(fields...)).
 		WithTheme(catalystHuhTheme()).
-		WithShowHelp(true).
+		// The flyout renders its own footer ("[←/→] choose · [Tab/↑↓] navigate…")
+		// — huh's built-in help duplicates it with conflicting hints ("/ filter",
+		// "enter select"), so keep huh's help off.
+		WithShowHelp(false).
 		WithShowErrors(false)
 	out.form = form
 	out.focusIdx = 0
@@ -332,26 +335,30 @@ func (s *session) sendAskReply(a *askPrompt, answers any) {
 	s.layout()
 }
 
-func (s *session) pumpHuhAsk(msg tea.Msg) {
+// pumpHuhAsk feeds msg into the ask form and returns the resulting cmd for
+// the bubbletea runtime to execute ASYNCHRONOUSLY. It must NEVER run cmds
+// inline on the UI goroutine: bubbles v2 textinput returns a cursor-blink cmd
+// on every cursor-moving keystroke, and that cmd BLOCKS on a context deadline
+// (cursor defaultBlinkSpeed = 530ms) when invoked; feeding the resulting
+// BlinkMsg back re-arms it, so the old synchronous drain loop
+// (for i := 0; i < 8; i++ { next := cmd() … }) blocked ~8×530ms ≈ 4.2s PER
+// KEYSTROKE (measured). Queued keystrokes compounded into ~30s/letter and
+// even Ctrl+C queued behind the flood — the reported lockup. Select pickers
+// never return blink cmds, which is why only text/"custom" inputs lagged.
+// Follow-up msgs the runtime resolves (BlinkMsg, huh internal msgs) are
+// forwarded back here from the main Update's default case, keeping the blink
+// chain alive without ever blocking the loop.
+func (s *session) pumpHuhAsk(msg tea.Msg) tea.Cmd {
 	a := s.pendingAsk
 	if a == nil || a.form == nil {
-		return
+		return nil
 	}
 	m, cmd := a.form.Update(msg)
 	if f, ok := m.(*huh.Form); ok {
 		a.form = f
 	}
-	for i := 0; i < 8 && cmd != nil; i++ {
-		next := cmd()
-		if next == nil {
-			break
-		}
-		m, cmd = a.form.Update(next)
-		if f, ok := m.(*huh.Form); ok {
-			a.form = f
-		}
-	}
 	a.syncFocusFromForm()
+	return cmd
 }
 
 // handleAskKey owns all keys while the ask flyout is open.
@@ -403,16 +410,15 @@ func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				// ←/→ on the custom text input exits custom mode and returns
 				// focus to the picker (stepping its cursor off "Custom…").
 				a.advanceField(-1)
-				s.pumpHuhAsk(msg)
-				return s, nil
+				return s, s.pumpHuhAsk(msg)
 			}
-			s.pumpHuhAsk(msg)
+			cmd := s.pumpHuhAsk(msg)
 			// Landing on "Custom…" (allowCustom) enters its text input so the
 			// user can type a value instead of picking a listed option.
 			if q.allowCustom && a.fieldValues[a.focusIdx] == askCustomSentinel {
 				a.advanceField(1)
 			}
-			return s, nil
+			return s, cmd
 		}
 		// Swallow stray keys on the picker so letters don't start huh's filter
 		// mode; they're meaningless for a select. (Custom input falls through.)
@@ -421,8 +427,10 @@ func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	// Text question, or the custom text input: forward typing/edits to huh.
-	s.pumpHuhAsk(msg)
-	return s, nil
+	// Return the form's cmd (cursor-blink on text inputs) for the runtime to
+	// execute asynchronously — running it inline blocks the UI loop (the old
+	// synchronous drain caused ~30s/letter lag).
+	return s, s.pumpHuhAsk(msg)
 }
 
 // renderAskOverlay renders the ask flyout as a centered modal over the base view.

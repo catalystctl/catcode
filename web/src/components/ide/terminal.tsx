@@ -76,6 +76,8 @@ export interface TerminalProps {
   onExit?: (code: number) => void;
   /** Called when the server confirms that the persistent PTY no longer exists. */
   onUnavailable?: () => void;
+  /** Incremented to request a clear of the terminal scrollback+screen. */
+  clearSeq?: number;
 }
 
 /**
@@ -83,10 +85,11 @@ export interface TerminalProps {
  * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
-export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable }: TerminalProps) {
+export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>("initializing");
+  const lastClearSeq = useRef(clearSeq ?? 0);
 
   // Keep latest values in refs so the effect only re-runs when the session id
   // changes (one renderer + WS attachment per session), not on parent renders.
@@ -259,6 +262,18 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable }: T
     };
   }, [sessionId]);
 
+  // Clear the terminal screen + scrollback when clearSeq bumps.
+  useEffect(() => {
+    if (clearSeq == null || clearSeq <= (lastClearSeq.current ?? 0)) return;
+    lastClearSeq.current = clearSeq;
+    try {
+      // Clear screen, move cursor home, and clear scrollback (3J).
+      termRef.current?.write("\x1b[3J\x1b[H\x1b[2J");
+    } catch {
+      /* ignore */
+    }
+  }, [clearSeq]);
+
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#080a0f]">
       <div ref={containerRef} className="h-full w-full" />
@@ -294,6 +309,8 @@ export interface TerminalPanelProps {
   onSelect: (id: string) => void;
   onExit: (id: string, code: number) => void;
   onUnavailable: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onRestart: (id: string) => void;
 }
 
 export function TerminalPanel({
@@ -305,8 +322,31 @@ export function TerminalPanel({
   onSelect,
   onExit,
   onUnavailable,
+  onRename,
+  onRestart,
 }: TerminalPanelProps) {
   const active = sessions.find((s) => s.id === activeId) ?? null;
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [clearSeqs, setClearSeqs] = useState<Record<string, number>>({});
+
+  const closeWithConfirm = (id: string, title: string, alive: boolean) => {
+    if (alive && !window.confirm(`Close terminal “${title}”? Its running process will be terminated.`)) return;
+    terminateTerminalSession(id, workspace);
+    onClose(id);
+  };
+
+  const startRename = (s: TerminalSession) => {
+    setRenamingId(s.id);
+    setRenameValue(s.title);
+  };
+  const commitRename = () => {
+    if (renamingId && renameValue.trim()) onRename(renamingId, renameValue.trim());
+    setRenamingId(null);
+  };
+  const requestClear = (id: string) => {
+    setClearSeqs((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
+  };
 
   return (
     <div className="flex h-full w-full flex-col bg-ink-950 text-ink-100">
@@ -334,7 +374,26 @@ export function TerminalPanel({
             }`}
             title={s.cwd}
           >
-            <span className="max-w-[12rem] truncate">{s.title}</span>
+            {renamingId === s.id ? (
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+                  if (e.key === "Escape") { e.preventDefault(); setRenamingId(null); }
+                }}
+                className="w-24 rounded bg-ink-900 px-1 py-0.5 text-xs text-ink-100 outline-none ring-1 ring-accent/50"
+                aria-label={`Rename ${s.title}`}
+              />
+            ) : (
+              <span
+                className="max-w-[12rem] truncate"
+                onDoubleClick={(e) => { e.stopPropagation(); startRename(s); }}
+              >{s.title}</span>
+            )}
             {!s.alive && s.exitCode !== null && (
               <span className="text-ink-500" title={`exited ${s.exitCode}`}>
                 [{s.exitCode}]
@@ -345,18 +404,29 @@ export function TerminalPanel({
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                terminateTerminalSession(s.id, workspace);
-                onClose(s.id);
+                startRename(s);
+              }}
+              title="Rename"
+              aria-label={`Rename ${s.title}`}
+              className="ml-1 hidden rounded text-ink-500 hover:text-ink-100 sm:group-hover:inline-block"
+            >
+              ✎
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                closeWithConfirm(s.id, s.title, s.alive);
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   e.stopPropagation();
-                  terminateTerminalSession(s.id, workspace);
-                  onClose(s.id);
+                  closeWithConfirm(s.id, s.title, s.alive);
                 }
               }}
-              className="ml-1 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
+              className="ml-0.5 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
               aria-label={`close ${s.title}`}
             >
               ×
@@ -373,6 +443,13 @@ export function TerminalPanel({
           +
         </button>
       </div>
+      {active ? (
+        <div className="flex items-center gap-1 border-b border-ink-800 bg-ink-925 px-2 py-1">
+          <button type="button" onClick={() => onRestart(active.id)} title="Restart terminal" aria-label="Restart terminal" className="rounded px-2 py-0.5 text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100">Restart</button>
+          <button type="button" onClick={() => requestClear(active.id)} title="Clear terminal" aria-label="Clear terminal" className="rounded px-2 py-0.5 text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100">Clear</button>
+          <span className="ml-auto truncate font-mono text-[10px] text-ink-600" title={active.cwd}>{active.cwd || "workspace root"}</span>
+        </div>
+      ) : null}
       <div className="relative min-h-0 flex-1 p-1">
         {active?.alive ? (
           <Terminal
@@ -382,6 +459,7 @@ export function TerminalPanel({
             cwd={active.cwd}
             onExit={(code) => onExit(active.id, code)}
             onUnavailable={() => onUnavailable(active.id)}
+            clearSeq={clearSeqs[active.id]}
           />
         ) : active ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-ink-400">
@@ -392,10 +470,10 @@ export function TerminalPanel({
             </span>
             <button
               type="button"
-              onClick={onNew}
+              onClick={() => onRestart(active.id)}
               className="rounded border border-ink-700 px-3 py-1.5 text-ink-300 hover:bg-ink-800"
             >
-              Open a new terminal
+              Restart terminal
             </button>
           </div>
         ) : (

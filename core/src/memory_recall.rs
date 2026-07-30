@@ -245,7 +245,10 @@ pub fn summary(workspace: &Path) -> RecallSummary {
     Store::new(Store::default_root()).summary(workspace)
 }
 
-/// Rolling synonym miss/hit counts for the embedding preference gate.
+/// Rolling synonym miss/hit counts — recall-quality diagnostic (previously fed the
+/// embedding-preference gate, now retired; retained for `memory stats` and any
+/// future real-embedding gating).
+#[allow(dead_code)]
 pub fn rolling_synonym_counts() -> (u64, u64) {
     // Best-effort: use the current process cwd as workspace; callers in
     // build_relevant_tail don't always have a Path, and empty is fine (gate off).

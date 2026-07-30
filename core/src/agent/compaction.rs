@@ -633,6 +633,78 @@ pub(crate) fn trim_heap() {
 #[cfg(not(all(unix, target_env = "gnu")))]
 pub(crate) fn trim_heap() {}
 
+/// Build a compact manifest of the tool calls made in the turns being
+/// dropped by full compaction, so the model knows what it can re-run to restore
+/// full outputs from the digest cache (soft-digest stores restorable outputs
+/// keyed by tool name + args before collapsing them). Without this, a
+/// compacted agent has no idea which calls existed in the dropped middle and
+/// cannot re-fetch their results.
+///
+/// Returns an empty string when there were no tool calls to list.
+pub(crate) fn build_compaction_manifest(to_summarize: &[Message]) -> String {
+    const MAX_ENTRIES: usize = 30;
+    const MAX_CHARS: usize = 1_500;
+    const LABEL_CAP: usize = 80;
+
+    fn key_arg(args: &str) -> String {
+        let v: serde_json::Value = match serde_json::from_str(args) {
+            Ok(v) => v,
+            Err(_) => return String::new(),
+        };
+        let obj = match v.as_object() {
+            Some(o) => o,
+            None => return String::new(),
+        };
+        for f in ["path", "command", "pattern", "query", "task", "url"] {
+            if let Some(k) = obj.get(f) {
+                let s = match k {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                return s.chars().take(60).collect::<String>();
+            }
+        }
+        String::new()
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    for m in to_summarize {
+        if let Some(calls) = m.tool_calls() {
+            for tc in calls {
+                if tc.function.name == "finish" {
+                    continue;
+                }
+                let key = key_arg(&tc.function.arguments);
+                let label = if key.is_empty() {
+                    tc.function.name.clone()
+                } else {
+                    format!("{}({})", tc.function.name, key)
+                };
+                let capped: String = label.chars().take(LABEL_CAP).collect();
+                entries.push(capped);
+                if entries.len() >= MAX_ENTRIES {
+                    break;
+                }
+            }
+        }
+        if entries.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut manifest = String::from(
+        "\n\n[Compacted tool calls — re-run any of these to restore its full output from the digest cache]:\n",
+    );
+    manifest.push_str(&entries.join(", "));
+    if manifest.chars().count() > MAX_CHARS {
+        let kept: String = manifest.chars().take(MAX_CHARS).collect();
+        manifest = format!("{kept}…");
+    }
+    manifest
+}
+
 pub fn compact_conversation(messages: &mut Vec<Message>, context_window: u64) {
     if messages.len() <= 2 {
         return;
@@ -705,7 +777,17 @@ pub async fn compact_with_summary(
     let mut summary_chars = 0usize;
     let mut compacted = vec![messages[0].clone()];
     if let Some((s, facts)) = combined {
-        let content = format!("[Summary of earlier turns]\n{s}");
+        // Append a compaction manifest: a compact list of the tool calls made in
+        // the dropped middle turns, so the model knows what it can re-run to
+        // restore full outputs from the digest cache (soft-digest stored the
+        // restorable outputs before collapsing them). Without this a compacted
+        // agent has no record of which calls existed in the dropped history.
+        let manifest = build_compaction_manifest(&to_summarize);
+        let content = if manifest.is_empty() {
+            format!("[Summary of earlier turns]\n{s}")
+        } else {
+            format!("[Summary of earlier turns]\n{s}{manifest}")
+        };
         summary_chars = content.chars().count();
         compacted.push(Message::system(content));
         // Session memory extraction: persist durable facts so future sessions inherit
@@ -753,4 +835,72 @@ pub async fn compact_with_summary(
     digest_to_budget(&mut compacted, budget);
     *messages = compacted;
     summary_chars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_lists_tool_calls_from_dropped_turns() {
+        let dropped = vec![
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                typ: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/main.rs"}"#.into(),
+                },
+            }]),
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "c2".into(),
+                typ: "function".into(),
+                function: FunctionCall {
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"TODO","head_limit":10}"#.into(),
+                },
+            }]),
+        ];
+        let m = build_compaction_manifest(&dropped);
+        assert!(m.contains("read_file(src/main.rs)"));
+        assert!(m.contains("grep(TODO)"));
+        assert!(m.contains("re-run any of these"));
+    }
+
+    #[test]
+    fn manifest_skips_finish_and_empty_when_no_calls() {
+        // Only a finish call → no manifest.
+        let dropped = vec![Message::assistant_tool_calls(vec![ToolCall {
+            id: "f1".into(),
+            typ: "function".into(),
+            function: FunctionCall {
+                name: "finish".into(),
+                arguments: "{}".into(),
+            },
+        }])];
+        let m = build_compaction_manifest(&dropped);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn manifest_caps_entries_and_total_chars() {
+        // 50 tool calls → only 30 listed, total capped.
+        let mut dropped = Vec::new();
+        for i in 0..50 {
+            dropped.push(Message::assistant_tool_calls(vec![ToolCall {
+                id: format!("c{i}"),
+                typ: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"file_{i}.rs"}}"#),
+                },
+            }]));
+        }
+        let m = build_compaction_manifest(&dropped);
+        // 30 entries max → file_29 present, file_49 absent.
+        assert!(m.contains("file_29.rs"));
+        assert!(!m.contains("file_49.rs"));
+        // Total under a reasonable bound (cap + ellipsis + header).
+        assert!(m.chars().count() < 2000);
+    }
 }

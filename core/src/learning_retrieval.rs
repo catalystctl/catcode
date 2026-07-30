@@ -119,6 +119,21 @@ pub fn rank_memories(
     scored
 }
 
+/// Lexical overlap (TF, no corpus DF) between a memory and a prompt.
+///
+/// Used as a cheap content-relevance *gate* for the per-turn memory tail:
+/// `rank_memories` gives every workspace memory a ~0.18 floor from
+/// PROJECT_BONUS + scope + confidence, so a score threshold alone can't keep
+/// irrelevant workspace memories out of the tail. Requiring `lexical_overlap > 0`
+/// (any shared significant token) ensures only memories with real prompt overlap
+/// surface — matching the recall behavior of the older tf·idf path while keeping
+/// the ranker's symbol/path/fingerprint boosts for ranking within that set.
+pub fn lexical_overlap(entry: &MemoryEntry, prompt: &str) -> f32 {
+    let prompt_tokens = tokenize_rich(prompt);
+    let mem_tokens = memory_tokens(entry);
+    tf_overlap(&prompt_tokens, &mem_tokens)
+}
+
 /// Human-readable explanation of why a memory scored as it did.
 pub fn explain_score(entry: &MemoryEntry, prompt: &str, fp: &TaskFingerprint) -> String {
     let (score, reasons) = score_memory(entry, prompt, fp);

@@ -225,6 +225,14 @@ type session struct {
 	modalSelection           transcriptSelection // selection over the currently rendered modal canvas
 	modalSelectionKind       modalKind
 	modalPlain               []string // ANSI-free last-rendered modal overlay, used for hit-testing/copy
+	stashedDraft             string   // idle-Esc cleared draft; a second Esc on the empty composer restores it
+	modalBoxTop              int      // placed modal box origin in screen cells (mouse hit-testing)
+	modalBoxLeft             int
+	modalItemRow             map[int]int // custom list modals: box-relative line → filtered item index
+	modalPickerFirst         int         // charm pickers: box-relative line of the first item row
+	modalPickerRows          int         // charm pickers: clickable item rows on the current page
+	modalPressItem           int         // item index under the mouse press (-1 = none)
+	modalPressKind           modalKind
 
 	// scroll: follow=true keeps the viewport pinned to the newest line (the
 	// default). Scrolling up pauses follow so history can be read without the
@@ -725,7 +733,39 @@ func (s *session) setToast(kind toastKind, text string) {
 	if len(text) > 240 {
 		text = text[:237] + "…"
 	}
+	// Priority guard (kinds are iota-ordered info<success<warn<error): while a
+	// warn/error toast is still fresh, lower-priority chatter ("draft
+	// restored", "copied") must not erase the error the user needs to see.
+	// Same-or-higher priority always replaces; anything replaces an expired one.
+	if s.toast != nil && time.Now().Before(s.toast.until) && kind < s.toast.kind {
+		return
+	}
 	s.toast = &statusToast{kind: kind, text: text, until: time.Now().Add(4 * time.Second)}
+}
+
+// largeDraftWarnThreshold is the composer size at which a paste stops being
+// silent: pasting a whole log/base64 blob and hitting Enter would otherwise
+// send it all to the model with zero signal.
+const largeDraftWarnThreshold = 100 * 1024
+
+// warnIfLargeDraft flashes an actionable warning when a paste just pushed the
+// composer past largeDraftWarnThreshold. Enter still sends (no blocking) —
+// the point is the user knows what they're about to send, and the
+// Esc-clears-draft affordance is the way out.
+func (s *session) warnIfLargeDraft() {
+	n := len(s.input.Value())
+	if n < largeDraftWarnThreshold {
+		return
+	}
+	s.logWarn("large draft (" + humanByteCount(n) + ") — Enter sends it all · Esc clears")
+}
+
+// humanByteCount formats a byte count compactly ("100 KB", "1.4 MB").
+func humanByteCount(n int) string {
+	if n >= 1<<20 {
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	}
+	return fmt.Sprintf("%d KB", n/1024)
 }
 
 // requestCoreRestart kills the core so coreEOFMsg respawns it with new
@@ -755,7 +795,11 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh the transcript while there's live content (a streaming block or
 		// an in-flight tool) so the in-flight badge `◷` and its elapsed timer tick.
 		// Finalized blocks are cached, so this is O(live) when idle it's a no-op.
-		if s.hasLiveContent() {
+		// While a blocking input flyout (ask/sudo/approval) is open the agent is
+		// paused on the user, so the transcript cannot change — skip the per-tick
+		// rebuild (renderBlocks is expensive on long sessions). Without this the
+		// 1Hz refresh churn starves typing in the flyout.
+		if s.hasLiveContent() && !s.blockingInputOpen() {
 			s.refresh()
 		}
 		// Drop expired toasts so the rail clears without waiting for another key.
@@ -767,7 +811,10 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// has stopped. The cycle stops when idle (see busyFrameMsg) to avoid a
 		// ~10x/sec re-render storm that disrupts mouse text selection (copy);
 		// tickMsg (every 500ms) catches the busy transition and restarts it.
-		if (s.busy || !s.ready) && !s.busyFrameActive {
+		// Don't re-arm the busy-frame clock while a blocking input flyout owns
+		// the keyboard (see busyFrameMsg): the agent is paused on the user, so
+		// the ~10×/s re-render only starves typing. Resumes within ~1s of close.
+		if !s.blockingInputOpen() && (s.busy || !s.ready) && !s.busyFrameActive {
 			s.busyFrameActive = true
 			cmds = append(cmds, busyFrameTick())
 		}
@@ -778,6 +825,15 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// stop so the renderer isn't driven ~10x/sec — that constant re-render
 		// makes mouse text selection (copy) impossible. tickMsg restarts the
 		// cycle when activity resumes.
+		// While a blocking input flyout (ask/sudo/approval) is open the agent is
+		// paused on the user; pause the ~10Hz re-render too, otherwise it saturates
+		// the single-threaded loop and typing in the flyout lags badly (seconds
+		// per keystroke on long transcripts). tickMsg restarts the cycle within
+		// ~1s after the flyout closes (s.busy && !busyFrameActive).
+		if s.blockingInputOpen() {
+			s.busyFrameActive = false
+			return s, nil
+		}
 		if s.busy || !s.ready {
 			s.busyFrameActive = true
 			return s, busyFrameTick()
@@ -817,7 +873,13 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamRefreshMsg:
 		s.streamRefreshPending = false
-		s.refresh()
+		// Skip the transcript rebuild while a keyboard-intercepting overlay
+		// (ask/sudo/approval flyout or any modal) is open: it overlays the
+		// transcript, so rebuilding it only starves the typing loop. The next
+		// tickMsg (or the next delta after the overlay closes) refreshes.
+		if !s.blockingInputOpen() {
+			s.refresh()
+		}
 		return s, nil
 
 	case mentionSearchMsg:
@@ -982,9 +1044,11 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(res.attached) > 0 && res.text != "" {
 				// Mixed paste: images staged, residual text still goes in.
 				s.input, _ = s.input.Update(tea.PasteMsg{Content: res.text})
+				s.warnIfLargeDraft()
 				return s, nil
 			}
 			s.input, _ = s.input.Update(msg)
+			s.warnIfLargeDraft()
 		}
 		return s, nil
 
@@ -1000,6 +1064,14 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	default:
+		// While the ask flyout is open, forward unhandled msgs (e.g. the cursor
+		// BlinkMsg resolved from the cmd handleAskKey returned) back into the ask
+		// form so the blink chain re-arms; the form's resulting cmd is returned
+		// for the runtime to run asynchronously. Without this the cursor blinks
+		// once then freezes.
+		if s.pendingAsk != nil {
+			return s, s.pumpHuhAsk(msg)
+		}
 		// Charm picker lists (command/models/sessions/theme) filter asynchronously:
 		// typing while "/"-filtering returns a filterItems cmd → list.FilterMatchesMsg.
 		// Forward those (and other list-owned msgs) into pickerList; dropping them

@@ -632,6 +632,7 @@ export type CoreEvent =
   | { type: "approval_request"; request_id: string; tool: string; args: string; diff?: string }
   | { type: "approval_expired"; request_id: string; tool_call_id?: string }
   | { type: "run_cancelled"; run_id?: string; reason?: string }
+  | { type: "stuck_nudge"; message: string }
   | {
       type: "runtime_status";
       discarded_stale_results?: number;

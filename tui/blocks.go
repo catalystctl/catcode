@@ -579,7 +579,10 @@ func (s *session) refresh() {
 		// unchanged, or repeated layout()/refresh calls.
 		s.viewport.SetContent(base)
 	}
-	if s.follow {
+	// Freeze auto-follow while a drag selection is in flight: new deltas
+	// arriving mid-drag would scroll the content out from under the anchor
+	// coordinates, so copy-on-release would capture the wrong text.
+	if s.follow && !(s.selection.active && s.selection.dragged) {
 		s.viewport.GotoBottom()
 	}
 }
@@ -1221,6 +1224,27 @@ func (s *session) hasLiveContent() bool {
 		}
 	}
 	return false
+}
+
+// blockingInputOpen reports whether a keyboard-intercepting overlay is
+// currently open: a HITL flyout that blocks the agent on user input (ask /
+// sudo / approval) OR any modal (command palette, settings edit, OAuth code
+// box, value-edit box, …). While one is open the main input doesn't own the
+// keyboard, so the transcript re-render churn is paused — the busy-frame
+// storm (10×/s View) and the tickMsg / streamRefreshMsg renderBlocks rebuilds
+// (see those handlers in main.go). Without this the churn saturates
+// bubbletea's single-threaded loop and makes typing in the overlay lag by
+// seconds per keystroke on long transcripts (the same root cause as the
+// ask-flyout lag, just on the modal path — modals were left out of the
+// original guard).
+//
+// For ask/sudo/approval the agent is paused so the transcript truly can't
+// change. For a modal the agent may keep streaming, but the modal overlays
+// the transcript, so a frozen view is harmless and catches up within ~1s of
+// the modal closing (tickMsg re-arms the busy-frame and refreshes; a
+// streaming turn also refreshes on the next streamRefreshMsg).
+func (s *session) blockingInputOpen() bool {
+	return s.pendingAsk != nil || s.pendingSudo != nil || s.pendingApproval != nil || s.modal.kind != modalNone
 }
 
 // finalizeInFlight marks any still-running tool blocks as done so the

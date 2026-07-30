@@ -5,7 +5,7 @@
 // a file calls ide.openFile(path). The active file (== ide.state.activeTabId for
 // file tabs) is highlighted. Header has refresh + new-file/folder + collapse-all.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, DragEvent as ReactDragEvent, ChangeEvent as ReactChangeEvent } from "react";
 import { useIdeContext } from "@/lib/ide-context";
 import type { IdeApi } from "@/lib/use-ide";
 import type { FileEntry, FileNode, GitStatusEntry } from "@/lib/types";
@@ -22,7 +22,12 @@ import {
   EditIcon,
   CopyIcon,
   MinusIcon,
+  UploadIcon,
+  DownloadIcon,
+  DuplicateIcon,
+  TerminalIcon,
 } from "@/components/icons";
+import { UploadOverlay, triggerUpload } from "./upload-overlay";
 
 type CreateKind = "file" | "folder";
 type MenuState = { node: FileNode; x: number; y: number } | null;
@@ -541,6 +546,252 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
     }
   }, [workspace]);
 
+  // ── Upload ──
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const uploadDestRef = useRef("");
+  // Module-level clipboard for copy/cut/paste within the explorer.
+  const fileClipboardRef = useRef<{ mode: "copy" | "cut"; path: string } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [dragOverPath, setDragOverPath] = useState<string | null>(null);
+
+  const pickUploadFiles = useCallback((dest: string) => {
+    uploadDestRef.current = dest;
+    setMenu(null);
+    fileInputRef.current?.click();
+  }, []);
+
+  const pickUploadFolder = useCallback((dest: string) => {
+    uploadDestRef.current = dest;
+    setMenu(null);
+    const input = folderInputRef.current;
+    if (input) {
+      input.setAttribute("webkitdirectory", "");
+      input.click();
+    }
+  }, []);
+
+  const onFileInputChange = useCallback((event: ReactChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (files && files.length) {
+      void triggerUpload(uploadDestRef.current, Array.from(files));
+    }
+    event.target.value = "";
+  }, []);
+
+  // Existing child paths under a destination folder (for conflict detection).
+  const getExisting = useCallback(
+    (dest: string) => {
+      const set = new Set<string>();
+      const nodes = cache[dest] ?? [];
+      for (const n of nodes) set.add(n.name);
+      return set;
+    },
+    [cache],
+  );
+
+  // After upload completes, refresh the affected folders + reveal the first file.
+  const onUploaded = useCallback(
+    (dest: string, paths: string[]) => {
+      if (dest) {
+        ide.expandDir(dest);
+        load(dest);
+      } else {
+        load(base);
+      }
+      const first = paths[0];
+      if (first) {
+        const parent = first.includes("/") ? first.slice(0, first.lastIndexOf("/")) : dest;
+        if (parent) {
+          ide.expandDir(parent);
+          load(parent);
+        }
+        setFocusedPath(first);
+      }
+    },
+    [base, ide, load],
+  );
+
+  // OS drag-and-drop onto the tree. Determine the destination folder from the
+  // hovered node (a folder itself, or the parent of a file).
+  const destForHoveredPath = useCallback((path: string | null): string => {
+    if (!path) return base;
+    // Look up the node in the cache to decide dir vs file.
+    let isDir = false;
+    for (const nodes of Object.values(cache)) {
+      const found = nodes.find((n) => n.path === path);
+      if (found) { isDir = found.dir; break; }
+    }
+    if (isDir) return path;
+    return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : base;
+  }, [base, cache]);
+
+  const onTreeDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    // Resolve the hovered node from the element under the cursor.
+    const el = (event.target as HTMLElement).closest("[data-tree-path]");
+    const path = el?.getAttribute("data-tree-path") ?? null;
+    setDragOverPath(path);
+    setDragOver(true);
+  }, []);
+
+  const onTreeDragLeave = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+    setDragOver(false);
+    setDragOverPath(null);
+  }, []);
+
+  const onTreeDrop = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    const el = (event.target as HTMLElement).closest("[data-tree-path]");
+    const pathAttr = el?.getAttribute("data-tree-path") ?? null;
+    const dest = destForHoveredPath(pathAttr);
+    setDragOver(false);
+    setDragOverPath(null);
+    void triggerUpload(dest, event.dataTransfer);
+  }, [destForHoveredPath]);
+
+  // ── Download ──
+  const downloadEntry = useCallback((path: string) => {
+    const a = document.createElement("a");
+    a.href = `/api/download?path=${encodeURIComponent(path)}&workspace=${encodeURIComponent(workspace)}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setMenu(null);
+  }, [workspace]);
+
+  // ── Duplicate ──
+  const duplicateEntry = useCallback(async (node: FileNode) => {
+    if (node.dir) return; // folder duplication omitted for simplicity
+    const affectedTabs = ide.state.openTabs.filter((t) => t.target === node.path);
+    if (affectedTabs.some((t) => t.dirty)) {
+      setError("Save the file before duplicating it.");
+      setMenu(null);
+      return;
+    }
+    const dot = node.name.lastIndexOf(".");
+    const stem = dot > 0 ? node.name.slice(0, dot) : node.name;
+    const ext = dot > 0 ? node.name.slice(dot) : "";
+    const parent = node.path.includes("/") ? node.path.slice(0, node.path.lastIndexOf("/")) : "";
+    const siblings = new Set((cache[parent] ?? []).map((n) => n.name));
+    let n = 1;
+    let candidate = `${stem} copy${ext}`;
+    while (siblings.has(candidate)) {
+      candidate = `${stem} copy ${n}${ext}`;
+      n++;
+    }
+    const newPath = parent ? `${parent}/${candidate}` : candidate;
+    try {
+      const r = await fetch("/api/file", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: newPath, workspace, kind: "file" }),
+      });
+      if (!r.ok) {
+        const data = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? "Duplicate failed");
+        return;
+      }
+      // Copy contents via PUT.
+      const src = await fetch(`/api/file?path=${encodeURIComponent(node.path)}&workspace=${encodeURIComponent(workspace)}`);
+      if (src.ok) {
+        const data = (await src.json()) as { content?: string };
+        await fetch("/api/file", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: newPath, content: data.content ?? "", workspace }),
+        });
+      }
+      if (parent) load(parent); else load(base);
+    } catch {
+      setError("Duplicate failed");
+    }
+    setMenu(null);
+  }, [base, cache, ide, load, workspace]);
+
+  // ── Open terminal here ──
+  const openTerminalHere = useCallback((path: string) => {
+    ide.newTerminal(path);
+    setMenu(null);
+  }, [ide]);
+
+  // ── Copy / Cut / Paste ──
+  // Module-level clipboard so it survives tree re-mounts (same as upload trigger).
+  const copyEntry = useCallback((path: string) => {
+    fileClipboardRef.current = { mode: "copy", path };
+    setMenu(null);
+  }, []);
+  const cutEntry = useCallback((path: string) => {
+    fileClipboardRef.current = { mode: "cut", path };
+    setMenu(null);
+  }, []);
+  const canPaste = !!fileClipboardRef.current;
+  const pasteEntry = useCallback(async (destDir: string) => {
+    const clip = fileClipboardRef.current;
+    if (!clip) return;
+    setMenu(null);
+    const src = clip.path;
+    const name = src.includes("/") ? src.slice(src.lastIndexOf("/") + 1) : src;
+    const newPath = destDir ? `${destDir}/${name}` : name;
+    if (newPath === src) { fileClipboardRef.current = null; return; }
+    try {
+      if (clip.mode === "copy") {
+        const r = await fetch("/api/file", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: newPath, workspace, kind: "file" }),
+        });
+        if (r.status === 409) {
+          setError(`"${name}" already exists in this folder`);
+          return;
+        }
+        if (!r.ok) {
+          const data = (await r.json().catch(() => ({}))) as { error?: string };
+          setError(data.error ?? "Paste failed");
+          return;
+        }
+        // Copy contents.
+        const srcRes = await fetch(`/api/file?path=${encodeURIComponent(src)}&workspace=${encodeURIComponent(workspace)}`);
+        if (srcRes.ok) {
+          const data = (await srcRes.json()) as { content?: string };
+          await fetch("/api/file", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: newPath, content: data.content ?? "", workspace }),
+          });
+        }
+      } else {
+        // Move via PATCH (rename across directories).
+        const r = await fetch("/api/file", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: src, newPath, workspace }),
+        });
+        if (r.status === 409) {
+          setError(`"${name}" already exists in this folder`);
+          return;
+        }
+        if (!r.ok) {
+          const data = (await r.json().catch(() => ({}))) as { error?: string };
+          setError(data.error ?? "Move failed");
+          return;
+        }
+        ide.remapFileTabs(src, newPath);
+        ide.remapExpandedDirs(src, newPath);
+        fileClipboardRef.current = null;
+      }
+      if (destDir) { ide.expandDir(destDir); load(destDir); } else load(base);
+      setFocusedPath(newPath);
+    } catch {
+      setError("Paste failed");
+    }
+  }, [base, ide, load, workspace]);
+
   const gitByPath = useMemo(() => {
     const map = new Map<string, GitStatusEntry>();
     for (const entry of ide.state.gitStatus?.entries ?? []) {
@@ -676,6 +927,15 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
           </button>
           <button
             type="button"
+            onClick={() => pickUploadFiles("")}
+            title="Upload files"
+            aria-label="Upload files"
+            className="rounded p-1 text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+          >
+            <UploadIcon width={14} height={14} />
+          </button>
+          <button
+            type="button"
             onClick={() => ide.collapseAllDirs()}
             title="Collapse all"
             aria-label="Collapse all"
@@ -732,7 +992,10 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
         aria-label="Workspace files"
         tabIndex={0}
         onKeyDown={onTreeKeyDown}
-        className="min-h-0 flex-1 overflow-y-auto pb-2 outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/40"
+        onDragOver={onTreeDragOver}
+        onDragLeave={onTreeDragLeave}
+        onDrop={onTreeDrop}
+        className="relative min-h-0 flex-1 overflow-y-auto pb-2 outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/40"
       >
         {query.trim() ? searchResults.map((node) => (
           <button key={node.path} type="button" title={node.path} onClick={() => ide.openFile(node.path)} className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink-300 hover:bg-ink-800/60 hover:text-ink-100">
@@ -749,18 +1012,39 @@ export function FileTree({ root, refreshToken }: { root?: string; refreshToken?:
         {!query.trim() && !loading[base] && rootNodes.length === 0 && !error ? (
           <div className="px-3 py-3 text-xs leading-relaxed text-ink-600">Empty workspace. Create a file or folder above to get started.</div>
         ) : null}
+        {dragOver ? (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-accent/10 ring-2 ring-inset ring-accent/60">
+            <span className="rounded-lg bg-ink-900/95 px-3 py-1.5 text-[12px] font-medium text-accent-soft">
+              Drop to upload{dragOverPath ? ` into ${dragOverPath}` : ""}
+            </span>
+          </div>
+        ) : null}
       </div>
       {menu && (
         <div ref={menuRef} role="menu" aria-label={`Actions for ${menu.node.name}`} style={{ position: "fixed", left: Math.min(menu.x, window.innerWidth - 180), top: Math.min(menu.y, window.innerHeight - 220) }} className="z-50 w-48 rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40">
           {!menu.node.dir && <button role="menuitem" onClick={() => { ide.openFile(menu.node.path); setMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Open</button>}
           <button role="menuitem" onClick={() => beginCreate("file", menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><PlusIcon width={12} height={12} />New file here</button>
           <button role="menuitem" onClick={() => beginCreate("folder", menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><FolderPlusIcon width={12} height={12} />New folder here</button>
+          <div className="my-1 h-px bg-ink-800" />
+          <button role="menuitem" onClick={() => pickUploadFiles(menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><UploadIcon width={12} height={12} />Upload files here</button>
+          <button role="menuitem" onClick={() => pickUploadFolder(menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><UploadIcon width={12} height={12} />Upload folder here</button>
+          <button role="menuitem" onClick={() => downloadEntry(menu.node.path)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><DownloadIcon width={12} height={12} />Download</button>
+          <div className="my-1 h-px bg-ink-800" />
           <button role="menuitem" onClick={() => { setRenaming({ path: menu.node.path, name: menu.node.name }); setMenu(null); }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><EditIcon width={12} height={12} />Rename</button>
           <button role="menuitem" onClick={() => void copyPath(menu.node.path, false)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><CopyIcon width={12} height={12} />Copy path</button>
           <button role="menuitem" onClick={() => void copyPath(menu.node.path, true)} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Copy absolute path</button>
+          <button role="menuitem" onClick={() => copyEntry(menu.node.path)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><CopyIcon width={12} height={12} />Copy</button>
+          <button role="menuitem" onClick={() => cutEntry(menu.node.path)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><CopyIcon width={12} height={12} />Cut</button>
+          <button role="menuitem" disabled={!canPaste} onClick={() => void pasteEntry(menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800 disabled:opacity-30"><CopyIcon width={12} height={12} />Paste</button>
+          <button role="menuitem" onClick={() => void openTerminalHere(menu.node.dir ? menu.node.path : menu.node.path.slice(0, Math.max(0, menu.node.path.lastIndexOf("/"))))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><TerminalIcon width={12} height={12} />Open terminal here</button>
+          {!menu.node.dir && <button role="menuitem" onClick={() => void duplicateEntry(menu.node)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800"><DuplicateIcon width={12} height={12} />Duplicate</button>}
+          <div className="my-1 h-px bg-ink-800" />
           <button role="menuitem" onClick={() => void deleteEntry(menu.node)} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] text-red-300 hover:bg-red-950/60"><TrashIcon width={12} height={12} />Delete</button>
         </div>
       )}
+      <input ref={fileInputRef} type="file" multiple className="hidden" onChange={onFileInputChange} aria-hidden="true" tabIndex={-1} />
+      <input ref={folderInputRef} type="file" multiple className="hidden" onChange={onFileInputChange} aria-hidden="true" tabIndex={-1} />
+      <UploadOverlay workspace={workspace} getExisting={getExisting} onUploaded={onUploaded} />
     </div>
   );
 }

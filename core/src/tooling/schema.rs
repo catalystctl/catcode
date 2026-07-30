@@ -21,6 +21,7 @@ pub fn is_core_tool(name: &str) -> bool {
             | "finish"
             | "memory"
             | "knowledge"
+            | "collections"
             | "ask"
             | "load_tools"
             | "subagent"
@@ -691,6 +692,27 @@ fn definitions_uncached() -> Vec<Value> {
                         "path": { "type": "string", "description": "related/tests: workspace-relative path" },
                         "name": { "type": "string", "description": "symbol/explain: symbol or memory name" },
                         "limit": { "type": "integer", "description": "max results (default varies by action)" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "collections",
+                "description": "Document collections with local embedding retrieval (RAG). Index API docs, specs, notes, READMEs, or arbitrary text into named collections, then search them by semantic similarity to ground a task. Stored under the harness learning dir (never mutates the workspace). Actions: add (collection, text, source?) indexes text; add_file (collection, path) reads a workspace file and indexes it; index (collection, path, exts?, max_files?) recursively indexes a directory of text files; search (collection, query, limit?) retrieves relevant chunks with scores; list lists collections; stats (collection) shows counts; remove (collection) deletes a collection. Reuse across sessions — collections persist per project.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["add", "add_file", "index", "search", "list", "stats", "remove"], "description": "collections operation" },
+                        "collection": { "type": "string", "description": "collection name (required for all except list)" },
+                        "text": { "type": "string", "description": "add: text content to index" },
+                        "source": { "type": "string", "description": "add: optional source label (e.g. file path or URL); defaults to 'inline'" },
+                        "path": { "type": "string", "description": "add_file/index: workspace-relative file or directory path" },
+                        "exts": { "type": "array", "items": { "type": "string" }, "description": "index: optional file extensions to include (without dots); defaults to common text/code types" },
+                        "query": { "type": "string", "description": "search: query text" },
+                        "limit": { "type": "integer", "description": "search: max results (default 6, max 50)" }
                     },
                     "required": ["action"]
                 }

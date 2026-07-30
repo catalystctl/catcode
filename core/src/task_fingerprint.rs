@@ -74,6 +74,58 @@ pub fn build_fingerprint(input: &FingerprintInputs<'_>) -> TaskFingerprint {
     fp
 }
 
+/// Cheap heuristic: does this prompt look like a code-change / build / verify
+/// task (worth refreshing the codebase index, change coupling, and coverage,
+/// and worth surfacing likely-files/companions)? Conversational/strategic
+/// prompts return false so the turn skips that I/O and the context pack omits
+/// file/companion sections that would only false-match. Conservative — leans
+/// toward `true` (refresh), since a stale index is cheap to tolerate and the
+/// context pack still reads the existing index for file hints when needed.
+pub fn looks_like_code_task(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    // A file-path-like token (path separator + extension) is a strong signal.
+    if p.split_whitespace()
+        .any(|t| t.contains('/') && t.contains('.'))
+    {
+        return true;
+    }
+    // Code-edit / build / verify verbs and tool names. Broad on purpose — false
+    // positives only mean a refresh runs, which is safe.
+    const CODE_VERBS: &[&str] = &[
+        "edit",
+        "fix",
+        "refactor",
+        "implement",
+        "build",
+        "compile",
+        "debug",
+        "wire",
+        "extend",
+        "migrate",
+        "port",
+        "rewrite",
+        "patch",
+        "cargo",
+        "npm",
+        "pnpm",
+        "bun",
+        "pytest",
+        "rustc",
+        "clippy",
+        "lint",
+        "test",
+        "update",
+        "add",
+        "remove",
+        "delete",
+        "rename",
+        "create",
+        "change",
+        "modify",
+    ];
+    p.split_whitespace().any(|t| CODE_VERBS.contains(&t))
+}
+
 /// Similarity in `0.0..=1.0` using weighted Jaccard over fingerprint fields.
 /// Deterministic and independent of tool-choice order.
 pub fn fingerprint_similarity(a: &TaskFingerprint, b: &TaskFingerprint) -> f32 {

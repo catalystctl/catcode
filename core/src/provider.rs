@@ -3682,6 +3682,7 @@ mod tests {
             oauth: false,
             context_window: Some(32_768),
             models_override: Vec::new(),
+            models_endpoint: None,
         };
         let mut models = vec![openai_model_caps("gemma-3-12b-it", "Gemma 3 12B")];
         assert_eq!(models[0].context_window, 200_000); // no gemma branch -> default
@@ -3726,6 +3727,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            models_endpoint: None,
         };
         let mut models = vec![
             openai_model_caps("gemma-3-12b-it", "Gemma 3 12B"),
@@ -4306,6 +4308,7 @@ mod tests {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         }
     }
 
@@ -4611,6 +4614,7 @@ mod tests {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         };
         let mut timer = TurnTimer::new();
         let result = stream_turn_anthropic(
@@ -4637,6 +4641,269 @@ mod tests {
         assert_eq!(result.3, 2);
         let requests = server.await.unwrap();
         assert_eq!(requests[0]["stream"], true);
+    }
+
+    // Helper: build an Anthropic-kind ResolvedProvider against a mock SSE base.
+    fn mock_anthropic_provider(base: String) -> ResolvedProvider {
+        ResolvedProvider {
+            name: "anthropic-mock".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        }
+    }
+
+    // Helper: turn a Vec of JSON event values into an SSE response body.
+    fn anthropic_sse_body(events: Vec<Value>) -> String {
+        events
+            .into_iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>()
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_use_start_ignores_empty_input_placeholder() {
+        // Regression for the bug where content_block_start's `input: {}`
+        // placeholder was captured into tool_args and concatenated with the
+        // input_json_delta fragments, producing malformed args like
+        // `{}{"command":"ls -la"}`. The start event must set tool_id +
+        // tool_name ONLY; args are assembled entirely from input_json_delta.
+        let response = anthropic_sse_body(vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"tool_use","id":"toolu_01","name":"bash","input":{}}
+            }),
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls -la\"}"}
+            }),
+            json!({"type":"content_block_stop","index":0}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":5}
+            }),
+            json!({"type":"message_stop"}),
+        ]);
+        let (base, _server) = mock_openai_sse_server(vec![response]).await;
+        let provider = mock_anthropic_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_anthropic(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "claude-3-5-sonnet",
+            &[Message::user("list files")],
+            &[],
+            "none",
+            &[],
+            1024,
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("tool_use stream should succeed");
+
+        let msg = &result.0;
+        let tool_calls = msg["tool_calls"]
+            .as_array()
+            .expect("should have tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "toolu_01");
+        assert_eq!(tool_calls[0]["function"]["name"], "bash");
+        let args = tool_calls[0]["function"]["arguments"].as_str().unwrap();
+        // The critical assertion: args must be the clean assembled JSON, NOT
+        // prefixed with the empty `{}{` placeholder.
+        assert_eq!(args, r#"{"command":"ls -la"}"#);
+        assert!(
+            !args.starts_with("{}"),
+            "empty-input placeholder must not leak"
+        );
+        // stop_reason tool_use → finish_reason "tool_calls"
+        assert_eq!(result.1, "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn anthropic_partial_json_deltas_assemble_tool_args() {
+        // input_json_delta arrives in multiple partial_json fragments that must
+        // concatenate into valid JSON.
+        let response = anthropic_sse_body(vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":8}}}),
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"tool_use","id":"toolu_02","name":"edit","input":{}}
+            }),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"/main.rs\",\"edits\":[]}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":4}
+            }),
+            json!({"type":"message_stop"}),
+        ]);
+        let (base, _server) = mock_openai_sse_server(vec![response]).await;
+        let provider = mock_anthropic_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_anthropic(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "claude-3-5-sonnet",
+            &[Message::user("edit the file")],
+            &[],
+            "none",
+            &[],
+            1024,
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("partial-json stream should succeed");
+
+        let tool_calls = result.0["tool_calls"].as_array().unwrap();
+        let args = tool_calls[0]["function"]["arguments"].as_str().unwrap();
+        // Fragments must concatenate cleanly into valid JSON.
+        assert_eq!(args, r#"{"path":"src/main.rs","edits":[]}"#);
+        let parsed: Value = serde_json::from_str(args).expect("assembled args must be valid JSON");
+        assert_eq!(parsed["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn anthropic_multi_block_two_tool_calls_in_one_response() {
+        // A single response carrying TWO tool_use blocks at different indices —
+        // both must assemble independently with correct ids/names/args.
+        let response = anthropic_sse_body(vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":12}}}),
+            // Block 0: text
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Running two commands."}}),
+            json!({"type":"content_block_stop","index":0}),
+            // Block 1: first tool_use (bash)
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_10","name":"bash","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            // Block 2: second tool_use (read_file)
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_11","name":"read_file","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x.rs\"}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":10}
+            }),
+            json!({"type":"message_stop"}),
+        ]);
+        let (base, _server) = mock_openai_sse_server(vec![response]).await;
+        let provider = mock_anthropic_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_anthropic(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "claude-3-5-sonnet",
+            &[Message::user("do two things")],
+            &[],
+            "none",
+            &[],
+            1024,
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("multi-block stream should succeed");
+
+        let msg = &result.0;
+        assert_eq!(msg["content"], "Running two commands.");
+        let tool_calls = msg["tool_calls"]
+            .as_array()
+            .expect("should have tool_calls");
+        assert_eq!(tool_calls.len(), 2, "two tool_use blocks → two tool_calls");
+        // First call (index 1)
+        assert_eq!(tool_calls[0]["id"], "toolu_10");
+        assert_eq!(tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            r#"{"command":"ls"}"#
+        );
+        // Second call (index 2)
+        assert_eq!(tool_calls[1]["id"], "toolu_11");
+        assert_eq!(tool_calls[1]["function"]["name"], "read_file");
+        assert_eq!(tool_calls[1]["function"]["arguments"], r#"{"path":"x.rs"}"#);
+    }
+
+    #[tokio::test]
+    async fn anthropic_thinking_block_streams_then_text() {
+        // Extended thinking (thinking_delta) followed by a text block. Thinking
+        // is shown live but NOT persisted in the assistant message (Anthropic
+        // thinking blocks aren't replayable). The final message must carry only
+        // the text content, not the reasoning.
+        let response = anthropic_sse_body(vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":6}}}),
+            // Block 0: thinking
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me consider the approach."}}),
+            json!({"type":"content_block_stop","index":0}),
+            // Block 1: text
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Here is my answer."}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":8}
+            }),
+            json!({"type":"message_stop"}),
+        ]);
+        let (base, _server) = mock_openai_sse_server(vec![response]).await;
+        let provider = mock_anthropic_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_anthropic(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "claude-3-7-sonnet",
+            &[Message::user("think and answer")],
+            &[],
+            "none",
+            &[],
+            1024,
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("thinking+text stream should succeed");
+
+        let msg = &result.0;
+        // Text content is present.
+        assert_eq!(msg["content"], "Here is my answer.");
+        // Thinking is NOT persisted into the assistant message.
+        assert!(msg.get("reasoning_content").is_none());
+        assert!(!msg["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Let me consider"));
+        // No tool calls in this turn.
+        assert!(msg.get("tool_calls").is_none());
+        assert_eq!(result.1, "stop");
     }
 
     #[tokio::test]
@@ -4705,6 +4972,7 @@ mod tests {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         };
         let models = discover_models_force_refresh(&client, &provider).await;
         assert!(

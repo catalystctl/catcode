@@ -147,6 +147,7 @@ mod fixture_tests {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         };
         let messages: Vec<Message> = serde_json::from_value(json!([{
             "role": "user",

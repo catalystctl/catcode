@@ -272,6 +272,14 @@ export interface IdeApi {
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
   markDirty: (id: string, dirty: boolean) => void;
+  /** Close every tab except the given one. */
+  closeOthers: (id: string) => void;
+  /** Close every tab to the right of the given one. */
+  closeToRight: (id: string) => void;
+  /** Close every saved (non-dirty) tab. */
+  closeSaved: () => void;
+  /** Reopen the most recently closed tab (if restorable). */
+  reopenClosed: () => void;
   /** Remap open file tabs after a rename/move (updates id/target/label + activeTabId). */
   remapFileTabs: (oldPath: string, newPath: string) => void;
   /** Open a file change as a Monaco DiffEditor tab in the main work area. */
@@ -288,6 +296,10 @@ export interface IdeApi {
   setActiveTerminal: (id: string) => void;
   setTerminalExit: (id: string, code: number) => void;
   setTerminalUnavailable: (id: string) => void;
+  /** Rename a terminal tab in place. */
+  renameTerminal: (id: string, title: string) => void;
+  /** Destroy and recreate a terminal at the same cwd, preserving its title. */
+  restartTerminal: (id: string) => string;
   // ── git ──
   setGitStatus: (s: GitStatus | null) => void;
   refreshGit: () => void;
@@ -307,6 +319,8 @@ export interface IdeApi {
   // ── shell chrome (IDE vs chat-only) ──
   setUiMode: (mode: "ide" | "chat") => void;
   toggleUiMode: () => void;
+  /** Reset panel layout to defaults (keeps terminals + expanded dirs). */
+  resetLayout: () => void;
 }
 
 export function useIde(workspace?: string): IdeApi {
@@ -413,6 +427,8 @@ export function useIde(workspace?: string): IdeApi {
   // queue per active session id). The Terminal component pops + WS-writes these.
   const pendingCommands = useRef<Record<string, string[]>>({});
   const termSeq = useRef(0);
+  // Recently closed file tabs (newest first) for the "Reopen Closed Editor" action.
+  const recentlyClosedRef = useRef<Array<{ id: string; target: string; label: string; language?: string }>>([]);
 
   const setActivePanel = useCallback((p: IdePanelId) => {
     setState((s) => ({ ...s, activePanel: p, sidebarCollapsed: false }));
@@ -658,6 +674,14 @@ export function useIde(workspace?: string): IdeApi {
 
   const closeTab = useCallback((id: string) => {
     if (stateRef.current.openTabs.some((tab) => tab.id === id)) {
+      // Track restorable tabs so Reopen Closed Editor can bring them back.
+      const closing = stateRef.current.openTabs.find((t) => t.id === id);
+      if (closing && closing.kind === "file") {
+        recentlyClosedRef.current = [
+          { id: closing.id, target: closing.target, label: closing.label, language: closing.language },
+          ...recentlyClosedRef.current.filter((c) => c.target !== closing.target),
+        ].slice(0, 20);
+      }
       // Let React detach the visible editor before disposing the backing model.
       // Tab switches do not come through here, so their undo history survives.
       queueMicrotask(() => disposeEditorModel(id));
@@ -673,6 +697,79 @@ export function useIde(workspace?: string): IdeApi {
           : null;
       }
       return { ...s, openTabs, activeTabId };
+    });
+  }, []);
+
+  const closeOthers = useCallback((keepId: string) => {
+    const closing = stateRef.current.openTabs.filter((t) => t.id !== keepId);
+    // Track restorable file tabs before disposing their models.
+    for (const tab of closing) {
+      if (tab.kind === "file") {
+        recentlyClosedRef.current = [
+          { id: tab.id, target: tab.target, label: tab.label, language: tab.language },
+          ...recentlyClosedRef.current.filter((c) => c.target !== tab.target),
+        ].slice(0, 20);
+      }
+      queueMicrotask(() => disposeEditorModel(tab.id));
+    }
+    setState((s) => ({
+      ...s,
+      openTabs: s.openTabs.filter((t) => t.id === keepId),
+      activeTabId: keepId,
+      activeDockPanels: { ...s.activeDockPanels, main: null },
+    }));
+  }, []);
+
+  const closeToRight = useCallback((keepId: string) => {
+    const idx = stateRef.current.openTabs.findIndex((t) => t.id === keepId);
+    if (idx < 0) return;
+    const closing = stateRef.current.openTabs.slice(idx + 1);
+    for (const tab of closing) {
+      if (tab.kind === "file") {
+        recentlyClosedRef.current = [
+          { id: tab.id, target: tab.target, label: tab.label, language: tab.language },
+          ...recentlyClosedRef.current.filter((c) => c.target !== tab.target),
+        ].slice(0, 20);
+      }
+      queueMicrotask(() => disposeEditorModel(tab.id));
+    }
+    setState((s) => ({
+      ...s, openTabs: s.openTabs.slice(0, idx + 1), activeTabId: keepId }));
+  }, []);
+
+  const closeSaved = useCallback(() => {
+    const closing = stateRef.current.openTabs.filter((t) => !t.dirty);
+    for (const tab of closing) {
+      queueMicrotask(() => disposeEditorModel(tab.id));
+    }
+    setState((s) => {
+      const openTabs = s.openTabs.filter((t) => t.dirty);
+      let activeTabId = s.activeTabId;
+      if (activeTabId && !openTabs.some((t) => t.id === activeTabId)) {
+        activeTabId = openTabs.length ? openTabs[openTabs.length - 1].id : null;
+      }
+      return { ...s, openTabs, activeTabId };
+    });
+  }, []);
+
+  const reopenClosed = useCallback(() => {
+    const last = recentlyClosedRef.current[0];
+    if (!last) return;
+    recentlyClosedRef.current = recentlyClosedRef.current.slice(1);
+    // Re-open as a file tab. If already open, just focus it.
+    setState((s) => {
+      if (s.openTabs.some((t) => t.target === last.target)) {
+        return { ...s, activeTabId: s.openTabs.find((t) => t.target === last.target)!.id };
+      }
+      const tab: IdeTab = {
+        id: `file:${last.target}`,
+        kind: "file",
+        target: last.target,
+        label: last.label,
+        dirty: false,
+        language: last.language,
+      };
+      return { ...s, openTabs: [...s.openTabs, tab], activeTabId: tab.id, activeDockPanels: { ...s.activeDockPanels, main: null } };
     });
   }, []);
 
@@ -814,6 +911,34 @@ export function useIde(workspace?: string): IdeApi {
     }));
   }, []);
 
+  const renameTerminal = useCallback((id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setState((s) => ({
+      ...s,
+      terminals: s.terminals.map((t) => (t.id === id ? { ...t, title: trimmed } : t)),
+    }));
+  }, []);
+
+  const restartTerminal = useCallback((id: string) => {
+    // Preserve the cwd + title of the old session, terminate its server PTY,
+    // and spawn a fresh session so the user gets a clean shell at the same path.
+    const old = stateRef.current.terminals.find((t) => t.id === id);
+    const cwd = old?.cwd ?? "";
+    const title = old?.title;
+    const newId = `term_${Date.now()}_${++termSeq.current}`;
+    setState((s) => {
+      const terminals = s.terminals.map((t) =>
+        t.id === id
+          ? { id: newId, title: title ?? `Terminal ${s.terminals.length}`, cwd, alive: true, exitCode: null }
+          : t,
+      );
+      return { ...s, terminals, activeTerminalId: newId };
+    });
+    // The old server PTY is abandoned; the server reaps idle PTYs after detach.
+    return newId;
+  }, []);
+
   const setGitStatus = useCallback((g: GitStatus | null) => {
     setState((s) => ({ ...s, gitStatus: g }));
   }, []);
@@ -884,6 +1009,26 @@ export function useIde(workspace?: string): IdeApi {
     setState((s) => ({ ...s, uiMode: s.uiMode === "chat" ? "ide" : "chat" }));
   }, []);
 
+  const resetLayout = useCallback(() => {
+    // Restore default panel arrangement while keeping workspace-local state
+    // (terminals, expanded dirs) so the user doesn't lose their session.
+    setState((s) => ({
+      ...s,
+      activePanel: DEFAULTS.activePanel,
+      sidebarWidth: DEFAULTS.sidebarWidth,
+      sidebarCollapsed: DEFAULTS.sidebarCollapsed,
+      bottomPanelHeight: DEFAULTS.bottomPanelHeight,
+      bottomPanelVisible: DEFAULTS.bottomPanelVisible,
+      copilotVisible: DEFAULTS.copilotVisible,
+      copilotWidth: DEFAULTS.copilotWidth,
+      panelLocations: { ...DEFAULTS.panelLocations },
+      panelVisibility: { ...DEFAULTS.panelVisibility },
+      activeDockPanels: { ...DEFAULTS.activeDockPanels },
+      leftDockWidth: DEFAULTS.leftDockWidth,
+      uiMode: "ide",
+    }));
+  }, []);
+
   // Memoize the returned api object so its identity is stable across renders
   // unless the state (or a state-derived callback) actually changed. The panels
   // (editor.tsx, git-panel.tsx) list `ide` in their useEffect deps; without this,
@@ -917,12 +1062,18 @@ export function useIde(workspace?: string): IdeApi {
       setActiveTab,
       markDirty,
       remapFileTabs,
+      closeOthers,
+      closeToRight,
+      closeSaved,
+      reopenClosed,
       newTerminal,
       runCommand,
       closeTerminal,
       setActiveTerminal,
       setTerminalExit,
       setTerminalUnavailable,
+      renameTerminal,
+      restartTerminal,
       setGitStatus,
       refreshGit,
       setPreview,
@@ -934,6 +1085,7 @@ export function useIde(workspace?: string): IdeApi {
       isExpanded,
       setUiMode,
       toggleUiMode,
+      resetLayout,
     }),
     [
       state,
@@ -963,12 +1115,18 @@ export function useIde(workspace?: string): IdeApi {
       setActiveTab,
       markDirty,
       remapFileTabs,
+      closeOthers,
+      closeToRight,
+      closeSaved,
+      reopenClosed,
       newTerminal,
       runCommand,
       closeTerminal,
       setActiveTerminal,
       setTerminalExit,
       setTerminalUnavailable,
+      renameTerminal,
+      restartTerminal,
       setGitStatus,
       refreshGit,
       setPreview,

@@ -13,6 +13,7 @@ import {
   HomeIcon,
   SearchIcon,
   XIcon,
+  GitBranchIcon,
 } from "@/components/icons";
 
 interface ProjectSwitcherProps {
@@ -35,7 +36,7 @@ type BrowseResponse = {
   error?: string;
 };
 
-type Mode = "recent" | "browse";
+type Mode = "recent" | "browse" | "create" | "clone";
 
 function pathSegments(abs: string): Array<{ label: string; path: string }> {
   if (!abs) return [{ label: "/", path: "/" }];
@@ -90,6 +91,22 @@ export function ProjectSwitcher({
   const trapRef = useFocusTrap<HTMLDivElement>(true);
   const current = projects.find((project) => project.path === workspace);
 
+  // ── Create mode state ──
+  const [createName, setCreateName] = useState("");
+  const [createParent, setCreateParent] = useState<string>("");
+  const [createInitGit, setCreateInitGit] = useState(true);
+  const [createReadme, setCreateReadme] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  // ── Clone mode state ──
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneParent, setCloneParent] = useState<string>("");
+  const [cloneName, setCloneName] = useState("");
+  const [cloneBranch, setCloneBranch] = useState("");
+  const [cloning, setCloning] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -130,6 +147,68 @@ export function ProjectSwitcher({
       setBrowseLoading(false);
     }
   }, []);
+
+  const createProject = useCallback(async () => {
+    const name = createName.trim();
+    if (!name) { setCreateError("Enter a project name"); return; }
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "create",
+          name,
+          parentDir: createParent.trim() || undefined,
+          initGit: createInitGit,
+          createReadme: createReadme,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; path?: string; name?: string; error?: string; exists?: boolean };
+      if (!res.ok || !data.ok) {
+        setCreateError(data.error ?? `Could not create project (${res.status})`);
+        return;
+      }
+      onSwitchWorkspace(data.path ?? "");
+      onClose();
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : "Could not create project");
+    } finally {
+      setCreating(false);
+    }
+  }, [createName, createParent, createInitGit, createReadme, onSwitchWorkspace, onClose]);
+
+  const cloneRepo = useCallback(async () => {
+    const url = cloneUrl.trim();
+    if (!url) { setCloneError("Enter a repository URL"); return; }
+    setCloning(true);
+    setCloneError(null);
+    try {
+      const res = await fetch("/api/project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "clone",
+          url,
+          parentDir: cloneParent.trim() || undefined,
+          name: cloneName.trim() || undefined,
+          branch: cloneBranch.trim() || undefined,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; path?: string; name?: string; error?: string };
+      if (!res.ok || !data.ok) {
+        setCloneError(data.error ?? `Could not clone (${res.status})`);
+        return;
+      }
+      onSwitchWorkspace(data.path ?? "");
+      onClose();
+    } catch (e) {
+      setCloneError(e instanceof Error ? e.message : "Could not clone repository");
+    } finally {
+      setCloning(false);
+    }
+  }, [cloneUrl, cloneParent, cloneName, cloneBranch, onSwitchWorkspace, onClose]);
 
   useEffect(() => {
     if (mode !== "browse") return;
@@ -191,6 +270,8 @@ export function ProjectSwitcher({
             [
               { id: "recent", label: "Recent" },
               { id: "browse", label: "Browse" },
+              { id: "create", label: "Create" },
+              { id: "clone", label: "Clone" },
             ] as const
           ).map((tab) => {
             const active = mode === tab.id;
@@ -217,7 +298,127 @@ export function ProjectSwitcher({
         </div>
       </header>
 
-      {mode === "recent" ? (
+      {mode === "create" ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3">
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-ink-400">Project name</span>
+              <input
+                autoFocus
+                value={createName}
+                disabled={creating}
+                onChange={(e) => setCreateName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void createProject(); }}
+                placeholder="my-project"
+                aria-label="Project name"
+                className="w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[12px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-ink-400">Parent directory</span>
+              <div className="flex gap-1.5">
+                <input
+                  value={createParent}
+                  disabled={creating}
+                  onChange={(e) => setCreateParent(e.target.value)}
+                  placeholder={browseHome ?? "~"}
+                  aria-label="Parent directory"
+                  className="min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[11px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+                />
+                <button type="button" disabled={creating} onClick={() => setMode("browse")} className="shrink-0 rounded-lg border border-ink-700 px-2 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 disabled:opacity-40">Browse</button>
+              </div>
+              {createParent.trim() || createName.trim() ? (
+                <span className="mt-1 block truncate font-mono text-[10px] text-ink-600">
+                  → {createParent.trim() || (browseHome ?? "~")}/{createName.trim() || "my-project"}
+                </span>
+              ) : null}
+            </label>
+            <div className="flex flex-col gap-1.5">
+              <label className="flex items-center gap-2 text-[12px] text-ink-300">
+                <input type="checkbox" checked={createInitGit} disabled={creating} onChange={(e) => setCreateInitGit(e.target.checked)} className="accent-accent" />
+                Initialize a Git repository
+              </label>
+              <label className="flex items-center gap-2 text-[12px] text-ink-300">
+                <input type="checkbox" checked={createReadme} disabled={creating} onChange={(e) => setCreateReadme(e.target.checked)} className="accent-accent" />
+                Create a README.md
+              </label>
+            </div>
+            {createError ? (
+              <div role="alert" className="rounded-lg bg-danger/10 px-2.5 py-2 text-[12px] text-danger">{createError}</div>
+            ) : null}
+          </div>
+          <div className="mt-auto flex items-center gap-2 border-t border-ink-800 pt-3">
+            <button type="button" disabled={creating || switching} onClick={() => void createProject()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft disabled:opacity-40">
+              <FolderPlusIcon width={14} height={14} />
+              {creating ? "Creating…" : "Create project"}
+            </button>
+          </div>
+        </div>
+      ) : mode === "clone" ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3">
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-ink-400">Repository URL</span>
+              <input
+                autoFocus
+                value={cloneUrl}
+                disabled={cloning}
+                onChange={(e) => setCloneUrl(e.target.value)}
+                placeholder="https://github.com/user/repo.git"
+                aria-label="Repository URL"
+                className="w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[11px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-ink-400">Parent directory</span>
+              <div className="flex gap-1.5">
+                <input
+                  value={cloneParent}
+                  disabled={cloning}
+                  onChange={(e) => setCloneParent(e.target.value)}
+                  placeholder={browseHome ?? "~"}
+                  aria-label="Parent directory"
+                  className="min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[11px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+                />
+                <button type="button" disabled={cloning} onClick={() => setMode("browse")} className="shrink-0 rounded-lg border border-ink-700 px-2 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 disabled:opacity-40">Browse</button>
+              </div>
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-medium text-ink-400">Folder name (optional)</span>
+                <input
+                  value={cloneName}
+                  disabled={cloning}
+                  onChange={(e) => setCloneName(e.target.value)}
+                  placeholder="auto from URL"
+                  aria-label="Folder name"
+                  className="w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[12px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-medium text-ink-400">Branch (optional)</span>
+                <input
+                  value={cloneBranch}
+                  disabled={cloning}
+                  onChange={(e) => setCloneBranch(e.target.value)}
+                  placeholder="default"
+                  aria-label="Branch"
+                  className="w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[12px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 disabled:opacity-50"
+                />
+              </label>
+            </div>
+            {cloneError ? (
+              <div role="alert" className="rounded-lg bg-danger/10 px-2.5 py-2 text-[12px] text-danger">{cloneError}</div>
+            ) : null}
+          </div>
+          <div className="mt-auto flex items-center gap-2 border-t border-ink-800 pt-3">
+            <button type="button" disabled={cloning || switching || !cloneUrl.trim()} onClick={() => void cloneRepo()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft disabled:opacity-40">
+              <GitBranchIcon width={14} height={14} />
+              {cloning ? "Cloning…" : "Clone repository"}
+            </button>
+          </div>
+        </div>
+      ) : mode === "recent" ? (
         <>
           <div className="border-b border-ink-800 px-2.5 py-2">
             <label className="flex items-center gap-2 rounded-lg border border-ink-800 bg-ink-950 px-2.5 py-1.5">

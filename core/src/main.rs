@@ -13,6 +13,7 @@ mod browser;
 mod change_coupling;
 mod checkpoint;
 mod codebase_index;
+mod collections;
 mod commands;
 mod config;
 mod context_pack;
@@ -50,6 +51,10 @@ mod protocol;
 mod provider;
 mod providers;
 mod rejected_approaches;
+/// Test-only reference implementation of the deep-research evidence-ledger
+/// contract (canonicalization, dedup, citation verification, stopping rules).
+#[cfg(test)]
+mod research_evidence;
 mod runtime;
 mod sandbox;
 mod search_tool;
@@ -105,8 +110,8 @@ You can read, edit, write, and list files, search with grep/glob, and run shell 
 Judgment (tool schemas own the mechanics):
 - Read/search before changing; prefer the smallest correct edit; verify with a command.
 - Prefer edit over write_file for targeted changes; prefer grep/glob (scoped) before full reads; page with offset/limit.
-- Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; for complex logic write a script and run it.
-- Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed (see Deferred tools below).
+- Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; write a script for complex logic.
+- Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed.
 - Paths are workspace-relative; absolute paths and ".." are rejected.
 
 Complete and verify requests end-to-end. Stop only when done, blocked on the user,
@@ -115,10 +120,12 @@ Be concise.
 
 Self-learning:
 - Persist durable facts with `memory` (workspace default; `scope:global` for cross-repo). Prefer `append` over duplicate saves; skip transient task state and trivia. Always pass a one-line `description`. Use durable types (convention/decision/gotcha/…) or importance=high; pass force=true only to override the write policy.
-- The standing prompt carries a capped MEMORY CATALOG (name + one-line only). Use `memory` action=get for full text when a catalog entry matters; list to see everything. Call get when relevant — recall telemetry tracks misses.
-- Call `memory` mid-task when you learn something reusable; auto-reflect also runs at the end of tool-using turns. Use action=consolidate to merge near-duplicates; action=stats for recall quality.
+- The standing prompt carries a capped MEMORY CATALOG (name + one-line only). Use `memory` action=get for full text when a catalog entry matters; list to see everything.
+- Call `memory` mid-task when you learn something reusable. Use action=consolidate to merge near-duplicates; action=stats for recall quality.
 - Reusable workflows → `.catalyst-code/skills/<name>/SKILL.md` (frontmatter name/description; body when-to-use/steps/examples). Read a skill before applying; create one after the same shape recurs. Prefer `/skill:<name>` for global skills that read_file cannot reach.
-- `/index` bootstraps an unfamiliar repo; `/reflect` is a deliberate learning pass."#;
+- `/index` bootstraps an unfamiliar repo; `/reflect` is a deliberate learning pass.
+
+Document collections (RAG): `collections` indexes docs/notes into named collections and searches them by similarity to ground a task; per-project."#;
 
 /// Compact orchestrator stub — enough to use `subagent` without injecting the
 /// full pi-subagents skill body on every turn. Parent-only (`with_skill`).
@@ -1068,6 +1075,7 @@ pub fn resolve_provider_from_config(
         oauth: false,
         context_window: p.context_window,
         models_override: p.models_override.clone(),
+        models_endpoint: p.models_endpoint.clone(),
     }
 }
 
@@ -1710,7 +1718,10 @@ async fn start_turn(
 ) {
     // Living codebase index: refresh once per turn-start window (throttled
     // inside codebase_index). Fail-open — never block the turn on index I/O.
-    {
+    // Skip for conversational/strategic prompts: the index, coupling, and
+    // coverage only aid code-change tasks, and the context pack still reads
+    // the existing (possibly stale) index for file hints when needed.
+    if crate::task_fingerprint::looks_like_code_task(&prompt) {
         let ws = state.cfg.read().await.workspace.clone();
         let (project_id, _f, _s) = codebase_index::ensure_index(&ws);
         // Best-effort git coupling refresh (capped internally).
@@ -3666,6 +3677,7 @@ const SOFT_DIGEST_KEEP_FRACTION: f32 = 0.20;
 /// one-liners, denial messages) stay full — they're cheap and the model may
 /// need them verbatim.
 pub(crate) use crate::agent::compaction::*;
+pub(crate) use crate::agent::stuck_detector::*;
 async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>) -> tools::Outcome {
     let mut names: Vec<String> = Vec::new();
     if let Some(arr) = args.get("tools").and_then(|v| v.as_array()) {

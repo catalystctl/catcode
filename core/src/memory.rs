@@ -994,15 +994,37 @@ fn catalog_blurb(entry: &MemoryEntry) -> String {
     let raw = if !entry.description.trim().is_empty() {
         entry.description.trim().to_string()
     } else {
+        // No explicit description: fall back to the first *informative* content
+        // line. Skip markdown headers, frontmatter separators, the append
+        // marker, and stray frontmatter keys so auto-extracted blurbs stay
+        // useful (and don't feed structural noise into retrieval text).
         entry
             .content
             .lines()
             .map(str::trim)
-            .find(|l| !l.is_empty())
+            .find(|l| is_informative_blurb_line(*l))
             .unwrap_or("")
             .to_string()
     };
     truncate_chars(&raw, CATALOG_DESC_MAX_CHARS)
+}
+
+/// A content line worth showing as a one-line blurb (and worth indexing for
+/// retrieval). Excludes structural noise that carries no signal.
+fn is_informative_blurb_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    !t.starts_with('#') // markdown header
+        && t != "---" // frontmatter separator
+        && !t.starts_with("--- ") // append marker / horizontal rule
+        && !t.starts_with("status=")
+        && !t.starts_with("name=")
+        && !t.starts_with("description=")
+        && !t.starts_with("type=")
+        && !t.starts_with("importance=")
+        && !t.starts_with("pin:")
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -1163,122 +1185,58 @@ fn build_catalog(memories: &[MemoryEntry]) -> String {
 fn build_relevant_tail(memories: &[MemoryEntry], prompt: &str) -> String {
     // Exclude deprecated (superseded) memories — the successor carries the
     // knowledge; they remain visible via `list`/`get`.
-    let live: Vec<&MemoryEntry> = memories.iter().filter(|m| !m.deprecated).collect();
-    if live.is_empty() {
+    if memories.iter().all(|m| m.deprecated) {
         return String::new();
     }
 
-    // Prefer embedding retrieval when synonym-miss rate is elevated.
-    let prefer_embed = {
-        let (misses, hits) = crate::memory_recall::rolling_synonym_counts();
-        crate::embed::should_prefer_embeddings(misses, hits)
-    };
-    if prefer_embed {
-        // Ensure index is warm for live memories.
-        // Workspace is inferred from the first memory path's grandparent hash dir —
-        // callers always pass workspace-scoped memories; fall back to tf·idf if
-        // we can't locate the store.
-        if let Some(ws_hint) = live.first().and_then(|m| m.path.parent()) {
-            // Index lives under ~/.config/.../memory/<hash>/; we don't have the
-            // workspace Path here, so use hashing over name+desc+content keyed by
-            // stem and search against an in-memory sketch for this call.
-            let q = crate::embed::hash_embed(prompt);
-            let mut scored: Vec<(&MemoryEntry, f32)> = live
-                .iter()
-                .copied()
-                .map(|m| {
-                    let text = format!("{} {} {}", m.name, m.description, m.content);
-                    let v = crate::embed::hash_embed(&text);
-                    (m, crate::embed::cosine(&q, &v))
-                })
-                .filter(|(_, s)| *s > 0.05)
-                .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let _ = ws_hint;
-            if !scored.is_empty() {
-                scored.truncate(RELEVANT_MAX_ENTRIES);
-                let mut out = String::from(
-                    "[RELEVANT MEMORIES] — embedding-sketch matches for this turn (transient).\n",
-                );
-                for (m, _score) in &scored {
-                    let blurb = catalog_blurb(m);
-                    out.push_str(&format!(
-                        "- **{}** ({}, {}){}\n",
-                        m.name,
-                        if m.mem_type.is_empty() {
-                            "note"
-                        } else {
-                            m.mem_type.as_str()
-                        },
-                        m.scope.as_str(),
-                        if blurb.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {blurb}")
-                        }
-                    ));
-                }
-                if out.len() > 1 {
-                    return out;
-                }
-            }
-        }
-    }
-
-    // Always-on semantic retrieval: tf·idf-weighted cosine over significant
-    // tokens, plus a keyword bonus for exact name/description token hits.
-    // This is the local Milestone-4 stand-in (no external embedding model): it
-    // ranks by query relevance rather than type-pinning, so pinned-but-irrelevant
-    // memories can no longer crowd out real matches. The synonym-miss signal
-    // from `memory_recall` (body matched but name didn't) is what unfroze this —
-    // the deferral gate's condition has been met.
-    let idf = compute_idf(&live);
-    let q = tfidf_vector(prompt, &idf);
-    let mut scored: Vec<(&MemoryEntry, f64)> = live
+    // Unified retrieval: the spec §15 hybrid ranker (BM25-lite + symbol/path/
+    // fingerprint/diagnostic signals) — the same ranker the context pack and
+    // `knowledge search` use. We over-fetch, then GATE on actual lexical overlap
+    // so a memory can't surface purely on the PROJECT_BONUS + scope + confidence
+    // floor (~0.18 for any workspace memory): only memories sharing real prompt
+    // tokens appear. This retires the earlier hash-embedding sketch path, which
+    // was net-negative — it fired on the synonym-miss signal (precisely when
+    // retrieval was already struggling) and returned noisier, blurb-only results.
+    // tf·idf remains the lexical channel inside the ranker; true neural embeddings
+    // are a future enhancement (network-dependent).
+    let fp =
+        crate::task_fingerprint::build_fingerprint(&crate::task_fingerprint::FingerprintInputs {
+            user_intent: prompt,
+            files_read: &[],
+            files_changed: &[],
+            symbols: &[],
+            tools_used: &[],
+            diagnostics: &[],
+            tests_run: &[],
+        });
+    let ranked = crate::learning_retrieval::rank_memories(memories, prompt, &fp, memories.len());
+    let mut scored: Vec<&(f32, MemoryEntry, Vec<String>)> = ranked
         .iter()
-        .copied()
-        .filter_map(|m| {
-            let text = format!("{} {} {}", m.name, m.description, m.content);
-            let sem = cosine_sim(&q, &tfidf_vector(&text, &idf));
-            // Exact name/description keyword hit is a strong signal — give it a
-            // small flat bonus so a genuine match edges out a near-synonym, and
-            // guarantees real matches surface even when the corpus is tiny.
-            let kw = if is_name_relevant(m, prompt) {
-                0.15
-            } else {
-                0.0
-            };
-            let score = sem + kw;
-            if sem > 0.0 || kw > 0.0 {
-                Some((m, score))
-            } else {
-                None
-            }
-        })
+        .filter(|(_, m, _)| crate::learning_retrieval::lexical_overlap(m, prompt) > 0.0)
         .collect();
     if scored.is_empty() {
         return String::new();
     }
-    // Relevance dominates; pinning/importance are only tie-breakers (a query-" "
-    // relevant unpinned memory must outrank a pinned-but-irrelevant one).
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| importance_rank(b.0.importance).cmp(&importance_rank(a.0.importance)))
-            .then_with(|| b.0.pinned.cmp(&a.0.pinned))
-            .then_with(|| a.0.name.cmp(&b.0.name))
-    });
     let total = scored.len();
     scored.truncate(RELEVANT_MAX_ENTRIES);
 
     let mut out = String::from(
-        "[RELEVANT MEMORIES] — semantic matches for this turn (transient; \
-         tf·idf cosine + keyword over the memory store). Use memory action=get for full text.\n",
+        "[RELEVANT MEMORIES] — top matches for this turn (hybrid ranker: BM25 + \
+         symbol/path/fingerprint signals, gated on lexical overlap). Use memory \
+         action=get for full text.\n",
     );
-    for (m, _score) in &scored {
+    for (_, m, _) in &scored {
+        let status = match m.status {
+            MemoryStatus::Verified => "[VERIFIED]",
+            MemoryStatus::Candidate => "[CANDIDATE]",
+            MemoryStatus::NeedsVerification => "[NEEDS-VERIFY]",
+            MemoryStatus::Stale => "[STALE]",
+            MemoryStatus::Deprecated => "[DEPRECATED]",
+            MemoryStatus::Rejected => "[REJECTED]",
+        };
         let blurb = catalog_blurb(m);
         out.push_str(&format!(
-            "- **{}** ({}, {}){}\n",
+            "- {status} **{}** ({}, {}){}\n",
             m.name,
             if m.mem_type.is_empty() {
                 "note"
@@ -2286,6 +2244,84 @@ mod tests {
         assert!(
             !tail.contains("ship-policy"),
             "common-token false match must NOT surface: {tail}"
+        );
+    }
+
+    #[test]
+    fn relevant_tail_gates_on_lexical_overlap_and_empties_without_match() {
+        // The unified ranker (rank_memories) gives every workspace memory a
+        // ~0.18 floor (PROJECT_BONUS + scope + confidence). The lexical-overlap
+        // gate must keep such scope-bonus-only memories out of the tail, and
+        // yield an empty tail when nothing shares prompt tokens (no noise).
+        let relevant = MemoryEntry {
+            name: "self-learning-system-architecture".into(),
+            description: "Map of the memory store, recall telemetry, skills".into(),
+            mem_type: "architecture".into(),
+            content: "memory store + retrieval ranker + skills + reflect".into(),
+            path: PathBuf::from("/fake/arch.md"),
+            scope: Scope::Workspace,
+            pinned: false,
+            importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
+            schema_version: 2,
+            source_session: None,
+            source_run: None,
+            created_at: None,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
+        };
+        // Irrelevant workspace memory: would score ~0.18 from scope bonus alone.
+        let irrelevant = MemoryEntry {
+            name: "tui-color-palette".into(),
+            description: "Preferred terminal color palette".into(),
+            mem_type: "note".into(),
+            content: "Use a dark background with muted accents.".into(),
+            path: PathBuf::from("/fake/tui.md"),
+            scope: Scope::Workspace,
+            pinned: false,
+            importance: Importance::Normal,
+            deprecated: false,
+            superseded_by: None,
+            schema_version: 2,
+            source_session: None,
+            source_run: None,
+            created_at: None,
+            status: MemoryStatus::Verified,
+            confidence: 1.0,
+            support_count: 0,
+            contradiction_count: 0,
+            last_verified_at: None,
+            last_verified_commit: None,
+            ref_files: vec![],
+            ref_symbols: vec![],
+            evidence_episodes: vec![],
+        };
+        let memories = vec![relevant.clone(), irrelevant.clone()];
+
+        // Matching prompt: relevant surfaces, irrelevant is gated out.
+        let tail = build_relevant_tail(&memories, "make the memory system better on tokens");
+        assert!(
+            tail.contains("self-learning-system-architecture"),
+            "relevant memory must surface: {tail}"
+        );
+        assert!(
+            !tail.contains("tui-color-palette"),
+            "scope-bonus-only memory must be gated out by lexical overlap: {tail}"
+        );
+
+        // No prompt overlap at all → empty tail (no noise), not N irrelevant hits.
+        let none = build_relevant_tail(&memories, "completely unrelated xyzzy query");
+        assert!(
+            none.is_empty(),
+            "no lexical overlap must yield an empty tail, not noise: {none:?}"
         );
     }
 

@@ -105,3 +105,4 @@ sdk/node_modules/
 !.catalyst-code/skills
 core/.config
 .catalyst-code/plugins/engraphis-memory/
+.catalyst-code/plugins/deep-research/

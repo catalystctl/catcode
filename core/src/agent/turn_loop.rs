@@ -73,6 +73,16 @@ pub(crate) async fn run_turn(
     let mut turn_tool_calls: u32 = 0;
     let mut shape_tools: Vec<String> = Vec::new();
     let mut shape_files: Vec<String> = Vec::new();
+    // Self-correcting stuck detector (NOT a max-turn cap): tracks a sliding
+    // window of recent tool-call signatures and injects a steering nudge when
+    // the agent repeats the same read-only call without making filesystem
+    // progress. The model self-corrects; the loop never hard-stops.
+    let mut stuck = StuckDetector::new();
+    // goal_write_plan is terminal for the planning turn: once a plan is
+    // accepted the turn must end so deploy starts. Set when a successful
+    // goal_write_plan flips the phase to plan_ready; checked after the
+    // tool-call batch to finalize the turn instead of looping back.
+    let mut goal_plan_just_written = false;
 
     // Ensure system prompt is present; persist every finalized message to the session file.
     let mut init_est_add = 0u64;
@@ -997,6 +1007,11 @@ pub(crate) async fn run_turn(
                             ParallelWaveResult::Aborted => return,
                             ParallelWaveResult::Done => call_offset = wave_end,
                         }
+                        // Record the wave calls' signatures for stuck detection
+                        // (the sequential loop only handles calls[call_offset..]).
+                        for wc in &calls[..wave_end] {
+                            stuck.record(&wc.function.name, &wc.function.arguments);
+                        }
                     }
                 }
                 for tc in &calls[call_offset..] {
@@ -1031,6 +1046,9 @@ pub(crate) async fn run_turn(
                             shape_files.push(cat);
                         }
                     }
+                    // Self-correcting stuck detection: record this call's
+                    // normalized signature so the detector can spot repetition.
+                    stuck.record(&name, &args_str);
                     let args: Value = match serde_json::from_str(&args_str) {
                         Ok(v) => v,
                         Err(_) => {
@@ -1654,6 +1672,23 @@ pub(crate) async fn run_turn(
                         return;
                     }
 
+                    // goal_write_plan is terminal for the planning turn: once
+                    // a plan is accepted (phase flips to plan_ready) the turn
+                    // must end so deploy starts. Without this a misbehaving model
+                    // keeps re-calling goal_write_plan — it is still in the tool
+                    // list built at turn start (planning=true) and a DIRECT call
+                    // bypasses the bulk-only deferred-tool staging gate, so it
+                    // reaches handle_goal_write_plan and loops forever on
+                    // "only valid during planning (phase=plan_ready)" while deploy
+                    // never begins. (A failed goal_write_plan keeps outcome.ok
+                    // false, so the flag — and thus the turn — only ends on a
+                    // real acceptance.)
+                    if name == "goal_write_plan" && outcome.ok {
+                        if st.goal.lock().await.phase == goal::GoalPhase::PlanReady {
+                            goal_plan_just_written = true;
+                        }
+                    }
+
                     // Milestone 1.1: a memory save/append/forget via the AI
                     // tool must be visible to subsequent turns in THIS session,
                     // so rebuild the memory slice of the system prompt now (no-op
@@ -1943,6 +1978,50 @@ pub(crate) async fn run_turn(
                 // Re-sync after parallel wave / any path that touched conversation
                 // without going through the working buffer.
                 messages.clone_from(&*st.conversation.lock().await);
+                // goal_write_plan succeeded this batch → the planning turn is done.
+                // Finalize and hand off to the goal orchestrator finisher (it
+                // spawns deploy — or CEO self-review). Skip the auto-reflect gate:
+                // a plan-submission turn has nothing to reflect on, and
+                // re-streaming would hand the model goal_write_plan again and
+                // re-introduce the loop this guard exists to break.
+                if goal_plan_just_written {
+                    *st.last_turn_time.lock().await = std::time::Instant::now();
+                    let (r_in, r_out) = reported_tokens(st, tokens_in, tokens_out).await;
+                    let metrics = timer.finalize(r_in, r_out, cached_tokens, model.clone());
+                    *st.last_turn_metrics.lock().await = Some(metrics.clone());
+                    emit_turn_metrics(st, &metrics).await;
+                    st.logger.log(
+                        "turn_done",
+                        json!({ "model": metrics.model, "tokens_in": metrics.tokens_in, "tokens_out": metrics.tokens_out, "cached_tokens": metrics.cached_tokens, "ttft_ms": metrics.ttft_ms, "elapsed_ms": metrics.elapsed_ms, "tps": metrics.tps }),
+                    );
+                    st.logger.record_turn();
+                    persist_stats(st).await;
+                    sync_session_file(st).await;
+                    maybe_finish_goal_orchestrator_turn(st, client, cancel.is_cancelled()).await;
+                    emit(&Event::new("done"));
+                    return;
+                }
+                // Self-correcting stuck detection: after the tool batch, check
+                // whether the agent repeated the same read-only call without
+                // making filesystem progress. If so, inject a steering nudge
+                // (a transient system message) so the model self-corrects on the
+                // next request. This is NOT a max-turn cap — the loop continues
+                // and the model decides how to recover.
+                if let Some(nudge) = stuck.check_and_nudge() {
+                    emit(&Event::new("stuck_nudge").with("message", json!(&nudge)));
+                    st.logger.log("stuck_nudge", json!({}));
+                    let nudge_msg = Message::system(&nudge);
+                    let est = estimate_message_tokens(&nudge_msg);
+                    messages.push(nudge_msg.clone());
+                    {
+                        let mut conv = st.conversation.lock().await;
+                        conv.push(nudge_msg);
+                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                            session::append(p, conv.last().unwrap());
+                        }
+                    }
+                    *st.estimated_tokens.lock().await += est;
+                }
                 // Loop back for the model to continue.
             }
             _ => {

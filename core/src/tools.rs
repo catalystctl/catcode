@@ -97,6 +97,7 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_commit" => git_commit(args, cfg),
         "memory" => memory_tool(args, cfg),
         "knowledge" => knowledge_tool(args, cfg),
+        "collections" => collections_tool(args, cfg),
         "goal_write_plan" => Outcome::err(
             "goal_write_plan must be dispatched through handle_goal_write_plan (async, goal mode only)",
         ),
@@ -1660,8 +1661,17 @@ pub async fn execute_bash(
                     diff: None,
                 }
             } else {
+                let ok = r.exit_code == Some(0);
+                // Feed recurring technical failures (compile/test/panic signatures)
+                // into the failure atlas so future error-recovery can surface
+                // "you've hit this N times before". Gated on diagnostic-looking
+                // output so a typo or `grep` exit-1 doesn't flood the atlas.
+                if !ok && crate::failure_atlas::looks_like_diagnostic_output(&combined) {
+                    let pid = crate::project_identity::resolve_project_identity(&cfg.workspace).id;
+                    crate::failure_atlas::record_diagnostic(&pid, "bash", &combined);
+                }
                 Outcome {
-                    ok: r.exit_code == Some(0),
+                    ok,
                     output: combined,
                     diff: None,
                 }
@@ -1928,6 +1938,45 @@ fn plan_edit(
     let path = resolve_ws(cfg, input)?;
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("edit: read {input:?} failed: {e}"))?;
+
+    // Fail-closed pre-scan: detect the replace_all-clobbers-insertion conflict
+    // BEFORE applying anything. When a later edit uses replace_all with search S
+    // and an EARLIER edit's replace text contains S, the replace_all would run
+    // on the evolved content and silently rewrite the just-inserted text. This
+    // caused silent corruption (e.g. a helper inserted then rewritten into
+    // self-recursion). Reject the whole batch with a clear error instead — the
+    // caller should split into separate edit calls.
+    let parsed: Vec<(usize, &str, &str, bool, bool)> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            (
+                i,
+                ev.get("search").and_then(|v| v.as_str()).unwrap_or(""),
+                ev.get("replace").and_then(|v| v.as_str()).unwrap_or(""),
+                ev.get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                ev.get("normalize_whitespace")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+        })
+        .collect();
+    for (i, search_i, _replace_i, replace_all_i, _norm_i) in &parsed {
+        if *replace_all_i && !search_i.is_empty() {
+            for (j, _search_j, replace_j, _ra_j, _n_j) in &parsed {
+                if *j < *i && replace_j.contains(search_i) {
+                    return Err(format!(
+                        "edit #{i}: replace_all search `{search_i}` also appears in edit #{j}'s replacement text. \
+                         A replace_all runs on the evolved content and would silently rewrite the text edit #{j} just inserted. \
+                         Split this into separate edit calls: apply the replace_all FIRST, then the insertion (or make the inserted text not contain `{search_i}`)."
+                    ));
+                }
+            }
+        }
+    }
+
     let mut new_content = content.clone();
 
     for (i, ev) in edits.iter().enumerate() {
@@ -2650,6 +2699,13 @@ pub async fn execute_diagnostics(args: &Value, cfg: &Config) -> Outcome {
     if output.len() > CAP {
         output = smart_truncate(&output, CAP);
     }
+    // Feed the checker's failure into the failure atlas — a non-zero exit
+    // here is always a real diagnostic (compile/type/build error), so no
+    // output-content gate is needed (unlike the bash tool).
+    if r.exit_code != Some(0) {
+        let pid = crate::project_identity::resolve_project_identity(&cfg.workspace).id;
+        crate::failure_atlas::record_diagnostic(&pid, label, &output);
+    }
     // ponytail: diagnostics "ok" is true only when the checker exits 0.
     Outcome {
         ok: r.exit_code == Some(0),
@@ -2809,6 +2865,186 @@ pub fn make_unified_diff(old: &str, new: &str, path: &str, context: usize) -> St
         }
     }
     out
+}
+
+// ---- collections (RAG over arbitrary docs) ----
+
+/// Document collections with embedding retrieval. Dispatches to
+/// `crate::collections`. Reads the workspace for `add_file`/`index`; all
+/// writes are to the harness learning dir (never the workspace), so the tool
+/// is classified ReadOnly (like `memory`).
+fn collections_tool(args: &Value, cfg: &Config) -> Outcome {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if action.is_empty() {
+        return Outcome::err(
+            "collections requires 'action' (add|add_file|index|search|list|stats|remove)",
+        );
+    }
+    let pid = crate::project_identity::resolve_project_identity(&cfg.workspace).id;
+    let collection = args
+        .get("collection")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    match action {
+        "list" => {
+            let cols = crate::collections::list(&pid);
+            if cols.is_empty() {
+                return Outcome::ok(
+                    "No collections yet. Use `collections add` or `collections index` to create one.",
+                );
+            }
+            let mut out = String::from("Collections:\n");
+            for m in cols {
+                out.push_str(&format!(
+                    "- {} ({} chunks, {} sources, {} chars)\n",
+                    m.name, m.chunk_count, m.source_count, m.total_chars
+                ));
+            }
+            Outcome::ok(out.trim_end().to_string())
+        }
+        "stats" => {
+            if collection.is_empty() {
+                return Outcome::err("collections stats requires 'collection'");
+            }
+            match crate::collections::stats(&pid, collection) {
+                Ok(m) => Outcome::ok(format!(
+                    "Collection '{}' — {} chunks, {} sources, {} chars indexed.",
+                    m.name, m.chunk_count, m.source_count, m.total_chars
+                )),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "add" => {
+            if collection.is_empty() {
+                return Outcome::err("collections add requires 'collection'");
+            }
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.trim().is_empty() {
+                return Outcome::err("collections add requires 'text'");
+            }
+            let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("inline");
+            match crate::collections::add_text(&pid, collection, text, source) {
+                Ok(r) => Outcome::ok(format!(
+                    "Indexed {} chars into '{}' ({} new chunks; {} total).",
+                    r.chars_indexed, r.collection, r.chunks_added, r.total_chunks
+                )),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "add_file" => {
+            if collection.is_empty() {
+                return Outcome::err("collections add_file requires 'collection'");
+            }
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.trim().is_empty() {
+                return Outcome::err("collections add_file requires 'path'");
+            }
+            let resolved = match resolve_ws(cfg, path) {
+                Ok(p) => p,
+                Err(e) => return Outcome::err(e),
+            };
+            let text = match std::fs::read_to_string(&resolved) {
+                Ok(t) => t,
+                Err(e) => return Outcome::err(format!("read {path:?} failed: {e}")),
+            };
+            if text.trim().is_empty() {
+                return Outcome::err(format!("file {path:?} is empty"));
+            }
+            match crate::collections::add_text(&pid, collection, &text, path) {
+                Ok(r) => Outcome::ok(format!(
+                    "Indexed '{}' into '{}' ({} new chunks; {} total).",
+                    path, r.collection, r.chunks_added, r.total_chunks
+                )),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "index" => {
+            if collection.is_empty() {
+                return Outcome::err("collections index requires 'collection'");
+            }
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.trim().is_empty() {
+                return Outcome::err("collections index requires 'path' (directory)");
+            }
+            let resolved = match resolve_ws(cfg, path) {
+                Ok(p) => p,
+                Err(e) => return Outcome::err(e),
+            };
+            let exts: Option<Vec<String>> = args
+                .get("exts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            match crate::collections::index_directory(&pid, collection, &resolved, exts.as_deref()) {
+                Ok(r) => {
+                    let mut out = format!(
+                        "Indexed '{}' into '{}' — {} files, {} chunks, {} bytes ({} skipped).",
+                        path, r.collection, r.files_indexed, r.chunks_added, r.bytes_indexed, r.files_skipped
+                    );
+                    if !r.skipped.is_empty() {
+                        out.push_str("\nSkipped (sample):");
+                        for s in &r.skipped {
+                            out.push_str(&format!("\n  - {s}"));
+                        }
+                    }
+                    Outcome::ok(out)
+                }
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "search" => {
+            if collection.is_empty() {
+                return Outcome::err("collections search requires 'collection'");
+            }
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            if query.trim().is_empty() {
+                return Outcome::err("collections search requires 'query'");
+            }
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(6);
+            match crate::collections::search(&pid, collection, query, limit) {
+                Ok(hits) if hits.is_empty() => Outcome::ok(format!(
+                    "No matches in collection '{}' for that query. (Is it indexed? Try `collections stats {}`.)",
+                    collection, collection
+                )),
+                Ok(hits) => {
+                    let mut out = String::new();
+                    for h in &hits {
+                        out.push_str(&format!(
+                            "[{:.2}] {} ({}:{})\n{}\n\n",
+                            h.score, h.collection, h.source, h.chunk_id, h.text
+                        ));
+                    }
+                    Outcome::ok(format!(
+                        "Top {} hits in '{}':\n\n{}",
+                        hits.len(),
+                        collection,
+                        out.trim_end()
+                    ))
+                }
+                Err(e) => Outcome::err(e),
+            }
+        }
+        "remove" => {
+            if collection.is_empty() {
+                return Outcome::err("collections remove requires 'collection'");
+            }
+            match crate::collections::remove(&pid, collection) {
+                Ok(()) => Outcome::ok(format!("Removed collection '{}'.", collection)),
+                Err(e) => Outcome::err(e),
+            }
+        }
+        other => Outcome::err(format!(
+            "unknown collections action '{other}'; expected add|add_file|index|search|list|stats|remove"
+        )),
+    }
 }
 
 // ---- git tools (shell out to the `git` binary; cwd = workspace) ----
@@ -3047,6 +3283,63 @@ mod tests {
         assert!(!o.ok);
         assert!(o.output.contains("closest match"), "{}", o.output);
         assert!(o.output.contains("line 1"), "{}", o.output);
+    }
+
+    #[test]
+    fn edit_replace_all_does_not_clobber_inserted_text() {
+        // Regression: a single edit call with BOTH (a) an insertion whose
+        // replace text contains substring S, AND (b) a replace_all whose search
+        // is S, would silently rewrite the just-inserted text (the replace_all
+        // runs after the insertion on the evolving content). This must now
+        // fail-closed with a clear error instead of silently corrupting.
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("f.txt"), "foo()\nbar()\n").unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "bar()", "replace": "bar()\n// helper: foo() is great" },
+            { "search": "foo()", "replace": "qux()", "replace_all": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(
+            !o.ok,
+            "should fail-closed, not silently clobber; got: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("replace_all"),
+            "error should explain the conflict: {}",
+            o.output
+        );
+        assert!(
+            o.output.contains("foo()"),
+            "error should name the clobbered substring: {}",
+            o.output
+        );
+        // File must be left untouched (atomic — no partial application).
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            "foo()\nbar()\n"
+        );
+    }
+
+    #[test]
+    fn edit_normalize_whitespace_noop_multiline_no_corruption() {
+        // Regression: normalize_whitespace:true on a multi-line no-op edit
+        // (search == replace) must leave the file byte-identical. The earlier
+        // per-char/byte indexing bug could corrupt even no-op edits by merging
+        // adjacent lines and dropping tokens.
+        let (_root, cfg) = tmp_ws();
+        let original = "msg := fmt.Sprintf(\"hi\")\n\treturn lipgloss.NewStyle()\n";
+        fs::write(cfg.workspace.join("f.txt"), original).unwrap();
+        let args = json!({ "path": "f.txt", "edits": [
+            { "search": "return lipgloss.NewStyle()", "replace": "return lipgloss.NewStyle()", "normalize_whitespace": true }
+        ] });
+        let o = execute("edit", &args, &cfg);
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("f.txt")).unwrap(),
+            original,
+            "no-op normalize_whitespace edit must not corrupt multi-line content"
+        );
     }
 
     #[test]

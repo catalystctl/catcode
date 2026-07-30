@@ -87,10 +87,6 @@ pub fn build_context_pack_for(workspace: &Path, prompt: &str, role: ContextRole)
             .unwrap_or_default()
     ));
 
-    let include_arch = matches!(
-        role,
-        ContextRole::Full | ContextRole::Planner | ContextRole::Reviewer
-    );
     let include_prefs = matches!(
         role,
         ContextRole::Full | ContextRole::Planner | ContextRole::Worker
@@ -116,16 +112,6 @@ pub fn build_context_pack_for(workspace: &Path, prompt: &str, role: ContextRole)
         ContextRole::Full | ContextRole::Reviewer | ContextRole::Worker
     );
 
-    if include_arch || include_prefs {
-        append_ranked_memories(
-            &mut out,
-            workspace,
-            prompt,
-            &fp,
-            include_arch,
-            include_prefs,
-        );
-    }
     if include_prefs {
         let prefs = preferences::load_global_preferences();
         append_preferences(&mut out, &prefs);
@@ -140,10 +126,14 @@ pub fn build_context_pack_for(workspace: &Path, prompt: &str, role: ContextRole)
     if include_episodes {
         append_episodes(&mut out, &identity, &fp);
     }
-    if include_files {
+    // File/companion surfacing needs the code index and only helps for
+    // code-change tasks; for conversational prompts it false-matches paths and
+    // wastes tokens. Gate on a cheap code-task heuristic.
+    let code_task = task_fingerprint::looks_like_code_task(prompt);
+    if include_files && code_task {
         append_likely_files(&mut out, &identity, prompt);
     }
-    if include_companions {
+    if include_companions && code_task {
         append_companions(&mut out, &identity, prompt);
     }
     if include_validation {

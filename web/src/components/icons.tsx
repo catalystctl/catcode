@@ -252,6 +252,21 @@ export const DownloadIcon = (p: P) => (
   </svg>
 );
 
+export const UploadIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <path d="M7 9l5-5 5 5" />
+    <path d="M12 4v12" />
+  </svg>
+);
+
+export const DuplicateIcon = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2" />
+  </svg>
+);
+
 export const RefreshIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M21 12a9 9 0 1 1-3-6.7" />

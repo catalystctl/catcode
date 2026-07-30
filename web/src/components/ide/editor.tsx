@@ -14,6 +14,20 @@ import { currentMonacoTheme, loadMonaco } from "./monaco-loader";
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 
+/** Heuristic: detect binary content (null bytes or a high control-char ratio). */
+function isBinaryContent(text: string): boolean {
+  if (!text) return false;
+  if (text.includes("\u0000")) return true;
+  const sample = text.length > 8000 ? text.slice(0, 8000) : text;
+  let control = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const code = sample.charCodeAt(i);
+    // Allow tab/newline/CR; count other control chars.
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) control++;
+  }
+  return control / sample.length > 0.1;
+}
+
 type MonacoApi = typeof Monaco;
 
 /** Last disk/saved snapshot per workspace path — survives editor remounts. */
@@ -21,6 +35,60 @@ const lastSavedByPath = new Map<string, string>();
 
 function savedSnapshotKey(workspace: string, path: string): string {
   return `${workspace}\0${path}`;
+}
+
+/**
+ * Save every dirty file tab by writing its live Monaco model content to disk.
+ * Works even for tabs whose editor isn't currently mounted because Monaco
+ * models persist in the model store keyed by URI. Returns the count saved.
+ */
+export async function saveAllDirtyTabs(
+  workspace: string,
+  tabs: Array<{ id: string; target: string; dirty?: boolean; kind?: string }>,
+): Promise<{ saved: number; failed: number }> {
+  const dirty = tabs.filter((t) => t.kind !== "diff" && t.kind !== "patch" && t.dirty);
+  if (!dirty.length) return { saved: 0, failed: 0 };
+  const { loadMonaco } = await import("./monaco-loader");
+  const monaco = await loadMonaco();
+  let saved = 0;
+  let failed = 0;
+  await Promise.all(
+    dirty.map(async (tab) => {
+      try {
+        const uri = modelUri(monaco, workspace, tab.target);
+        const model = monaco.editor.getModel(uri);
+        const content = model?.getValue() ?? "";
+        const res = await fetch("/api/file", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: tab.target, content, workspace }),
+        });
+        if (res.ok) {
+          lastSavedByPath.set(savedSnapshotKey(workspace, tab.target), content);
+          saved++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+    }),
+  );
+  return { saved, failed };
+}
+
+let saveAllFn: ((workspace: string, tabs: Array<{ id: string; target: string; dirty?: boolean; kind?: string }>) => Promise<{ saved: number; failed: number }>) | null = null;
+export function registerSaveAll(fn: typeof saveAllFn): void {
+  saveAllFn = fn;
+}
+export function triggerSaveAll(): Promise<{ saved: number; failed: number } | null> {
+  return saveAllFn ? saveAllFn(currentWorkspaceRef, currentDirtyTabsRef) : Promise.resolve(null);
+}
+let currentWorkspaceRef = "";
+let currentDirtyTabsRef: Array<{ id: string; target: string; dirty?: boolean; kind?: string }> = [];
+export function setSaveAllContext(workspace: string, tabs: Array<{ id: string; target: string; dirty?: boolean; kind?: string }>): void {
+  currentWorkspaceRef = workspace;
+  currentDirtyTabsRef = tabs;
 }
 
 function modelUri(monaco: MonacoApi, workspace: string, path: string): Monaco.Uri {
@@ -175,6 +243,11 @@ export function Editor({
           if (!response.ok) throw new Error(`Failed to load (${response.status})`);
           const data = (await response.json()) as { content?: string };
           if (cancelled) return;
+          // Detect binary content (null bytes / control-char ratio) so we don't
+          // load garbled bytes into Monaco.
+          if (isBinaryContent(data.content ?? "")) {
+            throw new Error("This is a binary file and can't be displayed in the editor. Use Download or Preview instead.");
+          }
           model = monaco.editor.createModel(
             data.content ?? "",
             resolveLanguage(monaco, tab.target, tab.language),

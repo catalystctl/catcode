@@ -8,6 +8,7 @@ import (
 
 	"charm.land/bubbles/v2/filepicker"
 	"charm.land/bubbles/v2/list"
+	"charm.land/bubbles/v2/paginator"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
@@ -57,6 +58,13 @@ func buildPickerList(title string, items []listItem, selected int) list.Model {
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(true)
+	// Page numbers, not the dot row: with 50+ palette entries the Dots
+	// paginator renders a long row of identical bullets that reads as a
+	// glitch; Arabic ("2/11") tells the user where they are.
+	l.Paginator.Type = paginator.Arabic
+	// "q" is a filter keystroke (type-to-filter), not quit — drop the stale
+	// "q quit" hint from the list help so the footer stops lying.
+	l.KeyMap.Quit.SetEnabled(false)
 	l.Styles.Title = accentStyle
 	l.Styles.HelpStyle = dimStyle
 	l.Help.Styles = catalystHelpStyles()
@@ -190,6 +198,21 @@ func (s *session) renderPickerList() string {
 	}
 	s.modal.pickerList.SetHeight(listH)
 	body := s.modal.pickerList.View()
+	// Record clickable row geometry for mouse hit-testing: the box adds a
+	// 1-line border, the list renders a 2-line title section, then items at a
+	// fixed 2-line pitch (delegate Height 2 + Spacing 0).
+	if perPage := s.modal.pickerList.Paginator.PerPage; perPage > 0 {
+		page := s.modal.pickerList.Paginator.Page
+		rows := len(s.modal.pickerList.VisibleItems()) - page*perPage
+		if rows > perPage {
+			rows = perPage
+		}
+		if rows < 0 {
+			rows = 0
+		}
+		s.modalPickerFirst = 3
+		s.modalPickerRows = rows
+	}
 	if s.modal.loading || s.modal.loadError != "" {
 		inner := max(1, w-4)
 		var extra strings.Builder

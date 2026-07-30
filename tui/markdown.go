@@ -34,13 +34,14 @@ func renderMarkdown(text string, w int) string {
 	if w < 8 {
 		w = 8
 	}
+	text = preprocessMarkdownPolish(text)
 	if looksLikeMarkdown(text) {
 		out, err := renderMarkdownGlamour(text, w)
 		if err == nil {
-			return out
+			return postprocessMarkdownPolish(out)
 		}
 	}
-	return renderMarkdownLegacy(text, w)
+	return postprocessMarkdownPolish(renderMarkdownLegacy(text, w))
 }
 
 func looksLikeMarkdown(text string) bool {

@@ -18,7 +18,7 @@ A single plugin can provide any combination of:
 | **OAuth providers** | Add a subscription-based provider (login flow + token resolution) like built-in OpenAI/Claude/Gemini. |
 | **Memory providers** | Replace the built-in markdown memory store for standing-prompt injection, compaction extracts, and `/memory` commands. |
 | **System-prompt injection** | Static text appended to the system prompt every turn. |
-| **Slash commands** | Custom `/name` handlers callable from the chat. |
+| **Slash commands** | Custom `/name` handlers callable from the chat — script-backed (run a handler, show output) or prompt-backed (`mode: "agent_turn"` → render a template and run a full agent turn). |
 | **Disable built-in tools** | Remove a built-in tool from the model's toolset entirely. |
 | **Tool override** | Replace a built-in tool's handler (e.g. a sandboxed `bash`, a redacting `read_file`) — the model keeps calling the same tool name. |
 
@@ -339,6 +339,20 @@ Stdout JSON:
 
 **Source:** `CommandManifestEntry` (line 216), `execute_plugin_command` (line 2119)
 in `core/src/plugins.rs`.
+
+### Prompt-backed commands (agent turns)
+
+A command can be **prompt-backed** instead of script-backed: set `prompt_file`
+(instead of `script`) and `mode: "agent_turn"`. When invoked, the harness renders
+the template (substituting `{{args}}`, `{{workspace}}`, `{{session_id}}`,
+`{{timestamp}}`, `{{plugin}}`, `{{command}}`) and submits it as a normal agent turn
+— the same path as a user `send`, with full tool/subagent access and the active
+model. This is how `/deep-research` drives a multi-agent research workflow from one
+slash command with no script and no recompile. Exactly one of `script` /
+`prompt_file` must be set; `prompt_file` is path-confined to the plugin dir and
+capped at 256 KiB. See the plugin-authoring skill for the full contract and a
+manifest example. The bundled `deep-research` plugin (`.catalyst-code/plugins/
+deep-research/`) is a complete reference implementation.
 
 ---
 

@@ -71,7 +71,7 @@ pub fn override_learning_root(root: PathBuf) -> LearningRootGuard {
     LearningRootGuard { prev }
 }
 
-fn learning_root() -> PathBuf {
+pub(crate) fn learning_root() -> PathBuf {
     if let Ok(g) = ROOT_OVERRIDE.lock() {
         if let Some(ref p) = *g {
             return p.clone();

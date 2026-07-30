@@ -106,7 +106,70 @@ func (s *session) handleModalMouseClick(msg tea.MouseClickMsg) tea.Cmd {
 	s.selectionPending = false
 	s.selectionFrameScheduled = false
 	s.selectionLastFrame = time.Time{}
+	// Row hit-test: move the highlight under the mouse so a release on the
+	// same row can activate it; a drag still becomes a copy-selection.
+	if idx, ok := s.modalItemAt(point.line); ok {
+		s.modalPressItem = idx
+		s.modalPressKind = s.modal.kind
+		s.moveModalCursorTo(idx)
+	} else {
+		s.modalPressItem = -1
+	}
 	return nil
+}
+
+// pickerItemPitch is the rendered height of one charm-picker item row
+// (delegate Height 2 + Spacing 0).
+const pickerItemPitch = 2
+
+// modalItemAt maps a screen row to a selectable modal item. Charm pickers
+// return an index into pickerList.VisibleItems(); custom list modals return
+// the filtered-list cursor index recorded at render time.
+func (s *session) modalItemAt(y int) (int, bool) {
+	rel := y - s.modalBoxTop
+	if rel < 0 {
+		return 0, false
+	}
+	if s.usesCharmPickerList() {
+		if s.modalPickerRows == 0 || rel < s.modalPickerFirst {
+			return 0, false
+		}
+		row := (rel - s.modalPickerFirst) / pickerItemPitch
+		if row < 0 || row >= s.modalPickerRows {
+			return 0, false
+		}
+		idx := s.modal.pickerList.Paginator.Page*s.modal.pickerList.Paginator.PerPage + row
+		if idx < 0 || idx >= len(s.modal.pickerList.VisibleItems()) {
+			return 0, false
+		}
+		return idx, true
+	}
+	vi, ok := s.modalItemRow[rel]
+	return vi, ok
+}
+
+// moveModalCursorTo highlights the item under the mouse without activating it.
+func (s *session) moveModalCursorTo(idx int) {
+	if s.usesCharmPickerList() {
+		s.modal.pickerList.Select(idx)
+		return
+	}
+	s.modal.cursor = idx
+}
+
+// activateModalItem triggers the item as if Enter had been pressed on it.
+func (s *session) activateModalItem(idx int) tea.Cmd {
+	if s.usesCharmPickerList() {
+		s.modal.pickerList.Select(idx)
+		if it, ok := s.modal.pickerList.SelectedItem().(catalogItem); ok {
+			_, cmd := s.executeListSelect(it.abs)
+			return cmd
+		}
+		return nil
+	}
+	s.modal.cursor = idx
+	_, cmd := s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	return cmd
 }
 
 func (s *session) handleModalMouseMotion(msg tea.MouseMotionMsg) tea.Cmd {
@@ -176,13 +239,22 @@ func (s *session) handleModalMouseRelease(msg tea.MouseReleaseMsg) tea.Cmd {
 	s.selectionFrameGeneration++
 	s.selectionPending = false
 	s.selectionFrameScheduled = false
-	if point, ok := s.modalPointAt(msg.X, msg.Y); ok {
+	point, pointOK := s.modalPointAt(msg.X, msg.Y)
+	if pointOK {
 		if point != s.modalSelection.anchor {
 			s.modalSelection.dragged = true
 		}
 		s.modalSelection.head = point
 	}
 	s.modalSelection.active = false
+	// A click (press+release on the same item row, no drag) activates the item.
+	if pointOK && !s.modalSelection.dragged && s.modalPressItem >= 0 && s.modalPressKind == s.modal.kind {
+		if idx, ok := s.modalItemAt(point.line); ok && idx == s.modalPressItem {
+			s.modalPressItem = -1
+			return s.activateModalItem(idx)
+		}
+	}
+	s.modalPressItem = -1
 	text := s.selectedModalText()
 	if text == "" {
 		return nil

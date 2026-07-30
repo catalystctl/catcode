@@ -96,6 +96,6 @@ mod turn_terminal_tests {
             );
             assert_eq!(event["protocol_version"], PROTOCOL_VERSION);
         }
-        assert_eq!(kinds.len(), 94, "fixture must cover every known event");
+        assert_eq!(kinds.len(), 95, "fixture must cover every known event");
     }
 }

@@ -924,7 +924,7 @@ func (s *session) providerItems() []listItem {
 	// Trailing entry: open the add-custom-provider form (full config parity).
 	items = append(items, listItem{
 		label: "+ Add custom provider…",
-		desc:  "any OpenAI/Anthropic-compatible endpoint · name · base URL · key or env · headers · context window",
+		desc:  "any OpenAI/Anthropic-compatible endpoint · guided setup: URL · key · headers",
 		meta2: "custom",
 	})
 	return items
@@ -1011,11 +1011,22 @@ func (s *session) visionItems() []listItem {
 			star = "★ "
 		}
 		label := fmt.Sprintf("[%s] %s%s", check, star, m.ID)
-		desc := ""
+		// Per-row state so the footer verbs aren't the only explanation:
+		// "[x]" = vision-capable, "★" = preferred handoff target.
+		var parts []string
 		if m.Vision {
-			desc = "endpoint vision"
+			parts = append(parts, "endpoint vision")
 		}
-		items[i] = listItem{label: label, desc: desc}
+		if on && !m.Vision {
+			parts = append(parts, "marked vision-capable")
+		}
+		if s.visionModel == m.ID {
+			parts = append(parts, "preferred for image turns")
+		}
+		if !on {
+			parts = append(parts, "not used for images")
+		}
+		items[i] = listItem{label: label, desc: strings.Join(parts, " · ")}
 	}
 	return items
 }
@@ -1144,6 +1155,7 @@ func (s *session) closeModal() {
 	s.modalSelection = transcriptSelection{}
 	s.modalSelectionKind = modalNone
 	s.modalPlain = nil
+	s.modalPressItem = -1
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,6 +3218,9 @@ func (s *session) renderModalOverlay(base string) string {
 	if s.modal.kind == modalNone {
 		return base
 	}
+	// Reset click hit-test geometry; the body renderers repopulate it.
+	s.modalItemRow = nil
+	s.modalPickerRows = 0
 	box := s.renderModalBody()
 	w := s.width
 	h := s.height
@@ -3219,6 +3234,9 @@ func (s *session) renderModalOverlay(base string) string {
 			box = strings.Join(ls[:h], "\n")
 		}
 	}
+	// Record the placed box origin so mouse clicks map back to item rows.
+	s.modalBoxTop = max(0, (h-lipgloss.Height(box))/2)
+	s.modalBoxLeft = max(0, (w-lipgloss.Width(box))/2)
 	// Overlay: place the box over the base via centered placement.
 	overlay := lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 	return overlay
@@ -3922,6 +3940,11 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		if vi == s.modal.cursor {
 			row = hiStyle.Render(row) // full-width highlight bar (pads to rowW)
 		}
+		// Record the row's box-relative line (1 = top border) for click hit-testing.
+		if s.modalItemRow == nil {
+			s.modalItemRow = map[int]int{}
+		}
+		s.modalItemRow[1+len(lines)] = vi
 		lines = append(lines, row)
 	}
 	if visEnd < n && s.height >= 9 {
@@ -3943,7 +3966,7 @@ func (s *session) renderListModal(title string, items []listItem, showFilter boo
 		footer = "  ↑↓ select · enter load · ^R rename · ^P pin · ^D delete · esc close"
 	}
 	if s.modal.kind == modalVision {
-		footer = "  ↑↓ navigate · e toggle handoff · space mark vision · enter prefer · esc close"
+		footer = "  ↑↓ navigate · e handoff on/off · space toggle vision · enter prefer for images · esc close"
 	}
 	lines = append(lines, truncStyle.Render(dimStyle.Render(footer)))
 	body := strings.Join(lines, "\n")

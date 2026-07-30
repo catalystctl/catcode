@@ -49,6 +49,7 @@ pub struct ToolMetadata {
 
 const READ: &[&str] = &["workspace.read"];
 const WRITE: &[&str] = &["workspace.write"];
+const READ_WRITE: &[&str] = &["workspace.read", "workspace.write"];
 const PROCESS: &[&str] = &["subprocess.execute"];
 const NETWORK: &[&str] = &["network.access"];
 const CHILD: &[&str] = &["subagent.spawn"];
@@ -229,6 +230,15 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Never,
             Cooperative,
             WRITE,
+        ),
+        "collections" => entry(
+            name_static("collections"),
+            ReadOnly,
+            Control,
+            Sequential,
+            Never,
+            Cooperative,
+            READ_WRITE,
         ),
         "ask" | "contact_supervisor" | "intercom" => entry(
             match name {

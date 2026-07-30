@@ -443,6 +443,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.logInfo(fmt.Sprintf("%d model(s) discovered — refine caps or submit", len(models)))
 		}
 		s.refresh()
+
+	case "delta":
+		// Assistant text token from core (Event::new("delta").with("text",…),
+		// provider.rs). Each delta appends to the live assistant block and
+		// schedules a coalesced refresh — without this case the streaming
+		// reply is silently dropped and only tool/thinking blocks render.
 		if s.cur == nil || s.cur.kind != blkAssistant {
 			s.push(blkAssistant)
 		}
@@ -754,10 +760,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.suspendComposer(owner)
 		args, diff := capStored(ev.get("args")), capStored(ev.get("diff"))
 		s.pendingApproval = &approvalPrompt{
-			requestID: ev.get("request_id"),
-			tool:      ev.get("tool"),
-			args:      args,
-			diff:      diff,
+			requestID:  ev.get("request_id"),
+			tool:       ev.get("tool"),
+			args:       args,
+			diff:       diff,
+			receivedAt: time.Now(),
 		}
 		s.logApproveDiff(ev.get("tool"), args, diff)
 		s.input.Focus()
@@ -2176,6 +2183,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.input.Reset()
 		s.evalMention()
 		s.histIdx = len(s.history)
+		s.stashedDraft = "" // sending commits the draft; no undo-restore after
 		return s, s.handleUserLine(text)
 	}
 
@@ -2184,6 +2192,27 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		s.input.Value() == "" && len(s.pendingImages) > 0 {
 		s.popPendingImage()
 		return s, nil
+	}
+
+	// Idle Esc was a dead key, which is safe but useless. Give it the chat-UI
+	// affordance without the trap: first Esc clears the draft but stashes it,
+	// a second Esc on the empty composer restores it. Modal/approval/busy
+	// owners of "close" returned long before this point.
+	if s.kb(msg, "close") {
+		if v := s.input.Value(); strings.TrimSpace(v) != "" {
+			s.stashedDraft = v
+			s.input.Reset()
+			s.evalMention()
+			s.logInfo("draft cleared — Esc again to restore")
+			return s, nil
+		}
+		if s.stashedDraft != "" {
+			s.input.SetValue(s.stashedDraft)
+			s.stashedDraft = ""
+			s.evalMention()
+			s.logInfo("draft restored")
+			return s, nil
+		}
 	}
 
 	var cmd tea.Cmd

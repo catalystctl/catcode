@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { flushSync } from "react-dom";
 import { useAgent } from "@/lib/use-agent";
 import { useIde } from "@/lib/use-ide";
 import { IdeContext, useIdeContext, type AttachToChatFn } from "@/lib/ide-context";
@@ -30,6 +29,7 @@ import { CommandPalette, type PaletteItem } from "./command-palette";
 import { PanelHeader, panelTabClass } from "./panel-header";
 import { ProjectSwitcher } from "./project-switcher";
 import { ResizeHandle } from "./resize-handle";
+import { registerSaveAll, setSaveAllContext, saveAllDirtyTabs, triggerSaveAll } from "./editor";
 import { SettingsModal } from "@/components/settings";
 import {
   FileIcon,
@@ -92,11 +92,16 @@ export function IdeShell() {
     if (chatOnly && focusMode) setFocusMode(false);
   }, [chatOnly, focusMode]);
 
-  // flushSync so DockDropOverlay is pointer-interactive before the browser
-  // fires the next dragover — otherwise Ghostty/iframes cancel the gesture.
+  // Activate the drop overlay for this drag. Do NOT flushSync here: forcing a
+  // synchronous re-render *during* the native dragstart event cancels the
+  // HTML5 drag in some Chromium/React combinations — no drag ghost appears and
+  // no dock targets light up, so the drag never visibly starts. The overlay is
+  // always mounted, so a normal (deferred) state update flips it active on the
+  // next paint, well before the user releases. The body class below already
+  // neutralises iframes/canvas for any intervening dragovers.
   const beginPanelDrag = useCallback((panel: MovablePanelId) => {
     document.body.classList.add("catalyst-panel-dragging");
-    flushSync(() => setDragging(panel));
+    setDragging(panel);
   }, []);
   const endPanelDrag = useCallback(() => {
     document.body.classList.remove("catalyst-panel-dragging");
@@ -148,6 +153,10 @@ export function IdeShell() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen((open) => !open);
+      }
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void triggerSaveAll();
       }
       if (event.key === "Escape" && focusMode && !paletteOpen) setFocusMode(false);
     };
@@ -201,6 +210,16 @@ export function IdeShell() {
     return true;
   }, [agent, ide.state.openTabs, workspace]);
 
+  // Wire the editor's save-all function so the command palette + Ctrl+Shift+S
+  // can save every dirty tab (including unmounted ones whose Monaco models persist).
+  useEffect(() => {
+    registerSaveAll(saveAllDirtyTabs);
+    return () => registerSaveAll(null);
+  }, []);
+  useEffect(() => {
+    setSaveAllContext(workspace, ide.state.openTabs);
+  }, [workspace, ide.state.openTabs]);
+
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const ensureIde = () => {
       if (ide.state.uiMode !== "ide") ide.setUiMode("ide");
@@ -233,6 +252,60 @@ export function IdeShell() {
         : []),
       { id: "command:settings", label: "Open settings", group: "Commands", run: openSettings },
       { id: "command:projects", label: "Switch project…", group: "Commands", run: openProjects },
+      {
+        id: "command:create-project",
+        label: "Create new project…",
+        detail: "Make a new folder, optionally init Git + README",
+        group: "Commands",
+        keywords: "new folder create",
+        run: openProjects,
+      },
+      {
+        id: "command:new-file",
+        label: "New file",
+        detail: "Create a file in the explorer",
+        group: "Commands",
+        keywords: "create",
+        run: () => { ensureIde(); ide.selectExplorer(); },
+      },
+      {
+        id: "command:new-folder",
+        label: "New folder",
+        group: "Commands",
+        keywords: "create directory",
+        run: () => { ensureIde(); ide.selectExplorer(); },
+      },
+      {
+        id: "command:new-terminal",
+        label: "New terminal",
+        detail: "Open a terminal session",
+        group: "Commands",
+        keywords: "shell",
+        run: () => { ensureIde(); ide.newTerminal(); ide.showDockPanel("terminal"); },
+      },
+      {
+        id: "command:save-all",
+        label: "Save all",
+        detail: "Save every dirty editor",
+        group: "Commands",
+        keywords: "save",
+        run: () => { triggerSaveAll(); },
+      },
+      {
+        id: "command:reopen-closed",
+        label: "Reopen closed editor",
+        group: "Commands",
+        keywords: "reopen restore tab",
+        run: () => { ensureIde(); ide.reopenClosed(); },
+      },
+      {
+        id: "command:reset-layout",
+        label: "Reset layout",
+        detail: "Restore the default panel arrangement",
+        group: "Commands",
+        keywords: "layout panels reset",
+        run: () => ide.resetLayout(),
+      },
       {
         id: "command:chat-main",
         label: "Open chat in editor area",
@@ -455,8 +528,8 @@ export function IdeShell() {
             />}
           </div>
 
-            {/* Always mounted so enabling it is only a class flip (plus flushSync
-                on dragstart). Conditional mount races dragover against React paint. */}
+            {/* Always mounted so enabling it is only a class flip on dragstart.
+                Conditional mount races dragover against React paint. */}
             <DockDropOverlay panel={dragging} active={dragging !== null} onDrop={drop} />
             {focusMode && (
               <button type="button" onClick={() => setFocusMode(false)} className="absolute bottom-3 left-3 z-40 rounded-md border border-ink-700 bg-ink-900/90 px-2.5 py-1.5 text-[11px] text-ink-400 shadow-lg hover:text-ink-100" title="Exit focus mode (Esc)">
@@ -588,6 +661,8 @@ function MobileShell({
               onSelect={ide.setActiveTerminal}
               onExit={ide.setTerminalExit}
               onUnavailable={ide.setTerminalUnavailable}
+              onRename={ide.renameTerminal}
+              onRestart={ide.restartTerminal}
             />
           )}
           {mobileView === "preview" && (
@@ -976,6 +1051,8 @@ function PanelContent({
       onSelect={ide.setActiveTerminal}
       onExit={ide.setTerminalExit}
       onUnavailable={ide.setTerminalUnavailable}
+      onRename={ide.renameTerminal}
+      onRestart={ide.restartTerminal}
     />
   );
 }
@@ -1045,10 +1122,19 @@ function TabStrip({
 }) {
   const { ide } = useIdeContext();
   const { openTabs, activeTabId } = ide.state;
+  const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const panelTabs = MOVABLE.filter(
     (panel) => ide.state.panelVisibility[panel] && ide.state.panelLocations[panel] === "main",
   );
   const activePanel = activeMainPanel(ide);
+  useEffect(() => {
+    if (!tabMenu) return;
+    const close = () => setTabMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setTabMenu(null); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", onKey); };
+  }, [tabMenu]);
   return (
     <PanelHeader>
       {openTabs.length === 0 && panelTabs.length === 0 && <span className="flex items-center px-3 text-xs text-ink-600">No open editors</span>}
@@ -1061,6 +1147,10 @@ function TabStrip({
             tabIndex={0}
             aria-selected={active}
             onClick={() => ide.setActiveTab(tab.id)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              setTabMenu({ id: tab.id, x: event.clientX, y: event.clientY });
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -1149,6 +1239,22 @@ function TabStrip({
           </button>
         </div>
       ))}
+      {tabMenu ? (
+        <div
+          role="menu"
+          aria-label="Tab actions"
+          style={{ position: "fixed", left: Math.min(tabMenu.x, window.innerWidth - 200), top: Math.min(tabMenu.y, window.innerHeight - 200) }}
+          className="z-50 w-52 rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-2xl shadow-black/40"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button role="menuitem" onClick={() => { ide.setActiveTab(tabMenu.id); ide.closeTab(tabMenu.id); setTabMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Close</button>
+          <button role="menuitem" onClick={() => { ide.closeOthers(tabMenu.id); setTabMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Close others</button>
+          <button role="menuitem" onClick={() => { ide.closeToRight(tabMenu.id); setTabMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Close tabs to the right</button>
+          <button role="menuitem" onClick={() => { ide.closeSaved(); setTabMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Close saved tabs</button>
+          <div className="my-1 h-px bg-ink-800" />
+          <button role="menuitem" onClick={() => { ide.reopenClosed(); setTabMenu(null); }} className="w-full rounded px-2 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-800">Reopen closed editor</button>
+        </div>
+      ) : null}
     </PanelHeader>
   );
 }

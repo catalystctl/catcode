@@ -2787,11 +2787,28 @@ async fn run_parallel(
     if tasks.is_empty() {
         return Outcome::err("parallel requires a non-empty 'tasks' array");
     }
-    if tasks.len() as u32 > cfg.subagents.parallel_max_tasks {
+    // Soft cap: the configured `parallel_max_tasks` (default 64) is advisory.
+    // Exceeding it no longer errors instantly — tasks queue through the
+    // concurrency semaphore below (only `concurrency` run at once). We emit an
+    // info event so the user knows a large batch is queuing. A much higher
+    // absolute safety bound guards against runaway fan-out (DoS).
+    const PARALLEL_TASKS_ABSOLUTE_MAX: usize = 256;
+    if tasks.len() > PARALLEL_TASKS_ABSOLUTE_MAX {
         return Outcome::err(format!(
-            "parallel has {} tasks (max {})",
-            tasks.len(),
-            cfg.subagents.parallel_max_tasks
+            "parallel has {} tasks (absolute safety max {PARALLEL_TASKS_ABSOLUTE_MAX}); \
+             split into smaller batches",
+            tasks.len()
+        ));
+    }
+    if tasks.len() as u32 > cfg.subagents.parallel_max_tasks {
+        emit(&Event::new("info").with(
+            "message",
+            json!(format!(
+                "parallel batch has {} tasks (soft cap {}): queuing with the configured concurrency; \
+                 only a few run at once. Raise subagents.maxTasks in settings if you expect this.",
+                tasks.len(),
+                cfg.subagents.parallel_max_tasks
+            )),
         ));
     }
     let concurrency = args

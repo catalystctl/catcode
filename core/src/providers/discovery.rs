@@ -361,22 +361,36 @@ async fn discover_models_openai(
     // other vanilla OpenAI-compatible endpoints don't serve it, so on a miss
     // we fall back to the standard OpenAI `/models` list and synthesize
     // ModelInfo with curated per-id capabilities.
-    let url = format!("{}{MODELS_INFO_PATH}", provider.base_url);
-    let mut req = client.get(&url).timeout(Duration::from_secs(5));
-    if let Some(k) = provider.api_key.as_deref() {
-        req = req.bearer_auth(k);
+    //
+    // When a custom `models_endpoint` is configured, skip the Umans-specific
+    // `/models/info` probe entirely and go straight to the custom endpoint
+    // (step 2b) — a non-standard endpoint would 404 on `/models/info` anyway,
+    // and this avoids a wasted round-trip.
+    let mut live = Vec::new();
+    if provider.models_endpoint.is_none() {
+        let url = format!("{}{MODELS_INFO_PATH}", provider.base_url);
+        let mut req = client.get(&url).timeout(Duration::from_secs(5));
+        if let Some(k) = provider.api_key.as_deref() {
+            req = req.bearer_auth(k);
+        }
+        live = match req.send().await {
+            Ok(r) if r.status().is_success() => {
+                parse_models_response(&match r.json::<Value>().await {
+                    Ok(v) => v,
+                    Err(_) => Value::Null,
+                })
+            }
+            _ => Vec::new(),
+        };
     }
-    let live = match req.send().await {
-        Ok(r) if r.status().is_success() => parse_models_response(&match r.json::<Value>().await {
-            Ok(v) => v,
-            Err(_) => Value::Null,
-        }),
-        _ => Vec::new(),
-    };
 
     // 2b. /models/info miss (non-Umans endpoint) → standard OpenAI `/models`.
+    // When a custom `models_endpoint` is configured, this is the primary path
+    // (step 2 was skipped) — the configured endpoint is hit directly.
     if live.is_empty() {
-        let url = if is_codex_endpoint(&provider.base_url) {
+        let url = if let Some(ep) = &provider.models_endpoint {
+            format!("{}{ep}", provider.base_url)
+        } else if is_codex_endpoint(&provider.base_url) {
             // The Codex `/models` endpoint REQUIRES `client_version` and filters
             // the catalog by each model's `minimal_client_version`: a value too
             // low (e.g. our own CARGO_PKG_VERSION "0.2.0") returns an EMPTY

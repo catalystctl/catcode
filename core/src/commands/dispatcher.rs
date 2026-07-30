@@ -873,6 +873,7 @@ pub(crate) async fn run() {
                     headers,
                     context_window,
                     models_override,
+                    models_endpoint: None,
                 };
                 let existed;
                 {
@@ -979,6 +980,7 @@ pub(crate) async fn run() {
                     oauth: false,
                     context_window: None,
                     models_override: Vec::new(),
+                    models_endpoint: None,
                 };
                 emit(&Event::new("info").with(
                     "message",
@@ -1284,6 +1286,14 @@ pub(crate) async fn run() {
                 }
                 // Drop the last turn: a user msg + everything after it (assistant, tool msgs).
                 let mut conv = state.conversation.lock().await;
+                // Capture the undone task (last user message) before dropping it,
+                // to record it as a rejected approach for future planning.
+                let undone_task: Option<String> = conv
+                    .iter()
+                    .rev()
+                    .find(|m| m.is_user())
+                    .and_then(|m| m.content_text().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty());
                 // Walk back past trailing tool/assistant messages to the last user message.
                 while let Some(last) = conv.last() {
                     if last.is_user() {
@@ -1304,6 +1314,45 @@ pub(crate) async fn run() {
                     .collect();
                 let est = estimate_messages_tokens(&conv);
                 drop(conv);
+                // Record the undone task as a rejected approach (implicit user
+                // rejection of the agent's work) so future similar tasks can warn
+                // the planner. Moderate confidence — an undo is implicit, not an
+                // explicit "this approach is wrong" statement. Fail-open.
+                if let Some(task) = undone_task {
+                    let cfg = state.cfg.read().await;
+                    let pid = project_identity::resolve_project_identity(&cfg.workspace).id;
+                    let fp =
+                        task_fingerprint::build_fingerprint(&task_fingerprint::FingerprintInputs {
+                            user_intent: &task,
+                            files_read: &[],
+                            files_changed: &[],
+                            symbols: &[],
+                            tools_used: &[],
+                            diagnostics: &[],
+                            tests_run: &[],
+                        });
+                    let approach: String = task.chars().take(200).collect();
+                    let record = rejected_approaches::RejectedApproach {
+                        id: format!(
+                            "undo-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0)
+                        ),
+                        scope: "project".into(),
+                        task_fingerprint: fp,
+                        approach: format!("agent implementation reverted by /undo: {approach}"),
+                        rejection_reason:
+                            "user undid the agent's changes (reverted to the last checkpoint)"
+                                .into(),
+                        preferred_alternative: None,
+                        evidence: vec![],
+                        confidence: rejected_approaches::confidence_for_rejection(false, 1, false),
+                        status: preferences::LearningStatus::Candidate,
+                    };
+                    rejected_approaches::append_rejected(Some(&pid), &record);
+                }
                 // The dropped turn invalidates the real baseline's length anchor.
                 state.invalidate_real_token_baseline().await;
                 *state.estimated_tokens.lock().await = est;
@@ -2132,12 +2181,81 @@ pub(crate) async fn run() {
                             .and_then(|n| n.to_str())
                             .unwrap_or("")
                             .to_string();
-                        let out =
-                            plugins::execute_plugin_command(&cfg, &args, &ws, &session_id).await;
-                        if out.ok {
-                            emit(&Event::new("info").with("message", json!(out.output)));
-                        } else {
-                            emit(&Event::new("error").with("message", json!(out.output)));
+                        match cfg.mode {
+                            plugins::CommandMode::Script => {
+                                let out =
+                                    plugins::execute_plugin_command(&cfg, &args, &ws, &session_id)
+                                        .await;
+                                if out.ok {
+                                    emit(&Event::new("info").with("message", json!(out.output)));
+                                } else {
+                                    emit(&Event::new("error").with("message", json!(out.output)));
+                                }
+                            }
+                            plugins::CommandMode::AgentTurn => {
+                                // Prompt-backed command: render the template and
+                                // submit it as a normal agent turn (the same path
+                                // as a user `send`), preserving cancellation,
+                                // approval, tool use, model selection, compaction,
+                                // and telemetry.
+                                let rendered = match plugins::render_prompt_command(
+                                    &cfg,
+                                    &args,
+                                    &ws,
+                                    &session_id,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        emit(&Event::new("error").with("message", json!(e)));
+                                        continue;
+                                    }
+                                };
+                                if rendered.trim().is_empty() {
+                                    emit(&Event::new("error").with(
+                                        "message",
+                                        json!(format!(
+                                            "/{name} requires a request. Usage: /{name} <research request>"
+                                        )),
+                                    ));
+                                    continue;
+                                }
+                                // Resolve the model + effort the same way a bare
+                                // `send` would: last-used model (if still known),
+                                // else the configured default, else the first
+                                // available model. Effort defaults to "medium"
+                                // (matching `send`/`steer`).
+                                let models = state.models.read().await.clone();
+                                let last_model = state.last_model.lock().await.clone();
+                                let default_model = state.cfg.read().await.default_model.clone();
+                                let model = last_model
+                                    .filter(|m| models.iter().any(|mi| &mi.id == m))
+                                    .or_else(|| default_model.clone())
+                                    .or_else(|| models.first().map(|m| m.id.clone()))
+                                    .unwrap_or_default();
+                                if model.is_empty() {
+                                    emit(&Event::new("error").with(
+                                        "message",
+                                        json!("no model available; set a provider/key first"),
+                                    ));
+                                    continue;
+                                }
+                                // Surface the original command (not the full
+                                // rendered prompt) so the transcript stays
+                                // readable while the model receives the protocol.
+                                let shown = if args.trim().is_empty() {
+                                    format!("/{name}")
+                                } else {
+                                    format!("/{name} {args}")
+                                };
+                                emit(&Event::new("info").with(
+                                    "message",
+                                    json!(format!("{shown} — starting agent turn")),
+                                ));
+                                let st = state.clone();
+                                let client_c = client.clone();
+                                let effort = "medium".to_string();
+                                start_turn(&st, &client_c, model, rendered, effort, None).await;
+                            }
                         }
                     }
                     None => {

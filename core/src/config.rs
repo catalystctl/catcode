@@ -454,7 +454,7 @@ impl Default for SubagentConfig {
         Self {
             max_depth: 2,
             intercom_bridge_mode: IntercomBridgeMode::Always,
-            parallel_max_tasks: 8,
+            parallel_max_tasks: 64,
             parallel_concurrency: 4,
             async_by_default: false,
             disable_builtins: false,
@@ -555,6 +555,12 @@ pub struct ProviderConfig {
     /// the user hand-tune reasoning levels / context / output for individual
     /// models the endpoint under-reports. Empty = no per-model refinement.
     pub models_override: Vec<ModelOverride>,
+    /// Optional custom models-list endpoint path (e.g. `/v1/models`,
+    /// `/api/models`). When set, discovery hits `{base_url}{models_endpoint}`
+    /// directly instead of the hardcoded `/models/info` (Umans) → `/models`
+    /// (OpenAI) fallback chain. Lets a non-standard OpenAI-compatible endpoint
+    /// work without a code branch. `None` = use the default discovery path.
+    pub models_endpoint: Option<String>,
 }
 
 /// A provider fully resolved for an API call: kind, base URL, the effective API
@@ -581,6 +587,9 @@ pub struct ResolvedProvider {
     /// `discover_models` can refine individual models after discovery. Applied
     /// in `apply_models_override` (after `apply_context_window_override`).
     pub models_override: Vec<ModelOverride>,
+    /// Custom models-list endpoint path carried from `ProviderConfig` so
+    /// discovery can hit a non-standard endpoint without a code branch.
+    pub models_endpoint: Option<String>,
 }
 
 impl ResolvedProvider {
@@ -606,6 +615,7 @@ impl ResolvedProvider {
             oauth: false,
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         }
     }
 }
@@ -737,6 +747,7 @@ impl ProviderPreset {
             headers: Vec::new(),
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         }
     }
 }
@@ -764,6 +775,7 @@ pub fn preset_provider_configs(p: &ProviderPreset, api_key: Option<String>) -> V
             headers: Vec::new(),
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         };
         vec![
             make("opencode-go", ProviderKind::OpenAI),
@@ -984,6 +996,7 @@ impl Config {
             oauth: false,
             context_window: p.context_window,
             models_override: p.models_override.clone(),
+            models_endpoint: p.models_endpoint.clone(),
         }
     }
 }
@@ -2015,6 +2028,12 @@ pub fn parse_provider(v: &Value) -> Option<ProviderConfig> {
     let headers = parse_headers(v.get("headers"));
     let models_override =
         parse_models_override(v.get("models_override").or_else(|| v.get("modelsOverride")));
+    let models_endpoint = v
+        .get("models_endpoint")
+        .or_else(|| v.get("modelsEndpoint"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     Some(ProviderConfig {
         name,
         kind,
@@ -2024,6 +2043,7 @@ pub fn parse_provider(v: &Value) -> Option<ProviderConfig> {
         context_window,
         headers,
         models_override,
+        models_endpoint,
     })
 }
 
@@ -2371,6 +2391,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_provider_reads_models_endpoint() {
+        let v = json!({
+            "name": "custom-gw",
+            "base_url": "http://localhost:8080/v1",
+            "kind": "openai",
+            "models_endpoint": "/v1/models"
+        });
+        let p = parse_provider(&v).unwrap();
+        assert_eq!(p.models_endpoint.as_deref(), Some("/v1/models"));
+        // camelCase alias also accepted.
+        let v2 = json!({"name": "x", "base_url": "http://x/v1", "modelsEndpoint": "/api/models"});
+        assert_eq!(
+            parse_provider(&v2).unwrap().models_endpoint.as_deref(),
+            Some("/api/models")
+        );
+        // absent / whitespace-only -> None (use default discovery path).
+        let v3 = json!({"name": "y", "base_url": "http://y/v1"});
+        assert_eq!(parse_provider(&v3).unwrap().models_endpoint, None);
+        let v4 = json!({"name": "z", "base_url": "http://z/v1", "models_endpoint": "   "});
+        assert_eq!(parse_provider(&v4).unwrap().models_endpoint, None);
+    }
+
+    #[test]
     fn resolve_provider_carries_context_window() {
         let mut c = Config::default();
         c.providers.push(ProviderConfig {
@@ -2382,6 +2425,7 @@ mod tests {
             headers: Vec::new(),
             context_window: Some(32_768),
             models_override: Vec::new(),
+            models_endpoint: None,
         });
         c.active_provider = Some("lmstudio".into());
         let keys = std::collections::HashMap::new();
@@ -2454,6 +2498,7 @@ mod tests {
             headers: vec![("h".into(), "v".into())],
             context_window: None,
             models_override: Vec::new(),
+            models_endpoint: None,
         });
         // active_provider None -> first configured provider.
         let mut keys = std::collections::HashMap::new();

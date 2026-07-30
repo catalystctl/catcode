@@ -293,6 +293,20 @@ func (s *session) renderApprovalBanner() string {
 	if controls != "" {
 		msg += "   " + controls
 	}
+	// A non-empty composer disables the Y/N/A decision keys (they'd otherwise
+	// fire mid-typing). The composer placeholder explains this only when it's
+	// EMPTY — useless exactly when the keys are dead — so say it here, on the
+	// always-visible banner, whenever a draft is present.
+	if strings.TrimSpace(s.input.Value()) != "" {
+		msg += "   · clear input to answer"
+	}
+	// Elapsed waiting time: after a few seconds it reassures the user the
+	// request is live and how long they've been blocking the turn.
+	if !a.receivedAt.IsZero() {
+		if d := time.Since(a.receivedAt); d >= 5*time.Second {
+			msg += " · waiting " + d.Truncate(time.Second).String()
+		}
+	}
 	banner := lipgloss.NewStyle().
 		Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
 		Background(lipgloss.Color(c.warn)).

@@ -73,7 +73,21 @@ fn fingerprint_for(prompt: &str) -> task_fingerprint::TaskFingerprint {
 fn action_context(workspace: &Path, args: &Value) -> String {
     let prompt =
         arg_str(args, "prompt").unwrap_or_else(|| arg_str(args, "query").unwrap_or_default());
-    context_pack::build_context_pack(workspace, &prompt)
+    let mut out = context_pack::build_context_pack(workspace, &prompt);
+    // The per-turn context pack no longer embeds memories — the transient
+    // [RELEVANT MEMORIES] tail is the single memory surface (hybrid ranker +
+    // body previews + a lexical-overlap gate). For this opt-in `knowledge
+    // context` action, append that same tail so durable facts still appear.
+    if !prompt.is_empty() {
+        let tail = memory::relevant_tail_for_subagent(workspace, &prompt);
+        if !tail.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&tail);
+        }
+    }
+    out
 }
 
 fn action_search(workspace: &Path, args: &Value) -> String {

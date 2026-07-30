@@ -336,6 +336,90 @@ Stdout: `{ "ok", "output", "notify"?, "status"? }` (same side-effect fields as
 hooks/tools). Reload plugins at runtime with `/plugin-reload` (protocol:
 `reload_plugins`) — enabled/disabled flags are preserved.
 
+### Prompt-backed commands (`prompt_file` + `mode: "agent_turn"`)
+
+A command can also be **prompt-backed**: instead of running a script, it renders a
+template file and submits the result as a normal agent turn (the same path as a user
+`send`). This lets a command like `/deep-research` drive a full agent loop — with
+tool use, subagents, and the active model — without a script, an interpreter, or a
+recompile. Use it for any "run a big agentic workflow from one slash command" need
+(`/review-pr`, `/document-repo`, `/investigate-bug`, `/migration-plan`, …).
+
+A command is **either** script-backed (`script`) **or** prompt-backed
+(`prompt_file`); exactly one must be set. `mode` is optional and inferred
+(`"script"` / `"agent_turn"`).
+
+```
+{
+  "name": "deep-research",
+  "version": "1.0.0",
+  "commands": [
+    {
+      "name": "deep-research",
+      "description": "Conduct comprehensive, citation-backed research.",
+      "prompt_file": "prompts/deep-research.md",
+      "mode": "agent_turn"
+    },
+    {
+      "name": "research",
+      "description": "Alias for deep research.",
+      "prompt_file": "prompts/deep-research.md",
+      "mode": "agent_turn"
+    }
+  ]
+}
+```
+
+- `prompt_file` (required for prompt-backed): path-confined to the plugin dir
+  (no absolute paths, no `..`), must be a regular file, capped at 256 KiB. It need
+  not be executable — it is read as text and rendered, not spawned.
+- `mode` (optional): `"script"` or `"agent_turn"`. Inferred from which field is
+  set; set it explicitly only to be self-documenting. A mismatch (e.g. `script`
+  with `mode: "agent_turn"`) is rejected at load.
+- At most one of `script` / `prompt_file`. Both set, or neither set, is an error.
+
+**Template tokens** (substituted before the turn starts; whitespace-tolerant
+`{{ key }}` works; unknown `{{...}}` is left verbatim):
+
+| Token | Value |
+|---|---|
+| `{{args}}` | the raw text after the command name (the user's request) |
+| `{{workspace}}` | absolute workspace path |
+| `{{session_id}}` | session file name |
+| `{{timestamp}}` | unix seconds at invocation |
+| `{{plugin}}` | plugin name |
+| `{{command}}` | command name (without `/`) |
+
+**Execution:** the harness renders the template, emits a concise `info` event
+showing the original command (not the full prompt), resolves the model
+(last-used → configured default → first available) and effort (`"medium"`), and
+calls the same `start_turn` path as a user `send`. This preserves cancellation,
+session persistence, approval, tool use, model selection, compaction, and
+telemetry. If `{{args}}` renders to an empty/whitespace prompt, the harness emits
+a usage error instead of starting a turn — so prompt-backed commands should
+document their usage in the template or rely on this fallback.
+
+**Why no hidden state:** the conversation is both the model input and the
+persisted transcript, with no clean display/actual split. The rendered prompt
+becomes the user message (the visible-prompt fallback). Keep the template a
+coherent directive (not raw internal scaffolding) so the transcript stays
+readable; surface the original command via the `info` event the harness emits.
+
+**Collecting input via a modal (`ask`):** the command palette does not pass
+inline arguments — selecting a `/name` command from the palette invokes it with
+`args: ""`. So a prompt-backed command that needs user input should not just
+print a usage message when `{{args}}` is empty; instead, instruct the agent to
+call the `ask` tool, which emits an `ask_request` event the TUI renders as an
+input modal (text + select fields), then proceed with the user's answers. This is
+how the bundled `deep-research` plugin collects the research request, depth,
+format, and source scope when launched from the palette. Inline `/name <args>` is
+still supported when the client passes it; design the prompt to use inline args
+if present and fall back to the `ask` modal when empty.
+
+**Capability note:** a prompt-backed command executes no subprocess, so it does
+not require the `execute_subprocess` capability (only `register_commands`). It
+carries no arbitrary-code-execution surface beyond a normal agent turn.
+
 ### Add, override, and remove core behavior
 
 A plugin can do everything a direct core edit can — add, override, and remove
