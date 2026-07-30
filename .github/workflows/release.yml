@@ -33,7 +33,11 @@ jobs:
             script: release-linux.sh
             rust_targets: ''
             macos_arch: ''
-            apt_packages: ''
+            # The Microsandbox SDK (default feature) links libcap-ng; the
+            # ubuntu-latest image no longer ships libcap-ng-dev, so install it
+            # here (mirrors the ci.yml core job) or the release link fails with
+            # `rust-lld: error: unable to find library -lcap-ng`.
+            apt_packages: libcap-ng-dev
           - platform: windows
             script: release-windows.sh
             rust_targets: x86_64-pc-windows-gnu

@@ -87,8 +87,17 @@ make_dmg() {
 build_arch() {
 	local rust_target="$1" goarch="$2" tag="$3"
 
-	echo "[1/3] core -> ${rust_target} (cargo zigbuild --release)..."
-	cargo zigbuild --release --target "$rust_target" --manifest-path core/Cargo.toml
+	echo "[1/3] core -> ${rust_target} (cargo zigbuild --release, no microsandbox)..."
+	# Build the macOS core WITHOUT the `microsandbox` default feature. The
+	# Microsandbox SDK (msb_krun_utils) references `kvm_bindings` (Linux KVM)
+	# unconditionally and does not compile for the darwin target at all — so a
+	# feature-on darwin build dies at `error[E0433]: cannot find crate
+	# kvm_bindings`. With the feature off the core uses its fail-closed
+	# `UnsupportedSandboxBackend` (manager.rs): default config is sandbox=none
+	# (runs on the host, fully usable); an explicit --sandbox microsandbox on
+	# macOS returns a structured SetupRequired error instead of running on the
+	# host. Linux/Windows releases still build microsandbox-enabled.
+	cargo zigbuild --release --target "$rust_target" --no-default-features --manifest-path core/Cargo.toml
 	# cargo-zigbuild writes to the standard target/<triple>/release path; the
 	# [[bin]] name in core/Cargo.toml is "core" (no suffix on macOS).
 	local corebin="core/target/${rust_target}/release/core"
