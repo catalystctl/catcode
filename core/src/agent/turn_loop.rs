@@ -427,11 +427,8 @@ pub(crate) async fn run_turn(
                 *st.conv_len_at_last_real.lock().await,
             );
             let (idle_ctx, idle_max_tokens) = st
-                .models
-                .read()
+                .model_info_for(&model)
                 .await
-                .iter()
-                .find(|m| m.id == model)
                 .map(|m| (m.context_window as u64, m.max_tokens))
                 .unwrap_or((200_000, 8_192));
             let policy = context_policy(
@@ -565,11 +562,8 @@ pub(crate) async fn run_turn(
         // When false, the user must /compact manually (or /clear).
         // `messages` is the turn-local working buffer (cloned once before the loop).
         let (model_ctx, thinking_levels, max_tokens) = st
-            .models
-            .read()
+            .model_info_for(&model)
             .await
-            .iter()
-            .find(|m| m.id == model)
             .map(|m| {
                 (
                     m.context_window as u64,

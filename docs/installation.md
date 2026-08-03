@@ -364,6 +364,8 @@ cannot use prebuilt binaries.
 ```bash
 # From the repo root:
 ./build.sh
+# Or build and launch the matching local core immediately:
+./build.sh --run
 ```
 
 This runs:
@@ -372,6 +374,10 @@ This runs:
 cargo build --release --manifest-path core/Cargo.toml   # → core/target/release/core
 ( cd tui && go build -o tui . )                           # → tui/tui
 ```
+
+`build.sh` does not install over an existing `catcode`/`catcode-core` on your
+`PATH`. If `CATCODE_CORE` points at an installed binary, use `./build.sh --run`
+or set it explicitly to `core/target/release/core`.
 
 Requires Rust (stable) and Go 1.24+.
 

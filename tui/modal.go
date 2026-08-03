@@ -56,6 +56,7 @@ const (
 	modalGoal               // multi-field /goal form (goal, concurrency, models, providers)
 	modalGoalPlan           // plan-ready review (approve / revise / cancel)
 	modalPluginInstallScope // global vs workspace after /plugin-install path
+	modalPluginTrust        // trust/deny untrusted project plugins (/plugin-trust)
 	modalSearchKey          // pick Exa/Tavily to set/clear its web_search API key
 	modalCustomProvider     // multi-field add-custom-provider form (config parity)
 	modalRestartConfirm     // restart core to apply launch-only settings
@@ -1204,6 +1205,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Agent", label: "/plugin-config", desc: "list plugins · enter to enable/disable"},
 		{group: "Agent", label: "/plugin-remove", desc: "uninstall a plugin (picker) · alias: /plugin-uninstall"},
 		{group: "Agent", label: "/plugin-reload", desc: "re-scan plugin directories"},
+		{group: "Agent", label: "/plugin-trust", desc: "trust/deny untrusted project plugins (modal)"},
 		{group: "Agent", label: "/goal", desc: "goal mode — plan & deploy subagents (modal)"},
 		{group: "Agent", label: "/run", desc: "delegate to a subagent (single) — modal"},
 		{group: "Agent", label: "/parallel", desc: "run subagents in parallel — modal"},
@@ -1653,6 +1655,9 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if s.modal.kind == modalConfirm {
 		return s.handleConfirmFormKey(msg)
+	}
+	if s.modal.kind == modalPluginTrust {
+		return s.handlePluginTrustKey(msg)
 	}
 	if s.modal.kind == modalCommand || s.modal.kind == modalModels ||
 		s.modal.kind == modalSessions || s.modal.kind == modalTheme {
@@ -3321,6 +3326,8 @@ func (s *session) renderModalBody() string {
 		return s.renderCustomProviderModal()
 	case modalGoalPlan:
 		return s.renderGoalPlanModal()
+	case modalPluginTrust:
+		return s.renderPluginTrustModal()
 	case modalHelp:
 		return s.renderHelpModal()
 	case modalKeybinds:

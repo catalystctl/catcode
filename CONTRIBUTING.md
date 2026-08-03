@@ -19,6 +19,7 @@ Build the core and TUI from the repo root:
 
 ```sh
 ./build.sh            # cargo build --release (core) + go build (tui)
+./build.sh --run      # build, then launch the TUI with that exact core
 ```
 
 Or individually:

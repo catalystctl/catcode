@@ -41,6 +41,7 @@ dist/
 **/.umans-harness/vision.json
 
 # Other AI tooling local state
+.omx/
 .pi/
 .claude/
 .kilocode/

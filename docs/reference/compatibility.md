@@ -21,7 +21,7 @@ The harness speaks two wire protocols:
 
 | Protocol | Provider kind | Config key |
 |----------|--------------|------------|
-| **OpenAI-compatible** (chat completions) | `openai` | Standard OpenAI API, Umans, OpenCode Go, OpenRouter, Gemini, xAI, Groq, Together, any OpenAI-proxy |
+| **OpenAI-compatible** (chat completions) | `openai` | Standard OpenAI API, Umans, OpenCode Go, OpenRouter, DeepSeek, Gemini, xAI, Groq, Together, any OpenAI-proxy |
 | **Anthropic-compatible** (messages) | `anthropic` | Anthropic API (Claude) |
 
 Provider presets (built-in):
@@ -31,6 +31,7 @@ Provider presets (built-in):
 | Umans | openai | `UMANS_API_KEY` | First-party; OAuth via plugin |
 | OpenCode Go | openai | `OPENCODE_API_KEY` | First-party |
 | OpenRouter | openai | `OPENROUTER_API_KEY` | Model aggregator |
+| DeepSeek | openai | `DEEPSEEK_API_KEY` | Official OpenAI-compatible API |
 
 Custom providers can be added via `config.json` with any `base_url` and protocol `kind`.
 

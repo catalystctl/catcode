@@ -1,6 +1,7 @@
 use super::ClientInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 fn default_vision_enabled() -> bool {
     true
@@ -276,6 +277,21 @@ pub enum Command {
     /// Re-scan plugin directories, preserving enabled/disabled flags.
     #[serde(rename = "reload_plugins")]
     ReloadPlugins,
+    /// Re-emit a `plugin_trust_prompt` event for this project's untrusted
+    /// project-scoped plugins (the `/plugin-trust` command). Includes plugins
+    /// with a recorded decision so the user can change their mind.
+    #[serde(rename = "plugin_trust_prompt")]
+    PluginTrustPrompt,
+    /// Record the user's trust decisions for this project's plugins
+    /// (name → "trust" | "deny"), persist them, re-scan so newly-trusted
+    /// plugins load, and emit `plugin_trust_applied`. Only the caller-supplied
+    /// names are (re)decided; names the user did not touch keep their prior
+    /// state when they had one.
+    #[serde(rename = "plugin_trust_decisions")]
+    PluginTrustDecisions {
+        /// plugin name → "trust" | "deny".
+        decisions: HashMap<String, String>,
+    },
     /// Run a plugin-declared slash command by name.
     #[serde(rename = "plugin_command")]
     PluginCommand {

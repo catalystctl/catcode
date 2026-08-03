@@ -374,15 +374,17 @@ pub(crate) async fn run() {
                 let authed = rp.api_key.is_some();
                 let cfg = state.cfg.read().await;
                 let conv_len = state.conversation.lock().await.len();
-                let skipped_plugins = state.plugin_manager.skipped_project_plugins();
                 let loaded_plugins: Vec<String> =
                     state.plugin_manager.list().keys().cloned().collect();
                 // Only surface skips that left the plugin unavailable (a same-named
-                // global copy may still be loaded — common for staged defaults).
-                let skipped_unavailable: Vec<String> = skipped_plugins
+                // global copy may still be loaded — common for staged defaults)
+                // AND have no recorded decision yet — a deliberately DENIED plugin
+                // must not nag on every startup (the user already answered).
+                let pending_trust = state.plugin_manager.pending_trust_plugins();
+                let skipped_unavailable: Vec<String> = pending_trust
                     .iter()
-                    .filter(|n| !loaded_plugins.iter().any(|l| l == *n))
-                    .cloned()
+                    .map(|p| p.name.clone())
+                    .filter(|n| !loaded_plugins.iter().any(|l| l == n))
                     .collect();
                 emit(
                     &Event::new("ready")
@@ -438,16 +440,25 @@ pub(crate) async fn run() {
                         )
                         .with("capabilities", json!(protocol::CAPABILITIES)),
                 );
-                if !skipped_unavailable.is_empty() {
-                    let names = skipped_unavailable.join(", ");
-                    emit(
-                        &Event::new("info").with(
-                            "message",
-                            json!(format!(
-                                "Skipped project plugin(s): {names}. They live under .catalyst-code/plugins but need --trust-project-plugins, or reinstall with `/plugin-install <src> workspace` (user-install marker) or `/plugin-install <src> global`."
-                            )),
-                        ),
-                    );
+                // Auto trust prompt: when project plugins are gated off with NO
+                // recorded decision, surface the trust modal once (decisions
+                // are persisted, so it does not re-appear on later loads).
+                let pending_trust = state.plugin_manager.pending_trust_plugins();
+                let plugins = pending_trust
+                    .into_iter()
+                    .filter(|p| !loaded_plugins.iter().any(|name| name == &p.name))
+                    .map(|p| {
+                        json!({
+                            "name": p.name,
+                            "version": p.version,
+                            "description": p.description,
+                            "path": p.path.display().to_string(),
+                            "decision": p.decision.unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if !plugins.is_empty() {
+                    emit(&Event::new("plugin_trust_prompt").with("plugins", json!(plugins)));
                 }
                 // Tell the user when the harness staged its global defaults
                 // (first run) so the global ~/.catalyst-code/ layout is
@@ -2166,6 +2177,95 @@ pub(crate) async fn run() {
                 // Refresh system prompt so plugin injections / memory providers
                 // pick up enable/disable / newly loaded plugins.
                 let _ = refresh_memory_injection(&state).await;
+            }
+            Command::PluginTrustPrompt => {
+                // The `/plugin-trust` command: re-emit the prompt (includes
+                // plugins with a recorded decision so the user can change them).
+                let entries = state.plugin_manager.trust_prompt_json();
+                emit(&Event::new("plugin_trust_prompt").with("plugins", json!(entries)));
+            }
+            Command::PluginTrustDecisions { decisions } => {
+                let invalid: Vec<String> = decisions
+                    .iter()
+                    .filter(|(_, v)| v.as_str() != "trust" && v.as_str() != "deny")
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if !invalid.is_empty() {
+                    emit(
+                        &Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "plugin_trust_decisions: invalid value for {} (expected \"trust\" or \"deny\")",
+                                invalid.join(", ")
+                            )),
+                        ),
+                    );
+                    continue;
+                }
+                match state
+                    .plugin_manager
+                    .apply_trust_decisions(decisions.clone())
+                {
+                    Ok(summary) => {
+                        let trusted: Vec<String> = decisions
+                            .iter()
+                            .filter(|(_, v)| v.as_str() == "trust")
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        let denied: Vec<String> = decisions
+                            .iter()
+                            .filter(|(_, v)| v.as_str() == "deny")
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        let loaded = summary.get("loaded").and_then(|v| v.as_u64()).unwrap_or(0);
+                        emit(
+                            &Event::new("plugin_trust_applied")
+                                .with("trusted", json!(trusted))
+                                .with("denied", json!(denied))
+                                .with("loaded", json!(loaded)),
+                        );
+                        // Refresh the plugin registry + slash commands so
+                        // newly-trusted plugins are live immediately.
+                        let entries: Vec<Value> = state
+                            .plugin_manager
+                            .list()
+                            .values()
+                            .map(|p| {
+                                let mut hooks: Vec<String> = p.hooks.keys().cloned().collect();
+                                hooks.sort();
+                                let scope = state.plugin_manager.scope_of_path(&p.source_path);
+                                let tools: Vec<String> =
+                                    p.tools.iter().map(|t| t.name.clone()).collect();
+                                let commands: Vec<String> =
+                                    p.commands.iter().map(|c| c.name.clone()).collect();
+                                json!({
+                                    "name": p.name,
+                                    "version": p.version,
+                                    "enabled": p.enabled,
+                                    "description": p.description,
+                                    "hooks": hooks,
+                                    "tools": tools,
+                                    "commands": commands,
+                                    "disable_tools": p.disable_tools,
+                                    "has_oauth": p.oauth.is_some(),
+                                    "has_memory_provider": p.memory_provider.is_some(),
+                                    "has_system_prompt": !p.system_prompt.trim().is_empty(),
+                                    "path": p.source_path.display().to_string(),
+                                    "scope": scope.as_str(),
+                                })
+                            })
+                            .collect();
+                        emit(&Event::new("plugins_list").with("plugins", json!(entries)));
+                        let cmds = state.plugin_manager.command_definitions();
+                        emit(&Event::new("plugin_commands").with("commands", json!(cmds)));
+                        // Refresh system prompt so plugin injections / memory
+                        // providers from newly-trusted plugins take effect.
+                        let _ = refresh_memory_injection(&state).await;
+                    }
+                    Err(e) => {
+                        emit(&Event::new("error").with("message", json!(e)));
+                    }
+                }
             }
             Command::PluginCommand { name, args } => {
                 match state.plugin_manager.command_config(&name) {

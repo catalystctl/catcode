@@ -307,7 +307,7 @@ Re-resolves base URL, key, and wire protocol. Re-discovers models. Emits
 
 #### `list_provider_presets`
 
-List the built-in provider presets (Umans, OpenCode Go, OpenRouter) plus plugin
+List the built-in provider presets (Umans, OpenCode Go, OpenRouter, DeepSeek) plus plugin
 OAuth providers. Emits `provider_presets`.
 
 ```json
@@ -657,6 +657,31 @@ Re-scan plugin directories, preserving enabled/disabled flags.
 {"type": "reload_plugins"}
 ```
 
+#### `plugin_trust_prompt`
+
+Re-emit a `plugin_trust_prompt` event for this project's untrusted
+project-scoped plugins (the `/plugin-trust` command). Includes plugins with a
+recorded decision so the user can change their mind.
+
+```json
+{"type": "plugin_trust_prompt"}
+```
+
+#### `plugin_trust_decisions`
+
+Record the user's trust decisions for this project's plugins, persist them,
+re-scan so newly-trusted plugins load, and emit `plugin_trust_applied`.
+Decisions are merged per plugin name (names not mentioned keep their prior
+state).
+
+```json
+{"type": "plugin_trust_decisions", "decisions": {"my-plugin": "trust", "shady": "deny"}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `decisions` | object | yes | plugin name → `"trust"` \| `"deny"` |
+
 #### `plugin_command`
 
 Run a plugin-declared slash command by name.
@@ -873,6 +898,12 @@ Emitted once after `init` completes. Carries the full initial state.
   "plugins_skipped": []
 }
 ```
+
+`plugins_skipped` lists project-scoped plugins that are not loaded **and have
+no recorded trust decision yet** (a deliberately denied plugin is not listed —
+it would nag on every startup). When that list is non-empty the core also emits
+a `plugin_trust_prompt` right after `ready` so the client can surface the trust
+modal once.
 
 #### `reset`
 
@@ -1303,6 +1334,44 @@ Emitted after `list_plugins`.
   "plugins": [
     {"name": "catcode-chatgpt-provider", "enabled": true, "version": "1.0.0"}
   ]
+}
+```
+
+#### `plugin_trust_prompt`
+
+Emitted automatically at startup when project-scoped plugins are gated off
+with **no** recorded trust decision (so it appears once — decisions are
+persisted), and again on the `plugin_trust_prompt` command (`/plugin-trust`).
+Each entry carries manifest metadata plus the recorded `decision` (`""` =
+undecided, `"trust"`, or `"deny"`).
+
+```json
+{
+  "type": "plugin_trust_prompt",
+  "plugins": [
+    {
+      "name": "shady",
+      "version": "1.0.0",
+      "description": "Hook-heavy linter",
+      "path": "/ws/.catalyst-code/plugins/shady",
+      "decision": ""
+    }
+  ]
+}
+```
+
+#### `plugin_trust_applied`
+
+Emitted after `plugin_trust_decisions` is applied: the decided names, how many
+plugins are now loaded, and refreshed `plugins_list` / `plugin_commands`
+events follow so newly-trusted plugins are live immediately.
+
+```json
+{
+  "type": "plugin_trust_applied",
+  "trusted": ["my-plugin"],
+  "denied": ["shady"],
+  "loaded": 3
 }
 ```
 

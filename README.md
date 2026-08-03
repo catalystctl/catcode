@@ -194,6 +194,7 @@ Built-in presets currently include:
 * Umans
 * OpenCode Go
 * OpenRouter
+* DeepSeek
 
 You can also connect compatible local servers, gateways, and custom endpoints. Use `/login` inside CatCode to configure a provider.
 

@@ -68,6 +68,47 @@ pub fn is_umans(base_url: &str) -> bool {
     host == "umans.ai" || host.ends_with(".umans.ai")
 }
 
+/// True if the base URL points at the Kimi (Moonshot) Code endpoint
+/// (`https://api.kimi.com/coding/v1`). Kimi accepts non-standard fields — a
+/// top-level `thinking: {type: enabled|disabled}` sent alongside
+/// `reasoning_effort`, and streams `reasoning_content` — that vanilla OpenAI
+/// servers reject, so those are gated on this check. Mirrors `is_umans` host
+/// parsing (exact host) to avoid look-alike endpoints.
+pub fn is_kimi(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "api.kimi.com"
+}
+
+/// True if the base URL points at DeepSeek's official API endpoint
+/// (`https://api.deepseek.com`). DeepSeek's OpenAI-compatible API accepts the
+/// vendor `thinking` and `reasoning_effort` fields and streams
+/// `reasoning_content`; those fields are host-gated so ordinary OpenAI
+/// compatible endpoints never receive them accidentally.
+pub fn is_deepseek(base_url: &str) -> bool {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "api.deepseek.com"
+}
+
 /// True only for the loopback Catalyst Cursor SDK sidecar. The dedicated path
 /// is intentional: it lets the OpenAI-compatible transport preserve streamed
 /// SDK thinking text without enabling non-standard fields for arbitrary local
@@ -1232,7 +1273,12 @@ async fn stream_turn_openai(
     let base_url = &provider.base_url;
     let umans = is_umans(base_url);
     let cursor_bridge = is_cursor_bridge(base_url);
-    let supports_reasoning_content = umans || cursor_bridge;
+    let kimi = is_kimi(base_url);
+    let deepseek = is_deepseek(base_url);
+    // Kimi and DeepSeek stream `reasoning_content` (OpenAI-shaped), same as
+    // Umans/Cursor — include it so thinking text is replayed into the assistant
+    // message.
+    let supports_reasoning_content = umans || cursor_bridge || kimi || deepseek;
     let api_key = provider.api_key.as_deref().unwrap_or("");
     let adapter = adapter_for(provider);
     let built = adapter.build_request(&ProviderRequest {
@@ -1549,7 +1595,8 @@ async fn stream_turn_openai(
     timer.end_call(tokens_out, est_out);
 
     // Build the assistant message. OpenAI requires content null when tool_calls
-    // present and empty. reasoning_content is Umans-only (gated above).
+    // present and empty. reasoning_content is retained only for endpoints
+    // explicitly gated above.
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), json!("assistant"));
     msg.insert(
@@ -3563,6 +3610,27 @@ mod tests {
         assert!(!is_umans("https://umans.ai.evil.com/v1"));
         // port suffix is handled
         assert!(is_umans("https://api.umans.ai:443/v1"));
+    }
+
+    #[test]
+    fn is_kimi_detection() {
+        assert!(is_kimi("https://api.kimi.com/coding/v1"));
+        assert!(is_kimi("https://api.kimi.com/v1"));
+        assert!(is_kimi("https://api.kimi.com:443/coding/v1"));
+        assert!(!is_kimi("https://api.openai.com/v1"));
+        // look-alike host must NOT match (substring false-positive guard)
+        assert!(!is_kimi("https://api.kimi.com.evil.com/v1"));
+        assert!(!is_kimi("https://kimi.com/v1"));
+    }
+
+    #[test]
+    fn is_deepseek_detection() {
+        assert!(is_deepseek("https://api.deepseek.com"));
+        assert!(is_deepseek("https://api.deepseek.com/v1"));
+        assert!(is_deepseek("https://api.deepseek.com:443/beta"));
+        assert!(!is_deepseek("https://deepseek.com/v1"));
+        assert!(!is_deepseek("https://api.deepseek.com.evil.com/v1"));
+        assert!(!is_deepseek("https://api.openai.com/v1"));
     }
 
     #[test]

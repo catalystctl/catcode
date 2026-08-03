@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// Bump when the bundled default set changes meaningfully. The marker file
 /// stores this; on a version mismatch we re-scan for *missing* files (existing
 /// user files are still never overwritten) and then re-stamp the marker.
-pub const STAGING_VERSION: u32 = 4;
+pub const STAGING_VERSION: u32 = 6;
 
 /// `~/.catalyst-code` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
@@ -223,6 +223,45 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
             "plugins/telemetry/README.md",
             include_str!("../../.catalyst-code/plugins/telemetry/README.md"),
         ),
+        // --- kimi provider (Moonshot subscription via device-code OAuth).
+        //      First-party provider bundle sourced from core/providers/ (the
+        //      shipped provider catalog) — NOT .catalyst-code/plugins/. See
+        //      core/providers/README.md for the transport-vs-catalog split. ---
+        (
+            "plugins/kimi/plugin.json",
+            include_str!("../providers/kimi/plugin.json"),
+        ),
+        (
+            "plugins/kimi/oauth/kimi-oauth.py",
+            include_str!("../providers/kimi/oauth/kimi-oauth.py"),
+        ),
+        (
+            "plugins/kimi/README.md",
+            include_str!("../providers/kimi/README.md"),
+        ),
+        // --- codex provider (ChatGPT subscription via the official Codex CLI
+        //      device-code OAuth flow; automatic polling + auth.json import). ---
+        (
+            "plugins/codex/plugin.json",
+            include_str!("../providers/codex/plugin.json"),
+        ),
+        (
+            "plugins/codex/oauth/codex-oauth.py",
+            include_str!("../providers/codex/oauth/codex-oauth.py"),
+        ),
+        (
+            "plugins/codex/README.md",
+            include_str!("../providers/codex/README.md"),
+        ),
+        // --- deepseek provider (official API-key provider bundle). ---
+        (
+            "plugins/deepseek/plugin.json",
+            include_str!("../providers/deepseek/plugin.json"),
+        ),
+        (
+            "plugins/deepseek/README.md",
+            include_str!("../providers/deepseek/README.md"),
+        ),
         // --- A short guide to the global layout + override model. ---
         ("README.md", GLOBAL_README),
     ]
@@ -233,6 +272,8 @@ fn executable_rel_paths() -> &'static [&'static str] {
     &[
         "plugins/vision-handoff/hooks/pre_turn.py",
         "plugins/telemetry/hooks/session_stop.py",
+        "plugins/kimi/oauth/kimi-oauth.py",
+        "plugins/codex/oauth/codex-oauth.py",
     ]
 }
 
@@ -325,7 +366,10 @@ project.
     │   ├── pi-subagents/      # orchestrator delegation playbook (opt-in via /skill)
     │   └── plugin-authoring/  # full plugin contract (opt-in via /skill)
     ├── plugins/
-    │   └── vision-handoff/# cheapest same-provider vision handoff (default ON)
+    │   ├── vision-handoff/  # cheapest same-provider vision handoff (default ON)
+    │   ├── kimi/            # Moonshot subscription OAuth provider
+    │   ├── codex/           # ChatGPT subscription OAuth provider
+    │   └── deepseek/        # DeepSeek API-key provider
     ├── README.md          # this file
     └── .staged            # staging schema version marker (do not edit)
 
@@ -383,6 +427,34 @@ mod tests {
         assert!(home
             .join("plugins/telemetry/hooks/session_stop.py")
             .exists());
+        assert!(
+            home.join("plugins/kimi/plugin.json").exists(),
+            "kimi provider should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/kimi/oauth/kimi-oauth.py").exists(),
+            "kimi oauth script should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/codex/plugin.json").exists(),
+            "codex provider should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/codex/oauth/codex-oauth.py").exists(),
+            "codex oauth script should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/codex/README.md").exists(),
+            "codex provider README should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/deepseek/plugin.json").exists(),
+            "deepseek provider should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/deepseek/README.md").exists(),
+            "deepseek provider README should be staged on first run"
+        );
         assert!(home.join(".staged").exists());
         assert_eq!(
             std::fs::read_to_string(home.join(".staged")).unwrap(),
@@ -433,6 +505,16 @@ mod tests {
                 mode & 0o111 != 0,
                 "telemetry hook script must be executable"
             );
+            let mode = std::fs::metadata(home.join("plugins/kimi/oauth/kimi-oauth.py"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "kimi oauth script must be executable");
+            let mode = std::fs::metadata(home.join("plugins/codex/oauth/codex-oauth.py"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "codex oauth script must be executable");
         }
     }
 

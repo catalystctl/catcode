@@ -396,6 +396,16 @@ export interface PluginEntry {
   error?: string;
 }
 
+/** One project-scoped plugin listed in a `plugin_trust_prompt` event.
+ *  `decision` is the recorded user decision: "" (undecided) | "trust" | "deny". */
+export interface PluginTrustEntry {
+  name: string;
+  version?: string;
+  description?: string;
+  path?: string;
+  decision: "" | "trust" | "deny";
+}
+
 /** A discoverable skill (project then user scope). `content` is the parsed
  *  SKILL.md body — sent by the core so `/skill:<name>` can apply a skill even
  *  when it lives under ~/.catalyst-code/skills (outside the workspace, which
@@ -720,6 +730,8 @@ export type CoreEvent =
   | { type: "search_key_set"; provider: string; has_key: boolean }
   | { type: "plugin_commands"; commands: unknown[] }
   | { type: "plugin_status"; plugin: string; text: string }
+  | { type: "plugin_trust_prompt"; plugins: PluginTrustEntry[] }
+  | { type: "plugin_trust_applied"; trusted: string[]; denied: string[]; loaded: number }
   | { type: "session_changed"; path: string; new?: boolean }
   | { type: "session_change_failed"; path: string; message: string }
   | { type: "session_deleted"; path: string }
@@ -895,6 +907,8 @@ export type CoreCommand =
   | { type: "enable_plugin"; name: string }
   | { type: "disable_plugin"; name: string }
   | { type: "list_plugins" }
+  | { type: "plugin_trust_prompt" }
+  | { type: "plugin_trust_decisions"; decisions: Record<string, "trust" | "deny"> }
   | { type: "list_agents" }
   // ── Vision ──
   | { type: "get_vision_config" }

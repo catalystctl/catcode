@@ -642,9 +642,9 @@ pub struct ProviderPreset {
 }
 
 /// The first-party provider presets. Order is the order shown in pickers.
-/// Only Umans, OpenCode Go, and OpenRouter ship in-tree — every other vendor
-/// should be a plugin (API-key config and/or `oauth` block). Umans is listed
-/// first as the default/original provider.
+/// Official provider bundles under `core/providers/` carry provider-specific
+/// metadata and documentation so removable vendors stay isolated. Umans is
+/// listed first as the default/original provider.
 pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "umans",
@@ -681,6 +681,18 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_env: "OPENROUTER_API_KEY",
         alt_envs: &[],
         description: "OpenRouter multi-model gateway. Uses OPENROUTER_API_KEY (https://openrouter.ai/settings/keys).",
+    },
+    ProviderPreset {
+        id: "deepseek",
+        label: "DeepSeek",
+        kind: ProviderKind::OpenAI,
+        // DeepSeek's official OpenAI-compatible base URL intentionally does
+        // not include `/v1`; the API appends `/chat/completions` and `/models`
+        // directly to this base.
+        base_url: "https://api.deepseek.com",
+        api_key_env: "DEEPSEEK_API_KEY",
+        alt_envs: &[],
+        description: "DeepSeek API — V4 Pro and V4 Flash with automatic live model discovery. Uses DEEPSEEK_API_KEY (https://platform.deepseek.com/api_keys).",
     },
 ];
 
@@ -2741,9 +2753,9 @@ mod tests {
     }
 
     #[test]
-    fn first_party_presets_are_only_the_three_keepers() {
+    fn first_party_presets_include_deepseek() {
         let ids: Vec<&str> = PROVIDER_PRESETS.iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec!["umans", "opencode-go", "openrouter"]);
+        assert_eq!(ids, vec!["umans", "opencode-go", "openrouter", "deepseek"]);
         for id in &ids {
             let p = find_preset(id).expect("preset exists");
             assert!(
@@ -2758,6 +2770,9 @@ mod tests {
         assert_eq!(or.api_key_env, "OPENROUTER_API_KEY");
         let go = find_preset("opencode-go").unwrap();
         assert_eq!(go.api_key_env, "OPENCODE_GO_API_KEY");
+        let deepseek = find_preset("deepseek").unwrap();
+        assert_eq!(deepseek.base_url, "https://api.deepseek.com");
+        assert_eq!(deepseek.api_key_env, "DEEPSEEK_API_KEY");
     }
 
     #[test]

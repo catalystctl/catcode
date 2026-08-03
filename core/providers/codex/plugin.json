@@ -1,0 +1,19 @@
+{
+  "name": "codex",
+  "version": "0.1.0",
+  "description": "ChatGPT subscription access through the official Codex CLI device-code OAuth flow; auto-staged into every install.",
+  "oauth": {
+    "provider_id": "codex",
+    "label": "ChatGPT (Codex)",
+    "kind": "openai",
+    "base_url": "https://chatgpt.com/backend-api/codex",
+    "description": "ChatGPT Plus/Pro Codex access — device authorization is polled automatically and existing Codex CLI auth is imported.",
+    "headers": [["originator", "codex_cli_rs"]],
+    "token_path": "codex.json",
+    "detect_path": "$CODEX_HOME/auth.json",
+    "script": "oauth/codex-oauth.py",
+    "login_timeout_ms": 960000,
+    "token_timeout_ms": 30000,
+    "env_passthrough": ["CODEX_HOME", "CODEX_AUTH_BASE_URL"]
+  }
+}

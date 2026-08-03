@@ -4,7 +4,7 @@ Catalyst Code is a **self-hosted, OpenAI-compatible coding-agent harness** — o
 binary, any provider, with a human-in-the-loop approval gate. Run it in the
 terminal, the browser, or from your own code.
 
-- **Multi-provider** — log into Umans, OpenCode Go, OpenRouter, or a plugin
+- **Multi-provider** — log into Umans, OpenCode Go, OpenRouter, DeepSeek, or a plugin
   OAuth (ChatGPT, SuperGrok, …) and route any turn to any model.
 - **Safe by default** — workspace confinement, destructive-tool approval gate,
   restricted-path protection, optional cross-platform microVM sandbox via
@@ -138,7 +138,7 @@ configuration through the core's config layer: CLI flags > environment variables
 - [`catcode-core` CLI flags](commands/#catcode-core) — headless core flags
 - [Settings files](configuration/) — layering, paths, managed settings
 - [Environment variables](configuration/index.md) — env vars and CLI flags
-  `UMANS_API_KEY`, `OPENROUTER_API_KEY`, `CATALYST_CODE_WORKSPACE`, and more
+  `UMANS_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `CATALYST_CODE_WORKSPACE`, and more
 
 ### Slash Commands
 
@@ -221,7 +221,7 @@ Key configuration categories:
 
 ### Providers & Login
 
-The harness ships with three built-in provider presets. Log into several at
+The harness ships with four built-in provider presets. Log into several at
 once; the model picker shows every provider's models tagged by prefix.
 
 | Preset | Endpoint | Auth |
@@ -229,19 +229,19 @@ once; the model picker shows every provider's models tagged by prefix.
 | **Umans** | `api.code.umans.ai/v1` | API key (`UMANS_API_KEY`) |
 | **OpenCode Go** | `opencode.ai/zen/go/v1` | API key (`OPENCODE_GO_API_KEY`) |
 | **OpenRouter** | `openrouter.ai/api/v1` | API key (`OPENROUTER_API_KEY`) |
+| **DeepSeek** | `api.deepseek.com` | API key (`DEEPSEEK_API_KEY`) |
 
 **Subscription login (OAuth):** ChatGPT Plus/Pro, Claude Pro/Max, SuperGrok,
 and similar — installed as **plugins** that declare an `oauth` block in
-`plugin.json`. The harness owns `/login` / `/oauth-code` UX; the plugin owns
-authorize/token/refresh.
+`plugin.json`. Most flows are owned by the plugin; automatic device-code
+providers can be polled during `/login` without `/oauth-code`.
 
 ```text
-/plugin-install karutoil/catcode-chatgpt-provider global
-/login chatgpt
+/login codex
 ```
 
 [Provider reference](../README.md#providers-and-login) · [OAuth plugin
-contract](plugins/)
+contract](plugins/) · [Codex provider](../core/providers/codex/README.md)
 
 ### Plugins
 
@@ -391,7 +391,7 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 | Service management | systemd (Linux), launchd (macOS), NSSM/Scheduled Task (Windows) |
 | Reverse proxy | Bind web to `127.0.0.1`, put Caddy/nginx/IIS with TLS in front |
 | Private repo | Clone locally, run `install.sh` or `install.ps1` from the checkout |
-| Build from source | [`build.sh`](../build.sh), then `cd core && cargo build --release`, `cd tui && go build` |
+| Build from source | [`build.sh`](../build.sh); use `./build.sh --run` to launch the TUI with the rebuilt core |
 | Release | `release-all.sh <version>`, or per-platform: `release-linux.sh`, `release-macos.sh`, `release-windows.sh`, `release-web.sh` |
 
 ---

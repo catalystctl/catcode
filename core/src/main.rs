@@ -43,6 +43,7 @@ mod message;
 mod models_dev;
 mod oauth;
 mod pattern_log;
+mod plugin_trust;
 mod plugins;
 mod preferences;
 mod presence;
@@ -144,10 +145,10 @@ Before non-trivial multi-agent work, apply `/skill:pi-subagents` for the full pl
 const PROVIDER_GUIDE: &str = r#"## Adding model providers
 
 "Add/connect provider X" → two no-recompile paths, pick by auth type:
-1. **API-key auth, OpenAI/Anthropic-compatible** → CONFIG. Add a `providers` entry to `~/.config/catalyst-code/config.json`:
+1. **API-key auth, OpenAI/Anthropic-compatible** → CONFIG. Built-in first-party presets include `umans`, `opencode-go`, `openrouter`, and `deepseek` (DeepSeek uses `https://api.deepseek.com` + `DEEPSEEK_API_KEY`). Add a `providers` entry to `~/.config/catalyst-code/config.json` when a preset is not suitable:
    `{"providers":[{"name":"x","kind":"openai","base_url":"https://api.x.com/v1","api_key_env":"X_API_KEY"}],"activeProvider":"x"}`
    `kind` sets wire+auth (`openai`→/chat/completions+Bearer; `anthropic`→/messages+`x-api-key`) + discovery. `api_key_env` (env var NAME, preferred) or `api_key` (literal). Models auto-discover via /models; non-standard discovery (custom fields/404) needs a code branch in `core/src/provider.rs` — skill `add-key-provider` has the config-vs-code decision tree.
-2. **OAuth/subscription login** (browser/device-code, no plain key — e.g. Grok, ChatGPT) → PLUGIN. A plugin's `plugin.json` declares an `oauth` block (`provider_id`, `kind`, `base_url`, `token_path`, `script` handling login/complete/token/clear actions, JSON in/out). The harness resolves the bearer token at turn time and lists the provider in `/login`. Skill `plugin-authoring` has the full schema + script contract; `docs/examples/plugins/grok-oauth/` is a device-code example.
+2. **OAuth/subscription login** (browser/device-code, no plain key — e.g. Grok, ChatGPT/Codex) → PLUGIN. A plugin's `plugin.json` declares an `oauth` block (`provider_id`, `kind`, `base_url`, `token_path`, `script` handling login/complete/token/clear actions, JSON in/out). The harness resolves the bearer token at turn time and lists the provider in `/login`; device-code plugins may return `flow: "poll"` so the harness completes them without `/oauth-code`. The staged `codex` bundle also imports file-backed Codex CLI auth. Skill `plugin-authoring` has the full schema + script contract; `docs/examples/plugins/grok-oauth/` is a device-code example.
 Rule: plain API key → config; login flow → plugin."#;
 
 /// Deferred load_tools groups — always injected so the agent knows secondary
@@ -821,6 +822,23 @@ async fn finalize_oauth(state: &State, client: &reqwest::Client, preset: &str, l
     ));
 }
 
+/// Pick which provider should serve a model id given its owner providers (in
+/// aggregated-list order) and the effective active provider name. When several
+/// providers own the same id, the ACTIVE provider wins the tie; a non-owner
+/// active falls back to the first owner (sending the id to a provider that
+/// does not serve it would fail). Empty owners -> None (caller falls back to
+/// the active/legacy provider, matching the pre-provider-tag behavior).
+fn pick_provider_for_model<'a>(owners: &'a [String], active: Option<&str>) -> Option<&'a str> {
+    if owners.len() > 1 {
+        active
+            .and_then(|a| owners.iter().find(|o| o.as_str() == a))
+            .map(|s| s.as_str())
+            .or(Some(owners[0].as_str()))
+    } else {
+        owners.first().map(|s| s.as_str())
+    }
+}
+
 impl State {
     /// Resolve the active provider for an API call: kind, base URL, effective
     /// API key (runtime override -> config literal -> config env var -> global
@@ -922,23 +940,86 @@ impl State {
     /// the active/legacy provider when the model has no provider tag (legacy
     /// single-provider models) or its provider isn't configured. This is the
     /// per-model routing seam that lets `/models` mix models from several
-    /// logged-in providers.
+    /// logged-in providers. When several providers serve the SAME model id
+    /// (e.g. two gateways both listing `deepseek-v4-flash`), the user's
+    /// ACTIVE provider wins the tie so the selected provider is actually used;
+    /// otherwise the first listed owner (and a non-owner active provider falls
+    /// back to the first owner, since sending the id to a provider that does
+    /// not serve it would fail).
     pub async fn resolve_provider_for_model(&self, model: &str) -> ResolvedProvider {
-        let provider_name = self
-            .models
-            .read()
-            .await
-            .iter()
-            .find(|m| m.id == model)
-            .map(|m| m.provider.clone())
-            .filter(|s| !s.is_empty());
+        // Effective active provider: runtime override (set_provider) wins over
+        // the config's `activeProvider` — same precedence as aggregate_models.
+        let active = {
+            let cfg = self.cfg.read().await;
+            self.active_provider
+                .read()
+                .await
+                .clone()
+                .or_else(|| cfg.active_provider.clone())
+        };
+        // Owner providers for this model id, in aggregated-list order (deduped).
+        let owners: Vec<String> = {
+            let models = self.models.read().await;
+            let mut seen = std::collections::HashSet::new();
+            models
+                .iter()
+                .filter(|m| m.id == model && !m.provider.is_empty())
+                .filter_map(|m| {
+                    if seen.insert(m.provider.clone()) {
+                        Some(m.provider.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let provider_name = pick_provider_for_model(&owners, active.as_deref());
         if let Some(name) = provider_name {
-            if let Some(rp) = self.resolve_provider_by_name(&name).await {
+            if let Some(rp) = self.resolve_provider_by_name(name).await {
                 return oauth::enrich_oauth(rp, &self.client, Some(&self.plugin_manager)).await;
             }
         }
         let rp = self.resolved_provider().await;
         oauth::enrich_oauth(rp, &self.client, Some(&self.plugin_manager)).await
+    }
+
+    /// Resolve the model-info entry (caps) for `model` the same way turns
+    /// route: when several providers serve the SAME id, prefer the ACTIVE
+    /// provider's entry — its caps reflect what that provider actually enforces
+    /// (e.g. a gateway that caps ctx lower than the upstream model's
+    /// models.dev figure). Falls back to the first listed owner, then any
+    /// entry by id. `None` when the id is unknown.
+    pub async fn model_info_for(&self, model: &str) -> Option<crate::protocol::ModelInfo> {
+        let models = self.models.read().await;
+        let mut seen = std::collections::HashSet::new();
+        let owners: Vec<String> = models
+            .iter()
+            .filter(|m| m.id == model && !m.provider.is_empty())
+            .filter_map(|m| {
+                if seen.insert(m.provider.clone()) {
+                    Some(m.provider.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let active = {
+            let cfg = self.cfg.read().await;
+            self.active_provider
+                .read()
+                .await
+                .clone()
+                .or_else(|| cfg.active_provider.clone())
+        };
+        let picked = pick_provider_for_model(&owners, active.as_deref());
+        match picked {
+            Some(p) => models
+                .iter()
+                .find(|m| m.id == model && m.provider == p)
+                .cloned()
+                .or_else(|| models.iter().find(|m| m.id == model).cloned()),
+            None => models.iter().find(|m| m.id == model).cloned(),
+        }
     }
 
     /// The set of provider names that are "logged in": configured providers
@@ -1098,8 +1179,8 @@ pub fn logged_in_providers_for(
         .iter()
         .filter(|p| {
             // Logged in = has an API key (runtime/config/env), OR is an OAuth-capable
-            // provider with reusable OAuth credentials. OpenAI/Codex only uses
-            // this app's OAuth store; no ~/.codex/auth.json auto-detect.
+            // provider with reusable OAuth credentials. The Codex plugin also
+            // detects the file-backed official CLI auth store when configured.
             keys.get(&p.name)
                 .cloned()
                 .or_else(|| p.api_key.clone())
@@ -4178,8 +4259,10 @@ mod system_prompt_slim_tests {
             prompt.contains("`git`"),
             "deferred git group must be named in the standing prompt"
         );
+        // 5500 (not 5000): the provider guide now names the built-in presets
+        // (incl. deepseek endpoint) — still a hard cap against runaway growth.
         assert!(
-            fixed < 5_000,
+            fixed < 5_500,
             "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"
         );
         let _ = std::fs::remove_dir_all(&ws);
@@ -5180,5 +5263,53 @@ mod expand_mentions_tests {
         assert!(text.ends_with("```"));
         let fail = format_user_bash_context("false", "(no output)", false);
         assert!(fail.contains("(exit non-zero)"));
+    }
+}
+
+#[cfg(test)]
+mod provider_routing_tests {
+    use super::pick_provider_for_model;
+
+    fn owners(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn active_provider_wins_tie_when_it_owns_the_model() {
+        let o = owners(&["opencode-go", "karutoil"]);
+        assert_eq!(
+            pick_provider_for_model(&o, Some("karutoil")),
+            Some("karutoil")
+        );
+        assert_eq!(
+            pick_provider_for_model(&o, Some("opencode-go")),
+            Some("opencode-go")
+        );
+    }
+
+    #[test]
+    fn non_owner_active_falls_back_to_first_owner() {
+        let o = owners(&["opencode-go", "karutoil"]);
+        assert_eq!(
+            pick_provider_for_model(&o, Some("umans")),
+            Some("opencode-go")
+        );
+        assert_eq!(pick_provider_for_model(&o, None), Some("opencode-go"));
+    }
+
+    #[test]
+    fn single_owner_unaffected_by_active() {
+        let o = owners(&["karutoil"]);
+        assert_eq!(
+            pick_provider_for_model(&o, Some("opencode-go")),
+            Some("karutoil")
+        );
+        assert_eq!(pick_provider_for_model(&o, None), Some("karutoil"));
+    }
+
+    #[test]
+    fn no_owners_means_fallback() {
+        let o: Vec<String> = Vec::new();
+        assert_eq!(pick_provider_for_model(&o, Some("karutoil")), None);
     }
 }

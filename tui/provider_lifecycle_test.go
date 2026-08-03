@@ -23,6 +23,38 @@ func TestCoreBinaryPathHonorsExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestDevCoreBinaryPathPrefersRepositoryBuildOverPath(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "core", "target", "release", "core")
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte("local core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pathDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(pathDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pathCore := filepath.Join(pathDir, "catcode-core")
+	if err := os.WriteFile(pathCore, []byte("installed core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	savedVersion := coreVersion
+	t.Cleanup(func() { coreVersion = savedVersion })
+	coreVersion = "dev"
+	t.Setenv("CATCODE_CORE", "")
+	t.Setenv("PATH", pathDir)
+	t.Chdir(root)
+
+	got := coreBinaryPath()
+	want, _ := filepath.Abs(local)
+	if got != want {
+		t.Fatalf("coreBinaryPath=%q, want repository build %q", got, want)
+	}
+}
+
 func rawEvent(t *testing.T, typ string, fields map[string]any) *coreEvent {
 	t.Helper()
 	fields["type"] = typ

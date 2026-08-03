@@ -206,6 +206,7 @@ Built-in provider presets for quick setup:
 | `umans` | Umans (GLM-5.2) | OpenAI | `https://api.code.umans.ai/v1` | `UMANS_API_KEY` |
 | `opencode-go` | OpenCode Go | OpenAI | `https://opencode.ai/zen/go/v1` | `OPENCODE_GO_API_KEY` |
 | `openrouter` | OpenRouter | OpenAI | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `deepseek` | DeepSeek | OpenAI | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
 
 OpenCode Go expands into **two** provider configs (OpenAI-kind + Anthropic-kind)
 because it serves models over both wire protocols under one API key.

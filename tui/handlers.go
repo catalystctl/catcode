@@ -235,15 +235,6 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				_ = json.Unmarshal(raw, &s.providerPresets)
 			}
 			s.providerHasKey = s.authed // ready's authed reflects the active provider's key
-			if raw, ok := m["plugins_skipped"]; ok {
-				var skipped []string
-				if json.Unmarshal(raw, &skipped) == nil && len(skipped) > 0 {
-					s.logError(fmt.Sprintf(
-						"skipped project plugin(s): %s — reinstall with `/plugin-install <src> global` (or `workspace`), or start with --trust-project-plugins",
-						strings.Join(skipped, ", "),
-					))
-				}
-			}
 			s.applyReadySandboxFields(m)
 		}
 		// Bind a pre-provider-era global key to the provider reported at startup.
@@ -1304,6 +1295,48 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugin_error":
 		s.logError(fmt.Sprintf("plugin error (%s): %s", ev.get("name"), ev.get("message")))
+	case "plugin_trust_prompt":
+		// Auto-appears once at startup when undecided plugins exist; re-opens
+		// on /plugin-trust (where decided plugins are included too, so the
+		// user can change their mind).
+		var m map[string]json.RawMessage
+		if json.Unmarshal(ev.Raw, &m) == nil {
+			if raw, ok := m["plugins"]; ok {
+				entries := parsePluginTrustPrompt(raw)
+				if len(entries) == 0 {
+					s.logInfo("no untrusted project plugins")
+				} else {
+					s.openPluginTrustModal(entries)
+				}
+			}
+		}
+	case "plugin_trust_applied":
+		// {trusted: [names], denied: [names], loaded: n} — trusted/denied are
+		// arrays, so parse them via rawKey (ev.get returns a raw string for
+		// non-scalars).
+		var trusted, denied []string
+		if raw, ok := ev.rawKey("trusted"); ok {
+			_ = json.Unmarshal(raw, &trusted)
+		}
+		if raw, ok := ev.rawKey("denied"); ok {
+			_ = json.Unmarshal(raw, &denied)
+		}
+		var loaded int
+		if raw := ev.get("loaded"); raw != "" && raw != "null" {
+			_ = json.Unmarshal([]byte(raw), &loaded)
+		}
+		msg := "plugin trust updated"
+		if len(trusted) > 0 {
+			msg += "; trusted: " + strings.Join(trusted, ", ")
+		}
+		if len(denied) > 0 {
+			msg += "; denied: " + strings.Join(denied, ", ")
+		}
+		if loaded > 0 {
+			msg += fmt.Sprintf("; %d plugins loaded", loaded)
+		}
+		s.logSuccess(msg)
+		s.sendCore(map[string]any{"type": "list_plugin_commands"})
 	case "plugins_list":
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(ev.Raw, &m); err == nil {
@@ -2866,6 +2899,12 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/plugin-reload":
 			s.sendCore(map[string]any{"type": "reload_plugins"})
 			s.logInfo("reloading plugins…")
+			return nil
+		case "/plugin-trust":
+			// Re-open the plugin trust modal (also opens automatically once on
+			// startup when undecided plugins exist).
+			s.sendCore(map[string]any{"type": "plugin_trust_prompt"})
+			s.logInfo("checking plugin trust…")
 			return nil
 		case "/goal":
 			prefill := ""

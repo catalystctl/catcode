@@ -1354,6 +1354,24 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
     case "plugin_error":
       return { ...state, toasts: pushToast(state.toasts, "error", ev.message) };
+    case "plugin_trust_prompt":
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `${Array.isArray(ev.plugins) ? ev.plugins.length : 0} project plugin trust decision${Array.isArray(ev.plugins) && ev.plugins.length === 1 ? "" : "s"} required`,
+        ),
+      };
+    case "plugin_trust_applied":
+      return {
+        ...state,
+        toasts: pushToast(
+          state.toasts,
+          "success",
+          `Plugin trust updated${ev.loaded ? `; ${ev.loaded} loaded` : ""}`,
+        ),
+      };
 
     // ── Skills ──
     case "skills":

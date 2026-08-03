@@ -1,0 +1,5 @@
+{
+  "name": "deepseek",
+  "version": "0.1.0",
+  "description": "DeepSeek API — official first-party API-key provider bundle. Model discovery and capability metadata are refreshed automatically from DeepSeek and models.dev."
+}

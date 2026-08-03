@@ -12,7 +12,7 @@
 | **Learning** | The self-learning subsystem: persistent memory store (markdown with YAML frontmatter), skills (advisory prompt fragments), and auto-reflection at turn end. |
 | **Plugin** | An extension loaded from `.catalyst-code/plugins/<name>/plugin.json` that can register hooks, custom tools, OAuth providers, memory providers, and slash commands. |
 | **Plugin scope** | Where a plugin is installed: `global` (`~/.catalyst-code/plugins/`, every workspace) or `workspace` (this repo's `.catalyst-code/plugins/`, project only). |
-| **Provider** | A configured AI model endpoint (e.g. Umans, OpenCode Go, OpenRouter, or a custom OpenAI/Anthropic-compatible endpoint). Multiple providers can be logged in simultaneously. |
+| **Provider** | A configured AI model endpoint (e.g. Umans, OpenCode Go, OpenRouter, DeepSeek, or a custom OpenAI/Anthropic-compatible endpoint). Multiple providers can be logged in simultaneously. |
 | **Sandbox** | Optional Microsandbox microVM that isolates agent-controlled process execution (bash, git, diagnostics, plugin scripts). Runs a separate Linux kernel + filesystem root on Linux (KVM), Apple Silicon macOS, and Windows (WHP). The host environment and credentials are not inherited. See [Sandbox Guide](../guides/sandbox.md). |
 | **SDK** | The TypeScript package (`@catalyst-code/coding-agent`) that wraps the core binary's JSONL protocol into a pi-coding-agent-compatible API. |
 | **Session** | An append-only JSONL file recording every message in a conversation. Auto-resumed on restart. Schema-versioned for forward compatibility. |

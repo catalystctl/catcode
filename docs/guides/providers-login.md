@@ -22,7 +22,7 @@ Each turn is automatically routed to the provider that owns the selected model.
 
 ## Built-in Provider Presets
 
-Three first-party provider presets ship with the harness
+Four first-party provider presets ship with the harness
 (`PROVIDER_PRESETS` (/core/src/config.rs), line 486). They can be activated
 with one `/login` command — no manual JSON editing required.
 
@@ -31,6 +31,7 @@ with one `/login` command — no manual JSON editing required.
 | `umans` | Umans (GLM-5.2) | OpenAI | `https://api.code.umans.ai/v1` | `UMANS_API_KEY` |
 | `opencode-go` | OpenCode Go | OpenAI + Anthropic | `https://opencode.ai/zen/go/v1` | `OPENCODE_GO_API_KEY` |
 | `openrouter` | OpenRouter | OpenAI | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `deepseek` | DeepSeek | OpenAI | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
 
 ### OpenCode Go Dual-Protocol Expansion
 
@@ -85,7 +86,7 @@ containing the preset list plus whether each already has a stored key.
 ### Interactive Flow in the TUI
 
 1. Press `/` to open the command bar.
-2. Type `login` and press Enter — the picker shows the three built-in presets
+2. Type `login` and press Enter — the picker shows the four built-in presets
    plus any plugin OAuth providers.
 3. Select a preset.
 4. You are prompted to paste an API key. For presets with a configured env var
@@ -245,6 +246,7 @@ The built-in presets look for their API key in these environment variables:
 | `UMANS_API_KEY` | Umans |
 | `OPENCODE_GO_API_KEY` | OpenCode Go |
 | `OPENROUTER_API_KEY` | OpenRouter |
+| `DEEPSEEK_API_KEY` | DeepSeek |
 
 **Important:** These env vars are **not** scanned for auto-login. A user must
 still run `/login` with an explicit key paste. The env var is used as the
@@ -296,8 +298,16 @@ Source: `ResolvedProvider` (/core/src/config.rs), line ~420.
 ## OAuth Plugin Providers
 
 Built-in vendor OAuth has been removed from the core. Subscription-based OAuth
-login (e.g., ChatGPT via the catcode-chatgpt-provider plugin, xAI SuperGrok)
-is handled by **plugins** that declare an `oauth` block.
+login (e.g., ChatGPT/Codex, xAI SuperGrok) is handled by **plugins** that
+declare an `oauth` block. The first-party Codex bundle is staged automatically:
+
+```text
+/login codex
+```
+
+It follows the official Codex CLI device flow, polls automatically after the
+device code is approved, and imports file-backed `$CODEX_HOME/auth.json` when
+the Codex CLI has already authenticated. It does not require `/oauth-code`.
 
 ### Plugin OAuth Flow
 
@@ -308,8 +318,9 @@ is handled by **plugins** that declare an `oauth` block.
    {"type": "login_oauth", "preset": "chatgpt"}
    ```
 3. The core emits `{"type": "oauth_prompt", "url": "...", "code": "...", "message": "..."}`.
-4. Open the URL on any device, approve the authorization, and obtain a code.
-5. Paste the code via the TUI or send:
+4. Open the URL on any device and approve the authorization. Automatic device
+   flows poll and finish here; manual flows continue with the next step.
+5. For a manual flow, paste the code via the TUI or send:
    ```json
    {"type": "oauth_code", "code": "..."}
    ```

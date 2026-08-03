@@ -166,13 +166,14 @@ type session struct {
 	coreLifecycle            coreLifecycleState
 	coreFailure              string
 	streamRefreshPending     bool
-	coreStartGen             uint64          // bumped each startCore; lets a stale watchdog tick ignore a restart
-	abortGen                 uint64          // bumped on abort arm/disarm; stale abortTimeoutMsg ignored
-	visionModels             map[string]bool // user-curated vision-capable model ids (drives /vision)
-	visionModel              string          // preferred handoff target ("" = cheapest same-provider)
-	visionEnabled            bool            // auto handoff (default true / recommended ON)
-	pendingVisionPicker      bool            // open the vision picker once the config arrives
-	pendingPluginInstallPath string          // path/URL awaiting scope pick (modalPluginInstallScope)
+	coreStartGen             uint64             // bumped each startCore; lets a stale watchdog tick ignore a restart
+	abortGen                 uint64             // bumped on abort arm/disarm; stale abortTimeoutMsg ignored
+	visionModels             map[string]bool    // user-curated vision-capable model ids (drives /vision)
+	visionModel              string             // preferred handoff target ("" = cheapest same-provider)
+	visionEnabled            bool               // auto handoff (default true / recommended ON)
+	pendingVisionPicker      bool               // open the vision picker once the config arrives
+	pendingPluginInstallPath string             // path/URL awaiting scope pick (modalPluginInstallScope)
+	pluginTrust              *pluginTrustPrompt // active trust modal state (modalPluginTrust)
 
 	// Active model provider (openai/anthropic endpoint). activeProvider is the
 	// name the core resolved; providers is the list of configured names for the
@@ -350,8 +351,8 @@ func coreExeSuffix() string {
 // coreBinaryPath resolves the core subprocess binary. Search order:
 //  1. $CATCODE_CORE — explicit override (used as-is if it exists)
 //  2. <dir of this exe>/catcode-core[.exe] — installed layout (beside the TUI)
-//  3. catcode-core on PATH
-//  4. Development-only CWD/repository fallbacks (when coreVersion == "dev")
+//  3. Development-only CWD/repository fallbacks (when coreVersion == "dev")
+//  4. catcode-core on PATH
 //
 // On Windows ".exe" is appended to every candidate so the install layout
 // (catcode.exe next to catcode-core.exe) is found from any CWD.
@@ -372,17 +373,10 @@ func coreBinaryPath() string {
 	coreName := "catcode-core" + sfx // installed beside the TUI
 	devName := "core" + sfx          // cargo's bin name in the dev build
 	var candidates []string
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		installed := filepath.Join(dir, coreName)
-		if _, err := os.Stat(installed); err == nil {
-			return installed
-		}
-	}
-	if p, err := exec.LookPath(coreName); err == nil {
-		return p
-	}
 	if coreVersion == "dev" {
+		// Prefer a repository build over an older globally-installed core when
+		// launching the development TUI. An explicit CATCODE_CORE above still
+		// wins, so production/service configurations remain authoritative.
 		candidates = append(candidates,
 			"core/target/release/"+devName,
 			"../core/target/release/"+devName,
@@ -395,6 +389,13 @@ func coreBinaryPath() string {
 			)
 		}
 	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		installed := filepath.Join(dir, coreName)
+		if _, err := os.Stat(installed); err == nil {
+			return installed
+		}
+	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
 			if abs, err := filepath.Abs(c); err == nil {
@@ -402,6 +403,9 @@ func coreBinaryPath() string {
 			}
 			return c
 		}
+	}
+	if p, err := exec.LookPath(coreName); err == nil {
+		return p
 	}
 	// Let exec.Command report a useful PATH error on release builds. Local dev
 	// builds retain the historical repo-relative error path for diagnostics.

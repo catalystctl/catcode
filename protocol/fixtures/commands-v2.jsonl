@@ -37,6 +37,8 @@
 {"type":"disable_plugin","name":"fixture"}
 {"type":"list_plugins"}
 {"type":"reload_plugins"}
+{"type":"plugin_trust_prompt"}
+{"type":"plugin_trust_decisions","decisions":{}}
 {"type":"plugin_command","name":"fixture","args":"value"}
 {"type":"list_plugin_commands"}
 {"type":"list_agents"}

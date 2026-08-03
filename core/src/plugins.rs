@@ -569,6 +569,12 @@ struct OauthManifestEntry {
     /// every script invocation, so the plugin owns the token's on-disk format.
     #[serde(default)]
     token_path: Option<String>,
+    /// Optional external credential file to detect and import. The supported
+    /// `$CODEX_HOME/auth.json` form follows the official Codex CLI store; the
+    /// harness uses it only as a cheap credential-presence hint and leaves the
+    /// actual format/import logic to the provider script.
+    #[serde(default)]
+    detect_path: Option<String>,
     /// The script handling ALL actions (login/complete/token/clear). Required
     /// unless every action has an explicit override.
     #[serde(default)]
@@ -705,7 +711,8 @@ pub struct CommandConfig {
 /// A loaded OAuth-provider declaration (manifest `oauth` block with script
 /// paths resolved to absolute, path-confined, executable files). The plugin
 /// owns the token's on-disk format; the harness owns the loopback redirect
-/// server (web flow) and the `/oauth-code` paste path (manual flow).
+/// server (web flow), optional automatic completion, and the `/oauth-code`
+/// paste path (manual flow).
 #[derive(Clone, Debug)]
 pub struct PluginOauthConfig {
     pub provider_id: String,
@@ -716,6 +723,8 @@ pub struct PluginOauthConfig {
     pub headers: Vec<(String, String)>,
     /// Absolute path the plugin reads/writes its token at.
     pub token_path: PathBuf,
+    /// Optional external credential path used for cheap login detection.
+    pub detect_path: Option<PathBuf>,
     /// Resolved absolute script paths per action (override else the default).
     pub scripts: HashMap<String, PathBuf>,
     pub login_timeout_ms: u64,
@@ -905,6 +914,23 @@ impl PluginInstallScope {
     }
 }
 
+/// A project-scoped plugin that was NOT loaded because it is not trusted
+/// (or its trust decision is still pending). Carries enough manifest metadata
+/// for the trust prompt UI plus the recorded decision.
+#[derive(Clone, Debug)]
+pub struct SkippedProjectPlugin {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub path: PathBuf,
+    /// Stable key for the project plugin directory, independent of the
+    /// manifest's mutable display name.
+    pub decision_key: String,
+    /// Recorded user decision: `Some("trust")` → would load; `Some("deny")`
+    /// → stays skipped; `None` → undecided (drives the auto trust prompt).
+    pub decision: Option<String>,
+}
+
 /// Manages the lifecycle of all installed plugins.
 /// Holds an in-memory registry behind a `RwLock`.
 pub struct PluginManager {
@@ -922,9 +948,20 @@ pub struct PluginManager {
     /// workspace's `.catalyst-code/plugins` are NOT auto-loaded — a repo you
     /// `cd` into must not run hook scripts with your privileges without opt-in.
     trust_project: bool,
+    /// Canonical workspace root used as the trust-store key.
+    trust_key: PathBuf,
+    /// Per-project trust decisions (canonical plugin directory key →
+    /// "trust" | "deny") loaded from the user-owned store; consulted when
+    /// gating project plugins.
+    trust_decisions: RwLock<HashMap<String, String>>,
+    /// Where decisions are persisted (`~/.config/catalyst-code/plugin-trust.json`);
+    /// None for isolated test constructors so tests never touch the real store.
+    trust_store_path: Option<PathBuf>,
     plugins: RwLock<HashMap<String, Plugin>>,
-    /// Project-scoped plugin names skipped because trust_project is false.
-    skipped_project: Mutex<Vec<String>>,
+    /// Project-scoped plugins skipped because they are not trusted (or the
+    /// trust decision is still pending). Carries manifest metadata + decision
+    /// so the UI can render the trust prompt.
+    skipped_project: Mutex<Vec<SkippedProjectPlugin>>,
     /// In-memory cache of resolved OAuth access tokens (provider_id → token),
     /// so the per-turn hot path (`enrich_oauth`) doesn't spawn the token script
     /// on every request. Refreshed when near expiry.
@@ -942,7 +979,25 @@ impl PluginManager {
             workspace.join(plugins_dir)
         }
     }
+}
 
+/// Canonical (symlink-resolved) form of `workspace`, used as the trust-store
+/// key so the same project always maps to the same decisions regardless of how
+/// it was opened.
+fn canonical_workspace(workspace: &Path) -> PathBuf {
+    std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+/// Stable trust-store key for one project plugin directory. Decisions are
+/// intentionally bound to the directory, not only the mutable manifest name.
+fn canonical_plugin_key(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+impl PluginManager {
     /// Create a new manager and scan/load all plugins from `plugins_dir` only
     /// (the project plugins dir). This is the **isolated** constructor used by
     /// tests; it does NOT scan the global `~/.catalyst-code/plugins` dir, so
@@ -952,11 +1007,15 @@ impl PluginManager {
     /// instead, which also loads globally-staged plugins.
     pub fn new(plugins_dir: PathBuf, workspace: PathBuf, trust_project: bool) -> Self {
         let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
+        let trust_key = canonical_workspace(&workspace);
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir: None,
             workspace,
             trust_project,
+            trust_key,
+            trust_decisions: RwLock::new(HashMap::new()),
+            trust_store_path: None,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
             token_cache: Mutex::new(HashMap::new()),
@@ -977,11 +1036,20 @@ impl PluginManager {
     ) -> Self {
         let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
         let user_plugins_dir = crate::config::home_dir().map(|h| h.join(".catalyst-code/plugins"));
+        let trust_store_path = crate::plugin_trust::plugin_trust_store_path();
+        let trust_decisions = trust_store_path
+            .as_ref()
+            .map(|p| crate::plugin_trust::PluginTrustStore::load(p).decisions_for(&workspace))
+            .unwrap_or_default();
+        let trust_key = canonical_workspace(&workspace);
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir,
             workspace,
             trust_project,
+            trust_key,
+            trust_decisions: RwLock::new(trust_decisions),
+            trust_store_path,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
             token_cache: Mutex::new(HashMap::new()),
@@ -1001,11 +1069,15 @@ impl PluginManager {
         trust_project: bool,
     ) -> Self {
         let plugins_dir = Self::resolve_plugins_dir(plugins_dir, &workspace);
+        let trust_key = canonical_workspace(&workspace);
         let mgr = PluginManager {
             plugins_dir,
             user_plugins_dir,
             workspace,
             trust_project,
+            trust_key,
+            trust_decisions: RwLock::new(HashMap::new()),
+            trust_store_path: None,
             plugins: RwLock::new(HashMap::new()),
             skipped_project: Mutex::new(Vec::new()),
             token_cache: Mutex::new(HashMap::new()),
@@ -1014,10 +1086,148 @@ impl PluginManager {
         mgr
     }
 
-    /// Names of project-scoped plugins skipped because `trust_project` is false.
+    /// Names of project-scoped plugins skipped because they are not trusted.
     /// The caller surfaces these to the user so the opt-in is discoverable.
     pub fn skipped_project_plugins(&self) -> Vec<String> {
-        self.skipped_project.lock().unwrap().clone()
+        self.skipped_project
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Project-scoped plugins that were skipped with NO recorded decision yet.
+    /// Non-empty drives the auto trust prompt on startup.
+    pub fn pending_trust_plugins(&self) -> Vec<SkippedProjectPlugin> {
+        self.skipped_project
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.decision.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// All skipped project-scoped plugins with their current decision (`` for
+    /// undecided) — the full list for the trust prompt (`/plugin-trust`).
+    pub fn trust_prompt_plugins(&self) -> Vec<SkippedProjectPlugin> {
+        let mut entries = self.skipped_project.lock().unwrap().clone();
+        let known: std::collections::HashSet<String> =
+            entries.iter().map(|p| p.decision_key.clone()).collect();
+        let decisions = self.trust_decisions.read().unwrap();
+        for plugin in self.plugins.read().unwrap().values() {
+            if self.scope_of_path(&plugin.source_path) != PluginInstallScope::Workspace {
+                continue;
+            }
+            let decision_key = canonical_plugin_key(&plugin.source_path);
+            if known.contains(&decision_key) {
+                continue;
+            }
+            entries.push(SkippedProjectPlugin {
+                name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                description: plugin.description.clone(),
+                path: plugin.source_path.clone(),
+                decision_key: decision_key.clone(),
+                decision: decisions.get(&decision_key).cloned(),
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+        entries
+    }
+
+    /// JSON entries for the `plugin_trust_prompt` event payload: one per
+    /// skipped project-scoped plugin, with manifest metadata + the recorded
+    /// decision ("" = undecided).
+    pub fn trust_prompt_json(&self) -> Vec<Value> {
+        self.trust_prompt_plugins()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "name": p.name,
+                    "version": p.version,
+                    "description": p.description,
+                    "path": p.path.display().to_string(),
+                    "decision": p.decision.clone().unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Record the user's trust decisions for this project's plugins and
+    /// re-scan so newly-trusted plugins load immediately. Decisions are
+    /// persisted to the user-owned store (production) so the auto prompt is
+    /// not re-shown on later loads. Returns Err on persistence failure;
+    /// validation of values is the caller's job.
+    pub fn apply_trust_decisions(
+        &self,
+        decisions: HashMap<String, String>,
+    ) -> Result<Value, String> {
+        let known = self.trust_prompt_plugins();
+        let keyed_decisions: HashMap<String, String> = decisions
+            .iter()
+            .filter_map(|(name_or_path, value)| {
+                let key = known
+                    .iter()
+                    .find(|p| &p.name == name_or_path || &p.decision_key == name_or_path)
+                    .map(|p| p.decision_key.clone())
+                    .or_else(|| {
+                        self.find_project_plugin_dir(name_or_path)
+                            .map(|p| canonical_plugin_key(&p))
+                    })?;
+                Some((key, value.clone()))
+            })
+            .collect();
+        {
+            let mut cur = self.trust_decisions.write().unwrap();
+            // Merge: only the entries in this partial update change; prior
+            // decisions for other plugin directories are preserved.
+            for (key, value) in &keyed_decisions {
+                cur.insert(key.clone(), value.clone());
+            }
+        }
+        // Persist best-effort: a failed write keeps decisions in memory for
+        // this run but reports the error so the UI can surface it.
+        if let Some(ref path) = self.trust_store_path {
+            // Decisions are a shared read-modify-write store: serialize the
+            // full load/merge/save transaction so two cores cannot lose each
+            // other's per-plugin updates.
+            let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))
+                .map_err(|e| format!("failed to lock plugin trust store: {e}"))?;
+            let mut store = crate::plugin_trust::PluginTrustStore::load(path);
+            let mut stored = store.decisions_for(&self.trust_key);
+            for (key, value) in &keyed_decisions {
+                stored.insert(key.clone(), value.clone());
+            }
+            store.set_decisions(&self.trust_key, &stored);
+            store.save(path)?;
+        }
+        // Reload (preserves enabled/disabled flags + OAuth token cache) so
+        // newly-trusted plugins load immediately.
+        let summary = self.reload();
+        if let Some(errors) = summary.get("errors").and_then(|v| v.as_array()) {
+            for e in errors {
+                eprintln!("[plugins] {e}");
+            }
+        }
+        Ok(summary)
+    }
+
+    fn find_project_plugin_dir(&self, name: &str) -> Option<PathBuf> {
+        let candidate = self.plugins_dir.join(name);
+        candidate.join("plugin.json").is_file().then_some(candidate)
+    }
+
+    fn user_installed_keys(&self) -> Vec<String> {
+        let Some(path) = &self.trust_store_path else {
+            return Vec::new();
+        };
+        let store = crate::plugin_trust::PluginTrustStore::load(path);
+        store
+            .installed_plugins_for(&self.trust_key)
+            .into_iter()
+            .collect()
     }
 
     /// Re-scan the plugin directories and load/reload all valid plugins.
@@ -1043,17 +1253,19 @@ impl PluginManager {
             std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
         let mut plugins = self.plugins.write().unwrap();
         plugins.clear();
-        let mut skipped_local: Vec<String> = Vec::new();
+        let mut skipped_local: Vec<SkippedProjectPlugin> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 
         // 1) Global, user-owned plugins (~/.catalyst-code/plugins) when this
-        //    manager was constructed to scan them (production). Outside the
-        //    workspace, so `is_project` is false and they load unconditionally.
+        //    manager was constructed to scan them (production). The explicit
+        //    `user_owned` flag is authoritative even if HOME happens to be
+        //    nested under the workspace; these are not project plugins.
         //    Skipped entirely for the isolated `new()` constructor (tests).
         if let Some(ref user_dir) = self.user_plugins_dir {
             self.scan_dir(
                 user_dir,
                 &canon_ws,
+                true,
                 &mut plugins,
                 &mut skipped_local,
                 &mut errors,
@@ -1067,6 +1279,7 @@ impl PluginManager {
         self.scan_dir(
             &self.plugins_dir,
             &canon_ws,
+            false,
             &mut plugins,
             &mut skipped_local,
             &mut errors,
@@ -1078,14 +1291,18 @@ impl PluginManager {
 
     /// Scan one plugin directory and load every valid plugin in it into
     /// `plugins` (later inserts override earlier ones on name collision).
-    /// `skipped` collects project-scoped plugin names that were gated off by
-    /// `trust_project`. A missing or unreadable directory is a silent no-op.
+    /// `user_owned` identifies the explicit global/user directory. It is kept
+    /// separate from the filesystem-prefix check so a user-owned directory
+    /// nested inside a workspace is not mistaken for a repo plugin.
+    /// `skipped` collects project-scoped plugins gated off by trust (denied or
+    /// undecided). A missing or unreadable directory is a silent no-op.
     fn scan_dir(
         &self,
         dir: &std::path::Path,
         canon_ws: &std::path::Path,
+        user_owned: bool,
         plugins: &mut HashMap<String, Plugin>,
-        skipped: &mut Vec<String>,
+        skipped: &mut Vec<SkippedProjectPlugin>,
         errors: &mut Vec<String>,
     ) {
         let rd = match std::fs::read_dir(dir) {
@@ -1103,30 +1320,88 @@ impl PluginManager {
             }
             // Project-scoped gating: a plugin dir inside the workspace (e.g.
             // `.catalyst-code/plugins/*` shipped by the repo) is treated as
-            // untrusted unless the user opted in via `trust_project`. This stops
-            // a repo from auto-running hook scripts (which see every tool's
+            // untrusted unless the user opted in (via `trust_project`, a
+            // user-install marker, or a recorded trust decision). This stops a
+            // repo from auto-running hook scripts (which see every tool's
             // args, including bash commands + file contents) with your
-            // privileges. User-installed plugins (outside the workspace) load
-            // regardless. `trust_project` is read only from env/CLI, never a
-            // project config file, so a repo can't self-enable.
+            // privileges. User-owned plugins from the explicit global scan
+            // load regardless, even if their path is nested. `trust_project`
+            // is read only from env/CLI, never a project config file, so a repo
+            // can't self-enable.
             let canon_plugin = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let is_project = canon_plugin.starts_with(canon_ws);
-            let user_installed = path.join(PLUGIN_USER_INSTALLED_MARKER).is_file();
-            if is_project && !self.trust_project && !user_installed {
-                let name = std::fs::read_to_string(&manifest_path)
+            // Classify project scope from the configured directory's lexical
+            // location, not only its resolved target. A repo can ship a
+            // symlinked plugin directory that points outside the workspace;
+            // that must remain gated as repo code, not become trusted merely
+            // because its target happens to be elsewhere.
+            let physically_in_project = canon_plugin.starts_with(canon_ws);
+            // Decide whether this scan root is project-scoped from its lexical
+            // path before resolving child symlinks. A project plugin symlinked
+            // to an external directory must remain gated; a custom plugin dir
+            // outside the workspace remains user-owned by location.
+            let workspace_abs =
+                std::path::absolute(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
+            let scan_dir_abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+            let is_project = !user_owned && scan_dir_abs.starts_with(&workspace_abs);
+            // A repo symlink must not inherit the exemption from a marker in
+            // an external user-installed plugin it happens to target.
+            let user_installed = physically_in_project
+                && (self
+                    .user_installed_keys()
+                    .contains(&canonical_plugin_key(&path))
+                    || (cfg!(test) && path.join(".catalyst-plugin-user-installed").is_file()));
+            let mut skip: Option<SkippedProjectPlugin> = None;
+            if !user_owned && is_project && !self.trust_project && !user_installed {
+                let manifest: Value = std::fs::read_to_string(&manifest_path)
                     .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| Value::Null);
+                let name = manifest
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
                     .unwrap_or_else(|| {
                         path.file_name()
                             .and_then(|n| n.to_str())
                             .map(String::from)
                             .unwrap_or_default()
                     });
-                eprintln!(
-                    "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); set --trust-project-plugins / CATALYST_CODE_TRUST_PROJECT_PLUGINS=1 to enable, or reinstall with `/plugin-install … workspace`"
-                );
-                skipped.push(name);
+                // A recorded "trust" decision loads the plugin; anything else
+                // (deny or undecided) keeps it gated off and records it so the
+                // trust prompt can list it.
+                let decision_key = canonical_plugin_key(&path);
+                let decision = self
+                    .trust_decisions
+                    .read()
+                    .unwrap()
+                    .get(&decision_key)
+                    .cloned();
+                if decision.as_deref() != Some("trust") {
+                    let version = manifest
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let description = manifest
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    eprintln!(
+                        "[plugins] skipping project-scoped plugin '{name}' (in {canon_plugin:?}); trust it with the plugin trust prompt (/plugin-trust), set --trust-project-plugins / CATALYST_CODE_TRUST_PROJECT_PLUGINS=1, or reinstall with `/plugin-install … workspace`"
+                    );
+                    skip = Some(SkippedProjectPlugin {
+                        name,
+                        version,
+                        description,
+                        path: canon_plugin,
+                        decision_key,
+                        decision,
+                    });
+                }
+            }
+            if let Some(s) = skip {
+                skipped.push(s);
                 continue;
             }
             match Self::load_plugin_from_dir(&path) {
@@ -1145,6 +1420,21 @@ impl PluginManager {
         }
     }
 
+    fn validate_plugin_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("plugin name is empty".into());
+        }
+        if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+            return Err(format!("plugin name contains a path separator: {name:?}"));
+        }
+        if Path::new(name).components().count() != 1 {
+            return Err(format!(
+                "plugin name must be a single directory name: {name:?}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Load a single plugin from a directory containing plugin.json.
     fn load_plugin_from_dir(dir: &Path) -> Result<Plugin, String> {
         let manifest_path = dir.join("plugin.json");
@@ -1154,9 +1444,7 @@ impl PluginManager {
         let manifest: PluginManifest =
             serde_json::from_str(&raw).map_err(|e| format!("plugin.json parse error: {e}"))?;
 
-        if manifest.name.is_empty() {
-            return Err("plugin name is empty".into());
-        }
+        Self::validate_plugin_name(&manifest.name)?;
         let capabilities = validate_manifest_capabilities(&manifest)?;
         let plugin_protocol_version = manifest.protocol_version.unwrap_or(1);
 
@@ -1406,9 +1694,22 @@ impl PluginManager {
         }
     }
 
+    fn record_user_installed(&self, path: &Path) -> Result<(), String> {
+        let Some(store_path) = &self.trust_store_path else {
+            return Ok(());
+        };
+        let _lock = crate::fsutil::FileLock::acquire(&store_path.with_extension("lock"))
+            .map_err(|e| format!("failed to lock plugin trust store: {e}"))?;
+        let mut store = crate::plugin_trust::PluginTrustStore::load(store_path);
+        let mut installed = store.installed_plugins_for(&self.trust_key);
+        installed.insert(canonical_plugin_key(path));
+        store.set_installed_plugins(&self.trust_key, &installed);
+        store.save(store_path)
+    }
+
     /// True when repo-shipped workspace plugins are allowed to load. Explicitly
-    /// user-installed workspace plugins carry a marker and do not require this
-    /// blanket trust flag.
+    /// user-installed workspace plugins are recorded in the user-owned store
+    /// and do not require this blanket trust flag.
     pub fn trust_project(&self) -> bool {
         self.trust_project
     }
@@ -1513,6 +1814,7 @@ impl PluginManager {
 
         let dest_root = self.install_dir_for(scope)?;
         let _ = std::fs::create_dir_all(&dest_root);
+        Self::validate_plugin_name(&plugin.name)?;
         let dest_dir = dest_root.join(&plugin.name);
         if dest_dir.exists() {
             let _ = std::fs::remove_dir_all(&dest_dir);
@@ -1520,13 +1822,20 @@ impl PluginManager {
 
         copy_dir(&source, &dest_dir)?;
 
-        // Any install that lands inside the workspace must carry the
-        // user-installed marker so scan loads it without --trust-project-plugins.
-        // (Repo-shipped plugins lack this marker and stay gated.)
+        // Workspace installs are recorded in the user-owned trust store; a
+        // repo cannot self-authorize by committing a marker file next to its
+        // manifest. Test-only managers retain their marker-based fixture
+        // behavior because they intentionally have no persistent trust store.
         if scope == PluginInstallScope::Workspace
             || self.scope_of_path(&dest_dir) == PluginInstallScope::Workspace
         {
-            write_user_installed_marker(&dest_dir);
+            if self.trust_store_path.is_some() {
+                self.record_user_installed(&dest_dir)?;
+            }
+            #[cfg(test)]
+            if self.trust_store_path.is_none() {
+                write_user_installed_marker(&dest_dir);
+            }
         }
 
         // Re-load from the copied location so paths point to the managed dir.
@@ -1727,7 +2036,13 @@ impl PluginManager {
         }
 
         let loaded = self.plugins.read().unwrap().len();
-        let skipped = self.skipped_project.lock().unwrap().clone();
+        let skipped = self
+            .skipped_project
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<String>>();
         let mut out = json!({
             "loaded": loaded,
             "skipped": skipped,
@@ -1813,7 +2128,7 @@ impl PluginManager {
 
     /// All OAuth providers declared by enabled plugins (one per plugin that
     /// declares an `oauth` block). Used to populate the `/login` picker and to
-    /// dispatch `/login` / `/oauth-code` / `/logout`.
+    /// dispatch `/login` / optional `/oauth-code` / `/logout`.
     pub fn oauth_configs(&self) -> Vec<PluginOauthConfig> {
         self.enabled_plugins_sorted()
             .into_iter()
@@ -1876,12 +2191,16 @@ impl PluginManager {
         cfg.script_for("login").is_some()
     }
 
-    /// Cheap sync check (no subprocess): does the plugin's token file exist?
+    /// Cheap sync check (no subprocess): does the plugin's token file or its
+    /// optional external credential file exist?
     /// Used to gate an OAuth-only provider into model aggregation so `/models`
     /// shows it without an API key.
     pub fn has_oauth_creds(&self, provider_id: &str) -> bool {
         self.oauth_config(provider_id)
-            .map(|c| c.token_path.exists())
+            .map(|c| {
+                c.token_path.is_file()
+                    || c.detect_path.as_ref().map(|p| p.is_file()).unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -1998,6 +2317,11 @@ impl PluginManager {
     ///  - `manual` (default for SSH/headless, or when the script chooses it):
     ///    the script returns a URL + an opaque `pending` blob; the user pastes
     ///    the code back via `/oauth-code`, which calls `complete`.
+    ///  - `poll` / `auto`: the script returns a device-code URL + pending blob,
+    ///    and the harness immediately invokes `complete`; the script owns the
+    ///    polling loop, so no `/oauth-code` command is needed.
+    ///  - `already_authenticated`: the script imported an existing credential
+    ///    store and no browser flow is needed.
     pub async fn oauth_login(
         &self,
         provider_id: &str,
@@ -2024,28 +2348,31 @@ impl PluginManager {
                     &oauth_script_env(&cfg),
                 )
                 .await?;
-            let url = resp
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or("login script did not return a url")?
-                .to_string();
-            let flow = resp
-                .get("flow")
-                .and_then(|v| v.as_str())
-                .unwrap_or("web")
-                .to_string();
-            let code = resp.get("code").and_then(|v| v.as_str()).map(String::from);
+            if let Some(err) = oauth_login_error(&resp) {
+                return Err(format!("OAuth login failed: {err}"));
+            }
+            let flow = oauth_flow(&resp, "web");
             let state = resp
                 .get("state")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let pending = resp.get("pending").cloned();
+            if oauth_flow_is_existing(&resp) {
+                self.invalidate_oauth_cache(provider_id);
+                return Ok(LoginOutcome::Done);
+            }
+            let url = resp
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("login script did not return a url")?
+                .to_string();
+            let code = resp.get("code").and_then(|v| v.as_str()).map(String::from);
             let message = resp
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Open the URL to log in.")
                 .to_string();
-            let pending = resp.get("pending").cloned();
             emit(OAuthPrompt {
                 url: url.clone(),
                 code,
@@ -2053,6 +2380,17 @@ impl PluginManager {
             });
             let _ = crate::oauth::open_browser(&url);
 
+            if oauth_flow_is_auto(&resp) {
+                self.run_oauth_complete(
+                    provider_id,
+                    &token_path,
+                    "",
+                    pending.as_ref(),
+                    Some(&redirect_uri),
+                )
+                .await?;
+                return Ok(LoginOutcome::Done);
+            }
             if flow == "manual" {
                 // The script insisted on the manual flow even locally.
                 return Ok(LoginOutcome::AwaitingCode {
@@ -2062,35 +2400,19 @@ impl PluginManager {
             // Wait for the browser redirect, then complete the exchange.
             let code =
                 crate::oauth::await_redirect_dual(listener, listener_v6, &state, None).await?;
-            let mut ctx = self.oauth_action_ctx("complete", provider_id, &token_path);
-            ctx["code"] = json!(code);
-            ctx["redirect_uri"] = json!(redirect_uri);
-            if let Some(p) = &pending {
-                ctx["pending"] = p.clone();
-            }
-            let resp = self
-                .execute_oauth_script(
-                    cfg.script_for("complete").ok_or("no complete script")?,
-                    ctx,
-                    cfg.login_timeout_ms,
-                    &oauth_script_env(&cfg),
-                )
-                .await?;
-            if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let err = resp
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                return Err(format!("OAuth complete failed: {err}"));
-            }
-            // Invalidate the cache so the next turn resolves the fresh token.
-            if let Ok(mut cache) = self.token_cache.lock() {
-                cache.remove(provider_id);
-            }
+            self.run_oauth_complete(
+                provider_id,
+                &token_path,
+                &code,
+                pending.as_ref(),
+                Some(&redirect_uri),
+            )
+            .await?;
             Ok(LoginOutcome::Done)
         } else {
-            // Manual / device-code flow: emit the URL, stash `pending`, wait
-            // for the user to paste the code via `/oauth-code`.
+            // Headless flow: providers may still choose manual paste, but a
+            // device-code provider can return `flow: "poll"` and complete
+            // itself while the harness waits for authorization.
             let mut ctx = self.oauth_action_ctx("login", provider_id, &token_path);
             ctx["headless"] = json!(true);
             let resp = self
@@ -2101,6 +2423,13 @@ impl PluginManager {
                     &oauth_script_env(&cfg),
                 )
                 .await?;
+            if let Some(err) = oauth_login_error(&resp) {
+                return Err(format!("OAuth login failed: {err}"));
+            }
+            if oauth_flow_is_existing(&resp) {
+                self.invalidate_oauth_cache(provider_id);
+                return Ok(LoginOutcome::Done);
+            }
             let url = resp
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -2114,10 +2443,53 @@ impl PluginManager {
                 .to_string();
             let pending = resp.get("pending").cloned();
             emit(OAuthPrompt { url, code, message });
+            if oauth_flow_is_auto(&resp) {
+                self.run_oauth_complete(provider_id, &token_path, "", pending.as_ref(), None)
+                    .await?;
+                return Ok(LoginOutcome::Done);
+            }
             Ok(LoginOutcome::AwaitingCode {
                 pending: PendingOauth::plugin(provider_id, String::new(), pending),
             })
         }
+    }
+
+    /// Run a plugin's `complete` action for either a pasted code, a loopback
+    /// redirect, or an automatic device-code poll.
+    async fn run_oauth_complete(
+        &self,
+        provider_id: &str,
+        token_path: &str,
+        code: &str,
+        pending: Option<&Value>,
+        redirect_uri: Option<&str>,
+    ) -> Result<(), String> {
+        let cfg = self
+            .oauth_config(provider_id)
+            .ok_or_else(|| format!("'{provider_id}' has no plugin OAuth flow"))?;
+        let script = cfg
+            .script_for("complete")
+            .ok_or_else(|| format!("'{provider_id}' has no complete script"))?;
+        let mut ctx = self.oauth_action_ctx("complete", provider_id, token_path);
+        ctx["code"] = json!(code);
+        if let Some(uri) = redirect_uri {
+            ctx["redirect_uri"] = json!(uri);
+        }
+        if let Some(p) = pending {
+            ctx["pending"] = p.clone();
+        }
+        let resp = self
+            .execute_oauth_script(script, ctx, cfg.login_timeout_ms, &oauth_script_env(&cfg))
+            .await?;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("OAuth complete failed: {err}"));
+        }
+        self.invalidate_oauth_cache(provider_id);
+        Ok(())
     }
 
     /// Complete a pending manual (paste-code) plugin OAuth login: exchange the
@@ -2132,30 +2504,21 @@ impl PluginManager {
         let cfg = self
             .oauth_config(provider_id)
             .ok_or_else(|| format!("'{provider_id}' has no plugin OAuth flow"))?;
-        let script = cfg
-            .script_for("complete")
-            .ok_or_else(|| format!("'{provider_id}' has no complete script"))?;
         let token_path = cfg.token_path.to_string_lossy().to_string();
-        let mut ctx = self.oauth_action_ctx("complete", provider_id, &token_path);
-        ctx["code"] = json!(code);
-        if let Some(p) = &pending.plugin_pending {
-            ctx["pending"] = p.clone();
-        }
-        let resp = self
-            .execute_oauth_script(script, ctx, cfg.login_timeout_ms, &oauth_script_env(&cfg))
-            .await?;
-        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let err = resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(format!("OAuth complete failed: {err}"));
-        }
-        // Invalidate the cache so the next turn resolves the fresh token.
+        self.run_oauth_complete(
+            provider_id,
+            &token_path,
+            code,
+            pending.plugin_pending.as_ref(),
+            None,
+        )
+        .await
+    }
+
+    fn invalidate_oauth_cache(&self, provider_id: &str) {
         if let Ok(mut cache) = self.token_cache.lock() {
             cache.remove(provider_id);
         }
-        Ok(())
     }
 
     /// Build the base context JSON passed to every OAuth script invocation
@@ -3159,6 +3522,11 @@ fn load_oauth_entry(
             ));
         }
     }
+    let detect_path = entry
+        .detect_path
+        .as_deref()
+        .map(resolve_oauth_detect_path)
+        .transpose()?;
     Ok(PluginOauthConfig {
         provider_id,
         label,
@@ -3167,11 +3535,45 @@ fn load_oauth_entry(
         description: entry.description.unwrap_or_default(),
         headers: entry.headers,
         token_path,
+        detect_path,
         scripts,
         login_timeout_ms: entry.login_timeout_ms.unwrap_or(120_000),
         token_timeout_ms: entry.token_timeout_ms.unwrap_or(30_000),
         env_passthrough: entry.env_passthrough,
     })
+}
+
+/// Resolve the small, intentionally constrained external-credential path
+/// surface used by first-party OAuth bundles. `$CODEX_HOME/auth.json` follows
+/// the official Codex CLI location and honors CODEX_HOME when it is set;
+/// `~/.codex/auth.json` is accepted as the equivalent spelling. Other paths
+/// are relative to the user's home and may not escape it with `..` or use an
+/// absolute path.
+fn resolve_oauth_detect_path(raw: &str) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("oauth detect_path must not be empty".into());
+    }
+    if raw == "$CODEX_HOME/auth.json" || raw == "~/.codex/auth.json" {
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| crate::config::home_dir().map(|h| h.join(".codex")))
+            .ok_or("oauth detect_path needs HOME or CODEX_HOME to be set")?;
+        return Ok(codex_home.join("auth.json"));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(format!(
+            "oauth detect_path '{raw}' must be relative, $CODEX_HOME/auth.json, or ~/.codex/auth.json"
+        ));
+    }
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!("oauth detect_path '{raw}' may not contain '..'"));
+        }
+    }
+    let home = crate::config::home_dir().ok_or("oauth detect_path needs HOME to be set")?;
+    Ok(home.join(path))
 }
 
 /// Cross-platform check for whether a hook script is executable.
@@ -3200,6 +3602,46 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Normalize the plugin login flow name while keeping the manifest contract
+/// forwards-compatible with providers that call this `auto` or `device_code`.
+fn oauth_flow(resp: &Value, default: &str) -> String {
+    resp.get("flow")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn oauth_flow_is_auto(resp: &Value) -> bool {
+    resp.get("auto_complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || matches!(
+            oauth_flow(resp, "").as_str(),
+            "poll" | "auto" | "device_code" | "device-code"
+        )
+}
+
+fn oauth_flow_is_existing(resp: &Value) -> bool {
+    resp.get("ok").and_then(|v| v.as_bool()) != Some(false)
+        && matches!(
+            oauth_flow(resp, "").as_str(),
+            "already_authenticated" | "already-authenticated" | "existing" | "authenticated"
+        )
+}
+
+fn oauth_login_error(resp: &Value) -> Option<String> {
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(false) {
+        return None;
+    }
+    Some(
+        resp.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error")
+            .to_string(),
+    )
 }
 
 /// Parse optional `"headers": [["Name","value"], …]` from a plugin `token`
@@ -3363,22 +3805,15 @@ fn oauth_script_env(cfg: &PluginOauthConfig) -> Vec<(String, String)> {
 /// re-fetch the same GitHub Release source zip (or a newer tag).
 const PLUGIN_SOURCE_META_FILE: &str = ".catalyst-plugin-source.json";
 
-/// Written when the user installs a workspace-scoped plugin via
-/// `/plugin-install … workspace`. Scan loads these even without
-/// `--trust-project-plugins` (that flag only gates repo-shipped plugins).
-const PLUGIN_USER_INSTALLED_MARKER: &str = ".catalyst-plugin-user-installed";
-
+// Workspace installs are recorded in the user-owned trust store. No marker
+// file is written into the project tree because a repository must not be able
+// to self-authorize its own plugin hooks.
+#[cfg(test)]
 fn write_user_installed_marker(dest_dir: &Path) {
-    let marker = dest_dir.join(PLUGIN_USER_INSTALLED_MARKER);
-    if let Err(e) = std::fs::write(
-        &marker,
-        "{\"installed_by\":\"plugin-install\",\"scope\":\"workspace\"}\n",
-    ) {
-        eprintln!(
-            "[plugins] warning: could not write {}: {e}",
-            PLUGIN_USER_INSTALLED_MARKER
-        );
-    }
+    let _ = std::fs::write(
+        dest_dir.join(".catalyst-plugin-user-installed"),
+        "test-only user install marker\n",
+    );
 }
 
 /// A parsed GitHub plugin install source. Installs always go through a
@@ -4334,6 +4769,67 @@ mod tests {
     }
 
     #[test]
+    fn trust_decisions_gate_project_plugins() {
+        // Undecided project plugins are skipped and reported as pending;
+        // a "trust" decision loads them, a "deny" keeps them gated and the
+        // decision is recorded for the prompt.
+        let tmp = TmpDir::new("trust_gate");
+        let plugins_dir = tmp.path.join(".catalyst-code/plugins");
+        for (name, version) in [("shady", "1.0.0"), ("linter", "2.1.0")] {
+            let plugin_dir = plugins_dir.join(name);
+            fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+            write_hook_script(&plugin_dir.join("hooks"), "hook.sh", r#"{"allow":true}"#, 0);
+            write_plugin(
+                &plugin_dir,
+                name,
+                version,
+                r#"{"pre_bash":{"script":"hooks/hook.sh"}}"#,
+            );
+        }
+
+        // Undecided: both skipped, both pending, nothing loaded.
+        let mgr = PluginManager::new(plugins_dir.clone(), tmp.path.clone(), false);
+        assert!(mgr.list().is_empty());
+        let pending = mgr.pending_trust_plugins();
+        let names: Vec<String> = pending.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["linter".to_string(), "shady".to_string()]);
+        assert!(pending.iter().all(|p| p.decision.is_none()));
+        assert_eq!(mgr.skipped_project_plugins().len(), 2);
+
+        // Trust "shady": it loads immediately; "linter" stays gated + pending.
+        let mut decisions = HashMap::new();
+        decisions.insert("shady".to_string(), "trust".to_string());
+        mgr.apply_trust_decisions(decisions).unwrap();
+        assert!(mgr.list().contains_key("shady"));
+        assert!(!mgr.list().contains_key("linter"));
+        let pending = mgr.pending_trust_plugins();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "linter");
+
+        // Deny "linter": now nothing is pending and nothing new loads.
+        let mut decisions = HashMap::new();
+        decisions.insert("linter".to_string(), "deny".to_string());
+        mgr.apply_trust_decisions(decisions).unwrap();
+        assert!(mgr.pending_trust_plugins().is_empty());
+        assert!(!mgr.list().contains_key("linter"));
+        assert!(mgr.list().contains_key("shady"));
+        // Trust prompt JSON still lists denied plugins and trusted loaded
+        // plugins so either decision can be changed later.
+        let prompt = mgr.trust_prompt_json();
+        assert_eq!(prompt.len(), 2);
+        let linter = prompt.iter().find(|p| p["name"] == "linter").unwrap();
+        assert_eq!(linter["decision"], "deny");
+        let shady = prompt.iter().find(|p| p["name"] == "shady").unwrap();
+        assert_eq!(shady["decision"], "trust");
+        // Re-deciding linter to trust loads it.
+        let mut decisions = HashMap::new();
+        decisions.insert("linter".to_string(), "trust".to_string());
+        mgr.apply_trust_decisions(decisions).unwrap();
+        assert!(mgr.list().contains_key("linter"));
+        assert!(mgr.pending_trust_plugins().is_empty());
+    }
+
+    #[test]
     fn global_user_plugins_load_alongside_project() {
         // A plugin in the user (global) plugins dir loads regardless of
         // trust_project (it lives outside the workspace), and a same-named
@@ -4396,6 +4892,24 @@ mod tests {
             mgr3.skipped_project_plugins(),
             vec!["vision-fake".to_string()]
         );
+    }
+
+    #[test]
+    fn explicit_global_directory_is_trusted_when_nested_in_workspace() {
+        let ws = TmpDir::new("nested_global_ws");
+        let global = ws.path.join(".catalyst-code/global-plugins");
+        let project = ws.path.join(".catalyst-code/plugins");
+        let pdir = global.join("codex");
+        fs::create_dir_all(&pdir).unwrap();
+        write_manifest(
+            &pdir,
+            r#"{"name":"codex","version":"0.1.0","description":"first-party"}"#,
+        );
+
+        let mgr =
+            PluginManager::new_with_user_plugins_dir(project, Some(global), ws.path.clone(), false);
+        assert!(mgr.list().contains_key("codex"));
+        assert!(mgr.skipped_project_plugins().is_empty());
     }
 
     #[test]
@@ -4482,10 +4996,7 @@ mod tests {
             .install(&src.path, PluginInstallScope::Workspace)
             .unwrap();
         assert!(project_plugins.join("scoped/plugin.json").exists());
-        assert!(project_plugins
-            .join("scoped")
-            .join(PLUGIN_USER_INSTALLED_MARKER)
-            .exists());
+        assert!(project_plugins.join("scoped/plugin.json").exists());
         assert_eq!(
             mgr.scope_of_path(&local.source_path),
             PluginInstallScope::Workspace
@@ -4526,8 +5037,7 @@ mod tests {
             .join(".catalyst-code/plugins/relplug/plugin.json")
             .exists());
         assert!(ws
-            .join(".catalyst-code/plugins/relplug")
-            .join(PLUGIN_USER_INSTALLED_MARKER)
+            .join(".catalyst-code/plugins/relplug/plugin.json")
             .exists());
 
         // Simulate restart: new manager, trust still off.
@@ -5491,6 +6001,47 @@ mod tests {
         assert!(oauth.script_for("complete").is_some());
         assert!(oauth.script_for("token").is_some());
         assert!(oauth.script_for("clear").is_some());
+    }
+
+    #[test]
+    fn oauth_login_supports_automatic_and_existing_flows() {
+        let poll = json!({"flow":"poll","auto_complete":true});
+        assert!(oauth_flow_is_auto(&poll));
+        assert!(!oauth_flow_is_existing(&poll));
+
+        let existing = json!({
+            "ok": true,
+            "flow": "already_authenticated"
+        });
+        assert!(oauth_flow_is_existing(&existing));
+        assert!(!oauth_flow_is_auto(&existing));
+
+        let failed = json!({
+            "ok": false,
+            "flow": "already_authenticated",
+            "error": "not signed in"
+        });
+        assert!(!oauth_flow_is_existing(&failed));
+        assert_eq!(oauth_login_error(&failed).as_deref(), Some("not signed in"));
+    }
+
+    #[test]
+    fn oauth_detect_path_resolves_codex_home_form() {
+        let tmp = TmpDir::new("oauth_detect_path");
+        let odir = tmp.path.join("oauth");
+        fs::create_dir_all(&odir).unwrap();
+        write_hook_script(&odir, "oauth.sh", r#"{"access_token":null}"#, 0);
+        write_manifest(
+            &tmp.path,
+            r#"{"name":"codex","version":"0.1.0","oauth":{
+               "provider_id":"codex","base_url":"https://chatgpt.com/backend-api/codex",
+               "detect_path":".codex/auth.json","script":"oauth/oauth.sh"
+            }}"#,
+        );
+        let plugin = PluginManager::load_plugin_from_dir(&tmp.path).unwrap();
+        let oauth = plugin.oauth.unwrap();
+        let home = crate::config::home_dir().expect("test HOME");
+        assert_eq!(oauth.detect_path, Some(home.join(".codex/auth.json")));
     }
 
     #[test]

@@ -28,8 +28,10 @@ pub struct OAuthPrompt {
     pub message: String,
 }
 
-/// Pending state for the manual-code OAuth flow — held in `State` until the
-/// user pastes the authorization code back via the `oauth_code` command.
+/// Pending state for a plugin OAuth flow that explicitly chose manual code
+/// completion — held in `State` until the user pastes the authorization code
+/// back via the `oauth_code` command. Automatic device-code flows never create
+/// this state: the plugin is polled during `/login`.
 #[derive(Clone)]
 pub struct PendingOauth {
     /// Provider id (plugin `provider_id`) this login is for.
@@ -62,7 +64,7 @@ impl PendingOauth {
 pub enum LoginOutcome {
     /// Login finished — token stored; provider is ready.
     Done,
-    /// Manual / device flow: URL already emitted; wait for `/oauth-code`.
+    /// Manual flow: URL already emitted; wait for `/oauth-code`.
     AwaitingCode { pending: PendingOauth },
 }
 

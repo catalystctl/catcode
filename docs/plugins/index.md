@@ -267,8 +267,8 @@ The plugin supplies a script that handles four actions dispatched by an
 
 | Action | Purpose |
 |--------|---------|
-| `login` | Start the login flow (returns URL + optional auto-open flag) |
-| `complete` | Complete a manual paste-code flow |
+| `login` | Start the login flow (web, manual, or automatic device polling) |
+| `complete` | Complete a pasted code, redirect, or automatic device poll |
 | `token` | Resolve or refresh the access token |
 | `clear` | Clear stored credentials |
 
@@ -278,9 +278,10 @@ The script receives:
 { "action": "token", "provider_id": "my-service", "token_path": "/abs/path/to/token.json" }
 ```
 
-The harness owns the loopback redirect server (browser flow) and the
-`/oauth-code` paste path (manual flow). The plugin owns the token's on-disk
-format.
+The harness owns the loopback redirect server (browser flow), can invoke
+`complete` immediately for an automatic device-code flow, and provides the
+`/oauth-code` paste path for providers that explicitly choose manual flow. The
+plugin owns the token's on-disk format.
 
 Once registered, the provider appears in the `/login` picker and works like any
 built-in provider: the harness enriches outgoing API requests with the resolved
@@ -363,7 +364,18 @@ By default, **project-scoped plugins** (shipped inside a repository's
 into from automatically running hook scripts (which see every tool's arguments,
 including bash commands and file contents) with your privileges.
 
-To enable them, pass:
+When the harness starts in a project that has untrusted plugins with **no
+recorded decision**, it auto-opens the **plugin trust modal**: each plugin can
+be marked **trust** or **deny**, and `Apply & close` records the decisions and
+loads the trusted plugins immediately. Decisions are persisted per project in
+the user-owned `~/.config/catalyst-code/plugin-trust.json` (never inside the
+repo, so a repository cannot self-trust its hooks by committing a file), which
+means the modal does **not** re-appear automatically on later loads. Re-open it
+any time with `/plugin-trust` (or the `plugin_trust_prompt` protocol command)
+to change a decision — re-deciding a denied plugin to trust loads it on the
+spot.
+
+You can also trust everything up front, bypassing the modal:
 
 ```bash
 catcode --trust-project-plugins
@@ -380,8 +392,8 @@ under `~/.catalyst-code/plugins/` also load unconditionally.
 
 Disabled plugins remain on disk but are not invoked.
 
-**Source:** `config.rs` line 170, `PluginManager::scan_dir` (line 718) in
-`core/src/plugins.rs`.
+**Source:** `config.rs` line 170, `PluginManager::scan_dir` in
+`core/src/plugins.rs`; trust store `core/src/plugin_trust.rs`.
 
 ---
 
@@ -395,6 +407,8 @@ Disabled plugins remain on disk but are not invoked.
 | `/plugin-disable <name>` | `disable_plugin { name }` | Disable a plugin without removing it. |
 | `/plugin-remove <name>` | `remove_plugin { name }` | Remove a plugin entirely (from disk). |
 | `/plugin-reload` | `reload_plugins` | Re-scan plugin directories (preserves enabled/disabled flags). |
+| `/plugin-trust` | `plugin_trust_prompt` | Re-open the plugin trust modal (trust/deny untrusted project plugins). |
+| — | `plugin_trust_decisions` | Record trust decisions (name → `"trust"` \| `"deny"`) and load trusted plugins. |
 | — | `plugin_command { name, args }` | Run a plugin-declared slash command programmatically. |
 | — | `list_plugin_commands` | List all plugin-declared slash commands. |
 

@@ -464,8 +464,9 @@ No MCP required — hooks are the substrate.
 
 Plugins can declare an `oauth` block in `plugin.json`, enabling subscription
 logins (ChatGPT Plus/Pro, Claude Pro/Max, SuperGrok, etc.). The harness owns
-`/login` / `/oauth-code` loopback + paste UX; the plugin script owns the
-authorize/token/refresh logic.
+`/login`, loopback redirects, optional automatic device polling, and the
+`/oauth-code` paste UX; the plugin script owns the authorize/token/refresh
+logic.
 
 **Source:** `core/src/plugins.rs` (5155 lines), `core/src/oauth.rs`,
 `.catalyst-code/plugins/` directory, `docs/examples/plugins/` directory.

@@ -52,8 +52,12 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             });
         }
 
+        let kimi = crate::provider::is_kimi(&input.provider.base_url);
+        let deepseek = crate::provider::is_deepseek(&input.provider.base_url);
         let supports_reasoning = crate::provider::is_umans(&input.provider.base_url)
-            || crate::provider::is_cursor_bridge(&input.provider.base_url);
+            || crate::provider::is_cursor_bridge(&input.provider.base_url)
+            || kimi
+            || deepseek;
         let mut notices = Vec::new();
         if supports_reasoning {
             let resolved =
@@ -64,7 +68,24 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     input.reasoning_effort, input.model, resolved
                 ));
             }
-            body["reasoning_effort"] = json!(resolved);
+            if kimi || deepseek {
+                // Kimi and DeepSeek use a DUAL thinking mechanism: top-level
+                // `reasoning_effort` AND `thinking: {type: enabled|disabled}`
+                // are sent together. Gate on/off via the ORIGINAL requested
+                // effort — `resolve_effort` clamps "none" up to a supported
+                // level for leveled models, so the resolved value can't tell
+                // us the user wants thinking OFF.
+                let off = input.reasoning_effort.eq_ignore_ascii_case("none")
+                    || input.reasoning_effort.is_empty();
+                if off {
+                    body["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    body["reasoning_effort"] = json!(resolved);
+                    body["thinking"] = json!({ "type": "enabled" });
+                }
+            } else {
+                body["reasoning_effort"] = json!(resolved);
+            }
         }
 
         Ok(BuiltProviderRequest {
@@ -132,5 +153,108 @@ mod tests {
         assert_eq!(built.url, "https://example.com/v1/chat/completions");
         assert_eq!(built.body["tools"][0]["function"]["name"], "a_tool");
         assert!(built.body.get("reasoning_effort").is_none());
+    }
+
+    fn kimi_provider() -> ResolvedProvider {
+        provider("https://api.kimi.com/coding/v1")
+    }
+
+    #[test]
+    fn kimi_injects_dual_thinking_when_effort_set() {
+        // Kimi's dual mechanism: reasoning_effort AND thinking.type together.
+        let levels = ["low".to_string(), "medium".to_string(), "high".to_string()];
+        let provider = kimi_provider();
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "kimi-for-coding",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "high",
+            thinking_levels: &levels,
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["reasoning_effort"], json!("high"));
+        assert_eq!(built.body["thinking"], json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn kimi_disables_thinking_when_effort_none() {
+        // resolve_effort clamps "none" up to a supported level for leveled
+        // models, so the gate uses the ORIGINAL effort: "none" must send
+        // thinking.type=disabled and NOT send reasoning_effort.
+        let levels = ["low".to_string(), "medium".to_string(), "high".to_string()];
+        let provider = kimi_provider();
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "kimi-for-coding",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &levels,
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert!(built.body.get("reasoning_effort").is_none());
+        assert_eq!(built.body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn non_vendor_openai_endpoint_sends_no_thinking_field() {
+        // A vanilla OpenAI-compatible endpoint must not get vendor-specific
+        // thinking fields (they would 400) nor reasoning_effort.
+        let provider = provider("https://example.com/v1");
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "high",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert!(built.body.get("reasoning_effort").is_none());
+        assert!(built.body.get("thinking").is_none());
+    }
+
+    fn deepseek_provider() -> ResolvedProvider {
+        provider("https://api.deepseek.com")
+    }
+
+    #[test]
+    fn deepseek_injects_vendor_thinking_fields_when_effort_set() {
+        let levels = ["high".to_string(), "max".to_string()];
+        let provider = deepseek_provider();
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "deepseek-v4-flash",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "max",
+            thinking_levels: &levels,
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["reasoning_effort"], json!("max"));
+        assert_eq!(built.body["thinking"], json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn deepseek_disables_thinking_when_effort_none() {
+        let levels = ["high".to_string(), "max".to_string()];
+        let provider = deepseek_provider();
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "deepseek-v4-flash",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &levels,
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert!(built.body.get("reasoning_effort").is_none());
+        assert_eq!(built.body["thinking"], json!({ "type": "disabled" }));
     }
 }

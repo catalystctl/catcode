@@ -47,6 +47,8 @@
 {"type":"plugin_removed","protocol_version":2}
 {"type":"plugin_status","protocol_version":2}
 {"type":"plugins_list","protocol_version":2}
+{"type":"plugin_trust_applied","protocol_version":2,"trusted":[],"denied":[],"loaded":0}
+{"type":"plugin_trust_prompt","protocol_version":2,"plugins":[]}
 {"type":"protocol_hello","protocol_version":2}
 {"type":"provider_changed","protocol_version":2}
 {"type":"provider_presets","protocol_version":2}

@@ -2432,11 +2432,18 @@ async fn stream_with_fallback(
         // Per-candidate max_tokens (Anthropic requires it; OpenAI servers ignore
         // it). Looked up from the registry so a fallback model with a smaller
         // output cap doesn't get an over-large request that the API rejects.
-        let max_tokens = models
-            .iter()
-            .find(|m| m.id == *model)
-            .map(|m| m.max_tokens)
-            .unwrap_or(8_192);
+        let max_tokens = if let Some(st) = st {
+            st.model_info_for(model)
+                .await
+                .map(|m| m.max_tokens)
+                .unwrap_or(8_192)
+        } else {
+            models
+                .iter()
+                .find(|m| m.id == *model)
+                .map(|m| m.max_tokens)
+                .unwrap_or(8_192)
+        };
         // Multi-provider: route each candidate to its owning endpoint when we
         // have State; otherwise keep the inherited parent provider.
         let resolved;

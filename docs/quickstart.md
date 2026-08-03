@@ -84,6 +84,7 @@ A provider picker appears. Select one of the built-in presets:
 | **Umans** | API key from `api.code.umans.ai` (set `UMANS_API_KEY`) |
 | **OpenCode Go** | API key from `opencode.ai` (set `OPENCODE_GO_API_KEY`) |
 | **OpenRouter** | API key from `openrouter.ai` (set `OPENROUTER_API_KEY`) |
+| **DeepSeek** | API key from `platform.deepseek.com` (set `DEEPSEEK_API_KEY`) |
 
 If the corresponding environment variable is already set, the TUI logs you in
 automatically ��� no typing required.
@@ -95,15 +96,16 @@ shows every provider's models tagged by prefix (`[umans]`, `[opencode-go]`,
 ### Subscription accounts (OAuth)
 
 ChatGPT Plus/Pro, Claude Pro/Max, SuperGrok, and similar subscription logins
-use **plugins with OAuth**. Install the plugin first:
+use **plugins with OAuth**. The first-party Codex provider is staged
+automatically; start it with:
 
 ```text
-/plugin-install <source> global
-/login <preset>
+/login codex
 ```
 
-The harness handles the `/login` / `/oauth-code` flow; the plugin's OAuth
-scripts handle authorize/token/refresh.
+The harness handles `/login`, including automatic device-code polling when a
+provider declares it; manual providers may still use `/oauth-code`. The
+plugin's OAuth scripts handle authorize/token/refresh.
 
 ---
 

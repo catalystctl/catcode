@@ -21,7 +21,7 @@ async fn discover_models_anthropic(
     // this provider's protocol (Anthropic /v1/messages here). See
     // opencode_go_discover_models for the family-prefix partition + caching.
     if is_opencode_go(&provider.base_url) {
-        return opencode_go_discover_models(client, provider, cache_key, false).await;
+        return opencode_go_discover_models(client, provider, cache_key, false, force_live).await;
     }
     if !force_live {
         if let Some(models) = read_models_cache(cache_key) {
@@ -306,6 +306,9 @@ pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [M
         if let Some(max) = ov.max_tokens {
             m.max_tokens = max;
         }
+        if ov.max_tokens.is_none() && m.max_tokens >= m.context_window {
+            m.max_tokens = xai_default_max_tokens(m.context_window);
+        }
         if let Some(r) = ov.reasoning {
             m.reasoning = r;
         }
@@ -325,9 +328,13 @@ pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [M
 /// Cache key: base URL (trailing slash normalized) + provider kind.
 fn provider_cache_key(provider: &ResolvedProvider) -> String {
     format!(
-        "{}|{}",
+        "{}|{}|{}",
         provider.base_url.trim_end_matches('/'),
-        provider.kind.as_str()
+        provider.kind.as_str(),
+        provider
+            .models_endpoint
+            .as_deref()
+            .unwrap_or(OPENAI_MODELS_PATH)
     )
 }
 
@@ -342,7 +349,20 @@ async fn discover_models_openai(
     // this provider's protocol (OpenAI chat/completions here). See
     // opencode_go_discover_models for the family-prefix partition + caching.
     if is_opencode_go(&provider.base_url) {
-        return opencode_go_discover_models(client, provider, cache_key, true).await;
+        return opencode_go_discover_models(client, provider, cache_key, true, force_live).await;
+    }
+    // Kimi (Moonshot) Code: a curated capability table + live `/models` list
+    // (the endpoint returns ids + `context_length` but not reasoning/vision
+    // flags). See `kimi_discover_models`.
+    if is_kimi(&provider.base_url) {
+        return kimi_discover_models(client, provider, cache_key, force_live).await;
+    }
+    // DeepSeek's official `/models` endpoint is OpenAI-shaped but only
+    // returns ids and ownership. Use the live catalog for automatic model
+    // updates, then fill capabilities from the curated DeepSeek table and
+    // models.dev instead of the generic OpenAI defaults.
+    if is_deepseek(&provider.base_url) {
+        return deepseek_discover_models(client, provider, cache_key, force_live).await;
     }
     // 1. Try disk cache (fresh: < 8 hours old). Skipped on a forced live refresh
     //    (the startup background check) so newly-added models are picked up every
@@ -478,7 +498,8 @@ const MODELS_CACHE_TTL: u64 = 28800;
 // v7: xAI models parse live `context_length` / vision from `/models` +
 // `/language-models` (previously hardcoded wrong windows for Grok).
 // v8: Antigravity Gemini 3 + Claude-via-Antigravity catalog.
-pub(crate) const MODELS_CACHE_VERSION: u64 = 9;
+// v10: DeepSeek/Kimi provider-specific discovery and capability metadata.
+pub(crate) const MODELS_CACHE_VERSION: u64 = 10;
 
 /// True when a parsed cache object matches the current schema version. Pure
 /// (no disk) so the version gate can be unit-tested.
@@ -757,6 +778,7 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
         .or_else(|| m.get("context_window"))
         .or_else(|| m.get("max_context_window"))
         .or_else(|| m.get("max_model_len"))
+        .or_else(|| m.get("max_input_tokens"))
         .and_then(|v| v.as_u64())
         .filter(|&c| c > 0)
     {
@@ -774,6 +796,11 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
         .filter(|&c| c > 0)
     {
         info.max_tokens = max.min(u32::MAX as u64) as u32;
+    }
+    // Keep the advertised generation budget below the context window after
+    // applying both live context and output-limit fields.
+    if info.max_tokens >= info.context_window {
+        info.max_tokens = xai_default_max_tokens(info.context_window);
     }
     // Image input pricing / modality hints (xAI, some gateways).
     if m.get("prompt_image_token_price")
@@ -873,8 +900,16 @@ fn is_xai_chat_model_entry(m: &Value) -> bool {
 /// Default max output tokens when the vendor does not report one. Keeps a
 /// comfortable generation budget while leaving headroom under the context window.
 fn xai_default_max_tokens(context_window: u32) -> u32 {
-    let headroom = context_window.saturating_sub(4_096).max(8_192);
-    headroom.min(65_536)
+    if context_window <= 1 {
+        return 1;
+    }
+    // Reserve a quarter of the context for the prompt and cap the default
+    // output budget for providers that do not publish one. Never return a
+    // value equal to or above the context window, even for tiny local models.
+    (context_window.saturating_mul(3) / 4)
+        .max(1)
+        .min(65_536)
+        .min(context_window - 1)
 }
 
 /// Curated xAI Grok capabilities used as the base before live `/models` fields
@@ -1295,6 +1330,20 @@ fn endpoint_host(base_url: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// True if the base URL points at the Kimi (Moonshot) Code endpoint
+/// (`https://api.kimi.com/coding/v1`). Used to route discovery through the
+/// curated `kimi_model_caps` table + live `/models` list.
+pub fn is_kimi(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.kimi.com"
+}
+
+/// True if the base URL points at DeepSeek's official API. The endpoint uses
+/// the standard OpenAI `/models` response shape but does not publish model
+/// limits in that response.
+pub fn is_deepseek(base_url: &str) -> bool {
+    endpoint_host(base_url) == "api.deepseek.com"
+}
+
 /// Capabilities for an OpenCode Go model id. The OpenCode Go `/v1/models`
 /// endpoint returns only ids (no context window / max tokens / reasoning /
 /// vision), and does NOT indicate which wire protocol each model uses — that
@@ -1515,10 +1564,13 @@ pub(crate) async fn opencode_go_discover_models(
     provider: &ResolvedProvider,
     cache_key: &str,
     openai: bool,
+    force_live: bool,
 ) -> Vec<ModelInfo> {
-    // 1. Fresh disk cache (< 8h TTL).
-    if let Some(models) = read_models_cache(cache_key) {
-        return models;
+    // 1. Fresh disk cache (< 8h TTL), unless this is an explicit refresh.
+    if !force_live {
+        if let Some(models) = read_models_cache(cache_key) {
+            return models;
+        }
     }
     // 2. Fetch the live OpenAI-style /v1/models list. The endpoint serves every
     //    model here regardless of wire protocol; auth is optional (the list is
@@ -1574,6 +1626,255 @@ pub(crate) fn opencode_go_anthropic_models() -> Vec<ModelInfo> {
     opencode_go_fallback_models(false)
 }
 
+/// Discover Kimi (Moonshot) Code models from the live `/models` endpoint,
+/// applying curated capabilities for known ids. Mirrors the OpenCode Go
+/// pattern: fresh cache → live fetch → stale cache → curated fallback. The
+/// live list drives auto-update (new Kimi models appear as Moonshot ships
+/// them); the curated `kimi_model_caps` guarantees correct reasoning/vision
+/// for known models regardless of what `/models` reports.
+pub(crate) async fn kimi_discover_models(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    cache_key: &str,
+    force_live: bool,
+) -> Vec<ModelInfo> {
+    if !force_live {
+        if let Some(models) = read_models_cache(cache_key) {
+            return models;
+        }
+    }
+    let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
+    let mut req = client.get(&url).timeout(Duration::from_secs(8));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.bearer_auth(k);
+    }
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
+    let live = match req.send().await {
+        Ok(r) if r.status().is_success() => {
+            kimi_parse_models_list(&r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+        _ => Vec::new(),
+    };
+    if !live.is_empty() {
+        write_models_cache(cache_key, &live);
+        return live;
+    }
+    read_models_cache_stale(cache_key).unwrap_or_else(kimi_fallback_models)
+}
+
+/// Parse Kimi's OpenAI-style `/models` list (`{data:[{id,...}]}`), mapping each
+/// id through the curated `kimi_model_caps` and overlaying any vendor-reported
+/// fields (e.g. `context_length`).
+fn kimi_parse_models_list(data: &Value) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = m
+                .get("name")
+                .or_else(|| m.get("display_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let mut info = kimi_model_caps(&id, &name);
+            apply_live_model_fields(m, &mut info);
+            Some(info)
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
+/// The known Kimi Code model ids + display names. The live `/models` endpoint
+/// is authoritative for the id list (auto-update); this supplies the display
+/// name + offline fallback.
+fn kimi_known_models() -> &'static [(&'static str, &'static str)] {
+    &[("kimi-for-coding", "Kimi for Coding")]
+}
+
+/// Capabilities for a Kimi (Moonshot) Code model id. `kimi-for-coding`
+/// (256K context, dual thinking + vision) is curated; unknown ids (a new Kimi
+/// release the table hasn't caught up to) fall back to conservative defaults
+/// that still advertise reasoning + vision so thinking/image turns aren't
+/// silently disabled. Thinking levels are `[low, medium, high]` — Kimi's
+/// supported `reasoning_effort` values (per the official `kimi` CLI).
+fn kimi_model_caps(id: &str, name: &str) -> ModelInfo {
+    let l = id.to_ascii_lowercase();
+    let (context_window, max_tokens, vision) = if l.contains("kimi-for-coding") {
+        (262_144, 32_000, true)
+    } else {
+        (200_000, 8_192, true)
+    };
+    ModelInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        reasoning: true,
+        context_window,
+        max_tokens,
+        thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+        vision,
+        ..Default::default()
+    }
+}
+
+/// Hardcoded curated Kimi model list — the offline fallback when the live
+/// `/models` endpoint is unreachable. Derived from `kimi_known_models`.
+fn kimi_fallback_models() -> Vec<ModelInfo> {
+    kimi_known_models()
+        .iter()
+        .map(|(id, name)| kimi_model_caps(id, name))
+        .collect()
+}
+
+/// Discover DeepSeek models from the live official `/models` endpoint. The
+/// endpoint is the source of truth for model ids, while the curated table plus
+/// models.dev supply the capability details that DeepSeek does not return.
+pub(crate) async fn deepseek_discover_models(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    cache_key: &str,
+    force_live: bool,
+) -> Vec<ModelInfo> {
+    if !force_live {
+        if let Some(models) = read_models_cache(cache_key) {
+            return models;
+        }
+    }
+    let url = format!("{}{OPENAI_MODELS_PATH}", provider.base_url);
+    let mut req = client.get(&url).timeout(Duration::from_secs(8));
+    if let Some(k) = provider.api_key.as_deref() {
+        req = req.bearer_auth(k);
+    }
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
+    let mut live = match req.send().await {
+        Ok(r) if r.status().is_success() => {
+            deepseek_parse_models_list(&r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+        _ => Vec::new(),
+    };
+    if !live.is_empty() {
+        // DeepSeek's list endpoint intentionally omits context/output limits.
+        // Enrich unknown/new ids from the shared registry while preserving the
+        // official/curated values for models we know exactly.
+        if let Some(dev) = crate::models_dev::fetch_models_dev(client).await {
+            crate::models_dev::enrich_models(&mut live, &dev, &provider.base_url);
+        }
+        write_models_cache(cache_key, &live);
+        return live;
+    }
+    read_models_cache_stale(cache_key).unwrap_or_else(deepseek_fallback_models)
+}
+
+/// Parse DeepSeek's OpenAI-style `/models` list (`{data:[{id,owned_by}]}`).
+/// DeepSeek currently returns no capability fields, so known ids use the
+/// curated table and unknown ids remain eligible for models.dev enrichment.
+fn deepseek_parse_models_list(data: &Value) -> Vec<ModelInfo> {
+    let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = m
+                .get("name")
+                .or_else(|| m.get("display_name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| deepseek_display_name(&id));
+            let mut info = deepseek_model_caps(&id, &name);
+            apply_live_model_fields(m, &mut info);
+            Some(info)
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|m| seen.insert(m.id.clone()));
+    out
+}
+
+/// The current official DeepSeek model ids used for the offline fallback.
+/// The live list remains authoritative, so a newly published id appears on
+/// the next refresh without a code change.
+fn deepseek_known_models() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+        ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+    ]
+}
+
+/// Curated DeepSeek capability details. DeepSeek V4 supports both thinking and
+/// non-thinking modes, has a 1M context window, and allows up to 384K output.
+/// Legacy ids are retained only when a still-serving endpoint reports them;
+/// they are intentionally not part of the offline fallback after retirement.
+fn deepseek_model_caps(id: &str, name: &str) -> ModelInfo {
+    let l = id.to_ascii_lowercase();
+    let (context_window, max_tokens, reasoning, thinking_levels) = if l.contains("v4") {
+        (1_000_000, 384_000, true, vec!["high".into(), "max".into()])
+    } else if l.contains("reasoner") {
+        (131_072, 65_536, true, vec!["high".into(), "max".into()])
+    } else if l == "deepseek-chat" {
+        (131_072, 8_192, false, Vec::new())
+    } else {
+        // Unknown ids are deliberately generic so models.dev can fill them in
+        // without a curated entry masking its reasoning/context metadata.
+        (200_000, 8_192, false, Vec::new())
+    };
+    ModelInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        reasoning,
+        context_window,
+        max_tokens,
+        thinking_levels,
+        vision: false,
+        ..Default::default()
+    }
+}
+
+/// Display name for a model id when DeepSeek's `/models` response only gives
+/// the slug. Known ids use the documented names; new ids get a readable label.
+fn deepseek_display_name(id: &str) -> String {
+    let lower = id.to_ascii_lowercase();
+    if let Some((_, name)) = deepseek_known_models()
+        .iter()
+        .find(|(known, _)| *known == lower)
+    {
+        return name.to_string();
+    }
+    let suffix = lower.strip_prefix("deepseek-").unwrap_or(&lower);
+    let title = suffix
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "DeepSeek".to_string()
+    } else {
+        format!("DeepSeek {title}")
+    }
+}
+
+fn deepseek_fallback_models() -> Vec<ModelInfo> {
+    deepseek_known_models()
+        .iter()
+        .map(|(id, name)| deepseek_model_caps(id, name))
+        .collect()
+}
+
 /// Curated fallback models for an OpenAI-compatible endpoint that served no
 /// list at all. Gemini host → Gemini models; xAI host → Grok models; otherwise
 /// the Umans default list.
@@ -1588,6 +1889,12 @@ fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
     }
     if is_xai_endpoint(base_url) {
         return xai_fallback_models();
+    }
+    if is_kimi(base_url) {
+        return kimi_fallback_models();
+    }
+    if is_deepseek(base_url) {
+        return deepseek_fallback_models();
     }
     fallback_models()
 }
@@ -1664,4 +1971,127 @@ pub fn is_xai_endpoint(base_url: &str) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     host == "api.x.ai" || host == "x.ai" || host.ends_with(".x.ai")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kimi_endpoint_detection() {
+        assert!(is_kimi("https://api.kimi.com/coding/v1"));
+        assert!(is_kimi("https://api.kimi.com/v1"));
+        assert!(is_kimi("https://api.kimi.com:443/coding/v1"));
+        assert!(!is_kimi("https://api.openai.com/v1"));
+        // look-alike host must NOT match
+        assert!(!is_kimi("https://api.kimi.com.evil.com/v1"));
+    }
+
+    #[test]
+    fn kimi_model_caps_known_and_unknown() {
+        let m = kimi_model_caps("kimi-for-coding", "Kimi for Coding");
+        assert_eq!(m.id, "kimi-for-coding");
+        assert_eq!(m.context_window, 262_144);
+        assert_eq!(m.max_tokens, 32_000);
+        assert!(m.reasoning);
+        assert!(m.vision);
+        assert_eq!(m.thinking_levels, vec!["low", "medium", "high"]);
+
+        // Unknown id → conservative defaults (still reasoning + vision so
+        // thinking/image turns aren't silently disabled on a new release).
+        let u = kimi_model_caps("kimi-future-99", "Kimi Future 99");
+        assert!(u.reasoning);
+        assert!(u.vision);
+        assert_eq!(u.thinking_levels, vec!["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn kimi_parse_models_list_maps_ids_and_overlays_context() {
+        let data = json!({
+            "data": [
+                {"id": "kimi-for-coding"},
+                {"id": "kimi-future", "context_length": 1000000}
+            ]
+        });
+        let models = kimi_parse_models_list(&data);
+        assert_eq!(models.len(), 2);
+        let known = models.iter().find(|m| m.id == "kimi-for-coding").unwrap();
+        assert_eq!(known.context_window, 262_144);
+        let fut = models.iter().find(|m| m.id == "kimi-future").unwrap();
+        // context_length from the live list overrides the curated default.
+        assert_eq!(fut.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn kimi_fallback_models_curated() {
+        let models = kimi_fallback_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "kimi-for-coding");
+    }
+
+    #[test]
+    fn deepseek_endpoint_detection() {
+        assert!(is_deepseek("https://api.deepseek.com"));
+        assert!(is_deepseek("https://api.deepseek.com/v1"));
+        assert!(is_deepseek("https://api.deepseek.com:443/beta"));
+        assert!(!is_deepseek("https://api.deepseek.com.evil.com/v1"));
+        assert!(!is_deepseek("https://deepseek.com/v1"));
+    }
+
+    #[test]
+    fn deepseek_model_caps_include_current_thinking_details() {
+        let flash = deepseek_model_caps("deepseek-v4-flash", "DeepSeek V4 Flash");
+        assert_eq!(flash.context_window, 1_000_000);
+        assert_eq!(flash.max_tokens, 384_000);
+        assert!(flash.reasoning);
+        assert_eq!(flash.thinking_levels, vec!["high", "max"]);
+        assert!(!flash.vision);
+
+        // Unknown ids stay generic so models.dev can supply their real caps.
+        let future = deepseek_model_caps("deepseek-v5-future", "DeepSeek V5 Future");
+        assert_eq!(future.context_window, 200_000);
+        assert!(future.thinking_levels.is_empty());
+    }
+
+    #[test]
+    fn deepseek_parse_models_list_auto_names_and_deduplicates() {
+        let data = json!({
+            "object": "list",
+            "data": [
+                {"id": "deepseek-v4-flash", "owned_by": "deepseek"},
+                {"id": "deepseek-v4-flash", "owned_by": "deepseek"},
+                {"id": "deepseek-v5-future", "owned_by": "deepseek"}
+            ]
+        });
+        let models = deepseek_parse_models_list(&data);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "DeepSeek V4 Flash");
+        assert_eq!(models[1].name, "DeepSeek V5 Future");
+        assert_eq!(models[1].context_window, 200_000);
+    }
+
+    #[test]
+    fn deepseek_fallback_models_are_current_documented_ids() {
+        let models = deepseek_fallback_models();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+        );
+        assert!(models.iter().all(|m| m.context_window == 1_000_000));
+    }
+
+    #[test]
+    fn openai_shape_b_max_input_tokens_sets_context_window() {
+        let mut info = openai_model_caps("gateway-model", "Gateway Model");
+        apply_live_model_fields(
+            &json!({
+                "id": "gateway-model",
+                "max_input_tokens": 512000,
+                "max_output_tokens": 8192
+            }),
+            &mut info,
+        );
+        assert_eq!(info.context_window, 512_000);
+        assert_eq!(info.max_tokens, 8_192);
+    }
 }

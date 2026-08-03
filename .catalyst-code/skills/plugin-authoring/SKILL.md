@@ -539,8 +539,9 @@ hooks still fire (keyed on the tool name), and `pre_tool`/`post_tool` fire too.
 Built-in presets are API-key only. A plugin adds a subscription-OAuth provider
 for any vendor with no recompile. The plugin supplies ONE script that handles
 four actions (`login`, `complete`, `token`, `clear`); the harness owns the
-loopback redirect server (web flow) and the `/oauth-code` paste path
-(manual/device flow).
+loopback redirect server (web flow), can invoke `complete` immediately for an
+automatic device-code flow, and provides the `/oauth-code` paste path for
+manual flow.
 
 Working example: `~/catcode-chatgpt-provider` (ChatGPT Plus/Pro → Codex).
 Template: `docs/examples/plugins/grok-oauth`.
@@ -583,6 +584,9 @@ Fields:
   relative to `~/.config/catalyst-code/oauth/`. The plugin owns the token's
   on-disk format; the harness only checks existence (for the "logged in"
   status) and passes the absolute path to the script.
+- `detect_path` (optional): an external credential file used for cheap login
+  detection. `$CODEX_HOME/auth.json` and `~/.codex/auth.json` are supported;
+  the provider script remains responsible for importing its format.
 - `script` (required unless every action has an explicit override): the script
   handling ALL actions, dispatched by the `action` field in stdin.
 - `login_script` / `complete_script` / `token_script` (optional): per-action
@@ -609,13 +613,18 @@ harness already bound — embed it verbatim in your authorize URL). Output:
 ```json
 { "url": "https://auth.example.com/device?...", "code": "ABCD-EFGH",
   "message": "Open the URL and enter the code",
-  "flow": "web" | "manual",
+  "flow": "web" | "manual" | "poll" | "already_authenticated",
+  "auto_complete": true,
   "state": "<csrf>", "pending": { "verifier": "...", "device_id": "..." } }
 ```
 - `flow`: `"web"` = the harness waits for the loopback redirect (local
   machine); `"manual"` = the user pastes a code back via `/oauth-code`
-  (SSH/headless, or device-code flows). Honor `headless`: return `"manual"`
-  when there is no usable browser.
+  (SSH/headless, or a provider that requires manual completion); `"poll"`
+  or `"auto"` = the harness invokes `complete` immediately and waits while
+  the provider polls; `"already_authenticated"` = the provider found an
+  existing credential store and needs no browser flow. `auto_complete: true`
+  is an equivalent explicit marker. Honor `headless` when choosing between
+  web and manual; automatic polling works in either environment.
 - `state` (web flow): the CSRF state you put in the authorize URL, so the
   harness can verify the redirect.
 - `pending` (both flows): an opaque JSON blob you need to carry to `complete`
@@ -659,10 +668,10 @@ Output: `{ "ok": true }`.
 #### How it fits together
 
 - `/login <provider_id>`: the harness runs `login`, emits the URL as an
-  `oauth_prompt`, and either waits for the redirect (web) or stashes `pending`
-  and waits for `/oauth-code` (manual). On success it creates the provider
-  config (name = provider_id, your base_url/kind/headers, no api_key) and
-  refreshes `/models`.
+  `oauth_prompt`, and either waits for the redirect (web), invokes `complete`
+  immediately (automatic polling), or stashes `pending` for `/oauth-code`
+  (manual). On success it creates the provider config (name = provider_id,
+  your base_url/kind/headers, no api_key) and refreshes `/models`.
 - At turn + discovery time: the harness runs `token` (cached), injects the
   access token as `Authorization: Bearer`, merges any returned `headers`, and
   routes the turn to your `base_url` over your declared `kind`.

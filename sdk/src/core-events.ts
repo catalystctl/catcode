@@ -57,6 +57,8 @@ export const CORE_EVENT_TYPES = [
   "plugin_removed",
   "plugin_status",
   "plugins_list",
+  "plugin_trust_applied",
+  "plugin_trust_prompt",
   "protocol_hello",
   "provider_changed",
   "provider_presets",
@@ -184,6 +186,27 @@ export interface FileChangeEvent {
   tool: string;
   agent_id?: string;
   run_id?: string;
+}
+
+export interface PluginTrustEntry {
+  name: string;
+  version?: string;
+  description?: string;
+  path?: string;
+  /** "" = undecided | "trust" | "deny". */
+  decision: "" | "trust" | "deny";
+}
+
+export interface PluginTrustPromptEvent extends ProtocolMetadata {
+  type: "plugin_trust_prompt";
+  plugins: PluginTrustEntry[];
+}
+
+export interface PluginTrustAppliedEvent extends ProtocolMetadata {
+  type: "plugin_trust_applied";
+  trusted: string[];
+  denied: string[];
+  loaded: number;
 }
 
 export interface CheckpointCreatedEvent {
@@ -456,6 +479,8 @@ export type NarrowCoreEvent =
   | AskRequestEvent
   | SudoRequestEvent
   | MetricsEvent
+  | PluginTrustPromptEvent
+  | PluginTrustAppliedEvent
   | SandboxStatusEvent
   | SandboxPrepareProgressEvent
   | SandboxReadyEvent

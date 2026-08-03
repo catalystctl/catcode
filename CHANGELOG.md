@@ -2,6 +2,10 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-07-31
+
+- Plugin trust modal: untrusted project plugins now auto-prompt a trust/deny modal (once — decisions persist per project in ~/.config/catalyst-code/plugin-trust.json); re-open with /plugin-trust; trusted plugins load immediately. [working]
+
 ## 2026-07-23
 
 - Added web frontend + notification audit reports; dropped empty tui embed placeholder; clarified git-commit-all changelog step. [88f0351]
