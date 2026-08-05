@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -139,5 +140,111 @@ func TestFitListRow(t *testing.T) {
 		if got > w {
 			t.Errorf("fitListRow width %d > budget %d", got, w)
 		}
+	}
+}
+
+// makePreviewModels builds n synthetic discovery results for the custom-provider modal.
+func makePreviewModels(n int) []modelInfo {
+	out := make([]modelInfo, n)
+	for i := 0; i < n; i++ {
+		out[i] = modelInfo{
+			ID:            fmt.Sprintf("model-%03d", i),
+			Name:          fmt.Sprintf("Model %d", i),
+			ContextWindow: 128000,
+			MaxTokens:     8192,
+		}
+	}
+	return out
+}
+
+// TestCustomProviderModalFitsTerminal guards the long-discovery overflow bug:
+// a huge /models preview must window instead of growing past the terminal.
+func TestCustomProviderModalFitsTerminal(t *testing.T) {
+	for _, h := range []int{12, 16, 20, 24, 30, 40} {
+		for _, n := range []int{0, 1, 5, 20, 50, 200} {
+			s := initialSession()
+			s.ready = true
+			s.width, s.height = 80, h
+			s.openCustomProviderModal()
+			s.customProvider.name = "local"
+			s.customProvider.baseURL = "http://localhost:1234/v1"
+			s.customProvider.previewModels = makePreviewModels(n)
+			cpSeedModelCaps(&s.customProvider)
+			s.customProvider.field = cpFieldModels
+			s.customProvider.modelCursor = 0
+			s.customProvider.modelScroll = 0
+			s.layout()
+
+			box := s.renderModalBody()
+			got := lipgloss.Height(box)
+			if got > s.height {
+				t.Errorf("height=%d models=%d: modal height %d overflows terminal %d\n%s",
+					h, n, got, s.height, stripANSI(box))
+			}
+			overlay := s.renderModalOverlay("base")
+			if oh := lipgloss.Height(overlay); oh != s.height {
+				t.Errorf("height=%d models=%d: overlay height %d != terminal %d",
+					h, n, oh, s.height)
+			}
+			// On roomy terminals the window should advertise hidden models. Very
+			// short terminals may clip the indicator after chrome (border safety
+			// net still keeps the box inside the viewport).
+			plain := stripANSI(box)
+			if h >= 20 && n > cpModelWindowDefault && !strings.Contains(plain, "more below") {
+				t.Errorf("height=%d models=%d: expected more-below indicator; got:\n%s", h, n, plain)
+			}
+		}
+	}
+}
+
+// TestCustomProviderModelListScrollsWithCursor ensures ↑/↓ moves the window so
+// the focused model stays visible when the discovery list is longer than the
+// terminal can show.
+func TestCustomProviderModelListScrollsWithCursor(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	s.openCustomProviderModal()
+	s.customProvider.previewModels = makePreviewModels(40)
+	cpSeedModelCaps(&s.customProvider)
+	s.customProvider.field = cpFieldModels
+	s.customProvider.modelCursor = 0
+	s.customProvider.modelScroll = 0
+
+	// Drive the cursor far down the list; each step should keep it in-window.
+	for i := 0; i < 25; i++ {
+		s.handleCustomProviderKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	if s.customProvider.modelCursor != 25 {
+		t.Fatalf("cursor=%d, want 25", s.customProvider.modelCursor)
+	}
+	box := stripANSI(s.renderCustomProviderModal())
+	if !strings.Contains(box, "model-025") {
+		t.Fatalf("focused model not visible after scroll:\n%s", box)
+	}
+	if !strings.Contains(box, "more above") {
+		t.Fatalf("expected more-above indicator after scrolling:\n%s", box)
+	}
+	if s.customProvider.modelScroll <= 0 {
+		t.Fatalf("modelScroll=%d, want > 0 after scrolling down", s.customProvider.modelScroll)
+	}
+	// Modal must still fit the terminal.
+	if got := lipgloss.Height(s.renderCustomProviderModal()); got > s.height {
+		t.Fatalf("scrolled modal height %d overflows terminal %d", got, s.height)
+	}
+}
+
+func TestCpModelWindowForHeight(t *testing.T) {
+	// Tiny terminal: still shows at least one model block.
+	if w := cpModelWindowForHeight(10, 20, 100); w != 1 {
+		t.Fatalf("tiny terminal window=%d, want 1", w)
+	}
+	// Plenty of room: soft-capped at default.
+	if w := cpModelWindowForHeight(80, 10, 100); w != cpModelWindowDefault {
+		t.Fatalf("tall terminal window=%d, want %d", w, cpModelWindowDefault)
+	}
+	// Fewer models than capacity: clamp to count.
+	if w := cpModelWindowForHeight(80, 10, 3); w != 3 {
+		t.Fatalf("small list window=%d, want 3", w)
 	}
 }

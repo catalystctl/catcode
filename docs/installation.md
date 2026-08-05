@@ -49,8 +49,9 @@ irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/inst
 ```
 
 Installs `catcode.exe` to `%LOCALAPPDATA%\Programs\catcode` and adds it to
-your user PATH. Open a **new** PowerShell window (so PATH reloads) and run
-`catcode`.
+your user PATH. Open a **new terminal window** (PowerShell, Command Prompt, or
+Windows Terminal) so PATH reloads, then run `catcode`. The binary works from
+CMD and PowerShell alike once PATH is refreshed.
 
 ### Terminal + Web service (Windows)
 
@@ -106,6 +107,21 @@ is run with no arguments in a real terminal (no piping).
 ---
 
 ## Install Options (Windows)
+
+### Execution policy and local scripts
+
+- **Recommended one-liner** (`irm | iex` or the scriptblock form) runs as an
+  expression and usually works under the default Restricted policy.
+- **Saved `install.ps1`** may be blocked by Mark-of-the-Web or execution policy.
+  Unblock then run with Bypass:
+  ```powershell
+  Unblock-File .\install.ps1
+  pwsh -ExecutionPolicy Bypass -File .\install.ps1
+  ```
+- Per-user PATH install does **not** require Administrator. Elevation is only
+  needed for one-time sandbox features (Windows Hypervisor Platform) or
+  updating a protected system-wide install.
+
 
 Pass options using the scriptblock form:
 
@@ -350,7 +366,9 @@ Removes (from code in `install.ps1` `Do-Uninstall()`):
 - Web bundle directory
 - Installer state
 
-Open a **new** PowerShell window after uninstalling for a clean PATH.
+Open a **new terminal window** (PowerShell, CMD, or Windows Terminal) after
+uninstalling for a clean PATH. Script uninstalls also remove the install
+directory from your user PATH.
 
 ---
 
@@ -375,9 +393,10 @@ cargo build --release --manifest-path core/Cargo.toml   # → core/target/releas
 ( cd tui && go build -o tui . )                           # → tui/tui
 ```
 
-`build.sh` does not install over an existing `catcode`/`catcode-core` on your
-`PATH`. If `CATCODE_CORE` points at an installed binary, use `./build.sh --run`
-or set it explicitly to `core/target/release/core`.
+`build.sh` replaces the `catcode` binary found on your `PATH` and its sibling
+`catcode-core` when present. If no `catcode` is on `PATH`, it leaves the built
+artifacts in the repository. If `CATCODE_CORE` points at another binary,
+`./build.sh --run` still uses the freshly built core explicitly.
 
 Requires Rust (stable) and Go 1.24+.
 

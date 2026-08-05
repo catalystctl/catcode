@@ -113,6 +113,7 @@ func (s *session) handleSudoKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // view. No-op (returns base unchanged) when nothing is pending.
 func (s *session) renderSudoOverlay(base string) string {
 	if s.pendingSudo == nil {
+		s.sudoBoxRows = nil
 		return base
 	}
 	box := s.renderSudoBox()
@@ -124,6 +125,9 @@ func (s *session) renderSudoOverlay(base string) string {
 			box = strings.Join(ls[:h], "\n")
 		}
 	}
+	// Record the placed-box origin so overlay clicks map back to the painted
+	// rows (mirrors renderModalOverlay's modalBoxTop/Left).
+	s.sudoBoxTop, s.sudoBoxLeft, s.sudoBoxW, s.sudoBoxH, s.sudoBoxRows = s.recordOverlayBoxGeom(box)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 

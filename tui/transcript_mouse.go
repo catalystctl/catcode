@@ -28,6 +28,9 @@ func (s *session) transcriptViewportTop() int {
 }
 
 func (s *session) transcriptPlainLines() []string {
+	if s.transcriptPlain == nil && s.transcriptBase != "" {
+		s.transcriptPlain = plainTranscriptLines(s.transcriptBase)
+	}
 	return s.transcriptPlain
 }
 
@@ -205,10 +208,23 @@ func (s *session) mouseOverlayOwnsInput() bool {
 }
 
 func (s *session) handleTranscriptMouseClick(msg tea.MouseClickMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if s.modal.kind != modalNone {
 		return s.handleModalMouseClick(msg)
 	}
+	// Blocking ask/sudo flyouts own the whole screen: route clicks to the
+	// overlay press registry, never to chrome or the transcript behind them.
+	if s.pendingAsk != nil || s.pendingSudo != nil {
+		return s.handleOverlayMouseClick(msg)
+	}
 	if msg.Button != tea.MouseLeft || s.mouseOverlayOwnsInput() {
+		return nil
+	}
+	// Chrome surfaces (header, banners, shelf, panels, composer, footer) own
+	// their clicks: record the press target; a stationary release activates it.
+	if hit := s.chromeHitAt(msg.X, msg.Y); hit.zone != chromeNone {
+		s.chromePress = chromePress{active: true, hit: hit, x: msg.X, y: msg.Y}
+		s.chromePressSideEffects(hit)
 		return nil
 	}
 	point, ok := s.transcriptPointAt(msg.X, msg.Y, false)
@@ -226,8 +242,27 @@ func (s *session) handleTranscriptMouseClick(msg tea.MouseClickMsg) tea.Cmd {
 }
 
 func (s *session) handleTranscriptMouseMotion(msg tea.MouseMotionMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if s.modal.kind != modalNone {
 		return s.handleModalMouseMotion(msg)
+	}
+	// While an overlay press is held, motion only decides click-vs-drag; the
+	// chrome and transcript registries are not involved.
+	if s.overlayPress.active {
+		if abs(msg.X-s.overlayPress.x)+abs(msg.Y-s.overlayPress.y) > chromeDragSlop {
+			s.overlayPress.dragged = true
+		}
+		s.reuseLastView = true
+		return nil
+	}
+	// While a chrome press is held, motion only decides click-vs-drag; the
+	// transcript selection registry is not involved.
+	if s.chromePress.active {
+		if abs(msg.X-s.chromePress.x)+abs(msg.Y-s.chromePress.y) > chromeDragSlop {
+			s.chromePress.dragged = true
+		}
+		s.reuseLastView = true
+		return nil
 	}
 	if !s.selection.active || s.mouseOverlayOwnsInput() {
 		s.reuseLastView = true
@@ -301,8 +336,40 @@ func (s *session) handleTranscriptSelectionFrame(msg selectionFrameMsg) tea.Cmd 
 }
 
 func (s *session) handleTranscriptMouseRelease(msg tea.MouseReleaseMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if s.modal.kind != modalNone {
+		// A modal owns input while open; chrome/overlay presses must not survive it.
+		s.chromePress = chromePress{}
+		s.overlayPress = overlayPress{}
 		return s.handleModalMouseRelease(msg)
+	}
+	if s.pendingAsk != nil || s.pendingSudo != nil {
+		// A blocking flyout may have arrived between press and release. Never
+		// activate the old chrome target through the overlay; the flyout's own
+		// press registry is the only thing that can fire here.
+		s.chromePress = chromePress{}
+		if s.overlayPress.active {
+			return s.handleOverlayMouseRelease(msg)
+		}
+		s.selection = transcriptSelection{}
+		s.reuseLastView = true
+		return nil
+	}
+	// A chrome click (press + stationary release on the same target) activates
+	// the target; a drag cancels it without touching transcript selection.
+	if s.chromePress.active {
+		p := s.chromePress
+		s.chromePress = chromePress{}
+		if p.dragged {
+			s.reuseLastView = true
+			return nil
+		}
+		hit := s.chromeHitAt(msg.X, msg.Y)
+		if hit.zone != p.hit.zone || (p.hit.action >= 0 && hit.action != p.hit.action) {
+			s.reuseLastView = true
+			return nil
+		}
+		return s.activateChromeHit(hit, msg.X, msg.Y)
 	}
 	if !s.selection.active {
 		s.reuseLastView = true

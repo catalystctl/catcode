@@ -436,6 +436,7 @@ func (s *session) handleAskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // renderAskOverlay renders the ask flyout as a centered modal over the base view.
 func (s *session) renderAskOverlay(base string) string {
 	if s.pendingAsk == nil {
+		s.askBoxRows = nil
 		return base
 	}
 	box := s.renderAskBox()
@@ -447,6 +448,9 @@ func (s *session) renderAskOverlay(base string) string {
 			box = strings.Join(ls[:h], "\n")
 		}
 	}
+	// Record the placed-box origin so overlay clicks map back to the painted
+	// rows (mirrors renderModalOverlay's modalBoxTop/Left).
+	s.askBoxTop, s.askBoxLeft, s.askBoxW, s.askBoxH, s.askBoxRows = s.recordOverlayBoxGeom(box)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
 }
 

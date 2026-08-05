@@ -127,6 +127,8 @@ func TestStartingWelcomeDoesNotClaimAPIKeyIsMissing(t *testing.T) {
 	s := initialSession()
 	s.ready = true
 	s.coreStartGen = 1
+	s.coreLifecycle = coreStarting
+	s.splashStartedAt = time.Now()
 	s.width, s.height = 80, 24
 	s.layout()
 

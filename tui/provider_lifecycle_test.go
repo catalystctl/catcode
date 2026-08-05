@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -128,6 +129,9 @@ func TestReadyEventReplacesCachedStartingWelcome(t *testing.T) {
 	s.width, s.height = 80, 24
 	s.coreStartGen = 1
 	s.coreLifecycle = coreStarting
+	// Expire the min-hold so ready can replace the splash immediately (production
+	// keeps the brand for ~1.8s; tests assert the post-hold welcome path).
+	s.splashStartedAt = time.Now().Add(-splashMinHold - time.Second)
 	s.layout()
 
 	if view := stripANSI(s.viewport.View()); !strings.Contains(view, "Starting") {
@@ -172,5 +176,94 @@ func TestWelcomeArrowsDoNotStealDraftNavigation(t *testing.T) {
 	s.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
 	if s.welcomeIdx != original {
 		t.Fatal("welcome cursor moved while composer had a draft")
+	}
+}
+
+// Multi-provider sends must not be blocked when the ACTIVE provider has no key
+// but another logged-in provider (or discovered models) can still serve a turn.
+// This was the Linux/WSL "requests never leave catcode" failure mode: stale
+// settings.active_provider / expired OAuth made s.authed=false and the global
+// gate dropped every send before HTTP left the core.
+func TestCanSendAllowsMultiProviderWhenActiveUnauthed(t *testing.T) {
+	s := initialSession()
+	s.authed = false
+	s.providerHasKey = false
+	s.anyLoggedIn = false
+	s.models = nil
+	if s.canSend() {
+		t.Fatal("canSend must be false with no auth and no models")
+	}
+
+	s.anyLoggedIn = true
+	if !s.canSend() {
+		t.Fatal("canSend must be true when anyLoggedIn even if active authed=false")
+	}
+
+	s.anyLoggedIn = false
+	s.models = []modelInfo{{
+		ID: "grok-4.5", Provider: "china-man",
+	}}
+	if !s.canSend() {
+		t.Fatal("canSend must be true when models are present (discovery implies a logged-in owner)")
+	}
+}
+
+func TestReadyAnyLoggedInUnlocksSendsWhenActiveUnauthed(t *testing.T) {
+	s := initialSession()
+	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
+	s.coreStartGen = 1
+	s.coreLifecycle = coreStarting
+
+	s.handleCoreEvent(rawEvent(t, "ready", map[string]any{
+		"models": []modelInfo{{
+			ID: "grok-4.5", Name: "Grok", Provider: "china-man",
+			ContextWindow: 128000, MaxTokens: 8192,
+		}},
+		"authed":          false, // active provider unauthenticated
+		"anyLoggedIn":     true,  // but another provider is logged in
+		"provider":        "codex",
+		"providerKind":    "openai",
+		"providers":       []string{"codex", "china-man"},
+		"providerPresets": []providerPreset{},
+		"approval":        "destructive",
+	}))
+
+	if s.authed {
+		t.Fatal("ready.authed=false must leave s.authed false (active-provider status)")
+	}
+	if !s.anyLoggedIn {
+		t.Fatal("ready.anyLoggedIn=true must set s.anyLoggedIn")
+	}
+	if !s.canSend() {
+		t.Fatal("canSend must allow multi-provider sends when anyLoggedIn")
+	}
+	if s.coreLifecycle != coreReady {
+		t.Fatalf("lifecycle=%v want coreReady", s.coreLifecycle)
+	}
+}
+
+func TestReadyWithoutAnyLoggedInFallsBackToModels(t *testing.T) {
+	s := initialSession()
+	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
+	s.coreStartGen = 1
+
+	// Older cores omit anyLoggedIn; models still imply a logged-in owner.
+	s.handleCoreEvent(rawEvent(t, "ready", map[string]any{
+		"models": []modelInfo{{
+			ID: "deepseek-v4-flash", Provider: "karutoil",
+			ContextWindow: 512000, MaxTokens: 8192,
+		}},
+		"authed":       false,
+		"provider":     "codex",
+		"providerKind": "openai",
+		"providers":    []string{"codex", "karutoil"},
+		"approval":     "destructive",
+	}))
+
+	if !s.anyLoggedIn {
+		t.Fatal("models on ready must set anyLoggedIn when the field is omitted")
+	}
+	if !s.canSend() {
+		t.Fatal("canSend must be true after ready with models even if authed=false")
 	}
 }

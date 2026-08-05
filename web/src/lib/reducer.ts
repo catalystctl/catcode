@@ -47,6 +47,7 @@ export const initialState: AgentState = {
   },
   models: [],
   authed: null,
+  anyLoggedIn: null,
   provider: "",
   providerKind: "",
   approvalMode: "destructive",
@@ -760,6 +761,11 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ready: ev,
         models: ev.models ?? [],
         authed: ev.authed,
+        // Prefer explicit anyLoggedIn; fall back to active authed or models present
+        // (discovery only runs for logged-in providers).
+        anyLoggedIn:
+          ev.anyLoggedIn === true ||
+          (ev.anyLoggedIn !== false && (ev.authed === true || (ev.models?.length ?? 0) > 0)),
         provider: ev.provider,
         providerKind: ev.providerKind,
         approvalMode: ev.approval,
@@ -801,13 +807,21 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         providerModelsPreviewError: ev.error?.trim() ? ev.error : null,
       };
     case "authed":
-      return { ...state, authed: ev.ok, pendingOauth: null };
+      return {
+        ...state,
+        authed: ev.ok,
+        anyLoggedIn: ev.ok ? true : state.anyLoggedIn,
+        pendingOauth: null,
+      };
     case "provider_changed":
       return {
         ...state,
         provider: ev.provider,
         providerKind: ev.kind,
         authed: ev.has_key,
+        // Gaining a key unlocks multi-provider sends; losing the active key alone
+        // does not clear anyLoggedIn (other providers may still be usable).
+        anyLoggedIn: ev.has_key ? true : state.anyLoggedIn,
         pendingOauth: null,
       };
     case "approval_changed": {

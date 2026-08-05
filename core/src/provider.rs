@@ -1052,6 +1052,7 @@ async fn stream_turn_codex(
     let mut cached_tokens = 0;
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
     let mut last_stats: Option<Instant> = None;
+    let mut terminal_event = false;
 
     loop {
         let chunk = tokio::select! {
@@ -1059,16 +1060,30 @@ async fn stream_turn_codex(
             _ = cancel.cancelled() => return Err("aborted".into()),
         };
         let Some(chunk) = chunk else { break };
-        let chunk = chunk.map_err(|e| format!("stream read: {}", fmt_chain(&e)))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let detail = fmt_chain(&error);
+                if is_recoverable_truncated_chunked_body(&detail, &decoder, terminal_event) {
+                    break;
+                }
+                return Err(format!("stream read: {detail}"));
+            }
+        };
         for frame in decoder.push(&chunk) {
             let obj = match frame {
                 SseFrame::Json { value, .. } => value,
-                SseFrame::Done => continue,
+                SseFrame::Done => {
+                    terminal_event = true;
+                    continue;
+                }
                 SseFrame::Malformed { preview, .. } => {
                     return Err(format!("malformed provider SSE frame: {preview}"));
                 }
             };
+            terminal_event |= is_terminal_stream_object(&obj);
             for event in adapter.decode_stream_event(&obj) {
+                terminal_event |= is_terminal_stream_event(&event);
                 apply_codex_event(
                     event,
                     &mut content,
@@ -1353,6 +1368,7 @@ async fn stream_turn_openai(
         let mut stream = resp.bytes_stream();
         let mut decoder = SseDecoder::default();
         let mut emitted = false;
+        let mut terminal_event = false;
         let mut err: Option<String> = None;
 
         'read_stream: loop {
@@ -1367,21 +1383,29 @@ async fn stream_turn_openai(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    let detail = fmt_chain(&e);
+                    if !is_recoverable_truncated_chunked_body(&detail, &decoder, terminal_event) {
+                        err = Some(format!("stream read: {detail}"));
+                    }
                     break;
                 }
             };
             for frame in decoder.push(&chunk) {
                 let obj = match frame {
                     SseFrame::Json { value, .. } => value,
-                    SseFrame::Done => continue,
+                    SseFrame::Done => {
+                        terminal_event = true;
+                        continue;
+                    }
                     SseFrame::Malformed { preview, .. } => {
                         err = Some(malformed_response(&preview).message);
                         break 'read_stream;
                     }
                 };
+                terminal_event |= is_terminal_stream_object(&obj);
 
                 for event in adapter.decode_stream_event(&obj) {
+                    terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
                             if content.is_empty() {
@@ -1708,6 +1732,7 @@ async fn stream_turn_gemini(
         .await?;
         let mut stream = resp.bytes_stream();
         let mut decoder = SseDecoder::default();
+        let mut terminal_event = false;
         let mut err: Option<String> = None;
 
         'read_stream: loop {
@@ -1722,21 +1747,29 @@ async fn stream_turn_gemini(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    let detail = fmt_chain(&e);
+                    if !is_recoverable_truncated_chunked_body(&detail, &decoder, terminal_event) {
+                        err = Some(format!("stream read: {detail}"));
+                    }
                     break;
                 }
             };
             for frame in decoder.push(&chunk) {
                 let obj = match frame {
                     SseFrame::Json { value, .. } => value,
-                    SseFrame::Done => continue,
+                    SseFrame::Done => {
+                        terminal_event = true;
+                        continue;
+                    }
                     SseFrame::Malformed { preview, .. } => {
                         err = Some(malformed_response(&preview).message);
                         break 'read_stream;
                     }
                 };
+                terminal_event |= is_terminal_stream_object(&obj);
 
                 for event in adapter.decode_stream_event(&obj) {
+                    terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
                             if content.is_empty() {
@@ -2195,6 +2228,35 @@ fn fmt_chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// Some gateways close a chunked SSE response without writing the terminating
+/// zero-sized HTTP chunk. Hyper reports that as an "unexpected EOF during
+/// chunk size line" even when the provider already sent a complete terminal
+/// SSE event. Keep that transport quirk from discarding an otherwise complete
+/// assistant turn, but never hide it when the SSE decoder still has a partial
+/// event buffered or no terminal event was observed.
+fn is_recoverable_truncated_chunked_body(
+    error: &str,
+    decoder: &SseDecoder,
+    terminal_event: bool,
+) -> bool {
+    if !terminal_event || decoder.has_pending_data() {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unexpected eof") && lower.contains("chunk size line")
+}
+
+fn is_terminal_stream_event(event: &NormalizedStreamEvent) -> bool {
+    matches!(event, NormalizedStreamEvent::FinishReason(_))
+}
+
+fn is_terminal_stream_object(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.completed") | Some("message_stop")
+    )
+}
+
 // =========================================================================
 // Anthropic Messages API translation
 // =========================================================================
@@ -2614,6 +2676,7 @@ async fn stream_turn_anthropic(
         let mut stream = resp.bytes_stream();
         let mut decoder = SseDecoder::default();
         let mut emitted = false;
+        let mut terminal_event = false;
         let mut err: Option<String> = None;
 
         'read_stream: loop {
@@ -2631,14 +2694,20 @@ async fn stream_turn_anthropic(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    err = Some(format!("stream read: {}", fmt_chain(&e)));
+                    let detail = fmt_chain(&e);
+                    if !is_recoverable_truncated_chunked_body(&detail, &decoder, terminal_event) {
+                        err = Some(format!("stream read: {detail}"));
+                    }
                     break;
                 }
             };
             for frame in decoder.push(&chunk) {
                 let (event_name, mut obj) = match frame {
                     SseFrame::Json { event, value } => (event, value),
-                    SseFrame::Done => continue,
+                    SseFrame::Done => {
+                        terminal_event = true;
+                        continue;
+                    }
                     SseFrame::Malformed { preview, .. } => {
                         err = Some(malformed_response(&preview).message);
                         break 'read_stream;
@@ -2653,7 +2722,9 @@ async fn stream_turn_anthropic(
                         obj["type"] = json!(event_name);
                     }
                 }
+                terminal_event |= is_terminal_stream_object(&obj);
                 for event in adapter.decode_stream_event(&obj) {
+                    terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
                             if content.is_empty() {
@@ -4313,6 +4384,36 @@ mod tests {
         assert!(!models.is_empty());
     }
 
+    #[test]
+    fn truncated_chunked_eof_requires_a_complete_terminal_sse_event() {
+        let error = "error decoding response body -> error reading a body from connection -> unexpected EOF during chunk size line";
+
+        let mut complete = SseDecoder::default();
+        complete.push(b"data: [DONE]\n\n");
+        assert!(is_recoverable_truncated_chunked_body(
+            error, &complete, true
+        ));
+
+        let mut no_terminal = SseDecoder::default();
+        no_terminal.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        assert!(!is_recoverable_truncated_chunked_body(
+            error,
+            &no_terminal,
+            false
+        ));
+
+        let mut partial = SseDecoder::default();
+        partial.push(b"data: [DONE]\n\ndata: {\"choices\":[");
+        assert!(!is_recoverable_truncated_chunked_body(
+            error, &partial, true
+        ));
+        assert!(!is_recoverable_truncated_chunked_body(
+            "unexpected EOF while reading body",
+            &complete,
+            true
+        ));
+    }
+
     // ---- mocked-provider integration tests ----
     // A tiny one-shot HTTP server so summarize/extract_facts exercise the real
     // reqwest HTTP path (request build, POST /chat/completions, JSON parse)
@@ -4380,6 +4481,36 @@ mod tests {
         }
     }
 
+    async fn mock_truncated_chunked_openai_sse_server(
+        response_body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let h = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while find_header_end(&buf).is_none() {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n",
+                response_body.len(), response_body
+            );
+            // Deliberately omit the terminating zero-sized chunk. Hyper reports
+            // this as an unexpected EOF after yielding the complete SSE body.
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (base, h)
+    }
+
     async fn mock_openai_sse_server(
         responses: Vec<String>,
     ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
@@ -4430,6 +4561,42 @@ mod tests {
             requests
         });
         (base, h)
+    }
+
+    #[tokio::test]
+    async fn truncated_chunked_sse_after_terminal_frame_is_accepted() {
+        let response = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{"delta": {"content": "hello"}}]
+            }),
+            json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}]
+            })
+        );
+        let (base, server) = mock_truncated_chunked_openai_sse_server(response).await;
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let result = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10,
+            "mock-model",
+            &[Message::user("say hello")],
+            &[],
+            "none",
+            &[],
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("a complete terminal SSE turn should survive truncated chunked EOF");
+
+        assert_eq!(result.0["content"], "hello");
+        assert_eq!(result.1, "stop");
+        server.await.unwrap();
     }
 
     #[tokio::test]

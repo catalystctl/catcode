@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,40 @@ func TestExtractImagePathsQuotedAndFileURI(t *testing.T) {
 	got = extractImagePaths("file://" + plain)
 	if len(got) != 1 {
 		t.Fatalf("file:// URI: got %v", got)
+	}
+}
+
+func TestResolveImagePathWindowsFileURI(t *testing.T) {
+	// Pure string-normalization checks for the Windows drive-letter form
+	// without requiring a real Windows host or the file to exist on disk.
+	// We only assert the intermediate path after URI decoding when the file
+	// is missing (ok=false) — the important part is not panicking and not
+	// keeping the leading slash that breaks filepath.Abs on Windows.
+	if runtime.GOOS != "windows" {
+		// On non-Windows, drive-letter file:// still shouldn't crash.
+		_, ok := resolveImagePath("file:///C:/Users/x/shot.png")
+		if ok {
+			t.Fatalf("nonexistent Windows file:// path should not resolve on %s", runtime.GOOS)
+		}
+		return
+	}
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.png")
+	if err := os.WriteFile(plain, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Build file:///C:/... form from the real path.
+	abs, err := filepath.Abs(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri := "file:///" + strings.ReplaceAll(abs, "\\", "/")
+	got, ok := resolveImagePath(uri)
+	if !ok {
+		t.Fatalf("Windows file:// drive URI should resolve: %s", uri)
+	}
+	if !strings.EqualFold(got, abs) && !strings.EqualFold(filepath.Clean(got), filepath.Clean(abs)) {
+		t.Fatalf("resolved %q, want %q (from %s)", got, abs, uri)
 	}
 }
 

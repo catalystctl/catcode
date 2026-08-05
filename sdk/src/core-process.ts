@@ -120,7 +120,10 @@ export interface CoreProcessOptions {
 
 export interface ReadyPayload {
   models: any[];
+  /** True when the ACTIVE provider has a usable key. */
   authed: boolean;
+  /** True when ANY configured provider is logged in (multi-provider sends). */
+  anyLoggedIn?: boolean;
   workspace: string;
   approval: string;
   base_url: string;

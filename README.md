@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/mast
 
 #### Windows
 
-Open PowerShell and run:
+Open **PowerShell** (Windows Terminal, the PowerShell app, or classic PowerShell) and run:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1))) -WithWeb
@@ -108,7 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/mast
 
 #### Windows
 
-Open PowerShell and run:
+Open **PowerShell** (Windows Terminal, the PowerShell app, or classic PowerShell) and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex
@@ -116,9 +116,9 @@ irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/inst
 
 Select the terminal installation from the installer menu.
 
-After installation, open a new PowerShell window so the updated `PATH` is loaded.
+After installation, open a **new terminal window** (PowerShell, Command Prompt, or Windows Terminal) so the updated user `PATH` is loaded. `catcode.exe` works from CMD as well as PowerShell once PATH reloads — no extra shim is required.
 
-> The agent's Bash tool on Windows requires Git Bash, WSL, or another Bash executable on `PATH`. Chat, file editing, search, and other native tools work without it.
+> The agent's `bash` tool on Windows uses **PowerShell** by default (`pwsh` if installed, otherwise Windows PowerShell). With Microsandbox enabled it runs **Linux bash** in the guest instead. Optional override: `CATALYST_CODE_SHELL` (e.g. Git Bash path, or `cmd.exe`). Chat, file editing, search, and other native tools work without any extra shell install.
 
 ### Homebrew
 

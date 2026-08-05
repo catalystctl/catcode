@@ -261,13 +261,21 @@ Enable Intel VT-x / AMD-V in your firmware, same as the Linux section.
 
 ### 2. Enable the Windows Hypervisor Platform feature
 
-Open **PowerShell as Administrator** and run:
+Open an **elevated** terminal (PowerShell as Administrator, or elevated CMD)
+and enable the feature. Daily `catcode` use does **not** need admin — only this
+one-time WHP enable does.
 
 ```powershell
 Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
 ```
 
-- PowerShell must be run as **Administrator**.
+CMD equivalent:
+
+```bat
+DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform /All
+```
+
+- The enable step must run **elevated**.
 - A **restart** is usually required after enabling the feature.
 - Hardware virtualization must also be enabled in BIOS/UEFI (step 1).
 
@@ -560,12 +568,13 @@ The tool stays named **`bash`** for protocol compatibility (the TUI, web, SDK,
 and model prompt all reference `bash`).
 
 - **Sandbox disabled:** the existing host-specific behavior is preserved — `bash`
-  on Linux/macOS, PowerShell on Windows (or whatever `CATALYST_CODE_SHELL`
-  resolves to).
+  on Linux/macOS, PowerShell on Windows by default (`pwsh` if present). Override
+  with `CATALYST_CODE_SHELL` (full path to Git Bash, `cmd.exe`, `pwsh`, etc.).
+  `cmd` uses `/d /c`; PowerShell uses `-NoProfile -NonInteractive -Command`.
 - **Microsandbox enabled:** commands run inside the Linux guest using the
-  guest's `bash`. The model-facing tool description is updated so Windows users
-  are **not** told to generate PowerShell. A Windows host shell path is never
-  passed into the Linux guest.
+  guest's `bash`. The model-facing tool description **and** system-prompt shell
+  guidance are updated so Windows users are **not** told to generate PowerShell.
+  A Windows host shell path is never passed into the Linux guest.
 
 The effective shell description is part of the core `ready` state so the TUI,
 web UI, SDK, and model prompt all agree.

@@ -30,16 +30,32 @@ organized by symptom.
 
 **Likely cause:** The install prefix is not in `PATH`.
 
-**Check:**
+**Linux / macOS — Check:**
 - Run `which catcode` or `catcode --version`.
 - Check the prefix used during installation (default: `/usr/local/bin`).
 
-**Fix:**
+**Linux / macOS — Fix:**
 - Add the install prefix to your `PATH`:
   ```bash
   export PATH="/usr/local/bin:$PATH"
   ```
   Add the line to `~/.bashrc`, `~/.zshrc`, or equivalent.
+
+**Windows — Check:**
+- Open a **new** terminal window (PowerShell, Command Prompt, or Windows Terminal)
+  after install — the current session keeps the old `PATH`.
+- PowerShell: `Get-Command catcode`, `$env:Path -split ';' | Select-String catcode`
+- CMD: `where catcode` and `echo %PATH%`
+- Default install dir: `%LOCALAPPDATA%\Programs\catcode\catcode.exe`
+
+**Windows — Fix:**
+- Launch a new terminal, or run the full path once:
+  ```powershell
+  & "$env:LOCALAPPDATA\Programs\catcode\catcode.exe"
+  ```
+  ```bat
+  "%LOCALAPPDATA%\Programs\catcode\catcode.exe"
+  ```
 
 ### Windows: `iex` closes my shell
 
@@ -47,11 +63,25 @@ organized by symptom.
 After `| iex`, the shell exits because the installer runs `exit`.
 
 **Fix:**
-- Open a **new** PowerShell window after installation so `PATH` reloads.
+- Open a **new terminal window** (PowerShell, CMD, or Windows Terminal) after
+  installation so `PATH` reloads.
 - Or use the scriptblock form to avoid the `iex` exit issue:
   ```powershell
   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1)))
   ```
+
+### Windows Terminal vs PowerShell app vs Command Prompt
+
+- **Launching `catcode`:** any of Windows Terminal, the PowerShell app, classic
+  conhost PowerShell, or Command Prompt works once user PATH includes the
+  install dir. Prefer **Windows Terminal** for full mouse/truecolor TUI support;
+  legacy conhost may have weaker mouse/selection behavior.
+- **Agent shell ≠ your interactive profile:** the `bash` tool defaults to
+  PowerShell on unsandboxed Windows hosts even if your Windows Terminal profile
+  is CMD or Git Bash. Align them with `CATALYST_CODE_SHELL` (e.g. full path to
+  `bash.exe`, or `cmd.exe`) when you want the agent to match your interactive shell.
+- **Web IDE terminal** may open `cmd.exe` via `COMSPEC` while the agent still
+  speaks PowerShell — that split is expected unless you override the shell.
 
 ### Windows installer fails with missing dependencies
 
@@ -63,6 +93,35 @@ execution, or the MSI installer requires Windows Installer service.
   is needed).
 - For the standalone `.exe`, no runtime is needed — download the
   `catcode-<ver>-windows-x86_64.exe` from [releases](https://github.com/catalystctl/catcode/releases).
+
+### `could not resolve the latest release` from GitHub API
+
+**Symptom:** `install.sh` / `install-web.sh` dies while "Resolving release" with:
+```text
+error: could not resolve the latest release from
+  https://api.github.com/repos/catalystctl/catcode/releases/latest.
+```
+
+**Likely causes:**
+- Host is missing `jq` on older installer builds (the pipeline failed closed
+  and looked like a private-repo / rate-limit error).
+- Unauthenticated GitHub API rate limit (60 req/hr per IP), common on shared
+  WSL/CI networks.
+- Network/DNS/TLS cannot reach `api.github.com`.
+
+**Immediate workaround (always works):** pin a known release tag:
+```bash
+curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install-web.sh \
+  | bash -s -- --version 0a26423
+```
+List tags/assets at [releases](https://github.com/catalystctl/catcode/releases).
+
+**Other fixes:**
+- Export a token to raise the API limit: `export GITHUB_TOKEN=ghp_...` (or
+  `GH_TOKEN`), then re-run the installer.
+- Retry later if rate-limited (HTTP 403/429).
+- Current `install.sh` parses `tag_name` with `jq` **or** pure `grep`/`sed`,
+  so `jq` is no longer required for release resolution.
 
 ---
 
@@ -226,12 +285,62 @@ that is not running.
   ```bash
   curl http://localhost:11434/api/tags   # Ollama
   ```
-- Check for network proxies — the core uses `reqwest` with system proxy settings.
+- Check for network proxies — the core uses `reqwest` with `system-proxy` so
+  `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` (and Windows/macOS
+  system proxy settings) are honored. A **broken** proxy (common on WSL when
+  Windows injects a corporate proxy that is unreachable from the Linux side)
+  makes every provider request fail with connect/tunnel errors.
+- On Linux/WSL, TLS uses rustls with **both** Mozilla webpki roots and the
+  system CA store (`/etc/ssl/certs`). Corporate MITM proxies need their CA in
+  the system trust store (or disable the broken proxy).
 
 **Fix:**
 - Start your local model server if it's not running.
 - Correct the `base_url` in the provider configuration.
 - Check firewall rules — local model servers often bind to `127.0.0.1`.
+- On WSL: `env | grep -i proxy`. If a Windows-side proxy is set but dead from
+  Linux, `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy` (or
+  point `NO_PROXY` at your provider hosts) and restart catcode.
+- Prefer `127.0.0.1` over `localhost` for local servers (IPv6 `::1` misses when
+  the server binds IPv4-only).
+
+### Prompts never leave catcode ("not authenticated" / no provider traffic)
+
+**Symptom:** On Linux/WSL (or multi-provider setups) you type a prompt and
+nothing hits the provider — no `provider_request` lines in
+`~/.config/catalyst-code/debug.jsonl`, or the TUI only says
+"not authenticated — run /login first" even though other providers are logged
+in.
+
+**Likely causes:**
+1. **Active-provider-only auth gate (fixed):** the TUI used to block *all*
+   sends when the *active* provider had no key, even if models from other
+   logged-in providers were selected. Stale `settings.json`
+   `active_provider` (e.g. `codex` after logout) or expired OAuth on the
+   active provider triggered this. The core now emits `anyLoggedIn` on
+   `ready`, and the TUI/web allow sends when any configured provider is
+   logged in (models still route to their owning provider).
+2. **Core never reached `ready`:** the TUI only sends `init` after spawn;
+   without `ready` within 30s the startup watchdog fails the core. Check
+   the debug log and `CATCODE_CORE`.
+3. **Dead proxy / TLS:** see "Connection refused" above.
+
+**Check:**
+```bash
+# Did any HTTP leave the core?
+tail -n 50 ~/.config/catalyst-code/debug.jsonl | grep provider_request
+
+# Active provider vs configured providers
+python3 -c 'import json; c=json.load(open("/home/$USER/.config/catalyst-code/config.json")); s=json.load(open("/home/$USER/.config/catalyst-code/settings.json")); print("config", c.get("activeProvider"), [p["name"] for p in c.get("providers",[])]); print("settings", s.get("active_provider"), s.get("model"))'
+```
+(Replace `$USER` / paths as needed.)
+
+**Fix:**
+- `/login` the provider you actually want, or `/logout` a stale active one and
+  switch with the provider picker so `active_provider` matches a keyed entry.
+- Ensure the selected **model** is owned by a logged-in provider (`/models`).
+- Rebuild/reinstall after the multi-provider auth + HTTP client fix so
+  `anyLoggedIn`, native CA roots, `http2`, and `system-proxy` are present.
 
 ---
 

@@ -81,6 +81,8 @@ export interface CustomProviderDraft {
 export interface ReadyPayload extends SDKReadyPayload {
   type: "ready";
   models: ModelInfo[];
+  /** True when ANY configured provider is logged in (multi-provider sends). */
+  anyLoggedIn?: boolean;
   providerPresets?: ProviderPreset[];
   /** When true, the core auto-compacts context on thresholds / idle. */
   auto_compact?: boolean;
@@ -1104,7 +1106,10 @@ export interface AgentState {
    *  for whether agent commands may run. */
   sandbox: SandboxRuntimeStatus;
   models: ModelInfo[];
+  /** True when the ACTIVE provider has a usable key (footer/status). */
   authed: boolean | null;
+  /** True when ANY configured provider is logged in (multi-provider sends). */
+  anyLoggedIn: boolean | null;
   provider: string;
   providerKind: string;
   approvalMode: string;

@@ -227,7 +227,7 @@ func isPrivileged() bool {
 
 func elevationHint() string {
 	if runtime.GOOS == "windows" {
-		return "re-run from an elevated PowerShell: catcode --update"
+		return "re-run from an elevated terminal (PowerShell or Command Prompt): catcode --update"
 	}
 	return "re-run with sudo catcode --update"
 }

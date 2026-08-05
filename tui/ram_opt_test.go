@@ -115,3 +115,54 @@ func TestMaxStoredOutputLowered(t *testing.T) {
 		t.Fatalf("maxStoredOutput=%d want 64KiB", maxStoredOutput)
 	}
 }
+
+func TestTranscriptPlainIsLazy(t *testing.T) {
+	s := initialSession()
+	s.transcriptBase = "\x1b[31mhello\x1b[0m"
+	if s.transcriptPlain != nil {
+		t.Fatal("plain transcript should not be built eagerly")
+	}
+	lines := s.transcriptPlainLines()
+	if len(lines) != 1 || lines[0] != "hello" {
+		t.Fatalf("plain transcript = %#v, want [hello]", lines)
+	}
+	if got := s.transcriptPlainLines(); &got[0] != &lines[0] {
+		t.Fatal("plain transcript should be memoized")
+	}
+}
+
+func TestGlamourCacheHasByteBudget(t *testing.T) {
+	if glamourBlockCacheMaxBytes <= 0 || glamourBlockCacheMaxEntryBytes <= 0 {
+		t.Fatal("glamour cache byte budgets must be positive")
+	}
+	glamourMu.Lock()
+	glamourBlockCache = map[string]string{}
+	glamourCacheBytes = 0
+	glamourMu.Unlock()
+	t.Cleanup(func() {
+		glamourMu.Lock()
+		glamourBlockCache = map[string]string{}
+		glamourCacheBytes = 0
+		glamourMu.Unlock()
+	})
+
+	glamourMu.Lock()
+	glamourBlockCache["old"] = "old"
+	glamourCacheBytes = glamourBlockCacheMaxBytes - 1
+	cacheGlamourBlockLocked("new", "x")
+	entries, bytes := len(glamourBlockCache), glamourCacheBytes
+	_, oldKept := glamourBlockCache["old"]
+	_, newKept := glamourBlockCache["new"]
+	glamourMu.Unlock()
+	if oldKept || !newKept || entries != 1 || bytes != len("new")+len("x") {
+		t.Fatalf("cache did not reset on byte budget: old=%v new=%v entries=%d bytes=%d", oldKept, newKept, entries, bytes)
+	}
+
+	glamourMu.Lock()
+	cacheGlamourBlockLocked("oversized", strings.Repeat("x", glamourBlockCacheMaxEntryBytes))
+	_, kept := glamourBlockCache["oversized"]
+	glamourMu.Unlock()
+	if kept {
+		t.Fatal("oversized entry should not be retained")
+	}
+}

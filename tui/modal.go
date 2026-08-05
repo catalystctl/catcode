@@ -117,6 +117,7 @@ type customProviderDraft struct {
 	previewModels []modelInfo
 	modelCaps     map[string]*cpModelCaps
 	modelCursor   int  // focused model in the list
+	modelScroll   int  // first visible model (windowed list so long discovery fits)
 	modelField    int  // focused cap sub-field (cpCap*)
 	discovering   bool // a discover request is in flight
 	// discoverGen bumps on each discover/cancel so a late provider_models_preview
@@ -1554,6 +1555,8 @@ func (s *session) executeDestructive(action, id string) {
 		s.contextTokens = 0
 		s.follow = true
 		s.invalidateAll()
+		s.transcriptBase = ""
+		s.transcriptPlain = nil
 		s.viewport.SetContent("")
 		s.logInfo("conversation and session reset")
 	case "plugin-remove":
@@ -2062,7 +2065,7 @@ func (s *session) submitGoalModal() tea.Cmd {
 		s.logError("goal text is required")
 		return nil
 	}
-	if !s.authed {
+	if !s.canSend() {
 		s.modal.loadError = "Log in before starting a goal."
 		s.logError("not authenticated — run /login first")
 		return nil
@@ -2707,6 +2710,18 @@ func (s *session) selectLogoutItem(abs int) (tea.Model, tea.Cmd) {
 		s.authed = false
 		s.providerHasKey = false
 	}
+	// Recompute multi-provider send unlock from remaining presets/models.
+	s.anyLoggedIn = false
+	for _, p := range s.providerPresets {
+		if p.LoggedIn {
+			s.anyLoggedIn = true
+			break
+		}
+	}
+	if !s.anyLoggedIn && len(s.models) > 0 {
+		// Models still present usually means another provider owns them; keep sends open.
+		s.anyLoggedIn = s.containsOtherLoggedInProvider() || len(s.providers) > 1
+	}
 	_ = s.settings.save()
 	s.logInfo("logged out of " + name)
 	s.closeModal()
@@ -2902,7 +2917,7 @@ func (s *session) valueEditError(target, val string) string {
 		return ""
 	}
 	requireReady := func() string {
-		if !s.authed {
+		if !s.canSend() {
 			return "Log in before submitting this value."
 		}
 		if len(s.models) == 0 {
@@ -3195,7 +3210,9 @@ func (s *session) helpText() string {
 	lines = append(lines,
 		"",
 		"Mouse & copy",
+		"  click banners, panels, composer, footer, and model label",
 		"  click reasoning/tool rows to open or close",
+		"  click ask/sudo choices and flyout actions",
 		"  drag chat or modal text to select and copy automatically",
 		"  mouse wheel scrolls the active chat or modal",
 		"",
@@ -4502,6 +4519,83 @@ func cpNextField(cur, delta int) int {
 	return cpFieldOrder[idx]
 }
 
+// cpModelBlockLines is the rendered height of one discovered-model entry
+// (model id row + four cap rows). Used with the terminal height so long
+// discovery lists scroll instead of overflowing the viewport.
+const cpModelBlockLines = 5
+
+// cpModelWindowDefault is the soft cap when terminal height is unknown/huge.
+const cpModelWindowDefault = 8
+
+// cpModelWindowForHeight returns how many model blocks fit in the remaining
+// body lines after form chrome. Floor 1 so the focused model always shows.
+func cpModelWindowForHeight(termHeight, chromeLines, modelCount int) int {
+	if modelCount <= 0 {
+		return 0
+	}
+	body := termHeight - 2 /* modal borders */ - chromeLines
+	if body < cpModelBlockLines {
+		body = cpModelBlockLines
+	}
+	// Reserve one line for a "N more" indicator when the list is long.
+	if modelCount > 1 && body > cpModelBlockLines {
+		body--
+	}
+	w := body / cpModelBlockLines
+	if w < 1 {
+		w = 1
+	}
+	if w > cpModelWindowDefault {
+		w = cpModelWindowDefault
+	}
+	if w > modelCount {
+		w = modelCount
+	}
+	return w
+}
+
+// cpEnsureModelVisible keeps modelCursor inside the windowed model list so
+// ↑/↓ navigation never lands on a model that isn't rendered.
+func cpEnsureModelVisible(d *customProviderDraft, window int) {
+	if d == nil {
+		return
+	}
+	n := len(d.previewModels)
+	if n == 0 {
+		d.modelCursor = 0
+		d.modelScroll = 0
+		return
+	}
+	if d.modelCursor < 0 {
+		d.modelCursor = 0
+	}
+	if d.modelCursor >= n {
+		d.modelCursor = n - 1
+	}
+	if window < 1 {
+		window = 1
+	}
+	if window > n {
+		window = n
+	}
+	if d.modelCursor < d.modelScroll {
+		d.modelScroll = d.modelCursor
+	}
+	if d.modelCursor >= d.modelScroll+window {
+		d.modelScroll = d.modelCursor - window + 1
+	}
+	if d.modelScroll < 0 {
+		d.modelScroll = 0
+	}
+	maxScroll := n - window
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if d.modelScroll > maxScroll {
+		d.modelScroll = maxScroll
+	}
+}
+
 func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	d := &s.customProvider
 	key := msg.String()
@@ -4545,6 +4639,7 @@ func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 		if d.field == cpFieldModels && len(d.previewModels) > 0 {
 			if d.modelCursor > 0 {
 				d.modelCursor--
+				cpEnsureModelVisible(d, cpModelWindowForHeight(s.height, 12, len(d.previewModels)))
 			}
 			return s, nil
 		}
@@ -4555,6 +4650,7 @@ func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 		if d.field == cpFieldModels && len(d.previewModels) > 0 {
 			if d.modelCursor+1 < len(d.previewModels) {
 				d.modelCursor++
+				cpEnsureModelVisible(d, cpModelWindowForHeight(s.height, 12, len(d.previewModels)))
 			}
 			return s, nil
 		}
@@ -4927,6 +5023,11 @@ func (s *session) renderCustomProviderModal() string {
 	w := s.modalWidth(78)
 	d := s.customProvider
 	inner := max(1, w-4)
+	hasModels := len(d.previewModels) > 0
+	// Compact the Endpoint/Auth/Advanced chrome once discovery returns so the
+	// model list can claim the remaining terminal rows instead of pushing the
+	// modal past the viewport on long /models responses.
+	compact := hasModels
 
 	row := func(idx int, label, value string) string {
 		marker := "  "
@@ -4952,7 +5053,6 @@ func (s *session) renderCustomProviderModal() string {
 	textVal := func(idx int, mask bool) string {
 		if d.editing && d.field == idx {
 			if mask {
-				// Masked fields still show a cursor via a bullet run + View cursor.
 				v := s.modal.editBuf.Value()
 				if v == "" {
 					return s.modal.editBuf.View()
@@ -4970,54 +5070,89 @@ func (s *session) renderCustomProviderModal() string {
 
 	var lines []string
 	lines = append(lines, accentStyle.Render("◆ Add custom provider"))
-	lines = append(lines, dimStyle.Render("  Full config parity — name · kind · base URL · key or env · headers · context window"))
+	if compact {
+		// One-line summary of the endpoint so form fields stay editable via ↑/↓
+		// without eating the model-list budget.
+		summary := strings.TrimSpace(d.name)
+		if summary == "" {
+			summary = "(unnamed)"
+		}
+		if u := strings.TrimSpace(d.baseURL); u != "" {
+			summary += " · " + u
+		}
+		summary += " · " + d.kind
+		lines = append(lines, dimStyle.Render("  "+truncateFit(summary, inner-2)))
+	} else {
+		lines = append(lines, dimStyle.Render("  Full config parity — name · kind · base URL · key or env · headers · context window"))
+	}
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", inner)))
 
-	// ── Endpoint ────────────────────────────────────────────────────────
-	lines = append(lines, "")
-	lines = append(lines, section("Endpoint"))
-	lines = append(lines, row(cpFieldName, "Name", baseStyle.Render(textVal(cpFieldName, false))))
-	kindSel := 0
-	if d.kind == "anthropic" {
-		kindSel = 1
-	}
-	lines = append(lines, row(cpFieldKind, "Protocol",
-		goalSegment([]string{"OpenAI-compat", "Anthropic"}, kindSel, d.field == cpFieldKind)))
-	if d.field == cpFieldKind {
-		lines = append(lines, dimStyle.Render("    ←/→ cycle · OpenAI = /chat/completions · Anthropic = /v1/messages"))
-	}
-	lines = append(lines, row(cpFieldBaseURL, "Base URL", baseStyle.Render(textVal(cpFieldBaseURL, false))))
-	if d.field == cpFieldBaseURL {
-		lines = append(lines, dimStyle.Render("    include the version segment — paths are appended directly"))
-	}
+	if !compact {
+		// ── Endpoint ────────────────────────────────────────────────────────
+		lines = append(lines, "")
+		lines = append(lines, section("Endpoint"))
+		lines = append(lines, row(cpFieldName, "Name", baseStyle.Render(textVal(cpFieldName, false))))
+		kindSel := 0
+		if d.kind == "anthropic" {
+			kindSel = 1
+		}
+		lines = append(lines, row(cpFieldKind, "Protocol",
+			goalSegment([]string{"OpenAI-compat", "Anthropic"}, kindSel, d.field == cpFieldKind)))
+		if d.field == cpFieldKind {
+			lines = append(lines, dimStyle.Render("    ←/→ cycle · OpenAI = /chat/completions · Anthropic = /v1/messages"))
+		}
+		lines = append(lines, row(cpFieldBaseURL, "Base URL", baseStyle.Render(textVal(cpFieldBaseURL, false))))
+		if d.field == cpFieldBaseURL {
+			lines = append(lines, dimStyle.Render("    include the version segment — paths are appended directly"))
+		}
 
-	// ── Auth ─────────────────────────────────────────────────────────────
-	lines = append(lines, "")
-	lines = append(lines, section("Auth"))
-	lines = append(lines, row(cpFieldAPIKey, "API key", baseStyle.Render(textVal(cpFieldAPIKey, true))))
-	if d.field == cpFieldAPIKey {
-		lines = append(lines, dimStyle.Render("    stored in the 0600 user config · wins over env var"))
-	}
-	lines = append(lines, row(cpFieldAPIKeyEnv, "Env var", baseStyle.Render(textVal(cpFieldAPIKeyEnv, false))))
-	if d.field == cpFieldAPIKeyEnv {
-		lines = append(lines, dimStyle.Render("    secret stays in your environment · read at request time"))
-	}
+		// ── Auth ─────────────────────────────────────────────────────────────
+		lines = append(lines, "")
+		lines = append(lines, section("Auth"))
+		lines = append(lines, row(cpFieldAPIKey, "API key", baseStyle.Render(textVal(cpFieldAPIKey, true))))
+		if d.field == cpFieldAPIKey {
+			lines = append(lines, dimStyle.Render("    stored in the 0600 user config · wins over env var"))
+		}
+		lines = append(lines, row(cpFieldAPIKeyEnv, "Env var", baseStyle.Render(textVal(cpFieldAPIKeyEnv, false))))
+		if d.field == cpFieldAPIKeyEnv {
+			lines = append(lines, dimStyle.Render("    secret stays in your environment · read at request time"))
+		}
 
-	// ── Advanced ─────────────────────────────────────────────────────────
-	lines = append(lines, "")
-	lines = append(lines, section("Advanced"))
-	hdrVal := textVal(cpFieldHeaders, false)
-	hdrShown := hdrVal
-	if n := len(cpHeaderLines(hdrVal)); n > 1 {
-		hdrShown = fmt.Sprintf("%d headers", n)
-	}
-	lines = append(lines, row(cpFieldHeaders, "Headers", baseStyle.Render(hdrShown)))
-	if d.field == cpFieldHeaders && !d.editing {
-		lines = append(lines, dimStyle.Render("    one Key: value per line · enter to edit"))
-	}
-	lines = append(lines, row(cpFieldContextWindow, "Context win", baseStyle.Render(textVal(cpFieldContextWindow, false))))
-	if d.field == cpFieldContextWindow {
-		lines = append(lines, dimStyle.Render("    optional · force every discovered model to this window (tokens)"))
+		// ── Advanced ─────────────────────────────────────────────────────────
+		lines = append(lines, "")
+		lines = append(lines, section("Advanced"))
+		hdrVal := textVal(cpFieldHeaders, false)
+		hdrShown := hdrVal
+		if n := len(cpHeaderLines(hdrVal)); n > 1 {
+			hdrShown = fmt.Sprintf("%d headers", n)
+		}
+		lines = append(lines, row(cpFieldHeaders, "Headers", baseStyle.Render(hdrShown)))
+		if d.field == cpFieldHeaders && !d.editing {
+			lines = append(lines, dimStyle.Render("    one Key: value per line · enter to edit"))
+		}
+		lines = append(lines, row(cpFieldContextWindow, "Context win", baseStyle.Render(textVal(cpFieldContextWindow, false))))
+		if d.field == cpFieldContextWindow {
+			lines = append(lines, dimStyle.Render("    optional · force every discovered model to this window (tokens)"))
+		}
+	} else {
+		// Compact form: keep the focused text field visible so editing still works
+		// after discovery without re-expanding the whole form.
+		switch d.field {
+		case cpFieldName, cpFieldBaseURL, cpFieldAPIKey, cpFieldAPIKeyEnv, cpFieldHeaders, cpFieldContextWindow:
+			label := map[int]string{
+				cpFieldName: "Name", cpFieldBaseURL: "Base URL", cpFieldAPIKey: "API key",
+				cpFieldAPIKeyEnv: "Env var", cpFieldHeaders: "Headers", cpFieldContextWindow: "Context win",
+			}[d.field]
+			mask := d.field == cpFieldAPIKey
+			lines = append(lines, row(d.field, label, baseStyle.Render(textVal(d.field, mask))))
+		case cpFieldKind:
+			kindSel := 0
+			if d.kind == "anthropic" {
+				kindSel = 1
+			}
+			lines = append(lines, row(cpFieldKind, "Protocol",
+				goalSegment([]string{"OpenAI-compat", "Anthropic"}, kindSel, true)))
+		}
 	}
 
 	// ── Discover ─────────────────────────────────────────────────────────
@@ -5026,22 +5161,63 @@ func (s *session) renderCustomProviderModal() string {
 	discoverVal := dimStyle.Render("enter to fetch models from the endpoint")
 	if d.discovering {
 		discoverVal = accentStyle.Render("discovering… · enter to cancel")
-	} else if len(d.previewModels) > 0 {
+	} else if hasModels {
 		discoverVal = successStyle.Render(fmt.Sprintf("%d model(s) found · enter to re-fetch", len(d.previewModels)))
 	}
 	lines = append(lines, row(cpFieldDiscover, "Discover", discoverVal))
 	if d.field == cpFieldDiscover {
 		if d.discovering {
 			lines = append(lines, dimStyle.Render("    waiting on the endpoint · enter cancels (you can still Add provider)"))
-		} else {
+		} else if !hasModels {
 			lines = append(lines, dimStyle.Render("    fetches the endpoint's model list so you can refine caps"))
 		}
 	}
 
-	// Discovered models with editable per-model caps.
-	if len(d.previewModels) > 0 {
+	// Tail chrome (Finish + error + footer) is measured first so the models
+	// window can claim only the remaining terminal rows.
+	var tail []string
+	tail = append(tail, "")
+	tail = append(tail, section("Finish"))
+	submitVal := ""
+	if d.field == cpFieldSubmit {
+		submitVal = accentStyle.Render("enter / ctrl+enter to add provider")
+	}
+	tail = append(tail, row(cpFieldSubmit, "Add provider", submitVal))
+	if s.modal.loadError != "" {
+		tail = append(tail, "")
+		tail = append(tail, errStyle.Render("  ✗ "+s.modal.loadError))
+	}
+	tail = append(tail, "")
+	if d.editing {
+		tail = append(tail, dimStyle.Render("  typing… · enter commit · esc keep text · ctrl+enter submit"))
+	} else if hasModels {
+		tail = append(tail, dimStyle.Render("  ↑/↓ model · ←/→ cap · enter edit · esc close · ctrl+enter submit"))
+	} else {
+		tail = append(tail, dimStyle.Render("  ↑/↓ move · enter edit · esc close · ctrl+enter submit (no discover required)"))
+	}
+
+	// Discovered models with editable per-model caps (windowed to fit height).
+	if n := len(d.previewModels); n > 0 {
 		capLabels := []string{"Ctx", "Out", "Levels", "Think"}
-		for i, m := range d.previewModels {
+		// Head + tail + optional more-above/below indicators (+2 worst case).
+		chromeLines := len(lines) + len(tail) + 2
+		window := cpModelWindowForHeight(s.height, chromeLines, n)
+		if window < 1 {
+			window = 1
+		}
+		cpEnsureModelVisible(&d, window)
+		// Write scroll back — d is a value copy of s.customProvider.
+		s.customProvider.modelScroll = d.modelScroll
+		s.customProvider.modelCursor = d.modelCursor
+		start, end := d.modelScroll, d.modelScroll+window
+		if end > n {
+			end = n
+		}
+		if start > 0 {
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("    ⋮ %d more above", start)))
+		}
+		for i := start; i < end; i++ {
+			m := d.previewModels[i]
 			focused := d.field == cpFieldModels && d.modelCursor == i
 			marker := "  "
 			nameStyle := dimStyle
@@ -5049,7 +5225,9 @@ func (s *session) renderCustomProviderModal() string {
 				marker = "▸ "
 				nameStyle = accentStyle
 			}
-			lines = append(lines, nameStyle.Render(fmt.Sprintf("%s%s", marker, m.ID)))
+			// Truncate long model ids so a single row never wraps past the modal.
+			idShown := truncateFit(m.ID, max(1, inner-4))
+			lines = append(lines, nameStyle.Render(fmt.Sprintf("%s%s", marker, idShown)))
 			c := d.modelCaps[m.ID]
 			if c == nil {
 				c = &cpModelCaps{}
@@ -5063,9 +5241,10 @@ func (s *session) renderCustomProviderModal() string {
 			for ci, lbl := range capLabels {
 				capFocused := focused && d.modelField == ci
 				v := vals[ci]
-				// Show the live edit buffer (with cursor) for the focused cap.
 				if capFocused && d.editing && d.field == cpFieldModels {
 					v = s.modal.editBuf.View()
+				} else {
+					v = truncateFit(v, max(1, inner-16))
 				}
 				mark := "  "
 				style := dimStyle
@@ -5076,30 +5255,25 @@ func (s *session) renderCustomProviderModal() string {
 				lines = append(lines, style.Render(fmt.Sprintf("      %s%-7s %s", mark, lbl, v)))
 			}
 		}
-		if d.field == cpFieldModels {
-			lines = append(lines, dimStyle.Render("    ↑/↓ model · ←/→ cap · enter edit/toggle"))
+		if end < n {
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("    ⋮ %d more below", n-end)))
 		}
 	}
 
-	// ── Submit ───────────────────────────────────────────────────────────
-	lines = append(lines, "")
-	lines = append(lines, section("Finish"))
-	submitVal := ""
-	if d.field == cpFieldSubmit {
-		submitVal = accentStyle.Render("enter / ctrl+enter to add provider")
+	lines = append(lines, tail...)
+	body := strings.Join(lines, "\n")
+	// Final safety: never let chrome alone push past the terminal (short
+	// terminals with the pre-discover form). Overlay also clips, but keeping
+	// the body budget honest avoids a half-cut border.
+	maxBody := s.height - 2
+	if maxBody < 1 {
+		maxBody = 1
 	}
-	lines = append(lines, row(cpFieldSubmit, "Add provider", submitVal))
-
-	if s.modal.loadError != "" {
-		lines = append(lines, "")
-		lines = append(lines, errStyle.Render("  ✗ "+s.modal.loadError))
+	if bh := lipgloss.Height(body); bh > maxBody {
+		ls := strings.Split(body, "\n")
+		if maxBody <= len(ls) {
+			body = strings.Join(ls[:maxBody], "\n")
+		}
 	}
-	lines = append(lines, "")
-	if d.editing {
-		lines = append(lines, dimStyle.Render("  typing… · enter commit · esc keep text · ctrl+enter submit"))
-	} else {
-		lines = append(lines, dimStyle.Render("  ↑/↓ move · enter edit · esc close · ctrl+enter submit (no discover required)"))
-	}
-
-	return modalBox(w, strings.Join(lines, "\n"))
+	return modalBox(w, body)
 }

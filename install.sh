@@ -537,6 +537,37 @@ detect_arch() {
   esac
 }
 
+# Extract "tag_name" from a GitHub Releases API JSON body without requiring jq.
+# Prefer jq when present; fall back to pure grep/sed so minimal hosts work.
+github_release_tag_from_json() {
+  local body="$1" tag=""
+  if have jq; then
+    tag="$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  fi
+  if [[ -z "$tag" ]]; then
+    # First "tag_name" field in the top-level release object.
+    tag="$(printf '%s' "$body" \
+      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' 2>/dev/null \
+      | head -1 \
+      | sed -E 's/.*:[[:space:]]*"([^"]+)"$/\1/' || true)"
+  fi
+  printf '%s' "$tag"
+}
+
+# curl headers for api.github.com — GitHub rejects some clients without a UA,
+# and an optional token raises the unauthenticated 60 req/hr limit.
+github_api_curl_args() {
+  GITHUB_API_CURL_ARGS=(-fsSL --retry 2 -A "catcode-installer/${VERSION}")
+  GITHUB_API_CURL_ARGS_NO_FAIL=(-sS --retry 2 -A "catcode-installer/${VERSION}")
+  local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  if [[ -n "$token" ]]; then
+    GITHUB_API_CURL_ARGS+=(-H "Authorization: Bearer ${token}")
+    GITHUB_API_CURL_ARGS_NO_FAIL+=(-H "Authorization: Bearer ${token}")
+  fi
+  GITHUB_API_CURL_ARGS+=(-H "Accept: application/vnd.github+json")
+  GITHUB_API_CURL_ARGS_NO_FAIL+=(-H "Accept: application/vnd.github+json")
+}
+
 # Resolve the release TAG/VER and the download BASE_URL.
 #   --version <v>  pins a version (accepts "0.2.0" or "v0.2.0")
 #   otherwise      query the GitHub API for the latest release tag
@@ -553,10 +584,30 @@ resolve_release() {
     VER="${TAG#v}"
   else
     local api="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    if ! TAG="$(curl -fsSL --retry 2 "$api" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)" || [[ -z "${TAG:-}" ]]; then
+    local body="" http_code=""
+    github_api_curl_args
+    # Capture body + HTTP status so we can distinguish rate-limit / 404 / empty.
+    body="$(curl "${GITHUB_API_CURL_ARGS[@]}" -w '\n%{http_code}' "$api" 2>/dev/null || true)"
+    http_code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    # curl -f fails on 4xx/5xx and may leave body empty; retry without -f for diagnostics.
+    if [[ -z "$body" || ! "$http_code" =~ ^2 ]]; then
+      body="$(curl "${GITHUB_API_CURL_ARGS_NO_FAIL[@]}" -w '\n%{http_code}' "$api" 2>/dev/null || true)"
+      http_code="${body##*$'\n'}"
+      body="${body%$'\n'*}"
+    fi
+    TAG="$(github_release_tag_from_json "$body")"
+    if [[ -z "${TAG:-}" ]]; then
+      local hint="The repo may be private, the API rate-limited, or network blocked."
+      case "$http_code" in
+        403|429) hint="GitHub API rate-limited or forbidden (HTTP $http_code). Wait, export GITHUB_TOKEN, or pass --version." ;;
+        404)     hint="No published release found (HTTP 404). Pass --version <tag> once a release exists." ;;
+        ""|000) hint="Could not reach GitHub (network/DNS/TLS). Check connectivity or pass --base-url." ;;
+        *)       [[ -n "$http_code" ]] && hint="GitHub API returned HTTP $http_code." ;;
+      esac
       die "could not resolve the latest release from $api.
-  The repo may be private, or the API is rate-limited. Pass --version <v>
-  (e.g. --version 0.2.0 or --version 9fecd6b) or --base-url <url> to a public mirror."
+  $hint
+  Pass --version <v> (e.g. --version 0.2.0 or --version 0a26423) or --base-url <url> to a public mirror."
     fi
     VER="${TAG#v}"
   fi

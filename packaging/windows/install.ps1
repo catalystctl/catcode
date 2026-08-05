@@ -1,7 +1,8 @@
 # catcode installer for Windows.
 #
 # Copies catcode.exe + catcode-core.exe into %LOCALAPPDATA%\Programs\catcode and adds
-# that directory to the user PATH so `catcode` works from any CWD in PowerShell.
+# that directory to the user PATH so `catcode` works from any CWD (PowerShell,
+# Command Prompt, or Windows Terminal).
 #
 # Run from inside the unzipped bundle (the two .exe files sit next to this
 # script):
@@ -10,7 +11,7 @@
 # Windows flagged it as downloaded:  Unblock-File .\install.ps1).
 #
 # No administrator rights are required: this installs per-user. Open a NEW
-# PowerShell window after install so the refreshed PATH is visible.
+# terminal window after install so the refreshed PATH is visible.
 
 [CmdletBinding()]
 param(
@@ -56,7 +57,8 @@ if ($parts -notcontains $InstallDir) {
 $env:Path = "$env:Path;$InstallDir"
 
 Write-Host ""
-Write-Host "Done. Open a NEW PowerShell window (so PATH reloads) and run:" -ForegroundColor Green
+Write-Host "Done. Open a NEW terminal window (PowerShell, CMD, or Windows Terminal)" -ForegroundColor Green
+Write-Host "so PATH reloads, then run:" -ForegroundColor Green
 Write-Host "    catcode" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "First run inside catcode:  /login   then pick a model with /model"

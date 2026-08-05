@@ -369,7 +369,15 @@ function Add-ToPath {
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $path) { $path = '' }
     $parts = @($path.Split(';') | Where-Object { $_ -ne '' })
-    if ($parts -notcontains $InstallDir) {
+    # Case-insensitive compare so we don't double-add with different casing.
+    $already = $false
+    foreach ($p in $parts) {
+        if ([string]::Equals($p, $InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $already = $true
+            break
+        }
+    }
+    if (-not $already) {
         $newPath = (($parts + $InstallDir) -join ';')
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
         W-Ok "Added $InstallDir to your user PATH."
@@ -378,6 +386,24 @@ function Add-ToPath {
     }
     # refresh the current session so `catcode` works immediately
     if ($env:Path -notlike "*$InstallDir*") { $env:Path = "$env:Path;$InstallDir" }
+}
+
+function Remove-FromPath {
+    $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $path) { return }
+    $parts = @($path.Split(';') | Where-Object {
+        $_ -ne '' -and -not [string]::Equals($_, $InstallDir, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    $newPath = ($parts -join ';')
+    if ($newPath -ne $path) {
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        W-Ok "Removed $InstallDir from your user PATH."
+    }
+    # Best-effort: drop from the current session PATH too.
+    $sessionParts = @($env:Path.Split(';') | Where-Object {
+        $_ -ne '' -and -not [string]::Equals($_, $InstallDir, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    $env:Path = ($sessionParts -join ';')
 }
 
 # -- TUI install (download standalone catcode.exe) ------------
@@ -723,7 +749,8 @@ function Summary-Install {
     if ($script:WithWeb) { Write-Host "    expose:  $($script:Expose)  origin: $($script:ResolvedOrigin)" -ForegroundColor Green }
     Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host ''
-    Write-Host '  Open a NEW PowerShell window (so PATH reloads) and run:' -ForegroundColor Green
+    Write-Host '  Open a NEW terminal window (PowerShell, Command Prompt, or Windows Terminal)' -ForegroundColor Green
+    Write-Host '  so PATH reloads, then run:' -ForegroundColor Green
     Write-Host '    catcode' -ForegroundColor Yellow
     if ($script:WithWeb) {
         Write-Host "  web:   http://localhost:$Port   (logs: $env:LOCALAPPDATA\catalyst-code\catalyst-code-web.log)" -ForegroundColor Green
@@ -744,7 +771,7 @@ function Summary-Uninstall {
     Write-Host '  --------------------------------------------' -ForegroundColor Green
     Write-Host '  OK  Removed  Catalyst Code' -ForegroundColor Green
     Write-Host '  --------------------------------------------' -ForegroundColor Green
-    Write-Host '  Open a NEW PowerShell window for a clean PATH.' -ForegroundColor DarkGray
+    Write-Host '  Open a NEW terminal window (PowerShell, CMD, or Windows Terminal) for a clean PATH.' -ForegroundColor DarkGray
 }
 
 # -- actions ---------------------------------------------------
@@ -832,6 +859,9 @@ function Do-Uninstall {
         $p = Join-Path $InstallDir $b
         if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; W-Ok "Removed $p" }
     }
+    # Drop the install dir from the user PATH (Add-ToPath mirror). MSI installs
+    # manage PATH via WiX Environment; script installs must clean up themselves.
+    Remove-FromPath
     # state
     if (Test-Path -LiteralPath $StateFile) { Remove-Item -LiteralPath $StateFile -Force; W-Ok "Removed $StateFile" }
     Summary-Uninstall

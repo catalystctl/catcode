@@ -7,7 +7,7 @@
 //!   - Workspace mapped to `/workspace`; no host home / `.ssh` / sockets.
 //!   - `--no-network` enforced through Microsandbox network policy.
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::{Config, Sandbox, SandboxNetworkMode};
 
@@ -19,6 +19,8 @@ pub enum ShellKind {
     Posix,
     /// Windows PowerShell (`-NoProfile -NonInteractive -Command`).
     PowerShell,
+    /// Windows Command Prompt (`cmd.exe /d /c <command>`).
+    Cmd,
 }
 
 impl ShellKind {
@@ -29,8 +31,38 @@ impl ShellKind {
         match self {
             ShellKind::Posix => "bash",
             ShellKind::PowerShell => "powershell",
+            ShellKind::Cmd => "cmd",
         }
     }
+}
+
+/// Classify a shell program path/name into a [`ShellKind`].
+///
+/// Accepts bare names (`bash`, `pwsh`, `cmd`) and full paths including
+/// Windows-style paths with backslashes — even when running on a Unix host
+/// (e.g. unit tests, or a mis-set `CATALYST_CODE_SHELL`).
+fn shell_kind_for_program(prog: &str) -> ShellKind {
+    let stem = shell_program_stem(prog);
+    match stem.as_str() {
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "busybox" => ShellKind::Posix,
+        "cmd" => ShellKind::Cmd,
+        // Default non-POSIX host shells (powershell / pwsh / unknown) use the
+        // PowerShell argv form. Callers that need strict validation should
+        // check the stem explicitly.
+        _ => ShellKind::PowerShell,
+    }
+}
+
+/// Basename stem of a shell program, tolerant of `/` and `\\` separators and
+/// optional `.exe` (so `C:\\...\\bash.exe` classifies as `bash` on any OS).
+fn shell_program_stem(prog: &str) -> String {
+    let trimmed = prog.trim().trim_matches('"').trim_matches('\'');
+    let name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let stem = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
+    stem.to_ascii_lowercase()
 }
 
 /// Read whether sandboxing is enabled from the active backend (single source of
@@ -51,22 +83,12 @@ pub fn effective_shell_kind() -> ShellKind {
 
 /// Host-native shell kind (ignores sandbox state). Mirrors `tools::shell_is_posix`.
 fn host_shell_kind() -> ShellKind {
-    let prog = resolve_host_shell();
-    let stem = Path::new(&prog)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if matches!(
-        stem.as_str(),
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
-    ) {
-        ShellKind::Posix
-    } else {
-        ShellKind::PowerShell
-    }
+    shell_kind_for_program(&resolve_host_shell())
 }
 
 /// Resolve the host shell program (CATALYST_CODE_SHELL override or OS default).
+/// Honors full paths (e.g. `C:\\Program Files\\Git\\bin\\bash.exe`,
+/// `%COMSPEC%`, `pwsh`).
 pub(crate) fn resolve_host_shell() -> String {
     if let Ok(s) = std::env::var("CATALYST_CODE_SHELL") {
         let s = s.trim();
@@ -88,30 +110,64 @@ pub(crate) fn resolve_host_shell() -> String {
     }
 }
 
-/// Build `(program, args)` to run a single command string in the active shell.
-/// POSIX: `<shell> -c <command>`. PowerShell: `-NoProfile -NonInteractive
-/// -Command`. When sandboxed the program is always `bash` (resolved in the
-/// guest), never a Windows host shell path.
-pub fn shell_argv(command: &str) -> (String, Vec<String>) {
-    let kind = effective_shell_kind();
-    match kind {
-        ShellKind::Posix => (
-            "bash".to_string(),
-            vec!["-c".to_string(), command.to_string()],
-        ),
-        ShellKind::PowerShell => {
-            let prog = resolve_host_shell();
-            (
-                prog,
-                vec![
-                    "-NoProfile".into(),
-                    "-NonInteractive".into(),
-                    "-Command".into(),
-                    command.into(),
-                ],
-            )
+/// Prefer PowerShell Core (`pwsh`) when present, else Windows PowerShell.
+/// Used by plugin `.ps1` hooks so they match the bash-tool default.
+pub(crate) fn resolve_powershell_program() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if crate::tools::pwsh_available() {
+            "pwsh".to_string()
+        } else {
+            "powershell".to_string()
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Cross-platform PowerShell Core name; spawn fails cleanly if absent.
+        "pwsh".to_string()
+    }
+}
+
+/// Build `(program, args)` for a concrete shell program path/name.
+///
+/// - POSIX stems (`bash`/`sh`/…): `<prog> -c <command>`
+/// - `cmd` / `cmd.exe`: `<prog> /d /c <command>`
+/// - PowerShell (`powershell`/`pwsh`): `-NoProfile -NonInteractive -Command`
+pub fn shell_argv_for_program(prog: &str, command: &str) -> (String, Vec<String>) {
+    match shell_kind_for_program(prog) {
+        ShellKind::Posix => (
+            prog.to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        ),
+        ShellKind::Cmd => (
+            prog.to_string(),
+            vec!["/d".to_string(), "/c".to_string(), command.to_string()],
+        ),
+        ShellKind::PowerShell => (
+            prog.to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        ),
+    }
+}
+
+/// Build `(program, args)` to run a single command string in the active shell.
+/// POSIX: `<shell> -c <command>`. PowerShell: `-NoProfile -NonInteractive
+/// -Command`. Cmd: `/d /c`. When sandboxed the program is always `bash`
+/// (resolved in the guest), never a Windows host shell path.
+pub fn shell_argv(command: &str) -> (String, Vec<String>) {
+    if is_sandbox_enabled() {
+        return (
+            "bash".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        );
+    }
+    let prog = resolve_host_shell();
+    shell_argv_for_program(&prog, command)
 }
 
 /// Purpose of an exec — selects which host env extras (compiler caches) to
@@ -154,8 +210,8 @@ pub struct ProcessEnv {
 ///
 /// - **Host, POSIX shell:** `env_clear` + PATH/HOME/TMPDIR/USER (+ purpose
 ///   extras). No LD_PRELOAD / proxy leak.
-/// - **Host, PowerShell:** inherit the parent env (SystemRoot/PATHEXT/APPDATA
-///   are required); apply nothing extra.
+/// - **Host, PowerShell / cmd:** inherit the parent env (SystemRoot/PATHEXT/
+///   APPDATA/COMSPEC are required); apply nothing extra.
 /// - **Microsandbox:** empty per-command map — the base guest env is set at
 ///   sandbox creation (see [`guest_base_env`]); secrets are never inherited.
 pub fn build_process_env(cfg: &Config, purpose: ExecPurpose) -> ProcessEnv {
@@ -164,7 +220,7 @@ pub fn build_process_env(cfg: &Config, purpose: ExecPurpose) -> ProcessEnv {
     }
     let kind = host_shell_kind();
     if !kind.is_posix() {
-        // PowerShell depends on the Windows process environment.
+        // Windows shells depend on the full process environment.
         return ProcessEnv {
             env: BTreeMap::new(),
             inherit_parent: true,
@@ -318,5 +374,75 @@ pub fn bash_tool_description() -> &'static str {
     match effective_shell_kind() {
         ShellKind::Posix => "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.",
         ShellKind::PowerShell => "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.",
+        ShellKind::Cmd => "Run a shell command in the workspace (cmd.exe; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .cmd/.bat script with write_file and run it via `cmd /c script.cmd`. Use cmd.exe syntax (`%VAR%`, `&&`, `dir`), not PowerShell.",
+    }
+}
+
+/// OS-/sandbox-aware shell guidance for the standing system prompt so the model
+/// emits syntax that matches the live `bash` tool (not a compile-time OS guess).
+pub fn shell_guidance() -> &'static str {
+    if is_sandbox_enabled() {
+        return "Shell: the `bash` tool runs commands in Linux bash inside the sandbox microVM. Write POSIX syntax. For complex logic write a script with write_file and run `bash script.sh`.";
+    }
+    match effective_shell_kind() {
+        ShellKind::Posix => {
+            "Shell: the `bash` tool runs commands in bash. For complex logic write a script with write_file and run `bash script.sh`."
+        }
+        ShellKind::PowerShell => {
+            "Shell: the `bash` tool runs commands in PowerShell (pwsh if installed, else Windows PowerShell). Write PowerShell syntax — e.g. `Get-ChildItem`/`gci`, `Select-String`, `Remove-Item`, `$env:VAR`, `$LASTEXITCODE`. For complex logic write a `.ps1` script with write_file and run `powershell -File script.ps1`. Avoid POSIX-isms (`&&`/`||` chains, `2>/dev/null`, `export`); use `;`/`if`/`$()`/`$env:` instead."
+        }
+        ShellKind::Cmd => {
+            "Shell: the `bash` tool runs commands in cmd.exe. Write cmd syntax — e.g. `dir`, `type`, `findstr`, `%VAR%`, `&&`/`||`, `if errorlevel`. For complex logic write a `.cmd` script with write_file and run `cmd /c script.cmd`. Avoid PowerShell-only cmdlets and POSIX-only constructs."
+        }
+    }
+}
+
+#[cfg(test)]
+mod shell_argv_tests {
+    use super::*;
+
+    #[test]
+    fn shell_kind_classifies_common_stems() {
+        assert_eq!(shell_kind_for_program("bash"), ShellKind::Posix);
+        assert_eq!(
+            shell_kind_for_program(r"C:\Program Files\Git\bin\bash.exe"),
+            ShellKind::Posix
+        );
+        assert_eq!(shell_kind_for_program("pwsh"), ShellKind::PowerShell);
+        assert_eq!(
+            shell_kind_for_program("powershell.exe"),
+            ShellKind::PowerShell
+        );
+        assert_eq!(shell_kind_for_program("cmd"), ShellKind::Cmd);
+        assert_eq!(
+            shell_kind_for_program(r"C:\Windows\System32\cmd.exe"),
+            ShellKind::Cmd
+        );
+    }
+
+    #[test]
+    fn shell_argv_for_program_uses_matching_flags() {
+        let (p, a) = shell_argv_for_program("bash", "echo hi");
+        assert_eq!(p, "bash");
+        assert_eq!(a, vec!["-c".to_string(), "echo hi".to_string()]);
+
+        let (p, a) = shell_argv_for_program("pwsh", "Write-Output hi");
+        assert_eq!(p, "pwsh");
+        assert_eq!(
+            a,
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "Write-Output hi".to_string(),
+            ]
+        );
+
+        let (p, a) = shell_argv_for_program("cmd.exe", "echo hi");
+        assert_eq!(p, "cmd.exe");
+        assert_eq!(
+            a,
+            vec!["/d".to_string(), "/c".to_string(), "echo hi".to_string()]
+        );
     }
 }

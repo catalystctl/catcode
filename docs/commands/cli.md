@@ -50,9 +50,10 @@ The TUI locates the `core` binary in this order:
 3. Development fallbacks (only when the TUI is a dev build): `core/target/release/core`, `../core/target/release/core`
 4. `catcode-core` on `PATH`
 
-`build.sh` only creates the repository binaries; it does not replace an
-installed `/usr/local/bin/catcode-core`. Use `./build.sh --run` (or set
-`CATCODE_CORE` to `core/target/release/core`) when testing a source build.
+`build.sh` replaces the `catcode` binary found on `PATH` and its sibling
+`catcode-core` when present. If no installed `catcode` is found, use
+`./build.sh --run` (or set `CATCODE_CORE` to `core/target/release/core`) when
+testing a source build.
 
 ---
 

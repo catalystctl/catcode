@@ -108,12 +108,16 @@ func resolveImagePath(tok string) (string, bool) {
 	// file:// URIs (some terminals/VS Code paste these for drag-drop).
 	if strings.HasPrefix(p, "file://") {
 		p = strings.TrimPrefix(p, "file://")
-		// file:///C:/Users/... on Windows-style; file:///home/... on Unix.
-		if runtime.GOOS != "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
-			// Leave Windows drive paths alone only when running on Windows.
-		}
-		// Percent-decode minimal cases (%20 for spaces).
+		// Percent-decode common cases (space + drive colon) first so
+		// file:///C%3A/Users/... becomes /C:/Users/...
 		p = strings.ReplaceAll(p, "%20", " ")
+		p = strings.ReplaceAll(p, "%3A", ":")
+		p = strings.ReplaceAll(p, "%3a", ":")
+		// Windows drag-drop often yields file:///C:/Users/... (leading slash
+		// before the drive letter). filepath.Abs leaves that invalid; strip it.
+		if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+			p = p[1:]
+		}
 	}
 	if strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -756,6 +760,8 @@ func readClipboardImageLinux() ([]byte, error) {
 
 func readClipboardImageWindows() ([]byte, error) {
 	// PowerShell: pull Clipboard image, save as PNG to a temp path, print path.
+	// WinForms Clipboard APIs require an STA thread (-Sta). Prefer pwsh when
+	// present, fall back to Windows PowerShell 5.1.
 	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("catcode-clip-%d.png", time.Now().UnixNano()))
 	// Escape for PowerShell single-quoted string (double any single quotes).
 	psTmp := strings.ReplaceAll(tmp, "'", "''")
@@ -767,19 +773,32 @@ if ($null -eq $img) { Write-Error 'no image in clipboard'; exit 1 }
 $img.Save('%s', [System.Drawing.Imaging.ImageFormat]::Png)
 Write-Output '%s'
 `, psTmp, psTmp)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	progs := []string{"pwsh", "powershell"}
+	var lastErr error
+	for _, prog := range progs {
+		if _, err := exec.LookPath(prog); err != nil {
+			continue
+		}
+		cmd := exec.Command(prog, "-NoProfile", "-NonInteractive", "-Sta", "-Command", script)
+		hideConsoleWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %v (%s)", prog, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		data, err := os.ReadFile(tmp)
 		_ = os.Remove(tmp)
-		return nil, fmt.Errorf("Windows clipboard: %v (%s)", err, strings.TrimSpace(string(out)))
+		if err != nil {
+			return nil, err
+		}
+		if sniffImageExt(data) == "" {
+			return nil, fmt.Errorf("Windows clipboard has no image")
+		}
+		return data, nil
 	}
-	data, err := os.ReadFile(tmp)
 	_ = os.Remove(tmp)
-	if err != nil {
-		return nil, err
+	if lastErr != nil {
+		return nil, fmt.Errorf("Windows clipboard: %v", lastErr)
 	}
-	if sniffImageExt(data) == "" {
-		return nil, fmt.Errorf("Windows clipboard has no image")
-	}
-	return data, nil
+	return nil, fmt.Errorf("Windows clipboard: neither pwsh nor powershell found on PATH")
 }

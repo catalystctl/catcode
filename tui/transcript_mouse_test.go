@@ -12,6 +12,8 @@ import (
 func mouseTranscriptSession(t *testing.T) (*session, *block, *block, *block) {
 	t.Helper()
 	s := initialSession()
+	s.thinkExpanded = false
+	s.settings.ThinkExpanded = false
 	s.ready = true
 	s.coreLifecycle = coreReady
 	s.width, s.height = 90, 36

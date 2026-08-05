@@ -40,7 +40,7 @@ Then open `http://localhost:49283` in your browser.
 irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex
 ```
 
-Open a **new** PowerShell window (so PATH reloads) and proceed below.
+Open a **new terminal window** (PowerShell, Command Prompt, or Windows Terminal) so PATH reloads, then proceed below.
 
 ### Windows (with web frontend)
 

@@ -171,16 +171,11 @@ Secondary tools are not in the default schema. Call `load_tools` with a **group*
 const SKILL_MANIFEST_MAX: usize = 12;
 const SKILL_DESC_MAX_CHARS: usize = 80;
 
-/// OS-aware shell guidance injected into every system prompt (main + subagents)
-/// so the model emits the matching command syntax: bash on Linux/macOS,
-/// PowerShell on Windows. The `bash` tool still carries its name (renaming it
-/// would break TUI/web/SDK wire compatibility); on Windows it executes the
-/// command through PowerShell via `shell_argv` (tools.rs). Override the shell
-/// with `CATALYST_CODE_SHELL` (e.g. `bash` under Git-Bash/WSL).
-#[cfg(target_os = "windows")]
-const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in PowerShell (pwsh if installed, else Windows PowerShell). Write PowerShell syntax — e.g. `Get-ChildItem`/`gci`, `Select-String`, `Remove-Item`, `$env:VAR`, `$LASTEXITCODE`. For complex logic write a `.ps1` script with write_file and run `powershell -File script.ps1`. Avoid POSIX-isms (`&&`/`||` chains, `2>/dev/null`, `$(...)`, `export`); use `;`/`if`/`$()`/`$env:` instead.";
-#[cfg(not(target_os = "windows"))]
-const SHELL_GUIDANCE: &str = "Shell: the `bash` tool runs commands in bash. For complex logic write a script with write_file and run `bash script.sh`.";
+/// Shell guidance is derived at prompt-build time from
+/// [`sandbox::policy::shell_guidance`] so it matches the live `bash` tool
+/// (sandbox guest bash vs host PowerShell/cmd/posix, including
+/// `CATALYST_CODE_SHELL`). The wire tool name stays `bash` for TUI/web/SDK
+/// compatibility.
 
 /// Build the full system prompt by appending git context, memory context,
 /// the plugins pointer, the provider-onboarding guide, and the deferred-tools
@@ -201,7 +196,7 @@ pub fn build_system_prompt(
         workspace.display()
     ));
     prompt.push_str("\n\n");
-    prompt.push_str(SHELL_GUIDANCE);
+    prompt.push_str(sandbox::policy::shell_guidance());
     if let Some(git) = read_git_context(workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&git_context_injection(&git));

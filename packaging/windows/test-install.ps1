@@ -167,7 +167,17 @@ try {
     Remove-Item -LiteralPath $tmpHome -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# ── 8. No `if` used in expression position (irm | iex / pwsh -File) ─────────
+# ── 8. Uninstall must strip user PATH (Add-ToPath mirror) ─────────────────
+$src = Get-Content -LiteralPath $Installer -Raw
+if ($src -notmatch 'function Remove-FromPath') {
+    Fail 'Remove-FromPath function missing — uninstall leaves stale PATH'
+} elseif ($src -notmatch 'Do-Uninstall[\s\S]*Remove-FromPath') {
+    Fail 'Do-Uninstall does not call Remove-FromPath'
+} else {
+    Pass 'Do-Uninstall removes install dir from user PATH'
+}
+
+# ── 9. No `if` used in expression position (irm | iex / pwsh -File) ─────────
 # `if` is a STATEMENT, not an expression. Inside plain parens as an operand
 # (e.g. `('HOST="' + (if ($x) { $a } else { $b }) + '"')`) PowerShell parses
 # `if` as a COMMAND NAME and throws CommandNotFoundException ("The term 'if'

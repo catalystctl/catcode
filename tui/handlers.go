@@ -169,6 +169,9 @@ func (s *session) clearBlockingPrompts() {
 	s.pendingApproval = nil
 	s.pendingIntercom = nil
 	s.intercomQueue = nil
+	s.overlayPress = overlayPress{}
+	s.askBoxRows = nil
+	s.sudoBoxRows = nil
 }
 
 // disarmAbortTimeout invalidates any pending abortBusyTimeout tick so a late
@@ -204,6 +207,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				_ = json.Unmarshal(a, &b)
 				s.authed = b
 			}
+			// anyLoggedIn unlocks multi-provider sends even when the active
+			// provider itself has no key (stale settings / expired OAuth).
+			if raw, ok := m["anyLoggedIn"]; ok {
+				var b bool
+				if err := json.Unmarshal(raw, &b); err == nil {
+					s.anyLoggedIn = b
+				}
+			} else {
+				// Older cores omit the field — fall back to active-provider auth.
+				s.anyLoggedIn = s.authed
+			}
 			if raw, ok := m["approval"]; ok {
 				var mode string
 				_ = json.Unmarshal(raw, &mode)
@@ -235,6 +249,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				_ = json.Unmarshal(raw, &s.providerPresets)
 			}
 			s.providerHasKey = s.authed // ready's authed reflects the active provider's key
+			// Models already in the ready payload imply at least one logged-in
+			// provider (discovery only runs for those). Prefer the explicit flag,
+			// but never leave anyLoggedIn false when models arrived.
+			if !s.anyLoggedIn && len(models) > 0 {
+				s.anyLoggedIn = true
+			}
 			s.applyReadySandboxFields(m)
 		}
 		// Bind a pre-provider-era global key to the provider reported at startup.
@@ -286,9 +306,11 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			return waitForEvent(s.coreEvents, s.coreStartGen)
 		}
 		s.reauthActiveProvider()
-		// First-run auth: open /login once when ready with no key so the user
-		// isn't forced to burn a failed send to discover the path.
-		if !s.authed && !s.loginOffered && s.modal.kind == modalNone {
+		// First-run auth: open /login once when NO provider is logged in so the
+		// user isn't forced to burn a failed send to discover the path. Multi-
+		// provider setups with a broken active provider but working secondary
+		// keys must still be able to send (canSend uses anyLoggedIn).
+		if !s.canSend() && !s.loginOffered && s.modal.kind == modalNone {
 			s.loginOffered = true
 			s.openLoginPicker()
 		}
@@ -307,6 +329,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				// prompt send stays blocked after SuperGrok / Claude / Gemini OAuth.
 				// Mirror has_key into authed so logout/switch-without-key also clears it.
 				s.authed = b
+				// Gaining a key on any provider unlocks multi-provider sends.
+				if b {
+					s.anyLoggedIn = true
+				} else if !s.containsOtherLoggedInProvider() && len(s.models) == 0 {
+					// Losing the only usable provider fully signs the session out.
+					s.anyLoggedIn = false
+				}
+				// else: keep anyLoggedIn — other owners still have models/keys.
 			}
 		}
 		// A persisted provider may be applied asynchronously after ready. The
@@ -361,8 +391,12 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.authed = ok
 		s.providerHasKey = ok
 		if ok {
+			s.anyLoggedIn = true
 			s.oauth = nil
 			s.logSuccess("authenticated")
+		} else if len(s.models) == 0 {
+			// No models left and active provider lost its key → fully signed out.
+			s.anyLoggedIn = false
 		}
 		s.refresh()
 
@@ -438,6 +472,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			cpSeedModelCaps(d)
 			d.field = cpFieldModels
 			d.modelCursor = 0
+			d.modelScroll = 0
 			d.modelField = cpCapContext
 			s.modal.loadError = ""
 			s.logInfo(fmt.Sprintf("%d model(s) discovered — refine caps or submit", len(models)))
@@ -898,6 +933,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			if strings.Contains(low, "logged into") && strings.Contains(low, "oauth") {
 				s.authed = true
 				s.providerHasKey = true
+				s.anyLoggedIn = true
 				s.logSuccess("authenticated (OAuth)")
 			}
 		}
@@ -1537,9 +1573,37 @@ func (s *session) reauthActiveProvider() {
 	}
 	if s.sendProviderKey(s.activeProvider) {
 		s.logInfo("sending key…")
-	} else {
+	} else if !s.canSend() {
+		// Only nag when NO provider can serve a turn. Multi-provider setups with a
+		// broken active provider but working secondary keys must still send.
 		s.logWarn("not authenticated — run /login")
 	}
+}
+
+// canSend reports whether the user may dispatch a model turn. True when the
+// active provider is keyed OR any configured provider is logged in (models
+// route per-id to their owning provider). This unblocks Linux/WSL users who
+// had a stale/broken active provider while other providers still worked — the
+// old global `authed` gate silently dropped every send before HTTP left core.
+func (s *session) canSend() bool {
+	return s.authed || s.anyLoggedIn || s.providerHasKey || len(s.models) > 0
+}
+
+// containsOtherLoggedInProvider is a cheap heuristic used when the active
+// provider loses its key: if models remain tagged to a non-active owner, some
+// other provider is still usable for sends.
+func (s *session) containsOtherLoggedInProvider() bool {
+	for _, m := range s.models {
+		if m.Provider != "" && m.Provider != s.activeProvider {
+			return true
+		}
+	}
+	for _, p := range s.providerPresets {
+		if p.LoggedIn && p.ID != s.activeProvider {
+			return true
+		}
+	}
+	return false
 }
 
 // In v2 mouse mode is a declarative View field. It remains in cell-motion mode
@@ -1549,6 +1613,11 @@ func (s *session) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	// keyboard navigation instead of scrolling the hidden transcript.
 	if s.modal.kind != modalNone {
 		return s.handleModalMouseWheel(msg)
+	}
+	// Blocking ask/sudo flyouts also own the whole screen: swallow the wheel so
+	// it cannot scroll the hidden transcript behind the password/answer field.
+	if s.pendingAsk != nil || s.pendingSudo != nil {
+		return nil
 	}
 	switch msg.Button {
 	case tea.MouseWheelUp:
@@ -1570,7 +1639,7 @@ func (s *session) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 // subagent tool (the model applies the pi-subagents skill). cmdName is shown
 // to the user as the originating slash command.
 func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
@@ -1713,7 +1782,7 @@ func splitChain(s string) string {
 }
 
 func (s *session) sendSteer(prompt string) tea.Cmd {
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
@@ -1764,7 +1833,7 @@ func (s *session) steerFromInput() tea.Cmd {
 // and runs it after the current turn. Marks a chained turn so the TUI stays
 // busy across the hand-off instead of flashing "ready".
 func (s *session) queueFollowUp(text string) tea.Cmd {
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
@@ -2162,7 +2231,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// example cursor; enter drops the selected example into the (editable)
 	// input. Only arrow keys are used so typing letters/digits is unaffected.
 	if !s.hasConversation() && s.pendingApproval == nil && strings.TrimSpace(s.input.Value()) == "" {
-		if !s.authed {
+		if !s.canSend() {
 			if s.kb(msg, "select") && strings.TrimSpace(s.input.Value()) == "" {
 				s.openLoginPicker()
 				return s, nil
@@ -2213,7 +2282,7 @@ func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			text = "Describe this image."
 		}
 		if !strings.HasPrefix(text, "/") && !isBangCommand(text) {
-			if !s.authed {
+			if !s.canSend() {
 				s.logError("not authenticated — run /login first")
 				return s, nil
 			}
@@ -2718,6 +2787,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.contextTokens = 0
 			s.follow = true
 			s.invalidateAll()
+			s.transcriptBase = ""
+			s.transcriptPlain = nil
 			s.viewport.SetContent("")
 			s.logInfo("in-memory conversation cleared (session file kept)")
 			return nil
@@ -2959,7 +3030,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		}
 	}
 
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
@@ -3008,7 +3079,7 @@ func (s *session) sendAttach(imgPath, promptText string) tea.Cmd {
 	if strings.TrimSpace(promptText) == "" {
 		promptText = "Describe this image."
 	}
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}
@@ -3061,7 +3132,7 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 		s.logError("unknown skill: " + name)
 		return nil
 	}
-	if !s.authed {
+	if !s.canSend() {
 		s.logError("not authenticated — run /login first")
 		return nil
 	}

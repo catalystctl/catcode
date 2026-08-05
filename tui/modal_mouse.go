@@ -93,6 +93,7 @@ func (s *session) renderModalSelection(view string) string {
 }
 
 func (s *session) handleModalMouseClick(msg tea.MouseClickMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if msg.Button != tea.MouseLeft {
 		return nil
 	}
@@ -173,6 +174,7 @@ func (s *session) activateModalItem(idx int) tea.Cmd {
 }
 
 func (s *session) handleModalMouseMotion(msg tea.MouseMotionMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if !s.modalSelection.active || s.modalSelectionKind != s.modal.kind {
 		s.reuseLastView = true
 		return nil
@@ -232,6 +234,7 @@ func (s *session) handleModalSelectionFrame(msg selectionFrameMsg) tea.Cmd {
 }
 
 func (s *session) handleModalMouseRelease(msg tea.MouseReleaseMsg) tea.Cmd {
+	msg.X, msg.Y = mouseCoord(msg.X, msg.Y)
 	if !s.modalSelection.active || s.modalSelectionKind != s.modal.kind {
 		s.reuseLastView = true
 		return nil

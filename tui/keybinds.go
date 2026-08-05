@@ -163,7 +163,56 @@ func (s *session) kb(msg tea.KeyPressMsg, action string) bool {
 	if caseInsensitiveActions[action] && len([]rune(key)) == 1 {
 		return strings.EqualFold(got, key)
 	}
-	return got == key
+	// Stored bindings may order modifiers non-canonically (hand-edited settings
+	// files); Key.Keystroke always emits ctrl+alt+shift+meta+hyper+super, so
+	// canonicalize before comparing — for real keypresses and for synthesized
+	// keys (mouse click dispatch).
+	return got == canonicalKeyMods(key)
+}
+
+// canonicalKeyMods reorders the modifier prefix of a stored binding string into
+// the canonical order Key.Keystroke emits (ctrl, alt, shift, meta, hyper,
+// super). "shift+ctrl+p" → "ctrl+shift+p". Non-modifier parts are untouched.
+func canonicalKeyMods(key string) string {
+	parts := strings.Split(key, "+")
+	if len(parts) < 2 {
+		return key
+	}
+	order := []string{"ctrl", "alt", "shift", "meta", "hyper", "super"}
+	var mods []string
+	rest := ""
+	for _, p := range parts {
+		m := ""
+		for _, o := range order {
+			if strings.EqualFold(p, o) {
+				m = o
+				break
+			}
+		}
+		if m == "" {
+			rest = p // the key part (first non-modifier); anything after is literal
+			break
+		}
+		mods = append(mods, m)
+	}
+	if len(mods) == 0 {
+		return key
+	}
+	seen := map[string]bool{}
+	var ordered []string
+	for _, o := range order {
+		for _, m := range mods {
+			if m == o && !seen[m] {
+				ordered = append(ordered, o)
+				seen[m] = true
+			}
+		}
+	}
+	out := strings.Join(ordered, "+")
+	if rest != "" {
+		out += "+" + rest
+	}
+	return out
 }
 
 // spaceNorm maps the two space representations to one canonical form so kb()

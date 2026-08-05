@@ -80,6 +80,13 @@ type block struct {
 const maxBlocks = 400
 
 func (s *session) push(kind blockKind) *block {
+	// A new block closes the previous streaming block. Clear its throttled
+	// render snapshot so a final short delta cannot be lost when that block is
+	// moved into the immutable prefix cache.
+	if s.cur != nil && (s.cur.kind == blkAssistant || s.cur.kind == blkThinking) {
+		s.cur.renderStr = ""
+		s.cur.renderLen = 0
+	}
 	b := &block{kind: kind}
 	if kind == blkThinking {
 		b.collapsed = !s.thinkExpanded
@@ -570,9 +577,12 @@ func (s *session) renderCoreFailure() string {
 // follow is off and the current offset is preserved so reading isn't yanked.
 func (s *session) refresh() {
 	base := s.renderBlocks()
-	if base != s.transcriptBase || s.transcriptPlain == nil {
+	if base != s.transcriptBase {
 		s.transcriptBase = base
-		s.transcriptPlain = plainTranscriptLines(base)
+		// Mouse hit-testing is opt-in. Do not eagerly build a second, ANSI-free
+		// copy of the entire transcript on every stream frame; the first mouse
+		// event will populate it through transcriptPlainLines().
+		s.transcriptPlain = nil
 		// SetContent re-splits the entire transcript (strings.Split + line
 		// normalization in bubbles/viewport). Skip it when content is byte-
 		// identical — e.g. spinner/stream ticks that left the live block
@@ -848,7 +858,8 @@ func (s *session) renderBlock(b *block, w int) string {
 		return s.decorateFocusedBlock(b, s.renderKeyHints(out))
 	}
 	if blockRenderCacheable(b) && b.renderStr != "" &&
-		b.renderW == w && b.renderTheme == activeTheme.name {
+		b.renderW == w && b.renderTheme == activeTheme.name &&
+		b.renderLen == b.text.Len() {
 		return s.decorateFocusedBlock(b, s.renderKeyHints(b.renderStr))
 	}
 	out := s.renderBlockFull(b, w)
@@ -909,7 +920,11 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		if meta == "" && len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 			meta = s.models[s.modelIdx].ID
 		}
-		return s.renderAssistantTurn(meta, b.text.String(), w)
+		markdown := renderMarkdown
+		if b == s.cur {
+			markdown = renderMarkdownUncached
+		}
+		return s.renderAssistantTurn(meta, b.text.String(), w, markdown)
 	case blkThinking:
 		if b.collapsed {
 			n := strings.Count(b.text.String(), "\n") + 1
@@ -922,7 +937,11 @@ func (s *session) renderBlockFull(b *block, w int) string {
 			}
 			return softPillStyle(c.secondary, c.surface).Render(label)
 		}
-		content := thinkStyle.Render(renderMarkdown(b.text.String(), w-4))
+		markdown := renderMarkdown
+		if b == s.cur {
+			markdown = renderMarkdownUncached
+		}
+		content := thinkStyle.Render(markdown(b.text.String(), w-4))
 		return recessedStyle.Width(max(1, w-2)).Render(content)
 	case blkTool:
 		return s.renderToolBlock(b, w)
@@ -1378,13 +1397,13 @@ func (s *session) renderUserBubble(text string, w int) string {
 
 // renderAssistantTurn renders the model's reply as full-width prose with a
 // quiet model tag above and a thin accent rail down the left.
-func (s *session) renderAssistantTurn(meta, text string, w int) string {
+func (s *session) renderAssistantTurn(meta, text string, w int, markdown func(string, int) string) string {
 	var out strings.Builder
 	if meta != "" {
 		out.WriteString(dimStyle.Render("  " + truncate(meta, 48)))
 		out.WriteByte('\n')
 	}
-	out.WriteString(turnRail(renderMarkdown(text, w-2), railStyle))
+	out.WriteString(turnRail(markdown(text, w-2), railStyle))
 	return out.String()
 }
 
@@ -1434,16 +1453,14 @@ func (s *session) renderWelcome() string {
 	w := s.viewport.Width()
 	h := s.viewport.Height()
 
-	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
-		panelW := min(50, max(20, w-4))
-		panel := surfacePanel(panelW).Render(
-			accentStyle.Render("◷ Starting…") + "\n\n" +
-				baseStyle.Render("Connecting to the core and checking credentials."))
-		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
+	if s.showingSplash() {
+		return s.renderSplashScreen(w, h)
 	}
 
 	// Unauthed first-run: lead with login instead of example prompts.
-	if !s.authed {
+	// canSend (not bare authed) so multi-provider sessions with a broken
+	// active provider still show the normal welcome once models are ready.
+	if !s.canSend() {
 		panelW := 50
 		if w-4 < panelW {
 			panelW = w - 4

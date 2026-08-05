@@ -27,8 +27,14 @@ pub(crate) async fn run() {
     // config (host when sandbox=none, Microsandbox microVM when enabled). The
     // microVM itself boots lazily on the first agent-controlled exec.
     crate::sandbox::init_from_config(std::sync::Arc::new(cfg.clone()));
+    // connect_timeout only: no total .timeout() — long reasoning streams must
+    // not be aborted mid-body. Per-chunk idle timeouts live in stream_turn.
+    // system-proxy / http2 / native roots come from Cargo features (see
+    // core/Cargo.toml); Client::builder() picks them up automatically.
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_nodelay(true)
         .build()
         .expect("client");
 
@@ -371,8 +377,23 @@ pub(crate) async fn run() {
                 // Enrich OAuth so SuperGrok / Claude / Gemini look signed-in on
                 // startup (they store tokens on disk, not as api_key in config).
                 let rp = state.resolved_provider_enriched().await;
+                // `authed` = the ACTIVE provider has a usable key (footer/status).
+                // `any_logged_in` = ANY configured provider is logged in — the TUI
+                // uses this to allow multi-provider sends (model routes to its
+                // owner) even when the active/fallback provider is unauthenticated
+                // (stale settings.active_provider, expired OAuth, etc.). Without
+                // this, Linux/WSL users with a broken active provider and working
+                // secondary keys saw "not authenticated" and never fired requests.
                 let authed = rp.api_key.is_some();
                 let cfg = state.cfg.read().await;
+                // `any_logged_in` needs the cfg + runtime key map; compute before
+                // we start using `cfg` for the ready payload so we don't hold
+                // two overlapping read guards on the same lock.
+                let any_logged_in = {
+                    let keys = state.api_keys.read().await;
+                    !logged_in_providers_for(&cfg, &keys, Some(&state.plugin_manager)).is_empty()
+                        || authed
+                };
                 let conv_len = state.conversation.lock().await.len();
                 let loaded_plugins: Vec<String> =
                     state.plugin_manager.list().keys().cloned().collect();
@@ -390,6 +411,7 @@ pub(crate) async fn run() {
                     &Event::new("ready")
                         .with("models", json!(models))
                         .with("authed", json!(authed))
+                        .with("anyLoggedIn", json!(any_logged_in))
                         .with("workspace", json!(cfg.workspace.display().to_string()))
                         .with("approval", json!(cfg.approval.as_str()))
                         .with("base_url", json!(rp.base_url))

@@ -3717,8 +3717,10 @@ fn hook_command_with_env(script: &Path, extra_env: &[(String, String)]) -> Comma
     let mut c = match ext.as_str() {
         "bat" | "cmd" | "exe" | "com" => Command::new(script),
         "ps1" => {
-            let mut c = Command::new("powershell");
+            // Prefer pwsh when available so hooks match the bash-tool default.
+            let mut c = Command::new(crate::sandbox::policy::resolve_powershell_program());
             c.arg("-NoProfile")
+                .arg("-NonInteractive")
                 .arg("-ExecutionPolicy")
                 .arg("Bypass")
                 .arg("-File")
@@ -3753,10 +3755,10 @@ fn hook_command_with_env(script: &Path, extra_env: &[(String, String)]) -> Comma
     // Plugin/hook/oauth scripts are untrusted user/repo code: NEVER let them
     // inherit the parent's environment — that would leak every *_API_KEY,
     // UMANS_*, CATALYST_CODE_* the user exported. Clear the child env and
-    // re-inject only the minimal set the interpreter + scripts need (PATH to
-    // find the interpreter and any binaries the script calls, HOME + USER for
-    // ~ expansion, TMPDIR for temp). All real context travels via the stdin
-    // JSON. Mirrors execute_bash's env_clear (tools.rs).
+    // re-inject only the minimal set the interpreter + scripts need. On
+    // Windows also re-inject the baseline process env PowerShell/cmd need
+    // (SystemRoot/PATHEXT/COMSPEC/…) — without these, .ps1/.bat hooks fail to
+    // start. All real context travels via the stdin JSON.
     c.env_clear();
     if let Ok(v) = std::env::var("PATH") {
         c.env("PATH", v);
@@ -3769,6 +3771,37 @@ fn hook_command_with_env(script: &Path, extra_env: &[(String, String)]) -> Comma
     }
     if let Ok(v) = std::env::var("USER") {
         c.env("USER", v);
+    }
+    // Windows baseline required by PowerShell, cmd, and most .bat helpers.
+    #[cfg(target_os = "windows")]
+    {
+        for key in [
+            "SystemRoot",
+            "windir",
+            "PATHEXT",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "USERNAME",
+            "USERDOMAIN",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+            "OS",
+            "ProgramData",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "CommonProgramFiles",
+            "PSModulePath",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                c.env(key, v);
+            }
+        }
     }
     // Memory-provider plugins (Engraphis, etc.) need their DB/embed config and
     // optionally a custom PYTHONPATH. These are not API secrets.

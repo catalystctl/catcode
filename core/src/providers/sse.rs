@@ -55,6 +55,13 @@ impl SseDecoder {
         frames
     }
 
+    /// Whether the decoder has transport data that has not formed a complete
+    /// SSE line/event yet. A body-level transport error may be tolerated only
+    /// after a terminal frame and when this is false.
+    pub(crate) fn has_pending_data(&self) -> bool {
+        !self.line_buffer.is_empty() || !self.data.is_empty()
+    }
+
     pub fn finish(&mut self) -> Vec<SseFrame> {
         let mut frames = Vec::new();
         if !self.line_buffer.is_empty() {

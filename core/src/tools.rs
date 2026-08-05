@@ -1683,72 +1683,26 @@ pub async fn execute_bash(
 
 /// Resolve the shell program used to run `bash`-tool commands.
 ///
-/// Defaults to the platform-native shell so the model emits the matching
-/// syntax: `bash` on Linux/macOS, PowerShell on Windows (`pwsh` if installed,
-/// else Windows PowerShell). Override with `CATALYST_CODE_SHELL` (e.g. `bash`
-/// for Git-Bash/WSL users on Windows, `zsh`, `pwsh`, or a full path) — mirrors
-/// the plugin hook-launcher convention in plugins.rs.
+/// Single source of truth: [`crate::sandbox::policy::resolve_host_shell`].
+#[allow(dead_code)] // kept as the tools-layer alias; policy is the authority
 pub(crate) fn resolve_shell() -> String {
-    if let Ok(s) = std::env::var("CATALYST_CODE_SHELL") {
-        let s = s.trim();
-        if !s.is_empty() {
-            return s.to_string();
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if pwsh_available() {
-            "pwsh".to_string()
-        } else {
-            "powershell".to_string()
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "bash".to_string()
-    }
+    crate::sandbox::policy::resolve_host_shell()
 }
 
 /// Whether the resolved shell is a POSIX shell (`bash`/`sh`/`zsh`/`dash`/…):
 /// it takes `-c <cmd>` and supports the `sudo()` function-wrapper trick.
-/// False for PowerShell (`powershell`/`pwsh`). Keyed on the resolved shell
-/// (not the host OS) so a WSL `bash` on Windows still behaves as bash and a
-/// `pwsh` override on Linux behaves as PowerShell.
+/// False for PowerShell (`powershell`/`pwsh`) and cmd.exe. Keyed on the
+/// resolved shell (not the host OS) so a WSL `bash` on Windows still behaves
+/// as bash and a `pwsh` override on Linux behaves as PowerShell.
 pub(crate) fn shell_is_posix() -> bool {
-    let stem = std::path::Path::new(&resolve_shell())
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    matches!(
-        stem.as_str(),
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
-    )
+    crate::sandbox::policy::effective_shell_kind().is_posix()
 }
 
 /// Build `(program, args)` for running a single command string in the active
-/// shell. POSIX shells: `<shell> -c <command>`. PowerShell:
-/// `powershell -NoProfile -NonInteractive -Command <command>` (`-NonInteractive`
-/// prevents `Read-Host` from hanging the agent loop; `-NoProfile` skips the
-/// user profile for a clean, fast startup).
+/// shell. Delegates to [`crate::sandbox::policy::shell_argv`] so diagnostics
+/// and the bash tool share cmd/PowerShell/POSIX argv forms.
 pub(crate) fn shell_argv(command: &str) -> (String, Vec<String>) {
-    let prog = resolve_shell();
-    let stem = std::path::Path::new(&prog)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if stem == "powershell" || stem == "pwsh" {
-        (
-            prog,
-            vec![
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                command.into(),
-            ],
-        )
-    } else {
-        (prog, vec!["-c".into(), command.into()])
-    }
+    crate::sandbox::policy::shell_argv(command)
 }
 
 /// Is `prog` on PATH? A minimal `which` used to prefer `pwsh` over

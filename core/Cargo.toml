@@ -11,7 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# rustls + webpki for public CAs; native-roots for corporate/WSL MITM CAs in
+# /etc/ssl/certs; http2 for ALPN with Cloudflare/CDN gateways; system-proxy so
+# HTTP(S)_PROXY env vars (and Windows/macOS system proxy settings) are honored.
+# default-features = false drops native-tls; we stay rustls-only for portable
+# static builds (AppImage / musl-ish Linux distros without OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "http2", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"

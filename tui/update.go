@@ -67,6 +67,12 @@ type updateAvailableMsg struct {
 	info updateInfo
 }
 
+// updateExecMsg reports completion of an update launched from the clickable
+// banner. It is intentionally local to the TUI; CLI update behavior is unchanged.
+type updateExecMsg struct {
+	err error
+}
+
 // -----------------------------------------------------------------------------
 // Platform → asset-name mapping (must match release-{linux,macos,windows}.sh)
 // -----------------------------------------------------------------------------
@@ -449,6 +455,25 @@ func createUpdateStage() (*os.File, error) {
 	return os.CreateTemp(os.TempDir(), "catcode-update.*"+coreExeSuffix())
 }
 
+// cleanupStaleSelfUpdate removes leftover <exe>.old files from a previous
+// Windows self-update. Safe no-op on other platforms / missing files.
+func cleanupStaleSelfUpdate() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if rp, e := filepath.EvalSymlinks(exe); e == nil {
+		exe = rp
+	}
+	_ = os.Remove(exe + ".old")
+	// Companion core binary may also leave a .old after web/core updates.
+	core := filepath.Join(filepath.Dir(exe), "catcode-core"+coreExeSuffix())
+	_ = os.Remove(core + ".old")
+}
+
 // selfReplace copies a verified staged download to a short-lived file beside
 // the executable, then atomically swaps it into place. The adjacent file is
 // necessary because rename is only atomic within one filesystem; the full
@@ -497,6 +522,7 @@ func selfReplace(staged, exe string) error {
 			_ = os.Rename(old, exe) // try to restore the old binary
 			return err
 		}
+		// Leave <exe>.old for the next launch to delete (file still mapped).
 		return nil
 	}
 	return os.Rename(replacementName, exe)
@@ -555,13 +581,20 @@ func runUpdate() int {
 	}
 	dir := filepath.Dir(exe)
 
-	// A system-wide install (e.g. /usr/local/bin, root-owned) can't be written
-	// to by an unprivileged user. Detect this before touching the network: if
-	// we can't write to the install dir, either re-exec under sudo so the
-	// update just works, or print a clear, actionable error — instead of
-	// failing mid-download with a cryptic temp-file permission error.
+	// A system-wide / non-writable install can't be updated in place. Detect
+	// this before touching the network so we fail with an actionable message
+	// instead of a cryptic mid-download permission error.
 	if !canWriteDir(dir) {
-		if os.Geteuid() != 0 {
+		if runtime.GOOS == "windows" {
+			fmt.Fprintf(os.Stderr, "  ✗ permission denied: cannot write to %s\n", dir)
+			fmt.Fprintf(os.Stderr, "    catcode is installed in a protected location.\n")
+			fmt.Fprintf(os.Stderr, "    Re-run from an elevated terminal (PowerShell or Command Prompt):\n")
+			fmt.Fprintf(os.Stderr, "      catcode --update\n")
+			fmt.Fprintf(os.Stderr, "    or reinstall per-user with:\n")
+			fmt.Fprintf(os.Stderr, "      irm https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.ps1 | iex\n")
+			return 1
+		}
+		if !isPrivileged() {
 			fmt.Printf("catcode is installed system-wide (%s) and needs elevated privileges to update.\n", dir)
 			fmt.Println("Re-running with sudo…")
 			if code, ok := tryEscalateSudo(exe); ok {

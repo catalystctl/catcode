@@ -716,7 +716,7 @@ func (s *session) renderContext() string {
 // composerPlaceholder returns the empty-input hint, contextualized for busy /
 // approval / queue so in-flight controls aren't invisible.
 func (s *session) composerPlaceholder() string {
-	if s.coreLifecycle == coreStarting && s.coreStartGen > 0 {
+	if s.showingSplash() {
 		return "Starting core and checking credentials…"
 	}
 	if s.coreLifecycle == coreFailed {
@@ -742,7 +742,7 @@ func (s *session) composerPlaceholder() string {
 		}
 		return send + " queues · " + close + " aborts · " + steer + " steers · / commands"
 	}
-	if !s.authed {
+	if !s.canSend() {
 		return "Log in first — /login · / for commands · ? help"
 	}
 	if s.input.Placeholder != "" {
@@ -1614,7 +1614,16 @@ func (s *session) View() tea.View {
 	s.reuseLastView = false
 	var content string
 	if !s.ready {
-		content = baseStyle.Render("starting core…")
+		// Pre-layout boot: show the branded splash at a sensible default size so
+		// the first paint isn't a bare one-liner while we wait for WindowSizeMsg.
+		w, h := s.width, s.height
+		if w < 40 {
+			w = 80
+		}
+		if h < 10 {
+			h = 24
+		}
+		content = s.renderSplashScreen(w, h)
 	} else {
 		// Recompute the viewport height from the CURRENT input-box + tasks-panel
 		// height on every render. This is the single source of truth: paths that

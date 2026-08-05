@@ -22,21 +22,39 @@ import (
 
 const glamourBlockCacheMax = 256
 
+// Keep the markdown memo bounded by bytes as well as entries. A single large
+// response can otherwise make 256 cached renders consume far more RAM than the
+// entry count suggests (streaming snapshots are especially poor cache keys).
+const glamourBlockCacheMaxBytes = 16 * 1024 * 1024
+const glamourBlockCacheMaxEntryBytes = glamourBlockCacheMaxBytes / 8
+
 var (
 	glamourMu         sync.Mutex
 	glamourWidth      int
 	glamourRenderer   *glamour.TermRenderer
 	glamourThemeKey   string
 	glamourBlockCache = map[string]string{}
+	glamourCacheBytes int
 )
 
 func renderMarkdown(text string, w int) string {
+	return renderMarkdownWithCache(text, w, true)
+}
+
+// renderMarkdownUncached is for live streaming content. Each stream snapshot
+// has a unique content hash, so retaining it in the global memo only pins a
+// dead copy until eviction without improving a later render.
+func renderMarkdownUncached(text string, w int) string {
+	return renderMarkdownWithCache(text, w, false)
+}
+
+func renderMarkdownWithCache(text string, w int, useCache bool) string {
 	if w < 8 {
 		w = 8
 	}
 	text = preprocessMarkdownPolish(text)
 	if looksLikeMarkdown(text) {
-		out, err := renderMarkdownGlamour(text, w)
+		out, err := renderMarkdownGlamour(text, w, useCache)
 		if err == nil {
 			return postprocessMarkdownPolish(out)
 		}
@@ -57,14 +75,17 @@ func looksLikeMarkdown(text string) bool {
 		strings.Contains(text, "\n| ")
 }
 
-func renderMarkdownGlamour(text string, w int) (string, error) {
-	key := glamourBlockKey(text, w)
-	glamourMu.Lock()
-	if out, ok := glamourBlockCache[key]; ok {
+func renderMarkdownGlamour(text string, w int, useCache bool) (string, error) {
+	var key string
+	if useCache {
+		key = glamourBlockKey(text, w)
+		glamourMu.Lock()
+		if out, ok := glamourBlockCache[key]; ok {
+			glamourMu.Unlock()
+			return out, nil
+		}
 		glamourMu.Unlock()
-		return out, nil
 	}
-	glamourMu.Unlock()
 
 	r, err := glamourRendererFor(w)
 	if err != nil {
@@ -75,13 +96,32 @@ func renderMarkdownGlamour(text string, w int) (string, error) {
 		return "", err
 	}
 	out = strings.Trim(out, "\n")
-	glamourMu.Lock()
-	if len(glamourBlockCache) >= glamourBlockCacheMax {
+	if useCache {
+		glamourMu.Lock()
+		cacheGlamourBlockLocked(key, out)
+		glamourMu.Unlock()
+	}
+	return out, nil
+}
+
+// cacheGlamourBlockLocked inserts a rendered markdown block while holding
+// glamourMu. Oversized individual entries are skipped, and the coarse reset
+// keeps both entry count and retained bytes bounded.
+func cacheGlamourBlockLocked(key, out string) {
+	entryBytes := len(key) + len(out)
+	if entryBytes > glamourBlockCacheMaxEntryBytes {
+		return
+	}
+	if old, ok := glamourBlockCache[key]; ok {
+		glamourCacheBytes -= len(key) + len(old)
+	}
+	if len(glamourBlockCache) >= glamourBlockCacheMax ||
+		glamourCacheBytes+entryBytes > glamourBlockCacheMaxBytes {
 		glamourBlockCache = map[string]string{}
+		glamourCacheBytes = 0
 	}
 	glamourBlockCache[key] = out
-	glamourMu.Unlock()
-	return out, nil
+	glamourCacheBytes += entryBytes
 }
 
 func glamourBlockKey(text string, w int) string {
@@ -207,4 +247,5 @@ func invalidateGlamourCache() {
 	glamourRenderer = nil
 	glamourThemeKey = ""
 	glamourBlockCache = map[string]string{}
+	glamourCacheBytes = 0
 }

@@ -647,7 +647,13 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     if (lastUserIdx >= 0 && lastAssistantIdx >= 0) break;
   }
 
-  const needKey = state.ready != null && state.authed === false && !keyDismissed;
+  // Block the composer only when NO provider can serve a turn. Active-provider
+  // authed=false is fine in multi-login if anyLoggedIn / models are present.
+  const canDispatch =
+    state.authed === true ||
+    state.anyLoggedIn === true ||
+    (state.models?.length ?? 0) > 0;
+  const needKey = state.ready != null && !canDispatch && !keyDismissed;
   const currentModel = state.models.find((m) => m.id === state.selectedModel) ?? state.models[0];
   const modelLabel = currentModel?.name ?? currentModel?.id ?? "no model";
   const currentSession = state.sessions.find((session) => {

@@ -52,6 +52,18 @@ type transcriptPoint struct {
 	col  int
 }
 
+// mouseCoord is the single screen-coordinate normalization boundary. Bubble
+// Tea v2 documents mouse X/Y as zero-based terminal cells; keeping this
+// explicit prevents individual hit-test paths from growing ad-hoc +/-1 fixes.
+// CATCODE_MOUSE_Y_BIAS is an opt-in compatibility override for wrappers that
+// forward raw one-based rows (normal Bubble Tea events leave it unset).
+func mouseCoord(x, y int) (int, int) {
+	if os.Getenv("CATCODE_MOUSE_Y_BIAS") == "1" {
+		return x, y - 1
+	}
+	return x, y
+}
+
 type transcriptSelection struct {
 	active  bool // left button is currently held
 	dragged bool // pointer moved away from anchor; distinguishes click from drag
@@ -119,7 +131,12 @@ type session struct {
 	coreEvents chan *coreEvent
 	stdinCh    chan []byte // P1-15: stdin writes are funneled through a writer goroutine
 
+	// authed is true when the ACTIVE provider has a usable key (footer/status).
+	// anyLoggedIn is true when ANY configured provider is logged in — multi-
+	// provider sends must not be blocked just because the active/fallback
+	// provider is unauthenticated (stale settings, expired OAuth, etc.).
 	authed          bool
+	anyLoggedIn     bool
 	models          []modelInfo
 	modelIdx        int
 	busy            bool
@@ -166,6 +183,7 @@ type session struct {
 	coreLifecycle            coreLifecycleState
 	coreFailure              string
 	streamRefreshPending     bool
+	splashStartedAt          time.Time          // when the current startup splash began (min-hold clock)
 	coreStartGen             uint64             // bumped each startCore; lets a stale watchdog tick ignore a restart
 	abortGen                 uint64             // bumped on abort arm/disarm; stale abortTimeoutMsg ignored
 	visionModels             map[string]bool    // user-curated vision-capable model ids (drives /vision)
@@ -213,7 +231,7 @@ type session struct {
 	cacheIdx                 int
 	cacheLines               int      // line count of s.cache (avoids cache.String() for offsets)
 	transcriptBase           string   // rendered transcript without mouse-selection styling
-	transcriptPlain          []string // ANSI-free lines cached for hit-testing/copy
+	transcriptPlain          []string // lazily built ANSI-free lines for hit-testing/copy
 	selection                transcriptSelection
 	selectionMotion          tea.MouseMotionMsg // newest drag event waiting for a selection frame
 	selectionPending         bool
@@ -234,6 +252,29 @@ type session struct {
 	modalPickerRows          int         // charm pickers: clickable item rows on the current page
 	modalPressItem           int         // item index under the mouse press (-1 = none)
 	modalPressKind           modalKind
+
+	// chromePress is the press-target registry for chrome surfaces (header,
+	// banners, shelf, panels, composer, footer). Mirror of the modal press-item
+	// pattern: captured on press, activated only by a stationary release on the
+	// same target.
+	chromePress chromePress
+
+	// overlayPress is the press-target registry for the blocking ask/sudo
+	// flyouts (submit/skip, approve/decline, question focus, select cycling).
+	// Like chromePress, a stationary release on the same target activates it.
+	overlayPress overlayPress
+
+	// Placed ask/sudo flyout box origin + dimensions in screen cells, and the
+	// ANSI-free box rows used for hit-testing. Mirrors modalBoxTop/Left: recorded
+	// when the overlay renders so clicks map back onto the painted box.
+	askBoxTop, askBoxLeft, askBoxW, askBoxH     int
+	askBoxRows                                  []string
+	sudoBoxTop, sudoBoxLeft, sudoBoxW, sudoBoxH int
+	sudoBoxRows                                 []string
+
+	// updating guards the update banner against double-clicks racing two
+	// self-updaters (each replaces the running executable).
+	updating bool
 
 	// scroll: follow=true keeps the viewport pinned to the newest line (the
 	// default). Scrolling up pauses follow so history can be read without the
@@ -434,6 +475,7 @@ func (s *session) startCore() tea.Cmd {
 	s.coreReady = false
 	s.coreLifecycle = coreStarting
 	s.coreFailure = ""
+	s.splashStartedAt = time.Now()
 	s.coreStartGen++
 	gen := s.coreStartGen
 	bin := coreBinaryPath()
@@ -594,15 +636,28 @@ func (s *session) startCore() tea.Cmd {
 			"capabilities": []string{"run_ids", "session_ids", "event_sequence"},
 		},
 	})
+	// Hold the branded splash for at least splashMinHold so a fast `ready` does
+	// not skip the animation entirely (local rebuilds often finish in <100ms).
+	hold := s.splashMinHoldDuration()
+	var splashHoldCmd tea.Cmd
+	if hold > 0 {
+		splashHoldCmd = tea.Tick(hold, func(time.Time) tea.Msg {
+			return splashHoldDoneMsg{gen: gen}
+		})
+	}
 	// Arm a startup watchdog: if the core starts but never emits `ready` within
 	// coreStartupTimeout (e.g. a bad UMANS_CORE path or a config that panics),
 	// surface a clear error instead of spinning "starting core…" forever. The
 	// tick carries the generation captured above so a tick from a previous
 	// (crashed+restarted) core is ignored once `ready` disarms it.
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		waitForEvent(eventCh, gen),
 		tea.Tick(coreStartupTimeout, func(time.Time) tea.Msg { return readyTimeoutMsg{gen: gen} }),
-	)
+	}
+	if splashHoldCmd != nil {
+		cmds = append(cmds, splashHoldCmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // coreStartErrorMsg reports a core subprocess start failure (P1-14: logged on
@@ -682,6 +737,9 @@ func (s *session) sendCore(m map[string]any) bool {
 // ---------------------------------------------------------------------------
 
 func (s *session) Init() tea.Cmd {
+	// Arm the busy-frame clock immediately so the startup splash animates from
+	// the first paint (before tickMsg's 1s re-arm path can notice needsBusyFrames).
+	s.busyFrameActive = true
 	return tea.Batch(s.startCore(), tick(), busyFrameTick())
 }
 
@@ -712,6 +770,10 @@ func (s *session) resetCoreUIState() {
 	s.umansConcUsed = nil
 	s.umansConcLimit = nil
 	s.oauth = nil
+	s.chromePress = chromePress{}
+	s.overlayPress = overlayPress{}
+	s.askBoxRows = nil
+	s.sudoBoxRows = nil
 	s.ctrlCAbortArmed = false
 	s.restoreAllComposerDrafts()
 	if s.modal.kind != modalNone {
@@ -818,17 +880,17 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Don't re-arm the busy-frame clock while a blocking input flyout owns
 		// the keyboard (see busyFrameMsg): the agent is paused on the user, so
 		// the ~10×/s re-render only starves typing. Resumes within ~1s of close.
-		if !s.blockingInputOpen() && (s.busy || !s.ready) && !s.busyFrameActive {
+		if !s.blockingInputOpen() && s.needsBusyFrames() && !s.busyFrameActive {
 			s.busyFrameActive = true
 			cmds = append(cmds, busyFrameTick())
 		}
 		return s, tea.Batch(cmds...)
 
 	case busyFrameMsg:
-		// Only keep framing while a turn runs or we're still starting. When idle,
-		// stop so the renderer isn't driven ~10x/sec — that constant re-render
-		// makes mouse text selection (copy) impossible. tickMsg restarts the
-		// cycle when activity resumes.
+		// Only keep framing while a turn runs, the core is still starting (splash
+		// animation), or we're pre-layout. When idle, stop so the renderer isn't
+		// driven ~10x/sec — that constant re-render makes mouse text selection
+		// (copy) impossible. tickMsg restarts the cycle when activity resumes.
 		// While a blocking input flyout (ask/sudo/approval) is open the agent is
 		// paused on the user; pause the ~10Hz re-render too, otherwise it saturates
 		// the single-threaded loop and typing in the flyout lags badly (seconds
@@ -838,8 +900,13 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.busyFrameActive = false
 			return s, nil
 		}
-		if s.busy || !s.ready {
+		if s.needsBusyFrames() {
 			s.busyFrameActive = true
+			// The startup splash lives in the viewport (not chrome), so each frame
+			// must refresh transcript content for the time-based phase to advance.
+			if s.splashAnimatesInViewport() {
+				s.refresh()
+			}
 			return s, busyFrameTick()
 		}
 		s.busyFrameActive = false
@@ -896,6 +963,28 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// renderUpdateBanner shows a one-line notice; re-layout to claim the line.
 		s.updateInfo = &msg.info
 		s.layout()
+		return s, nil
+	case updateExecMsg:
+		s.updating = false
+		if msg.err != nil {
+			s.setToast(toastError, "update failed: "+msg.err.Error())
+		} else {
+			s.setToast(toastSuccess, "update complete; restart catcode to use it")
+			s.updateInfo = nil
+			s.layout()
+		}
+		return s, nil
+
+	case splashHoldDoneMsg:
+		// Minimum splash hold elapsed. If the core is already ready the viewport
+		// may still be showing the brand panel — rebuild so the real welcome
+		// (or resumed transcript) takes over. Ignore stale gens from restarts.
+		if msg.gen != s.coreStartGen {
+			return s, nil
+		}
+		if s.coreLifecycle == coreReady && !s.hasConversation() {
+			s.layout()
+		}
 		return s, nil
 
 	case readyTimeoutMsg:
@@ -1108,6 +1197,10 @@ func main() {
 	// so NewProgram takes only the model. The renderer auto-enables the Kitty
 	// progressive-keyboard + xterm modifyOtherKeys protocols (and restores the
 	// terminal on exit), so the hand-rolled enable/disable sequences are gone.
+	// Windows self-update leaves <exe>.old beside the binary because the
+	// running image can't be deleted mid-process. Clean leftovers on launch.
+	cleanupStaleSelfUpdate()
+
 	claimInitialSession()
 	defer releaseSessionClaim()
 	prog := tea.NewProgram(initialSession())
