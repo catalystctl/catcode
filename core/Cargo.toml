@@ -11,12 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-# rustls + webpki for public CAs; native-roots for corporate/WSL MITM CAs in
-# /etc/ssl/certs; http2 for ALPN with Cloudflare/CDN gateways; system-proxy so
-# HTTP(S)_PROXY env vars (and Windows/macOS system proxy settings) are honored.
+# rustls + webpki for public CAs; http2 for ALPN with Cloudflare/CDN gateways.
 # default-features = false drops native-tls; we stay rustls-only for portable
 # static builds (AppImage / musl-ish Linux distros without OpenSSL).
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "http2", "system-proxy"] }
+#
+# native-roots + system-proxy are Linux/Windows-only (target cfg below): on
+# macOS they pull Security/SystemConfiguration/CoreFoundation frameworks,
+# which cargo-zigbuild cannot link when cross-compiling from Linux (no
+# MacOSX.sdk on the runner). macOS still trusts public CAs via webpki-roots
+# bundled with rustls-tls.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
@@ -43,6 +47,11 @@ cairo = { version = "0.18", package = "cairo-rs", optional = true, features = ["
 gtk = { version = "0.18", optional = true }
 glib = { version = "0.18", optional = true }
 gio = { version = "0.18", optional = true }
+
+# Corporate/WSL MITM CAs in /etc/ssl/certs (or the Windows cert store), plus
+# HTTP(S)_PROXY / platform system-proxy. Not enabled for macOS — see note above.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "system-proxy"] }
 
 [features]
 default = ["microsandbox"]

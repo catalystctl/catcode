@@ -8,8 +8,11 @@ use std::sync::Arc;
 use crate::config::{Config, Sandbox};
 
 use super::backend::{ExecutionBackend, HostExecutionBackend};
+#[cfg(not(feature = "microsandbox"))]
 use super::error::ExecutionError;
+#[cfg(not(feature = "microsandbox"))]
 use super::error::SandboxPreflightReport;
+#[cfg(not(feature = "microsandbox"))]
 use super::preflight::{run_platform_preflight, RealProbe};
 
 /// Selects the execution backend for a config.

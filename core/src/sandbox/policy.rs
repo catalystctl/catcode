@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::config::{Config, Sandbox, SandboxNetworkMode};
+use crate::config::Config;
 
 /// Which shell the `bash` tool runs commands in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -6,7 +6,6 @@
 //! booted on the first agent-controlled exec and kept alive for the session so
 //! package installs / build caches persist. On an unhealthy execution the VM is
 //! reset (stopped + recreated) rather than silently reusing a broken one.
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
