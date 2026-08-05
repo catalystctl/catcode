@@ -62,8 +62,10 @@ function SplitInner({ node, onRatioChange, renderLeaf }: SplitViewProps & { node
         role="separator"
         aria-orientation={horizontal ? "vertical" : "horizontal"}
         onPointerDown={startDrag}
-        className={`shrink-0 bg-ink-800/70 transition-colors hover:bg-accent/60 ${
-          horizontal ? "w-1.5 cursor-col-resize" : "h-1.5 cursor-row-resize"
+        // touch-none: the divider must own the touch gesture (otherwise the
+        // page scrolls instead of resizing). w-3/h-3 = a 12px touch target.
+        className={`shrink-0 touch-none bg-ink-800/70 transition-colors hover:bg-accent/60 ${
+          horizontal ? "w-3 cursor-col-resize sm:w-1.5" : "h-3 cursor-row-resize sm:h-1.5"
         }`}
       />
       <div className="min-h-0 min-w-0 flex-1">

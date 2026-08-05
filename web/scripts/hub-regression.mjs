@@ -228,9 +228,105 @@ try {
   await page.waitForSelector('[role="tab"][aria-selected="true"]', { timeout: 15_000 });
   await page.waitForFunction(() => document.querySelectorAll('button[aria-label="Close pane"]').length === 3, { timeout: 15_000 });
 
+  console.log("step: leave and return");
+  // ── persistence: LEAVE the page entirely, come back, live state returns ──
+  // Closing/navigating away tears down the WebSockets, but the server keeps
+  // every PTY alive; returning must reattach (NOT restart) the same sessions.
+  const beforeLeave = catcodeProcessCount();
+  await page.goto("about:blank", { waitUntil: "load" });
+  await wait(600);
+  await page.goto(`${BASE}/hub`, { waitUntil: "networkidle2" });
+  await page.waitForSelector('[role="tab"][aria-selected="true"]', { timeout: 15_000 });
+  await page.waitForFunction(() => document.querySelectorAll('button[aria-label="Close pane"]').length === 3, { timeout: 20_000 });
+  await wait(2500); // let reattach settle
+  const afterReturn = catcodeProcessCount();
+  if (afterReturn < beforeLeave - 1) {
+    throw new Error(`leaving the page killed terminals: before=${beforeLeave}, after=${afterReturn}`);
+  }
+  if (await page.evaluate(() => document.body.innerText.toLowerCase().includes("no longer available"))) {
+    throw new Error("a pane lost its live session after leave+return");
+  }
+  report.leaveReturn = { beforeLeave, afterReturn };
+
+  console.log("step: sign out keeps terminals");
+  // ── persistence: SIGN OUT keeps the server-side terminals running ────────
+  const beforeSignOut = catcodeProcessCount();
+  await page.click('button[aria-label="Account menu"]');
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('[role="menuitem"]')].some((b) => (b.textContent || "").includes("Sign out")),
+    { timeout: 5_000 },
+  );
+  await page.evaluate(() => {
+    const item = [...document.querySelectorAll('[role="menuitem"]')].find((x) => (x.textContent || "").includes("Sign out"));
+    if (item) item.click();
+  });
+  await page.waitForFunction(() => window.location.pathname.startsWith("/login"), { timeout: 15_000 });
+  await wait(1500);
+  const afterSignOut = catcodeProcessCount();
+  if (afterSignOut < beforeSignOut - 1) {
+    throw new Error(`sign-out killed terminals: before=${beforeSignOut}, after=${afterSignOut}`);
+  }
+  report.signOut = { beforeSignOut, afterSignOut };
+
+  console.log("step: sign back in reattaches");
+  // ── persistence: sign BACK IN restores tabs + reattaches live terminals ──
+  await login(page);
+  await page.goto(`${BASE}/hub`, { waitUntil: "networkidle2" });
+  await page.waitForSelector('[role="tab"][aria-selected="true"]', { timeout: 15_000 });
+  await page.waitForFunction(() => document.querySelectorAll('button[aria-label="Close pane"]').length === 3, { timeout: 20_000 });
+  await wait(2500);
+  const afterReattach = catcodeProcessCount();
+  if (afterReattach < afterSignOut - 1) {
+    throw new Error(`sign-in reattach lost terminals: signedOut=${afterSignOut}, reattached=${afterReattach}`);
+  }
+  if (await page.evaluate(() => document.body.innerText.toLowerCase().includes("no longer available"))) {
+    throw new Error("a pane lost its live session after sign-out + sign-in");
+  }
+  report.reattachAfterSignIn = { afterSignOut, afterReattach };
+
+  console.log("step: mobile viewport");
+  // ── mobile responsiveness ──────────────────────────────────────────────────
+  await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+  await page.reload({ waitUntil: "networkidle2" });
+  await page.waitForSelector('[role="tab"][aria-selected="true"]', { timeout: 15_000 });
+  await page.waitForFunction(() => document.querySelectorAll('button[aria-label="Close pane"]').length === 3, { timeout: 20_000 });
+  const mobileChecks = await page.evaluate(() => ({
+    // Presets become a native <select> on small screens.
+    presetSelect: !!document.querySelector('select[aria-label="Terminal layout"]'),
+    // The git panel must NOT be an inline column on a phone (it is a drawer).
+    inlineGitAside: !!document.querySelector('aside[aria-label="Git"]'),
+    // Nothing may overflow horizontally (the grid + chrome must fit 390px).
+    horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth + 1,
+    // Pane controls are touch-visible without hover.
+    paneControlsVisible: [...document.querySelectorAll('button[aria-label="Split right"]')]
+      .every((el) => el.getBoundingClientRect().width > 0),
+  }));
+  if (!mobileChecks.presetSelect) throw new Error("mobile: preset <select> missing");
+  if (mobileChecks.inlineGitAside) throw new Error("mobile: git panel must be a drawer, not an inline column");
+  if (mobileChecks.horizontalOverflow) throw new Error("mobile: horizontal overflow detected");
+  if (!mobileChecks.paneControlsVisible) throw new Error("mobile: pane controls not touch-visible");
+
+  // Git drawer opens over the terminals and closes again.
+  await page.click('button[aria-label="Show Git panel"]');
+  await page.waitForSelector('aside[aria-label="Git"]', { timeout: 5_000 });
+  await page.waitForFunction(() => document.body.innerText.toUpperCase().includes("SOURCE CONTROL"), { timeout: 15_000 });
+  await page.click('button[aria-label="Close Git panel"]');
+  await wait(300);
+  if (await page.$('aside[aria-label="Git"]')) throw new Error("mobile: git drawer did not close");
+  await page.screenshot({ path: join(ARTIFACTS, "hub-mobile.png") });
+  report.mobile = mobileChecks;
+
   // ── close the tab (terminates PTYs, keeps layout) ────────────────────────
   await page.click('[role="tab"][aria-selected="true"] button[aria-label^="Close"]');
   await page.waitForFunction(() => document.body.innerText.includes("No projects open yet"), { timeout: 10_000 });
+
+  // The tab's three PTYs were explicitly terminated — the count must drop.
+  await wait(1500);
+  const afterCloseTab = catcodeProcessCount();
+  if (afterCloseTab > beforeSignOut - 2) {
+    throw new Error(`closing the tab did not terminate its terminals: before=${beforeSignOut}, after=${afterCloseTab}`);
+  }
+  report.closeTab = { beforeSignOut, afterCloseTab };
 
   await page.screenshot({ path: join(ARTIFACTS, "hub-final.png") });
   report.status = "pass";

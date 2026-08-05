@@ -15,6 +15,7 @@
 // Pane ids double as server-side terminal session ids, so a refresh reattaches
 // every running catcode (scrollback replayed by the WS endpoint).
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrandMark,
@@ -23,9 +24,13 @@ import {
   GitBranchIcon,
   PlusIcon,
   TerminalIcon,
+  UserIcon,
   XIcon,
 } from "@/components/icons";
 import { ProjectSwitcher } from "@/components/ide/project-switcher";
+import { signOut } from "@/lib/auth-client";
+import { useIsMobile } from "@/lib/use-media-query";
+import { useOutsideClose } from "@/lib/use-outside-close";
 import {
   HUB_PRESETS,
   MAX_PANES,
@@ -64,7 +69,15 @@ export function HubShell() {
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  // Mobile: the git panel is a transient drawer (NOT persisted) so a small
+  // screen never boots with the terminals covered; desktop keeps its
+  // persisted hub.gitOpen state.
+  const [mobileGitOpen, setMobileGitOpen] = useState(false);
   const gitResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const isMobile = useIsMobile();
+  const menuRef = useOutsideClose(() => setMenuOpen(false), menuOpen);
 
   // Restore persisted tabs/layouts after hydration (server render is a splash).
   useEffect(() => {
@@ -340,6 +353,30 @@ export function HubShell() {
     return [...byPath.values()];
   }, [projects, hub.tabPaths, hub.names]);
 
+  // ── account menu: sign-out intentionally NEVER terminates PTYs ────────────
+  // Server-side terminals are owned by the user's session map, not by the
+  // browser connection: closing the page, signing out, or losing the network
+  // all leave them running. Signing back in restores the layout (localStorage)
+  // and every pane reattaches to its still-running catcode.
+  const handleSignOut = useCallback(async () => {
+    setSigningOut(true);
+    try {
+      await signOut();
+    } finally {
+      window.location.href = "/login";
+    }
+  }, []);
+
+  const gitVisible = isMobile ? mobileGitOpen : hub.gitOpen;
+  const toggleGit = useCallback(() => {
+    if (isMobile) setMobileGitOpen((v) => !v);
+    else setHub((prev) => ({ ...prev, gitOpen: !prev.gitOpen }));
+  }, [isMobile]);
+
+  const paneCount = activeLayout ? countLeaves(activeLayout) : 1;
+  const currentPresetId =
+    HUB_PRESETS.find((p) => p.rows * p.cols === paneCount)?.id ?? HUB_PRESETS[0].id;
+
   // ── render ────────────────────────────────────────────────────────────────
   if (!hydrated) {
     return (
@@ -392,7 +429,8 @@ export function HubShell() {
                 }`}
               >
                 <FolderIcon width={12} height={12} className={active ? "text-accent-soft" : "text-ink-600"} />
-                <span className="max-w-[11rem] truncate font-medium">{name}</span>
+                <span className="max-w-[7rem] truncate font-medium sm:max-w-[11rem]">{name}</span>
+                {/* Always visible on touch (no hover); hover-revealed on desktop. */}
                 <button
                   type="button"
                   title={`Close ${name}`}
@@ -401,7 +439,7 @@ export function HubShell() {
                     e.stopPropagation();
                     closeTab(path);
                   }}
-                  className="rounded p-0.5 text-ink-600 opacity-0 transition-opacity hover:bg-danger/15 hover:text-danger group-hover/tab:opacity-100 focus:opacity-100"
+                  className="rounded p-1 text-ink-600 opacity-100 transition-opacity hover:bg-danger/15 hover:text-danger focus:opacity-100 sm:p-0.5 sm:opacity-0 sm:group-hover/tab:opacity-100"
                 >
                   <XIcon width={11} height={11} />
                 </button>
@@ -421,7 +459,23 @@ export function HubShell() {
         </div>
 
         {/* ── layout presets (active project) ── */}
-        {activePath ? (
+        {/* Mobile: a native <select> (touch-friendly picker); desktop keeps
+            the inline button group (hidden below md). */}
+        {activePath && isMobile ? (
+          <select
+            aria-label="Terminal layout"
+            value={currentPresetId}
+            onChange={(e) => applyPreset(e.target.value as HubPreset)}
+            className="shrink-0 rounded-lg border border-ink-800 bg-ink-950 px-1.5 py-1 font-mono text-[11px] text-ink-300 outline-none focus:border-accent/50"
+          >
+            {HUB_PRESETS.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+        ) : null}
+        {activePath && !isMobile ? (
           <div
             className="hidden items-center gap-0.5 rounded-lg border border-ink-800 bg-ink-950 p-0.5 md:flex"
             role="group"
@@ -455,16 +509,59 @@ export function HubShell() {
 
         <button
           type="button"
-          onClick={() => setHub((prev) => ({ ...prev, gitOpen: !prev.gitOpen }))}
-          title={hub.gitOpen ? "Hide Git panel" : "Show Git panel"}
-          aria-label={hub.gitOpen ? "Hide Git panel" : "Show Git panel"}
-          aria-pressed={hub.gitOpen}
+          onClick={toggleGit}
+          title={gitVisible ? "Hide Git panel" : "Show Git panel"}
+          aria-label={gitVisible ? "Hide Git panel" : "Show Git panel"}
+          aria-pressed={gitVisible}
           className={`shrink-0 rounded-md p-1.5 transition-colors hover:bg-ink-850 ${
-            hub.gitOpen ? "text-accent-soft" : "text-ink-400 hover:text-ink-100"
+            gitVisible ? "text-accent-soft" : "text-ink-400 hover:text-ink-100"
           }`}
         >
           <GitBranchIcon width={15} height={15} />
         </button>
+
+        {/* ── account menu ── */}
+        <div ref={menuRef} className="relative shrink-0">
+          <button
+            type="button"
+            onClick={() => setMenuOpen((v) => !v)}
+            title="Account"
+            aria-label="Account menu"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
+          >
+            <UserIcon width={15} height={15} />
+          </button>
+          {menuOpen ? (
+            <div
+              role="menu"
+              aria-label="Account"
+              className="absolute right-0 top-full z-[75] mt-1 w-48 rounded-lg border border-ink-700 bg-ink-925 p-1 shadow-elev-2 animate-fade-in"
+            >
+              <Link
+                href="/"
+                role="menuitem"
+                className="block rounded-md px-2.5 py-1.5 text-[12px] text-ink-200 hover:bg-ink-850 hover:text-ink-100"
+              >
+                Open IDE
+              </Link>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={signingOut}
+                onClick={() => void handleSignOut()}
+                className="block w-full rounded-md px-2.5 py-1.5 text-left text-[12px] text-danger hover:bg-danger/10 disabled:opacity-50"
+              >
+                {signingOut ? "Signing out…" : "Sign out"}
+              </button>
+              <p className="border-t border-ink-800 px-2.5 pb-1 pt-1.5 text-[10px] leading-snug text-ink-600">
+                Terminals keep running on the server — sign back in to pick up
+                where you left off.
+              </p>
+            </div>
+          ) : null}
+        </div>
       </header>
 
       {projectsError ? (
@@ -515,8 +612,9 @@ export function HubShell() {
 
         {hub.tabPaths.length === 0 ? <EmptyState onAdd={() => setSwitcherOpen(true)} switching={switching} /> : null}
 
-        {/* ── git sidebar ── */}
-        {activePath && hub.gitOpen ? (
+        {/* ── git sidebar: inline + resizable on desktop, overlay drawer on
+            mobile (a fixed-width column would eat a phone's whole screen) ── */}
+        {activePath && gitVisible && !isMobile ? (
           <>
             <div
               role="separator"
@@ -534,6 +632,36 @@ export function HubShell() {
             </aside>
           </>
         ) : null}
+        {activePath && gitVisible && isMobile ? (
+          <>
+            <div
+              className="fixed inset-0 z-[64] bg-black/55"
+              onClick={() => setMobileGitOpen(false)}
+              aria-hidden
+            />
+            <aside
+              className="fixed inset-y-0 right-0 z-[65] flex w-[min(88vw,22rem)] flex-col border-l border-ink-800 bg-ink-925 shadow-2xl shadow-black/50"
+              aria-label="Git"
+            >
+              <div className="flex shrink-0 items-center justify-between border-b border-ink-800 px-3 py-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">
+                  Git
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileGitOpen(false)}
+                  className="rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100"
+                  aria-label="Close Git panel"
+                >
+                  <XIcon width={14} height={14} />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1">
+                <GitSidebar workspace={activePath} />
+              </div>
+            </aside>
+          </>
+        ) : null}
       </div>
 
       {/* ── project switcher (recent / browse / create / clone) ── */}
@@ -542,6 +670,7 @@ export function HubShell() {
           workspace={activePath ?? ""}
           projects={switcherProjects}
           switching={switching}
+          mobile={isMobile}
           onSwitchWorkspace={(path) => {
             void openTab(path);
           }}

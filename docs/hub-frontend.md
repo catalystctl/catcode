@@ -18,6 +18,44 @@ of CatCode TUI sessions side by side.
 | Terminals | Every pane is a persistent server PTY that auto-runs `catcode` in the project root. Panes survive refreshes and tab switches (server-side PTY persistence + scrollback replay). |
 | Split layouts | Per-pane split right / split down buttons, draggable dividers, and presets in the header: 1, 1×2, 2×1, 2×2, 3×3, 4×4 (16-pane cap). Presets keep existing terminals alive — surplus panes are terminated, existing panes keep their sessions. |
 | Persistence | Tabs, layouts, ratios, focused panes, and sidebar width persist to `localStorage` (`catcode:hub:v1`). Pane ids ARE the terminal session ids, so a refresh reattaches every running catcode. |
+| Account menu | The person icon opens **Open IDE** and **Sign out**. Signing out (or closing the page) never touches the server-side PTYs — sign back in and every terminal reattaches to its live catcode. |
+
+## Mobile responsiveness
+
+The shell is built off `useIsMobile()` (below Tailwind's `lg` breakpoint):
+
+- **Git panel** becomes a right-hand overlay drawer with a backdrop (a fixed-width
+  column would eat a phone's screen); the drawer state is transient on mobile
+  so a small screen never boots with the terminals covered.
+- **Layout presets** become a native `<select>` (touch-friendly picker) instead
+  of the inline button group.
+- **Pane toolbar + tab close buttons** are always visible on touch (no hover
+  required), with larger hit areas; split dividers are 12px-wide touch targets
+  with `touch-none` so the drag resizes instead of scrolling the page.
+- Tab names truncate earlier; the ProjectSwitcher gets its `mobile` layout.
+- Verified headless at 390×844: preset select present, git is a drawer, no
+  horizontal overflow, pane controls visible (hub-regression.mjs).
+
+## Persistence guarantee (leave / sign out / close the page)
+
+Terminals are owned by the SERVER's per-user session map — not by the browser
+connection — and live PTYs have no TTL (only exited shells are reaped):
+
+- **Close the tab / navigate away**: WebSockets detach; PTYs keep running with
+  scrollback buffering. Returning reattaches via `attachOnly` opens.
+- **Sign out**: the account menu's sign-out only clears the auth session; it
+  deliberately terminates NOTHING. Signing back in restores tabs/layouts from
+  localStorage and every pane reattaches (e2e: process count unchanged across
+  sign-out → sign-in).
+- **Close the browser / refresh**: same reattach path; layout restoration
+  reuses pane ids = session ids.
+- **Half-open sockets** (laptop lid, phone backgrounding, NAT timeout): the
+  Terminal pings every 30s and a watchdog force-closes the socket after 75s
+  without ANY server traffic, then reconnects (the IDE keeps its 6-attempt
+  budget; the hub passes `maxReconnects=Infinity` since a gone PTY answers
+  `missing` to the attach-only open and surfaces via `onUnavailable`).
+- The ONLY paths that terminate PTYs: closing a tab, closing a pane, restart,
+  preset surplus, or a web-server restart.
 
 ## Architecture
 
@@ -71,5 +109,6 @@ rules.
   win32 names, override semantics.
 - `web/src/lib/terminal-protocol.test.ts` — envelope shape for `launch`.
 - `web/scripts/hub-regression.mjs` — puppeteer smoke (login → browse-add →
-  preset → terminal panes → git sidebar → close pane), run via
+  preset → terminal panes → git sidebar → close pane → **leave/return,
+  sign-out/sign-in persistence, mobile viewport**), run via
   `npm run test:e2e:hub` against a running server (`AUDIT_BASE`).

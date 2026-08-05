@@ -29,6 +29,14 @@ type ServerMsg =
 
 type ConnectionState = "initializing" | "connecting" | "connected" | "reconnecting" | "failed";
 
+const PING_INTERVAL_MS = 30_000;
+/** No server traffic for this long (pings go out every 30s and the server
+ *  answers pong immediately) means the socket is half-open — the classic
+ *  laptop-lid / phone-backgrounded / NAT-timeout case where the browser never
+ *  fires onclose. The watchdog then tears the socket down and reattaches. */
+const PONG_TIMEOUT_MS = 75_000;
+const DEFAULT_MAX_RECONNECTS = 6;
+
 let ghosttyReady: Promise<void> | null = null;
 
 function terminalSocketUrl(): string {
@@ -85,6 +93,12 @@ export interface TerminalProps {
   /** What the server spawns in the PTY: the login shell (default) or the
    *  catcode TUI (used by the /hub terminal workspace). */
   launch?: TerminalLaunch;
+  /** Reconnect attempts before declaring the terminal unavailable (default 6).
+   *  The hub passes Infinity: server-side PTYs persist across tab closes,
+   *  sign-outs and long network gaps, so a later reattach can still succeed —
+   *  and a genuinely gone PTY answers "missing" to the attach-only open and
+   *  surfaces via onUnavailable regardless of the budget. */
+  maxReconnects?: number;
 }
 
 /**
@@ -92,7 +106,7 @@ export interface TerminalProps {
  * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
-export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq, launch }: TerminalProps) {
+export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq, launch, maxReconnects }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>("initializing");
@@ -110,6 +124,8 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
   onUnavailableRef.current = onUnavailable;
   const launchRef = useRef(launch);
   launchRef.current = launch;
+  const maxReconnectsRef = useRef(maxReconnects ?? DEFAULT_MAX_RECONNECTS);
+  maxReconnectsRef.current = maxReconnects ?? DEFAULT_MAX_RECONNECTS;
 
   useEffect(() => {
     let disposed = false;
@@ -120,6 +136,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
     let attachedOnce = false;
     let ended = false;
     let reconnectAttempts = 0;
+    let lastActivityAt = Date.now();
 
     (async () => {
       // Dynamic import keeps Ghostty's renderer + WASM out of the server and
@@ -159,6 +176,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
         const socket = new WebSocket(terminalSocketUrl());
         ws = socket;
         socket.onopen = () => {
+          lastActivityAt = Date.now();
           socket.send(
             JSON.stringify(
               terminalOpenEnvelope(
@@ -184,6 +202,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
           } catch {
             return;
           }
+          lastActivityAt = Date.now();
           if (m.type === "ready") {
             attachedOnce = true;
             reconnectAttempts = 0;
@@ -205,7 +224,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
         socket.onclose = () => {
           if (disposed || ended || socket !== ws) return;
           reconnectAttempts += 1;
-          if (reconnectAttempts > 6) {
+          if (reconnectAttempts > maxReconnectsRef.current) {
             ended = true;
             setConnectionState("failed");
             onUnavailableRef.current?.();
@@ -225,12 +244,35 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
         }
       });
 
-      // Keepalive (some proxies close idle WSes).
+      // Keepalive (some proxies close idle WSes) + half-open socket watchdog.
+      // When a machine sleeps or the phone OS suspends the tab, the socket
+      // dies silently (no onclose). If no server traffic arrived since the
+      // last ping cycle, detach the stale socket ourselves and reattach —
+      // the server-side PTY kept running the whole time.
       pingTimer = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "ping" }));
+        if (disposed || ended || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastActivityAt > PONG_TIMEOUT_MS) {
+          const stale = ws;
+          stale.onopen = null;
+          stale.onmessage = null;
+          stale.onerror = null;
+          stale.onclose = null;
+          try { stale.close(); } catch { /* already closed */ }
+          ws = null;
+          reconnectAttempts += 1;
+          if (reconnectAttempts > maxReconnectsRef.current) {
+            ended = true;
+            setConnectionState("failed");
+            onUnavailableRef.current?.();
+            return;
+          }
+          setConnectionState("reconnecting");
+          const delay = Math.min(10_000, 500 * 2 ** (reconnectAttempts - 1));
+          reconnectTimer = setTimeout(() => connect(attachedOnce), delay);
+          return;
         }
-      }, 30000);
+        ws.send(JSON.stringify({ type: "ping" }));
+      }, PING_INTERVAL_MS);
 
       const onResizeDisp = term.onResize(({ cols, rows }) => {
         if (ws?.readyState === WebSocket.OPEN) {

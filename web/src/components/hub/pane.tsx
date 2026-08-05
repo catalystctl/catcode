@@ -111,6 +111,11 @@ export function HubPane({
           sessionId={paneId}
           workspace={workspace}
           launch="catcode"
+          // Server-side PTYs persist across tab closes, sign-outs, device
+          // sleep and long network gaps — never give up reattaching. A truly
+          // gone PTY answers "missing" to the attach-only open and surfaces
+          // via onUnavailable regardless of the budget.
+          maxReconnects={Infinity}
           onExit={(code) => {
             setExitCode(code);
             setPhase("exited");
@@ -143,10 +148,11 @@ export function HubPane({
         </div>
       )}
 
-      {/* Hover toolbar — pointer events stop at the bar so terminal clicks
-          underneath are unaffected. */}
+      {/* Pane toolbar — visible on hover for desktop pointers, ALWAYS visible
+          on touch (no hover). Pointer events stop at the bar so terminal
+          clicks underneath are unaffected. */}
       <div
-        className="absolute right-1.5 top-1.5 z-10 flex items-center gap-0.5 rounded-md border border-ink-800 bg-ink-900/95 p-0.5 opacity-0 shadow-elev-1 transition-opacity focus-within:opacity-100 group-hover/pane:opacity-100"
+        className="absolute right-1.5 top-1.5 z-10 flex items-center gap-0.5 rounded-md border border-ink-800 bg-ink-900/95 p-0.5 opacity-100 shadow-elev-1 transition-opacity focus-within:opacity-100 sm:opacity-0 sm:group-hover/pane:opacity-100"
         onPointerDownCapture={(e) => e.stopPropagation()}
       >
         <ToolbarButton title="Split right" onClick={onSplitRight}>
@@ -183,7 +189,7 @@ function ToolbarButton({
       title={title}
       aria-label={title}
       onClick={onClick}
-      className={`rounded p-1 transition-colors ${
+      className={`rounded p-1.5 transition-colors sm:p-1 ${
         danger
           ? "text-ink-500 hover:bg-danger/15 hover:text-danger"
           : "text-ink-400 hover:bg-ink-800 hover:text-ink-100"
