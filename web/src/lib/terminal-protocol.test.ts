@@ -31,4 +31,18 @@ describe("terminal protocol identity", () => {
     expect(message.attachOnly).toBe(true);
     expect(message.workspace).toBe("/project");
   });
+
+  test("open envelopes omit launch for the historical shell default", () => {
+    expect("launch" in terminalOpenEnvelope("t", "/p", "", 80, 24, false)).toBe(false);
+    expect("launch" in terminalOpenEnvelope("t", "/p", "", 80, 24, false, "shell")).toBe(
+      false,
+    );
+  });
+
+  test("open envelopes carry launch:catcode for hub panes", () => {
+    const message = terminalOpenEnvelope("hub_1", "/project", "", 80, 24, false, "catcode");
+    expect(message.launch).toBe("catcode");
+    expect(message.sessionId).toBe("hub_1");
+    expect(message.attachOnly).toBe(false);
+  });
 });

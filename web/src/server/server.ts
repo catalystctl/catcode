@@ -22,6 +22,7 @@ import { getSession } from "../lib/auth";
 import { loadProjects } from "../lib/projects";
 import { terminalSessionKey } from "../lib/terminal-protocol";
 import { getBridge } from "./core-bridge";
+import { CATCODE_NOT_FOUND_ERROR, resolveCatcodeBinary } from "./catcode-launch";
 
 const dev = process.env.NODE_ENV !== "production";
 const port = Number(process.env.PORT) || 3000;
@@ -67,6 +68,9 @@ interface OpenMsg {
   cwd?: string;
   cols?: number;
   rows?: number;
+  /** "catcode" launches the Catalyst Code TUI instead of the login shell
+   *  (used by the /hub frontend; ignored by older clients). */
+  launch?: "shell" | "catcode";
 }
 interface DataMsg { type: "data"; data: string; }
 interface ResizeMsg { type: "resize"; cols: number; rows: number; }
@@ -95,6 +99,8 @@ interface TerminalProcess {
   id: string;
   ownerId: string;
   workspace: string;
+  /** What this PTY runs; persisted so reattach/restart is consistent. */
+  launch: "shell" | "catcode";
   pty: IPty | null;
   clients: Set<WebSocket>;
   scrollback: string;
@@ -172,9 +178,20 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
   const cols = clampDimension(msg.cols, 80, 500);
   const rows = clampDimension(msg.rows, 24, 300);
 
-  const shell =
-    process.env.SHELL ||
-    (process.platform === "win32" ? process.env.COMSPEC || "cmd.exe" : "/bin/sh");
+  const launch = msg.launch === "catcode" ? "catcode" : "shell";
+  // "catcode" spawns the TUI binary directly (no login-shell rc files, so no
+  // prompt noise and no `exec` race); "shell" keeps the historical behavior.
+  let argv: [string, string[]];
+  if (launch === "catcode") {
+    const bin = resolveCatcodeBinary();
+    if (!bin) throw new Error(CATCODE_NOT_FOUND_ERROR);
+    argv = [bin, []];
+  } else {
+    const shell =
+      process.env.SHELL ||
+      (process.platform === "win32" ? process.env.COMSPEC || "cmd.exe" : "/bin/sh");
+    argv = [shell, []];
+  }
   const env = Object.fromEntries(Object.entries({
     ...process.env,
     TERM: "xterm-256color",
@@ -190,6 +207,7 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
     id: msg.sessionId,
     ownerId,
     workspace,
+    launch,
     pty: null,
     clients: new Set(),
     scrollback: "",
@@ -198,7 +216,7 @@ function createTerminal(ownerId: string, msg: OpenMsg): TerminalProcess {
   };
   // zigpty: real host PTY (openpty / ConPTY). All platform prebuilds ship in
   // one npm package so the web release stays a single cross-platform tarball.
-  terminal.pty = spawn(shell, [], { name: "xterm-256color", cwd, env, cols, rows });
+  terminal.pty = spawn(argv[0], argv[1], { name: "xterm-256color", cwd, env, cols, rows });
   terminal.pty.onData((chunk) => {
     const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     terminal.scrollback += data;

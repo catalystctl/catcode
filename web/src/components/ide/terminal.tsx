@@ -12,7 +12,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Terminal as GhosttyTerminal } from "ghostty-web";
-import { terminalOpenEnvelope, terminalTerminateEnvelope } from "@/lib/terminal-protocol";
+import {
+  terminalOpenEnvelope,
+  terminalTerminateEnvelope,
+  type TerminalLaunch,
+} from "@/lib/terminal-protocol";
 
 // ── WS message envelopes (mirror web/src/server/server.ts, contract §4.5) ──
 type ServerMsg =
@@ -33,7 +37,7 @@ function terminalSocketUrl(): string {
 }
 
 /** Explicitly terminate a persistent server-side PTY, including when detached. */
-function terminateTerminalSession(sessionId: string, workspace: string): void {
+export function terminateTerminalSession(sessionId: string, workspace: string): void {
   const socket = new WebSocket(terminalSocketUrl());
   const timeout = window.setTimeout(() => socket.close(), 3000);
   const finish = () => {
@@ -78,6 +82,9 @@ export interface TerminalProps {
   onUnavailable?: () => void;
   /** Incremented to request a clear of the terminal scrollback+screen. */
   clearSeq?: number;
+  /** What the server spawns in the PTY: the login shell (default) or the
+   *  catcode TUI (used by the /hub terminal workspace). */
+  launch?: TerminalLaunch;
 }
 
 /**
@@ -85,7 +92,7 @@ export interface TerminalProps {
  * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
-export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq }: TerminalProps) {
+export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq, launch }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>("initializing");
@@ -101,6 +108,8 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
   onExitRef.current = onExit;
   const onUnavailableRef = useRef(onUnavailable);
   onUnavailableRef.current = onUnavailable;
+  const launchRef = useRef(launch);
+  launchRef.current = launch;
 
   useEffect(() => {
     let disposed = false;
@@ -159,6 +168,7 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
                 term!.cols,
                 term!.rows,
                 attachOnly,
+                launchRef.current,
               ),
             ),
           );
