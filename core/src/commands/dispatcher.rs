@@ -180,6 +180,26 @@ pub(crate) async fn run() {
     {
         let cfg = state.cfg.read().await;
         for (name, key) in cfg.persisted_keys.iter() {
+            // Diagnostic for silent shadowing: settings.json `provider_keys.<name>`
+            // (a runtime key) wins over the same provider's explicit `api_key` in
+            // config.json at request time. When the two diverge — e.g. config.json
+            // was edited to a fresh key but settings.json still holds a stale /
+            // pasted value from an earlier login — catcode fails with opaque
+            // `HTTP 401 Invalid API key` and there is otherwise no visible cause.
+            // Log a warning so the shadowing is observable instead of invisible.
+            if let Some(p) = cfg.providers.iter().find(|p| &p.name == name) {
+                if let Some(cfg_key) = p.api_key.as_ref().filter(|k| !k.is_empty()) {
+                    if cfg_key != key {
+                        eprintln!(
+                            "[catalyst-code] warning: persisted `provider_keys.{name}` in \
+                             settings.json differs from the same provider's `api_key` in \
+                             config.json and shadows it (the persisted key wins at request \
+                             time). To use the config.json key run /logout {name} or remove \
+                             `provider_keys.{name}` from settings.json."
+                        );
+                    }
+                }
+            }
             state
                 .api_keys
                 .write()
