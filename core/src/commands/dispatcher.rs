@@ -966,13 +966,23 @@ pub(crate) async fn run() {
                 // Used by the add-custom-provider flow so the user can see (and
                 // refine caps for) the models an endpoint exposes before
                 // committing. The result is NOT added to /models — only a preview.
+                //
+                // IMPORTANT: run off the command loop. Live /models + models.dev
+                // can take many seconds on a dead/slow host; awaiting here used
+                // to freeze every other command (and the UI spinner never
+                // cleared if the client only watched non-empty previews).
                 let base_url = base_url.trim().to_string();
                 if base_url.is_empty() {
-                    emit(&Event::new("error").with(
-                        "message",
-                        json!("discover_provider_models: base_url is required"),
-                    ));
-                    return;
+                    emit(
+                        &Event::new("provider_models_preview")
+                            .with("models", json!([]))
+                            .with("base_url", json!(""))
+                            .with(
+                                "error",
+                                json!("discover_provider_models: base_url is required"),
+                            ),
+                    );
+                    continue;
                 }
                 let kind = kind
                     .as_deref()
@@ -997,16 +1007,33 @@ pub(crate) async fn run() {
                     "message",
                     json!(format!("discovering models from {base_url}…")),
                 ));
-                let models = provider::discover_models(&client, &rp).await;
+                let cl = client.clone();
+                // Logger is not Clone (Mutex file handle). Log start here; the
+                // spawn only emits the preview event so the command loop stays free.
                 state.logger.log(
                     "discover_provider_models",
-                    json!({ "base_url": base_url, "count": models.len() }),
+                    json!({ "base_url": base_url, "phase": "start" }),
                 );
-                emit(
-                    &Event::new("provider_models_preview")
+                tokio::spawn(async move {
+                    // Force a live fetch so a stale disk cache from a previous
+                    // attempt at this URL doesn't short-circuit the preview.
+                    let models = provider::discover_models_force_refresh(&cl, &rp).await;
+                    let error = if models.is_empty() {
+                        Some(format!(
+                            "no models discovered from {base_url} — check base URL, API key, wire kind, and that the endpoint serves /models"
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut ev = Event::new("provider_models_preview")
                         .with("models", json!(models))
-                        .with("base_url", json!(base_url)),
-                );
+                        .with("base_url", json!(base_url))
+                        .with("count", json!(models.len()));
+                    if let Some(err) = error {
+                        ev = ev.with("error", json!(err));
+                    }
+                    emit(&ev);
+                });
             }
             Command::LoginOauth { preset } => {
                 // Plugin-declared subscription OAuth only. Built-in vendor

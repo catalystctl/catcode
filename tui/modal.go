@@ -119,6 +119,9 @@ type customProviderDraft struct {
 	modelCursor   int  // focused model in the list
 	modelField    int  // focused cap sub-field (cpCap*)
 	discovering   bool // a discover request is in flight
+	// discoverGen bumps on each discover/cancel so a late provider_models_preview
+	// from a cancelled attempt is ignored (UI no longer stuck "discovering…").
+	discoverGen uint64
 }
 
 const (
@@ -721,6 +724,12 @@ func (s *session) appendModalPaste(text string) bool {
 	if s.modal.kind == modalNone {
 		return false
 	}
+	// Custom provider: if focus is on a text field but capture hasn't started
+	// yet, begin editing first so paste of an API key / URL works without an
+	// extra Enter (the common "I can't paste into the form" failure mode).
+	if s.modal.kind == modalCustomProvider && !s.customProvider.editing {
+		s.cpEnsureTextEditForPaste()
+	}
 	if s.modalAcceptsTextPaste() {
 		// Let textinput sanitize and insert at its cursor. SetValue+CursorEnd made
 		// every modal paste append, regardless of where the user was editing.
@@ -757,6 +766,11 @@ func (s *session) modalAcceptsTextPaste() bool {
 		return s.modal.editing && s.pendingLogin != ""
 	case modalGoal:
 		return s.modal.editing && s.goalDraft.editing
+	case modalCustomProvider:
+		// Free-text capture for name/URL/key/headers/caps — same editBuf path
+		// as value-edit. Without this branch, bracketed paste is swallowed by
+		// the modal (no composer leak) but never inserted into the field.
+		return s.customProvider.editing && s.modal.editing
 	default:
 		return false
 	}
@@ -4576,6 +4590,14 @@ func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 			}
 			return s, nil
 		case cpFieldDiscover:
+			// Enter while already discovering cancels the wait so the form
+			// never locks on a hung endpoint (late preview is ignored).
+			if d.discovering {
+				d.discoverGen++
+				d.discovering = false
+				s.modal.loadError = "discovery cancelled — add without discovering, or try again"
+				return s, nil
+			}
 			return s.discoverCustomProviderModels()
 		case cpFieldModels:
 			// Edit the focused model's focused cap. Text caps use the buffer;
@@ -4604,6 +4626,32 @@ func (s *session) handleCustomProviderKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 		return s, nil
 	}
 	return s, nil
+}
+
+// cpEnsureTextEditForPaste starts free-text capture on the focused custom-provider
+// field so bracketed paste can land without a prior Enter. No-op when focus is on
+// a non-text control (protocol toggle, discover, submit, reasoning toggle).
+func (s *session) cpEnsureTextEditForPaste() {
+	d := &s.customProvider
+	if d.editing {
+		return
+	}
+	if d.field == cpFieldModels {
+		if len(d.previewModels) == 0 || d.modelField == cpCapReasoning {
+			return
+		}
+		cpBeginCapEdit(d, s)
+		return
+	}
+	if !cpIsTextField(d.field) {
+		return
+	}
+	d.editing = true
+	s.modal.editing = true
+	s.modal.editBuf.SetValue(d.fieldValue(d.field))
+	s.modal.editBuf.Placeholder = cpPlaceholder(d.field)
+	s.modal.editBuf.Focus()
+	s.modal.editBuf.CursorEnd()
 }
 
 // cpCommitEdit writes the committed edit-buffer value back to the draft — either
@@ -4687,7 +4735,28 @@ func (s *session) discoverCustomProviderModels() (tea.Model, tea.Cmd) {
 	if k := strings.TrimSpace(d.apiKey); k != "" {
 		cmd["api_key"] = k
 	}
+	// Forward extra headers so gated /models endpoints can be previewed.
+	var headers map[string]any
+	for _, line := range cpHeaderLines(d.headers) {
+		i := strings.Index(line, ":")
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.TrimSpace(line[i+1:])
+		if k == "" || v == "" {
+			continue
+		}
+		if headers == nil {
+			headers = map[string]any{}
+		}
+		headers[k] = v
+	}
+	if headers != nil {
+		cmd["headers"] = headers
+	}
 	s.sendCore(cmd)
+	d.discoverGen++
 	d.discovering = true
 	s.modal.loadError = ""
 	s.logInfo("discovering models from " + strings.TrimSpace(d.baseURL) + "…")
@@ -4878,12 +4947,21 @@ func (s *session) renderCustomProviderModal() string {
 	}
 
 	// value renders a text field's current value (masked for the key), showing
-	// the live edit buffer while capturing.
+	// the live edit buffer (with cursor) while capturing. Using Value() alone
+	// hid the cursor and made free-text capture look frozen/uneditable.
 	textVal := func(idx int, mask bool) string {
-		v := d.fieldValue(idx)
 		if d.editing && d.field == idx {
-			v = s.modal.editBuf.Value()
+			if mask {
+				// Masked fields still show a cursor via a bullet run + View cursor.
+				v := s.modal.editBuf.Value()
+				if v == "" {
+					return s.modal.editBuf.View()
+				}
+				return strings.Repeat("•", len(v)) + "▌"
+			}
+			return s.modal.editBuf.View()
 		}
+		v := d.fieldValue(idx)
 		if mask && v != "" {
 			return strings.Repeat("•", len(v))
 		}
@@ -4947,13 +5025,17 @@ func (s *session) renderCustomProviderModal() string {
 	lines = append(lines, section("Models"))
 	discoverVal := dimStyle.Render("enter to fetch models from the endpoint")
 	if d.discovering {
-		discoverVal = accentStyle.Render("discovering…")
+		discoverVal = accentStyle.Render("discovering… · enter to cancel")
 	} else if len(d.previewModels) > 0 {
-		discoverVal = successStyle.Render(fmt.Sprintf("%d model(s) found · enter to refine", len(d.previewModels)))
+		discoverVal = successStyle.Render(fmt.Sprintf("%d model(s) found · enter to re-fetch", len(d.previewModels)))
 	}
 	lines = append(lines, row(cpFieldDiscover, "Discover", discoverVal))
 	if d.field == cpFieldDiscover {
-		lines = append(lines, dimStyle.Render("    fetches the endpoint's model list so you can refine caps"))
+		if d.discovering {
+			lines = append(lines, dimStyle.Render("    waiting on the endpoint · enter cancels (you can still Add provider)"))
+		} else {
+			lines = append(lines, dimStyle.Render("    fetches the endpoint's model list so you can refine caps"))
+		}
 	}
 
 	// Discovered models with editable per-model caps.
@@ -4981,9 +5063,9 @@ func (s *session) renderCustomProviderModal() string {
 			for ci, lbl := range capLabels {
 				capFocused := focused && d.modelField == ci
 				v := vals[ci]
-				// Show the live edit buffer for the focused cap while editing.
+				// Show the live edit buffer (with cursor) for the focused cap.
 				if capFocused && d.editing && d.field == cpFieldModels {
-					v = s.modal.editBuf.Value()
+					v = s.modal.editBuf.View()
 				}
 				mark := "  "
 				style := dimStyle
@@ -5013,7 +5095,11 @@ func (s *session) renderCustomProviderModal() string {
 		lines = append(lines, errStyle.Render("  ✗ "+s.modal.loadError))
 	}
 	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("  ↑/↓ move · enter edit · esc close · ctrl+enter submit"))
+	if d.editing {
+		lines = append(lines, dimStyle.Render("  typing… · enter commit · esc keep text · ctrl+enter submit"))
+	} else {
+		lines = append(lines, dimStyle.Render("  ↑/↓ move · enter edit · esc close · ctrl+enter submit (no discover required)"))
+	}
 
 	return modalBox(w, strings.Join(lines, "\n"))
 }

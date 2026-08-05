@@ -405,8 +405,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "provider_models_preview":
 		// A discover_provider_models result (preview for the add-custom-provider
-		// form). Only act when that modal is open; otherwise ignore.
+		// form). Only act when that modal is open AND still waiting on this
+		// generation — ignore late results after cancel/close so the form
+		// never re-locks.
 		if s.modal.kind != modalCustomProvider {
+			return nil
+		}
+		d := &s.customProvider
+		if !d.discovering {
 			return nil
 		}
 		var models []modelInfo
@@ -420,11 +426,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				}
 			}
 		}
-		d := &s.customProvider
 		d.previewModels = models
 		d.discovering = false
 		if len(models) == 0 {
-			s.modal.loadError = "no models discovered — check the base URL / key / kind"
+			errMsg := ev.get("error")
+			if errMsg == "" {
+				errMsg = "no models discovered — check the base URL / key / kind (Add provider still works)"
+			}
+			s.modal.loadError = errMsg
 		} else {
 			cpSeedModelCaps(d)
 			d.field = cpFieldModels

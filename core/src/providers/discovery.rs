@@ -477,7 +477,9 @@ async fn discover_models_openai(
 
     if live.is_empty() {
         // Neither endpoint served a usable list — stale cache, else curated
-        // fallbacks for the vendor (Gemini host → Gemini models, else Umans).
+        // fallbacks for *known* vendors only. Unknown custom endpoints must
+        // return empty (not the Umans catalog) so the add-custom-provider
+        // preview doesn't pretend a dead URL serves umans-coder/etc.
         return read_models_cache_stale(cache_key)
             .unwrap_or_else(|| openai_fallback_models(&provider.base_url));
     }
@@ -1896,7 +1898,13 @@ fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
     if is_deepseek(base_url) {
         return deepseek_fallback_models();
     }
-    fallback_models()
+    // Umans-only curated catalog. Do NOT return this for arbitrary custom
+    // OpenAI-compatible URLs — a failed discover on localhost/LM Studio/etc.
+    // would otherwise show umans-coder and lock the user into a fake list.
+    if crate::provider::is_umans(base_url) {
+        return fallback_models();
+    }
+    Vec::new()
 }
 
 fn codex_fallback_models() -> Vec<ModelInfo> {
@@ -2093,5 +2101,16 @@ mod tests {
         );
         assert_eq!(info.context_window, 512_000);
         assert_eq!(info.max_tokens, 8_192);
+    }
+
+    #[test]
+    fn openai_fallback_unknown_custom_endpoint_is_empty() {
+        // A dead custom URL must NOT inherit the Umans curated catalog — that
+        // used to make add-custom-provider look "successful" with umans-coder.
+        assert!(openai_fallback_models("http://localhost:11434/v1").is_empty());
+        assert!(openai_fallback_models("https://api.example.com/v1").is_empty());
+        // Known vendors still get their curated lists.
+        assert!(!openai_fallback_models("https://api.code.umans.ai/v1").is_empty());
+        assert!(!openai_fallback_models("https://api.deepseek.com/v1").is_empty());
     }
 }

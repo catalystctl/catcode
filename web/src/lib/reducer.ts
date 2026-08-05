@@ -55,6 +55,7 @@ export const initialState: AgentState = {
   projects: [],
   providerPresets: [],
   providerModelsPreview: null,
+  providerModelsPreviewError: null,
   selectedModel: null,
   thinkingLevel: "medium",
   messages: [],
@@ -653,7 +654,9 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     case "_set_switching":
       return { ...state, switching: ev.switching };
     case "_clear_provider_models_preview":
-      return { ...state, providerModelsPreview: null };
+      return { ...state, providerModelsPreview: null, providerModelsPreviewError: null };
+    case "_set_provider_models_preview_error":
+      return { ...state, providerModelsPreviewError: ev.error };
     case "_add_notifications": {
       // Client-only: append feed items emitted by useAgent's liveSessions diff.
       // Dedup per session+kind: refresh (bump ts) an existing UNREAD item for
@@ -791,7 +794,12 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     case "provider_presets":
       return { ...state, providerPresets: ev.presets ?? [] };
     case "provider_models_preview":
-      return { ...state, providerModelsPreview: ev.models ?? [] };
+      return {
+        ...state,
+        // Always set (including []) so the spinner can clear on failure.
+        providerModelsPreview: ev.models ?? [],
+        providerModelsPreviewError: ev.error?.trim() ? ev.error : null,
+      };
     case "authed":
       return { ...state, authed: ev.ok, pendingOauth: null };
     case "provider_changed":

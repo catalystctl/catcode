@@ -620,7 +620,7 @@ export type CoreEvent =
   | ReadyPayload
   | { type: "models"; models: ModelInfo[] }
   | { type: "provider_presets"; presets: ProviderPreset[] }
-  | { type: "provider_models_preview"; models: ModelInfo[]; base_url: string }
+  | { type: "provider_models_preview"; models: ModelInfo[]; base_url: string; error?: string }
   | { type: "authed"; ok: boolean; provider: string }
   | { type: "provider_changed"; provider: string; kind: string; base_url: string; has_key: boolean }
   | { type: "approval_changed"; mode: string } // "destructive" | "always" | "<kind>:always"
@@ -975,6 +975,7 @@ export type SyntheticEvent =
   | { type: "_undo_local" }
   | { type: "_goal_approve_optimistic" }
   | { type: "_clear_provider_models_preview" }
+  | { type: "_set_provider_models_preview_error"; error: string | null }
   // Cross-session notification feed (client-only; derived in useAgent from
   // LiveSessionStatus transitions, never dispatched server-side).
   | { type: "_add_notifications"; items: NotificationItem[] }
@@ -1117,6 +1118,9 @@ export interface AgentState {
   /** Models discovered by `discover_provider_models` (a preview for the
    * add-custom-provider flow); null when no preview is active. */
   providerModelsPreview: ModelInfo[] | null;
+  /** Error from the latest discover_provider_models preview (empty-list or
+   * hard failure). Cleared on a successful non-empty preview or on modal close. */
+  providerModelsPreviewError: string | null;
   selectedModel: string | null;
   thinkingLevel: string;
   messages: UIMessage[];

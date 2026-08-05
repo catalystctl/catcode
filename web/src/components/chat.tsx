@@ -103,7 +103,9 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   >(null);
   const [images, setImages] = useState<string[]>([]);
   // True while `discover_provider_models` is in flight (custom-provider modal).
+  // A generation counter lets Cancel / late previews ignore stale results.
   const [discovering, setDiscovering] = useState(false);
+  const discoverGenRef = useRef(0);
   // Keep the server and first client render deterministic. The inline script in
   // layout.tsx applies the persisted value before paint; after hydration we
   // adopt that value into React state. Reading localStorage in the initializer
@@ -134,9 +136,10 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     }
   }, [restoredDrawerWorkspace, sidebarOpen, state.workspace]);
 
-  // A discovery result landed → stop the spinner (the modal advances to step 2).
+  // A discovery result landed (including empty/error) → stop the spinner.
+  // Null means no preview yet / cleared — don't clear discovering on open.
   useEffect(() => {
-    if (state.providerModelsPreview) setDiscovering(false);
+    if (state.providerModelsPreview !== null) setDiscovering(false);
   }, [state.providerModelsPreview]);
 
   // Refs so the edit/regenerate/command callbacks can stay stable (empty deps)
@@ -1019,13 +1022,22 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
       {modal === "custom-provider" && (
         <CustomProviderModal
           previewModels={agent.state.providerModelsPreview}
+          discoverError={agent.state.providerModelsPreviewError}
           discovering={discovering}
-          onDiscover={(url, kind, key) => {
+          onDiscover={(url, kind, key, headers) => {
+            discoverGenRef.current += 1;
+            agent.clearProviderModelsPreview();
             setDiscovering(true);
-            void agent.discoverProviderModels(url, kind, key);
+            void agent.discoverProviderModels(url, kind, key, headers);
+          }}
+          onCancelDiscover={() => {
+            discoverGenRef.current += 1;
+            setDiscovering(false);
+            agent.clearProviderModelsPreview();
           }}
           onSubmit={(draft) => void agent.addCustomProvider(draft)}
           onClose={() => {
+            discoverGenRef.current += 1;
             setModal(null);
             agent.clearProviderModelsPreview();
             setDiscovering(false);

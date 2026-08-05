@@ -64,7 +64,12 @@ export interface AgentApi {
   /** Add or update a custom provider with full config.json parity. */
   addCustomProvider: (draft: CustomProviderDraft) => Promise<void>;
   /** Discover models from an endpoint (preview, no persist) for the custom-provider form. */
-  discoverProviderModels: (base_url: string, kind: "openai" | "anthropic", api_key?: string) => Promise<void>;
+  discoverProviderModels: (
+    base_url: string,
+    kind: "openai" | "anthropic",
+    api_key?: string,
+    headers?: Record<string, string>,
+  ) => Promise<void>;
   /** Clear the provider-models preview (when the modal closes). */
   clearProviderModelsPreview: () => void;
   loginOauth: (preset: string) => Promise<void>;
@@ -690,12 +695,18 @@ export function useAgent(): AgentApi {
   // Discover models from an endpoint WITHOUT persisting a provider — a preview
   // for the add-custom-provider form. The core emits provider_models_preview.
   const discoverProviderModels = useCallback(
-    async (base_url: string, kind: "openai" | "anthropic", api_key?: string) => {
+    async (
+      base_url: string,
+      kind: "openai" | "anthropic",
+      api_key?: string,
+      headers?: Record<string, string>,
+    ) => {
       await send({
         type: "discover_provider_models",
         base_url: base_url.trim(),
         kind,
         api_key: api_key?.trim() || undefined,
+        headers: headers && Object.keys(headers).length ? headers : undefined,
       });
     },
     [send],

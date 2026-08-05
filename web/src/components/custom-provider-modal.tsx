@@ -7,8 +7,11 @@
 // can refine per-model caps (reasoning levels, context length, output tokens)
 // — anything left at the discovered/default value (200k/8k flat default for
 // unknown ids) is not written, so the config stays clean.
+//
+// Discovery is optional. Failures surface inline without locking the form;
+// the user can always add without discovering, or type model ids by hand.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type { CustomProviderDraft, ModelInfo, ModelOverride } from "@/lib/types";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
@@ -18,9 +21,18 @@ import { XIcon, ShieldIcon, ArrowLeftIcon } from "./icons";
 interface Props {
   /** Models discovered by `discover_provider_models` (null until a preview lands). */
   previewModels: ModelInfo[] | null;
+  /** Error string from the latest discover attempt (empty list / hard failure). */
+  discoverError?: string | null;
   /** True while a discovery request is in flight. */
   discovering: boolean;
-  onDiscover: (base_url: string, kind: CustomProviderDraft["kind"], api_key?: string) => void;
+  onDiscover: (
+    base_url: string,
+    kind: CustomProviderDraft["kind"],
+    api_key?: string,
+    headers?: Record<string, string>,
+  ) => void;
+  /** Cancel an in-flight discover (clears spinner; late preview is ignored). */
+  onCancelDiscover?: () => void;
   onSubmit: (draft: CustomProviderDraft) => void;
   onClose: () => void;
 }
@@ -38,10 +50,24 @@ interface ModelCaps {
   thinking_levels: string;
 }
 
+function parseHeaders(text: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const line of text.split(/\n+/)) {
+    const i = line.indexOf(":");
+    if (i <= 0) continue;
+    const k = line.slice(0, i).trim();
+    const v = line.slice(i + 1).trim();
+    if (k && v) headers[k] = v;
+  }
+  return headers;
+}
+
 export function CustomProviderModal({
   previewModels,
+  discoverError = null,
   discovering,
   onDiscover,
+  onCancelDiscover,
   onSubmit,
   onClose,
 }: Props) {
@@ -60,11 +86,17 @@ export function CustomProviderModal({
     modelsOverride: [],
   });
   const [touched, setTouched] = useState(false);
-  // Per-model editable caps, keyed by model id. Initialized from the preview.
+  // Per-model editable caps, keyed by model id. Initialized from the preview
+  // or from manual model-id entries.
   const [caps, setCaps] = useState<Record<string, ModelCaps>>({});
+  // Manual model ids (one per line) for endpoints that don't expose /models.
+  const [manualIds, setManualIds] = useState("");
+  // Baseline ModelInfo for each id so buildOverrides can detect changes.
+  const [baselines, setBaselines] = useState<ModelInfo[]>([]);
 
-  // When a preview lands, seed the editable caps from the discovered values
-  // and advance to the models step.
+  // When a non-empty preview lands, seed caps and advance to the models step.
+  // Empty previews stay on the endpoint step so the user can fix the URL/key
+  // or add without discovering — the spinner is cleared by the parent.
   useEffect(() => {
     if (previewModels && previewModels.length > 0) {
       const next: Record<string, ModelCaps> = {};
@@ -73,10 +105,11 @@ export function CustomProviderModal({
           context_window: String(m.context_window),
           max_tokens: String(m.max_tokens),
           reasoning: m.reasoning,
-          thinking_levels: m.thinking_levels.join(", "),
+          thinking_levels: (m.thinking_levels ?? []).join(", "),
         };
       }
       setCaps(next);
+      setBaselines(previewModels);
       setStep("models");
     }
   }, [previewModels]);
@@ -102,16 +135,56 @@ export function CustomProviderModal({
   const discover = () => {
     setTouched(true);
     if (!endpointValid) return;
-    onDiscover(draft.base_url.trim(), draft.kind, draft.apiKey.trim() || undefined);
+    const headers = parseHeaders(draft.headersText);
+    onDiscover(
+      draft.base_url.trim(),
+      draft.kind,
+      draft.apiKey.trim() || undefined,
+      Object.keys(headers).length ? headers : undefined,
+    );
+  };
+
+  /** Seed caps from manual model-id lines and jump to the refine step. */
+  const useManualModels = () => {
+    const ids = manualIds
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (ids.length === 0) return;
+    const next: Record<string, ModelCaps> = {};
+    const base: ModelInfo[] = [];
+    for (const id of ids) {
+      // Flat defaults for unknown ids (200k / 8k) — same as core discovery.
+      const m: ModelInfo = {
+        id,
+        name: id,
+        context_window: 200_000,
+        max_tokens: 8_192,
+        reasoning: false,
+        thinking_levels: [],
+        vision: false,
+        provider: draft.name.trim() || "custom",
+      };
+      base.push(m);
+      next[id] = {
+        context_window: "200000",
+        max_tokens: "8192",
+        reasoning: false,
+        thinking_levels: "",
+      };
+    }
+    setBaselines(base);
+    setCaps(next);
+    setStep("models");
   };
 
   // Build the models_override payload: only include a model when the user
-  // changed a field from its discovered baseline. Unchanged models fall through
-  // to the discovered/curated/flat-default caps (200k/8k for unknown ids).
+  // changed a field from its discovered/manual baseline. Unchanged models fall
+  // through to the discovered/curated/flat-default caps.
   const buildOverrides = (): ModelOverride[] => {
-    if (!previewModels) return [];
+    if (baselines.length === 0) return [];
     const out: ModelOverride[] = [];
-    for (const m of previewModels) {
+    for (const m of baselines) {
       const c = caps[m.id];
       if (!c) continue;
       const ctx = parseInt(c.context_window.trim(), 10);
@@ -123,15 +196,20 @@ export function CustomProviderModal({
       const ctxChanged = Number.isFinite(ctx) && ctx !== m.context_window;
       const maxChanged = Number.isFinite(max) && max !== m.max_tokens;
       const reasonChanged = c.reasoning !== m.reasoning;
-      const levelsChanged =
-        levels.join(",") !== m.thinking_levels.join(",");
-      if (!ctxChanged && !maxChanged && !reasonChanged && !levelsChanged) continue;
+      const levelsChanged = levels.join(",") !== (m.thinking_levels ?? []).join(",");
+      // Manual entries always write an override so the id is known after add.
+      const alwaysWrite = !(previewModels && previewModels.some((p) => p.id === m.id));
+      if (!alwaysWrite && !ctxChanged && !maxChanged && !reasonChanged && !levelsChanged) {
+        continue;
+      }
       out.push({
         id: m.id,
-        context_window: ctxChanged && Number.isFinite(ctx) ? ctx : undefined,
-        max_tokens: maxChanged && Number.isFinite(max) ? max : undefined,
-        reasoning: reasonChanged ? c.reasoning : undefined,
-        thinking_levels: levelsChanged ? levels : undefined,
+        context_window:
+          (alwaysWrite || ctxChanged) && Number.isFinite(ctx) ? ctx : undefined,
+        max_tokens:
+          (alwaysWrite || maxChanged) && Number.isFinite(max) ? max : undefined,
+        reasoning: alwaysWrite || reasonChanged ? c.reasoning : undefined,
+        thinking_levels: alwaysWrite || levelsChanged ? levels : undefined,
       });
     }
     return out;
@@ -208,6 +286,7 @@ export function CustomProviderModal({
                   {KINDS.map((k) => (
                     <button
                       key={k.id}
+                      type="button"
                       onClick={() => set({ kind: k.id })}
                       title={k.hint}
                       className={`flex-1 px-2 py-2 text-[12px] font-medium transition-colors ${
@@ -307,18 +386,45 @@ export function CustomProviderModal({
               </p>
               {fieldErr(ctxOk, "Digits only, or leave blank.")}
             </div>
+
+            <div>
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
+                Model ids <span className="normal-case text-ink-600">(optional, if /models is empty)</span>
+              </label>
+              <textarea
+                rows={2}
+                value={manualIds}
+                onChange={(e) => setManualIds(e.target.value)}
+                placeholder={"my-model-a\nmy-model-b"}
+                className={inputCls + " resize-y font-mono"}
+                disabled={discovering}
+              />
+              <p className="mt-1 text-[11px] text-ink-600">
+                One id per line when the endpoint doesn&apos;t list models. Then use
+                &quot;Use these models →&quot; or discover first.
+              </p>
+            </div>
+
+            {discoverError && (
+              <div className="rounded-sm border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+                {discoverError}
+                <p className="mt-1 text-[11px] text-ink-400">
+                  You can still add the provider without discovering, or enter model ids above.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
         {step === "models" && (
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
             <p className="text-[12px] text-ink-400">
-              Discovered <span className="font-semibold text-ink-100">{previewModels?.length ?? 0}</span>{" "}
-              models from <span className="font-mono text-ink-300">{draft.base_url}</span>. Refine any
-              caps below — fields left at the discovered value aren&apos;t written, so the harness
-              keeps its defaults (200k context / 8k output for unknown ids).
+              {baselines.length} model{baselines.length === 1 ? "" : "s"} for{" "}
+              <span className="font-mono text-ink-300">{draft.base_url}</span>. Refine any
+              caps below — fields left at the baseline aren&apos;t written for discovered
+              models (200k context / 8k output for unknown ids).
             </p>
-            {(previewModels ?? []).map((m) => {
+            {baselines.map((m) => {
               const c = caps[m.id];
               if (!c) return null;
               return (
@@ -352,7 +458,10 @@ export function CustomProviderModal({
                         inputMode="numeric"
                         value={c.context_window}
                         onChange={(e) =>
-                          setCaps((s) => ({ ...s, [m.id]: { ...c, context_window: e.target.value } }))
+                          setCaps((s) => ({
+                            ...s,
+                            [m.id]: { ...c, context_window: e.target.value },
+                          }))
                         }
                         className={inputCls + " px-2 py-1.5 font-mono text-[12px]"}
                       />
@@ -377,7 +486,10 @@ export function CustomProviderModal({
                       <input
                         value={c.thinking_levels}
                         onChange={(e) =>
-                          setCaps((s) => ({ ...s, [m.id]: { ...c, thinking_levels: e.target.value } }))
+                          setCaps((s) => ({
+                            ...s,
+                            [m.id]: { ...c, thinking_levels: e.target.value },
+                          }))
                         }
                         placeholder="low, medium, high"
                         className={inputCls + " px-2 py-1.5 font-mono text-[12px]"}
@@ -393,14 +505,36 @@ export function CustomProviderModal({
         <div className="flex items-center justify-between gap-3 border-t border-ink-800/80 px-5 py-3.5">
           <p className="text-[11px] text-ink-600">Saved to ~/.config/catalyst-code/config.json</p>
           {step === "endpoint" ? (
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <button
+                type="button"
                 onClick={submit}
-                className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800"
+                disabled={discovering}
+                className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 disabled:opacity-40"
               >
                 Add without discovering
               </button>
+              {manualIds.trim() !== "" && (
+                <button
+                  type="button"
+                  onClick={useManualModels}
+                  disabled={!endpointValid || discovering}
+                  className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-200 hover:bg-ink-800 disabled:opacity-40"
+                >
+                  Use these models →
+                </button>
+              )}
+              {discovering ? (
+                <button
+                  type="button"
+                  onClick={() => onCancelDiscover?.()}
+                  className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800"
+                >
+                  Cancel discover
+                </button>
+              ) : null}
               <button
+                type="button"
                 onClick={discover}
                 disabled={!endpointValid || discovering}
                 className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft disabled:opacity-40"
@@ -410,6 +544,7 @@ export function CustomProviderModal({
             </div>
           ) : (
             <button
+              type="button"
               onClick={submit}
               className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
             >

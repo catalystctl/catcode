@@ -32,6 +32,63 @@ func TestModalPasteInsertsAtEditorCursor(t *testing.T) {
 	}
 }
 
+// TestCustomProviderPasteStartsEditAndInserts guards the common failure where
+// bracketed paste into the add-custom-provider form was swallowed by the modal
+// (no composer leak) but never inserted — modalAcceptsTextPaste omitted the
+// modal, and paste before Enter never began free-text capture.
+func TestCustomProviderPasteStartsEditAndInserts(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.input.SetValue("draft must stay")
+	s.openCustomProviderModal()
+
+	// Focus Base URL without pressing Enter (navigation only).
+	s.customProvider.field = cpFieldBaseURL
+	_, _ = s.Update(tea.PasteMsg{Content: "https://api.example.com/v1"})
+	if !s.customProvider.editing || !s.modal.editing {
+		t.Fatalf("paste should auto-start text capture: editing=%v modal.editing=%v",
+			s.customProvider.editing, s.modal.editing)
+	}
+	if got := s.modal.editBuf.Value(); got != "https://api.example.com/v1" {
+		t.Fatalf("base URL paste = %q", got)
+	}
+	if s.input.Value() != "draft must stay" {
+		t.Fatalf("composer leaked paste: %q", s.input.Value())
+	}
+
+	// Commit URL, move to API key, paste without Enter again.
+	cpCommitEdit(&s.customProvider, s.modal.editBuf.Value())
+	s.customProvider.editing = false
+	s.modal.editing = false
+	s.customProvider.field = cpFieldAPIKey
+	_, _ = s.Update(tea.PasteMsg{Content: "sk-paste-me"})
+	if got := s.modal.editBuf.Value(); got != "sk-paste-me" {
+		t.Fatalf("API key paste = %q", got)
+	}
+	if s.input.Value() != "draft must stay" {
+		t.Fatalf("composer changed after key paste: %q", s.input.Value())
+	}
+}
+
+// TestCustomProviderPasteWhileAlreadyEditingInsertsAtCursor covers paste after
+// the user already pressed Enter to edit a field.
+func TestCustomProviderPasteWhileAlreadyEditingInsertsAtCursor(t *testing.T) {
+	s := initialSession()
+	s.openCustomProviderModal()
+	s.customProvider.field = cpFieldName
+	s.customProvider.editing = true
+	s.modal.editing = true
+	s.modal.editBuf.SetValue("my-")
+	s.modal.editBuf.Focus()
+	s.modal.editBuf.CursorEnd()
+	if !s.appendModalPaste("provider") {
+		t.Fatal("paste not accepted while editing custom provider")
+	}
+	if got := s.modal.editBuf.Value(); got != "my-provider" {
+		t.Fatalf("name paste = %q, want my-provider", got)
+	}
+}
+
 func TestInvalidValueEditRetainsModalAndText(t *testing.T) {
 	s := initialSession()
 	s.openValueEditModal(editTargetIdleTimeout, "Idle Timeout", "seconds", "9")
