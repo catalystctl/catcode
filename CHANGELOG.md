@@ -2,6 +2,10 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-08-05
+
+- Fixed add-custom-provider: non-blocking model discovery, no Umans fallback on dead endpoints, cancel/error UX, and paste into TUI form fields. [5f852cb]
+
 ## 2026-07-31
 
 - Plugin trust modal: untrusted project plugins now auto-prompt a trust/deny modal (once — decisions persist per project in ~/.config/catalyst-code/plugin-trust.json); re-open with /plugin-trust; trusted plugins load immediately. [working]
