@@ -52,6 +52,7 @@
 {"type":"get_vision_config"}
 {"type":"set_vision_config","enabled":true,"vision_models":[],"vision_model":null}
 {"type":"list_skills"}
+{"type":"refresh_models"}
 {"type":"apply_skill","name":"fixture","task":"run","model":"mock-model"}
 {"type":"start_goal","goal":"fixture","model":"mock-model","auto_deploy":false}
 {"type":"cancel_goal"}

@@ -437,6 +437,13 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.logInfo(fmt.Sprintf("%d model(s) discovered", len(models)))
 		s.refresh()
 
+	case "models_refreshed":
+		// Terminal event for the on-demand /refresh (core re-emitted `models`
+		// first, so the list is already updated here). Just confirm to the user.
+		count := ev.get("count")
+		s.logInfo(fmt.Sprintf("model list refreshed (%s models)", count))
+		s.refresh()
+
 	case "provider_models_preview":
 		// A discover_provider_models result (preview for the add-custom-provider
 		// form). Only act when that modal is open AND still waiting on this
@@ -613,6 +620,9 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.layout()
 			s.logSuccess(fmt.Sprintf("turn %d complete", s.turnCount))
 			s.input.Focus()
+			// Ring the window-title bell: the request finished and the user may
+			// be in another window. Any keypress silences it.
+			s.titleBell = true
 		}
 		// Refresh the discoverable-skills list so a skill created mid-turn
 		// (e.g. by /reflect or /index) shows up in the /skill:<name> autocomplete.
@@ -1179,6 +1189,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 					s.goalState.Phase = to
 				}
 				s.logWarn(line)
+				s.titleBell = true // attention: goal did not finish cleanly
 			}
 		case "done":
 			s.busy = false
@@ -1293,6 +1304,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		turnStarted := s.cur != nil || s.pendingApproval != nil || s.pendingAsk != nil ||
 			s.pendingSudo != nil || s.queuedNext || s.goalKeepsBusy()
 		s.logError(msg)
+		s.titleBell = true // attention: something failed
 		if s.modal.loading {
 			s.modal.loading = false
 			s.modal.loadError = msg
@@ -1507,6 +1519,18 @@ func (s *session) containsProvider(name string) bool {
 // providerKey returns the persisted API key for a provider, preferring the
 // per-provider key map over the legacy single APIKey (which applies to the
 // default/active provider). Empty when nothing is stored.
+// selectedProvider returns the owning provider of the currently selected model
+// (models[modelIdx]). Sent with send/steer so an explicit /model pick routes to
+// THAT provider even when several providers serve the same model id — selecting
+// a model uses its owning provider, no /login + provider switch needed. Empty
+// when there is no selection or the entry carries no provider tag.
+func (s *session) selectedProvider() string {
+	if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+		return s.models[s.modelIdx].Provider
+	}
+	return ""
+}
+
 func (s *session) providerKey(name string) string {
 	if k, ok := s.settings.ProviderKeys[name]; ok && k != "" {
 		return k
@@ -1649,7 +1673,7 @@ func (s *session) sendDelegation(prompt, cmdName string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	payload := s.withImages(map[string]any{
-		"type": "send", "prompt": prompt, "model": model,
+		"type": "send", "prompt": prompt, "model": model, "provider": s.selectedProvider(),
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, prompt)
 	if !s.sendCore(payload) {
@@ -1792,7 +1816,7 @@ func (s *session) sendSteer(prompt string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	if !s.sendCore(map[string]any{
-		"type": "steer", "prompt": prompt, "model": model,
+		"type": "steer", "prompt": prompt, "model": model, "provider": s.selectedProvider(),
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}) {
 		return nil
@@ -1847,7 +1871,7 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	payload := s.withImages(map[string]any{
-		"type": "send", "prompt": text, "model": model,
+		"type": "send", "prompt": text, "model": model, "provider": s.selectedProvider(),
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, text)
 	if !s.sendCore(payload) {
@@ -1872,6 +1896,9 @@ func (s *session) queueFollowUp(text string) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 func (s *session) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// The user is back at the keyboard — silence the window-title attention
+	// bell (turn-complete / error notifications have been seen).
+	s.titleBell = false
 	// global: the quit key (default Ctrl+C). While a turn is running, the first
 	// press aborts (or peels the queue) — matching CLI muscle memory — and a
 	// second press within a short window quits. Idle Ctrl+C still quits.
@@ -2809,6 +2836,13 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.sendCore(map[string]any{"type": "compact", "instructions": rest})
 			s.logInfo("forcing context compaction…")
 			return nil
+		case "/refresh":
+			// On-demand model-cache refresh: core force-fetches /models live from
+			// every logged-in provider (bypassing the 8h disk-cache TTL), then
+			// re-emits `models` + `provider_presets` and a final `models_refreshed`.
+			s.sendCore(map[string]any{"type": "refresh_models"})
+			s.logInfo("refreshing model list…")
+			return nil
 		case "/context":
 			s.sendCore(map[string]any{"type": "context"})
 			return nil
@@ -3040,7 +3074,7 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	}
 	model := s.models[s.modelIdx].ID
 	payload := s.withImages(map[string]any{
-		"type": "send", "prompt": text, "model": model,
+		"type": "send", "prompt": text, "model": model, "provider": s.selectedProvider(),
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}, text)
 	if !s.sendCore(payload) {
@@ -3093,6 +3127,7 @@ func (s *session) sendAttach(imgPath, promptText string) tea.Cmd {
 		"type":             "send",
 		"prompt":           promptText,
 		"model":            model,
+		"provider":         s.selectedProvider(),
 		"reasoning_effort": s.settings.ReasoningEffort,
 		"images":           []string{abs},
 	}, promptText)

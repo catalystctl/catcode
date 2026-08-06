@@ -427,6 +427,7 @@ pub(crate) async fn start_goal_parent_turn(
                 st.clone(),
                 client.clone(),
                 turn_model,
+                None,
                 prompt,
                 effort,
                 None,
@@ -523,7 +524,7 @@ pub(crate) async fn maybe_finish_goal_reviewing(
         }
         goal::ReviewOutcome::Replan => {
             if let Some(prompt) = prompt {
-                start_turn(st, client, model, prompt, effort, None).await;
+                start_turn(st, client, model, None, prompt, effort, None).await;
             }
         }
         goal::ReviewOutcome::Failed => {}
@@ -567,7 +568,7 @@ pub(crate) async fn maybe_finish_goal_verifying(
     };
     if matches!(outcome, goal::VerifyOutcome::Replan) {
         if let Some(prompt) = prompt {
-            start_turn(st, client, model, prompt, effort, None).await;
+            start_turn(st, client, model, None, prompt, effort, None).await;
         }
     }
 }

@@ -60,6 +60,7 @@ All flags and their equivalent environment variables:
 | `--idle-timeout <SECS>` | `CATALYST_CODE_IDLE_TIMEOUT` | `120` | SSE idle timeout in seconds |
 | `--max-session-tokens <N>` | `CATALYST_CODE_MAX_SESSION_TOKENS` | `0` (unlimited) | Hard session token budget |
 | `--debug-log <FILE>` | `CATALYST_CODE_DEBUG_LOG` | None (off) | Structured JSONL debug log (rotates at 64 MiB) |
+| `--debug` | `CATALYST_CODE_DEBUG=1` | off | Full-verbosity mode: HTTP bodies, tool args/outputs, protocol command/event mirror. Defaults a debug log path when unset. |
 | `--session <FILE>` | `CATALYST_CODE_SESSION` | None (off) | Append-only JSONL session file (resume on restart) |
 | `--model <ID>` | — | None | Default model ID |
 | `--provider <NAME>` | `UMANS_ACTIVE_PROVIDER` | None | Active model provider (see `providers` in config) |
@@ -284,6 +285,7 @@ All config fields with their types and defaults.
 | `context_digest_at` | number | `0.70` | Fraction triggering stale-tool-result digest |
 | `auto_compact` | bool | `true` | Automatically compact when approaching limit |
 | `debug_log` | string/null | `null` (off) | Path to JSONL debug log |
+| `debug_verbose` / `--debug` | bool | `false` | Full-verbosity debug mode (`catcode --debug`) |
 | `audit_log` | bool | `false` | Append-only security audit sidecar |
 | `session_file` | string/null | `null` | Path to JSONL session file |
 | `default_model` | string/null | `null` | Default model ID |
@@ -355,6 +357,10 @@ the defaults but before env/CLI.
 - The **`bash_deny`** list is a tripwire, not a security boundary. Use
   `--sandbox microsandbox` for real isolation (a separate microVM kernel +
   filesystem root). See [Sandbox Guide](../guides/sandbox.md).
-- **`debug_log`** records full tool arguments (file contents, bash commands)
-  which may include secrets. Off by default, rotates at 64 MiB. Enable only
-  when debugging.
+- **`debug_log`** is the structured JSONL path (metrics, tool hashes, errors).
+  Off by default for bare `core`; the TUI always passes a path. Rotates at 64 MiB.
+- **`--debug` / `debug_verbose`** additionally records full tool arguments and
+  outputs, provider HTTP request/response bodies, inbound commands, and a
+  mirror of protocol events. Secrets (api keys, tokens) are still redacted;
+  individual payloads are capped at 64 KiB. Enable only when debugging
+  (`catcode --debug` or `CATALYST_CODE_DEBUG=1`).

@@ -25,6 +25,7 @@ pub(crate) async fn run_turn(
     client: &reqwest::Client,
     run: RunContext,
     model: String,
+    provider: Option<String>,
     prompt: String,
     effort: String,
     images: Option<Vec<String>>,
@@ -62,6 +63,11 @@ pub(crate) async fn run_turn(
     // Vision handoff (pre_turn) and other plugins may remap the model for
     // this turn; keep a mutable binding so a swap propagates to the request loop.
     let mut model = model;
+    // The provider the user explicitly picked for `model` (from `/models`). It
+    // pins routing so an explicit pick wins over the active-provider tie-break.
+    // NOTE: if a vision/plugin remap ever swaps `model`, this pick must be
+    // cleared too — the remapped model may belong to a different provider.
+    let provider = provider;
 
     // Auto-reflect turn-local state (SELF_LEARNING §11 deterministic seam). The
     // shape (tool names + file categories) is accumulated as tools run; at the
@@ -452,7 +458,9 @@ pub(crate) async fn run_turn(
                         .with("utilization_pct", json!(utilization_pct(est, idle_ctx))),
                 );
                 dispatch_lifecycle(st, "pre_compact").await;
-                let rp = st.resolve_provider_for_model(&model).await;
+                let rp = st
+                    .resolve_provider_for_model_pick(&model, provider.as_deref())
+                    .await;
                 let summary_chars = if rp.api_key.is_some() {
                     let mp = st.plugin_manager.memory_provider();
                     compact_with_summary(
@@ -533,10 +541,14 @@ pub(crate) async fn run_turn(
         // Resolve the provider for this turn. In the multi-login model the
         // turn routes to the selected model's owning provider (so `/models`
         // can mix providers); falls back to the active/legacy provider for
-        // models without a provider tag. Errors out if no API key is available
-        // for the resolved provider (runtime key -> config literal -> env var).
+        // models without a provider tag. An explicit provider pick from the
+        // client's model selection wins over the active-provider tie-break.
+        // Errors out if no API key is available for the resolved provider
+        // (runtime key -> config literal -> env var).
         let provider = {
-            let rp = st.resolve_provider_for_model(&model).await;
+            let rp = st
+                .resolve_provider_for_model_pick(&model, provider.as_deref())
+                .await;
             match rp.api_key.as_ref() {
                 Some(_) => rp,
                 None => {
@@ -1902,21 +1914,40 @@ pub(crate) async fn run_turn(
                         outcome.output = apply_ingress_cap(&name, &args_str, outcome.output);
                     }
                     // Keep observability useful without copying commands, file contents,
-                    // or credentials into the debug log. The stable hash correlates this
-                    // record with the separately redacted audit trail.
+                    // or credentials into the debug log by default. The stable hash
+                    // correlates this record with the separately redacted audit trail.
+                    // `catcode --debug` (verbose) additionally attaches truncated args +
+                    // output so a full reconstruction is possible.
                     let status =
                         crate::tooling::ToolResultStatus::from_legacy(outcome.ok, &outcome.output);
-                    st.logger.log(
-                        "tool",
-                        json!({
-                            "tool_call_id": &id,
-                            "name": &name,
-                            "args_hash": audit::args_hash(&args_str),
-                            "status": status.as_str(),
-                            "output_len": outcome.output.len(),
-                            "duration_ms": tool_context.elapsed_ms(),
-                        }),
-                    );
+                    let mut payload = json!({
+                        "tool_call_id": &id,
+                        "name": &name,
+                        "args_hash": audit::args_hash(&args_str),
+                        "status": status.as_str(),
+                        "output_len": outcome.output.len(),
+                        "duration_ms": tool_context.elapsed_ms(),
+                    });
+                    if st.logger.is_verbose() {
+                        if let Some(obj) = payload.as_object_mut() {
+                            let (args_text, args_len, args_trunc) =
+                                crate::logging::truncate_for_log(
+                                    &args_str,
+                                    crate::logging::VERBOSE_PAYLOAD_CAP,
+                                );
+                            let (out_text, out_len, out_trunc) = crate::logging::truncate_for_log(
+                                &outcome.output,
+                                crate::logging::VERBOSE_PAYLOAD_CAP,
+                            );
+                            obj.insert("args".into(), json!(args_text));
+                            obj.insert("args_len".into(), json!(args_len));
+                            obj.insert("args_truncated".into(), json!(args_trunc));
+                            obj.insert("output".into(), json!(out_text));
+                            obj.insert("output_truncated".into(), json!(out_trunc));
+                            let _ = out_len; // output_len already present
+                        }
+                    }
+                    st.logger.log("tool", payload);
                     let mut ev = Event::new("tool_result")
                         .with("id", json!(id))
                         .with("ok", json!(outcome.ok))

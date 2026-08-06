@@ -251,11 +251,26 @@ pub fn enrich_models(
             continue;
         };
         // Overlay from models.dev (authoritative for this model).
+        // Skip zeros: an empty/broken registry entry must not pin max_tokens:0
+        // or wipe a usable curated/default budget.
         if entry.context > 0 {
             m.context_window = entry.context;
         }
         if entry.output > 0 {
             m.max_tokens = entry.output;
+        }
+        // models.dev occasionally lists output >= context (or equal). Keep a
+        // generation budget strictly below the context window so compaction /
+        // request builders always leave prompt room.
+        if m.max_tokens == 0 || m.max_tokens >= m.context_window {
+            if m.context_window > 1 {
+                m.max_tokens = (m.context_window.saturating_mul(3) / 4)
+                    .max(1)
+                    .min(65_536)
+                    .min(m.context_window - 1);
+            } else {
+                m.max_tokens = 1;
+            }
         }
         m.reasoning = entry.reasoning;
         m.vision = entry.vision;
@@ -507,6 +522,67 @@ mod tests {
         enrich_models(&mut models, &map, "https://api.deepseek.com");
         assert!(models[0].reasoning);
         assert!(!models[0].thinking_levels.is_empty());
+    }
+
+    #[test]
+    fn enrich_clamps_output_that_meets_or_exceeds_context() {
+        let mut map = HashMap::new();
+        map.insert(
+            "vendor/equal-caps".into(),
+            make_entry(1000, 1000, false, false),
+        );
+        map.insert(
+            "vendor/over-caps".into(),
+            make_entry(1000, 5000, false, false),
+        );
+        let mut models = vec![
+            crate::protocol::ModelInfo {
+                id: "equal-caps".into(),
+                name: "Equal".into(),
+                reasoning: false,
+                context_window: 200_000,
+                max_tokens: 8_192,
+                thinking_levels: Vec::new(),
+                vision: false,
+                provider: String::new(),
+            },
+            crate::protocol::ModelInfo {
+                id: "over-caps".into(),
+                name: "Over".into(),
+                reasoning: false,
+                context_window: 200_000,
+                max_tokens: 8_192,
+                thinking_levels: Vec::new(),
+                vision: false,
+                provider: String::new(),
+            },
+        ];
+        enrich_models(&mut models, &map, "https://api.example.com/v1");
+        assert_eq!(models[0].context_window, 1000);
+        assert!(models[0].max_tokens < 1000 && models[0].max_tokens > 0);
+        assert_eq!(models[1].context_window, 1000);
+        assert!(models[1].max_tokens < 1000 && models[1].max_tokens > 0);
+    }
+
+    #[test]
+    fn enrich_skips_zero_output_from_registry() {
+        let mut map = HashMap::new();
+        map.insert("vendor/broken".into(), make_entry(128000, 0, false, false));
+        let mut models = vec![crate::protocol::ModelInfo {
+            id: "broken".into(),
+            name: "Broken".into(),
+            reasoning: false,
+            context_window: 200_000,
+            max_tokens: 8_192,
+            thinking_levels: Vec::new(),
+            vision: false,
+            provider: String::new(),
+        }];
+        enrich_models(&mut models, &map, "https://api.example.com/v1");
+        assert_eq!(models[0].context_window, 128000);
+        // Zero output must not stick; keep a positive budget under context.
+        assert!(models[0].max_tokens > 0);
+        assert!(models[0].max_tokens < models[0].context_window);
     }
 
     #[test]

@@ -203,6 +203,43 @@ pub async fn fetch_provider_usage(
     ))
 }
 
+/// Coerce a JSON number-ish value to `u64`. Providers routinely encode counts
+/// as ints, floats (`3.0`), or quoted strings (`"3"`); `as_u64` alone drops
+/// those and the footer shows 0/∞ incorrectly.
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+        .or_else(|| {
+            value.as_f64().and_then(|number| {
+                if number.is_finite() && number >= 0.0 {
+                    Some(number as u64)
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            value
+                .as_str()?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .map(|number| number as u64)
+        })
+}
+
+/// Coerce a JSON number-ish value to `f64` (percent / credit fields).
+fn json_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_u64().map(|n| n as f64))
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+        .filter(|number| number.is_finite())
+}
+
 /// Parse the Umans `/v1/usage` JSON payload into `UmansUsage`. Pure (no I/O) so
 /// it can be unit-tested against the documented response shape:
 /// `{ limits: { concurrency: { limit }, requests: { limit } },
@@ -213,12 +250,12 @@ pub fn parse_umans_usage(v: &Value) -> UmansUsage {
     let used = v
         .get("usage")
         .and_then(|u| u.get("concurrent_sessions"))
-        .and_then(|c| c.as_u64());
+        .and_then(json_u64);
     let limit = v
         .get("limits")
         .and_then(|l| l.get("concurrency"))
         .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_u64());
+        .and_then(json_u64);
     UmansUsage { used, limit }
 }
 
@@ -249,12 +286,15 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
         .and_then(|r| {
             r.as_i64()
                 .or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok()))
+                .or_else(|| r.as_f64().filter(|n| n.is_finite()).map(|n| n as i64))
+                .or_else(|| r.as_str()?.trim().parse::<i64>().ok())
+                .or_else(|| r.as_str().and_then(parse_iso8601_unix))
         });
 
     let remaining_minutes = v
         .get("window")
         .and_then(|w| w.get("remaining_minutes"))
-        .and_then(|m| m.as_f64().or_else(|| m.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
 
     let reset_detail = remaining_minutes.map(|m| {
         if m < 1.0 {
@@ -277,12 +317,12 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
     let conc_used = v
         .get("usage")
         .and_then(|u| u.get("concurrent_sessions"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     let conc_limit = v
         .get("limits")
         .and_then(|l| l.get("concurrency"))
         .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_f64().or_else(|| l.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     if conc_used.is_some() || conc_limit.is_some() {
         windows.push(UsageWindow {
             id: "concurrency".into(),
@@ -298,12 +338,12 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
     let req_used = v
         .get("usage")
         .and_then(|u| u.get("requests_in_window"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     let req_limit = v
         .get("limits")
         .and_then(|l| l.get("requests"))
         .and_then(|c| c.get("limit"))
-        .and_then(|l| l.as_f64().or_else(|| l.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     if req_used.is_some() || req_limit.is_some() {
         windows.push(UsageWindow {
             id: "requests".into(),
@@ -319,11 +359,11 @@ pub fn parse_umans_usage_full(v: &Value) -> ProviderUsage {
     let tokens_in = v
         .get("usage")
         .and_then(|u| u.get("tokens_in"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     let tokens_out = v
         .get("usage")
         .and_then(|u| u.get("tokens_out"))
-        .and_then(|c| c.as_f64().or_else(|| c.as_u64().map(|u| u as f64)));
+        .and_then(json_f64);
     if tokens_in.is_some() || tokens_out.is_some() {
         let tin = tokens_in.unwrap_or(0.0);
         let tout = tokens_out.unwrap_or(0.0);
@@ -478,12 +518,7 @@ pub fn parse_codex_usage(v: &Value) -> ProviderUsage {
             .get("unlimited")
             .and_then(|u| u.as_bool())
             .unwrap_or(false);
-        let balance = credits.get("balance").and_then(|b| {
-            b.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| b.as_f64())
-                .or_else(|| b.as_u64().map(|u| u as f64))
-        });
+        let balance = credits.get("balance").and_then(json_f64);
         if unlimited {
             windows.push(UsageWindow {
                 id: "credits".into(),
@@ -530,16 +565,18 @@ fn parse_codex_rate_window(
     } else {
         w
     };
-    let used_percent = w
-        .get("used_percent")
-        .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)))?;
+    let used_percent = w.get("used_percent").and_then(json_f64)?;
     let window_secs = w
         .get("limit_window_seconds")
-        .and_then(|s| s.as_u64().or_else(|| s.as_f64().map(|f| f as u64)))
+        .and_then(json_u64)
         .unwrap_or(0);
-    let resets_at = w
-        .get("reset_at")
-        .and_then(|r| r.as_i64().or_else(|| r.as_u64().map(|u| u as i64)));
+    let resets_at = w.get("reset_at").and_then(|r| {
+        r.as_i64()
+            .or_else(|| r.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| r.as_f64().filter(|n| n.is_finite()).map(|n| n as i64))
+            .or_else(|| r.as_str()?.trim().parse::<i64>().ok())
+            .or_else(|| r.as_str().and_then(parse_iso8601_unix))
+    });
     let (id, label) = if window_secs > 0 {
         window_label_from_seconds(window_secs, fallback_id)
     } else {
@@ -640,15 +677,9 @@ pub fn parse_anthropic_oauth_usage(v: &Value) -> ProviderUsage {
             .and_then(|b| b.as_bool())
             .unwrap_or(true);
         if enabled {
-            let util = extra
-                .get("utilization")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
-            let used_credits = extra
-                .get("used_credits")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
-            let monthly = extra
-                .get("monthly_limit")
-                .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)));
+            let util = extra.get("utilization").and_then(json_f64);
+            let used_credits = extra.get("used_credits").and_then(json_f64);
+            let monthly = extra.get("monthly_limit").and_then(json_f64);
             if util.is_some() || used_credits.is_some() || monthly.is_some() {
                 windows.push(UsageWindow {
                     id: "extra_usage".into(),
@@ -685,9 +716,7 @@ pub fn parse_anthropic_oauth_usage(v: &Value) -> ProviderUsage {
 
 fn parse_anthropic_rate_limit(node: Option<&Value>, id: &str, label: &str) -> Option<UsageWindow> {
     let w = node.filter(|n| !n.is_null())?;
-    let utilization = w
-        .get("utilization")
-        .and_then(|u| u.as_f64().or_else(|| u.as_u64().map(|n| n as f64)))?;
+    let utilization = w.get("utilization").and_then(json_f64)?;
     let resets_at = w.get("resets_at").and_then(|r| {
         if let Some(n) = r.as_i64().or_else(|| r.as_u64().map(|u| u as i64)) {
             return Some(n);
@@ -795,18 +824,11 @@ const XAI_SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 /// Unwrap Grok's `{ "val": number }` money/credit wrappers (or a bare number).
 fn xai_val_number(v: Option<&Value>) -> Option<f64> {
     let v = v?;
-    if let Some(n) = v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)) {
+    if let Some(n) = json_f64(v) {
         return Some(n);
     }
-    if let Some(n) = v
-        .get("val")
-        .and_then(|x| x.as_f64().or_else(|| x.as_u64().map(|u| u as f64)))
-    {
+    if let Some(n) = v.get("val").and_then(json_f64) {
         return Some(n);
-    }
-    // Some payloads stringify the value.
-    if let Some(s) = v.as_str().or_else(|| v.get("val").and_then(|x| x.as_str())) {
-        return s.parse::<f64>().ok();
     }
     None
 }
@@ -853,9 +875,7 @@ pub fn parse_xai_billing(v: &Value) -> ProviderUsage {
     let cfg = v.get("config").unwrap_or(v);
 
     // ── Preferred: format=credits (matches grok.com Settings → Usage) ──
-    let credit_pct = cfg
-        .get("creditUsagePercent")
-        .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)));
+    let credit_pct = cfg.get("creditUsagePercent").and_then(json_f64);
 
     // Weekly window from currentPeriod (type USAGE_PERIOD_TYPE_WEEKLY).
     let period = cfg.get("currentPeriod");
@@ -914,9 +934,7 @@ pub fn parse_xai_billing(v: &Value) -> ProviderUsage {
                     .get("product")
                     .and_then(|p| p.as_str())
                     .unwrap_or("other");
-                let p_pct = entry
-                    .get("usagePercent")
-                    .and_then(|p| p.as_f64().or_else(|| p.as_u64().map(|u| u as f64)));
+                let p_pct = entry.get("usagePercent").and_then(json_f64);
                 let Some(p_pct) = p_pct else { continue };
                 // Skip zero-share products to keep the modal clean.
                 if p_pct <= 0.0 {
@@ -1083,4 +1101,115 @@ async fn fetch_xai_usage(
         }
     }
     Some(usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn umans_usage_accepts_string_and_float_counts() {
+        // Live gateways occasionally stringify concurrency fields.
+        let u = parse_umans_usage(&json!({
+            "usage": { "concurrent_sessions": "3" },
+            "limits": { "concurrency": { "limit": 8.0 } }
+        }));
+        assert_eq!(u.used, Some(3));
+        assert_eq!(u.limit, Some(8));
+    }
+
+    #[test]
+    fn umans_usage_full_accepts_string_windows() {
+        let u = parse_umans_usage_full(&json!({
+            "plan": { "display_name": "Pro" },
+            "usage": {
+                "concurrent_sessions": "2",
+                "requests_in_window": "12",
+                "tokens_in": "1000",
+                "tokens_out": 250.0
+            },
+            "limits": {
+                "concurrency": { "limit": "4" },
+                "requests": { "limit": 100.0 }
+            },
+            "window": { "resets_at": "1735689600", "remaining_minutes": "42" }
+        }));
+        assert!(u.available);
+        assert_eq!(u.plan.as_deref(), Some("Pro"));
+        assert_eq!(u.windows.len(), 3);
+        let conc = u.windows.iter().find(|w| w.id == "concurrency").unwrap();
+        assert_eq!(conc.used, Some(2.0));
+        assert_eq!(conc.limit, Some(4.0));
+        let req = u.windows.iter().find(|w| w.id == "requests").unwrap();
+        assert_eq!(req.used, Some(12.0));
+        assert_eq!(req.limit, Some(100.0));
+        assert_eq!(req.resets_at, Some(1735689600));
+    }
+
+    #[test]
+    fn codex_rate_window_accepts_string_percent() {
+        let u = parse_codex_usage(&json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": "42.5",
+                    "limit_window_seconds": "18000",
+                    "reset_at": "1735689600"
+                }
+            }
+        }));
+        assert!(u.available);
+        assert_eq!(u.windows.len(), 1);
+        assert_eq!(u.windows[0].used, Some(42.5));
+        assert_eq!(u.windows[0].limit, Some(100.0));
+        assert_eq!(u.windows[0].id, "five_hour");
+        assert_eq!(u.windows[0].resets_at, Some(1735689600));
+    }
+
+    #[test]
+    fn anthropic_oauth_accepts_string_utilization() {
+        let u = parse_anthropic_oauth_usage(&json!({
+            "five_hour": {
+                "utilization": "33",
+                "resets_at": "2025-01-01T00:00:00Z"
+            }
+        }));
+        assert!(u.available);
+        assert_eq!(u.windows[0].used, Some(33.0));
+        assert_eq!(u.windows[0].resets_at, Some(1735689600));
+    }
+
+    #[test]
+    fn xai_billing_accepts_string_percent_and_val_wrapper() {
+        let u = parse_xai_billing(&json!({
+            "config": {
+                "creditUsagePercent": "30.5",
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2025-01-01T00:00:00Z"
+                },
+                "productUsage": [
+                    { "product": "Api", "usagePercent": "12" }
+                ],
+                "onDemandCap": { "val": "100" },
+                "onDemandUsed": { "val": 10.0 }
+            }
+        }));
+        assert!(u.available);
+        let weekly = u.windows.iter().find(|w| w.id == "weekly").unwrap();
+        assert_eq!(weekly.used, Some(30.5));
+        let api = u.windows.iter().find(|w| w.id == "product_api").unwrap();
+        assert_eq!(api.used, Some(12.0));
+        let od = u.windows.iter().find(|w| w.id == "on_demand").unwrap();
+        assert_eq!(od.limit, Some(100.0));
+        assert_eq!(od.used, Some(10.0));
+    }
+
+    #[test]
+    fn json_coercers_reject_garbage() {
+        assert_eq!(json_u64(&json!("n/a")), None);
+        assert_eq!(json_u64(&json!(-3)), None);
+        assert_eq!(json_f64(&Value::Null), None);
+    }
 }

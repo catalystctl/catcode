@@ -222,6 +222,11 @@ pub struct Config {
     /// model writes (e.g. into a `.env`). User-owned, off by default, rotates at
     /// 64 MiB. Enable only when debugging.
     pub debug_log: Option<PathBuf>,
+    /// Full-verbosity debug mode (`--debug` / `CATALYST_CODE_DEBUG=1`). When
+    /// true, the debug log also records provider HTTP request/response bodies,
+    /// full tool args+outputs, inbound commands, and a mirror of protocol
+    /// events. Implies a default `debug_log` path when none is set.
+    pub debug_verbose: bool,
     /// Append-only security audit sidecar (tool decisions, args hashes).
     pub audit_log: bool,
     pub session_file: Option<PathBuf>,
@@ -1039,6 +1044,7 @@ impl Default for Config {
             context_compact_at: 0.90,
             context_digest_at: 0.70,
             debug_log: None,
+            debug_verbose: false,
             audit_log: false,
             session_file: None,
             default_model: None,
@@ -1123,6 +1129,7 @@ OPTIONS:
       --idle-timeout <SECS>    SSE idle timeout in seconds [env: CATALYST_CODE_IDLE_TIMEOUT]
       --max-session-tokens <N> Hard session token budget (0=unlimited) [env: CATALYST_CODE_MAX_SESSION_TOKENS]
       --debug-log <FILE>        Structured JSONL debug log [env: CATALYST_CODE_DEBUG_LOG]
+      --debug                   Full-verbosity debug mode (HTTP bodies, tool args, events) [env: CATALYST_CODE_DEBUG=1]
       --session <FILE>          Append-only JSONL session file (resume on restart) [env: CATALYST_CODE_SESSION]
       --model <ID>              Default model id
       --provider <NAME>        Active model provider (openai/anthropic endpoint; see `providers` in config) [env: UMANS_ACTIVE_PROVIDER]
@@ -1153,6 +1160,7 @@ pub fn load() -> Config {
     let mut cli_diag_timeout: Option<u64> = None;
     let mut cli_trust_project: Option<bool> = None;
     let mut cli_debug_log: Option<PathBuf> = None;
+    let mut cli_debug_verbose: Option<bool> = None;
     let mut cli_session: Option<PathBuf> = None;
     let mut cli_model: Option<String> = None;
     let mut cli_provider: Option<String> = None;
@@ -1227,6 +1235,9 @@ pub fn load() -> Config {
                 if let Some(v) = take_val(&mut i) {
                     cli_debug_log = Some(PathBuf::from(v));
                 }
+            }
+            "--debug" => {
+                cli_debug_verbose = Some(true);
             }
             "--session" => {
                 if let Some(v) = take_val(&mut i) {
@@ -1397,6 +1408,10 @@ pub fn load() -> Config {
     if let Ok(v) = std::env::var("CATALYST_CODE_DEBUG_LOG") {
         c.debug_log = Some(PathBuf::from(v));
     }
+    if let Ok(v) = std::env::var("CATALYST_CODE_DEBUG") {
+        let on = v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true");
+        c.debug_verbose = on;
+    }
     if let Ok(v) = std::env::var("CATALYST_CODE_SESSION") {
         c.session_file = Some(PathBuf::from(v));
     }
@@ -1522,6 +1537,16 @@ pub fn load() -> Config {
     }
     if let Some(v) = cli_debug_log {
         c.debug_log = Some(v);
+    }
+    if let Some(v) = cli_debug_verbose {
+        c.debug_verbose = v;
+    }
+    // Verbose mode always needs a log file. If the user only passed --debug
+    // (no --debug-log / env), default to ~/.config/catalyst-code/debug.jsonl
+    // so something actually gets written.
+    if c.debug_verbose && c.debug_log.is_none() {
+        let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+        c.debug_log = Some(home.join(".config/catalyst-code/debug.jsonl"));
     }
     if let Some(v) = cli_session {
         c.session_file = Some(v);
@@ -2317,17 +2342,26 @@ mod tests {
             ("CATALYST_CODE_NO_NETWORK", "1"),
             ("CATALYST_CODE_IDLE_TIMEOUT", "42"),
             ("CATALYST_CODE_MAX_SESSION_TOKENS", "123456"),
+            ("CATALYST_CODE_DEBUG", "1"),
         ];
         let saved: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
             .collect();
+        // Also save/clear any explicit debug-log path so the default path
+        // assertion below is deterministic.
+        let saved_debug_log = std::env::var("CATALYST_CODE_DEBUG_LOG").ok();
+        std::env::remove_var("CATALYST_CODE_DEBUG_LOG");
         for (k, v) in &vars {
             std::env::set_var(k, v);
         }
         let c = load();
         for (k, _) in &vars {
             std::env::remove_var(k);
+        }
+        match saved_debug_log {
+            Some(v) => std::env::set_var("CATALYST_CODE_DEBUG_LOG", v),
+            None => std::env::remove_var("CATALYST_CODE_DEBUG_LOG"),
         }
         for (k, prev) in saved {
             match prev {
@@ -2339,6 +2373,11 @@ mod tests {
         assert!(c.no_network);
         assert_eq!(c.idle_timeout_secs, 42);
         assert_eq!(c.max_session_tokens, 123456);
+        assert!(c.debug_verbose, "CATALYST_CODE_DEBUG=1 must enable verbose");
+        assert!(
+            c.debug_log.is_some(),
+            "--debug / CATALYST_CODE_DEBUG must default a debug_log path"
+        );
     }
 
     #[test]

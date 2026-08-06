@@ -171,6 +171,7 @@ func (s *session) announceGoalComplete() {
 	s.goalCompleteLogged = true
 	s.persistGoalLifecycle("goal complete")
 	s.logSuccess("goal complete")
+	s.titleBell = true // ring the window-title bell: goal finished
 }
 
 func goalStatusBadge(status string) string {

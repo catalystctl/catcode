@@ -84,8 +84,12 @@ func TestClearPendingImagesNeverDeletesUserFile(t *testing.T) {
 }
 
 func TestHandleCLIArgsRejectsUnknownAndConflictingArgs(t *testing.T) {
+	debugMode = false
 	if code, handled := handleCLIArgs(nil); code != 0 || handled {
 		t.Fatalf("no args = (%d,%v), want (0,false)", code, handled)
+	}
+	if debugMode {
+		t.Fatal("nil args must not set debugMode")
 	}
 	if code, handled := handleCLIArgs([]string{"--wat"}); code != 2 || !handled {
 		t.Fatalf("unknown arg = (%d,%v), want (2,true)", code, handled)
@@ -93,4 +97,25 @@ func TestHandleCLIArgsRejectsUnknownAndConflictingArgs(t *testing.T) {
 	if code, handled := handleCLIArgs([]string{"--version", "--help"}); code != 2 || !handled {
 		t.Fatalf("conflicting args = (%d,%v), want (2,true)", code, handled)
 	}
+}
+
+func TestHandleCLIArgsDebugLaunchesTUI(t *testing.T) {
+	debugMode = false
+	code, handled := handleCLIArgs([]string{"--debug"})
+	if code != 0 || handled {
+		t.Fatalf("--debug alone = (%d,%v), want (0,false) so TUI launches", code, handled)
+	}
+	if !debugMode {
+		t.Fatal("--debug must set debugMode")
+	}
+	// Reset so other tests aren't polluted.
+	debugMode = false
+
+	// --debug may be combined with nothing else that exits; combining with an
+	// action flag still runs the action (debug is stripped first).
+	code, handled = handleCLIArgs([]string{"--debug", "--version"})
+	if code != 0 || !handled {
+		t.Fatalf("--debug --version = (%d,%v), want (0,true)", code, handled)
+	}
+	debugMode = false
 }

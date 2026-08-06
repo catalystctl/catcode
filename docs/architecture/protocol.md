@@ -729,6 +729,20 @@ prompt, and runs a normal assistant turn.
 {"type": "apply_skill", "name": "repository-documentation-factory", "task": "document the CLI", "model": "glm-5.2"}
 ```
 
+#### `refresh_models`
+
+On-demand model-cache refresh. Forces a LIVE `/models` discovery for every
+logged-in provider, bypassing the 8-hour disk-cache TTL
+(`~/.config/catalyst-code/models-cache.json`) and rewriting the cache, then
+re-aggregates and re-emits `models` + `provider_presets`. Runs off the command
+loop; emits `info` up front and a terminal `models_refreshed` event. A dead
+endpoint falls back to the stale cache / curated snapshot, so the list never
+shrinks. Triggered by TUI `/refresh` and the web model-picker refresh button.
+
+```json
+{"type": "refresh_models"}
+```
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Skill name (resolved project > user scope) |
@@ -1005,6 +1019,16 @@ Full model list update. Emitted after login, logout, `set_provider`, and
 
 ```json
 {"type": "models", "models": [ /* ModelInfo[] */ ]}
+```
+
+#### `models_refreshed`
+
+Terminal event for `refresh_models` (after the `models` re-emit). Carries the
+total model count and per-provider model ids so clients can clear their
+refresh spinner and report what changed.
+
+```json
+{"type": "models_refreshed", "count": 12, "providers": {"umans": ["glm-5.2"]}}
 ```
 
 #### `provider_presets`
