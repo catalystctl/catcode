@@ -1563,6 +1563,39 @@ async fn stream_turn_openai(
                 }
             }
 
+            // Logical completion: terminal frame observed AND nothing left
+            // buffered in the decoder. Without this gate, providers that emit
+            // `finish_reason:stop` + `usage` but never send `[DONE]` and hold the
+            // connection open (e.g. mmx/MiniMax-M3 over 9router) make catcode
+            // sit on the per-chunk idle timeout (10s+) which the user reads as
+            // "infinitely loading". Break early so the stream resolves in
+            // <100ms after the terminal chunk. `decoder.finish()` drains any
+            // half-line into a final frame before we exit.
+            if stream_logically_complete(terminal_event, &decoder) {
+                for frame in decoder.finish() {
+                    let obj = match frame {
+                        SseFrame::Json { value, .. } => value,
+                        SseFrame::Done => continue,
+                        SseFrame::Malformed { preview, .. } => {
+                            err = Some(malformed_response(&preview).message);
+                            break 'read_stream;
+                        }
+                    };
+                    for event in adapter.decode_stream_event(&obj) {
+                        match event {
+                            NormalizedStreamEvent::Usage { .. } => {}
+                            NormalizedStreamEvent::FinishReason(reason) => {
+                                if finish_reason.is_empty() {
+                                    finish_reason = reason;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                break;
+            }
+
             // Live footer stats: emit a metrics event at most every ~400ms so the
             // TUI's context + approximate in-flight TPS move during the turn.
             // `tps_est` is explicitly marked approximate by the TUI; the final
@@ -1913,6 +1946,31 @@ async fn stream_turn_gemini(
                         NormalizedStreamEvent::ToolCallDelta(_)
                         | NormalizedStreamEvent::ToolCallComplete { .. } => {}
                     }
+                }
+
+                // Same early-break as the OpenAI path: a provider that sends
+                // `message_stop` / `response.completed` and holds the connection
+                // open (no further events) would otherwise wait for the idle
+                // timeout. Drain any buffered half-line and exit.
+                if stream_logically_complete(terminal_event, &decoder) {
+                    for frame in decoder.finish() {
+                        let obj = match frame {
+                            SseFrame::Json { value, .. } => value,
+                            SseFrame::Done => continue,
+                            SseFrame::Malformed { preview, .. } => {
+                                err = Some(malformed_response(&preview).message);
+                                break;
+                            }
+                        };
+                        for event in adapter.decode_stream_event(&obj) {
+                            if let NormalizedStreamEvent::FinishReason(reason) = event {
+                                if finish_reason.is_empty() {
+                                    finish_reason = reason;
+                                }
+                            }
+                        }
+                    }
+                    break 'read_stream;
                 }
 
                 // Live footer stats.
@@ -2429,6 +2487,17 @@ fn is_terminal_stream_object(value: &Value) -> bool {
             | Some("response.failed")
             | Some("message_stop")
     )
+}
+
+/// True when the stream has delivered a terminal event AND the decoder has no
+/// buffered bytes pending, so the read loop can break without waiting for the
+/// transport EOF or the per-chunk idle timeout. Required for providers that
+/// emit `finish_reason:stop` + `usage` but never send the `[DONE]` sentinel and
+/// hold the connection open (e.g. mmx/MiniMax-M3 over 9router): without this
+/// gate the TUI sits on an "infinite loading" footer until the 10s+ idle
+/// timeout fires, which the user reads as a hang.
+fn stream_logically_complete(terminal_event: bool, decoder: &SseDecoder) -> bool {
+    terminal_event && !decoder.has_pending_data()
 }
 
 // =========================================================================
@@ -4897,6 +4966,89 @@ mod tests {
         assert_eq!(result.0["content"], "hello");
         assert_eq!(result.1, "stop");
         server.await.unwrap();
+    }
+
+    /// Regression test for the "infinite loading" symptom on `mmx/MiniMax-M3`
+    /// over 9router: the provider emits a terminal `finish_reason:stop` +
+    /// `usage` chunk but never sends `[DONE]` AND holds the connection open
+    /// after. Without the early-break gate on `terminal_event && !has_pending`,
+    /// catcode would wait for the per-chunk idle timeout (10s+) on every turn,
+    /// which the user reads as a hang. With the fix the stream resolves in
+    /// <500ms after the terminal chunk even though the socket is still open.
+    #[tokio::test]
+    async fn stalled_connection_after_terminal_frame_resolves_promptly() {
+        // Build the terminal response body — same shape as the live mmx wire.
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"choices": [{"delta": {"role": "assistant"}, "finish_reason": null}]}),
+            json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": null}]}),
+            json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14}
+            })
+        );
+        // Mock server: write the body, then idle indefinitely with no `[DONE]`
+        // and no chunked terminator. This is the exact behavior the user hit
+        // against mmx — the response is "complete" but the socket stays open.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let h = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while find_header_end(&buf).is_none() {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the connection open (no terminating zero-chunk, no [DONE]).
+            // Catcode's fix must detect the terminal frame and break the read
+            // loop without waiting for this socket to close or for the idle
+            // timeout to fire.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let provider = mock_provider(base);
+        let mut timer = TurnTimer::new();
+        let started = std::time::Instant::now();
+        let result = stream_turn_openai(
+            &reqwest::Client::new(),
+            &provider,
+            10, // idle_timeout_secs
+            "mock-model",
+            &[Message::user("say ok")],
+            &[],
+            "none",
+            &[],
+            4096, // max_tokens
+            &CancellationToken::new(),
+            &mut timer,
+            0,
+            true,
+        )
+        .await
+        .expect("stream should resolve on terminal frame without waiting for socket EOF");
+        let elapsed_ms = started.elapsed().as_millis();
+        assert_eq!(result.0["content"], "ok");
+        assert_eq!(result.1, "stop");
+        // The whole point of the fix: this completes in well under the 10s
+        // idle timeout (and well under 1s on a local mock). Pre-fix this would
+        // hang at ~10s waiting for a chunk that never arrives.
+        assert!(
+            elapsed_ms < 5_000,
+            "expected prompt resolution (<5s); took {elapsed_ms}ms"
+        );
+        h.abort();
     }
 
     #[tokio::test]
