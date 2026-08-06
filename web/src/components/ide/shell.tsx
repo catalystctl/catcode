@@ -556,11 +556,13 @@ export function IdeShell() {
             ready={agent.state.ready}
             models={agent.state.models}
             selectedModel={agent.state.selectedModel}
+            modelsRefreshing={agent.state.modelsRefreshing}
             thinkingLevel={agent.state.thinkingLevel}
             approvalMode={agent.state.approvalMode}
             autoCompact={agent.state.ready?.auto_compact ?? true}
             sandbox={agent.state.ready?.sandbox ?? "none"}
             onSelectModel={agent.setModel}
+            onRefreshModels={() => void agent.refreshModels()}
             onSelectThinking={agent.setThinking}
             onSetApproval={agent.setApproval}
             onSetBashTimeout={(secs) => void agent.setConfig("bash_timeout_secs", secs)}

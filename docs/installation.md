@@ -28,7 +28,10 @@ The web service requires Node.js 22.13+.
 curl -fsSL https://raw.githubusercontent.com/catalystctl/catcode/refs/heads/master/install.sh | bash
 ```
 
-Installs the `catcode` TUI binary to `/usr/local/bin` (system-wide).
+Installs the `catcode` TUI binary to `/usr/local/bin` (system-wide). The
+prebuilt TUI embeds the Rust core and extracts it to
+`~/.cache/catalyst-code/` on first run — a separate `catcode-core` on PATH is
+**not** installed for terminal-only installs.
 
 ### Terminal + Web service (Linux & macOS)
 
@@ -342,7 +345,7 @@ Removes (from code in `install.sh` `do_uninstall()`):
 
 - Systemd unit (stop → disable → remove file) or launchd plist (unload → delete)
 - `/usr/local/bin/catcode`
-- `/usr/local/bin/catcode-core`
+- `/usr/local/bin/catcode-core` (when present — only installed with `--with-web` / source builds)
 - Web bundle directory (`/opt/catalyst-code/web` or `~/Library/Application Support/catalyst-code/web`)
 - Installer state file (`/etc/catalyst-code/installer.state`)
 - The git repo clone (if built from source) is left untouched

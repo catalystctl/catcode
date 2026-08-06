@@ -2,6 +2,11 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-08-06
+
+- Wired web model-list refresh (`refresh_models` / `models_refreshed`) with spinner + ModelPicker control; fixed CLI-only install summary for embedded core. [16ec65a]
+- Hardened multi-provider wire paths end-to-end (max_tokens floors, empty auth omit, Gemini tool results, SSE/usage coercion, discovery caps). [0a95f73]
+
 ## 2026-08-05
 
 - Fixed add-custom-provider: non-blocking model discovery, no Umans fallback on dead endpoints, cancel/error UX, and paste into TUI form fields. [5f852cb]

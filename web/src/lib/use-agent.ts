@@ -154,6 +154,9 @@ export interface AgentApi {
   setConfig: (key: string, value: string | number | boolean) => Promise<void>;
   // ── Memory extras ──
   refreshMemory: () => Promise<void>;
+  // ── Models ──
+  /** Force-refresh the multi-provider model cache (`refresh_models`). */
+  refreshModels: () => Promise<void>;
   // ── Projects / workspace ──
   switchWorkspace: (path: string) => Promise<void>;
   renameSession: (name: string, title: string) => Promise<void>;
@@ -1107,6 +1110,19 @@ export function useAgent(): AgentApi {
   const listPlugins = useCallback(() => fire({ type: "list_plugins" }), [fire]);
   const listAgents = useCallback(() => fire({ type: "list_agents" }), [fire]);
   const refreshMemory = useCallback(() => fire({ type: "refresh_memory" }), [fire]);
+  const refreshModels = useCallback(async () => {
+    // Optimistic spinner; cleared by the terminal `models_refreshed` event
+    // (or immediately if the post fails before core sees the command).
+    setState((s) => reduce(s, { type: "_set_models_refreshing", refreshing: true }));
+    try {
+      const ok = await send({ type: "refresh_models" });
+      if (!ok) {
+        setState((s) => reduce(s, { type: "_set_models_refreshing", refreshing: false }));
+      }
+    } catch {
+      setState((s) => reduce(s, { type: "_set_models_refreshing", refreshing: false }));
+    }
+  }, [send]);
 
   // ── Skills ──
   const listSkills = useCallback(() => fire({ type: "list_skills" }), [fire]);
@@ -1432,6 +1448,7 @@ export function useAgent(): AgentApi {
       listPlugins,
       listAgents,
       refreshMemory,
+      refreshModels,
       listSkills,
       applySkill,
       startGoal,

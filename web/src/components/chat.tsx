@@ -723,6 +723,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           provider={state.provider}
           models={state.models}
           selectedModel={state.selectedModel}
+          modelsRefreshing={state.modelsRefreshing}
           thinkingLevel={state.thinkingLevel}
           approvalMode={state.approvalMode}
           metrics={state.metrics}
@@ -736,6 +737,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           theme={theme}
           onMenuClick={() => setSidebarOpen(true)}
           onSelectModel={agent.setModel}
+          onRefreshModels={() => void agent.refreshModels()}
           onSelectThinking={agent.setThinking}
           onSetApproval={agent.setApproval}
           onReconnect={agent.reconnect}

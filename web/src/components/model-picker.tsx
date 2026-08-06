@@ -13,7 +13,7 @@
 import { useMemo, useState, type ReactNode } from "react";
 import type { ModelInfo } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
-import { CheckIcon, ModelIcon, SearchIcon, BrainIcon, XIcon } from "./icons";
+import { CheckIcon, ModelIcon, SearchIcon, BrainIcon, XIcon, RefreshIcon } from "./icons";
 
 interface Props {
   models: ModelInfo[];
@@ -23,6 +23,10 @@ interface Props {
   variant?: "popover" | "inline";
   /** Called after a selection is made (e.g. to close the popover). */
   onClose?: () => void;
+  /** Force-refresh the multi-provider model cache (`refresh_models`). */
+  onRefresh?: () => void;
+  /** True while an on-demand refresh is in flight. */
+  refreshing?: boolean;
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -49,6 +53,8 @@ export function ModelPicker({
   onSelect,
   variant = "inline",
   onClose,
+  onRefresh,
+  refreshing = false,
 }: Props) {
   const [query, setQuery] = useState("");
   const [provider, setProvider] = useState<string | null>(null);
@@ -180,11 +186,32 @@ export function ModelPicker({
           })
         )}
       </div>
-      {/* Result count footer */}
-      {models.length > 0 && (
-        <div className="border-t border-ink-800/60 px-3 py-1.5 text-[10px] text-ink-600">
-          {filtered.length} of {models.length} models
-          {provider && ` · ${prettyProvider(provider)}`}
+      {/* Result count + optional refresh footer */}
+      {(models.length > 0 || onRefresh) && (
+        <div className="flex items-center justify-between gap-2 border-t border-ink-800/60 px-3 py-1.5 text-[10px] text-ink-600">
+          <span>
+            {models.length > 0
+              ? `${filtered.length} of ${models.length} models`
+              : "No models yet"}
+            {provider && ` · ${prettyProvider(provider)}`}
+          </span>
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={onRefresh}
+              disabled={refreshing}
+              className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-200 disabled:cursor-wait disabled:opacity-60"
+              title="Refresh model list from providers"
+              aria-label="Refresh model list"
+            >
+              <RefreshIcon
+                width={11}
+                height={11}
+                className={refreshing ? "animate-spin" : ""}
+              />
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </button>
+          )}
         </div>
       )}
     </div>

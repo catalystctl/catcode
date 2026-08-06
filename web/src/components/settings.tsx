@@ -48,11 +48,15 @@ interface Props {
   ready: ReadyPayload | null;
   models: ModelInfo[];
   selectedModel: string | null;
+  /** True while an on-demand model-list refresh is in flight. */
+  modelsRefreshing?: boolean;
   thinkingLevel: string;
   approvalMode: string;
   autoCompact: boolean;
   sandbox: string;
   onSelectModel: (id: string) => void;
+  /** Force-refresh multi-provider model cache. */
+  onRefreshModels?: () => void;
   onSelectThinking: (level: string) => void;
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
   onSetBashTimeout: (secs: number) => void;
@@ -784,6 +788,8 @@ export function SettingsModal(props: Props) {
                       selectedModel={props.selectedModel}
                       onSelect={props.onSelectModel}
                       variant="inline"
+                      onRefresh={props.onRefreshModels}
+                      refreshing={props.modelsRefreshing}
                     />
                   </div>
                 </div>
