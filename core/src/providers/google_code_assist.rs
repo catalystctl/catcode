@@ -46,9 +46,13 @@ impl ProviderAdapter for GoogleCodeAssistAdapter {
             .unwrap_or_else(|| "rising-fact-p41fc".into());
         let model = resolve_model_id(input.model, input.reasoning_effort);
         let (contents, system_instruction) = messages_to_contents(input.messages);
+        // Some gateways reject maxOutputTokens:0 ("generate nothing"). A missing
+        // model budget used to flow through as 0; floor to 1 so the request is
+        // valid without imposing a real harness generation cap.
+        let max_out = input.max_tokens.max(1);
         let mut body = json!({
             "model": model, "project": project, "userAgent": "antigravity",
-            "request": { "contents": contents, "generationConfig": { "maxOutputTokens": input.max_tokens } }
+            "request": { "contents": contents, "generationConfig": { "maxOutputTokens": max_out } }
         });
         if let Some(system) = system_instruction {
             body["request"]["systemInstruction"] = system;

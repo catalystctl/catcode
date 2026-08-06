@@ -41,6 +41,13 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             "stream": true,
             "stream_options": { "include_usage": true },
         });
+        // Some OpenAI-compatible gateways reject or mis-handle `max_tokens: 0`
+        // (treat it as "generate nothing"). Only send the field when we have a
+        // real positive budget from model discovery; omit it otherwise so the
+        // server applies its own default (no artificial harness cap).
+        if input.max_tokens > 0 {
+            body["max_tokens"] = json!(input.max_tokens);
+        }
         if input
             .tools
             .iter()
@@ -153,6 +160,29 @@ mod tests {
         assert_eq!(built.url, "https://example.com/v1/chat/completions");
         assert_eq!(built.body["tools"][0]["function"]["name"], "a_tool");
         assert!(built.body.get("reasoning_effort").is_none());
+        assert_eq!(built.body["max_tokens"], 100);
+    }
+
+    #[test]
+    fn max_tokens_zero_is_omitted_not_sent() {
+        // Never put max_tokens:0 on the wire — some proxies treat it as
+        // "generate nothing". Omitting leaves the server default (uncapped by us).
+        let provider = provider("https://example.com/v1");
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 0,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert!(
+            built.body.get("max_tokens").is_none(),
+            "max_tokens:0 must be omitted, got {:?}",
+            built.body.get("max_tokens")
+        );
     }
 
     fn kimi_provider() -> ResolvedProvider {

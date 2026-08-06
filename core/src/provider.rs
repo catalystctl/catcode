@@ -978,6 +978,7 @@ pub async fn stream_turn(
                 tools,
                 reasoning_effort,
                 thinking_levels,
+                max_tokens,
                 cancel,
                 timer,
                 prompt_est,
@@ -1028,6 +1029,8 @@ async fn stream_turn_codex(
         tools,
         reasoning_effort,
         thinking_levels: &[],
+        // Codex adapter does not put max_tokens on the wire; 0 here is a
+        // no-op sentinel (same "omit when unknown" policy as OpenAI).
         max_tokens: 0,
     })?;
     let body = built.body;
@@ -1277,6 +1280,7 @@ async fn stream_turn_openai(
     tools: &[Value],
     reasoning_effort: &str,
     thinking_levels: &[String],
+    max_tokens: u32,
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
     prompt_est: u64,
@@ -1303,7 +1307,9 @@ async fn stream_turn_openai(
         tools,
         reasoning_effort,
         thinking_levels,
-        max_tokens: 0,
+        // Pass the model-advertised budget when known. The OpenAI adapter
+        // omits the field when this is 0 (never puts max_tokens:0 on the wire).
+        max_tokens,
     })?;
     if !quiet {
         for notice in &built.notices {
@@ -4740,6 +4746,7 @@ mod tests {
             &[],
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
@@ -4786,6 +4793,7 @@ mod tests {
             &tools,
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
@@ -4837,6 +4845,7 @@ mod tests {
             &[],
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
@@ -4880,6 +4889,7 @@ mod tests {
             &[],
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
@@ -4915,6 +4925,7 @@ mod tests {
             &[],
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
@@ -4950,6 +4961,7 @@ mod tests {
             &[],
             "none",
             &[],
+            0, // max_tokens: omit on wire when 0
             &CancellationToken::new(),
             &mut timer,
             0,
