@@ -73,6 +73,11 @@ echo "==> Installing dependencies and building the SDK"
 
 if ((RUN_TESTS)); then
   echo "==> Validating web sources"
+  # Drop generated App Router types from a previous deploy. After route removals
+  # (e.g. hub-only cleanup) stale .next/types still import deleted route modules
+  # and fail `tsc --noEmit` even when sources are clean. Next regenerates them
+  # on the build step below; the live .next tree is backed up just before that.
+  rm -rf web/.next/types
   (cd web && "$BUN" run typecheck && "$BUN" test)
 fi
 
