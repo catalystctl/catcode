@@ -9,8 +9,7 @@ import { useEffect, useState } from "react";
 import { RefreshIcon, XIcon } from "@/components/icons";
 import { terminateTerminalSession } from "@/components/ide/terminal";
 
-// Ghostty's WASM renderer must never run on the server (panel-registry.ts
-// loads the IDE's Terminal the same way).
+// Ghostty's WASM renderer must never run on the server.
 const Terminal = dynamic(
   () => import("@/components/ide/terminal").then((m) => m.Terminal),
   {
@@ -116,6 +115,10 @@ export function HubPane({
           // gone PTY answers "missing" to the attach-only open and surfaces
           // via onUnavailable regardless of the budget.
           maxReconnects={Infinity}
+          // Only the hub's focused pane may own the keyboard. Every project
+          // tab stays mounted under `hidden`; unrestricted auto-focus lets a
+          // background pane capture document.activeElement and blocks typing.
+          autoFocus={focused}
           onExit={(code) => {
             setExitCode(code);
             setPhase("exited");

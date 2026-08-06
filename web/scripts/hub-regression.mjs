@@ -71,7 +71,7 @@ async function login(page) {
       () => !window.location.pathname.startsWith("/setup"),
       { timeout: 20_000 },
     );
-    // The form navigates to "/" (the IDE); the hub smoke runs from /hub.
+    // The form navigates to "/" (hub primary); smoke continues from /hub alias.
     return;
   }
 
@@ -102,7 +102,27 @@ try {
 
   // ── fresh hub state ───────────────────────────────────────────────────────
   await page.goto(`${BASE}/hub`, { waitUntil: "networkidle2" });
-  await page.evaluate(() => localStorage.removeItem("catcode:hub:v1"));
+  // Clear both the same-device cache AND the account layout store so the smoke
+  // starts from an empty hub (otherwise a prior run's server layout reappears).
+  await page.evaluate(async () => {
+    localStorage.removeItem("catcode:hub:v1");
+    const empty = {
+      version: 1,
+      tabPaths: [],
+      names: {},
+      layouts: {},
+      active: null,
+      focused: {},
+      gitOpen: true,
+      gitWidth: 320,
+    };
+    await fetch("/api/hub/layout", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(empty),
+      credentials: "same-origin",
+    });
+  });
   await page.reload({ waitUntil: "networkidle2" });
   await page.waitForFunction(
     () =>

@@ -22,7 +22,7 @@ import { join, resolve, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { getSession } from "@/lib/auth";
-import { getBridge } from "@/server/core-bridge";
+import { touchProject } from "@/lib/projects";
 import { validateProjectName, validateCloneUrl, nameFromUrl, isUnderHome } from "@/lib/project-validate";
 
 export const dynamic = "force-dynamic";
@@ -81,8 +81,6 @@ export async function POST(req: Request) {
   }
 
   const action = typeof body.action === "string" ? body.action : "";
-  const bridge = getBridge();
-
   try {
     if (action === "create") {
       const name = validateProjectName(typeof body.name === "string" ? body.name : "");
@@ -127,7 +125,7 @@ export async function POST(req: Request) {
         }
       }
 
-      bridge.addProject(projectAbs);
+      touchProject(projectAbs);
       return Response.json({ ok: true, path: projectAbs, name });
     }
 
@@ -168,7 +166,7 @@ export async function POST(req: Request) {
         return Response.json({ error: `clone failed: ${msg}` }, { status: 502 });
       }
 
-      bridge.addProject(projectAbs);
+      touchProject(projectAbs);
       return Response.json({ ok: true, path: projectAbs, name: folderName });
     }
 

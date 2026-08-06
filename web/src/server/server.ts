@@ -21,8 +21,8 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { getSession } from "../lib/auth";
 import { loadProjects } from "../lib/projects";
 import { terminalSessionKey } from "../lib/terminal-protocol";
-import { getBridge } from "./core-bridge";
 import { CATCODE_NOT_FOUND_ERROR, resolveCatcodeBinary } from "./catcode-launch";
+import { getDefaultWorkspace } from "./default-workspace";
 
 const dev = process.env.NODE_ENV !== "production";
 const port = Number(process.env.PORT) || 3000;
@@ -120,7 +120,7 @@ function clampDimension(value: number | undefined, fallback: number, max: number
 
 /** Resolve a client workspace root to an allowlisted project path. */
 function authorizedWorkspace(candidate: string | undefined): string {
-  const fallback = getBridge().getDefaultWorkspace();
+  const fallback = getDefaultWorkspace();
   if (!candidate || typeof candidate !== "string") return fallback;
   const requested = resolve(candidate);
   const allowed = [fallback, ...loadProjects().map((project) => project.path)].map((workspace) =>

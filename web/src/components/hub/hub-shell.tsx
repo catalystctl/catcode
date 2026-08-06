@@ -1,10 +1,10 @@
 "use client";
 
-// The /hub shell — a project-centric terminal workspace:
+// The hub shell — a project-centric terminal workspace:
 //
 //   • PROJECT TABS across the top. Add projects by browsing the machine
-//     (reuses the IDE's ProjectSwitcher → /api/browse), or create/clone them.
-//   • GIT SIDEBAR (collapsible, resizable) — the IDE's full GitPanel bound
+//     (ProjectSwitcher → /api/browse), or create/clone them.
+//   • GIT SIDEBAR (collapsible, resizable) — full GitPanel bound
 //     to the active project via an IdeContext shim (see ./git-sidebar.tsx).
 //   • SPLIT TERMINAL GRID — every pane is a persistent PTY that auto-runs
 //     `catcode` in the project root. Split right/down per pane, or apply a
@@ -12,10 +12,10 @@
 //   • Tab-switching KEEPS every project mounted (display:none) so terminals
 //     never detach; PTYs are server-persistent anyway (see server.ts).
 //
-// Pane ids double as server-side terminal session ids, so a refresh reattaches
-// every running catcode (scrollback replayed by the WS endpoint).
+// Pane ids double as server-side terminal session ids, so a refresh — or a
+// second signed-in device loading the account layout — reattaches every
+// running catcode (scrollback replayed by the WS endpoint).
 
-import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrandMark,
@@ -53,13 +53,38 @@ import { HubPane } from "./pane";
 import { SplitView } from "./split-view";
 import {
   defaultHubState,
-  loadHubState,
+  fetchHubLayout,
   newPaneId,
   pathBasename,
-  saveHubState,
+  pushHubLayout,
+  sanitizeHubState,
+  writeLocalHubCache,
   type HubPersistState,
 } from "./hub-state";
 import { terminateTerminalSession } from "@/components/ide/terminal";
+
+/** Debounce for account-store writes (split/resize fires often). */
+const HUB_SAVE_DEBOUNCE_MS = 400;
+/** Poll so a second signed-in device picks up layout changes while open. */
+const HUB_SYNC_POLL_MS = 4_000;
+
+
+/** Ensure every open tab with a layout has a focused leaf id that still exists. */
+function ensureFocusedPanes(state: HubPersistState): HubPersistState {
+  const focused = { ...state.focused };
+  let changed = false;
+  for (const path of state.tabPaths) {
+    const layout = state.layouts[path];
+    if (!layout) continue;
+    const ids = leafIds(layout);
+    if (ids.length === 0) continue;
+    if (!focused[path] || !ids.includes(focused[path])) {
+      focused[path] = firstLeafId(layout);
+      changed = true;
+    }
+  }
+  return changed ? { ...state, focused } : state;
+}
 
 export function HubShell() {
   // ── state ─────────────────────────────────────────────────────────────────
@@ -78,17 +103,118 @@ export function HubShell() {
   const gitResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const isMobile = useIsMobile();
   const menuRef = useOutsideClose(() => setMenuOpen(false), menuOpen);
+  // Account-store sync bookkeeping: updatedAt is last known server write;
+  // skipNextSaveRef suppresses the push that would echo a remote apply.
+  const layoutUpdatedAtRef = useRef(0);
+  const skipNextSaveRef = useRef(false);
+  const hubRef = useRef(hub);
+  hubRef.current = hub;
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Restore persisted tabs/layouts after hydration (server render is a splash).
+  // Load the account layout (server is source of truth; localStorage is a
+  // same-device cache + one-shot migration for pre-sync installs).
   useEffect(() => {
-    setHub(loadHubState());
-    setHydrated(true);
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await fetchHubLayout();
+        if (cancelled) return;
+        layoutUpdatedAtRef.current = result.updatedAt;
+        skipNextSaveRef.current = true;
+        setHub(ensureFocusedPanes(result.layout));
+      } finally {
+        if (!cancelled) setHydrated(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Persist on every change (post-hydration only).
+  // Debounced push to the account store on every local change.
   useEffect(() => {
-    if (hydrated) saveHubState(hub);
+    if (!hydrated) return;
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      const snapshot = hubRef.current;
+      void pushHubLayout(snapshot).then((r) => {
+        if (r.updatedAt > 0) layoutUpdatedAtRef.current = r.updatedAt;
+      });
+    }, HUB_SAVE_DEBOUNCE_MS);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, [hub, hydrated]);
+
+  // Multi-device live sync: poll the account store and adopt a newer layout
+  // written by another signed-in client (last-write-wins).
+  useEffect(() => {
+    if (!hydrated) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/hub/layout", { cache: "no-store" });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { layout?: unknown; updatedAt?: number };
+        const remoteAt = typeof data.updatedAt === "number" ? data.updatedAt : 0;
+        if (remoteAt <= layoutUpdatedAtRef.current) return;
+        // Another device wrote a newer layout — adopt it and reattach panes.
+        const layout = sanitizeHubState(data.layout);
+        layoutUpdatedAtRef.current = remoteAt;
+        const normalized = ensureFocusedPanes(layout);
+        writeLocalHubCache(normalized);
+        skipNextSaveRef.current = true;
+        setHub(normalized);
+      } catch {
+        /* offline / transient — next poll retries */
+      }
+    };
+    const id = setInterval(() => void tick(), HUB_SYNC_POLL_MS);
+    // Also re-check when the tab becomes visible again (phone unlock, tab focus).
+    const onVis = () => {
+      if (document.visibilityState === "visible") void tick();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [hydrated]);
+
+  // Flush the latest layout on hard close / navigation so other devices see it.
+  useEffect(() => {
+    if (!hydrated) return;
+    const flush = () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      const snapshot = hubRef.current;
+      writeLocalHubCache(snapshot);
+      // keepalive lets the PUT complete after the document unloads. sendBeacon
+      // always POSTs, so we use fetch+keepalive with the same PUT the rest of
+      // the shell uses.
+      try {
+        void fetch("/api/hub/layout", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(snapshot),
+          keepalive: true,
+          credentials: "same-origin",
+        });
+      } catch {
+        /* best-effort */
+      }
+    };
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
+  }, [hydrated]);
 
   // Load the project registry once (feeds the switcher's Recent list).
   useEffect(() => {
@@ -142,12 +268,18 @@ export function HubShell() {
         const tabPaths = prev.tabPaths.includes(abs)
           ? prev.tabPaths
           : [...prev.tabPaths, abs];
+        const layout = prev.layouts[abs] ?? leafNode(newPaneId());
+        const focusId =
+          (prev.focused[abs] && leafIds(layout).includes(prev.focused[abs])
+            ? prev.focused[abs]
+            : firstLeafId(layout));
         return {
           ...prev,
           tabPaths,
           active: abs,
           names: { ...prev.names, [abs]: name ?? prev.names[abs] ?? pathBasename(abs) },
-          layouts: { ...prev.layouts, [abs]: prev.layouts[abs] ?? leafNode(newPaneId()) },
+          layouts: { ...prev.layouts, [abs]: layout },
+          focused: { ...prev.focused, [abs]: focusId },
         };
       });
     } finally {
@@ -356,11 +488,18 @@ export function HubShell() {
   // ── account menu: sign-out intentionally NEVER terminates PTYs ────────────
   // Server-side terminals are owned by the user's session map, not by the
   // browser connection: closing the page, signing out, or losing the network
-  // all leave them running. Signing back in restores the layout (localStorage)
-  // and every pane reattaches to its still-running catcode.
+  // all leave them running. Signing back in (on ANY device) restores the
+  // account layout from /api/hub/layout and every pane reattaches to its
+  // still-running catcode.
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
     try {
+      // Flush any pending debounced layout write before dropping the session.
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      await pushHubLayout(hubRef.current);
       await signOut();
     } finally {
       window.location.href = "/login";
@@ -539,13 +678,6 @@ export function HubShell() {
               aria-label="Account"
               className="absolute right-0 top-full z-[75] mt-1 w-48 rounded-lg border border-ink-700 bg-ink-925 p-1 shadow-elev-2 animate-fade-in"
             >
-              <Link
-                href="/"
-                role="menuitem"
-                className="block rounded-md px-2.5 py-1.5 text-[12px] text-ink-200 hover:bg-ink-850 hover:text-ink-100"
-              >
-                Open IDE
-              </Link>
               <button
                 type="button"
                 role="menuitem"
@@ -597,7 +729,11 @@ export function HubShell() {
                   <HubPane
                     paneId={leafId}
                     workspace={path}
-                    focused={path === activePath && (hub.focused[path] ?? "") === leafId}
+                    focused={
+                      path === activePath &&
+                      (hub.focused[path] ??
+                        (hub.layouts[path] ? firstLeafId(hub.layouts[path]) : "")) === leafId
+                    }
                     onFocus={() => (path === activePath ? focusPane(leafId) : undefined)}
                     onSplitRight={() => splitPane(leafId, "h")}
                     onSplitDown={() => splitPane(leafId, "v")}

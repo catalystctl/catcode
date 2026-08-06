@@ -106,23 +106,23 @@ const runtime = await createAgentSessionRuntime(factory, { cwd, agentDir });
 await runtime.session.prompt("explain this repo");
 ```
 
-### `web/` — Next.js frontend
+### `web/` — Hub frontend
 
-A browser equivalent of the TUI. The Next.js server spawns one `catcode-core`
-process via the SDK and streams events to the browser over SSE (Server-Sent
-Events). Fully prebuilt — no `next build` on the host.
+A project-centric terminal workspace in the browser. The Next.js server hosts
+persistent zigpty sessions that auto-launch the `catcode` TUI per pane, plus
+git/browse/project APIs. Fully prebuilt — no `next build` on the host. The
+former IDE shell and chat-only SSE bridge have been removed.
 
-[Source: `web/`](../web) · [`web/README.md`](../web/README.md)
+[Source: `web/`](../web) · [`web/README.md`](../web/README.md) · [`hub-frontend.md`](hub-frontend.md)
 
 ```
-Browser ──SSE──▶ /api/stream ──▶ HarnessBridge ──stdio JSONL──▶ catcode-core
-Browser ──POST─▶ /api/command ──▶ HarnessBridge ──────── (stdin)
+Browser ──WS───▶ /api/terminal ──▶ zigpty ──▶ catcode (per pane)
+Browser ──HTTP─▶ /api/git|/api/browse|/api/hub/projects ──▶ workspace FS
 ```
 
-- Streaming markdown with reasoning, tool calls, approvals, metrics
-- Session management and checkpoint restore
-- IDE panels (file explorer, editor, terminal, git, preview)
-- Contract: [`IDE_PANELS_CONTRACT.md`](IDE_PANELS_CONTRACT.md)
+- Project tabs with split terminal grids (presets up to 4×4)
+- Git sidebar (status, history, branches, stashes, remotes)
+- Server-side PTY persistence across refresh / sign-out
 
 ---
 
@@ -351,7 +351,7 @@ source](../core/src/checkpoint.rs)
 
 ```
 core/        Rust async engine (stdio JSONL)   tui/   Go + Bubble Tea terminal UI
-sdk/         TypeScript pi-compatible wrapper   web/   Next.js web frontend (SSE bridge)
+sdk/         TypeScript pi-compatible wrapper   web/   Next.js hub frontend (terminal workspace)
 packaging/   per-platform install scripts       .catalyst-code/   bundled agents, plugins, skills
 ```
 
@@ -432,14 +432,14 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 | Document | Scope |
 |----------|-------|
 | [`SELF_LEARNING.md`](SELF_LEARNING.md) | Self-learning layer design & implementation |
-| [`IDE_PANELS_CONTRACT.md`](IDE_PANELS_CONTRACT.md) | Web IDE panels integration contract |
+| [`hub-frontend.md`](hub-frontend.md) | Hub terminal workspace architecture |
 | [`tui-perf-surface.md`](tui-perf-surface.md) | TUI performance surface map |
 | [`PLUGINS.md`](PLUGINS.md) | Plugin authoring contract entry point |
 | [`examples/plugins/README.md`](examples/plugins/README.md) | Example plugin catalog |
 | [`core/src/`](../core/src) | Full core source (flat modules) |
 | `tui/` | TUI Go source |
 | `sdk/` | TypeScript SDK source |
-| `web/` | Next.js web frontend source |
+| `web/` | Next.js hub frontend source |
 
 > **Stability:** The wire protocol is stable. Core modules documented in
 > `core/src/` are internal — use the protocol and plugin system for extension.

@@ -1,7 +1,5 @@
 // Shared, framework-agnostic helpers for mapping file paths to editor language
-// ids and extracting basenames. Deliberately plain (no "use client", no React)
-// so it is safe to import from both client components and Node route handlers.
-// Used by use-ide.ts (openFile) and api/file/route.ts (GET language field).
+// ids. Safe to import from both client components and Node route handlers.
 
 /** Detect an editor language id from a file path's extension. */
 export function detectLanguage(path: string): string | undefined {
@@ -38,13 +36,28 @@ export function detectLanguage(path: string): string | undefined {
       return "yaml";
     case "sql":
       return "sql";
+    case "go":
+      return "go";
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "shell";
+    case "toml":
+      return "toml";
+    case "xml":
+      return "xml";
+    case "svg":
+      return "xml";
+    case "txt":
+    case "log":
+      return "plaintext";
     default:
       return undefined;
   }
 }
 
-/** Basename of a workspace-relative or absolute path (forward or back slashes). */
+/** Just the basename of a path (forward- or backslash-separated). */
 export function basename(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? path;
+  const parts = path.replace(/\\/g, "/").split("/");
+  return parts[parts.length - 1] || path;
 }

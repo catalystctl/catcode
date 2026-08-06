@@ -99,6 +99,11 @@ export interface TerminalProps {
    *  and a genuinely gone PTY answers "missing" to the attach-only open and
    *  surfaces via onUnavailable regardless of the budget. */
   maxReconnects?: number;
+  /** When true (default), grab keyboard focus after open. The hub keeps many
+   *  panes mounted (including under `display:none`) and passes `focused` so
+   *  only the active pane steals focus — otherwise a hidden terminal can own
+   *  document.activeElement and keystrokes never reach the visible catcode. */
+  autoFocus?: boolean;
 }
 
 /**
@@ -106,11 +111,25 @@ export interface TerminalProps {
  * mount, sends {type:"open",sessionId,cwd,cols,rows}, pipes data ↔ Ghostty, and
  * reports the shell exit via onExit. Disposes cleanly on unmount.
  */
-export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, clearSeq, launch, maxReconnects }: TerminalProps) {
+export function Terminal({
+  sessionId,
+  workspace,
+  cwd,
+  onExit,
+  onUnavailable,
+  clearSeq,
+  launch,
+  maxReconnects,
+  autoFocus = true,
+}: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
+  const fitRef = useRef<{ fit: () => void } | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>("initializing");
+  const [termReady, setTermReady] = useState(false);
   const lastClearSeq = useRef(clearSeq ?? 0);
+  const autoFocusRef = useRef(autoFocus);
+  autoFocusRef.current = autoFocus;
 
   // Keep latest values in refs so the effect only re-runs when the session id
   // changes (one renderer + WS attachment per session), not on parent renders.
@@ -162,13 +181,27 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
       const fit = new ghostty.FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
+      fitRef.current = fit;
       try {
         fit.fit();
       } catch {
         /* container not sized yet */
       }
       termRef.current = term;
-      term.focus();
+      setTermReady(true);
+      // Only auto-focus when this pane is supposed to own the keyboard. Hub
+      // mounts every project tab at once; focusing a hidden pane makes the
+      // visible one appear dead to typing.
+      if (autoFocusRef.current) {
+        try {
+          term.focus();
+          // Ghostty's InputHandler listens on the container, but canvas clicks
+          // move focus to the hidden textarea — keep both in sync.
+          term.textarea?.focus?.();
+        } catch {
+          /* ignore */
+        }
+      }
 
       const connect = (attachOnly: boolean) => {
         if (disposed || ended || !term) return;
@@ -311,6 +344,8 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
         /* ignore */
       }
       termRef.current = null;
+      fitRef.current = null;
+      setTermReady(false);
     };
   }, [sessionId]);
 
@@ -326,8 +361,56 @@ export function Terminal({ sessionId, workspace, cwd, onExit, onUnavailable, cle
     }
   }, [clearSeq]);
 
+  // Take / release keyboard focus when the hub marks this pane active, and
+  // re-fit after becoming visible (FitAddon often measures 0×0 under `hidden`).
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    if (autoFocus) {
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* container may still be settling */
+      }
+      try {
+        term.focus();
+        term.textarea?.focus?.();
+      } catch {
+        /* ignore */
+      }
+      // Second pass after layout (tab un-hide / split resize) so cols/rows match.
+      const t = window.setTimeout(() => {
+        try {
+          fitRef.current?.fit();
+          term.focus();
+          term.textarea?.focus?.();
+        } catch {
+          /* ignore */
+        }
+      }, 50);
+      return () => window.clearTimeout(t);
+    }
+    try {
+      term.blur?.();
+    } catch {
+      /* ignore */
+    }
+  }, [autoFocus, termReady]);
+
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#080a0f]">
+    <div
+      className="relative h-full w-full overflow-hidden bg-[#080a0f]"
+      onPointerDownCapture={() => {
+        // Clicking the terminal surface must own the keyboard even if a sibling
+        // pane or a previously focused hidden tab still held document focus.
+        try {
+          termRef.current?.focus();
+          termRef.current?.textarea?.focus?.();
+        } catch {
+          /* ignore */
+        }
+      }}
+    >
       <div ref={containerRef} className="h-full w-full" />
       {connectionState !== "connected" ? (
         <div

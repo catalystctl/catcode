@@ -16,7 +16,7 @@ import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { getSession } from "@/lib/auth";
 import { loadProjects, removeProject, touchProject } from "@/lib/projects";
-import { getBridge } from "@/server/core-bridge";
+import { getDefaultWorkspace } from "@/server/default-workspace";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -26,7 +26,7 @@ export async function GET(req: Request) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   return Response.json({
     projects: loadProjects(),
-    defaultWorkspace: getBridge().getDefaultWorkspace(),
+    defaultWorkspace: getDefaultWorkspace(),
   });
 }
 

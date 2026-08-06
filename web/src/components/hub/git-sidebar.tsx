@@ -1,18 +1,15 @@
 "use client";
 
-// The hub's git sidebar wraps the IDE's full GitPanel (changes, history,
-// branches, stashes, repository — every /api/git action) in a minimal
-// IdeContext shim. GitPanel's editor-bound actions (openDiff/openPatch/
-// openFile) are redirected to an in-hub viewer modal instead of Monaco, so
-// the hub never loads the IDE's editor stack.
+// The hub's git sidebar wraps GitPanel (changes, history, branches, stashes,
+// remotes — every /api/git action) in a minimal IdeContext shim. openDiff /
+// openPatch / openFile open an in-hub viewer modal instead of an editor.
 
 import { useCallback, useEffect, useState } from "react";
 import { Diff } from "@/components/diff";
 import { GitPanel } from "@/components/ide/git-panel";
 import { XIcon } from "@/components/icons";
-import { IdeContext, type IdeContextValue } from "@/lib/ide-context";
+import { IdeContext, type IdeApi, type IdeContextValue } from "@/lib/ide-context";
 import type { GitStatus } from "@/lib/types";
-import type { IdeApi } from "@/lib/use-ide";
 
 type ViewerState =
   | { kind: "none" }
@@ -111,22 +108,20 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
   // Minimal IdeApi shim — GitPanel consumes exactly: state.gitStatus,
   // setGitStatus, openDiff, openPatch, openFile, selectEditor. Everything
   // else is an inert no-op (the hub has no editor/tabs/docks).
-  const ide = {
+  const ide: IdeApi = {
     state: { gitStatus },
     setGitStatus,
     openDiff,
     openPatch,
     openFile,
     selectEditor: () => {},
-  } as unknown as IdeApi;
+  };
 
   const contextValue: IdeContextValue = {
     workspace,
     ide,
     openSettings: () => {},
     openProjects: () => {},
-    attachToChat: () => {},
-    registerAttachToChat: () => {},
   };
 
   return (

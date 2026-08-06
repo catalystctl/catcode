@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Update, validate, build, and restart the in-repo Catalyst Code web service.
+# Deploys the hub terminal workspace (primary UI at / and alias /hub).
 set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,15 +12,21 @@ if [[ -z "$BUN" && -x "${HOME}/.bun/bin/bun" ]]; then
 fi
 NODE="${NODE:-$(command -v node 2>/dev/null || true)}"
 PUBLIC_ORIGIN="${CATCODE_WEB_ORIGIN:-https://cc.karutoil.site}"
+LOCAL_BASE="${AUDIT_BASE:-http://127.0.0.1:49283}"
 PULL=1
 RUN_TESTS=1
+HUB_E2E=0
 
 usage() {
   cat <<'EOF'
-Usage: ./update-web.sh [--no-pull] [--skip-tests]
+Usage: ./update-web.sh [--no-pull] [--skip-tests] [--hub-e2e]
 
   --no-pull     Deploy the current checkout without fetching/pulling Git.
   --skip-tests  Skip type checks and web tests (build checks still run).
+  --hub-e2e     After the service is healthy, run the authenticated /hub
+                browser regression (web/scripts/hub-regression.mjs) against
+                the deployed service. Needs AUDIT_EMAIL/AUDIT_PASSWORD in the
+                environment or web/.env.local, and puppeteer's browser.
 
 Local changes are never overwritten. If tracked files have local changes, the
 script skips the pull automatically and deploys the current checkout.
@@ -30,6 +37,7 @@ while (($#)); do
   case "$1" in
     --no-pull) PULL=0 ;;
     --skip-tests) RUN_TESTS=0 ;;
+    --hub-e2e) HUB_E2E=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -114,14 +122,34 @@ fi
 SERVICE_STOPPED=1
 "${SYSTEMCTL[@]}" start "$SERVICE"
 
+health_ok() {
+  "${SYSTEMCTL[@]}" is-active --quiet "$SERVICE" || return 1
+  # Hub is auth-gated: unauthenticated it redirects (307/308) to /login.
+  # Either the shell (200) or the redirect proves the route built. Check both
+  # / (primary) and /hub (alias) so a broken root entry fails health.
+  local root_code hub_code
+  root_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "$LOCAL_BASE/" || true)"
+  hub_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "$LOCAL_BASE/hub" || true)"
+  [[ "$root_code" == 200 || "$root_code" == 307 || "$root_code" == 308 ]] || return 1
+  [[ "$hub_code" == 200 || "$hub_code" == 307 || "$hub_code" == 308 ]]
+}
+
 for attempt in {1..20}; do
-  if "${SYSTEMCTL[@]}" is-active --quiet "$SERVICE" && curl --silent --show-error --fail --output /dev/null http://127.0.0.1:49283/; then
+  if health_ok; then
     SERVICE_STOPPED=0
     if [[ -n "$BACKUP" && -d "$BACKUP" ]]; then
       rm -rf "$BACKUP"
     fi
     trap - EXIT
-    echo "==> Update complete: http://127.0.0.1:49283"
+    if ((HUB_E2E)); then
+      echo "==> Running hub browser regression against $LOCAL_BASE"
+      if [[ -z "${AUDIT_EMAIL:-}" && ! -f web/.env.local ]]; then
+        echo "--hub-e2e: no AUDIT_EMAIL/AUDIT_PASSWORD env and no web/.env.local; skipping" >&2
+      else
+        (cd web && AUDIT_BASE="$LOCAL_BASE" "$NODE" scripts/hub-regression.mjs)
+      fi
+    fi
+    echo "==> Update complete: $LOCAL_BASE (hub: $LOCAL_BASE/hub)"
     exit 0
   fi
   sleep 1

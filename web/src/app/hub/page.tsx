@@ -1,7 +1,6 @@
-// /hub — the project-centric terminal workspace (alternative to the IDE at /).
-// Auth-gated exactly like the main page: no account → setup, no session →
-// login. The shell itself is client-rendered (project tabs + terminal grid +
-// git sidebar); the server render is just a hydration splash.
+// /hub — permanent alias of the hub frontend (now also at /).
+// Kept so bookmarks, update-web.sh health checks, and e2e scripts that hit
+// /hub keep working without a breaking URL change.
 
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
