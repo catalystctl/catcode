@@ -403,8 +403,8 @@ print_banner() {
   local mode="download (prebuilt)"
   $BUILD_FROM_SOURCE && mode="build-from-source"
   print_box "Catalyst Code  —  installer v${VERSION_DETECTED}" \
-    "TUI (catcode) + core (catcode-core) -> PATH" \
-    "optional 24/7 web service (Next.js, prebuilt)" \
+    "TUI (catcode, core embedded) -> PATH" \
+    "optional web service (+ catcode-core) via --with-web" \
     "scope: system-wide   |   platform: ${PLATFORM} (${SVC_MGR})"
   printf "  ${C_DIM}mode: %s   |   dry-run: %s${C_RST}\n\n" "$mode" "$DRY_RUN"
 }
@@ -1557,6 +1557,17 @@ do_status() {
 summary_install() {
   local web_line="(not installed — run with --with-web)"
   local svc_line=""
+  local core_line
+  # Download CLI-only ships an embed_core TUI (extracts core to ~/.cache on
+  # first run). A separate catcode-core on PATH is only installed with --with-web
+  # (web service needs CATCODE_CORE) or --build-from-source. Do not probe
+  # $PREFIX for an existing binary — a leftover from a prior --with-web
+  # install would make a CLI-only summary lie about what this run installed.
+  if $WITH_WEB || $BUILD_FROM_SOURCE; then
+    core_line="core:      $PREFIX/catcode-core"
+  else
+    core_line="core:      embedded in TUI (extracted on first run)"
+  fi
   if $WITH_WEB; then
     local svc_id="$UNIT_NAME"
     [[ "$PLATFORM" == "Darwin" ]] && svc_id="$LAUNCHD_LABEL (launchd)"
@@ -1570,16 +1581,22 @@ summary_install() {
   fi
   local expose_line=""
   $WITH_WEB && expose_line="expose:    ${EXPOSE_MODE}  origin: ${ORIGIN:-<auto>}"
-  print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" \
-    "tui:       $PREFIX/catcode" \
-    "core:      $PREFIX/catcode-core" \
-    "web:       $web_line" \
-    "$expose_line" \
-    "$svc_line" \
-
-    "update:    catcode --update  (or bash install.sh --update)" \
-    "uninstall: bash install.sh --uninstall" \
+  # Build the box line list without empty entries or a blank line after `\`
+  # (a bare newline mid-continuation makes bash try to execute the next
+  # string as a command — set -e then aborts the installer after success).
+  local box_lines=(
+    "tui:       $PREFIX/catcode"
+    "$core_line"
+    "web:       $web_line"
+  )
+  [[ -n "$expose_line" ]] && box_lines+=("$expose_line")
+  [[ -n "$svc_line" ]] && box_lines+=("$svc_line")
+  box_lines+=(
+    "update:    catcode --update  (or bash install.sh --update)"
+    "uninstall: bash install.sh --uninstall"
     "log:       ${LOG_FILE:-<disabled>}"
+  )
+  print_box "✓  Installed  ${APP_NAME}  v${VERSION_DETECTED}" "${box_lines[@]}"
   log_info "Run the TUI with:  catcode"
   if $WITH_WEB && ! $SKIP_SERVICE; then
     if [[ "$PLATFORM" == "Darwin" ]]; then
@@ -1601,12 +1618,20 @@ summary_update() {
   [[ "${WEB_INSTALLED:-no}" == yes ]] && web_line="http://${HOST}:${PORT}  (restarted)"
   local expose_line=""
   [[ "${WEB_INSTALLED:-no}" == yes ]] && expose_line="expose: ${EXPOSE_MODE}  origin: ${ORIGIN:-<auto>}"
-  print_box "✓  Updated  ${APP_NAME}  v${VERSION_DETECTED}" \
-    "tui:    $PREFIX/catcode" \
-    "core:   $PREFIX/catcode-core" \
-    "web:    $web_line" \
-    "$expose_line" \
-    "source: ${METHOD:-download} @ ${BASE_URL:-${REPO_DIR:-<unknown>}}"
+  local core_line
+  if [[ "${WEB_INSTALLED:-no}" == yes ]] || $BUILD_FROM_SOURCE || $WITH_WEB; then
+    core_line="core:   $PREFIX/catcode-core"
+  else
+    core_line="core:   embedded in TUI (extracted on first run)"
+  fi
+  local box_lines=(
+    "tui:    $PREFIX/catcode"
+    "$core_line"
+    "web:    $web_line"
+  )
+  [[ -n "$expose_line" ]] && box_lines+=("$expose_line")
+  box_lines+=("source: ${METHOD:-download} @ ${BASE_URL:-${REPO_DIR:-<unknown>}}")
+  print_box "✓  Updated  ${APP_NAME}  v${VERSION_DETECTED}" "${box_lines[@]}"
   log_info "Run the TUI with:  catcode"
 }
 

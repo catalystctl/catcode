@@ -30,6 +30,8 @@ interface Props {
   provider: string;
   models: ModelInfo[];
   selectedModel: string | null;
+  /** True while an on-demand model-list refresh is in flight. */
+  modelsRefreshing?: boolean;
   thinkingLevel: string;
   approvalMode: string;
   metrics: Metrics | null;
@@ -45,6 +47,8 @@ interface Props {
   theme?: string;
   onMenuClick?: () => void;
   onSelectModel: (id: string) => void;
+  /** Force-refresh multi-provider model cache. */
+  onRefreshModels?: () => void;
   onSelectThinking: (level: string) => void;
   onSetApproval: (mode: "never" | "destructive" | "always") => void;
   onReconnect?: () => void;
@@ -151,6 +155,8 @@ export function Header(props: Props) {
               onSelect={props.onSelectModel}
               variant="popover"
               onClose={() => setModelOpen(false)}
+              onRefresh={props.onRefreshModels}
+              refreshing={props.modelsRefreshing}
             />
           </div>
         )}

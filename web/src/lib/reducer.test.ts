@@ -765,6 +765,23 @@ describe("models rebinds selectedModel", () => {
   });
 });
 
+describe("models_refreshed", () => {
+  test("clears modelsRefreshing and toasts the count", () => {
+    let s = reduce(initialState, {
+      type: "_set_models_refreshing",
+      refreshing: true,
+    });
+    expect(s.modelsRefreshing).toBe(true);
+    s = reduce(s, {
+      type: "models_refreshed",
+      count: 3,
+      providers: { umans: ["a", "b", "c"] },
+    });
+    expect(s.modelsRefreshing).toBe(false);
+    expect(s.toasts.some((t) => t.message.includes("3 models"))).toBe(true);
+  });
+});
+
 describe("history tokens_in", () => {
   test("history with tokens_in seeds stats", () => {
     const s = reduce(initialState, {

@@ -621,6 +621,12 @@ export interface GoalPlan {
 export type CoreEvent =
   | ReadyPayload
   | { type: "models"; models: ModelInfo[] }
+  /** Terminal event for `refresh_models` (after the `models` re-emit). */
+  | {
+      type: "models_refreshed";
+      count?: number;
+      providers?: Record<string, string[]>;
+    }
   | { type: "provider_presets"; presets: ProviderPreset[] }
   | { type: "provider_models_preview"; models: ModelInfo[]; base_url: string; error?: string }
   | { type: "authed"; ok: boolean; provider: string }
@@ -862,6 +868,7 @@ export type CoreCommand =
   | { type: "set_search_key"; provider: string; api_key: string }
   | { type: "set_provider"; name: string }
   | { type: "list_provider_presets" }
+  | { type: "refresh_models" }
   | { type: "login"; preset: string; api_key?: string }
   | {
       type: "add_custom_provider";
@@ -978,6 +985,8 @@ export type SyntheticEvent =
   | { type: "_goal_approve_optimistic" }
   | { type: "_clear_provider_models_preview" }
   | { type: "_set_provider_models_preview_error"; error: string | null }
+  /** Optimistic: an on-demand `refresh_models` is in flight. */
+  | { type: "_set_models_refreshing"; refreshing: boolean }
   // Cross-session notification feed (client-only; derived in useAgent from
   // LiveSessionStatus transitions, never dispatched server-side).
   | { type: "_add_notifications"; items: NotificationItem[] }
@@ -1127,6 +1136,8 @@ export interface AgentState {
    * hard failure). Cleared on a successful non-empty preview or on modal close. */
   providerModelsPreviewError: string | null;
   selectedModel: string | null;
+  /** True while an on-demand `refresh_models` is in flight (optimistic UI). */
+  modelsRefreshing: boolean;
   thinkingLevel: string;
   messages: UIMessage[];
   currentAssistantId: string | null;

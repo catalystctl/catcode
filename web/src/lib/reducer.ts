@@ -58,6 +58,7 @@ export const initialState: AgentState = {
   providerModelsPreview: null,
   providerModelsPreviewError: null,
   selectedModel: null,
+  modelsRefreshing: false,
   thinkingLevel: "medium",
   messages: [],
   currentAssistantId: null,
@@ -658,6 +659,8 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       return { ...state, providerModelsPreview: null, providerModelsPreviewError: null };
     case "_set_provider_models_preview_error":
       return { ...state, providerModelsPreviewError: ev.error };
+    case "_set_models_refreshing":
+      return { ...state, modelsRefreshing: ev.refreshing };
     case "_add_notifications": {
       // Client-only: append feed items emitted by useAgent's liveSessions diff.
       // Dedup per session+kind: refresh (bump ts) an existing UNREAD item for
@@ -795,6 +798,23 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ...state,
         models,
         selectedModel: stillValid ? state.selectedModel : models[0]?.id ?? null,
+      };
+    }
+    case "models_refreshed": {
+      // Terminal event for `refresh_models` (core already re-emitted `models`).
+      // Clear any optimistic spinner and confirm the count — parity with TUI.
+      const count =
+        typeof (ev as { count?: unknown }).count === "number"
+          ? (ev as { count: number }).count
+          : state.models.length;
+      return {
+        ...state,
+        modelsRefreshing: false,
+        toasts: pushToast(
+          state.toasts,
+          "info",
+          `Model list refreshed (${count} model${count === 1 ? "" : "s"})`,
+        ),
       };
     }
     case "provider_presets":
@@ -1439,6 +1459,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         goalIterations: [],
         subagentRuns: {},
         metrics: null,
+        modelsRefreshing: false,
       };
     case "session_renamed": {
       const sessions = state.sessions.map((s) =>
