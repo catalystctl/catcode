@@ -22,8 +22,8 @@
     "core/src/tools.rs": 2
   },
   "megamodules": {
-    "core/src/main.rs": 5500,
-    "core/src/provider.rs": 5400,
+    "core/src/main.rs": 5800,
+    "core/src/provider.rs": 5600,
     "core/src/tools.rs": 4400
   }
 }

@@ -91,17 +91,32 @@ impl SseDecoder {
         };
         let data = data.strip_prefix(' ').unwrap_or(data);
         if data == "[DONE]" {
+            // A bare [DONE] terminates the stream. Drop any incomplete data
+            // buffer — providers never intentionally end mid-JSON with DONE.
             self.data.clear();
             frames.push(SseFrame::Done);
             return;
         }
-        if self.data.len().saturating_add(data.len()) > self.max_event_bytes {
+        // SSE multi-line `data:` fields are joined with LF (HTML living
+        // standard). Skipping the separator corrupts pretty-printed JSON and
+        // any textual multi-line payloads.
+        let separator_len = if self.data.is_empty() { 0 } else { 1 };
+        if self
+            .data
+            .len()
+            .saturating_add(separator_len)
+            .saturating_add(data.len())
+            > self.max_event_bytes
+        {
             frames.push(SseFrame::Malformed {
                 event: self.event.clone(),
                 preview: "provider SSE event exceeded the configured size limit".into(),
             });
             self.data.clear();
             return;
+        }
+        if !self.data.is_empty() {
+            self.data.push('\n');
         }
         self.data.push_str(data);
         // Compatibility endpoints sometimes omit blank event boundaries. Emit
@@ -156,5 +171,42 @@ mod tests {
         assert!(
             matches!(&frames[0], SseFrame::Malformed { preview, .. } if preview.contains("size limit"))
         );
+    }
+
+    #[test]
+    fn joins_multiline_data_fields_with_lf() {
+        // Pretty-printed JSON split across `data:` lines must reassemble with
+        // newlines, matching the SSE spec — not bare concatenation.
+        let mut decoder = SseDecoder::default();
+        let frames = decoder.push(b"data: {\ndata: \"x\": 1\ndata: }\n\n");
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            SseFrame::Json { value, .. } if value["x"] == 1
+        ));
+    }
+
+    #[test]
+    fn has_pending_data_tracks_partial_lines_and_events() {
+        let mut decoder = SseDecoder::default();
+        assert!(!decoder.has_pending_data());
+        assert!(decoder.push(b"data: {\"x\":").is_empty());
+        assert!(decoder.has_pending_data());
+        // Complete the JSON + blank line → frame emitted, buffer clear.
+        let frames = decoder.push(b"1}\n\n");
+        assert!(matches!(&frames[0], SseFrame::Json { value, .. } if value["x"] == 1));
+        assert!(!decoder.has_pending_data());
+    }
+
+    #[test]
+    fn done_after_terminal_json_clears_without_pending() {
+        let mut decoder = SseDecoder::default();
+        let frames =
+            decoder.push(b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+        assert!(matches!(&frames[0], SseFrame::Json { .. }));
+        assert!(matches!(&frames[1], SseFrame::Done));
+        assert!(!decoder.has_pending_data());
+        // finish() must not invent extra frames after a clean DONE.
+        assert!(decoder.finish().is_empty());
     }
 }

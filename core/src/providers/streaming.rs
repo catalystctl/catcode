@@ -27,11 +27,157 @@ pub(crate) enum NormalizedStreamEvent {
     FatalError(String),
 }
 
+/// Read a token count from a usage field, tolerating integer, float, and
+/// string encodings different OpenAI-compatible servers emit.
 fn token_count(value: &Value) -> Option<u64> {
     value
         .as_u64()
-        .or_else(|| value.as_f64().map(|number| number as u64))
-        .or_else(|| value.as_str()?.trim().parse().ok())
+        .or_else(|| value.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+        .or_else(|| {
+            value.as_f64().and_then(|number| {
+                if number.is_finite() && number >= 0.0 {
+                    Some(number as u64)
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            value
+                .as_str()?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .map(|number| number as u64)
+        })
+}
+
+/// Tool-call indices arrive as ints, floats (`1.0`), or quoted numbers on some
+/// gateways. Falling back to `0` silently merges parallel tool streams.
+fn tool_call_index(value: Option<&Value>) -> usize {
+    value
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+                .or_else(|| {
+                    v.as_f64().and_then(|number| {
+                        if number.is_finite() && number >= 0.0 {
+                            Some(number as u64)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| {
+                    v.as_str()?
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|number| number.is_finite() && *number >= 0.0)
+                        .map(|number| number as u64)
+                })
+        })
+        .unwrap_or(0) as usize
+}
+
+/// Some providers stream `function.arguments` as a JSON object/array instead of
+/// a string fragment. Convert those to a compact JSON string so the accumulator
+/// can still assemble a valid arguments payload.
+fn tool_call_arguments(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if value.is_null() {
+        return None;
+    }
+    // Object/array/number/bool — serialize so history stays API-valid JSON text.
+    Some(value.to_string())
+}
+
+fn usage_field(usage: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(token_count))
+}
+
+fn cached_tokens_from_usage(usage: &Value) -> Option<u64> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(token_count)
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(token_count)
+        })
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(token_count))
+        .or_else(|| usage.get("cached_tokens").and_then(token_count))
+}
+
+fn normalize_finish_reason(reason: &str) -> String {
+    match reason {
+        // Older OpenAI wire name; harness + Anthropic path use `tool_calls`.
+        "function_call" => "tool_calls".into(),
+        other => other.to_string(),
+    }
+}
+
+fn stream_error_detail(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| error.as_str().map(str::to_string))
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn is_retryable_stream_error(error: &Value, detail: &str) -> bool {
+    let code = error
+        .get("code")
+        .and_then(|code| {
+            code.as_str()
+                .map(str::to_string)
+                .or_else(|| code.as_i64().map(|n| n.to_string()))
+                .or_else(|| code.as_u64().map(|n| n.to_string()))
+        })
+        .unwrap_or_default();
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code_l = code.to_ascii_lowercase();
+    let kind_l = kind.to_ascii_lowercase();
+    let detail_l = detail.to_ascii_lowercase();
+
+    matches!(
+        code_l.as_str(),
+        "rate_limit"
+            | "rate_limit_exceeded"
+            | "server_error"
+            | "overloaded"
+            | "overloaded_error"
+            | "timeout"
+            | "429"
+            | "500"
+            | "502"
+            | "503"
+            | "504"
+    ) || matches!(
+        kind_l.as_str(),
+        "rate_limit"
+            | "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "server_error"
+            | "overloaded"
+            | "overloaded_error"
+            | "api_error"
+            | "timeout"
+    ) || detail_l.contains("rate limit")
+        || detail_l.contains("too many requests")
+        || detail_l.contains("overloaded")
+        || detail_l.contains("temporarily unavailable")
 }
 
 /// Normalize one parsed OpenAI-compatible SSE data object. Transport framing,
@@ -40,30 +186,23 @@ fn token_count(value: &Value) -> Option<u64> {
 pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> {
     let mut events = Vec::new();
     if let Some(error) = object.get("error") {
-        let detail = error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| error.to_string());
-        let retryable = error
-            .get("code")
-            .and_then(Value::as_str)
-            .is_some_and(|code| matches!(code, "rate_limit" | "server_error" | "overloaded"));
-        events.push(if retryable {
+        let detail = stream_error_detail(error);
+        events.push(if is_retryable_stream_error(error, &detail) {
             NormalizedStreamEvent::RetryableError(detail)
         } else {
             NormalizedStreamEvent::FatalError(detail)
         });
+        // Never treat an error frame as a successful text/tool completion, even
+        // when a partial `choices` payload is also present.
         return events;
     }
     if let Some(usage) = object.get("usage") {
+        // Accept both OpenAI (`prompt_tokens`/`completion_tokens`) and the
+        // Anthropic-ish aliases some OpenAI-compatible proxies emit.
         events.push(NormalizedStreamEvent::Usage {
-            input_tokens: usage.get("prompt_tokens").and_then(token_count),
-            output_tokens: usage.get("completion_tokens").and_then(token_count),
-            cached_tokens: usage
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(token_count),
+            input_tokens: usage_field(usage, &["prompt_tokens", "input_tokens"]),
+            output_tokens: usage_field(usage, &["completion_tokens", "output_tokens"]),
+            cached_tokens: cached_tokens_from_usage(usage),
         });
     }
     let Some(choice) = object.get("choices").and_then(|choices| choices.get(0)) else {
@@ -79,6 +218,7 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
         }
         if let Some(reasoning) = delta
             .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
@@ -88,7 +228,7 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
             events.extend(tool_calls.iter().map(|tool_call| {
                 let function = tool_call.get("function");
                 NormalizedStreamEvent::ToolCallDelta(ToolCallDelta {
-                    index: tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    index: tool_call_index(tool_call.get("index")),
                     id: tool_call
                         .get("id")
                         .and_then(Value::as_str)
@@ -97,10 +237,9 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
                         .and_then(|value| value.get("name"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    arguments: function
-                        .and_then(|value| value.get("arguments"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    arguments: tool_call_arguments(
+                        function.and_then(|value| value.get("arguments")),
+                    ),
                 })
             }));
         }
@@ -110,7 +249,9 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
         .and_then(Value::as_str)
         .filter(|reason| !reason.is_empty())
     {
-        events.push(NormalizedStreamEvent::FinishReason(reason.to_string()));
+        events.push(NormalizedStreamEvent::FinishReason(
+            normalize_finish_reason(reason),
+        ));
     }
     events
 }
@@ -118,6 +259,7 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn fixture(name: &str) -> Value {
         let text = match name {
@@ -167,6 +309,123 @@ mod tests {
         assert_eq!(
             decode_openai_chunk(&fixture("error")),
             vec![NormalizedStreamEvent::RetryableError("busy".into())]
+        );
+    }
+
+    #[test]
+    fn token_count_accepts_int_float_and_string() {
+        assert_eq!(token_count(&json!(12)), Some(12));
+        assert_eq!(token_count(&json!(12.0)), Some(12));
+        assert_eq!(token_count(&json!("34")), Some(34));
+        assert_eq!(token_count(&json!(" 56.0 ")), Some(56));
+        assert_eq!(token_count(&json!(-1)), None);
+        assert_eq!(token_count(&json!("n/a")), None);
+    }
+
+    #[test]
+    fn usage_only_frame_is_not_dropped() {
+        // Final OpenAI chunk often has empty choices + usage only.
+        let events = decode_openai_chunk(&json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": "11",
+                "completion_tokens": 3.0,
+                "prompt_tokens_details": { "cached_tokens": "2" }
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![NormalizedStreamEvent::Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(3),
+                cached_tokens: Some(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn usage_accepts_anthropic_style_aliases() {
+        let events = decode_openai_chunk(&json!({
+            "usage": {
+                "input_tokens": "9",
+                "output_tokens": 4,
+                "cache_read_input_tokens": "1"
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![NormalizedStreamEvent::Usage {
+                input_tokens: Some(9),
+                output_tokens: Some(4),
+                cached_tokens: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn error_frame_is_never_success_even_with_choices() {
+        let events = decode_openai_chunk(&json!({
+            "error": { "message": "nope", "code": "invalid_request" },
+            "choices": [{ "delta": { "content": "should not emit" }, "finish_reason": "stop" }]
+        }));
+        assert_eq!(
+            events,
+            vec![NormalizedStreamEvent::FatalError("nope".into())]
+        );
+    }
+
+    #[test]
+    fn retryable_error_from_type_and_string_error() {
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": { "type": "rate_limit_error", "message": "slow down" }
+            })),
+            vec![NormalizedStreamEvent::RetryableError("slow down".into())]
+        );
+        assert_eq!(
+            decode_openai_chunk(&json!({ "error": "overloaded right now" })),
+            vec![NormalizedStreamEvent::RetryableError(
+                "overloaded right now".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn tool_call_index_and_object_arguments_assemble() {
+        let events = decode_openai_chunk(&json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": "1",
+                        "id": "call-1",
+                        "function": {
+                            "name": "bash",
+                            "arguments": {"command": "ls"}
+                        }
+                    }]
+                }
+            }]
+        }));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NormalizedStreamEvent::ToolCallDelta(delta) => {
+                assert_eq!(delta.index, 1);
+                assert_eq!(delta.id.as_deref(), Some("call-1"));
+                assert_eq!(delta.name.as_deref(), Some("bash"));
+                assert_eq!(delta.arguments.as_deref(), Some(r#"{"command":"ls"}"#));
+            }
+            other => panic!("expected tool delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_call_finish_reason_maps_to_tool_calls() {
+        let events = decode_openai_chunk(&json!({
+            "choices": [{ "delta": {}, "finish_reason": "function_call" }]
+        }));
+        assert_eq!(
+            events,
+            vec![NormalizedStreamEvent::FinishReason("tool_calls".into())]
         );
     }
 }

@@ -72,4 +72,31 @@ mod tests {
             ProviderProtocol::OpenAiChat
         );
     }
+
+    #[test]
+    fn code_assist_url_selects_google_adapter_not_openai() {
+        // Mis-routing Antigravity / Code Assist through OpenAI chat would 404
+        // every turn. Kind stays OpenAI (OAuth Gemini is OpenAI-shaped in
+        // config) — the URL heuristic must win for this endpoint family.
+        assert_eq!(
+            protocol_for(&provider(
+                ProviderKind::OpenAI,
+                "https://daily-cloudcode-pa.sandbox.googleapis.com"
+            )),
+            ProviderProtocol::GoogleCodeAssist
+        );
+    }
+
+    #[test]
+    fn anthropic_kind_wins_over_codex_url_heuristic() {
+        // Kind is authoritative for Anthropic wire; a mis-set base_url must
+        // not flip Messages → Codex Responses.
+        assert_eq!(
+            protocol_for(&provider(
+                ProviderKind::Anthropic,
+                "https://chatgpt.com/backend-api/codex"
+            )),
+            ProviderProtocol::AnthropicMessages
+        );
+    }
 }

@@ -534,7 +534,11 @@ pub fn build_anthropic_request(
     }
 
     let mut body = serde_json::Map::new();
-    // model is set by the caller (stream_turn_anthropic appends it)
+    // model is set by the caller (stream_turn_anthropic appends it).
+    // Anthropic requires a positive max_tokens; 0 is invalid on the wire.
+    // Match the adapter default (8192) rather than sending 1, which would
+    // truncate every reply when the model budget is unknown/unset.
+    let max_tokens = if max_tokens == 0 { 8192 } else { max_tokens };
     body.insert("max_tokens".into(), json!(max_tokens));
     if !system_parts.is_empty() {
         // Explicit system breakpoint: standing prompt is large enough to clear
@@ -930,6 +934,40 @@ mod tests {
         let thinking = body.get("thinking").unwrap();
         assert_eq!(thinking["type"], "enabled");
         assert!(thinking["budget_tokens"].as_u64().unwrap() >= 4096);
+    }
+
+    #[test]
+    fn anthropic_max_tokens_zero_defaults_to_8192() {
+        // Direct builder callers (not only the streaming adapter) must never
+        // put max_tokens:0 on the wire. Floor is 8192, not 1, so replies are
+        // not truncated when the model budget is unknown.
+        let body = build_anthropic_request(&[Message::user("hi")], &[], "none", &[], 0);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_never_ge_max_tokens() {
+        // budget_tokens must leave room for the final answer; Anthropic 400s
+        // when budget_tokens >= max_tokens.
+        let body = build_anthropic_request(
+            &[Message::user("think")],
+            &[],
+            "high",
+            &["low".into(), "medium".into(), "high".into()],
+            5000,
+        );
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget < 5000);
+        assert!(budget >= 1024);
+        // Too small for any thinking budget → omit thinking entirely.
+        let body2 = build_anthropic_request(
+            &[Message::user("think")],
+            &[],
+            "high",
+            &["high".into()],
+            1500,
+        );
+        assert!(body2.get("thinking").is_none());
     }
 
     // --- tolerant deserialization (P1 #1 / P1 #2) -----------------------

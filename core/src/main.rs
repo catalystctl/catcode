@@ -1038,20 +1038,24 @@ impl State {
     /// (e.g. a gateway that caps ctx lower than the upstream model's
     /// models.dev figure). Falls back to the first listed owner, then any
     /// entry by id. `None` when the id is unknown.
+    ///
+    /// Prefer [`Self::model_info_for_pick`] when the client selected an
+    /// explicit provider alongside the model — otherwise duplicate ids can
+    /// resolve to the active provider's caps while the turn itself routes to
+    /// the picked owner (wrong max_tokens / context_window).
     pub async fn model_info_for(&self, model: &str) -> Option<crate::protocol::ModelInfo> {
+        self.model_info_for_pick(model, None).await
+    }
+
+    /// Like [`Self::model_info_for`], but honors an explicit provider `pick`
+    /// the same way [`Self::resolve_provider_for_model_pick`] does. Caps and
+    /// routing must agree on which owner wins for a duplicated model id.
+    pub async fn model_info_for_pick(
+        &self,
+        model: &str,
+        pick: Option<&str>,
+    ) -> Option<crate::protocol::ModelInfo> {
         let models = self.models.read().await;
-        let mut seen = std::collections::HashSet::new();
-        let owners: Vec<String> = models
-            .iter()
-            .filter(|m| m.id == model && !m.provider.is_empty())
-            .filter_map(|m| {
-                if seen.insert(m.provider.clone()) {
-                    Some(m.provider.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
         let active = {
             let cfg = self.cfg.read().await;
             self.active_provider
@@ -1060,15 +1064,7 @@ impl State {
                 .clone()
                 .or_else(|| cfg.active_provider.clone())
         };
-        let picked = pick_provider_for_model(&owners, active.as_deref());
-        match picked {
-            Some(p) => models
-                .iter()
-                .find(|m| m.id == model && m.provider == p)
-                .cloned()
-                .or_else(|| models.iter().find(|m| m.id == model).cloned()),
-            None => models.iter().find(|m| m.id == model).cloned(),
-        }
+        select_model_info(&models, model, active.as_deref(), pick)
     }
 
     /// The set of provider names that are "logged in": configured providers
@@ -1229,17 +1225,11 @@ pub fn resolve_provider_from_config(
     p: &config::ProviderConfig,
     keys: &HashMap<String, String>,
 ) -> ResolvedProvider {
-    let api_key = keys
-        .get(&p.name)
-        .cloned()
-        .or_else(|| p.api_key.clone())
-        .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
-        .filter(|s| !s.is_empty());
     ResolvedProvider {
         name: p.name.clone(),
         kind: p.kind.clone(),
         base_url: p.base_url.clone(),
-        api_key,
+        api_key: provider_usable_api_key(p, keys),
         headers: p.headers.clone(),
         oauth: false,
         context_window: p.context_window,
@@ -1248,9 +1238,65 @@ pub fn resolve_provider_from_config(
     }
 }
 
+/// Effective non-empty API key for a configured provider (runtime override ->
+/// config literal -> env var). Empty strings are treated as missing so a
+/// cleared/blank key cannot look "logged in" or be sent as a Bearer token.
+fn provider_usable_api_key(
+    p: &config::ProviderConfig,
+    keys: &HashMap<String, String>,
+) -> Option<String> {
+    keys.get(&p.name)
+        .cloned()
+        .or_else(|| p.api_key.clone())
+        .or_else(|| {
+            p.api_key_env.as_ref().and_then(|v| {
+                // Empty env-var *name* means keyless (Ollama/LM Studio style),
+                // not "look up the empty string in the environment".
+                if v.is_empty() {
+                    None
+                } else {
+                    std::env::var(v).ok()
+                }
+            })
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Lowercased host from a URL (`https://api.x.ai/v1` → `api.x.ai`). Best-effort
+/// without a URL crate — mirrors the plugin OAuth host matcher so aggregation
+/// and turn-time enrich agree on alias detection.
+fn provider_url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, h)| h).unwrap_or(url);
+    let host = rest.split(['/', ':']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// True for loopback endpoints (Ollama / LM Studio / local gateways) that can
+/// run without an API key.
+fn is_loopback_base_url(base_url: &str) -> bool {
+    match provider_url_host(base_url).as_deref() {
+        Some("localhost") | Some("127.0.0.1") | Some("::1") => true,
+        _ => false,
+    }
+}
+
+/// Keyless local provider: no non-empty `api_key_env` is required AND the
+/// endpoint is loopback. Cloud OAuth providers also omit `api_key_env` but are
+/// gated separately via [`oauth_creds_for_provider`] — never treat a remote
+/// host as keyless just because a key is missing.
+fn is_keyless_local_provider(p: &config::ProviderConfig) -> bool {
+    let requires_key_env = p.api_key_env.as_ref().is_some_and(|e| !e.is_empty());
+    !requires_key_env && is_loopback_base_url(&p.base_url)
+}
+
 /// Names of providers that are "logged in": configured providers with a usable
-/// key. The aggregation layer discovers models only for these, so `/models`
-/// shows exactly the providers the user has authenticated. When no providers are
+/// non-empty key, a keyless local endpoint, or reusable OAuth credentials. The
+/// aggregation layer discovers models only for these, so `/models` shows
+/// exactly the providers the user has authenticated. When no providers are
 /// configured (legacy single-endpoint Umans setup) this returns empty so that
 /// `aggregate_models_for`'s `names.is_empty()` branch handles the legacy
 /// default discovery — returning a synthetic "default" name here would break,
@@ -1266,14 +1312,15 @@ pub fn logged_in_providers_for(
     cfg.providers
         .iter()
         .filter(|p| {
-            // Logged in = has an API key (runtime/config/env), OR is an OAuth-capable
-            // provider with reusable OAuth credentials. The Codex plugin also
-            // detects the file-backed official CLI auth store when configured.
-            keys.get(&p.name)
-                .cloned()
-                .or_else(|| p.api_key.clone())
-                .or_else(|| p.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
-                .is_some()
+            // Logged in =
+            //   * non-empty API key (runtime/config/env), OR
+            //   * keyless local (loopback + no required key env), OR
+            //   * OAuth-capable provider with reusable credentials.
+            // Empty strings must NOT count — resolve_provider drops them, and
+            // a blank key previously made the provider look authed while every
+            // turn still failed with "no API key".
+            provider_usable_api_key(p, keys).is_some()
+                || is_keyless_local_provider(p)
                 || oauth_creds_for_provider(p, pm)
         })
         .map(|p| p.name.clone())
@@ -1284,17 +1331,70 @@ pub fn logged_in_providers_for(
 /// check, no refresh). Used by `logged_in_providers_for` to gate plugin OAuth
 /// providers into aggregation. The actual token refresh happens at turn /
 /// discovery time via `oauth::enrich_oauth`.
+///
+/// Matching mirrors `PluginManager::oauth_config_for_provider`: provider-config
+/// name == plugin `provider_id` first, then base_url host. Without the host
+/// fallback, a manually-named alias pointing at the plugin endpoint (e.g.
+/// `chatgpt` → codex host) would be excluded from aggregation even though
+/// turn-time `enrich_oauth` would still inject the token.
 fn oauth_creds_for_provider(
     p: &config::ProviderConfig,
     pm: Option<&plugins::PluginManager>,
 ) -> bool {
     // Subscription OAuth is plugin-only.
-    if let Some(pm) = pm {
-        if pm.oauth_config(&p.name).is_some() {
-            return pm.has_oauth_creds(&p.name);
+    let Some(pm) = pm else {
+        return false;
+    };
+    if pm.oauth_config(&p.name).is_some() {
+        return pm.has_oauth_creds(&p.name);
+    }
+    let Some(host) = provider_url_host(&p.base_url) else {
+        return false;
+    };
+    for cfg in pm.oauth_configs() {
+        if provider_url_host(&cfg.base_url).as_deref() == Some(host.as_str()) {
+            // Creds are stored under the plugin's provider_id, not the alias name.
+            return pm.has_oauth_creds(&cfg.provider_id);
         }
     }
     false
+}
+
+/// Pick the `ModelInfo` row for `model` using the same owner/active/pick rules
+/// as turn routing ([`pick_provider_for_model_with`]). Pure + sync so unit
+/// tests cover caps selection without spinning up `State`.
+fn select_model_info(
+    models: &[ModelInfo],
+    model: &str,
+    active: Option<&str>,
+    pick: Option<&str>,
+) -> Option<ModelInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let owners: Vec<String> = models
+        .iter()
+        .filter(|m| m.id == model && !m.provider.is_empty())
+        .filter_map(|m| {
+            if seen.insert(m.provider.clone()) {
+                Some(m.provider.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let picked = pick_provider_for_model_with(&owners, active, pick);
+    match picked {
+        Some(p) => models
+            .iter()
+            .find(|m| m.id == model && m.provider == p)
+            .cloned()
+            .or_else(|| models.iter().find(|m| m.id == model).cloned()),
+        // No deterministic owner (multi-owner + non-owner active, or empty
+        // owners): fall back to any row by id. Callers that also resolve the
+        // provider will pin the turn to the active/legacy endpoint; caps from
+        // the first listed row are the least-bad estimate when ownership is
+        // ambiguous.
+        None => models.iter().find(|m| m.id == model).cloned(),
+    }
 }
 
 /// Aggregate models across ALL logged-in providers, tagging each model with its
@@ -5390,10 +5490,49 @@ mod expand_mentions_tests {
 
 #[cfg(test)]
 mod provider_routing_tests {
-    use super::{pick_provider_for_model, pick_provider_for_model_with};
+    use super::{
+        is_keyless_local_provider, is_loopback_base_url, logged_in_providers_for,
+        pick_provider_for_model, pick_provider_for_model_with, provider_url_host,
+        provider_usable_api_key, resolve_provider_from_config, select_model_info,
+    };
+    use crate::config::{Config, ProviderConfig, ProviderKind};
+    use crate::protocol::ModelInfo;
+    use std::collections::HashMap;
 
     fn owners(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn pc(
+        name: &str,
+        base_url: &str,
+        api_key: Option<&str>,
+        api_key_env: Option<&str>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            kind: ProviderKind::OpenAI,
+            base_url: base_url.into(),
+            api_key: api_key.map(|s| s.to_string()),
+            api_key_env: api_key_env.map(|s| s.to_string()),
+            headers: Vec::new(),
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        }
+    }
+
+    fn mi(id: &str, provider: &str, ctx: u32, max_tokens: u32) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            reasoning: false,
+            context_window: ctx,
+            max_tokens,
+            thinking_levels: Vec::new(),
+            vision: false,
+            provider: provider.into(),
+        }
     }
 
     #[test]
@@ -5485,5 +5624,135 @@ mod provider_routing_tests {
             pick_provider_for_model_with(&o, None, None),
             pick_provider_for_model(&o, None)
         );
+    }
+
+    #[test]
+    fn empty_api_key_is_not_usable_or_logged_in() {
+        // Blank config / runtime keys must not count as authentication — they
+        // previously made logged_in_providers_for report the provider while
+        // resolve_provider_from_config dropped the empty string (authed UX lie).
+        let p = pc(
+            "karutoil",
+            "https://ai.example/v1",
+            Some(""),
+            Some("KARUTOIL_KEY"),
+        );
+        let mut keys = HashMap::new();
+        keys.insert("karutoil".into(), "".into());
+        assert!(provider_usable_api_key(&p, &keys).is_none());
+        assert!(resolve_provider_from_config(&p, &keys).api_key.is_none());
+
+        let mut cfg = Config::default();
+        cfg.providers = vec![p];
+        assert!(logged_in_providers_for(&cfg, &keys, None).is_empty());
+    }
+
+    #[test]
+    fn non_empty_runtime_key_logs_provider_in() {
+        let p = pc(
+            "karutoil",
+            "https://ai.example/v1",
+            None,
+            Some("KARUTOIL_KEY"),
+        );
+        let mut keys = HashMap::new();
+        keys.insert("karutoil".into(), "sk-live".into());
+        let mut cfg = Config::default();
+        cfg.providers = vec![p.clone()];
+        assert_eq!(
+            logged_in_providers_for(&cfg, &keys, None),
+            vec!["karutoil".to_string()]
+        );
+        assert_eq!(
+            resolve_provider_from_config(&p, &keys).api_key.as_deref(),
+            Some("sk-live")
+        );
+    }
+
+    #[test]
+    fn keyless_loopback_is_logged_in_without_key() {
+        // Ollama / LM Studio style: no required key env + loopback host.
+        let local = pc("ollama", "http://localhost:11434/v1", None, None);
+        assert!(is_loopback_base_url(&local.base_url));
+        assert!(is_keyless_local_provider(&local));
+        let mut cfg = Config::default();
+        cfg.providers = vec![
+            local,
+            // Cloud provider with no key must NOT piggy-back on the keyless path.
+            pc("remote", "https://api.example/v1", None, None),
+        ];
+        let names = logged_in_providers_for(&cfg, &HashMap::new(), None);
+        assert_eq!(names, vec!["ollama".to_string()]);
+    }
+
+    #[test]
+    fn empty_api_key_env_name_does_not_lookup_empty_env() {
+        // api_key_env: Some("") is the keyless marker, not an env lookup of "".
+        let p = pc("lmstudio", "http://127.0.0.1:1234/v1", None, Some(""));
+        assert!(is_keyless_local_provider(&p));
+        assert!(provider_usable_api_key(&p, &HashMap::new()).is_none());
+        let mut cfg = Config::default();
+        cfg.providers = vec![p];
+        assert_eq!(
+            logged_in_providers_for(&cfg, &HashMap::new(), None),
+            vec!["lmstudio".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_url_host_strips_scheme_port_path() {
+        assert_eq!(
+            provider_url_host("https://api.x.ai/v1").as_deref(),
+            Some("api.x.ai")
+        );
+        assert_eq!(
+            provider_url_host("http://127.0.0.1:1234/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn select_model_info_honors_explicit_pick_over_active() {
+        // Caps must follow the same owner rules as turn routing: an explicit
+        // /models pick of `local` must not keep using karutoil's smaller budget.
+        let models = vec![
+            mi("deepseek-v4-flash", "karutoil", 512_000, 8_192),
+            mi("deepseek-v4-flash", "local", 128_000, 32_768),
+        ];
+        let info = select_model_info(
+            &models,
+            "deepseek-v4-flash",
+            Some("karutoil"),
+            Some("local"),
+        )
+        .expect("row");
+        assert_eq!(info.provider, "local");
+        assert_eq!(info.context_window, 128_000);
+        assert_eq!(info.max_tokens, 32_768);
+    }
+
+    #[test]
+    fn select_model_info_active_wins_without_pick() {
+        let models = vec![
+            mi("deepseek-v4-flash", "opencode-go", 1_000_000, 64_000),
+            mi("deepseek-v4-flash", "karutoil", 512_000, 8_192),
+        ];
+        let info =
+            select_model_info(&models, "deepseek-v4-flash", Some("karutoil"), None).expect("row");
+        assert_eq!(info.provider, "karutoil");
+        assert_eq!(info.context_window, 512_000);
+    }
+
+    #[test]
+    fn select_model_info_non_owner_active_falls_back_to_first_row() {
+        // Mirrors pick_provider_for_model returning None: no deterministic
+        // owner, so caps fall back to the first listed row by id.
+        let models = vec![
+            mi("deepseek-v4-flash", "opencode-go", 1_000_000, 64_000),
+            mi("deepseek-v4-flash", "karutoil", 512_000, 8_192),
+        ];
+        let info =
+            select_model_info(&models, "deepseek-v4-flash", Some("umans"), None).expect("row");
+        assert_eq!(info.provider, "opencode-go");
     }
 }

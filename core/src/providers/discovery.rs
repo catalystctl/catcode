@@ -244,6 +244,7 @@ pub async fn discover_models(
     };
     apply_context_window_override(provider, &mut models);
     apply_models_override(provider, &mut models);
+    sanitize_models_caps(&mut models);
     models
 }
 
@@ -266,6 +267,7 @@ pub async fn discover_models_force_refresh(
     };
     apply_context_window_override(provider, &mut models);
     apply_models_override(provider, &mut models);
+    sanitize_models_caps(&mut models);
     models
 }
 
@@ -276,13 +278,13 @@ pub async fn discover_models_force_refresh(
 /// model's actual loaded context (causing context-overflow errors). An explicit
 /// `context_window` on the provider config wins over discovered/curated caps.
 pub(crate) fn apply_context_window_override(provider: &ResolvedProvider, models: &mut [ModelInfo]) {
-    if let Some(ctx) = provider.context_window {
+    if let Some(ctx) = provider.context_window.filter(|&c| c > 0) {
         for m in models {
             m.context_window = ctx;
             // Keep max output below the (possibly reduced) context so there is
             // room for the prompt; mirrors apply_live_model_fields.
-            if m.max_tokens >= ctx {
-                m.max_tokens = (ctx / 4).max(1);
+            if m.max_tokens == 0 || m.max_tokens >= ctx {
+                m.max_tokens = xai_default_max_tokens(ctx);
             }
         }
     }
@@ -300,15 +302,15 @@ pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [M
         let Some(m) = models.iter_mut().find(|m| m.id == ov.id) else {
             continue;
         };
-        if let Some(ctx) = ov.context_window {
+        if let Some(ctx) = ov.context_window.filter(|&c| c > 0) {
             m.context_window = ctx;
         }
-        if let Some(max) = ov.max_tokens {
+        if let Some(max) = ov.max_tokens.filter(|&c| c > 0) {
             m.max_tokens = max;
         }
-        if ov.max_tokens.is_none() && m.max_tokens >= m.context_window {
-            m.max_tokens = xai_default_max_tokens(m.context_window);
-        }
+        // Always repair inversion / zero after overrides so a partial override
+        // (context-only) or a stale max cannot leave max_tokens:0 / max >= ctx.
+        sanitize_model_caps(m);
         if let Some(r) = ov.reasoning {
             m.reasoning = r;
         }
@@ -322,6 +324,29 @@ pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [M
                 m.reasoning = true;
             }
         }
+    }
+}
+
+/// Repair impossible / unusable cap combinations on a single model:
+/// - `context_window == 0` → generic 200k (zero context breaks compaction math)
+/// - `max_tokens == 0` → sensible default under context (never stick live 0)
+/// - `max_tokens >= context_window` → default under context (leave prompt room)
+///
+/// Call sites: live parse, disk-cache load, models.dev enrich, per-provider
+/// overrides, and the final discover_models exit so no path can ship a 0-budget
+/// or inverted pair into the picker / request builder.
+pub(crate) fn sanitize_model_caps(info: &mut ModelInfo) {
+    if info.context_window == 0 {
+        info.context_window = 200_000;
+    }
+    if info.max_tokens == 0 || info.max_tokens >= info.context_window {
+        info.max_tokens = xai_default_max_tokens(info.context_window);
+    }
+}
+
+pub(crate) fn sanitize_models_caps(models: &mut [ModelInfo]) {
+    for m in models.iter_mut() {
+        sanitize_model_caps(m);
     }
 }
 
@@ -628,7 +653,7 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
                     .collect()
             })
             .unwrap_or_default();
-        out.push(ModelInfo {
+        let mut info = ModelInfo {
             id,
             name,
             reasoning: m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -638,7 +663,12 @@ fn parse_cache_models(cache: &Value) -> Option<Vec<ModelInfo>> {
             vision,
 
             ..Default::default()
-        });
+        };
+        // Disk cache can still hold pre-fix max_tokens:0 / inverted pairs
+        // written by older builds; repair on read so the TTL doesn't re-ship
+        // a broken budget for up to 8h.
+        sanitize_model_caps(&mut info);
+        out.push(info);
     }
     if out.is_empty() {
         None
@@ -653,14 +683,20 @@ pub(crate) fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
     if let Some(obj) = data.as_object() {
         for (id, info) in obj {
             let caps = info.get("capabilities");
+            // Treat 0 as missing: some gateways advertise context_window/max
+            // as 0 rather than omitting the field; sticking 0 breaks the
+            // OpenAI wire path (omit vs send) and Anthropic (required field).
             let cw = caps
                 .and_then(|c| c.get("context_window"))
                 .and_then(|v| v.as_u64())
+                .filter(|&c| c > 0)
                 .unwrap_or(200_000) as u32;
             let mt = caps
                 .and_then(|c| c.get("recommended_max_tokens"))
                 .and_then(|v| v.as_u64())
-                .unwrap_or(65000) as u32;
+                .filter(|&c| c > 0)
+                .map(|c| c.min(u32::MAX as u64) as u32)
+                .unwrap_or_else(|| xai_default_max_tokens(cw));
             // Vision comes from capabilities.supports_vision, which the endpoint
             // encodes as true / false / "via-handoff". Only boolean true counts
             // as native client-side vision; "via-handoff" (GLM 5.2, whose vision
@@ -704,7 +740,7 @@ pub(crate) fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            out.push(ModelInfo {
+            let mut info = ModelInfo {
                 id: id.clone(),
                 name,
                 reasoning: reasoning_supported,
@@ -714,7 +750,9 @@ pub(crate) fn parse_models_response(data: &Value) -> Vec<ModelInfo> {
                 vision,
 
                 ..Default::default()
-            });
+            };
+            sanitize_model_caps(&mut info);
+            out.push(info);
         }
     }
     if out.is_empty() {
@@ -785,10 +823,6 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
         .filter(|&c| c > 0)
     {
         info.context_window = ctx.min(u32::MAX as u64) as u32;
-        // Keep max_tokens below context so there's room for the prompt.
-        if info.max_tokens >= info.context_window {
-            info.max_tokens = xai_default_max_tokens(info.context_window);
-        }
     }
     if let Some(max) = m
         .get("max_tokens")
@@ -799,11 +833,10 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
     {
         info.max_tokens = max.min(u32::MAX as u64) as u32;
     }
-    // Keep the advertised generation budget below the context window after
-    // applying both live context and output-limit fields.
-    if info.max_tokens >= info.context_window {
-        info.max_tokens = xai_default_max_tokens(info.context_window);
-    }
+    // Zero / inverted pairs must never stick from live fields. max_tokens:0 is
+    // filtered above (treated as missing), but a curated 0 or max >= context
+    // still needs repair after both overlays.
+    sanitize_model_caps(info);
     // Image input pricing / modality hints (xAI, some gateways).
     if m.get("prompt_image_token_price")
         .and_then(|v| v.as_u64())
@@ -1417,8 +1450,11 @@ fn opencode_go_caps(id: &str) -> Option<(u32, u32, bool)> {
         // OpenAI-compatible /v1/chat/completions (zhipu / moonshot / deepseek / xiaomi)
         "glm-5.2" => (1_000_000, 131_072, false),
         "glm-5.1" => (200_000, 131_072, false),
-        "kimi-k2.7-code" => (262_144, 262_144, true),
-        "kimi-k2.6" => (262_144, 262_144, true),
+        // max_tokens must stay strictly below context_window (sanitize would
+        // otherwise rewrite equal pairs to 3/4 context). 32k output matches
+        // the Kimi-for-coding curated budget and leaves prompt headroom.
+        "kimi-k2.7-code" => (262_144, 32_768, true),
+        "kimi-k2.6" => (262_144, 32_768, true),
         "deepseek-v4-pro" => (1_000_000, 384_000, false),
         "deepseek-v4-flash" => (1_000_000, 384_000, false),
         "mimo-v2.5" => (1_048_576, 131_072, true),
@@ -2112,5 +2148,184 @@ mod tests {
         // Known vendors still get their curated lists.
         assert!(!openai_fallback_models("https://api.code.umans.ai/v1").is_empty());
         assert!(!openai_fallback_models("https://api.deepseek.com/v1").is_empty());
+    }
+
+    #[test]
+    fn sanitize_model_caps_repairs_zero_and_inversion() {
+        let mut zero_max = ModelInfo {
+            id: "m".into(),
+            name: "m".into(),
+            context_window: 128_000,
+            max_tokens: 0,
+            ..Default::default()
+        };
+        sanitize_model_caps(&mut zero_max);
+        assert!(zero_max.max_tokens > 0);
+        assert!(zero_max.max_tokens < zero_max.context_window);
+
+        let mut inverted = ModelInfo {
+            id: "m".into(),
+            name: "m".into(),
+            context_window: 32_768,
+            max_tokens: 100_000,
+            ..Default::default()
+        };
+        sanitize_model_caps(&mut inverted);
+        assert!(inverted.max_tokens < inverted.context_window);
+
+        let mut zero_ctx = ModelInfo {
+            id: "m".into(),
+            name: "m".into(),
+            context_window: 0,
+            max_tokens: 0,
+            ..Default::default()
+        };
+        sanitize_model_caps(&mut zero_ctx);
+        assert_eq!(zero_ctx.context_window, 200_000);
+        assert!(zero_ctx.max_tokens > 0 && zero_ctx.max_tokens < zero_ctx.context_window);
+    }
+
+    #[test]
+    fn apply_live_model_fields_ignores_zero_max_tokens() {
+        // Live max_tokens:0 must NOT stick — treat as missing and keep/repair.
+        let mut info = openai_model_caps("gateway-model", "Gateway Model");
+        let before = info.max_tokens;
+        assert!(before > 0);
+        apply_live_model_fields(
+            &json!({
+                "id": "gateway-model",
+                "context_length": 128000,
+                "max_tokens": 0,
+                "max_output_tokens": 0
+            }),
+            &mut info,
+        );
+        assert_eq!(info.context_window, 128_000);
+        assert!(info.max_tokens > 0);
+        assert!(info.max_tokens < info.context_window);
+        // Zero output must not clobber the curated positive budget with 0.
+        assert_ne!(info.max_tokens, 0);
+    }
+
+    #[test]
+    fn apply_live_model_fields_shape_b_max_input_and_output() {
+        // Shape B bare gateway ids: max_input_tokens + max_output_tokens only.
+        // Start from generic defaults (unknown id path would be 200k/8k).
+        let mut info = openai_model_caps("custom-flash", "Custom Flash");
+        apply_live_model_fields(
+            &json!({
+                "id": "custom-flash",
+                "max_input_tokens": 512000,
+                "max_output_tokens": 8192
+            }),
+            &mut info,
+        );
+        assert_eq!(info.context_window, 512_000);
+        assert_eq!(info.max_tokens, 8_192);
+    }
+
+    #[test]
+    fn apply_live_model_fields_clamps_output_equal_to_context() {
+        let mut info = openai_model_caps("equal-caps", "Equal");
+        apply_live_model_fields(
+            &json!({
+                "context_length": 1000,
+                "max_output_tokens": 1000
+            }),
+            &mut info,
+        );
+        assert_eq!(info.context_window, 1_000);
+        assert!(info.max_tokens < 1_000);
+        assert!(info.max_tokens > 0);
+    }
+
+    #[test]
+    fn parse_models_response_ignores_zero_recommended_max() {
+        let data = json!({
+            "zero-max": {
+                "display_name": "Zero Max",
+                "capabilities": {
+                    "context_window": 128000,
+                    "recommended_max_tokens": 0,
+                    "supports_vision": false,
+                    "reasoning": { "supported": false, "levels": [] }
+                }
+            },
+            "zero-ctx": {
+                "display_name": "Zero Ctx",
+                "capabilities": {
+                    "context_window": 0,
+                    "recommended_max_tokens": 4096,
+                    "supports_vision": false,
+                    "reasoning": { "supported": false, "levels": [] }
+                }
+            }
+        });
+        let models = parse_models_response(&data);
+        let zm = models.iter().find(|m| m.id == "zero-max").unwrap();
+        assert_eq!(zm.context_window, 128_000);
+        assert!(zm.max_tokens > 0 && zm.max_tokens < zm.context_window);
+        let zc = models.iter().find(|m| m.id == "zero-ctx").unwrap();
+        assert_eq!(zc.context_window, 200_000); // 0 → generic default
+        assert!(zc.max_tokens > 0 && zc.max_tokens < zc.context_window);
+    }
+
+    #[test]
+    fn apply_models_override_rejects_zero_max_and_repairs_inversion() {
+        use crate::config::ModelOverride;
+        let provider = ResolvedProvider {
+            name: "custom".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "http://localhost:1234/v1".into(),
+            api_key: None,
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: vec![ModelOverride {
+                id: "gemma".into(),
+                context_window: Some(32_768),
+                max_tokens: Some(0), // must be ignored (filter > 0)
+                reasoning: None,
+                thinking_levels: None,
+            }],
+            models_endpoint: None,
+        };
+        let mut models = vec![ModelInfo {
+            id: "gemma".into(),
+            name: "Gemma".into(),
+            context_window: 200_000,
+            max_tokens: 8_192,
+            ..Default::default()
+        }];
+        apply_models_override(&provider, &mut models);
+        assert_eq!(models[0].context_window, 32_768);
+        // max_tokens:0 override ignored; previous 8192 still < 32768 so kept,
+        // or repaired if it had been inverted — never 0.
+        assert!(models[0].max_tokens > 0);
+        assert!(models[0].max_tokens < models[0].context_window);
+    }
+
+    #[test]
+    fn parse_openai_models_list_shape_b_bare_ids() {
+        let data = json!({
+            "data": [{
+                "id": "deepseek-v4-flash",
+                "max_input_tokens": 128000,
+                "max_output_tokens": 32768
+            }]
+        });
+        let models = parse_openai_models_list(&data);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "deepseek-v4-flash");
+        assert_eq!(models[0].context_window, 128_000);
+        assert_eq!(models[0].max_tokens, 32_768);
+    }
+
+    #[test]
+    fn opencode_go_kimi_caps_keep_max_below_context() {
+        let (ctx, max, _) = opencode_go_caps("kimi-k2.6").unwrap();
+        assert!(max < ctx, "max={max} must be < ctx={ctx}");
+        let m = opencode_go_model_caps("kimi-k2.6", "Kimi K2.6");
+        assert!(m.max_tokens < m.context_window);
     }
 }

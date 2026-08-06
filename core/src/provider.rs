@@ -489,11 +489,21 @@ async fn openai_complete(
         ]
     });
     let url = format!("{}{CHAT_PATH}", provider.base_url);
-    let req = client
+    // Never send `Authorization: Bearer ` with an empty token — some proxies
+    // treat that as present-but-invalid and return 401 instead of anonymous.
+    let mut req = client
         .post(&url)
-        .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
         .json(&body)
         .timeout(Duration::from_secs(120));
+    if let Some(k) = provider.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    // Honor provider.headers on the non-stream helper too (OpenRouter Referer,
+    // custom gateway keys, etc.). Without this, compaction/summary calls drop
+    // headers the streaming path always sends.
+    for (k, v) in &provider.headers {
+        req = req.header(k, v);
+    }
     let resp = tokio::select! {
         r = req.send() => r.ok()?,
         _ = cancel.cancelled() => return None,
@@ -520,6 +530,8 @@ async fn anthropic_complete(
     cancel: &CancellationToken,
 ) -> Option<String> {
     let messages: Vec<Message> = vec![Message::system(system), Message::user(user)];
+    // Same floor as the streaming adapter: Anthropic rejects max_tokens:0, and
+    // a 1-token floor would silently truncate compact/summary replies.
     let mut body =
         message::build_anthropic_request(&messages, &[], "none", &[], max_tokens.max(256));
     body["model"] = json!(model);
@@ -529,10 +541,25 @@ async fn anthropic_complete(
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&body)
         .timeout(Duration::from_secs(120));
-    if let Some(k) = provider.api_key.as_deref() {
+    // Mirror send_anthropic_request auth: OAuth subscription tokens need Bearer
+    // + the claude-code identity beta; API keys use x-api-key. Never attach an
+    // empty credential header (Some("") used to do that and 401'd).
+    let key = anthropic_nonempty_key(provider.api_key.as_deref());
+    let mut set_primary_auth = false;
+    if provider.oauth {
+        if let Some(k) = key {
+            req = req.header("authorization", format!("Bearer {k}"));
+            set_primary_auth = true;
+        }
+        req = req.header("anthropic-beta", CLAUDE_OAUTH_BETA);
+    } else if let Some(k) = key {
         req = req.header("x-api-key", k);
+        set_primary_auth = true;
     }
     for (k, v) in &provider.headers {
+        if set_primary_auth && is_anthropic_primary_auth_header(k) {
+            continue;
+        }
         req = req.header(k, v);
     }
     let resp = tokio::select! {
@@ -553,6 +580,16 @@ async fn anthropic_complete(
                     .flatten()
             })
         })
+}
+
+/// True when `k` is a primary Anthropic auth header name (case-insensitive).
+fn is_anthropic_primary_auth_header(k: &str) -> bool {
+    k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("x-api-key")
+}
+
+/// Pick the non-empty trimmed Anthropic credential, if any.
+fn anthropic_nonempty_key(api_key: Option<&str>) -> Option<&str> {
+    api_key.map(str::trim).filter(|k| !k.is_empty())
 }
 
 /// Sanitize orphaned tool_calls: ensure every tool_calls entry has a matching
@@ -961,6 +998,8 @@ pub async fn stream_turn(
                 messages,
                 tools,
                 reasoning_effort,
+                thinking_levels,
+                max_tokens,
                 cancel,
                 timer,
                 prompt_est,
@@ -1015,6 +1054,8 @@ async fn stream_turn_codex(
     messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
     prompt_est: u64,
@@ -1028,10 +1069,10 @@ async fn stream_turn_codex(
         messages,
         tools,
         reasoning_effort,
-        thinking_levels: &[],
-        // Codex adapter does not put max_tokens on the wire; 0 here is a
-        // no-op sentinel (same "omit when unknown" policy as OpenAI).
-        max_tokens: 0,
+        thinking_levels,
+        // Codex Responses uses max_output_tokens; the adapter omits the field
+        // when this is 0 (never puts max_output_tokens:0 on the wire).
+        max_tokens,
     })?;
     let body = built.body;
     let url = built.url;
@@ -1053,6 +1094,7 @@ async fn stream_turn_codex(
     let mut tokens_in = 0;
     let mut tokens_out = 0;
     let mut cached_tokens = 0;
+    let mut finish_reason = String::new();
     let idle = Duration::from_secs(idle_timeout_secs.max(10));
     let mut last_stats: Option<Instant> = None;
     let mut terminal_event = false;
@@ -1095,6 +1137,7 @@ async fn stream_turn_codex(
                     &mut tokens_in,
                     &mut tokens_out,
                     &mut cached_tokens,
+                    &mut finish_reason,
                     timer,
                     quiet,
                 )?;
@@ -1145,6 +1188,7 @@ async fn stream_turn_codex(
                 &mut tokens_in,
                 &mut tokens_out,
                 &mut cached_tokens,
+                &mut finish_reason,
                 timer,
                 quiet,
             )?;
@@ -1167,19 +1211,30 @@ async fn stream_turn_codex(
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), json!("assistant"));
     if !tool_calls.is_empty() {
-        msg.insert("content".into(), Value::Null);
+        // Keep any streamed prose alongside tool_calls so the next turn's
+        // Responses input still has the assistant narration (responses_input
+        // now preserves content+calls).
+        if content.is_empty() {
+            msg.insert("content".into(), Value::Null);
+        } else {
+            msg.insert("content".into(), json!(content));
+        }
         msg.insert("tool_calls".into(), Value::Array(tool_calls));
     } else {
         msg.insert("content".into(), json!(content));
     }
+    // Prefer an explicit stream finish reason (e.g. length from
+    // response.incomplete). Fall back to tool_calls/stop heuristics.
+    let reason = if !finish_reason.is_empty() {
+        finish_reason
+    } else if calls.is_empty() {
+        "stop".into()
+    } else {
+        "tool_calls".into()
+    };
     Ok((
         Value::Object(msg),
-        if calls.is_empty() {
-            "stop"
-        } else {
-            "tool_calls"
-        }
-        .into(),
+        reason,
         tokens_in,
         tokens_out,
         cached_tokens,
@@ -1195,6 +1250,7 @@ fn apply_codex_event(
     tokens_in: &mut u64,
     tokens_out: &mut u64,
     cached_tokens: &mut u64,
+    finish_reason: &mut String,
     timer: &mut TurnTimer,
     quiet: bool,
 ) -> Result<(), String> {
@@ -1259,11 +1315,13 @@ fn apply_codex_event(
                 *cached_tokens = value;
             }
         }
+        NormalizedStreamEvent::FinishReason(reason) => {
+            *finish_reason = reason;
+        }
         NormalizedStreamEvent::FatalError(message)
         | NormalizedStreamEvent::RetryableError(message) => return Err(message),
         NormalizedStreamEvent::ToolCallDelta(_)
-        | NormalizedStreamEvent::ToolCallComplete { .. }
-        | NormalizedStreamEvent::FinishReason(_) => {}
+        | NormalizedStreamEvent::ToolCallComplete { .. } => {}
     }
     Ok(())
 }
@@ -1689,7 +1747,7 @@ async fn stream_turn_gemini(
     messages: &[Message],
     tools: &[Value],
     reasoning_effort: &str,
-    _thinking_levels: &[String],
+    thinking_levels: &[String],
     max_tokens: u32,
     cancel: &CancellationToken,
     timer: &mut TurnTimer,
@@ -1699,15 +1757,22 @@ async fn stream_turn_gemini(
     let api_key = provider.api_key.as_deref().unwrap_or("");
     let max_attempts = 3u32;
     let adapter = adapter_for(provider);
+    // Pass model-advertised thinking levels so the Google adapter can clamp
+    // thinkingLevel/thinkingBudget (gemini-3 pro only accepts low|high).
     let built = adapter.build_request(&ProviderRequest {
         provider,
         model,
         messages,
         tools,
         reasoning_effort,
-        thinking_levels: &[],
+        thinking_levels,
         max_tokens,
     })?;
+    if !quiet {
+        for notice in &built.notices {
+            emit(&Event::new("info").with("message", json!(notice)));
+        }
+    }
     let request = built.body;
     let url = built.url;
     let idle = Duration::from_secs(idle_timeout_secs.max(5));
@@ -2074,12 +2139,22 @@ async fn send_with_retry(
 
         let mut req = client
             .post(url)
-            .bearer_auth(api_key)
             .header("accept", "text/event-stream")
             .header("accept-encoding", "identity")
             .header("cache-control", "no-cache")
             .json(body);
+        // Only attach Bearer when we have a real key. An empty `bearer_auth("")`
+        // still emits `Authorization: Bearer `, which confuses gateways.
+        let has_bearer = !api_key.is_empty();
+        if has_bearer {
+            req = req.bearer_auth(api_key);
+        }
         for (k, v) in headers {
+            // If we already set Authorization from api_key, drop a duplicate
+            // Authorization from provider.headers (plugin/config mis-merge).
+            if has_bearer && k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
             req = req.header(k, v);
         }
 
@@ -2145,8 +2220,9 @@ async fn send_with_retry(
             return Ok(resp);
         }
 
-        // Retryable: 429 (rate limit) and 5xx (server). 4xx otherwise → fatal.
-        let retryable = status.as_u16() == 429 || status.is_server_error();
+        // Retryable: 429 (rate limit), 408 (request timeout), and 5xx.
+        // Other 4xx → fatal (do not burn attempts on auth/validation errors).
+        let retryable = is_retryable_http_status(status);
         if !retryable || attempt >= 4 {
             let text = resp.text().await.unwrap_or_default();
             if logging::debug_verbose() {
@@ -2278,9 +2354,20 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
     Some(days as u64)
 }
 
+/// HTTP statuses worth retrying at the transport layer.
+/// 429 rate-limit, 408 request-timeout (proxy stall), and any 5xx.
+/// Other 4xx (auth, validation, not-found) fail immediately.
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    let code = status.as_u16();
+    code == 429 || code == 408 || status.is_server_error()
+}
+
 fn backoff_ms(attempt: u32, retry_after: Option<u64>) -> u64 {
     if let Some(ra) = retry_after {
-        return ra.saturating_mul(1000).min(30_000);
+        // Retry-After: 0 means "retry now"; still apply a tiny floor so we
+        // don't spin the event loop on a misbehaving gateway that always
+        // returns 0. Cap at 30s so a huge Retry-After cannot stall a turn.
+        return ra.saturating_mul(1000).clamp(50, 30_000);
     }
     // 500, 1000, 2000, 4000 ... capped at 8000
     let base = 500u64;
@@ -2337,7 +2424,10 @@ fn is_terminal_stream_event(event: &NormalizedStreamEvent) -> bool {
 fn is_terminal_stream_object(value: &Value) -> bool {
     matches!(
         value.get("type").and_then(Value::as_str),
-        Some("response.completed") | Some("message_stop")
+        Some("response.completed")
+            | Some("response.incomplete")
+            | Some("response.failed")
+            | Some("message_stop")
     )
 }
 
@@ -2658,19 +2748,27 @@ async fn send_anthropic_request(
             .header("cache-control", "no-cache")
             .header("content-type", "application/json")
             .json(body);
+        // Track whether we attached a primary auth header so provider.headers
+        // cannot inject a second Authorization / x-api-key (dual-auth 401s).
+        let mut set_primary_auth = false;
         if provider.oauth {
             // Claude.ai subscription (OAuth): Bearer token + the claude-code
             // identity beta (Anthropic's gateway requires it for subscription
             // tokens). UA/x-app come from provider.headers (injected by
             // enrich_oauth). Reuses the same Messages endpoint as the API-key path.
-            if let Some(k) = provider.api_key.as_deref() {
+            if let Some(k) = anthropic_nonempty_key(provider.api_key.as_deref()) {
                 req = req.header("authorization", format!("Bearer {k}"));
+                set_primary_auth = true;
             }
             req = req.header("anthropic-beta", CLAUDE_OAUTH_BETA);
-        } else if let Some(k) = provider.api_key.as_deref() {
+        } else if let Some(k) = anthropic_nonempty_key(provider.api_key.as_deref()) {
             req = req.header("x-api-key", k);
+            set_primary_auth = true;
         }
         for (k, v) in &provider.headers {
+            if set_primary_auth && is_anthropic_primary_auth_header(k) {
+                continue;
+            }
             req = req.header(k, v);
         }
         let resp = tokio::select! {
@@ -2695,7 +2793,7 @@ async fn send_anthropic_request(
                     }
                     return Ok(r);
                 }
-                let retryable = status.as_u16() == 429 || status.is_server_error();
+                let retryable = is_retryable_http_status(status);
                 if !retryable || attempt >= 4 {
                     let text = r.text().await.unwrap_or_default();
                     if logging::debug_verbose() {
@@ -3071,9 +3169,20 @@ async fn stream_turn_anthropic(
         msg.insert("tool_calls".into(), json!(tool_calls));
     }
 
+    // Prefer an explicit stream finish reason. If the gateway omitted
+    // message_delta.stop_reason (or only sent message_stop), fall back so the
+    // turn loop still sees tool_calls vs stop — empty used to leak through.
+    let reason = if !finish_reason.is_empty() {
+        finish_reason
+    } else if tool_calls.is_empty() {
+        "stop".into()
+    } else {
+        "tool_calls".into()
+    };
+
     Ok((
         Value::Object(msg),
-        finish_reason,
+        reason,
         tokens_in,
         tokens_out,
         cached_tokens,
@@ -3827,6 +3936,24 @@ mod tests {
         assert_eq!(backoff_ms(8, None), 8000); // capped
         assert_eq!(backoff_ms(2, Some(3)), 3000); // Retry-After honored
         assert_eq!(backoff_ms(2, Some(60)), 30000); // Retry-After capped at 30s
+        assert_eq!(backoff_ms(1, Some(0)), 50); // zero Retry-After floored
+    }
+
+    #[test]
+    fn retryable_http_status_policy() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_http_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        // Non-retryable client errors must fail fast.
+        assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_http_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_http_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_http_status(StatusCode::UNPROCESSABLE_ENTITY));
+        assert!(!is_retryable_http_status(StatusCode::OK));
     }
 
     #[test]
@@ -4313,6 +4440,18 @@ mod tests {
         // too small to leave room -> None
         assert_eq!(anthropic_thinking_budget("low", 2000), None);
         assert_eq!(anthropic_thinking_budget("high", 1500), None);
+    }
+
+    #[test]
+    fn anthropic_auth_helpers_reject_empty_and_whitespace_keys() {
+        assert_eq!(anthropic_nonempty_key(None), None);
+        assert_eq!(anthropic_nonempty_key(Some("")), None);
+        assert_eq!(anthropic_nonempty_key(Some("   ")), None);
+        assert_eq!(anthropic_nonempty_key(Some(" sk-live ")), Some("sk-live"));
+        assert!(is_anthropic_primary_auth_header("Authorization"));
+        assert!(is_anthropic_primary_auth_header("X-Api-Key"));
+        assert!(!is_anthropic_primary_auth_header("anthropic-beta"));
+        assert!(!is_anthropic_primary_auth_header("user-agent"));
     }
 
     #[test]

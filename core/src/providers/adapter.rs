@@ -99,6 +99,9 @@ pub(crate) fn normalize_http_error(status: Option<u16>, body: &str) -> ProviderE
     let kind = match status {
         Some(401 | 403) => ProviderErrorKind::Authentication,
         Some(429) => ProviderErrorKind::RateLimit,
+        // 408 Request Timeout is temporary (proxy/gateway stall) — treat as
+        // retryable like a server blip, not a fatal client error.
+        Some(408) => ProviderErrorKind::Server,
         Some(code) if code >= 500 => ProviderErrorKind::Server,
         _ if lower.contains("context_length")
             || lower.contains("context length")
@@ -139,15 +142,31 @@ fn sanitize_error_message(body: &str) -> String {
         return "provider request failed".into();
     }
     let mut out = trimmed.chars().take(2_000).collect::<String>();
+    let lower = out.to_ascii_lowercase();
+    // Whole-body redaction when the payload looks credential-bearing. Prefer
+    // over-redacting: these strings often appear next to live secrets in 401
+    // bodies, proxy dumps, and misconfigured gateway responses.
     for marker in [
         "authorization",
         "bearer ",
         "api_key",
         "api-key",
+        "api key",
+        "x-api-key",
         "access_token",
+        "access-token",
         "refresh_token",
+        "refresh-token",
+        "client_secret",
+        "client-secret",
+        "id_token",
+        "oauth_token",
+        "sk-ant-",
+        "sk-or-",
+        "sk-proj-",
+        "sk-",
     ] {
-        if out.to_ascii_lowercase().contains(marker) {
+        if lower.contains(marker) {
             return "provider returned a redacted authentication/error response".into();
         }
     }
@@ -175,5 +194,44 @@ mod tests {
         let context = normalize_http_error(Some(400), "maximum context length exceeded");
         assert_eq!(context.kind, ProviderErrorKind::ContextLength);
         assert!(!context.retryable);
+    }
+
+    #[test]
+    fn request_timeout_408_is_retryable_server() {
+        let err = normalize_http_error(Some(408), "gateway timed out waiting for upstream");
+        assert_eq!(err.kind, ProviderErrorKind::Server);
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(408));
+        assert!(err.message.contains("gateway timed out"));
+    }
+
+    #[test]
+    fn empty_error_body_gets_generic_message() {
+        let err = normalize_http_error(Some(500), "   ");
+        assert_eq!(err.kind, ProviderErrorKind::Server);
+        assert!(err.retryable);
+        assert_eq!(err.message, "provider request failed");
+    }
+
+    #[test]
+    fn sanitize_redacts_common_key_prefixes_and_header_names() {
+        for body in [
+            "invalid key sk-ant-api03-ABCDEF",
+            "OpenRouter rejected sk-or-v1-deadbeef",
+            "x-api-key header missing",
+            "client_secret leaked in proxy log",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+        ] {
+            let msg = sanitize_error_message(body);
+            assert_eq!(
+                msg, "provider returned a redacted authentication/error response",
+                "body should redact: {body}"
+            );
+            assert!(!msg.contains("sk-"), "leaked material in: {msg}");
+            assert!(!msg.contains("eyJ"), "leaked jwt in: {msg}");
+        }
+        // Ordinary provider errors must stay readable.
+        let plain = sanitize_error_message("model not found: foo-bar");
+        assert_eq!(plain, "model not found: foo-bar");
     }
 }

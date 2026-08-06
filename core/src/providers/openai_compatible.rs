@@ -31,16 +31,40 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
     }
 
     fn build_request(&self, input: &ProviderRequest<'_>) -> Result<BuiltProviderRequest, String> {
-        let mut tools = input.tools.to_vec();
-        tools.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
+        let kimi = crate::provider::is_kimi(&input.provider.base_url);
+        let deepseek = crate::provider::is_deepseek(&input.provider.base_url);
+        // Non-standard request fields (reasoning_effort / thinking / reasoning_content
+        // replay) are host-gated. Vanilla OpenAI-compatible servers reject them
+        // with 400, so never put them on the wire unless the host is known.
+        let supports_reasoning = crate::provider::is_umans(&input.provider.base_url)
+            || crate::provider::is_cursor_bridge(&input.provider.base_url)
+            || kimi
+            || deepseek;
+
+        // Message::to_openai_messages re-serializes Message as-is, including any
+        // persisted `reasoning_content`. That field is only legal on the gated
+        // hosts above — strip it for everyone else so a session that previously
+        // talked to DeepSeek/Kimi/Umans does not 400 a vanilla proxy on replay.
+        let mut messages = Message::to_openai_messages(input.messages);
+        if !supports_reasoning {
+            for message in &mut messages {
+                if let Some(obj) = message.as_object_mut() {
+                    obj.remove("reasoning_content");
+                }
+            }
+        }
+
         let mut body = json!({
             "model": input.model,
-            "messages": Message::to_openai_messages(input.messages),
-            "tools": tools,
-            "tool_choice": "auto",
+            "messages": messages,
             "stream": true,
+            // Ask the server for a final usage chunk. Official OpenAI and most
+            // modern gateways honor this; without it streamed turns often report
+            // 0 tokens. (Older local servers that reject unknown fields may still
+            // 400 — see residual risk note in tests / review findings.)
             "stream_options": { "include_usage": true },
         });
+
         // Some OpenAI-compatible gateways reject or mis-handle `max_tokens: 0`
         // (treat it as "generate nothing"). Only send the field when we have a
         // real positive budget from model discovery; omit it otherwise so the
@@ -48,23 +72,29 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         if input.max_tokens > 0 {
             body["max_tokens"] = json!(input.max_tokens);
         }
-        if input
-            .tools
-            .iter()
-            .any(|tool| tool_name(tool) == "goal_write_plan")
-        {
-            body["tool_choice"] = json!({
-                "type": "function",
-                "function": { "name": "goal_write_plan" }
-            });
+
+        // Never send `tools: []` + `tool_choice: "auto"`. Empty tools arrays
+        // (and tool_choice without tools) are rejected by strict proxies and
+        // several local OpenAI-compatible servers. Mirror Anthropic/Gemini:
+        // omit both fields entirely when the harness has no tools to offer.
+        if !input.tools.is_empty() {
+            let mut tools = input.tools.to_vec();
+            tools.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
+            body["tools"] = json!(tools);
+            if input
+                .tools
+                .iter()
+                .any(|tool| tool_name(tool) == "goal_write_plan")
+            {
+                body["tool_choice"] = json!({
+                    "type": "function",
+                    "function": { "name": "goal_write_plan" }
+                });
+            } else {
+                body["tool_choice"] = json!("auto");
+            }
         }
 
-        let kimi = crate::provider::is_kimi(&input.provider.base_url);
-        let deepseek = crate::provider::is_deepseek(&input.provider.base_url);
-        let supports_reasoning = crate::provider::is_umans(&input.provider.base_url)
-            || crate::provider::is_cursor_bridge(&input.provider.base_url)
-            || kimi
-            || deepseek;
         let mut notices = Vec::new();
         if supports_reasoning {
             let resolved =
@@ -90,7 +120,9 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     body["reasoning_effort"] = json!(resolved);
                     body["thinking"] = json!({ "type": "enabled" });
                 }
-            } else {
+            } else if !resolved.is_empty() {
+                // Umans / Cursor bridge: only send when non-empty. An empty
+                // string is another zero-ish sentinel some gateways 400 on.
                 body["reasoning_effort"] = json!(resolved);
             }
         }
@@ -183,6 +215,133 @@ mod tests {
             "max_tokens:0 must be omitted, got {:?}",
             built.body.get("max_tokens")
         );
+    }
+
+    #[test]
+    fn empty_tools_and_tool_choice_are_omitted() {
+        // tools:[] + tool_choice:"auto" 400 on strict OpenAI-compatible servers.
+        // When the harness has no tools, omit both fields entirely.
+        let provider = provider("https://example.com/v1");
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &[],
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert!(
+            built.body.get("tools").is_none(),
+            "empty tools must be omitted, got {:?}",
+            built.body.get("tools")
+        );
+        assert!(
+            built.body.get("tool_choice").is_none(),
+            "tool_choice without tools must be omitted, got {:?}",
+            built.body.get("tool_choice")
+        );
+        // stream_options.include_usage stays — we still want usage accounting.
+        assert_eq!(built.body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn non_empty_tools_still_send_sorted_tools_and_auto_choice() {
+        let provider = provider("https://example.com/v1");
+        let tools = vec![
+            json!({"type":"function","function":{"name":"z_tool"}}),
+            json!({"type":"function","function":{"name":"a_tool"}}),
+        ];
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &[],
+            tools: &tools,
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["tools"][0]["function"]["name"], "a_tool");
+        assert_eq!(built.body["tools"][1]["function"]["name"], "z_tool");
+        assert_eq!(built.body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn goal_write_plan_forces_tool_choice_when_tools_present() {
+        let provider = provider("https://example.com/v1");
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "goal_write_plan" }
+        })];
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &[],
+            tools: &tools,
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["tool_choice"]["type"], "function");
+        assert_eq!(
+            built.body["tool_choice"]["function"]["name"],
+            "goal_write_plan"
+        );
+    }
+
+    #[test]
+    fn vanilla_endpoint_strips_persisted_reasoning_content() {
+        // A session that previously hit DeepSeek/Kimi/Umans may have assistant
+        // messages with reasoning_content on disk. Replaying them to a vanilla
+        // OpenAI-compatible proxy must not put that non-standard field on wire.
+        let provider = provider("https://example.com/v1");
+        let messages = vec![Message::try_from(&json!({
+            "role": "assistant",
+            "content": "ok",
+            "reasoning_content": "secret thoughts from a prior vendor"
+        }))
+        .unwrap()];
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "model",
+            messages: &messages,
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["messages"][0]["content"], "ok");
+        assert!(
+            built.body["messages"][0].get("reasoning_content").is_none(),
+            "reasoning_content must be stripped for vanilla hosts, got {:?}",
+            built.body["messages"][0]
+        );
+    }
+
+    #[test]
+    fn deepseek_endpoint_keeps_persisted_reasoning_content() {
+        let provider = deepseek_provider();
+        let messages = vec![Message::try_from(&json!({
+            "role": "assistant",
+            "content": "ok",
+            "reasoning_content": "keep me"
+        }))
+        .unwrap()];
+        let request = ProviderRequest {
+            provider: &provider,
+            model: "deepseek-v4-flash",
+            messages: &messages,
+            tools: &[],
+            reasoning_effort: "none",
+            thinking_levels: &[],
+            max_tokens: 100,
+        };
+        let built = OpenAiCompatibleAdapter.build_request(&request).unwrap();
+        assert_eq!(built.body["messages"][0]["reasoning_content"], "keep me");
     }
 
     fn kimi_provider() -> ResolvedProvider {

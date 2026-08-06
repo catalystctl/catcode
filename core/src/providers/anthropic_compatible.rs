@@ -212,4 +212,113 @@ mod tests {
             vec![NormalizedStreamEvent::RetryableError("busy".into())]
         );
     }
+
+    #[test]
+    fn max_tokens_zero_defaults_to_8192_not_zero_or_one() {
+        // Anthropic requires max_tokens; 0 must not reach the wire, and we
+        // deliberately avoid a 1-token floor that would truncate replies.
+        use crate::config::{ProviderKind, ResolvedProvider};
+        use crate::message::Message;
+        use crate::providers::adapter::ProviderRequest;
+
+        let provider = ResolvedProvider {
+            name: "anthropic".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key: Some("sk-test".into()),
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        };
+        let messages = [Message::user("hi")];
+        let built = AnthropicCompatibleAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "claude-sonnet-4",
+                messages: &messages,
+                tools: &[],
+                reasoning_effort: "none",
+                thinking_levels: &[],
+                max_tokens: 0,
+            })
+            .expect("build");
+        assert_eq!(built.body["max_tokens"], 8192);
+        assert_eq!(built.body["stream"], true);
+        assert_eq!(built.body["model"], "claude-sonnet-4");
+    }
+
+    #[test]
+    fn thinking_delta_and_partial_json_and_cache_usage_decode() {
+        assert_eq!(
+            decode_anthropic_chunk(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "hmm"}
+            })),
+            vec![NormalizedStreamEvent::ReasoningDelta("hmm".into())]
+        );
+        assert!(matches!(
+            decode_anthropic_chunk(&json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"a\""}
+            })).as_slice(),
+            [NormalizedStreamEvent::ToolCallDelta(d)]
+                if d.index == 1 && d.arguments.as_deref() == Some("{\"a\"")
+        ));
+        // message_start may carry cache_read_input_tokens; surface as cached.
+        assert_eq!(
+            decode_anthropic_chunk(&json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 40
+                    }
+                }
+            })),
+            vec![NormalizedStreamEvent::Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(0),
+                cached_tokens: Some(40),
+            }]
+        );
+        // Non-retryable stream error stays fatal.
+        assert_eq!(
+            decode_anthropic_chunk(&json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "bad"}
+            })),
+            vec![NormalizedStreamEvent::FatalError("bad".into())]
+        );
+        // stop_sequence / max_tokens map to OpenAI-ish finish reasons.
+        assert_eq!(
+            decode_anthropic_chunk(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "max_tokens"}
+            })),
+            vec![NormalizedStreamEvent::FinishReason("length".into())]
+        );
+    }
+
+    #[test]
+    fn content_block_start_ignores_non_tool_blocks() {
+        // text / thinking starts must not fabricate ToolCallStart (that would
+        // poison tool_args assembly with empty placeholders).
+        assert!(decode_anthropic_chunk(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }))
+        .is_empty());
+        assert!(decode_anthropic_chunk(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }))
+        .is_empty());
+    }
 }
