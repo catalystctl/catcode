@@ -260,19 +260,40 @@ func launchUpdateCheck(prog *tea.Program) {
 // `catcode --update` (and --check-update / --version / --help)
 // -----------------------------------------------------------------------------
 
-// handleCLIArgs inspects os.Args before the TUI starts. If a recognized flag is
-// present it performs the action and returns (exitCode, true); otherwise
-// (0, false) so main() proceeds to launch the TUI.
+// debugMode is set by handleCLIArgs when the user passed `catcode --debug`.
+// startCore then forwards `--debug` to the core so HTTP bodies, tool args, and
+// protocol events land in ~/.config/catalyst-code/debug.jsonl.
+var debugMode bool
+
+// handleCLIArgs inspects os.Args before the TUI starts. Action flags
+// (--help/--version/--update/...) perform their work and return (exitCode, true).
+// `--debug` is a session flag: it arms verbose logging and returns (0, false)
+// so main() proceeds to launch the TUI. Combining `--debug` with an action
+// flag is rejected.
 func handleCLIArgs(args []string) (int, bool) {
 	if len(args) == 0 {
 		return 0, false
 	}
-	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "catcode: expected one command/flag, got %d\n", len(args))
+
+	filtered := make([]string, 0, len(args))
+	for _, a := range args {
+		switch a {
+		case "--debug":
+			debugMode = true
+		default:
+			filtered = append(filtered, a)
+		}
+	}
+	if len(filtered) == 0 {
+		// Only --debug (possibly repeated): launch the TUI in verbose mode.
+		return 0, false
+	}
+	if len(filtered) != 1 {
+		fmt.Fprintf(os.Stderr, "catcode: expected one command/flag, got %d\n", len(filtered))
 		fmt.Fprintln(os.Stderr, "Run `catcode --help` for usage.")
 		return 2, true
 	}
-	switch args[0] {
+	switch filtered[0] {
 	case "-h", "--help":
 		printUsage()
 		return 0, true
@@ -285,7 +306,7 @@ func handleCLIArgs(args []string) (int, bool) {
 	case "--update", "-u", "update":
 		return runUpdate(), true
 	default:
-		fmt.Fprintf(os.Stderr, "catcode: unknown argument %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "catcode: unknown argument %q\n", filtered[0])
 		fmt.Fprintln(os.Stderr, "Run `catcode --help` for usage.")
 		return 2, true
 	}
@@ -296,10 +317,17 @@ func printUsage() {
 
 Usage:
   catcode                       start the interactive TUI
+  catcode --debug               start with full-verbosity debug logging
   catcode --update              update CLI (+ web frontend if installed)
   catcode --check-update        report whether an update is available
   catcode --version, -v         print the current version
   catcode --help, -h            show this help
+
+--debug writes everything the core sees (HTTP request/response bodies, tool
+args + outputs, protocol commands/events, errors) to
+~/.config/catalyst-code/debug.jsonl. Secrets (api keys, tokens) are redacted;
+large payloads are truncated at 64 KiB per field. Also set via
+CATALYST_CODE_DEBUG=1.
 
 The version is the git commit short SHA of the build. Run ` + "`catcode --update`" + `
 to fetch the matching platform binary from github.com/` + githubRepo + ` and

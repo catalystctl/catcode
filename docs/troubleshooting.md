@@ -153,7 +153,7 @@ different prefix, or the install script's binary download failed.
 or incompatible system libraries.
 
 **Check:**
-- Run the TUI with verbose output to see the core's stderr.
+- Run `catcode --debug` and inspect `~/.config/catalyst-code/debug.jsonl` (HTTP bodies, tool args, protocol events, errors).
 - Look for a core crash log in the session directory.
 - Try starting without a session file:
   ```bash

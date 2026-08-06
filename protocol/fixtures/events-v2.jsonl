@@ -38,6 +38,7 @@
 {"type":"memory_saved","protocol_version":2}
 {"type":"metrics","protocol_version":2}
 {"type":"models","protocol_version":2}
+{"type":"models_refreshed","protocol_version":2,"count":2,"providers":{"umans":["fixture-model"]}}
 {"type":"oauth_prompt","protocol_version":2}
 {"type":"plugin_commands","protocol_version":2}
 {"type":"plugin_disabled","protocol_version":2}

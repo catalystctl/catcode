@@ -1204,6 +1204,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/new", desc: "start a fresh session file"},
 		{group: "Session", label: "/stats", desc: "token + turn totals"},
 		{group: "Session", label: "/status", desc: "model, policy, performance, and UI state"},
+		{group: "Session", label: "/refresh", desc: "refresh model list (live fetch, bypass cache)"},
 		{group: "Session", label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{group: "Session", label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
 		{group: "Session", label: "/abort", desc: "stop running turn (or Esc) · alias: /stop"},

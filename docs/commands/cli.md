@@ -15,6 +15,7 @@ The TUI binary is the primary user-facing entry point.
 
 ```text
 catcode                       start the interactive TUI
+catcode --debug               start with full-verbosity debug logging
 catcode --update              update CLI (and web frontend if installed)
 catcode --check-update        report whether an update is available
 catcode --version, -v         print version
@@ -26,6 +27,7 @@ catcode --help, -h            show help
 | Flag | Purpose | Default |
 |---|---|---|
 | _(no args)_ | Start the interactive TUI | — |
+| `--debug` | Full-verbosity debug mode: HTTP request/response bodies, tool args+outputs, protocol command/event mirror, errors. Writes to `~/.config/catalyst-code/debug.jsonl` (secrets redacted; payloads capped at 64 KiB). Also `CATALYST_CODE_DEBUG=1`. | off |
 | `-h`, `--help` | Print usage text and exit | — |
 | `-v`, `--version` | Print version and exit | — |
 | `--check-update` | Check GitHub Releases for a newer binary. Exits 0 regardless (scripting-friendly). | — |
@@ -40,6 +42,7 @@ The version is the git commit short SHA, injected at build via `-ldflags -X main
 | Variable | Purpose |
 |---|---|
 | `CATCODE_CORE` | Explicit path to the `core` binary. If set and the file exists, the TUI uses it instead of searching the install layout or PATH. |
+| `CATALYST_CODE_DEBUG` | Set to `1`/`true` to enable full-verbosity debug mode (same as `catcode --debug`). Forwarded to the core as `--debug`. |
 
 ### Core Binary Discovery
 
@@ -86,6 +89,7 @@ core [OPTIONS]
 | `--idle-timeout <SECS>` | integer | `120` | `CATALYST_CODE_IDLE_TIMEOUT` | SSE idle timeout. |
 | `--max-session-tokens <N>` | integer | `0` (unlimited) | `CATALYST_CODE_MAX_SESSION_TOKENS` | Hard session token budget. `0` = unlimited. |
 | `--debug-log <FILE>` | path | none | `CATALYST_CODE_DEBUG_LOG` | Structured JSONL debug log path. |
+| `--debug` | flag | off | `CATALYST_CODE_DEBUG=1` | Full-verbosity debug mode (HTTP bodies, tool args/outputs, protocol events). Defaults `--debug-log` to `~/.config/catalyst-code/debug.jsonl` when unset. |
 | `--session <FILE>` | path | none | `CATALYST_CODE_SESSION` | Append-only JSONL session file (resumed on restart). |
 | `--model <ID>` | string | none | — | Default model ID. |
 | `--provider <NAME>` | string | none | `UMANS_ACTIVE_PROVIDER` | Active provider name (matches a `providers[]` entry in config). |

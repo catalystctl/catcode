@@ -121,6 +121,13 @@ pub enum Command {
     Send {
         prompt: String,
         model: String,
+        /// Optional provider the selected model belongs to. When the same model
+        /// id is served by several logged-in providers, this is the user's
+        /// explicit pick and MUST win routing over the active-provider
+        /// tie-break (selecting a model in `/models` uses its owning provider,
+        /// no `/login` + provider switch needed). Omitted by older clients.
+        #[serde(default)]
+        provider: Option<String>,
         #[serde(default)]
         reasoning_effort: Option<String>,
         /// Optional images: each is a data URL (data:image/png;base64,...) or an
@@ -136,6 +143,9 @@ pub enum Command {
     Steer {
         prompt: String,
         model: String,
+        /// Optional owning provider for `model` (same semantics as `send`).
+        #[serde(default)]
+        provider: Option<String>,
         #[serde(default)]
         reasoning_effort: Option<String>,
     },
@@ -385,6 +395,16 @@ pub enum Command {
     /// TUI/web to populate the `/skill:<name>` autocomplete.
     #[serde(rename = "list_skills")]
     ListSkills,
+    /// On-demand model-cache refresh: force a LIVE discovery for every
+    /// logged-in provider (bypassing the 8h disk-cache TTL, rewriting the
+    /// cache), re-aggregate, and re-emit `models` + `provider_presets`,
+    /// finishing with a `models_refreshed` event (count + per-provider ids).
+    /// Runs off the command loop — live /models + models.dev enrichment can
+    /// take many seconds; a dead endpoint falls back to the stale cache so
+    /// the list never shrinks. Triggered by TUI `/refresh` and the web
+    /// model-picker refresh button.
+    #[serde(rename = "refresh_models")]
+    RefreshModels,
     /// Invoke a skill by name: the core reads the matching SKILL.md (resolving
     /// project > user scope, bypassing the read_file path restriction so global
     /// skills under ~/.catalyst-code/skills work too), builds a prompt that

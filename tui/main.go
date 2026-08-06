@@ -294,6 +294,8 @@ type session struct {
 	activityExpanded  bool                // expands the compact tasks/subagents activity shelf
 	activityScroll    int                 // first detail row shown in the focused activity shelf
 	cwd               string              // working dir, shown in the header as ~/
+	projectName       string              // launch-dir basename; shown in the terminal window title
+	titleBell         bool                // attention bell in the window title until the user returns
 	viewChrome        *viewChromeCache    // non-nil only during View(); dedupes measure+paint
 
 	// Ephemeral UX state (toasts, sticky OAuth, one-shot prompts).
@@ -352,6 +354,7 @@ func initialSession() *session {
 	s.follow = true // pin viewport to newest line until the user scrolls up
 	s.focusedBlock = -1
 	s.cwd = cwdDisplay()
+	s.projectName = projectName()
 	s.maxTaskRows = 4 // cap on task-panel entries; layout() shrinks it to fit available height
 	// Seed runtime knobs from settings so the UI shows persisted values before
 	// the core's ready event (and so a pre-ready edit doesn't fight defaults).
@@ -492,6 +495,11 @@ func (s *session) startCore() tea.Cmd {
 		"--session", sessionFile,
 		"--debug-log", debugLog,
 		"--idle-timeout", fmt.Sprintf("%d", s.settings.IdleTimeout),
+	}
+	// `catcode --debug` (or CATALYST_CODE_DEBUG=1) asks the core for full
+	// verbosity: HTTP bodies, tool args/outputs, protocol command/event mirror.
+	if debugMode || os.Getenv("CATALYST_CODE_DEBUG") == "1" || strings.EqualFold(os.Getenv("CATALYST_CODE_DEBUG"), "true") {
+		args = append(args, "--debug")
 	}
 	if s.settings.BashTimeoutSecs > 0 {
 		args = append(args, "--bash-timeout", fmt.Sprintf("%d", s.settings.BashTimeoutSecs))
@@ -740,6 +748,8 @@ func (s *session) Init() tea.Cmd {
 	// Arm the busy-frame clock immediately so the startup splash animates from
 	// the first paint (before tickMsg's 1s re-arm path can notice needsBusyFrames).
 	s.busyFrameActive = true
+	// Fresh launch: no stale attention bell from a previous session state.
+	s.titleBell = false
 	return tea.Batch(s.startCore(), tick(), busyFrameTick())
 }
 
@@ -775,6 +785,7 @@ func (s *session) resetCoreUIState() {
 	s.askBoxRows = nil
 	s.sudoBoxRows = nil
 	s.ctrlCAbortArmed = false
+	s.titleBell = false
 	s.restoreAllComposerDrafts()
 	if s.modal.kind != modalNone {
 		s.closeModal()
@@ -1103,6 +1114,17 @@ func (s *session) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return s, s.handleModalSelectionFrame(msg)
 		}
 		return s, s.handleTranscriptSelectionFrame(msg)
+
+	case tea.FocusMsg:
+		// The terminal window regained focus (ReportFocus in View) — the user is
+		// looking at catcode again, so silence the window-title attention bell.
+		s.titleBell = false
+		return s, nil
+
+	case tea.BlurMsg:
+		// Focus-loss carries no UI state change; consume it so the default case
+		// can't forward it into the ask flyout / picker list.
+		return s, nil
 
 	case tea.PasteMsg:
 		// v2 enables bracketed-paste by default, so every paste arrives as a

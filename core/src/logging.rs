@@ -5,12 +5,95 @@ use crate::message::{Content, ContentPart, Message};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+/// Process-wide mirror of `Config.debug_verbose`. Set once at core boot so
+/// hot paths (provider HTTP, protocol emit) can check without holding State.
+static DEBUG_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Optional process-wide logger used by code that has no State handle
+/// (provider HTTP, protocol emit mirror). Installed at boot when a debug log
+/// path is configured; never cleared mid-session.
+static GLOBAL_LOGGER: OnceLock<Arc<Logger>> = OnceLock::new();
+
+/// Cap for verbose payloads (request bodies, tool args/outputs, event data)
+/// so a single giant write_file or SSE dump cannot blow the log past rotation.
+pub const VERBOSE_PAYLOAD_CAP: usize = 64 * 1024;
+
+pub fn set_debug_verbose(on: bool) {
+    DEBUG_VERBOSE.store(on, Ordering::SeqCst);
+}
+
+pub fn debug_verbose() -> bool {
+    DEBUG_VERBOSE.load(Ordering::Relaxed)
+}
+
+/// Install the process-wide logger. First call wins (Arc clone shared).
+pub fn install_global_logger(logger: Arc<Logger>) {
+    let _ = GLOBAL_LOGGER.set(logger);
+}
+
+/// Best-effort log through the process-wide logger (no-op if not installed).
+pub fn global_log(kind: &str, payload: Value) {
+    if let Some(logger) = GLOBAL_LOGGER.get() {
+        logger.log(kind, payload);
+    }
+}
+
+/// Truncate a string for verbose logging. Returns (text, original_len, truncated).
+pub fn truncate_for_log(s: &str, cap: usize) -> (String, usize, bool) {
+    let len = s.len();
+    if len <= cap {
+        return (s.to_string(), len, false);
+    }
+    // Prefer a char boundary so we never emit invalid UTF-8 mid-grapheme.
+    let mut end = cap.min(len);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str(&format!(
+        "\n…[truncated {omitted} chars]",
+        omitted = len - end
+    ));
+    (out, len, true)
+}
+
+/// Truncate a JSON value's string form for verbose logging. Objects/arrays are
+/// re-serialized then truncated; already-string values are truncated in place.
+pub fn truncate_json_for_log(value: &Value, cap: usize) -> Value {
+    match value {
+        Value::String(s) => {
+            let (text, len, truncated) = truncate_for_log(s, cap);
+            if truncated {
+                json!({ "text": text, "original_len": len, "truncated": true })
+            } else {
+                Value::String(text)
+            }
+        }
+        other => {
+            let rendered = serde_json::to_string(other).unwrap_or_else(|_| "null".into());
+            let (text, len, truncated) = truncate_for_log(&rendered, cap);
+            if truncated {
+                json!({ "json": text, "original_len": len, "truncated": true })
+            } else {
+                // Prefer structured JSON when it fits; fall back to the string
+                // form only if re-parse somehow fails (shouldn't).
+                serde_json::from_str(&text).unwrap_or(Value::String(text))
+            }
+        }
+    }
+}
 
 pub struct Logger {
     file: Mutex<Option<std::fs::File>>,
     turns: std::sync::atomic::AtomicU64,
+    /// When true, callers may attach full request bodies / tool args / event
+    /// mirrors. The flag also lives process-wide (`debug_verbose()`) so code
+    /// without a Logger handle can check it.
+    verbose: bool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -26,6 +109,10 @@ pub struct TurnMetrics {
 
 impl Logger {
     pub fn new(path: Option<&std::path::Path>) -> Self {
+        Self::with_verbose(path, false)
+    }
+
+    pub fn with_verbose(path: Option<&std::path::Path>, verbose: bool) -> Self {
         let file = path.and_then(|p| {
             // Rotate once if the debug log has grown past a generous cap, so a
             // long-running session with CATALYST_CODE_DEBUG_LOG set can't fill
@@ -43,10 +130,18 @@ impl Logger {
             }
             OpenOptions::new().create(true).append(true).open(p).ok()
         });
+        // Keep the process-wide flag in sync so provider/protocol code can
+        // check without a Logger handle. Safe to call repeatedly.
+        set_debug_verbose(verbose);
         Self {
             file: Mutex::new(file),
             turns: std::sync::atomic::AtomicU64::new(0),
+            verbose,
         }
+    }
+
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
     }
 
     /// Number of completed turns this session (incremented by main on turn_done).
@@ -83,6 +178,14 @@ impl Logger {
         if let Some(f) = self.file.lock().unwrap().as_mut() {
             let _ = f.write_all(line.as_bytes());
             let _ = f.flush();
+        }
+    }
+
+    /// Log only when verbose mode is on. Used for high-volume mirrors (protocol
+    /// events, full HTTP bodies) that would drown a normal debug log.
+    pub fn log_verbose(&self, kind: &str, payload: Value) {
+        if self.verbose {
+            self.log(kind, payload);
         }
     }
 }
@@ -542,6 +645,65 @@ mod tests {
         assert_eq!(record["payload"]["nested"]["safe"], "visible");
         assert!(!text.contains("secret-one"));
         assert!(!text.contains("secret-two"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn truncate_for_log_keeps_short_strings() {
+        let (text, len, truncated) = truncate_for_log("hello", 100);
+        assert_eq!(text, "hello");
+        assert_eq!(len, 5);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_for_log_caps_long_strings() {
+        let big = "x".repeat(1000);
+        let (text, len, truncated) = truncate_for_log(&big, 50);
+        assert!(truncated);
+        assert_eq!(len, 1000);
+        assert!(text.contains("[truncated 950 chars]"));
+        assert!(text.len() < 100);
+    }
+
+    #[test]
+    fn log_verbose_is_a_no_op_when_not_verbose() {
+        let path = std::env::temp_dir().join(format!(
+            "catalyst-code-log-verbose-off-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let logger = Logger::with_verbose(Some(&path), false);
+            logger.log_verbose("should_not_appear", json!({"x": 1}));
+            logger.log("always", json!({"y": 2}));
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("should_not_appear"));
+        assert!(text.contains("always"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn log_verbose_writes_when_verbose() {
+        let path = std::env::temp_dir().join(format!(
+            "catalyst-code-log-verbose-on-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let logger = Logger::with_verbose(Some(&path), true);
+            assert!(logger.is_verbose());
+            assert!(debug_verbose());
+            logger.log_verbose("http_request", json!({"url": "https://example.test"}));
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("http_request"));
+        assert!(text.contains("example.test"));
+        // Reset process-wide flag so other tests aren't polluted.
+        set_debug_verbose(false);
         let _ = std::fs::remove_file(path);
     }
 }

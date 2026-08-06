@@ -64,10 +64,28 @@ pub(crate) async fn run() {
         cfg.active_provider.as_deref(),
         &client,
         Some(&plugin_manager),
+        false,
     )
     .await;
-    let logger = Logger::new(cfg.debug_log.as_deref());
-    logger.log("init", json!({ "workspace": cfg.workspace.display().to_string(), "provider": init_provider.name, "kind": init_provider.kind.as_str(), "base_url": init_provider.base_url, "approval": cfg.approval.as_str() }));
+    // Install the process-wide logger first so provider HTTP / protocol emit can
+    // write verbose records without a State handle. State keeps its own Logger
+    // handle on the same path (append-mode; both FDs are fine).
+    crate::logging::install_global_logger(std::sync::Arc::new(Logger::with_verbose(
+        cfg.debug_log.as_deref(),
+        cfg.debug_verbose,
+    )));
+    let logger = Logger::with_verbose(cfg.debug_log.as_deref(), cfg.debug_verbose);
+    logger.log(
+        "init",
+        json!({
+            "workspace": cfg.workspace.display().to_string(),
+            "provider": init_provider.name,
+            "kind": init_provider.kind.as_str(),
+            "base_url": init_provider.base_url,
+            "approval": cfg.approval.as_str(),
+            "debug_verbose": cfg.debug_verbose,
+        }),
+    );
 
     // Resume session if configured and present. A future-version session file
     // returns Err (surfaced to the user via an `error` event at Init) rather
@@ -357,9 +375,40 @@ pub(crate) async fn run() {
         if line.trim().is_empty() {
             continue;
         }
+        // Verbose mode: mirror every inbound protocol command (redacted) so a
+        // `catcode --debug` session can reconstruct the full wire conversation.
+        if crate::logging::debug_verbose() {
+            match serde_json::from_str::<Value>(&line) {
+                Ok(v) => crate::logging::global_log(
+                    "command",
+                    json!({ "raw": crate::logging::truncate_json_for_log(&v, crate::logging::VERBOSE_PAYLOAD_CAP) }),
+                ),
+                Err(_) => {
+                    let (text, len, truncated) = crate::logging::truncate_for_log(
+                        &line,
+                        crate::logging::VERBOSE_PAYLOAD_CAP,
+                    );
+                    crate::logging::global_log(
+                        "command",
+                        json!({
+                            "raw_text": text,
+                            "original_len": len,
+                            "truncated": truncated,
+                            "parse_error": true,
+                        }),
+                    );
+                }
+            }
+        }
         let cmd = match serde_json::from_str::<Command>(&line) {
             Ok(c) => c,
             Err(e) => {
+                if crate::logging::debug_verbose() {
+                    crate::logging::global_log(
+                        "command_error",
+                        json!({ "error": format!("bad command: {e}") }),
+                    );
+                }
                 emit(
                     &Event::new("error")
                         .with("code", json!("invalid_command"))
@@ -2403,7 +2452,8 @@ pub(crate) async fn run() {
                                 let st = state.clone();
                                 let client_c = client.clone();
                                 let effort = "medium".to_string();
-                                start_turn(&st, &client_c, model, rendered, effort, None).await;
+                                start_turn(&st, &client_c, model, None, rendered, effort, None)
+                                    .await;
                             }
                         }
                     }
@@ -2478,6 +2528,30 @@ pub(crate) async fn run() {
                 let ws = state.cfg.read().await.workspace.clone();
                 emit_skills_event(&ws);
             }
+            Command::RefreshModels => {
+                // On-demand model-cache refresh (TUI `/refresh`, web refresh
+                // button). Force a live discovery for every logged-in provider
+                // (bypassing the 8h disk-cache TTL), then re-aggregate + re-emit.
+                //
+                // IMPORTANT: run off the command loop. Live /models + models.dev
+                // enrichment can take many seconds on a dead/slow host; awaiting
+                // here would freeze every other command (same gotcha as
+                // `discover_provider_models`). Emit an info event up front so
+                // clients can show a spinner until `models_refreshed` arrives.
+                emit(&Event::new("info").with(
+                    "message",
+                    json!("refreshing model list (live fetch from all logged-in providers)…"),
+                ));
+                let st = state.clone();
+                let cl = client.clone();
+                state
+                    .logger
+                    .log("refresh_models", json!({ "phase": "start" }));
+                tokio::spawn(async move {
+                    st.refresh_models_force(&cl).await;
+                    st.logger.log("refresh_models", json!({ "phase": "done" }));
+                });
+            }
             Command::ListAgents => {
                 let cfg = state.cfg.read().await;
                 emit_agents_event(&cfg.workspace, &cfg);
@@ -2508,7 +2582,7 @@ pub(crate) async fn run() {
                 };
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
                 let prompt = build_skill_prompt(&skill, task.as_deref());
-                start_turn(&st, &client, model, prompt, effort, None).await;
+                start_turn(&st, &client, model, None, prompt, effort, None).await;
             }
             Command::StartGoal {
                 goal: goal_text,
@@ -2650,7 +2724,7 @@ pub(crate) async fn run() {
                                 drop(resource);
                             }));
                         }
-                        start_turn(&state, &client, turn_model, prompt, effort, None).await;
+                        start_turn(&state, &client, turn_model, None, prompt, effort, None).await;
                     }
                     Err(e) => {
                         emit(&Event::new("error").with("message", json!(e)));
@@ -2748,7 +2822,7 @@ pub(crate) async fn run() {
                     }
                 };
                 if let Some((prompt, effort)) = prompt {
-                    start_turn(&state, &client, model, prompt, effort, None).await;
+                    start_turn(&state, &client, model, None, prompt, effort, None).await;
                 }
             }
             Command::UserBash {
@@ -3099,6 +3173,7 @@ pub(crate) async fn run() {
             Command::Send {
                 prompt,
                 model,
+                provider,
                 reasoning_effort,
                 images,
             } => {
@@ -3113,11 +3188,12 @@ pub(crate) async fn run() {
                 let effort = reasoning_effort.unwrap_or_else(|| "medium".into());
                 // If a turn is already running, buffer this prompt (one-deep) instead
                 // of dropping it. It drains when the running turn emits `done`.
-                start_turn(&st, &client, model, prompt, effort, images).await;
+                start_turn(&st, &client, model, provider, prompt, effort, images).await;
             }
             Command::Steer {
                 prompt,
                 model,
+                provider,
                 reasoning_effort,
             } => {
                 let st = state.clone();
@@ -3138,6 +3214,7 @@ pub(crate) async fn run() {
                     *st.queued.lock().await = Some(QueuedPrompt {
                         prompt,
                         model,
+                        provider,
                         effort,
                     });
                     if let Some(cancelled) = st.runtime.cancel_current(CancellationReason::Steering)
@@ -3162,6 +3239,7 @@ pub(crate) async fn run() {
                         st.clone(),
                         client_c,
                         model,
+                        provider,
                         prompt,
                         effort,
                         None,

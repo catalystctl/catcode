@@ -6,7 +6,7 @@
 // delta/thinking/tool_call events. Retries on transient HTTP errors with
 // exponential backoff (honors Retry-After).
 use crate::config::{ProviderKind, ResolvedProvider};
-use crate::logging::{estimate_tokens, TurnTimer};
+use crate::logging::{self, estimate_tokens, TurnTimer};
 use crate::message::{self, Message};
 #[cfg(test)]
 use crate::protocol::ModelInfo;
@@ -2050,6 +2050,22 @@ async fn send_with_retry(
         // compression middleware commonly buffers several small token events
         // before producing one compressed output chunk, which looks like fake
         // streaming to callers even though the upstream is emitting deltas.
+        if logging::debug_verbose() {
+            // Header names only — never log bearer tokens / api keys.
+            let header_names: Vec<String> = headers.iter().map(|(k, _)| k.clone()).collect();
+            logging::global_log(
+                "http_request",
+                json!({
+                    "attempt": attempt,
+                    "method": "POST",
+                    "url": url,
+                    "header_names": header_names,
+                    "has_bearer": !api_key.is_empty(),
+                    "body": logging::truncate_json_for_log(body, logging::VERBOSE_PAYLOAD_CAP),
+                }),
+            );
+        }
+
         let mut req = client
             .post(url)
             .bearer_auth(api_key)
@@ -2070,6 +2086,17 @@ async fn send_with_retry(
             Ok(r) => r,
             Err(e) => {
                 // Transport error: retry with backoff.
+                if logging::debug_verbose() {
+                    logging::global_log(
+                        "http_error",
+                        json!({
+                            "attempt": attempt,
+                            "url": url,
+                            "error": fmt_chain(&e),
+                            "kind": "transport",
+                        }),
+                    );
+                }
                 if attempt >= 4 {
                     let normalized = adapter.normalize_error(None, &fmt_chain(&e));
                     return Err(format!(
@@ -2091,6 +2118,24 @@ async fn send_with_retry(
 
         let status = resp.status();
         if status.is_success() {
+            if logging::debug_verbose() {
+                logging::global_log(
+                    "http_response",
+                    json!({
+                        "attempt": attempt,
+                        "url": url,
+                        "status": status.as_u16(),
+                        "ok": true,
+                        // Streaming body is not buffered here; provider_request
+                        // metrics cover the call. Log status + content-type only.
+                        "content_type": resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(""),
+                    }),
+                );
+            }
             return Ok(resp);
         }
 
@@ -2098,6 +2143,22 @@ async fn send_with_retry(
         let retryable = status.as_u16() == 429 || status.is_server_error();
         if !retryable || attempt >= 4 {
             let text = resp.text().await.unwrap_or_default();
+            if logging::debug_verbose() {
+                let (body_text, body_len, truncated) =
+                    logging::truncate_for_log(&text, logging::VERBOSE_PAYLOAD_CAP);
+                logging::global_log(
+                    "http_response",
+                    json!({
+                        "attempt": attempt,
+                        "url": url,
+                        "status": status.as_u16(),
+                        "ok": false,
+                        "body": body_text,
+                        "body_len": body_len,
+                        "truncated": truncated,
+                    }),
+                );
+            }
             let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
             return Err(format!("HTTP {status}: {}", normalized.message));
         }
@@ -2109,7 +2170,24 @@ async fn send_with_retry(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
         // Drain body before retry to free the connection.
-        let _ = resp.text().await;
+        let err_body = resp.text().await.unwrap_or_default();
+        if logging::debug_verbose() {
+            let (body_text, body_len, truncated) =
+                logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
+            logging::global_log(
+                "http_response",
+                json!({
+                    "attempt": attempt,
+                    "url": url,
+                    "status": status.as_u16(),
+                    "ok": false,
+                    "retrying": true,
+                    "body": body_text,
+                    "body_len": body_len,
+                    "truncated": truncated,
+                }),
+            );
+        }
         let backoff = backoff_ms(attempt, retry_after);
         emit(
             &Event::new("http_retry")
@@ -2549,6 +2627,23 @@ async fn send_anthropic_request(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        if logging::debug_verbose() {
+            let header_names: Vec<String> =
+                provider.headers.iter().map(|(k, _)| k.clone()).collect();
+            logging::global_log(
+                "http_request",
+                json!({
+                    "attempt": attempt,
+                    "method": "POST",
+                    "url": url,
+                    "provider_kind": "anthropic",
+                    "header_names": header_names,
+                    "oauth": provider.oauth,
+                    "has_key": provider.api_key.is_some(),
+                    "body": logging::truncate_json_for_log(body, logging::VERBOSE_PAYLOAD_CAP),
+                }),
+            );
+        }
         let mut req = client
             .post(url)
             .header("anthropic-version", ANTHROPIC_VERSION)
@@ -2580,11 +2675,40 @@ async fn send_anthropic_request(
             Ok(r) => {
                 let status = r.status();
                 if status.is_success() {
+                    if logging::debug_verbose() {
+                        logging::global_log(
+                            "http_response",
+                            json!({
+                                "attempt": attempt,
+                                "url": url,
+                                "status": status.as_u16(),
+                                "ok": true,
+                                "provider_kind": "anthropic",
+                            }),
+                        );
+                    }
                     return Ok(r);
                 }
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 if !retryable || attempt >= 4 {
                     let text = r.text().await.unwrap_or_default();
+                    if logging::debug_verbose() {
+                        let (body_text, body_len, truncated) =
+                            logging::truncate_for_log(&text, logging::VERBOSE_PAYLOAD_CAP);
+                        logging::global_log(
+                            "http_response",
+                            json!({
+                                "attempt": attempt,
+                                "url": url,
+                                "status": status.as_u16(),
+                                "ok": false,
+                                "provider_kind": "anthropic",
+                                "body": body_text,
+                                "body_len": body_len,
+                                "truncated": truncated,
+                            }),
+                        );
+                    }
                     let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
                     return Err(format!("HTTP {status}: {}", normalized.message));
                 }
@@ -2593,7 +2717,25 @@ async fn send_anthropic_request(
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(parse_retry_after);
-                let _ = r.text().await;
+                let err_body = r.text().await.unwrap_or_default();
+                if logging::debug_verbose() {
+                    let (body_text, body_len, truncated) =
+                        logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
+                    logging::global_log(
+                        "http_response",
+                        json!({
+                            "attempt": attempt,
+                            "url": url,
+                            "status": status.as_u16(),
+                            "ok": false,
+                            "retrying": true,
+                            "provider_kind": "anthropic",
+                            "body": body_text,
+                            "body_len": body_len,
+                            "truncated": truncated,
+                        }),
+                    );
+                }
                 let backoff = backoff_ms(attempt, retry_after);
                 emit(
                     &Event::new("http_retry")
@@ -2604,6 +2746,18 @@ async fn send_anthropic_request(
                 sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
             }
             Err(e) => {
+                if logging::debug_verbose() {
+                    logging::global_log(
+                        "http_error",
+                        json!({
+                            "attempt": attempt,
+                            "url": url,
+                            "error": fmt_chain(&e),
+                            "kind": "transport",
+                            "provider_kind": "anthropic",
+                        }),
+                    );
+                }
                 if attempt >= 4 {
                     let normalized = adapter.normalize_error(None, &fmt_chain(&e));
                     return Err(format!(

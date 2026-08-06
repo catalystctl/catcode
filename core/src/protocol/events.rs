@@ -61,6 +61,32 @@ pub fn emit(event: &Event) {
             buffer.push((event.kind.to_string(), event.data.clone()));
         }
     });
+    // Verbose debug mode mirrors every outbound protocol event into the JSONL
+    // log so `catcode --debug` captures the full wire conversation. High-volume
+    // stream kinds (delta/thinking) are summarized to keep the log usable.
+    if crate::logging::debug_verbose() {
+        let kind = event.kind;
+        let payload = if matches!(kind, "delta" | "thinking" | "metrics") {
+            // Summarize streaming noise: length + a short preview only.
+            let text = event.data.get("text").and_then(Value::as_str).unwrap_or("");
+            let (preview, len, _) = crate::logging::truncate_for_log(text, 200);
+            serde_json::json!({
+                "type": kind,
+                "text_len": len,
+                "preview": preview,
+            })
+        } else {
+            let data_val = Value::Object(event.data.clone());
+            serde_json::json!({
+                "type": kind,
+                "data": crate::logging::truncate_json_for_log(
+                    &data_val,
+                    crate::logging::VERBOSE_PAYLOAD_CAP,
+                ),
+            })
+        };
+        crate::logging::global_log("event", payload);
+    }
     EVENT_SINK.emit(event);
 }
 

@@ -1702,6 +1702,15 @@ func (s *session) View() tea.View {
 	// selection is application-managed, so mouse tracking can stay enabled
 	// without sacrificing drag-to-copy.
 	v.MouseMode = tea.MouseModeCellMotion
+	// Focus events deliver tea.FocusMsg when the terminal window is
+	// (un)focused; used to silence the window-title attention bell the moment
+	// the user comes back (see window_title.go).
+	v.ReportFocus = true
+	// Window title = project name; the busy spinner animates it via the
+	// busy-frame clock and a bell marks completed turns / attention prompts
+	// (see window_title.go). The renderer emits OSC 2 only on change and
+	// clears the title on exit.
+	v.WindowTitle = s.windowTitle()
 	s.lastView = v
 	s.hasLastView = true
 	return v

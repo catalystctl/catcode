@@ -48,6 +48,7 @@ export const CORE_EVENT_TYPES = [
   "memory_saved",
   "metrics",
   "models",
+  "models_refreshed",
   "oauth_prompt",
   "plugin_commands",
   "plugin_disabled",
