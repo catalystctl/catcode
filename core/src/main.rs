@@ -286,9 +286,11 @@ fn build_main_system_prompt(
     // for subagents + the auto_reflect-off case).
     if auto_reflect {
         prompt.push_str(
-            "\n\nCompletion flow (auto-reflect on): call `finish` when work is verified — \
-             do not summarize first. After the harness reflection step, write the summary \
-             as your final message, then `finish`. This supersedes \"summarize when done\" above.",
+            "\n\nCompletion flow (auto-reflect on): call `finish` when work is verified — do not summarize first. \
+             After the harness reflection step, write the summary as your final message, then `finish`. \
+             A visible completion summary (≥ a short paragraph) is required before the turn ends; \
+             bare `finish` / tool-only reflection is not enough. This supersedes \
+             \"summarize when done\" above.",
         );
     }
     prompt
@@ -2621,15 +2623,17 @@ fn build_reflect_text(recurring: &[(usize, String)]) -> String {
          gotcha, persist it with the `memory` tool (action: append if a topic memory \n\
          exists, else save; use scope: \"global\" for cross-codebase facts like the \n\
          user's identity, tech-stack preferences, or harness conventions) — skip \n\
-         transient task state. Use ONLY tool calls here; do NOT write user-facing prose. \n\
+         transient task state. Use ONLY tool calls for reflection itself; do NOT write \n\
+         reflection prose for the user. \n\
          (2) If you just performed a reusable workflow, consider writing a skill under \n\
          `.catalyst-code/skills/<name>/SKILL.md` (run `list_dir .catalyst-code/skills/` \n\
          first to extend rather than duplicate). \n\
-         After reflecting: if you have NOT yet answered the user this turn, write your \n\
-         final completion summary now, then call `finish`. If you HAVE already given \n\
-         your answer (in any prior message this turn), do NOT write any new user-facing \n\
-         text — your existing answer above is the final message; save any remaining \n\
-         memories (tool calls only) and call `finish` with no content.",
+         After reflecting (or if there is nothing durable to persist): you MUST write a \n\
+         concise user-facing completion summary as assistant text — what was done, what \n\
+         failed if anything, and notable files/changes — then call `finish`. A bare \n\
+         `finish` with no summary text is rejected. Only skip the summary when you already \n\
+         delivered a full answer earlier in this same turn; in that case save remaining \n\
+         memories (tool calls only) and call `finish` with no new prose.",
     );
     if !recurring.is_empty() {
         s.push_str("\n\nRecurring patterns detected (performed 2+ times across sessions):");
@@ -5112,6 +5116,10 @@ mod auto_reflect_tests {
         assert!(txt.contains("memory"));
         assert!(txt.contains("skills/<name>/SKILL.md"));
         assert!(txt.contains("finish"));
+        // Must demand a user-facing completion summary after reflection — bare
+        // finish is the failure mode this prompt exists to prevent.
+        assert!(txt.contains("completion summary"));
+        assert!(txt.contains("bare"));
         // No recurrence → no recurring-patterns section.
         assert!(!txt.contains("Recurring patterns detected"));
     }

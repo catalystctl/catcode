@@ -6,6 +6,11 @@ use crate::*;
 /// continuation so the answer stays the last message the user reads.
 const AUTO_REFLECT_ANSWER_MIN_CHARS: usize = 80;
 
+/// How many times the post-reflect summary gate may re-prompt a model that
+/// tries to exit without a user-facing completion summary. Beyond this, the
+/// turn ends anyway so a non-compliant model cannot loop forever.
+const SUMMARY_NUDGE_MAX: u8 = 2;
+
 /// Whether the assistant message already carries a substantive text answer to
 /// the user (vs. a bare `finish`, a tool-only turn, or a trivial ack like
 /// "Done."). When true, the auto-reflect gate skips its reflection continuation:
@@ -18,6 +23,20 @@ fn assistant_delivered_answer(msg: &Message) -> bool {
     msg.content_text()
         .map(|s| s.trim().chars().count() >= AUTO_REFLECT_ANSWER_MIN_CHARS)
         .unwrap_or(false)
+}
+
+/// Nudge injected when the model tries to exit after auto-reflect without a
+/// user-facing completion summary. Mirrors the subagent nonempty-summary
+/// fallback, but for the main agent we re-prompt once/twice instead of
+/// inventing a stub — the model still owns the wording.
+fn build_summary_required_nudge() -> String {
+    format!(
+        "[summary-required] You ended without a user-facing completion summary \
+         (need ≥{AUTO_REFLECT_ANSWER_MIN_CHARS} characters of assistant text this turn). \
+         Write a concise final summary of what was done, what failed if anything, \
+         and notable files/changes, then call `finish`. Do not only call tools — \
+         the summary text is required before the turn can complete."
+    )
 }
 
 pub(crate) async fn run_turn(
@@ -74,8 +93,13 @@ pub(crate) async fn run_turn(
     // first `finish`/natural completion of a non-trivial turn it is logged to
     // the recurrence store and a reflection continuation is injected so durable
     // facts/patterns get persisted without relying on the model remembering to.
-    // `reflected` prevents re-entry: the reflect's own `finish` exits for real.
+    // `reflected` prevents re-entry on the reflect path; `answer_delivered`
+    // tracks whether ANY assistant message this turn already carried a
+    // substantive user-facing summary (so post-reflect bare `finish` is
+    // rejected until one exists).
     let mut reflected = false;
+    let mut answer_delivered = false;
+    let mut summary_nudge_count: u8 = 0;
     let mut turn_tool_calls: u32 = 0;
     let mut shape_tools: Vec<String> = Vec::new();
     let mut shape_files: Vec<String> = Vec::new();
@@ -938,6 +962,12 @@ pub(crate) async fn run_turn(
             emit(&Event::new("error").with("message", json!(format!("assistant parse: {e}"))));
             Message::assistant("")
         });
+        // Turn-scoped: once any assistant message carries a real user-facing
+        // answer, bare post-reflect finishes are allowed to exit (the answer
+        // already exists above). Checked every stream so mid-task prose counts.
+        if assistant_delivered_answer(&assistant_msg) {
+            answer_delivered = true;
+        }
 
         // Anchor all future estimates on the endpoint's REAL `prompt_tokens` —
         // the exact count of `messages` as the model tokenized it (system +
@@ -1808,15 +1838,16 @@ pub(crate) async fn run_turn(
                             {
                                 // If the model already delivered its answer
                                 // alongside this `finish` (it ignored "do not
-                                // summarize first"), don't re-stream a reflection
-                                // — the model would emit an empty/minimal second
-                                // `finish`, burying the real answer as the last
-                                // message the user reads ("the model gave no
-                                // final message"). The answer above IS the final
-                                // message. The episode + pattern-log side effects
-                                // already ran in maybe_reflect_prompt above; the
-                                // model can persist durable memories mid-task.
-                                if !assistant_delivered_answer(&assistant_msg) {
+                                // summarize first"), or earlier in this turn,
+                                // don't re-stream a reflection — the model would
+                                // emit an empty/minimal second `finish`, burying
+                                // the real answer as the last message the user
+                                // reads ("the model gave no final message").
+                                // The answer above IS the final message. Episode
+                                // + pattern-log side effects already ran in
+                                // maybe_reflect_prompt above; the model can
+                                // persist durable memories mid-task.
+                                if !answer_delivered {
                                     reflected = true;
                                     outcome.output = nudge;
                                     recurrence = rec;
@@ -1824,10 +1855,45 @@ pub(crate) async fn run_turn(
                                 }
                             }
                         }
+                        // Post-reflect summary gate: after auto-reflect has
+                        // run, a bare `finish` with no user-facing summary must
+                        // not complete the turn. Many models treat the reflect
+                        // nudge as "tool calls only + finish" and never write
+                        // the completion summary the user is waiting for.
+                        // Re-prompt up to SUMMARY_NUDGE_MAX times, then allow
+                        // exit so a non-compliant model cannot loop forever.
+                        let mut do_summary_nudge = false;
+                        if !do_reflect
+                            && reflected
+                            && !answer_delivered
+                            && !cancel.is_cancelled()
+                            && summary_nudge_count < SUMMARY_NUDGE_MAX
+                        {
+                            summary_nudge_count =
+                                summary_nudge_count.saturating_add(1);
+                            outcome.output = build_summary_required_nudge();
+                            do_summary_nudge = true;
+                        }
                         if do_reflect {
                             emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
                             // Fall through → the finish tool_result (carrying
                             // the nudge) is pushed below and the loop re-streams.
+                        } else if do_summary_nudge {
+                            emit(
+                                &Event::new("summary_required")
+                                    .with("attempt", json!(summary_nudge_count))
+                                    .with("max_attempts", json!(SUMMARY_NUDGE_MAX)),
+                            );
+                            st.logger.log(
+                                "summary_required",
+                                json!({
+                                    "attempt": summary_nudge_count,
+                                    "max_attempts": SUMMARY_NUDGE_MAX,
+                                    "path": "finish_tool",
+                                }),
+                            );
+                            // Fall through → finish tool_result carries the
+                            // summary-required nudge and the loop re-streams.
                         } else {
                             // Emit a real tool_result so the TUI/web don't leave
                             // the finish card empty / stuck as "[no result]".
@@ -2067,14 +2133,15 @@ pub(crate) async fn run_turn(
                     .await
                     {
                         // If the model already delivered its answer in this
-                        // natural completion, don't re-stream a reflection —
-                        // the model would emit an empty/minimal `finish` next,
-                        // burying the real answer ("the model gave no final
-                        // message"). The answer above IS the final message.
-                        // Episode + pattern-log side effects already ran in
-                        // maybe_reflect_prompt; the model can persist durable
-                        // memories mid-task before finishing.
-                        if !assistant_delivered_answer(&assistant_msg) {
+                        // natural completion (or earlier this turn), don't
+                        // re-stream a reflection — the model would emit an
+                        // empty/minimal `finish` next, burying the real answer
+                        // ("the model gave no final message"). The answer above
+                        // IS the final message. Episode + pattern-log side
+                        // effects already ran in maybe_reflect_prompt; the
+                        // model can persist durable memories mid-task before
+                        // finishing.
+                        if !answer_delivered {
                             reflected = true;
                             reflect_prompt = p;
                             recurrence = rec;
@@ -2096,6 +2163,40 @@ pub(crate) async fn run_turn(
                     drop(conv);
                     emit(&Event::new("reflecting").with("recurrence", json!(recurrence)));
                     // Don't return → the outer loop re-streams the reflection.
+                } else if reflected
+                    && !answer_delivered
+                    && !cancel.is_cancelled()
+                    && summary_nudge_count < SUMMARY_NUDGE_MAX
+                {
+                    // Post-reflect natural completion with no user-facing
+                    // summary: re-prompt instead of exiting blank.
+                    summary_nudge_count = summary_nudge_count.saturating_add(1);
+                    let nudge = build_summary_required_nudge();
+                    let msg = Message::user(nudge);
+                    let est = estimate_message_tokens(&msg);
+                    messages.push(msg.clone());
+                    {
+                        let mut conv = st.conversation.lock().await;
+                        conv.push(msg);
+                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                            session::append(p, conv.last().unwrap());
+                        }
+                    }
+                    *st.estimated_tokens.lock().await += est;
+                    emit(
+                        &Event::new("summary_required")
+                            .with("attempt", json!(summary_nudge_count))
+                            .with("max_attempts", json!(SUMMARY_NUDGE_MAX)),
+                    );
+                    st.logger.log(
+                        "summary_required",
+                        json!({
+                            "attempt": summary_nudge_count,
+                            "max_attempts": SUMMARY_NUDGE_MAX,
+                            "path": "natural_stop",
+                        }),
+                    );
+                    // Don't return → re-stream so the model can write the summary.
                 } else {
                     // Turn complete: emit metrics + done.
                     *st.last_turn_time.lock().await = std::time::Instant::now();
@@ -2118,7 +2219,6 @@ pub(crate) async fn run_turn(
 #[cfg(test)]
 mod auto_reflect_answer_tests {
     use super::*;
-    use crate::message::Content;
 
     fn assistant(content: Option<&str>) -> Message {
         Message::Assistant {
@@ -2156,5 +2256,14 @@ mod auto_reflect_answer_tests {
             Note: the tap repo returns 404 today — it is built but not yet live.";
         assert!(answer.chars().count() >= AUTO_REFLECT_ANSWER_MIN_CHARS);
         assert!(assistant_delivered_answer(&assistant(Some(answer))));
+    }
+
+    #[test]
+    fn summary_required_nudge_demands_final_text() {
+        let nudge = build_summary_required_nudge();
+        assert!(nudge.starts_with("[summary-required]"));
+        assert!(nudge.contains("finish"));
+        assert!(nudge.contains(&AUTO_REFLECT_ANSWER_MIN_CHARS.to_string()));
+        assert!(nudge.contains("summary"));
     }
 }

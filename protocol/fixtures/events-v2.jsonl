@@ -96,3 +96,4 @@
 {"type":"sandbox_ready","protocol_version":2,"ready":true,"report":{"requested":true,"supported":true,"ready":true,"platform":"linux","architecture":"x86_64","checks":[],"actions":[]}}
 {"type":"sandbox_error","protocol_version":2,"error":"sandbox setup required"}
 {"type":"stuck_nudge","protocol_version":2,"message":"You have repeated a read-only step without making filesystem progress — try a concrete edit or a different approach."}
+{"type":"summary_required","protocol_version":2,"attempt":1,"max_attempts":2}

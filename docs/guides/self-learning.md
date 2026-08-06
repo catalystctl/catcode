@@ -174,6 +174,11 @@ core injects a **reflect nudge** into the model's completion prompt:
 > or gotcha, persist it with the `memory` tool… (2) If you just performed a
 > reusable workflow, consider writing a skill…
 
+After reflection, the model **must** write a user-facing completion summary
+before `finish`. If it tries to exit with only tool calls (or an empty
+`finish`), the core emits `summary_required` and re-prompts up to twice so the
+user still gets a final message.
+
 ### Configuration
 
 | Config key | Default | Description |

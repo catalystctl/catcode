@@ -739,6 +739,17 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.logInfo("auto-reflect: reflecting on this turn…")
 		}
 
+	case "summary_required":
+		// Post-reflect finish without a user-facing completion summary. Core is
+		// re-prompting the model; surface so the extra stream isn't a mystery.
+		attempt := ev.get("attempt")
+		maxAttempts := ev.get("max_attempts")
+		if attempt != "" && maxAttempts != "" {
+			s.logInfo(fmt.Sprintf("auto-reflect: summary required before finish (attempt %s/%s)…", attempt, maxAttempts))
+		} else {
+			s.logInfo("auto-reflect: summary required before finish…")
+		}
+
 	case "approval_changed":
 		// Core emits two shapes:
 		//   "never"|"destructive"|"always"  — session gate mode changed

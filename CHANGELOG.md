@@ -4,6 +4,7 @@ All notable changes to **Catalyst Code** (formerly Umans Harness), day by day fr
 
 ## 2026-08-06
 
+- Reject bare post-reflect `finish` until the model writes a user-facing completion summary (`summary_required` re-prompt, up to 2 attempts). [working]
 - Wired web model-list refresh (`refresh_models` / `models_refreshed`) with spinner + ModelPicker control; fixed CLI-only install summary for embedded core. [16ec65a]
 - Hardened multi-provider wire paths end-to-end (max_tokens floors, empty auth omit, Gemini tool results, SSE/usage coercion, discovery caps). [0a95f73]
 

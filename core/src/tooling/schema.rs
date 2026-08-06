@@ -512,7 +512,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "finish",
-                "description": "Signal that the task is complete. Call this when you have finished the user's request and verified your work; it exits the agentic loop cleanly.",
+                "description": "Signal that the task is complete. Call this when you have finished the user's request and verified your work; it exits the agentic loop cleanly. After auto-reflect, include a visible completion summary in the same assistant message (or an earlier one this turn) — bare finish with no summary is rejected.",
                 "parameters": { "type": "object", "properties": {} }
             }
         }),

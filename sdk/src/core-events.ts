@@ -109,6 +109,7 @@ export const CORE_EVENT_TYPES = [
   "sandbox_ready",
   "sandbox_error",
   "stuck_nudge",
+  "summary_required",
 ] as const;
 
 export type CoreEventType = (typeof CORE_EVENT_TYPES)[number];
