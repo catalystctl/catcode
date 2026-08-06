@@ -4,12 +4,18 @@ All notable changes to **Catalyst Code** (formerly Umans Harness), day by day fr
 
 ## 2026-08-06
 
-- Reject bare post-reflect `finish` until the model writes a user-facing completion summary (`summary_required` re-prompt, up to 2 attempts). [working]
-- Wired web model-list refresh (`refresh_models` / `models_refreshed`) with spinner + ModelPicker control; fixed CLI-only install summary for embedded core. [16ec65a]
+- Hub-only web UI: `/` is the terminal hub (project tabs, git panel, split catcode PTYs); removed IDE/chat/SSE bridge + Monaco stack; account-scoped hub layout store. [ee0dbbd]
+- Reject bare post-reflect `finish` until the model writes a user-facing completion summary (`summary_required` re-prompt, up to 2 attempts). [1209f78]
+- Break OpenAI/Gemini SSE read loops on terminal frame (not just EOF/`[DONE]`) so providers that hold the socket open no longer idle-timeout. [75e564c]
+- Warn at startup when settings.json `provider_keys.<name>` shadows a divergent config.json `api_key`. [3415120]
+- Wired model-list refresh (`refresh_models` / `models_refreshed`) with spinner + ModelPicker control; fixed CLI-only install summary for embedded core. [16ec65a]
 - Hardened multi-provider wire paths end-to-end (max_tokens floors, empty auth omit, Gemini tool results, SSE/usage coercion, discovery caps). [0a95f73]
 
 ## 2026-08-05
 
+- `/hub` terminal workspace: project tabs, git panel, split catcode terminals + mobile-responsive layout and leave/sign-out PTY persistence. [0b8385c, de10a98]
+- `catcode --debug` full-verbosity JSONL logging + model refresh/routing. [65ef512]
+- Never put `max_tokens:0` on the OpenAI wire (omit or pass model budget). [6348ba9]
 - Fixed add-custom-provider: non-blocking model discovery, no Umans fallback on dead endpoints, cancel/error UX, and paste into TUI form fields. [5f852cb]
 
 ## 2026-07-31
