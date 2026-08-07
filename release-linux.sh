@@ -14,8 +14,9 @@
 #   catcode-<ver>-<arch>.AppImage               AppImage installer
 #   catcode-<ver>-<arch>.AppImage.sha256
 #
-# Run on Linux. Needs: cargo (stable), Go 1.21+. appimagetool is fetched on
-# demand to ~/.cache/appimagetool/ if not on PATH (needs network once).
+# Run on Ubuntu 22.04 or an equivalent glibc 2.35 build environment. Needs:
+# cargo (stable), Go 1.21+, and readelf. appimagetool is fetched on demand to
+# ~/.cache/appimagetool/ if not on PATH (needs network once).
 #   ./release-linux.sh [version]     # version defaults to the git commit (short SHA)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -26,6 +27,7 @@ EMBED_FILE="tui/embed/catcode-core"
 require() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }; }
 require cargo "install rustup/rust"
 require go    "https://go.dev/dl/"
+require readelf "install binutils"
 
 # Map the host arch to the labels used in artifact names. AppImage uses
 # x86_64/aarch64; the standalone follows the macOS convention (x86_64/arm64).
@@ -46,6 +48,7 @@ echo "[1/6] core -> native release (cargo, --locked)..."
 cargo build --release --locked --manifest-path core/Cargo.toml
 CORE_BIN="core/target/release/core"
 [[ -f "$CORE_BIN" ]] || { echo "error: expected core binary at $CORE_BIN" >&2; exit 1; }
+scripts/check-glibc-version.sh "$CORE_BIN" 2.35
 
 echo "[2/6] tui -> standalone (go build -tags embed_core, core embedded)..."
 cp "$CORE_BIN" "$EMBED_FILE"

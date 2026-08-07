@@ -90,7 +90,8 @@ REVIEW.md
 # External skill-manager lockfile (references third-party GitHub repos)
 skills-lock.json
 # Local scratch / working directories (not part of the shipped project)
-scripts/
+scripts/*
+!scripts/check-glibc-version.sh
 !web/scripts/
 !web/scripts/fix-sdk-link.mjs
 tmp/

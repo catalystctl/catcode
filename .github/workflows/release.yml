@@ -24,31 +24,37 @@ concurrency:
 jobs:
   platform:
     name: Build ${{ matrix.platform }} artifacts
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux
+            # Ubuntu 22.04 ships glibc 2.35. Building the Linux core here keeps
+            # artifacts runnable on 22.04 and newer glibc-based distributions.
+            runner: ubuntu-22.04
             script: release-linux.sh
             rust_targets: ''
             macos_arch: ''
-            # The Microsandbox SDK (default feature) links libcap-ng; the
-            # ubuntu-latest image no longer ships libcap-ng-dev, so install it
-            # here (mirrors the ci.yml core job) or the release link fails with
+            # The Microsandbox SDK (default feature) links libcap-ng; install
+            # its development package here (mirrors the ci.yml core job) or the
+            # release link fails with
             # `rust-lld: error: unable to find library -lcap-ng`.
             apt_packages: libcap-ng-dev
           - platform: windows
+            runner: ubuntu-latest
             script: release-windows.sh
             rust_targets: x86_64-pc-windows-gnu
             macos_arch: ''
             apt_packages: mingw-w64 msitools zip
           - platform: macos-arm64
+            runner: ubuntu-latest
             script: release-macos.sh
             rust_targets: aarch64-apple-darwin
             macos_arch: arm64
             apt_packages: xorriso
           - platform: macos-x86_64
+            runner: ubuntu-latest
             script: release-macos.sh
             rust_targets: x86_64-apple-darwin
             macos_arch: x86_64
@@ -86,7 +92,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
-          key: release-${{ matrix.platform }}
+          # Do not restore Linux objects compiled against a newer glibc after
+          # changing the release baseline. Other platforms retain their key.
+          key: release-${{ matrix.platform }}${{ matrix.platform == 'linux' && '-glibc235' || '' }}
 
       - uses: actions/setup-go@v5
         with:
