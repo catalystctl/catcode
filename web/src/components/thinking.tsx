@@ -38,7 +38,7 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex items-center gap-1.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-ink-300"
+        className="flex min-h-11 items-center gap-1.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-ink-300 sm:min-h-0"
       >
         <ChevronRight
           width={11}
@@ -54,7 +54,7 @@ export function Thinking({ text, active }: { text: string; active?: boolean }) {
         )}
       </button>
       {open && text && (
-        <div className="mt-1 max-h-80 overflow-auto pr-1">
+        <div className="mt-1 max-h-80 overflow-auto border border-ink-800 bg-ink-950 px-2.5 py-2 pr-1">
           <p className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink-400">
             {text}
           </p>

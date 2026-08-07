@@ -192,7 +192,7 @@ function ViewerModal({ viewer, onClose }: { viewer: Exclude<ViewerState, { kind:
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4 backdrop-blur-[2px]"
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-ink-950/80 p-4"
       onMouseDown={onClose}
     >
       <section
@@ -201,10 +201,10 @@ function ViewerModal({ viewer, onClose }: { viewer: Exclude<ViewerState, { kind:
         aria-modal="true"
         aria-label={`${kindLabel}: ${viewer.title}`}
         onMouseDown={(e) => e.stopPropagation()}
-        className="flex h-[min(85dvh,60rem)] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-ink-700 bg-ink-925 shadow-2xl shadow-black/50 animate-fade-in"
+        className="flex h-[min(85dvh,60rem)] w-full max-w-4xl flex-col overflow-hidden rounded-sm border border-ink-700 bg-ink-900 shadow-elev-2 animate-fade-in"
       >
         <header className="flex items-center gap-2 border-b border-ink-800 px-3 py-2">
-          <span className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+          <span className="shrink-0 rounded-sm border border-ink-700 bg-ink-850 px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider text-ink-400">
             {kindLabel}
           </span>
           <h2 className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink-100" title={viewer.title}>
@@ -213,7 +213,7 @@ function ViewerModal({ viewer, onClose }: { viewer: Exclude<ViewerState, { kind:
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0 sm:min-w-0"
             aria-label="Close viewer"
           >
             <XIcon width={14} height={14} />

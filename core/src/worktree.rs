@@ -139,6 +139,7 @@ fn remove_worktree_locked(workspace: &Path, wt_path: &Path) -> Result<(), String
 /// (`git diff --diff-filter=D`). Does **not** full-mirror-delete (would wipe
 /// sibling promotions on concurrent waves).
 pub fn promote_worktree(main_ws: &Path, wt_path: &Path) -> Result<Vec<String>, String> {
+    let _guard = WORKTREE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut promoted = Vec::new();
     copy_tree_diff(wt_path, main_ws, wt_path, &mut promoted)?;
     sync_git_deletions(wt_path, main_ws, &mut promoted)?;
@@ -150,6 +151,7 @@ pub fn promote_worktree(main_ws: &Path, wt_path: &Path) -> Result<Vec<String>, S
 /// deletions (full mirror under skip rules). Memory: promote is wt→main; seed
 /// is main→wt — without seed, next-wave workers miss uncommitted promotes.
 pub fn seed_worktree_from_main(main_ws: &Path, wt_path: &Path) -> Result<Vec<String>, String> {
+    let _guard = WORKTREE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut seeded = Vec::new();
     copy_tree_diff(main_ws, wt_path, main_ws, &mut seeded)?;
     // Full mirror deletes: drop wt paths that no longer exist on main.

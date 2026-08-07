@@ -7,6 +7,7 @@
 // the lint here rather than obscure the call sites.
 #![allow(clippy::too_many_arguments)]
 
+mod advisor;
 mod agent;
 mod audit;
 mod browser;
@@ -1875,20 +1876,23 @@ fn build_skill_prompt(skill: &subagent::SkillEntry, task: Option<&str>) -> Strin
 /// A mention is `@` followed by a non-whitespace path, where the `@` is at
 /// start-of-string or preceded by whitespace (so emails / `foo@bar` and
 /// inline `@param` tags without a leading space don't trigger). Paths resolve
-/// relative to the workspace; absolute paths (leading `/`) and `..`/`.` paths
-/// are honored as-is — the core has unrestricted FS access, so `@../` and
-/// `@/abs` reach outside the workspace (matching the TUI's mention completion).
-/// Directories, files larger than `max_bytes`, and unreadable paths are left
-/// as-is so the model can fall back to `read_file`. Returns the expanded
-/// prompt and the list of paths successfully inlined.
+/// relative to the workspace and pass through canonical confinement; absolute,
+/// parent-traversing, and symlink-escaping paths are left as plain text.
+/// Directories, unreadable files, and files larger than the per-file or
+/// aggregate inline budget are likewise left for an explicit `read_file` call.
+/// Returns the expanded prompt and the list of paths successfully inlined.
 fn expand_file_mentions(
     prompt: &str,
     workspace: &std::path::Path,
     max_bytes: u64,
 ) -> (String, Vec<String>) {
+    const MENTION_INLINE_TOTAL_MAX: usize = 64 * 1024;
+    const MENTION_INLINE_FILE_MAX: u64 = 24 * 1024;
+    let max_file_bytes = max_bytes.min(MENTION_INLINE_FILE_MAX);
     let chars: Vec<(usize, char)> = prompt.char_indices().collect();
     let mut out = String::with_capacity(prompt.len() + 256);
     let mut attached: Vec<String> = Vec::new();
+    let mut inlined_bytes = 0usize;
     let mut k = 0;
     let mut prev_ws_or_start = true;
     while k < chars.len() {
@@ -1907,7 +1911,14 @@ fn expand_file_mentions(
             };
             let raw = &prompt[tok_byte_start..tok_byte_end];
             if !raw.is_empty() {
-                if let Some((path, content)) = read_mentioned_file(raw, workspace, max_bytes) {
+                if let Some((path, content)) = read_mentioned_file(raw, workspace, max_file_bytes) {
+                    if inlined_bytes.saturating_add(content.len()) > MENTION_INLINE_TOTAL_MAX {
+                        out.push('@');
+                        k += 1;
+                        prev_ws_or_start = false;
+                        continue;
+                    }
+                    inlined_bytes += content.len();
                     out.push('@');
                     out.push_str(&path);
                     out.push_str("\n<file path=\"");
@@ -1972,12 +1983,7 @@ fn try_read_mentioned_file(
     workspace: &std::path::Path,
     max_bytes: u64,
 ) -> Option<(String, String)> {
-    let p = std::path::Path::new(token);
-    let resolved = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        workspace.join(p)
-    };
+    let resolved = crate::workspace::resolve(workspace, token).ok()?;
     let meta = std::fs::metadata(&resolved).ok()?;
     if meta.is_dir() {
         return None;
@@ -5464,9 +5470,7 @@ mod expand_mentions_tests {
 
     #[cfg(unix)]
     #[test]
-    fn absolute_path_inlined() {
-        // Absolute paths are honored (core has unrestricted FS access), even
-        // though they lie outside the workspace.
+    fn absolute_path_is_not_inlined() {
         let dir = std::env::temp_dir().join(format!(
             "catalyst-code-abs-{}",
             std::time::SystemTime::now()
@@ -5480,9 +5484,18 @@ mod expand_mentions_tests {
         let ws = fresh_workspace();
         let mention = format!("@{}", f.display());
         let (out, attached) = expand_file_mentions(&mention, &ws, u64::MAX);
-        assert_eq!(attached.len(), 1);
-        assert!(out.contains("abs content"));
-        assert!(out.contains("<file path=\""));
+        assert!(attached.is_empty());
+        assert_eq!(out, mention);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_mention_enforces_inline_budget() {
+        let ws = fresh_workspace();
+        std::fs::write(ws.join("large.txt"), "x".repeat(25 * 1024)).unwrap();
+        let (out, attached) = expand_file_mentions("@large.txt", &ws, u64::MAX);
+        assert!(attached.is_empty());
+        assert_eq!(out, "@large.txt");
     }
 
     #[test]

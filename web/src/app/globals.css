@@ -9,54 +9,48 @@
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
+  /* Signal ledger: a dense graphite ground, legible sheet layers, and one copper
+     control color. Every durable surface is intentionally opaque. */
+  --ink-950: 12 14 17;
+  --ink-925: 18 21 25;
+  --ink-900: 25 29 34;
+  --ink-850: 34 39 45;
+  --ink-800: 47 53 61;
+  --ink-750: 64 71 80;
+  --ink-700: 81 89 99;
+  --ink-600: 108 116 127;
+  --ink-500: 143 150 160;
+  --ink-400: 173 179 188;
+  --ink-300: 198 203 211;
+  --ink-200: 224 227 232;
+  --ink-100: 246 247 249;
 
-  /* Ink scale — deep charcoal with a whisper of warm slate so surfaces layer
-     with visible depth. Monotonic lift: page < card < overlay. */
-  --ink-950: 14 15 18;      /* page bg */
-  --ink-925: 17 19 23;      /* recessed wells (code, tool output) */
-  --ink-900: 22 24 29;      /* card */
-  --ink-850: 27 30 36;      /* raised card */
-  --ink-800: 34 37 44;      /* interactive surface */
-  --ink-750: 42 46 54;      /* strong border */
-  --ink-700: 52 56 65;      /* border */
-  --ink-600: 72 77 88;      /* faint text */
-  --ink-500: 124 130 142;   /* muted text (AA on page/surface) */
-  --ink-400: 140 146 158;   /* secondary text */
-  --ink-300: 176 181 191;   /* body-dim */
-  --ink-200: 216 219 226;   /* body */
-  --ink-100: 244 245 248;   /* fg */
+  --accent: 210 126 68;
+  --accent-soft: 235 157 95;
+  --accent-deep: 161 82 37;
+  --accent-foreground: 17 18 20;
 
-  /* Accent — warm peach/ember (catalyst primary). */
-  --accent: 214 142 88;
-  --accent-soft: 232 170 122;
-  --accent-deep: 182 118 66;
-  --accent-foreground: 14 15 18;
+  --success: 74 194 126;
+  --warning: 225 168 67;
+  --danger: 225 86 83;
+  --info: 73 169 197;
 
-  /* Semantic tokens. */
-  --success: 74 214 128;
-  --warning: 240 176 74;
-  --danger: 240 92 92;
-  --info: 56 199 201;
-
-  /* Prose / chrome extras. */
-  --bg-page: 14 15 18;
-  --bg-code: 12 13 16;
-  --bg-inline: 32 35 42;
-  --border-subtle: 44 48 56;
-  --scrollbar: 52 56 65;
-  --scrollbar-hover: 84 89 100;
-  --prose-heading: 244 245 248;
-  --prose-muted: 140 146 158;
-  --prose-link: 232 170 122;
-  --inline-code-text: 226 182 148;
+  --bg-page: 12 14 17;
+  --bg-code: 14 17 21;
+  --bg-inline: 34 39 45;
+  --border-subtle: 47 53 61;
+  --scrollbar: 81 89 99;
+  --scrollbar-hover: 143 150 160;
+  --prose-heading: 246 247 249;
+  --prose-muted: 173 179 188;
+  --prose-link: 235 157 95;
+  --inline-code-text: 239 184 145;
 
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system,
     BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono",
     SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --font-display: "Outfit Variable", ui-sans-serif, system-ui, sans-serif;
-
-  /* Motion tokens. */
   --motion-fast: 120ms;
   --motion-med: 200ms;
   --motion-slow: 340ms;
@@ -66,41 +60,37 @@
 
 [data-theme="light"] {
   color-scheme: light;
-
-  --ink-950: 248 248 250;
-  --ink-925: 243 243 246;
+  --ink-950: 246 247 248;
+  --ink-925: 238 240 242;
   --ink-900: 255 255 255;
-  --ink-850: 240 240 243;
-  --ink-800: 231 231 235;
-  --ink-750: 218 218 223;
-  --ink-700: 207 207 212;
-  --ink-600: 178 178 184;
-  --ink-500: 112 112 119;
-  --ink-400: 101 101 108;
-  --ink-300: 76 76 83;
-  --ink-200: 50 50 57;
-  --ink-100: 22 22 27;
-
-  --accent: 182 110 58;
-  --accent-soft: 200 130 80;
-  --accent-deep: 150 90 48;
-  --accent-foreground: 22 22 27;
-
-  --success: 24 124 62;
-  --warning: 176 96 10;
-  --danger: 198 28 52;
-  --info: 12 116 144;
-
-  --bg-page: 248 248 250;
-  --bg-code: 243 243 246;
-  --bg-inline: 240 240 243;
-  --border-subtle: 220 220 225;
-  --scrollbar: 207 207 212;
-  --scrollbar-hover: 158 158 165;
-  --prose-heading: 22 22 27;
-  --prose-muted: 101 101 108;
-  --prose-link: 182 110 58;
-  --inline-code-text: 160 92 42;
+  --ink-850: 229 232 235;
+  --ink-800: 211 215 220;
+  --ink-750: 190 196 202;
+  --ink-700: 167 174 182;
+  --ink-600: 125 133 142;
+  --ink-500: 94 102 111;
+  --ink-400: 74 81 89;
+  --ink-300: 56 62 69;
+  --ink-200: 37 42 48;
+  --ink-100: 21 25 29;
+  --accent: 170 82 37;
+  --accent-soft: 194 105 55;
+  --accent-deep: 130 57 25;
+  --accent-foreground: 255 255 255;
+  --success: 26 128 72;
+  --warning: 154 96 14;
+  --danger: 184 45 50;
+  --info: 21 111 145;
+  --bg-page: 246 247 248;
+  --bg-code: 238 240 242;
+  --bg-inline: 229 232 235;
+  --border-subtle: 211 215 220;
+  --scrollbar: 167 174 182;
+  --scrollbar-hover: 125 133 142;
+  --prose-heading: 21 25 29;
+  --prose-muted: 74 81 89;
+  --prose-link: 170 82 37;
+  --inline-code-text: 130 57 25;
 }
 
 html,
@@ -145,25 +135,19 @@ body {
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(var(--scrollbar) / 0.55) transparent;
+  scrollbar-color: rgb(var(--scrollbar)) rgb(var(--ink-925));
 }
 ::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 8px;
+  height: 8px;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+::-webkit-scrollbar-track { background: rgb(var(--ink-925)); }
 ::-webkit-scrollbar-thumb {
-  background: rgb(var(--scrollbar) / 0.55);
-  border: 2px solid transparent;
-  background-clip: content-box;
-  border-radius: 9999px;
+  background: rgb(var(--scrollbar));
+  border: 2px solid rgb(var(--ink-925));
+  border-radius: 0;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: rgb(var(--scrollbar-hover));
-  background-clip: content-box;
-}
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--scrollbar-hover)); }
 
 /* ── Keyframes ──────────────────────────────────────────────────────────── */
 @keyframes caret-blink {
@@ -223,11 +207,12 @@ body {
 .stagger-3 { animation: rise-in 0.45s var(--ease-out) 0.18s both; }
 .stagger-4 { animation: rise-in 0.45s var(--ease-out) 0.24s both; }
 
-/* ── Subtle dotted backdrop for the app shell ───────────────────────────── */
+/* Reserved for sparse empty states; no ambient grid behind active work. */
 .bg-grid {
-  background-image:
-    radial-gradient(circle at 1px 1px, rgb(var(--ink-300) / 0.055) 1px, transparent 0);
-  background-size: 24px 24px;
+  background-image: linear-gradient(rgb(var(--ink-800)) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--ink-800)) 1px, transparent 1px);
+  background-size: 2rem 2rem;
+  opacity: 0.18;
 }
 
 /* ── Composer instrument ──────────────────────────────────────────────────
@@ -235,37 +220,28 @@ body {
    prompt feel attached to the record instead of floating as a chat pill. */
 .composer-dock {
   position: relative;
-  background: rgb(var(--ink-925) / 0.96);
+  background: rgb(var(--ink-925));
   border-top: 1px solid rgb(var(--ink-800));
-  box-shadow: 0 -18px 32px -30px rgb(0 0 0 / 0.8);
 }
 .composer-shell {
-  border: 1px solid rgb(var(--ink-700) / 0.8);
+  border: 1px solid rgb(var(--ink-700));
   border-left: 3px solid rgb(var(--ink-700));
   background: rgb(var(--ink-950));
   border-radius: 3px;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.025);
-  transition:
-    border-color var(--motion-fast) var(--ease-out),
-    box-shadow var(--motion-med) var(--ease-out);
+  box-shadow: none;
+  transition: border-color var(--motion-fast) var(--ease-out);
 }
 .composer-shell:focus-within {
-  border-color: rgb(var(--ink-700));
+  border-color: rgb(var(--ink-600));
   border-left-color: rgb(var(--accent));
-  box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.035),
-    0 0 0 2px rgb(var(--accent) / 0.12);
+  box-shadow: none;
 }
 .composer-inflight {
   border-left-color: rgb(var(--accent));
-  box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.03),
-    0 0 0 1px rgb(var(--accent) / 0.1);
+  box-shadow: none;
   animation: inflight-bar 1.4s ease-in-out infinite;
 }
-.composer-inflight:focus-within {
-  border-left-color: rgb(var(--accent-soft));
-}
+.composer-inflight:focus-within { border-left-color: rgb(var(--accent-soft)); }
 
 /* Flat "thinking" text — a simple opacity pulse on the label. */
 .shimmer-text {
@@ -408,75 +384,18 @@ body {
   }
 }
 
-/* Empty-state instrument panel. */
-.chat-empty {
-  position: relative;
-  isolation: isolate;
-}
-.chat-empty::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(ellipse 60% 40% at 50% 0%, rgb(var(--accent) / 0.07), transparent 70%);
-  opacity: 0.9;
-}
-.chat-empty-card {
-  position: relative;
-  border: 1px solid rgb(var(--ink-800));
-  background: rgb(var(--ink-925) / 0.65);
-  border-radius: 12px;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
-}
-.chat-empty-prompt {
-  display: flex;
-  width: 100%;
-  align-items: flex-start;
-  gap: 0.75rem;
-  border: 1px solid rgb(var(--ink-800) / 0.9);
-  background: rgb(var(--ink-950) / 0.45);
-  border-radius: 10px;
-  padding: 0.85rem 1rem;
-  text-align: left;
-  transition:
-    border-color var(--motion-fast) var(--ease-out),
-    background var(--motion-fast) var(--ease-out),
-    transform var(--motion-fast) var(--ease-out);
-}
-.chat-empty-prompt:hover:not(:disabled) {
-  border-color: rgb(var(--accent) / 0.45);
-  background: rgb(var(--ink-900) / 0.8);
-  transform: translateY(-1px);
-}
-.chat-empty-prompt:focus-visible {
-  outline: none;
-  border-color: rgb(var(--accent) / 0.7);
-  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.18);
-}
-.chat-empty-prompt:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-/* Session list active tick. */
-.session-row-active {
-  background:
-    linear-gradient(
-      90deg,
-      rgb(var(--accent) / 0.1) 0%,
-      rgb(var(--ink-900) / 0.95) 28%
-    );
-}
-
-/* Jump-to-latest chip. */
-.chat-jump-pill {
-  border-radius: 9999px;
-  border: 1px solid rgb(var(--ink-700));
-  background: rgb(var(--ink-900) / 0.92);
-  backdrop-filter: blur(8px);
-  box-shadow: 0 4px 16px -6px rgb(0 0 0 / 0.5);
-}
+/* Empty-state register: quiet, directional, and opaque. */
+.chat-empty { position: relative; isolation: isolate; }
+.chat-empty::before { display: none; }
+.chat-empty-card { position: relative; border: 1px solid rgb(var(--ink-800)); background: rgb(var(--ink-925)); border-radius: 3px; box-shadow: none; }
+.chat-empty-prompt { display: flex; width: 100%; align-items: flex-start; gap: 0.75rem; border: 1px solid rgb(var(--ink-800)); background: rgb(var(--ink-950)); border-radius: 3px; padding: 0.85rem 1rem; text-align: left; transition: border-color var(--motion-fast) var(--ease-out), background var(--motion-fast) var(--ease-out); }
+.chat-empty-prompt:hover:not(:disabled) { border-color: rgb(var(--accent)); background: rgb(var(--ink-900)); }
+.chat-empty-prompt:focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; }
+.chat-empty-prompt:disabled { opacity: 0.45; cursor: not-allowed; }
+/* Session activity is encoded by a rail, not a gradient wash. */
+.session-row-active { background: rgb(var(--ink-900)); box-shadow: inset 3px 0 0 rgb(var(--accent)); }
+/* Jump control is a record action, not a glass pill. */
+.chat-jump-pill { border-radius: 3px; border: 1px solid rgb(var(--ink-700)); background: rgb(var(--ink-900)); box-shadow: none; }
 
 /* Focus ring utility for icon buttons. */
 .focus-ring:focus-visible {
@@ -649,7 +568,7 @@ body {
   border-bottom: none;
 }
 .prose-catalyst th {
-  background: rgb(var(--bg-inline) / 0.6);
+  background: rgb(var(--bg-inline));
   font-weight: 600;
   color: rgb(var(--ink-100));
 }
@@ -667,7 +586,7 @@ body {
   padding: 0.65em 0.8em;
   border: 1px solid rgb(var(--border-subtle));
   border-radius: 3px;
-  background: rgb(var(--bg-inline) / 0.45);
+  background: rgb(var(--bg-inline));
 }
 .prose-catalyst-document summary {
   cursor: pointer;

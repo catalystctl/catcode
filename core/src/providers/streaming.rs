@@ -183,6 +183,53 @@ fn is_retryable_stream_error(error: &Value, detail: &str) -> bool {
 /// Normalize one parsed OpenAI-compatible SSE data object. Transport framing,
 /// retry decisions, accumulation, and user-visible emission remain outside
 /// this pure decoder.
+fn reasoning_delta_text(delta: &Value) -> Option<String> {
+    if let Some(text) = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    // MiniMax OpenAI wire with reasoning_split=true may stream reasoning_details
+    // as a string or as [{text|content|type:reasoning_text}]. Official streaming
+    // examples re-send the full cumulative text each chunk; de-cumulation happens
+    // in append_stream_fragment at the accumulate sites, not here.
+    let details = delta.get("reasoning_details")?;
+    if let Some(text) = details.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    let arr = details.as_array()?;
+    let mut out = String::new();
+    for item in arr {
+        if let Some(text) = item
+            .as_str()
+            .or_else(|| item.get("text").and_then(Value::as_str))
+            .or_else(|| item.get("content").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+        {
+            out.push_str(text);
+            continue;
+        }
+        if item.get("type").and_then(Value::as_str) == Some("reasoning_text") {
+            if let Some(text) = item
+                .get("text")
+                .or_else(|| item.get("content"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                out.push_str(text);
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> {
     let mut events = Vec::new();
     if let Some(error) = object.get("error") {
@@ -216,13 +263,8 @@ pub(crate) fn decode_openai_chunk(object: &Value) -> Vec<NormalizedStreamEvent> 
         {
             events.push(NormalizedStreamEvent::TextDelta(text.to_string()));
         }
-        if let Some(reasoning) = delta
-            .get("reasoning_content")
-            .or_else(|| delta.get("reasoning"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            events.push(NormalizedStreamEvent::ReasoningDelta(reasoning.to_string()));
+        if let Some(reasoning) = reasoning_delta_text(delta) {
+            events.push(NormalizedStreamEvent::ReasoningDelta(reasoning));
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             events.extend(tool_calls.iter().map(|tool_call| {
@@ -426,6 +468,48 @@ mod tests {
         assert_eq!(
             events,
             vec![NormalizedStreamEvent::FinishReason("tool_calls".into())]
+        );
+    }
+
+    #[test]
+    fn decodes_minimax_reasoning_details_string_and_array() {
+        let string_events = decode_openai_chunk(&json!({
+            "choices": [{
+                "delta": { "reasoning_details": "step one" }
+            }]
+        }));
+        assert_eq!(
+            string_events,
+            vec![NormalizedStreamEvent::ReasoningDelta("step one".into())]
+        );
+
+        let array_events = decode_openai_chunk(&json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [
+                        { "type": "reasoning_text", "text": "alpha" },
+                        { "text": " beta" }
+                    ]
+                }
+            }]
+        }));
+        assert_eq!(
+            array_events,
+            vec![NormalizedStreamEvent::ReasoningDelta("alpha beta".into())]
+        );
+
+        // Prefer explicit reasoning_content over reasoning_details when both present.
+        let preferred = decode_openai_chunk(&json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "primary",
+                    "reasoning_details": [{ "text": "ignored" }]
+                }
+            }]
+        }));
+        assert_eq!(
+            preferred,
+            vec![NormalizedStreamEvent::ReasoningDelta("primary".into())]
         );
     }
 }

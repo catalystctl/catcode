@@ -22,8 +22,8 @@ case "${1:-}" in
     ;;
 esac
 
-echo "[1/3] building core (cargo, native-browser)..."
-cargo build --release --features native-browser --manifest-path core/Cargo.toml
+echo "[1/3] building core (cargo, native-browser, -j$(nproc))..."
+cargo build --release -j"$(nproc)" --features native-browser --manifest-path core/Cargo.toml
 
 echo "[2/3] building tui (go)..."
 ( cd tui && go build -o tui . )

@@ -201,32 +201,23 @@ func TestFooterMetricsCommandAndRender(t *testing.T) {
 		}
 	}
 	_ = s.handleUserLine("/footer-metrics off")
-	if s.settings.FooterMetrics || strings.Contains(stripANSI(s.renderFooter()), "tok/s") {
-		t.Fatal("footer-metrics off should hide the performance row")
+	if s.modal.kind != modalFooterMetrics || !s.settings.FooterMetrics {
+		t.Fatal("inline args must open footer-metrics modal without changing state")
 	}
 }
 
-// TestToggleCommandsPersistBashAndAutoCompact: slash commands write settings.json.
-func TestToggleCommandsPersistBashAndAutoCompact(t *testing.T) {
+func TestToggleCommandsPersistThroughModals(t *testing.T) {
 	s := initialSession()
 	s.ready = true
 	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
-
-	s.handleUserLine("/auto-compact off")
-	if s.settings.AutoCompact {
-		t.Fatal("settings.AutoCompact should be false")
-	}
-	s.handleUserLine("/bash-timeout 90")
-	if s.settings.BashTimeoutSecs != 90 {
-		t.Fatalf("settings.BashTimeoutSecs=%d, want 90", s.settings.BashTimeoutSecs)
-	}
-
+	s.openAutoCompactPicker()
+	s.executeListSelect(1)
+	s.openBashTimeoutModal()
+	s.modal.editBuf.SetValue("90")
+	s.commitValueEdit()
 	loaded := loadSettingsFrom(s.settings.path)
-	if loaded.AutoCompact {
-		t.Fatal("persisted AutoCompact should be false")
-	}
-	if loaded.BashTimeoutSecs != 90 {
-		t.Fatalf("persisted BashTimeoutSecs=%d, want 90", loaded.BashTimeoutSecs)
+	if loaded.AutoCompact || loaded.BashTimeoutSecs != 90 {
+		t.Fatalf("persisted auto=%t bash=%d", loaded.AutoCompact, loaded.BashTimeoutSecs)
 	}
 }
 

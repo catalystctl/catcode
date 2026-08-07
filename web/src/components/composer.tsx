@@ -593,7 +593,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   };
 
   const kbd =
-    "rounded border border-ink-700/80 bg-ink-900/80 px-1 py-0.5 font-mono text-[10px] text-ink-400";
+    "rounded-sm border border-ink-700 bg-ink-900 px-1 py-0.5 font-mono text-[10px] text-ink-400";
 
   return (
     <div
@@ -604,25 +604,25 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       <div className="mx-auto w-full max-w-[60rem]">
         {hitlOpen && (
           <p
-            className="mb-2.5 flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/5 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.1em] text-ink-300"
+            className="mb-2.5 flex items-center gap-2 border border-ink-700 border-l-[3px] border-l-accent bg-ink-925 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.1em] text-ink-300"
             role="status"
           >
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent-soft" aria-hidden="true" />
+            <span className="h-1.5 w-1.5 animate-pulse rounded-none bg-accent-soft" aria-hidden="true" />
             Answer the request above to continue
           </p>
         )}
         {followUpQueued && (
           <div
-            className="mb-2.5 flex items-center gap-2 rounded-lg border border-accent/20 bg-ink-900/70 px-2.5 py-1.5 font-mono text-[11px] text-ink-300"
+            className="mb-2.5 flex items-center gap-2 border border-ink-700 border-l-[3px] border-l-accent bg-ink-925 px-2.5 py-1.5 font-mono text-[11px] text-ink-300"
             title="A follow-up is queued for after this turn"
           >
-            <span className="h-1.5 w-1.5 rounded-full bg-accent-soft" aria-hidden="true" />
+            <span className="h-1.5 w-1.5 rounded-none bg-accent-soft" aria-hidden="true" />
             Follow-up queued
             {onClearQueue && (
               <button
                 type="button"
                 onClick={onClearQueue}
-                className="focus-ring ml-auto rounded-md px-1.5 py-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                className="focus-ring ml-auto min-h-11 rounded-sm px-1.5 py-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:min-h-0"
                 title="Clear queue (Esc)"
                 aria-label="Clear queued follow-up"
               >
@@ -644,10 +644,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                       : `${current.trimEnd()}${current.trim() ? " " : ""}@${activeFile} `,
                   )
                 }
-                className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-ink-700/80 bg-ink-900/80 px-2 py-0.5 font-mono text-[10px] text-ink-300 transition-colors hover:border-accent/50 hover:text-ink-100"
+                className="inline-flex max-w-[220px] items-center gap-1 rounded-sm border border-ink-700 bg-ink-900 px-2 py-0.5 font-mono text-[10px] text-ink-300 transition-colors hover:border-accent hover:text-ink-100"
                 title={`Active editor: ${activeFile}. Click to include it in the prompt.`}
               >
-                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent-soft" aria-hidden="true" />
+                <span className="h-1.5 w-1.5 shrink-0 rounded-none bg-accent-soft" aria-hidden="true" />
                 <span className="truncate">{activeFile}</span>
                 <span className="shrink-0 text-ink-500">+ include</span>
               </button>
@@ -655,14 +655,14 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             {referencedFiles.map((path) => (
               <span
                 key={path}
-                className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-ink-700/80 bg-ink-900/80 px-2 py-0.5 font-mono text-[10px] text-ink-300"
+                className="inline-flex max-w-[220px] items-center gap-1 rounded-sm border border-ink-700 bg-ink-900 px-2 py-0.5 font-mono text-[10px] text-ink-300"
                 title={`Referenced file: ${path}`}
               >
                 <span className="truncate">@{path}</span>
                 <button
                   type="button"
                   onClick={() => removeReference(path)}
-                  className="focus-ring shrink-0 rounded px-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="focus-ring shrink-0 rounded-sm px-0.5 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
                   aria-label={`Remove ${path} from prompt context`}
                 >
                   ×
@@ -737,7 +737,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                         (!canSend &&
                           !(text.trim().startsWith("/") || text.trim().startsWith("!")))
                       }
-                      className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
+                      className="focus-ring flex h-9 w-9 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:min-w-0"
                       title="Queue follow-up (Enter)"
                       aria-label="Queue follow-up"
                     >
@@ -746,7 +746,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                     <button
                       onClick={submitSteer}
                       disabled={hitlOpen || !connected || !canSend}
-                      className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40"
+                      className="focus-ring flex h-9 w-9 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40 sm:min-h-0 sm:min-w-0"
                       title="Steer in-flight turn (Ctrl+Enter)"
                       aria-label="Steer in-flight turn"
                     >
@@ -756,7 +756,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                 )}
                 <button
                   onClick={onAbort}
-                  className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm text-danger transition-colors hover:bg-ink-800"
+                  className="focus-ring flex h-9 w-9 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-sm text-danger transition-colors hover:bg-ink-800 sm:min-h-0 sm:min-w-0"
                   title="Stop"
                   aria-label="Stop"
                 >
@@ -767,7 +767,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               <button
                 onClick={submit}
                 disabled={disabled || (!text.trim() && images.length === 0)}
-                className="focus-ring flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
+                className="focus-ring flex h-9 w-9 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:min-w-0"
                 title="Send (Enter)"
                 aria-label="Send message"
               >

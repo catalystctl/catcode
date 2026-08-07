@@ -111,7 +111,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
   return (
     <div
       ref={trapRef}
-      className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925"
+      className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-[3px] border-l-accent bg-ink-925"
       role="dialog"
       aria-modal="true"
       aria-label="Agent questions"
@@ -125,7 +125,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
         </span>
         <button
           onClick={onSkip}
-          className="ml-auto rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="ml-auto flex h-8 w-8 min-h-11 min-w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:min-h-0 sm:min-w-0"
           aria-label="Skip"
         >
           <XIcon width={16} height={16} />
@@ -170,10 +170,10 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                           key={opt}
                           type="button"
                           onClick={() => pickOption(q, opt)}
-                          className={`rounded-sm border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          className={`min-h-11 rounded-sm border px-2.5 py-1.5 text-[11px] font-medium transition-colors sm:min-h-0 ${
                             selected
-                              ? "border-accent bg-accent/15 text-accent-soft"
-                              : "border-ink-700 bg-ink-950 text-ink-300 hover:border-accent/40 hover:text-ink-100"
+                              ? "border-accent bg-ink-900 text-accent-soft"
+                              : "border-ink-700 bg-ink-950 text-ink-300 hover:border-accent hover:text-ink-100"
                           }`}
                         >
                           {selected && <CheckIcon width={11} height={11} className="mr-1 inline" />}
@@ -185,10 +185,10 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                       <button
                         type="button"
                         onClick={() => toggleCustom(q)}
-                        className={`flex items-center gap-1 rounded-sm border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                        className={`flex min-h-11 items-center gap-1 rounded-sm border px-2.5 py-1.5 text-[11px] font-medium transition-colors sm:min-h-0 ${
                           isCustom
-                            ? "border-accent bg-accent/15 text-accent-soft"
-                            : "border-ink-700 bg-ink-950 text-ink-400 hover:border-accent/40 hover:text-ink-100"
+                            ? "border-accent bg-ink-900 text-accent-soft"
+                            : "border-ink-700 bg-ink-950 text-ink-400 hover:border-accent hover:text-ink-100"
                         }`}
                       >
                         <PencilIcon width={11} height={11} />
@@ -215,7 +215,7 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
                       }
                     }}
                     placeholder={q.placeholder ?? (isCustom ? "Type a custom answer…" : "Type your answer…")}
-                    className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 text-[12px] text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent/50 focus:outline-none"
+                    className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent focus:outline-none"
                   />
                 )}
               </div>
@@ -227,13 +227,13 @@ export function AskFlyout({ prompt, onSubmit, onSkip }: Props) {
       <div className="flex flex-wrap items-center gap-2 border-t border-ink-800 px-4 py-2.5">
         <button
           onClick={submit}
-          className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
+          className="flex min-h-11 items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft sm:min-h-0"
         >
           <SendIcon width={13} height={13} /> Submit
         </button>
         <button
           onClick={onSkip}
-          className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+          className="flex min-h-11 items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0"
         >
           <XIcon width={13} height={13} /> Skip
         </button>

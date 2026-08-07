@@ -38,24 +38,24 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
   };
 
   return (
-    <div className="overflow-hidden rounded-lg border border-ink-800/90 bg-ink-950/70 transition-colors duration-150">
+    <div className="chat-run-record overflow-hidden rounded-sm border border-ink-800 bg-ink-950 transition-colors duration-150">
       <button
         onClick={() => {
           userToggledRef.current = true;
           setOpen((o) => !o);
         }}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 bg-ink-925/80 px-2.5 py-1.5 text-left transition-colors hover:bg-ink-900"
+        className="flex w-full items-center gap-2 bg-ink-925 px-2.5 py-1.5 text-left transition-colors hover:bg-ink-900"
       >
         <ChevronRight
           width={11}
           height={11}
           className={`shrink-0 text-ink-600 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
         />
-        <span className="shrink-0 text-[12px] leading-none opacity-90">{toolIcon(tc.name)}</span>
+        <span className="shrink-0 text-[12px] leading-none text-ink-300">{toolIcon(tc.name)}</span>
         <span className="font-mono text-[11px] text-ink-200">{tc.name || "tool"}</span>
         {danger && (
-          <span className="rounded-sm border border-warning/40 px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-warning">
+          <span className="rounded-sm border border-warning px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-warning">
             destructive
           </span>
         )}
@@ -65,22 +65,22 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
         <span className="ml-auto flex shrink-0 items-center">
           {running ? (
             <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-warning">
-              <span className="h-1.5 w-1.5 animate-pulse bg-warning" aria-hidden="true" />
+              <span className="h-1.5 w-1.5 animate-pulse rounded-none bg-warning" aria-hidden="true" />
               running
             </span>
           ) : unknown ? (
             <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-ink-500">
-              <span className="h-1.5 w-1.5 bg-ink-600" aria-hidden="true" />
+              <span className="h-1.5 w-1.5 rounded-none bg-ink-600" aria-hidden="true" />
               loaded
             </span>
           ) : ok ? (
             <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-success">
-              <span className="h-1.5 w-1.5 bg-success" aria-hidden="true" />
+              <span className="h-1.5 w-1.5 rounded-none bg-success" aria-hidden="true" />
               ok
             </span>
           ) : (
             <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-danger">
-              <span className="h-1.5 w-1.5 bg-danger" aria-hidden="true" />
+              <span className="h-1.5 w-1.5 rounded-none bg-danger" aria-hidden="true" />
               error
             </span>
           )}
@@ -107,7 +107,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
                 </span>
                 <button
                   onClick={copy}
-                  className={`flex items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                  className={`flex min-h-11 items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors sm:min-h-0 ${
                     copied ? "text-success" : "text-ink-500 hover:bg-ink-800 hover:text-ink-100"
                   }`}
                 >

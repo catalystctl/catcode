@@ -39,7 +39,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
 
   if (items.length === 0) {
     return (
-      <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-sm border border-ink-700 bg-ink-900 px-2 py-2 font-mono text-[11px] text-ink-500 shadow-elev-2 animate-fade-in">
+      <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-auto rounded-sm border border-ink-700 bg-ink-900 px-3 py-3 font-mono text-[11px] text-ink-500 shadow-elev-2 animate-fade-in">
         {emptyHint ?? "No matches"}
       </div>
     );
@@ -63,7 +63,7 @@ export function Flyout({ items, selectedIndex, onSelect, onHover, emptyHint }: P
             onSelect(i);
           }}
           onMouseEnter={() => onHover(i)}
-          className={`flex w-full items-center gap-2 border-l-2 px-2 py-1 text-left text-[11px] transition-colors ${
+          className={`flex min-h-11 w-full items-center gap-2 border-l-2 px-2.5 py-2 text-left text-[11px] transition-colors sm:min-h-0 sm:py-1.5 ${
             i === selectedIndex
               ? "border-accent bg-ink-800 text-ink-100"
               : "border-transparent text-ink-300 hover:bg-ink-850"

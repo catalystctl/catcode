@@ -73,7 +73,7 @@ export function SudoPrompt({ prompt, onApprove, onDecline }: Props) {
           onKeyDown={handleKeyDown}
           placeholder="Enter your sudo password…"
           autoComplete="off"
-          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 text-[12px] text-ink-100 placeholder:text-ink-600 transition-colors focus:border-warning/50 focus:outline-none"
+          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] text-ink-100 placeholder:text-ink-600 transition-colors focus:border-warning focus:outline-none"
         />
       </div>
       <div className="flex items-center justify-between gap-2">
@@ -81,13 +81,13 @@ export function SudoPrompt({ prompt, onApprove, onDecline }: Props) {
           <button
             onClick={() => password.trim() && onApprove(password)}
             disabled={!password.trim()}
-            className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="focus-ring min-h-11 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             Approve
           </button>
           <button
             onClick={onDecline}
-            className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+            className="focus-ring min-h-11 rounded-sm border border-ink-700 px-3 py-2 text-[12px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             Decline
           </button>

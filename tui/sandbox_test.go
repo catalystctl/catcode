@@ -118,71 +118,16 @@ func TestSandboxStatusEventPopulatesReport(t *testing.T) {
 	}
 }
 
-// TestSandboxEnableReadyPersists: when the user enables Microsandbox and the
-// core reports the environment ready, the setting is persisted + a restart is
-// offered. Fail-closed: nothing is persisted until ready.
-func TestSandboxEnableReadyPersists(t *testing.T) {
-	s := newSandboxSession(t)
-	s.handleUserLine("/sandbox enable")
-	if !s.pendingSandboxEnable {
-		t.Fatal("enable should set pendingSandboxEnable")
-	}
-	if s.modal.kind != modalSandboxStatus {
-		t.Errorf("modal = %v, want modalSandboxStatus", s.modal.kind)
-	}
-	if got := s.coreIn.(*captureWriter).sentType(0); got != "get_sandbox_status" {
-		t.Errorf("first command = %q, want get_sandbox_status", got)
-	}
-	// Core replies: environment ready.
-	s.handleCoreEvent(rawEvent(t, "sandbox_status", map[string]any{
-		"mode":   "microsandbox",
-		"report": map[string]any{"ready": true, "supported": true, "platform": "linux"},
-	}))
-	if s.pendingSandboxEnable {
-		t.Error("pendingSandboxEnable should clear after ready reply")
-	}
-	if s.settings.Sandbox != "microsandbox" {
-		t.Errorf("settings.Sandbox = %q, want microsandbox", s.settings.Sandbox)
-	}
-	if s.modal.kind != modalConfirm {
-		t.Errorf("modal = %v, want modalConfirm (restart hint)", s.modal.kind)
-	}
-}
-
-// TestSandboxEnableNotReadyDoesNotPersist: a not-ready environment must never
-// silently save "none" (or "microsandbox") on the user's behalf — the status
-// panel stays open with setup guidance.
-func TestSandboxEnableNotReadyDoesNotPersist(t *testing.T) {
-	s := newSandboxSession(t)
-	s.handleUserLine("/sandbox enable")
-	s.handleCoreEvent(rawEvent(t, "sandbox_status", map[string]any{
-		"mode":   "microsandbox",
-		"report": map[string]any{"ready": false, "supported": true, "platform": "linux", "actions": []any{}},
-	}))
-	if s.settings.Sandbox != "none" {
-		t.Errorf("settings.Sandbox = %q, want none (must not persist until ready)", s.settings.Sandbox)
-	}
-	if s.modal.kind != modalSandboxStatus {
-		t.Errorf("modal = %v, want modalSandboxStatus (guidance stays open)", s.modal.kind)
-	}
-}
-
-// TestSandboxErrorCancelsPendingEnable: a sandbox_error cancels the pending
-// enable so the user must explicitly re-request it after fixing setup.
-func TestSandboxErrorCancelsPendingEnable(t *testing.T) {
-	s := newSandboxSession(t)
-	s.handleUserLine("/sandbox enable")
-	s.handleCoreEvent(rawEvent(t, "sandbox_error", map[string]any{
-		"error": "image_pull_failed",
-	}))
-	if s.pendingSandboxEnable {
-		t.Error("pendingSandboxEnable should clear on sandbox_error")
-	}
-	if s.sandboxStatus == nil || s.sandboxStatus.Error != "image_pull_failed" {
-		t.Errorf("error not recorded: %+v", s.sandboxStatus)
-	}
-	if s.settings.Sandbox != "none" {
-		t.Errorf("settings.Sandbox = %q, want none (fail-closed)", s.settings.Sandbox)
+func TestSandboxArgumentsOpenSelectorWithoutAction(t *testing.T) {
+	for _, command := range []string{"/sandbox enable", "/sandbox setup", "/sandbox reset", "/sandbox firejail"} {
+		s := newSandboxSession(t)
+		s.handleUserLine(command)
+		if s.modal.kind != modalSandbox {
+			t.Errorf("%s opened %v, want modalSandbox", command, s.modal.kind)
+		}
+		if s.pendingSandboxEnable || len(s.coreIn.(*captureWriter).lines) != 0 {
+			t.Errorf("%s executed before modal selection", command)
+		}
 	}
 }
 
@@ -210,64 +155,15 @@ func TestSandboxPrepareProgressThenReady(t *testing.T) {
 	}
 }
 
-// TestSandboxSubcommandsDispatch: the /sandbox subcommands issue the right
-// protocol commands and drive the expected UI state.
-func TestSandboxSubcommandsDispatch(t *testing.T) {
-	cases := []struct {
-		cmd       string
-		wantType  string // "" = no core command expected (e.g. disable is local)
-		wantModal modalKind
-	}{
-		{"/sandbox status", "get_sandbox_status", modalSandboxStatus},
-		{"/sandbox enable", "get_sandbox_status", modalSandboxStatus},
-		{"/sandbox recheck", "get_sandbox_status", modalSandboxStatus},
-		{"/sandbox setup", "prepare_sandbox", modalSandboxStatus},
-		{"/sandbox reset", "reset_sandbox", modalSandboxStatus},
-		{"/sandbox disable", "", modalConfirm},
-	}
-	for _, tc := range cases {
-		t.Run(tc.cmd, func(t *testing.T) {
-			s := newSandboxSession(t)
-			s.handleUserLine(tc.cmd)
-			cw := s.coreIn.(*captureWriter)
-			if tc.wantType != "" {
-				if got := cw.sentType(0); got != tc.wantType {
-					t.Errorf("command = %q, want %q", got, tc.wantType)
-				}
-			} else if len(cw.lines) != 0 {
-				t.Errorf("expected no core command, got %v", cw.lines)
-			}
-			if s.modal.kind != tc.wantModal {
-				t.Errorf("modal = %v, want %v", s.modal.kind, tc.wantModal)
-			}
-			if tc.cmd == "/sandbox disable" && s.settings.Sandbox != "none" {
-				t.Errorf("settings.Sandbox = %q, want none", s.settings.Sandbox)
-			}
-		})
-	}
-}
-
-// TestSandboxValueArgsMigrate: /sandbox <deprecated> preserves the intent to
-// sandbox (migrates to microsandbox + enable flow), while /sandbox microsandbox
-// also enables. Unknown values are rejected.
-func TestSandboxValueArgsMigrate(t *testing.T) {
-	for _, arg := range []string{"firejail", "fj", "seatbelt", "macos", "sandbox-exec"} {
-		t.Run(arg, func(t *testing.T) {
-			s := newSandboxSession(t)
-			s.handleUserLine("/sandbox " + arg)
-			if !s.pendingSandboxEnable {
-				t.Errorf("/sandbox %s should migrate to enable", arg)
-			}
-			if s.settings.Sandbox != "none" {
-				t.Errorf("settings.Sandbox = %q, want none (not persisted until ready)", s.settings.Sandbox)
-			}
-		})
-	}
-	// Unknown value is rejected, not silently coerced.
+func TestSandboxSelectorDispatchesChosenMode(t *testing.T) {
 	s := newSandboxSession(t)
-	s.handleUserLine("/sandbox bogus")
-	if s.pendingSandboxEnable {
-		t.Error("unknown sandbox value should not enable")
+	s.openSandboxPicker()
+	s.executeListSelect(1)
+	if !s.pendingSandboxEnable || s.modal.kind != modalSandboxStatus {
+		t.Fatalf("microsandbox selection did not start readiness flow: pending=%t modal=%v", s.pendingSandboxEnable, s.modal.kind)
+	}
+	if got := s.coreIn.(*captureWriter).sentType(0); got != "get_sandbox_status" {
+		t.Fatalf("command=%q, want get_sandbox_status", got)
 	}
 }
 

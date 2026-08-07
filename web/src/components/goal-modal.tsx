@@ -129,7 +129,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-sm border border-ink-700 bg-ink-950 px-2 py-1.5 text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
+        className="w-full rounded-sm border border-ink-700 bg-ink-950 px-2 py-1.5 text-[12px] text-ink-200 focus:border-accent focus:outline-none"
       >
         <option value="">(default)</option>
         {modelOpts.map((m) => (
@@ -151,14 +151,14 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
         aria-modal="true"
         aria-label="Goal mode"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div>
-            <span className="text-[13px] font-semibold text-ink-100">Goal mode</span>
+            <span className="text-[15px] font-semibold text-ink-100">Goal mode</span>
             <p className="text-[11px] text-ink-500">Plan, then deploy subagents</p>
           </div>
           <button
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -175,7 +175,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               placeholder="Describe what you want the harness to plan and deploy…"
-              className="w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+              className="w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent focus:outline-none"
               autoFocus
             />
           </label>
@@ -195,7 +195,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                   setConcurrency(next);
                   setMaxTasks((current) => Math.max(current, next));
                 }}
-                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent focus:outline-none"
               />
             </label>
             <label className="block">
@@ -212,7 +212,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                   setMaxTasks(next);
                   setConcurrency((current) => Math.min(current, next));
                 }}
-                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 focus:border-accent focus:outline-none"
               />
             </label>
           </div>
@@ -348,7 +348,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
                             return next;
                           });
                         }}
-                        className="w-16 rounded-sm border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-[12px] text-ink-200 focus:border-accent/60 focus:outline-none"
+                        className="w-16 rounded-sm border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-[12px] text-ink-200 focus:border-accent focus:outline-none"
                       />
                     </div>
                   ))}
@@ -358,11 +358,11 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t border-ink-800/80 px-4 py-3">
+        <div className="flex items-center justify-end gap-2 border-t border-ink-800 px-5 py-3">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-sm px-2.5 py-1 text-[11px] text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring min-h-11 rounded-sm px-3 py-2 text-[12px] text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             Cancel
           </button>
@@ -370,7 +370,7 @@ export function GoalModal({ models, providerPresets, providers, onStart, onClose
             type="button"
             onClick={submit}
             disabled={!goal.trim()}
-            className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="focus-ring min-h-11 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             Start goal
           </button>
@@ -417,21 +417,21 @@ export function GoalPlanBanner({
         <button
           type="button"
           onClick={onApprove}
-          className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
+          className="focus-ring min-h-11 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
         >
           Approve & deploy
         </button>
         <button
           type="button"
           onClick={onRevise}
-          className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+          className="focus-ring min-h-11 rounded-sm border border-ink-700 px-3 py-2 text-[12px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
         >
           Revise
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-sm px-2.5 py-1 text-[11px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200"
+          className="focus-ring min-h-11 rounded-sm px-3 py-2 text-[12px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
         >
           Cancel goal
         </button>
@@ -491,7 +491,7 @@ export function GoalProgressPanel({
           <button
             type="button"
             onClick={onCancel}
-            className="shrink-0 rounded-sm px-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-danger"
+            className="focus-ring shrink-0 rounded-sm px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-ink-500 transition-colors hover:text-danger"
           >
             cancel
           </button>

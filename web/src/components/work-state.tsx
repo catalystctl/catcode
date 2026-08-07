@@ -73,7 +73,7 @@ function Toggle({
     <button
       type="button"
       onClick={onClick}
-      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+      className="flex h-8 w-8 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-accent sm:min-h-0 sm:min-w-0"
       aria-label={expanded ? "Collapse status band" : "Expand status band"}
       aria-expanded={expanded}
       title={expanded ? "Collapse" : "Expand"}
@@ -173,7 +173,7 @@ export function WorkStatePanel({ ws, compact }: Props) {
       {expanded ? (
         // Expanded — full detail: goal wrapped (no truncation), every item shown.
         <div
-          className={`mx-auto w-full ${compact ? "max-w-none px-2 py-2" : "max-w-3xl px-3 py-2.5"}`}
+          className={`mx-auto w-full max-w-[60rem] ${compact ? "px-2 py-2" : "px-3 py-2.5 sm:px-6"}`}
         >
           <div className="flex items-start gap-2">
             <span
@@ -231,7 +231,7 @@ export function WorkStatePanel({ ws, compact }: Props) {
       ) : (
         // Collapsed — compact single-row flat band (truncated values, capped counts).
         <div
-          className={`mx-auto flex w-full flex-wrap items-center gap-x-2 gap-y-1 ${compact ? "max-w-none px-2 py-1" : "max-w-3xl px-3 py-1.5"}`}
+          className={`mx-auto flex w-full max-w-[60rem] flex-wrap items-center gap-x-2 gap-y-1 ${compact ? "px-2 py-1" : "px-3 py-1.5 sm:px-6"}`}
         >
           {/* goal — accent/success status square, then the truncated goal text. */}
           {showGoal && (

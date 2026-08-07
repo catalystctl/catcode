@@ -340,7 +340,7 @@ function SandboxStatusPanel({
 
       {/* Error */}
       {status.error ? (
-        <div className="flex items-start gap-2 rounded-sm border border-danger/40 bg-ink-900 px-3 py-2 text-[12px] text-danger">
+        <div className="flex items-start gap-2 rounded-sm border border-danger bg-ink-900 px-3 py-2 text-[12px] text-danger">
           <WarningIcon width={14} height={14} className="mt-0.5 shrink-0" />
           <span className="min-w-0 break-words">{status.error}</span>
         </div>
@@ -662,7 +662,7 @@ export function SettingsModal(props: Props) {
         aria-modal="true"
         aria-label="Settings"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3.5 sm:px-5">
+        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3.5 sm:px-5">
           <div className="flex items-center gap-2.5">
             <div className="flex h-8 w-8 items-center justify-center rounded-sm border border-ink-800 bg-ink-900 text-accent-soft">
               <BoltIcon width={16} height={16} />
@@ -674,7 +674,7 @@ export function SettingsModal(props: Props) {
           </div>
           <button
             onClick={props.onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close settings"
           >
             <XIcon width={18} height={18} />
@@ -685,7 +685,7 @@ export function SettingsModal(props: Props) {
           {/* Section nav */}
           <nav
             aria-label="Settings sections"
-            className="flex shrink-0 gap-1 overflow-x-auto border-b border-ink-800/80 p-2 sm:w-52 sm:flex-col sm:overflow-y-auto sm:border-b-0 sm:border-r"
+            className="flex shrink-0 gap-1 overflow-x-auto border-b border-ink-800 p-2 sm:w-52 sm:flex-col sm:overflow-y-auto sm:border-b-0 sm:border-r"
           >
             {SECTIONS.map((s) => {
               const active = section === s.id;
@@ -758,7 +758,7 @@ export function SettingsModal(props: Props) {
                               active
                                 ? "border-ink-700 border-l-2 border-l-accent bg-ink-900 text-ink-100"
                                 : "border-ink-800 bg-ink-900 text-ink-300 hover:border-ink-600 hover:bg-ink-850"
-                            } disabled:cursor-not-allowed disabled:opacity-50`}
+                            } disabled:cursor-not-allowed disabled:border-ink-800 disabled:bg-ink-950 disabled:text-ink-500`}
                           >
                             <Icon width={18} height={18} className="mt-0.5 shrink-0 text-accent-soft" />
                             <span className="min-w-0">
@@ -856,7 +856,7 @@ export function SettingsModal(props: Props) {
                         onKeyDown={(e) => {
                           if (e.key === "Enter") applyTimeout();
                         }}
-                        className="w-28 rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 focus:border-accent/60 focus:outline-none"
+                        className="w-28 rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-[13px] text-ink-100 focus:border-accent focus:outline-none"
                       />
                       <span className="text-[12px] text-ink-500">seconds</span>
                       <button
@@ -958,7 +958,7 @@ export function SettingsModal(props: Props) {
                 />
                 <div>
                   <FieldLabel>Handoff models</FieldLabel>
-                  <Card className={!draftEnabled ? "opacity-55" : ""}>
+                  <Card className={!draftEnabled ? "border-ink-700 bg-ink-950 text-ink-500" : ""}>
                     {visionCandidates.length === 0 ? (
                       <p className="text-[12px] text-ink-500">
                         No vision-capable models discovered yet.
@@ -1091,7 +1091,7 @@ export function SettingsModal(props: Props) {
           </div>
         </div>
 
-        <div className="flex items-center justify-between gap-3 border-t border-ink-800/80 px-4 py-2.5 sm:px-5">
+        <div className="flex items-center justify-between gap-3 border-t border-ink-800 px-4 py-2.5 sm:px-5">
           <p className="truncate text-[11px] text-ink-500">{activeMeta.label} · {activeMeta.hint}</p>
           <button
             type="button"

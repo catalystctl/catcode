@@ -32,12 +32,12 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
     );
   };
   return (
-    <div className="group/code my-3 overflow-hidden rounded-sm border border-ink-800 bg-ink-925">
-      <div className="flex items-center justify-between border-b border-ink-800 bg-ink-900 px-2 py-1">
+    <div className="group/code my-3 overflow-hidden rounded-sm border border-ink-800 bg-ink-950">
+      <div className="flex items-center justify-between border-b border-ink-800 bg-ink-925 px-2 py-1">
         <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">{lang}</span>
         <button
           onClick={copy}
-          className={`flex items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+          className={`flex min-h-11 items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors sm:min-h-0 ${
             copied ? "text-success" : "text-ink-500 hover:bg-ink-800 hover:text-ink-100"
           }`}
         >

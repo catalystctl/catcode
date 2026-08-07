@@ -30,11 +30,11 @@ type ConfirmFn = ReturnType<typeof useAppDialog>["confirm"];
 type PromptFn = ReturnType<typeof useAppDialog>["prompt"];
 
 const inputClass =
-  "min-w-0 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[12px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50";
+  "min-w-0 rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[12px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent";
 const buttonClass =
-  "rounded-lg border border-ink-700 px-2.5 py-1 text-[11px] font-medium text-ink-300 transition-colors hover:border-ink-600 hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40";
+  "rounded-sm border border-ink-700 bg-ink-900 px-2.5 py-1 text-[11px] font-medium text-ink-300 transition-colors hover:border-ink-600 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
 const primaryClass =
-  "rounded-lg bg-accent px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:opacity-40";
+  "rounded-sm bg-accent px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
 
 function statusLetter(status: GitStatusEntry["status"]) {
   return (
@@ -50,10 +50,10 @@ function statusLetter(status: GitStatusEntry["status"]) {
 }
 
 function statusColor(status: GitStatusEntry["status"]) {
-  if (status === "added" || status === "untracked") return "text-emerald-400";
-  if (status === "deleted" || status === "conflicted") return "text-red-400";
-  if (status === "renamed") return "text-sky-400";
-  return "text-amber-300";
+  if (status === "added" || status === "untracked") return "text-success";
+  if (status === "deleted" || status === "conflicted") return "text-danger";
+  if (status === "renamed") return "text-info";
+  return "text-warning";
 }
 
 function groupEntries(status: GitStatus | null) {
@@ -273,10 +273,10 @@ export function GitPanel({ compact }: { compact?: boolean }) {
       <span className="flex items-center gap-1.5 text-[12px] text-ink-400">
         <GitBranchIcon width={12} height={12} />
         <span className="text-ink-200">{status.branch}</span>
-        {status.ahead > 0 && <span className="text-emerald-400">↑{status.ahead}</span>}
-        {status.behind > 0 && <span className="text-amber-300">↓{status.behind}</span>}
+        {status.ahead > 0 && <span className="text-success">↑{status.ahead}</span>}
+        {status.behind > 0 && <span className="text-warning">↓{status.behind}</span>}
         {totalChanges > 0 && <span className="text-ink-500">• {totalChanges}</span>}
-        {operations.length > 0 && <span className="text-red-400">• {operations[0]}</span>}
+        {operations.length > 0 && <span className="text-danger">• {operations[0]}</span>}
       </span>
     );
   }
@@ -295,7 +295,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
 
       <div className="flex items-center justify-between border-b border-ink-800 px-3 py-2">
         <div className="min-w-0">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">
+          <div className="font-mono text-[10px] font-medium uppercase tracking-wider text-ink-500">
             Source Control
           </div>
           {status?.head && (
@@ -309,7 +309,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
           onClick={() => void refresh()}
           disabled={loading || busy}
           title="Refresh all Git data"
-          className="rounded-md p-1.5 text-ink-400 hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40"
+          className="rounded-sm p-1.5 text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40"
         >
           <RefreshIcon width={14} height={14} className={loading ? "animate-spin" : ""} />
         </button>
@@ -328,7 +328,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
 
       {status?.bare && (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-ink-850 text-ink-500">
+          <div className="flex h-12 w-12 items-center justify-center rounded-sm border border-ink-700 bg-ink-850 text-ink-500">
             <GitBranchIcon width={22} height={22} />
           </div>
           <div>
@@ -357,7 +357,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
                 role="tab"
                 aria-selected={tab === item.id}
                 onClick={() => setTab(item.id)}
-                className={`shrink-0 border-b-2 px-2.5 py-2 text-[10px] font-medium capitalize transition-colors ${
+                className={`shrink-0 border-b-2 px-2.5 py-2 font-mono text-[10px] font-medium uppercase tracking-wider transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent ${
                   tab === item.id
                     ? "border-accent text-ink-100"
                     : "border-transparent text-ink-500 hover:text-ink-200"
@@ -365,7 +365,7 @@ export function GitPanel({ compact }: { compact?: boolean }) {
               >
                 {item.label}
                 {item.count != null ? (
-                  <span className="ml-1 rounded bg-ink-800 px-1 py-0.5 text-[9px] text-ink-400">
+                  <span className="ml-1 rounded-sm bg-ink-800 px-1 py-0.5 font-mono text-[9px] text-ink-400">
                     {item.count}
                   </span>
                 ) : null}
@@ -446,7 +446,7 @@ function OperationsBanner({
   action: Action;
 }) {
   return (
-    <div className="border-b border-warning/30 bg-warning/10 px-3 py-2">
+    <div className="border-b border-ink-800 border-l-2 border-l-warning bg-ink-925 px-3 py-2">
       <div className="text-[11px] font-semibold text-warning">
         In progress: {operations.join(", ")}
       </div>
@@ -489,12 +489,12 @@ function RepositoryHeader({
   return (
     <div className="border-b border-ink-800 px-3 py-2.5 text-[12px]">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent/15 text-accent-soft">
+        <span className="flex h-6 w-6 items-center justify-center rounded-sm border border-ink-700 bg-ink-850 text-accent-soft">
           <GitBranchIcon width={13} height={13} />
         </span>
         <span className="min-w-0 truncate font-medium text-ink-100">{status.branch}</span>
-        {status.ahead > 0 && <span className="rounded bg-emerald-400/10 px-1.5 py-0.5 text-[10px] text-emerald-400">↑{status.ahead}</span>}
-        {status.behind > 0 && <span className="rounded bg-amber-300/10 px-1.5 py-0.5 text-[10px] text-amber-300">↓{status.behind}</span>}
+        {status.ahead > 0 && <span className="rounded-sm border border-ink-700 bg-ink-950 px-1.5 py-0.5 font-mono text-[10px] text-success">↑{status.ahead}</span>}
+        {status.behind > 0 && <span className="rounded-sm border border-ink-700 bg-ink-950 px-1.5 py-0.5 font-mono text-[10px] text-warning">↓{status.behind}</span>}
         <span className="ml-auto truncate text-[10px] text-ink-600" title={status.upstream ?? "No upstream"}>
           {status.upstream ?? "no upstream"}
         </span>
@@ -632,7 +632,7 @@ function Changes({
         </button>
         <button
           type="button"
-          className={`${buttonClass} hover:text-red-400`}
+          className={`${buttonClass} hover:text-danger`}
           disabled={busy || groups.untracked.length === 0}
           onClick={async () => {
             if (await confirm({ title: "Clean untracked files?", message: "Permanently delete all untracked files and folders?", confirmLabel: "Clean", danger: true })) {
@@ -826,7 +826,7 @@ function History({
       {visible.map((commit) => (
         <div
           key={commit.oid}
-          className={`group border-b border-ink-800/70 px-3 py-2 ${selected === commit.oid ? "bg-ink-850/80" : ""}`}
+          className={`group border-b border-ink-800 px-3 py-2 ${selected === commit.oid ? "border-l-2 border-l-accent bg-ink-850" : "border-l-2 border-l-transparent"}`}
         >
           <button type="button" className="flex w-full items-start gap-2 text-left" onClick={() => onShow(commit)}>
             <span className="font-mono text-[10px] text-accent-soft">{commit.shortOid}</span>
@@ -840,7 +840,7 @@ function History({
               {commit.refs.length > 0 && (
                 <span className="mt-1 flex flex-wrap gap-1">
                   {commit.refs.map((ref) => (
-                    <span key={ref} className="rounded bg-ink-800 px-1 text-[9px] text-sky-300">
+                    <span key={ref} className="rounded-sm border border-ink-700 bg-ink-950 px-1 font-mono text-[9px] text-ink-400">
                       {ref}
                     </span>
                   ))}
@@ -848,7 +848,7 @@ function History({
               )}
             </span>
           </button>
-          <div className="mt-1.5 flex flex-wrap gap-1 opacity-80 group-hover:opacity-100">
+          <div className="mt-1.5 flex flex-wrap gap-1">
             <button type="button" className={buttonClass} disabled={busy} onClick={() => onShow(commit)}>
               View
             </button>
@@ -1011,7 +1011,7 @@ function BranchList({
     <Section title={`${title} (${branches.length})`}>
       {branches.length === 0 && <Empty>No branches.</Empty>}
       {branches.map((branch) => (
-        <div key={`${branch.remote}-${branch.name}`} className="group border-t border-ink-800/70 py-2 first:border-0">
+        <div key={`${branch.remote}-${branch.name}`} className="group border-t border-ink-800 py-2 first:border-0">
           <div className="flex items-center gap-2">
             <GitBranchIcon
               width={12}
@@ -1033,7 +1033,7 @@ function BranchList({
               {branch.behind ? `↓${branch.behind}` : ""}
             </div>
           )}
-          <div className="ml-5 mt-1.5 flex flex-wrap gap-1 opacity-80 group-hover:opacity-100">
+          <div className="ml-5 mt-1.5 flex flex-wrap gap-1">
             {!branch.current && (
               <button
                 type="button"
@@ -1080,7 +1080,7 @@ function BranchList({
               <>
                 <button
                   type="button"
-                  className={`${buttonClass} hover:text-red-400`}
+                  className={`${buttonClass} hover:text-danger`}
                   disabled={busy}
                   onClick={async () => {
                     if (await confirm({ title: "Delete branch?", message: `Delete branch ${branch.name}?`, confirmLabel: "Delete", danger: true })) {
@@ -1092,7 +1092,7 @@ function BranchList({
                 </button>
                 <button
                   type="button"
-                  className={`${buttonClass} hover:text-red-400`}
+                  className={`${buttonClass} hover:text-danger`}
                   disabled={busy}
                   onClick={async () => {
                     if (await confirm({ title: "Force-delete branch?", message: `Force-delete unmerged branch ${branch.name}?`, confirmLabel: "Force delete", danger: true })) {
@@ -1178,10 +1178,10 @@ function Stashes({
       {stashes.map((stash) => (
         <div
           key={stash.ref}
-          className={`border-b border-ink-800 px-3 py-2 ${selected === stash.ref ? "bg-ink-850/80" : ""}`}
+          className={`border-b border-ink-800 px-3 py-2 ${selected === stash.ref ? "border-l-2 border-l-accent bg-ink-850" : "border-l-2 border-l-transparent"}`}
         >
           <button type="button" className="flex w-full gap-2 text-left" onClick={() => onShow(stash)}>
-            <span className="font-mono text-[10px] text-violet-300">{stash.ref}</span>
+            <span className="font-mono text-[10px] text-ink-400">{stash.ref}</span>
             <span className="min-w-0 flex-1 truncate text-[12px] text-ink-200">{stash.subject}</span>
           </button>
           <div className="mt-0.5 text-[10px] text-ink-600">{formatDate(stash.ts)}</div>
@@ -1223,7 +1223,7 @@ function Stashes({
             </button>
             <button
               type="button"
-              className={`${buttonClass} hover:text-red-400`}
+              className={`${buttonClass} hover:text-danger`}
               disabled={busy}
               onClick={async () => {
                 if (await confirm({ title: "Drop stash?", message: `Drop ${stash.ref}?`, confirmLabel: "Drop", danger: true })) {
@@ -1325,7 +1325,7 @@ function Repository({
         </div>
         {(status.operations?.length ?? 0) === 0 && (
           <>
-            <div className="mt-3 text-[10px] font-semibold uppercase tracking-wider text-ink-500">
+            <div className="mt-3 font-mono text-[10px] font-medium uppercase tracking-wider text-ink-500">
               Manual recovery
             </div>
             <div className="mt-1 grid grid-cols-2 gap-1">
@@ -1356,7 +1356,7 @@ function Repository({
       <Section title="Danger zone">
         <button
           type="button"
-          className={`${buttonClass} hover:text-red-400`}
+          className={`${buttonClass} hover:text-danger`}
           disabled={busy}
           onClick={async () => {
             if (await confirm({ title: "Clean ignored files?", message: "Delete untracked and ignored files? This permanently removes build output and all ignored files.", confirmLabel: "Clean all", danger: true })) {
@@ -1421,7 +1421,7 @@ function Tags({
       </button>
       <div className="mt-2 max-h-48 overflow-y-auto">
         {tags.map((item) => (
-          <div key={item.name} className="group flex items-center gap-2 border-t border-ink-800/70 py-1.5">
+          <div key={item.name} className="group flex items-center gap-2 border-t border-ink-800 py-1.5">
             <span className="min-w-0 flex-1 truncate text-[12px] text-ink-200" title={item.subject}>
               {item.name}
             </span>
@@ -1436,7 +1436,7 @@ function Tags({
             </button>
             <button
               type="button"
-              className={`${buttonClass} hover:text-red-400`}
+              className={`${buttonClass} hover:text-danger`}
               disabled={busy}
               onClick={async () => {
                 if (await confirm({ title: "Delete tag?", message: `Delete local tag ${item.name}?`, confirmLabel: "Delete", danger: true })) {
@@ -1501,7 +1501,7 @@ function Remotes({
         </button>
       </div>
       {remotes.map((remote) => (
-        <div key={remote.name} className="border-t border-ink-800/70 py-2 first:mt-2">
+        <div key={remote.name} className="border-t border-ink-800 py-2 first:mt-2">
           <div className="flex items-center gap-2">
             <span className="text-[12px] font-medium text-ink-100">{remote.name}</span>
             <span className="min-w-0 flex-1 truncate text-[10px] text-ink-500" title={remote.fetchUrl}>
@@ -1555,7 +1555,7 @@ function Remotes({
             </button>
             <button
               type="button"
-              className={`${buttonClass} hover:text-red-400`}
+              className={`${buttonClass} hover:text-danger`}
               disabled={busy}
               onClick={async () => {
                 if (await confirm({ title: "Remove remote?", message: `Remove remote ${remote.name}?`, confirmLabel: "Remove", danger: true })) {
@@ -1591,11 +1591,11 @@ function ChangeGroup({
 }) {
   if (!entries.length) return null;
   return (
-    <div className={`border-b border-ink-800 ${accent === "danger" ? "bg-red-400/5" : ""}`}>
+    <div className={`border-b border-ink-800 ${accent === "danger" ? "border-l-2 border-l-danger bg-ink-925" : ""}`}>
       <div className="flex items-center justify-between px-3 py-1.5">
         <span
-          className={`text-[11px] font-semibold uppercase tracking-wider ${
-            accent === "danger" ? "text-red-300" : "text-ink-400"
+          className={`font-mono text-[10px] font-medium uppercase tracking-wider ${
+            accent === "danger" ? "text-danger" : "text-ink-500"
           }`}
         >
           {title} <span className="text-ink-600">({entries.length})</span>
@@ -1627,8 +1627,8 @@ function FileRow({
 }) {
   return (
     <div
-      className={`group flex items-center gap-1.5 px-3 py-1 text-[12px] hover:bg-ink-850 ${
-        active ? "bg-ink-850" : ""
+      className={`group flex items-center gap-1.5 border-l-2 px-3 py-1 text-[12px] hover:bg-ink-850 ${
+        active ? "border-l-accent bg-ink-850" : "border-l-transparent"
       }`}
     >
       <span className={`w-3 shrink-0 text-center font-mono ${statusColor(entry.status)}`}>
@@ -1673,8 +1673,8 @@ function IconButton({
         onClick();
       }}
       disabled={disabled}
-      className={`rounded p-0.5 text-ink-400 hover:bg-ink-700 disabled:opacity-40 ${
-        danger ? "hover:text-red-400" : "hover:text-ink-100"
+      className={`flex min-h-9 min-w-9 items-center justify-center rounded-sm p-1 text-ink-400 hover:bg-ink-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 sm:min-h-0 sm:min-w-0 sm:p-0.5 ${
+        danger ? "hover:text-danger" : "hover:text-ink-100"
       }`}
     >
       {children}
@@ -1707,7 +1707,7 @@ function Check({
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="border-b border-ink-800 p-3">
-      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-ink-400">{title}</h3>
+      <h3 className="mb-2 font-mono text-[10px] font-medium uppercase tracking-wider text-ink-500">{title}</h3>
       {children}
     </section>
   );
@@ -1728,14 +1728,14 @@ function Notice({
 }) {
   return (
     <div
-      className={`m-2 flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-[11px] ${
+      className={`m-2 flex items-start gap-2 rounded-sm border px-2.5 py-1.5 text-[11px] ${
         danger
-          ? "border-red-400/30 bg-red-400/10 text-red-300"
-          : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+          ? "border-danger bg-ink-925 text-danger"
+          : "border-success bg-ink-925 text-success"
       }`}
     >
       <span className="min-w-0 flex-1 break-words">{children}</span>
-      <button type="button" onClick={onClose} aria-label="Dismiss" className="opacity-70 hover:opacity-100">
+      <button type="button" onClick={onClose} aria-label="Dismiss" className="text-ink-500 hover:text-ink-100">
         ×
       </button>
     </div>

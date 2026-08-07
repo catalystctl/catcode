@@ -127,16 +127,12 @@ impl Outcome {
 
 // ---- file tools ----
 
-/// Resolve a tool's path argument against the workspace root, honoring the
-/// approval mode. Under `Approval::Never` ALL path confinement is disabled —
-/// absolute paths, `..` traversal, and symlink escapes are allowed (the model
-/// is fully trusted, so it may read/write anywhere on the host). Under
-/// `Destructive`/`Always` the full confinement applies (reject absolute,
-/// reject `..`, reject symlink-outside-workspace). The dangerous-path list
-/// (.env/.git/.ssh) is gated separately in the approval gate
-/// (main::restricted_path_for_tool), which is also Never-off.
+/// Resolve a tool path against the workspace root. Approval::Never means
+/// approval-free host access only when the host backend is active; an enabled
+/// sandbox always preserves workspace confinement so file tools cannot bypass
+/// the guest boundary and reach arbitrary host paths.
 fn resolve_ws(cfg: &Config, input: &str) -> Result<std::path::PathBuf, String> {
-    if matches!(cfg.approval, Approval::Never) {
+    if matches!(cfg.approval, Approval::Never) && !crate::sandbox::is_sandbox_enabled() {
         workspace::resolve_unconfined(&cfg.workspace, input)
     } else {
         workspace::resolve(&cfg.workspace, input)
@@ -2448,7 +2444,17 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
                 })
                 .ok_or_else(|| format!("bad hunk header: {l}"))?;
             i += 1;
-            let mut target = old_start.saturating_sub(1); // 1-indexed -> 0
+            let mut target = if old_count == 0 {
+                old_start
+            } else {
+                old_start.saturating_sub(1)
+            };
+            if old_count == 0 && target > lines.len() {
+                return Err(format!(
+                    "zero-count hunk insertion position {target} is past end of file ({})",
+                    lines.len()
+                ));
+            }
             let mut consumed_old = 0usize;
             // Apply lines until the next hunk or EOF.
             while i < patch_lines.len() && !patch_lines[i].starts_with("@@") {
@@ -4042,6 +4048,23 @@ mod tests {
             fs::read_to_string(cfg.workspace.join("p.txt")).unwrap(),
             "alpha\nBETA\ngamma\n"
         );
+    }
+
+    #[test]
+    fn patch_zero_count_insertions_follow_unified_diff_positions() {
+        assert_eq!(
+            apply_unified_diff("a\nb\n", "@@ -0,0 +1,1 @@\n+start\n").unwrap(),
+            "start\na\nb\n"
+        );
+        assert_eq!(
+            apply_unified_diff("a\nb\nc\n", "@@ -2,0 +3,1 @@\n+middle\n").unwrap(),
+            "a\nb\nmiddle\nc\n"
+        );
+        assert_eq!(
+            apply_unified_diff("", "@@ -0,0 +1,1 @@\n+only\n").unwrap(),
+            "only"
+        );
+        assert!(apply_unified_diff("a\n", "@@ -2,0 +3,1 @@\n+bad\n").is_err());
     }
 
     #[test]

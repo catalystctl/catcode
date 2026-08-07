@@ -186,28 +186,12 @@ func TestRunModalCommitDelegates(t *testing.T) {
 	}
 }
 
-func TestGoalModalPrefillAndSubmit(t *testing.T) {
+func TestGoalArgumentsDoNotBypassModal(t *testing.T) {
 	s := initialSession()
 	s.ready = true
-	s.authed = true
-	s.models = []modelInfo{{ID: "m1", Provider: "openai"}}
-	s.modelIdx = 0
-	s.settings = &settingsStore{ReasoningEffort: "medium"}
 	s.handleUserLine("/goal fix the auth flow")
-	if s.modal.kind != modalGoal {
-		t.Fatalf("kind=%v, want modalGoal", s.modal.kind)
-	}
-	if s.goalDraft.goal != "fix the auth flow" {
-		t.Fatalf("prefill goal=%q", s.goalDraft.goal)
-	}
-	// Jump to Start and submit.
-	s.goalDraft.field = goalFieldStart
-	s.handleModalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if s.modal.kind != modalNone {
-		t.Fatalf("modal should close after submit; kind=%v", s.modal.kind)
-	}
-	if !s.busy {
-		t.Fatal("start_goal should mark session busy")
+	if s.modal.kind != modalGoal || s.goalDraft.goal != "" || !s.goalDraft.editing {
+		t.Fatalf("goal must open empty editable form; kind=%v goal=%q editing=%t", s.modal.kind, s.goalDraft.goal, s.goalDraft.editing)
 	}
 }
 
@@ -269,33 +253,17 @@ func TestGoalStatePlanReadyOpensReview(t *testing.T) {
 	}
 }
 
-func TestSkillStillRequiresNameNotModal(t *testing.T) {
+func TestSkillAndRememberArgumentsOpenModals(t *testing.T) {
 	s := initialSession()
 	s.ready = true
-	// Incomplete skill token is still a usage/error path, not a modal.
 	s.handleUserLine("/skill:")
-	if s.modal.kind != modalNone {
-		t.Fatalf("skills must not open a value modal; kind=%v", s.modal.kind)
+	if s.modal.kind != modalValueEdit {
+		t.Fatalf("skill command should be modal-first; kind=%v", s.modal.kind)
 	}
-}
-
-func TestCommandsWithArgsStillApplyDirectly(t *testing.T) {
-	s := initialSession()
-	s.ready = true
-	s.authed = true
-	s.models = []modelInfo{{ID: "m1"}}
-	s.modelIdx = 0
-	// Direct args must not open modals (power-user / scripting path).
+	s.closeModal()
 	s.handleUserLine("/remember keep the modal rule")
-	if s.modal.kind != modalNone {
-		t.Fatalf("/remember with args opened modal kind=%v", s.modal.kind)
-	}
-	s.handleUserLine("/approval always")
-	if s.modal.kind != modalNone {
-		t.Fatalf("/approval with args opened modal kind=%v", s.modal.kind)
-	}
-	if s.settings.Approval != "always" {
-		t.Fatalf("approval=%q, want always", s.settings.Approval)
+	if s.modal.kind != modalValueEdit || s.modal.editTarget != editTargetRemember {
+		t.Fatalf("remember args bypassed modal; kind=%v target=%q", s.modal.kind, s.modal.editTarget)
 	}
 }
 
@@ -321,11 +289,10 @@ func TestPluginRemoveSelectUninstalls(t *testing.T) {
 	}
 }
 
-func TestPaletteSkillStillInsertsNotModal(t *testing.T) {
+func TestPaletteSkillOpensTaskModal(t *testing.T) {
 	s := initialSession()
 	s.ready = true
-	s.width, s.height = 80, 24
-	s.skillsList = []skillInfo{{Name: "review", Description: "code review"}}
+	s.skillsList = []skillInfo{{Name: "review", Description: "review code"}}
 	s.openCommandPalette()
 	idx := -1
 	for i, it := range s.commandItems() {
@@ -338,10 +305,7 @@ func TestPaletteSkillStillInsertsNotModal(t *testing.T) {
 		t.Fatal("skill missing from palette")
 	}
 	s.runCommandByIndex(idx)
-	if got := s.input.Value(); got != "/skill:review " {
-		t.Fatalf("skill should insert into input, got %q", got)
-	}
-	if s.modal.kind != modalNone {
-		t.Fatalf("palette should close after skill insert; kind=%v", s.modal.kind)
+	if s.modal.kind != modalValueEdit || s.modal.editTarget != editTargetSkill+"review" {
+		t.Fatalf("skill should open task modal; kind=%v target=%q", s.modal.kind, s.modal.editTarget)
 	}
 }

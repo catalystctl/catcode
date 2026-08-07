@@ -42,33 +42,12 @@ func TestParsePluginInstallArgs(t *testing.T) {
 	}
 }
 
-func TestPluginInstallOpensScopePickerWhenScopeOmitted(t *testing.T) {
+func TestPluginInstallArgumentsOpenSourceModal(t *testing.T) {
 	s := initialSession()
 	s.ready = true
-	s.width, s.height = 80, 24
-	s.handleUserLine("/plugin-install https://github.com/karutoil/catcode-chatgpt-provider")
-	if s.modal.kind != modalPluginInstallScope {
-		t.Fatalf("kind=%v, want modalPluginInstallScope", s.modal.kind)
-	}
-	if s.pendingPluginInstallPath != "https://github.com/karutoil/catcode-chatgpt-provider" {
-		t.Fatalf("pending path=%q", s.pendingPluginInstallPath)
-	}
-	items := s.pluginInstallScopeItems()
-	if len(items) != 2 || items[0].label != "global" || items[1].label != "workspace" {
-		t.Fatalf("scope items=%v", items)
-	}
-}
-
-func TestPluginInstallSkipsScopePickerWhenScopeGiven(t *testing.T) {
-	s := initialSession()
-	s.ready = true
-	s.width, s.height = 80, 24
-	s.handleUserLine("/plugin-install ./plug workspace")
-	if s.modal.kind == modalPluginInstallScope {
-		t.Fatalf("should not open scope picker when scope is explicit")
-	}
-	if s.pendingPluginInstallPath != "" {
-		t.Fatalf("pending path should be empty, got %q", s.pendingPluginInstallPath)
+	s.handleUserLine("/plugin-install https://github.com/example/plugin workspace")
+	if s.modal.kind != modalValueEdit || s.modal.editTarget != editTargetPluginInstall {
+		t.Fatalf("plugin install must open source modal; kind=%v target=%q", s.modal.kind, s.modal.editTarget)
 	}
 }
 

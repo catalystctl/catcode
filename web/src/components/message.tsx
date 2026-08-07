@@ -28,7 +28,7 @@ function StreamingMarkdown({ children }: { children: string }) {
 
 const streamComponents: ComponentPropsWithoutRef<typeof ReactMarkdown>["components"] = {
   pre({ children }) {
-    return <pre className="!my-2 !rounded-md !border !border-ink-800 !bg-ink-925">{children}</pre>;
+    return <pre className="!my-2 !rounded-sm !border !border-ink-800 !bg-ink-950">{children}</pre>;
   },
 };
 
@@ -46,7 +46,7 @@ function CopyBtn({ text }: { text: string }) {
   return (
     <button
       onClick={copy}
-      className={`focus-ring flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-ink-800 ${
+      className={`focus-ring flex h-8 w-8 min-h-11 min-w-11 items-center justify-center rounded-sm transition-colors hover:bg-ink-800 sm:min-h-0 sm:min-w-0 ${
         copied ? "text-success" : "text-ink-500 hover:text-ink-100"
       }`}
       aria-label="Copy message"
@@ -120,7 +120,7 @@ function UserMessage({
       <div className="chat-turn-header flex items-center gap-2 pb-2 pt-5">
         <RoleLabel tone="ember">You</RoleLabel>
         {m.steer && (
-          <span className="rounded-full border border-warning/35 bg-warning/10 px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider text-warning">
+          <span className="rounded-sm border border-warning px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider text-warning">
             steer
           </span>
         )}
@@ -129,7 +129,7 @@ function UserMessage({
           {canEdit && onEdit && !editing && (
             <button
               onClick={() => setEditing(true)}
-              className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-8 w-8 min-h-11 min-w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:min-h-0 sm:min-w-0"
               aria-label="Edit message"
               title="Edit & resend"
             >
@@ -165,8 +165,8 @@ function UserMessage({
             className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-ink-100 focus:outline-none"
           />
           <div className="flex justify-end gap-1.5 pt-1 font-mono text-[10px] text-ink-500">
-            <kbd className="rounded bg-ink-900/80 px-1">↵</kbd> save{" "}
-            <kbd className="rounded bg-ink-900/80 px-1">Esc</kbd> cancel
+            <kbd className="rounded-sm border border-ink-800 bg-ink-900 px-1">↵</kbd> save{" "}
+            <kbd className="rounded-sm border border-ink-800 bg-ink-900 px-1">Esc</kbd> cancel
           </div>
         </div>
       ) : (
@@ -179,7 +179,7 @@ function UserMessage({
                   key={i}
                   src={src}
                   alt={`attachment ${i + 1}`}
-                  className="h-16 w-16 rounded-md border border-ink-800 object-cover"
+                  className="h-16 w-16 rounded-sm border border-ink-800 object-cover"
                 />
               ))}
             </div>
@@ -223,7 +223,7 @@ function AssistantMessage({
           {canRegenerate && onRegenerate && !m.streaming && (
             <button
               onClick={onRegenerate}
-              className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-8 w-8 min-h-11 min-w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:min-h-0 sm:min-w-0"
               aria-label="Regenerate response"
               title="Regenerate"
             >
@@ -246,7 +246,7 @@ function AssistantMessage({
           m.toolCalls.length === 0 &&
           m.streaming && (
             <div className="flex items-center gap-2 py-1.5 text-[13px]">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent-soft" aria-hidden="true" />
+              <span className="h-1.5 w-1.5 animate-pulse rounded-none bg-accent-soft" aria-hidden="true" />
               <span className="shimmer-text font-medium text-ink-300">Thinking…</span>
             </div>
           )
@@ -274,9 +274,10 @@ function ToolMessage({ m }: { m: ToolMsg }) {
   return (
     <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950/80">
-        <div className="flex items-center gap-2 border-b border-ink-800/80 bg-ink-925/80 px-2.5 py-1.5">
-          <span className={`h-1.5 w-1.5 rounded-full ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
+      <span className="sr-only">Run</span>
+      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950">
+        <div className="flex items-center gap-2 border-b border-ink-800 bg-ink-925 px-2.5 py-1.5">
+          <span className={`h-1.5 w-1.5 rounded-none ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
           <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-ink-500">
             {m.toolName || "tool"} · {m.ok ? "ok" : "error"}
           </span>
@@ -298,9 +299,10 @@ function BashMessage({ m }: { m: BashMsg }) {
   return (
     <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950/80">
-        <div className="flex items-center gap-2 border-b border-ink-800/80 bg-ink-925/80 px-2.5 py-1.5">
-          <span className={`h-1.5 w-1.5 rounded-full ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
+      <span className="sr-only">Run</span>
+      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950">
+        <div className="flex items-center gap-2 border-b border-ink-800 bg-ink-925 px-2.5 py-1.5">
+          <span className={`h-1.5 w-1.5 rounded-none ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
           <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-ink-500">
             {prefix} bash · {m.ok ? "ok" : "error"}
             {m.excludeFromContext ? " · no context" : ""}
@@ -341,9 +343,10 @@ function GoalMessage({ m }: { m: GoalMsg }) {
   return (
     <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className={`chat-run-record my-2 border-l-2 bg-ink-925/70 px-3.5 py-2.5 ${tone.bar}`}>
+      <span className="sr-only">Run</span>
+      <div className={`chat-run-record my-2 border border-ink-800 border-l-2 bg-ink-925 px-3.5 py-2.5 ${tone.bar}`}>
         <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em]">
-          <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} aria-hidden="true" />
+          <span className={`h-1.5 w-1.5 rounded-none ${tone.dot}`} aria-hidden="true" />
           <span className={tone.label}>goal · {kindLabel}</span>
           {m.status && <span className="text-ink-500">{m.status}</span>}
         </div>

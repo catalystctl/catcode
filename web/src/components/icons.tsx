@@ -308,7 +308,7 @@ export function BrandMark({
 }) {
   return (
     <span
-      className={`inline-flex shrink-0 items-center justify-center rounded-md bg-accent/10 font-display font-semibold text-accent-soft ring-1 ring-accent/25 ${className}`}
+      className={`inline-flex shrink-0 items-center justify-center rounded-sm border border-ink-750 bg-ink-900 font-display font-semibold text-accent-soft ${className}`}
       style={{ width: size, height: size, fontSize: Math.round(size * 0.58) }}
       aria-hidden
     >

@@ -229,7 +229,7 @@ export function ProjectSwitcher({
 
   return (
     <div
-      className="fixed inset-0 z-[70] flex justify-center bg-black/55 px-2 pt-[max(env(safe-area-inset-top),0.75rem)] backdrop-blur-[2px] sm:px-4"
+      className="fixed inset-0 z-[70] flex justify-center bg-ink-950/80 px-2 pt-[max(env(safe-area-inset-top),0.75rem)] sm:px-4"
       onMouseDown={onClose}
     >
     <section
@@ -238,13 +238,13 @@ export function ProjectSwitcher({
       aria-modal="true"
       aria-label="Switch project"
       onMouseDown={(event) => event.stopPropagation()}
-      className={`flex max-h-[min(36rem,calc(100dvh-4.5rem))] w-full flex-col overflow-hidden rounded-xl border border-ink-700 bg-ink-925 shadow-2xl shadow-black/50 animate-fade-in ${
+      className={`flex max-h-[min(36rem,calc(100dvh-4.5rem))] w-full flex-col overflow-hidden rounded-sm border border-ink-700 bg-ink-900 shadow-elev-2 animate-fade-in ${
         mobile ? "max-w-lg" : "max-w-md sm:absolute sm:bottom-3 sm:left-14 sm:max-w-none sm:w-[26rem]"
       }`}
     >
       <header className="border-b border-ink-800 px-3 pt-3 pb-0">
         <div className="mb-2.5 flex items-start gap-2">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent/15 text-accent-soft">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-sm border border-ink-700 bg-ink-850 text-accent-soft">
             <FolderIcon width={15} height={15} />
           </div>
           <div className="min-w-0 flex-1">
@@ -258,7 +258,7 @@ export function ProjectSwitcher({
           <button
             type="button"
             onClick={onClose}
-            className="flex min-h-11 min-w-11 items-center justify-center rounded-md p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:min-w-0"
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0 sm:min-w-0"
             aria-label="Close project switcher"
           >
             <XIcon width={14} height={14} />
@@ -282,15 +282,15 @@ export function ProjectSwitcher({
                 role="tab"
                 aria-selected={active}
                 onClick={() => setMode(tab.id)}
-                className={`relative min-h-11 flex-1 rounded-t-md px-3 py-2 text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/70 ${
+                className={`relative min-h-11 flex-1 rounded-t-sm px-3 py-2 font-mono text-[11px] font-medium uppercase tracking-wider transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent ${
                   active
-                    ? "bg-ink-900 text-ink-100"
-                    : "text-ink-500 hover:bg-ink-900/50 hover:text-ink-300"
+                    ? "bg-ink-950 text-ink-100"
+                    : "text-ink-500 hover:bg-ink-850 hover:text-ink-300"
                 }`}
               >
                 {tab.label}
                 {active ? (
-                  <span className="absolute inset-x-3 -bottom-px h-0.5 rounded-full bg-accent" />
+                  <span className="absolute inset-x-3 -bottom-px h-0.5 bg-accent" />
                 ) : null}
               </button>
             );
@@ -311,7 +311,7 @@ export function ProjectSwitcher({
                 onKeyDown={(e) => { if (e.key === "Enter") void createProject(); }}
                 placeholder="my-project"
                 aria-label="Project name"
-                className="min-h-11 w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
+                className="min-h-11 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
               />
             </label>
             <label className="block">
@@ -323,9 +323,9 @@ export function ProjectSwitcher({
                   onChange={(e) => setCreateParent(e.target.value)}
                   placeholder={browseHome ?? "~"}
                   aria-label="Parent directory"
-                  className="min-h-11 min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
+                  className="min-h-11 min-w-0 flex-1 rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
                 />
-                <button type="button" disabled={creating} onClick={() => setMode("browse")} className="min-h-11 shrink-0 rounded-lg border border-ink-700 px-3 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:min-h-0 sm:px-2">Browse</button>
+                <button type="button" disabled={creating} onClick={() => setMode("browse")} className="min-h-11 shrink-0 rounded-sm border border-ink-700 px-3 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 sm:min-h-0 sm:px-2">Browse</button>
               </div>
               {createParent.trim() || createName.trim() ? (
                 <span className="mt-1 block truncate font-mono text-[10px] text-ink-600">
@@ -335,20 +335,20 @@ export function ProjectSwitcher({
             </label>
             <div className="flex flex-col gap-1.5">
               <label className="flex min-h-11 items-center gap-2 text-[12px] text-ink-300 sm:min-h-0">
-                <input type="checkbox" checked={createInitGit} disabled={creating} onChange={(e) => setCreateInitGit(e.target.checked)} className="h-5 w-5 accent-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70" />
+                <input type="checkbox" checked={createInitGit} disabled={creating} onChange={(e) => setCreateInitGit(e.target.checked)} className="h-5 w-5 accent-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" />
                 Initialize a Git repository
               </label>
               <label className="flex min-h-11 items-center gap-2 text-[12px] text-ink-300 sm:min-h-0">
-                <input type="checkbox" checked={createReadme} disabled={creating} onChange={(e) => setCreateReadme(e.target.checked)} className="h-5 w-5 accent-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70" />
+                <input type="checkbox" checked={createReadme} disabled={creating} onChange={(e) => setCreateReadme(e.target.checked)} className="h-5 w-5 accent-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" />
                 Create a README.md
               </label>
             </div>
             {createError ? (
-              <div role="alert" className="rounded-lg bg-danger/10 px-2.5 py-2 text-[12px] text-danger">{createError}</div>
+              <div role="alert" className="rounded-sm border border-danger bg-ink-950 px-2.5 py-2 text-[12px] text-danger">{createError}</div>
             ) : null}
           </div>
           <div className="mt-auto flex items-center gap-2 border-t border-ink-800 pt-3">
-            <button type="button" disabled={creating || switching} onClick={() => void createProject()} className="flex min-h-11 flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40">
+            <button type="button" disabled={creating || switching} onClick={() => void createProject()} className="flex min-h-11 flex-1 items-center justify-center gap-2 rounded-sm bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40">
               <FolderPlusIcon width={14} height={14} />
               {creating ? "Creating…" : "Create project"}
             </button>
@@ -366,7 +366,7 @@ export function ProjectSwitcher({
                 onChange={(e) => setCloneUrl(e.target.value)}
                 placeholder="https://github.com/user/repo.git"
                 aria-label="Repository URL"
-                className="min-h-11 w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
+                className="min-h-11 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
               />
             </label>
             <label className="block">
@@ -378,9 +378,9 @@ export function ProjectSwitcher({
                   onChange={(e) => setCloneParent(e.target.value)}
                   placeholder={browseHome ?? "~"}
                   aria-label="Parent directory"
-                  className="min-h-11 min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
+                  className="min-h-11 min-w-0 flex-1 rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
                 />
-                <button type="button" disabled={cloning} onClick={() => setMode("browse")} className="min-h-11 shrink-0 rounded-lg border border-ink-700 px-3 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:min-h-0 sm:px-2">Browse</button>
+                <button type="button" disabled={cloning} onClick={() => setMode("browse")} className="min-h-11 shrink-0 rounded-sm border border-ink-700 px-3 py-1.5 text-[11px] text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 sm:min-h-0 sm:px-2">Browse</button>
               </div>
             </label>
             <div className="grid grid-cols-2 gap-2">
@@ -392,7 +392,7 @@ export function ProjectSwitcher({
                   onChange={(e) => setCloneName(e.target.value)}
                   placeholder="auto from URL"
                   aria-label="Folder name"
-                  className="min-h-11 w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
+                  className="min-h-11 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
                 />
               </label>
               <label className="block">
@@ -403,16 +403,16 @@ export function ProjectSwitcher({
                   onChange={(e) => setCloneBranch(e.target.value)}
                   placeholder="default"
                   aria-label="Branch"
-                  className="min-h-11 w-full rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
+                  className="min-h-11 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[12px]"
                 />
               </label>
             </div>
             {cloneError ? (
-              <div role="alert" className="rounded-lg bg-danger/10 px-2.5 py-2 text-[12px] text-danger">{cloneError}</div>
+              <div role="alert" className="rounded-sm border border-danger bg-ink-950 px-2.5 py-2 text-[12px] text-danger">{cloneError}</div>
             ) : null}
           </div>
           <div className="mt-auto flex items-center gap-2 border-t border-ink-800 pt-3">
-            <button type="button" disabled={cloning || switching || !cloneUrl.trim()} onClick={() => void cloneRepo()} className="flex min-h-11 flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40">
+            <button type="button" disabled={cloning || switching || !cloneUrl.trim()} onClick={() => void cloneRepo()} className="flex min-h-11 flex-1 items-center justify-center gap-2 rounded-sm bg-accent px-3 py-2 text-[12px] font-semibold text-white hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40">
               <GitBranchIcon width={14} height={14} />
               {cloning ? "Cloning…" : "Clone repository"}
             </button>
@@ -421,7 +421,7 @@ export function ProjectSwitcher({
       ) : mode === "recent" ? (
         <>
           <div className="border-b border-ink-800 px-2.5 py-2">
-            <label className="flex items-center gap-2 rounded-lg border border-ink-800 bg-ink-950 px-2.5 py-1.5">
+            <label className="flex items-center gap-2 rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5">
               <SearchIcon width={13} height={13} className="shrink-0 text-ink-500" />
               <input
                 autoFocus={!mobile}
@@ -429,13 +429,13 @@ export function ProjectSwitcher({
                 onChange={(event) => setFilter(event.target.value)}
                 placeholder="Filter recent projects…"
                 aria-label="Filter recent projects"
-                className="min-h-11 min-w-0 flex-1 bg-transparent text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:text-[12px]"
+                className="min-h-11 min-w-0 flex-1 bg-transparent text-[16px] text-ink-100 outline-none placeholder:text-ink-600 focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0 sm:text-[12px]"
               />
               {filter ? (
                 <button
                   type="button"
                   onClick={() => setFilter("")}
-                  className="flex min-h-11 min-w-11 items-center justify-center rounded p-0.5 text-ink-500 hover:text-ink-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:min-w-0"
+                  className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-0.5 text-ink-500 hover:text-ink-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0 sm:min-w-0"
                   aria-label="Clear filter"
                 >
                   <XIcon width={12} height={12} />
@@ -453,7 +453,7 @@ export function ProjectSwitcher({
                 <button
                   type="button"
                   onClick={() => setMode("browse")}
-                  className="mt-3 inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-ink-700 px-3 py-1.5 text-[11px] font-medium text-ink-300 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0"
+                  className="mt-3 inline-flex min-h-11 items-center gap-1.5 rounded-sm border border-ink-700 px-3 py-1.5 text-[11px] font-medium text-ink-300 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0"
                 >
                   <FolderPlusIcon width={12} height={12} />
                   Browse for a folder
@@ -465,19 +465,19 @@ export function ProjectSwitcher({
               return (
                 <div
                   key={project.path}
-                  className={`group/project flex items-center gap-1 rounded-lg px-1.5 py-1 ${
-                    active ? "bg-accent/12" : "hover:bg-ink-850"
+                  className={`group/project flex items-center gap-1 rounded-sm px-1.5 py-1 ${
+                    active ? "border-l-2 border-l-accent bg-ink-850" : "border-l-2 border-l-transparent hover:bg-ink-850"
                   }`}
                 >
                   <button
                     type="button"
                     disabled={switching}
                     onClick={() => (active ? onClose() : switchTo(project.path))}
-                    className="flex min-h-11 min-w-0 flex-1 items-center gap-2.5 rounded-md px-1.5 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50"
+                    className="flex min-h-11 min-w-0 flex-1 items-center gap-2.5 rounded-sm px-1.5 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
                   >
                     <span
-                      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${
-                        active ? "bg-accent/20 text-accent-soft" : "bg-ink-900 text-ink-500"
+                      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-sm ${
+                        active ? "bg-ink-800 text-accent-soft" : "bg-ink-950 text-ink-500"
                       }`}
                     >
                       <FolderIcon width={14} height={14} />
@@ -497,7 +497,7 @@ export function ProjectSwitcher({
                   <button
                     type="button"
                     onClick={() => onRemoveProject(project.path)}
-                    className="flex min-h-11 min-w-11 items-center justify-center rounded p-1 text-ink-600 opacity-100 hover:bg-danger/10 hover:text-danger focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger/70 sm:min-h-0 sm:min-w-0 sm:opacity-0 sm:group-hover/project:opacity-100 sm:focus:opacity-100"
+                    className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-1 text-ink-600 opacity-100 hover:bg-ink-800 hover:text-danger focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger sm:min-h-0 sm:min-w-0 sm:opacity-0 sm:group-hover/project:opacity-100 sm:focus:opacity-100"
                     title="Remove from recent projects"
                     aria-label={`Remove ${project.name} from recent projects`}
                   >
@@ -513,7 +513,7 @@ export function ProjectSwitcher({
               type="button"
               disabled={switching}
               onClick={() => setMode("browse")}
-              className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-ink-700 bg-ink-900 px-3 py-2 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50"
+              className="flex min-h-11 w-full items-center justify-center gap-2 rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] font-medium text-ink-200 transition-colors hover:border-ink-600 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
             >
               <FolderPlusIcon width={14} height={14} className="text-accent-soft" />
               Add project by browsing…
@@ -536,12 +536,12 @@ export function ProjectSwitcher({
                 onChange={(event) => setPathInput(event.target.value)}
                 placeholder="/path/to/project"
                 aria-label="Directory path"
-                className="min-h-11 min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 placeholder:text-ink-600 focus:border-accent/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
+                className="min-h-11 min-w-0 flex-1 rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[16px] text-ink-200 placeholder:text-ink-600 focus:border-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 sm:min-h-0 sm:text-[11px]"
               />
               <button
                 type="submit"
                 disabled={switching || browseLoading}
-                className="min-h-11 rounded-lg border border-ink-700 px-3 py-1.5 text-[11px] font-medium text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:min-h-0 sm:px-2.5"
+                className="min-h-11 rounded-sm border border-ink-700 px-3 py-1.5 text-[11px] font-medium text-ink-300 hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40 sm:min-h-0 sm:px-2.5"
               >
                 Go
               </button>
@@ -552,7 +552,7 @@ export function ProjectSwitcher({
                 type="button"
                 disabled={!browseParent || browseLoading || switching}
                 onClick={() => browseParent && void loadBrowse(browseParent)}
-                className="flex min-h-11 min-w-11 items-center justify-center rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-30 sm:min-h-0 sm:min-w-0"
+                className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 sm:min-h-0 sm:min-w-0"
                 title="Go up"
                 aria-label="Go up one directory"
               >
@@ -562,7 +562,7 @@ export function ProjectSwitcher({
                 type="button"
                 disabled={!browseHome || browseLoading || switching}
                 onClick={() => browseHome && void loadBrowse(browseHome)}
-                className="flex min-h-11 min-w-11 items-center justify-center rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-30 sm:min-h-0 sm:min-w-0"
+                className="flex min-h-11 min-w-11 items-center justify-center rounded-sm p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 sm:min-h-0 sm:min-w-0"
                 title="Home"
                 aria-label="Go to home directory"
               >
@@ -636,18 +636,18 @@ export function ProjectSwitcher({
                     disabled={switching}
                     onClick={() => void loadBrowse(entry.path)}
                     onDoubleClick={() => switchTo(entry.path)}
-                    className={`flex min-h-11 w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-50 ${
-                      active ? "bg-accent/12" : "hover:bg-ink-850"
+                    className={`flex min-h-11 w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 ${
+                      active ? "border-l-2 border-l-accent bg-ink-850" : "border-l-2 border-l-transparent hover:bg-ink-850"
                     }`}
                   >
-                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-ink-900 text-ink-400">
+                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm bg-ink-950 text-ink-400">
                       <FolderIcon width={14} height={14} />
                     </span>
                     <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-ink-100">
                       {entry.name}
                     </span>
                     {already ? (
-                      <span className="shrink-0 rounded bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
+                      <span className="shrink-0 rounded-sm bg-ink-800 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ink-400">
                         recent
                       </span>
                     ) : null}
@@ -662,7 +662,7 @@ export function ProjectSwitcher({
               type="button"
               disabled={switching || !browsePath}
               onClick={() => browsePath && switchTo(browsePath)}
-              className="flex min-h-11 min-w-0 flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40"
+              className="flex min-h-11 min-w-0 flex-1 items-center justify-center gap-2 rounded-sm bg-accent px-3 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40"
             >
               <FolderPlusIcon width={14} height={14} />
               <span className="truncate">
@@ -693,7 +693,7 @@ function Crumb({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={`min-h-11 max-w-[7rem] truncate rounded px-2 py-0.5 text-[11px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:px-1 ${
+      className={`min-h-11 max-w-[7rem] truncate rounded-sm px-2 py-0.5 text-[11px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:min-h-0 sm:px-1 ${
         active
           ? "font-medium text-ink-100"
           : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"

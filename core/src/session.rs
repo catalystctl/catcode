@@ -276,7 +276,10 @@ pub fn load_report(path: &Path) -> Result<LoadReport, String> {
             continue;
         }
         match serde_json::from_value::<Message>(value) {
-            Ok(message) => report.messages.push(message),
+            Ok(mut message) => {
+                message.normalize_embedded_thinking();
+                report.messages.push(message);
+            }
             Err(_) => malformed.push(line_number),
         }
     }
@@ -430,11 +433,24 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
     else {
         return;
     };
+    let preserved_records: Vec<String> = std::fs::read_to_string(path)
+        .ok()
+        .into_iter()
+        .flat_map(|content| content.lines().map(str::to_string).collect::<Vec<_>>())
+        .filter(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|value| value.get("_run").is_some())
+        })
+        .collect();
     let _ = writeln!(f, "{}", header_line());
     for m in messages {
         let mut line = serde_json::to_string(m).unwrap_or_default();
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
+    }
+    for record in preserved_records {
+        let _ = writeln!(f, "{record}");
     }
     let _ = f.flush();
     let _ = f.sync_all();
@@ -542,17 +558,19 @@ pub fn describe(path: &Path) -> SessionInfo {
             }
             // Old file with no header — this line is a real message; fall through.
         }
+        let parsed_message = serde_json::from_str::<Message>(&line).ok();
+        let Some(msg) = parsed_message else {
+            continue;
+        };
         messages += 1;
         // Sanity guard against a pathological file; stop counting beyond this.
         if messages > 100_000 {
             break;
         }
         if title.is_none() {
-            if let Ok(msg) = serde_json::from_str::<Message>(&line) {
-                if let Some(t) = first_user_text(&msg) {
-                    let t: String = t.trim().chars().take(80).collect();
-                    title = Some(t);
-                }
+            if let Some(t) = first_user_text(&msg) {
+                let t: String = t.trim().chars().take(80).collect();
+                title = Some(t);
             }
         }
     }
@@ -795,6 +813,25 @@ mod tests {
         assert!(load_report(&p).unwrap().unfinished_runs.is_empty());
     }
 
+    #[test]
+    fn rewrite_preserves_run_records_and_describe_excludes_them() {
+        let dir = std::env::temp_dir().join("catalyst_code_session_rewrite_runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        append(&p, &Message::user("hello"));
+        append_run_state(&p, "s1", "r1", RunState::Started, None);
+        assert_eq!(describe(&p).messages, 1);
+
+        rewrite(&p, &[Message::user("compacted")]);
+
+        let report = load_report(&p).unwrap();
+        assert_eq!(report.messages.len(), 1);
+        assert_eq!(report.unfinished_runs.len(), 1);
+        assert_eq!(report.unfinished_runs[0].run_id, "r1");
+        assert_eq!(describe(&p).messages, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn normal_replay_preserves_messages_and_terminal_activity() {
         let dir = std::env::temp_dir().join("catalyst_code_session_normal_replay");

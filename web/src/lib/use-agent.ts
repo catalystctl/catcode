@@ -381,7 +381,7 @@ export function useAgent(): AgentApi {
     if (items.length) {
       setState((st) => reduce(st, { type: "_add_notifications", items }));
     }
-  }, [state.liveSessions]);
+  }, [state.currentSessionFile, state.liveSessions]);
 
   // Drive the tab badge + OS desktop notifications from the feed. New (unseen)
   // items fire a desktop notification when the user opted in; the tab badge

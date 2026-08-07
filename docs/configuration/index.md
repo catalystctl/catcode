@@ -166,6 +166,79 @@ non-empty image, valid env var names).
 
 ---
 
+## Advisor and WATCHDOG files
+
+The advisor is an optional second-model reviewer. It is fail-open: provider
+errors, missing credentials, malformed advice, and malformed watchdog files do
+not stop the executor. Advisor output is bounded, secret-redacted, XML-escaped,
+deduplicated, and injected only as advisory context. Advisors never execute
+tools, approve actions, mutate files, or restart a stopped turn.
+
+```json
+{
+  "advisor": {
+    "enabled": true,
+    "model": "claude-sonnet-4-5",
+    "subagents": true,
+    "subagentModel": "claude-haiku-4-5"
+  }
+}
+```
+
+`model` defaults to the executor model. Subagents use `subagentModel`, then
+`model`, then their executor model. `/advisor` configures enablement and these
+model choices through the TUI.
+
+### WATCHDOG.md
+
+`WATCHDOG.md` contains reviewer-only guidance: project traps, architectural
+boundaries, dangerous APIs, and review priorities. It is never injected into
+the executor's ordinary prompt. The loader searches the user advisor directory
+(`~/.catalyst-code/WATCHDOG.md`), project ancestors, and
+`<project>/.catalyst-code/WATCHDOG.md`. A line containing `@relative/path` is
+expanded from the watchdog file's directory; missing imports remain literal.
+
+### WATCHDOG.yml
+
+`WATCHDOG.yml` or `.yaml` defines named reviewers:
+
+```yaml
+instructions: Check public API changes and test coverage.
+advisors:
+  - name: Architecture
+    enabled: true
+    model: claude-sonnet-4-5
+    tools: [read, grep, glob]
+    instructions: Watch coupling and unintended API growth.
+  - name: Security
+    enabled: true
+    model: claude-sonnet-4-5
+    instructions: Watch trust boundaries and secret handling.
+```
+
+Named reviewers are independent side calls. An explicit `model` wins over the
+role model. Duplicate names are resolved by discovery order, with more-specific
+project files loaded after broad user/ancestor files. `enabled: false` pauses a
+reviewer. The `tools` field is retained as roster metadata but this harness
+currently keeps watchdog execution read-only with no tool access; this is
+intentional safety behavior rather than an accidental permission drop.
+
+Each accepted note is emitted as `advisor_note` and injected as:
+
+```xml
+<advisory advisor="Architecture" severity="concern" scope="main">
+specific guidance
+</advisory>
+```
+
+The same reviewer cannot emit normalized duplicate advice more than once per
+process (FIFO history capped at 4096 notes). `nit`, `concern`, and `blocker`
+are informational severities; this implementation preserves all accepted notes
+for the next executor step and never auto-resumes the executor.
+
+---
+
+
 ## Provider Configuration
 
 ### Config File Format

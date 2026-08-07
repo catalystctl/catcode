@@ -814,7 +814,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
                 const el = scrollRef.current;
                 if (el) el.scrollTop = el.scrollHeight;
               }}
-              className="chat-jump-pill pointer-events-auto absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 px-3.5 py-1.5 font-mono text-[11px] text-ink-200 transition-colors hover:border-accent/50 hover:text-ink-100"
+              className="pointer-events-auto absolute bottom-3 left-1/2 z-10 flex min-h-11 -translate-x-1/2 items-center gap-1.5 rounded-sm border border-ink-700 bg-ink-900 px-3.5 py-1.5 font-mono text-[11px] text-ink-200 transition-colors hover:border-accent hover:text-ink-100"
             >
               <span className="text-accent-soft" aria-hidden="true">↓</span> Jump to latest
             </button>
@@ -823,14 +823,14 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
 
         {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
         {!switching && (
-          <div ref={hitlGateRef} className="mx-auto w-full max-w-[60rem] shrink-0">
+          <div ref={hitlGateRef} className="mx-auto w-full max-w-[60rem] shrink-0 px-3 sm:px-6">
             {state.pendingApproval && (
-              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+              <div className="mb-2 mt-2">
                 <Approval approval={state.pendingApproval} onApprove={agent.approve} />
               </div>
             )}
             {state.pendingIntercom && (
-              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+              <div className="mb-2 mt-2">
                 <IntercomPrompt
                   prompt={state.pendingIntercom}
                   onReply={agent.intercomReply}
@@ -839,7 +839,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               </div>
             )}
             {state.pendingAsk && (
-              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+              <div className="mb-2 mt-2">
                 <AskFlyout
                   prompt={state.pendingAsk}
                   onSubmit={(answers) => agent.askReply(answers)}
@@ -848,7 +848,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               </div>
             )}
             {state.pendingSudo && (
-              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+              <div className="mb-2 mt-2">
                 <SudoPrompt
                   prompt={state.pendingSudo}
                   onApprove={(password) => agent.sudoReply(true, password)}
@@ -857,7 +857,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               </div>
             )}
             {state.pendingOauth && (
-              <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+              <div className="mb-2 mt-2">
                 <OauthPromptBanner
                   prompt={state.pendingOauth}
                   onSubmit={agent.submitOauthCode}
@@ -868,7 +868,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
             {state.goalMode &&
               state.goalMode.phase === "plan_ready" &&
               !state.goalMode.auto_deploy && (
-                <div className={`${docked ? "mx-3 mb-2 mt-2 sm:mx-5" : "mx-3 mb-2 mt-3 sm:mx-6"}`}>
+                <div className="mb-2 mt-2">
                   <GoalPlanBanner
                     goal={state.goalMode.goal}
                     summary={state.goalPlan?.summary}
@@ -900,7 +900,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               state.goalMode.phase !== "idle" &&
               (state.goalMode.phase !== "plan_ready" ||
                 state.goalMode.auto_deploy) && (
-                <div className={`${docked ? "mx-3 mb-2 mt-2 sm:mx-5" : "mx-3 mb-2 mt-3 sm:mx-6"}`}>
+                <div className="mb-2 mt-2">
                   <GoalProgressPanel
                     goalMode={state.goalMode}
                     onCancel={() => void agent.cancelGoal()}
@@ -1092,7 +1092,7 @@ function EmptyState({
   const dockedEmpty = !!adaptive;
   const padX = dockedEmpty ? "px-3" : "px-4 sm:px-6";
   const kbd =
-    "rounded border border-ink-700/80 bg-ink-900/80 px-1.5 py-0.5 font-mono text-[10px] text-ink-400";
+    "rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-400";
   return (
     <div
       className={`chat-empty relative flex min-w-0 flex-col ${
@@ -1117,7 +1117,7 @@ function EmptyState({
               <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-500">
                 Session ready
               </p>
-              <p className="mt-0.5 truncate font-mono text-[11px] text-accent-soft/90">
+              <p className="mt-0.5 truncate font-mono text-[11px] text-accent-soft">
                 {basename(workspace) || workspace || "this workspace"}
                 {!connected && <span className="ml-2 text-ink-600">· connecting…</span>}
               </p>
@@ -1145,7 +1145,7 @@ function EmptyState({
                       "Inspect this project and summarize its structure, current state, and the most useful next task.",
                     );
                   }}
-                  className="focus-ring mt-5 inline-flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900 px-3.5 py-2.5 text-[13px] font-medium text-ink-100 transition-colors hover:border-accent/40 hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-40"
+                  className="focus-ring mt-5 inline-flex min-h-11 items-center gap-2 rounded-sm border border-ink-700 bg-ink-900 px-3.5 py-2.5 text-[13px] font-medium text-ink-100 transition-colors hover:border-accent hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Inspect project
                   <SendIcon width={13} height={13} />
@@ -1172,23 +1172,25 @@ function AgentActivity({ compact, activity, hasWorkState }: { compact: boolean; 
   const label = activity?.trim() || (hasWorkState ? "Working through the plan" : "Understanding your request");
   return (
     <div
-      className={`flex h-7 w-full items-center gap-2 border-b border-ink-800/80 bg-ink-925/90 ${
-        compact ? "px-2" : "px-4"
+      className={`flex h-8 w-full items-center gap-2 border-b border-ink-800 bg-ink-925 ${
+        compact ? "px-2" : "px-3 sm:px-6"
       }`}
       role="status"
       aria-live="polite"
     >
-      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent-soft shadow-[0_0_8px_rgb(var(--accent)/0.55)]" />
-      <span className="min-w-0 flex-1 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-ink-400">{label}</span>
-      {!compact && (
-        <span className="ml-auto hidden items-center gap-1.5 font-mono text-[10px] text-ink-600 sm:flex" aria-label="Agent activity stages">
-          <span className="text-accent-soft">Understand</span>
-          <span className="text-ink-700">→</span>
-          <span className={hasWorkState ? "text-accent-soft" : ""}>Work</span>
-          <span className="text-ink-700">→</span>
-          <span>Respond</span>
-        </span>
-      )}
+      <div className="mx-auto flex w-full max-w-[60rem] items-center gap-2">
+        <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-none bg-accent-soft" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-ink-400">{label}</span>
+        {!compact && (
+          <span className="ml-auto hidden items-center gap-1.5 font-mono text-[10px] text-ink-600 sm:flex" aria-label="Agent activity stages">
+            <span className="text-accent-soft">Understand</span>
+            <span className="text-ink-700">→</span>
+            <span className={hasWorkState ? "text-accent-soft" : ""}>Work</span>
+            <span className="text-ink-700">→</span>
+            <span>Respond</span>
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -1226,7 +1228,7 @@ function KeyOverlay({
           <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
         </button>
         <div className="mb-4 flex items-center gap-3">
-          <span className="flex h-10 w-10 items-center justify-center rounded-sm bg-accent/15 text-accent-soft">
+          <span className="flex h-10 w-10 items-center justify-center rounded-sm border border-ink-800 bg-ink-900 text-accent-soft">
             <ShieldIcon width={18} height={18} />
           </span>
           <div>
@@ -1243,7 +1245,7 @@ function KeyOverlay({
             if (e.key === "Enter") onSubmit();
           }}
           placeholder="sk-..."
-          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3.5 py-2.5 font-mono text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+          className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3.5 py-2.5 font-mono text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent focus:outline-none"
         />
         <button
           onClick={onSubmit}

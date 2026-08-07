@@ -70,7 +70,7 @@ function MemoryCard({
         </div>
         <button
           onClick={() => void onForget(m.id)}
-          className="shrink-0 rounded-sm p-1 text-ink-600 opacity-100 transition-opacity hover:bg-ink-800 hover:text-danger sm:opacity-0 sm:group-hover:opacity-100"
+          className="focus-ring flex h-11 w-11 shrink-0 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-danger sm:h-7 sm:w-7"
           title="Forget"
           aria-label={`Forget ${title}`}
         >
@@ -169,10 +169,10 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
           aria-modal="true"
           aria-label="Memories"
         >
-          <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
+          <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
             <div className="flex items-center gap-2">
               <BrainIcon width={15} height={15} className="text-accent-soft" />
-              <span className="text-[13px] font-semibold text-ink-100">Memories</span>
+              <span className="text-[15px] font-semibold text-ink-100">Memories</span>
               {memories.length > 0 && (
                 <span className="rounded-sm bg-ink-800 px-2 py-0.5 font-mono text-[10px] text-ink-400">
                   {memories.length}
@@ -183,7 +183,7 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
               {onRefresh && (
                 <button
                   onClick={onRefresh}
-                  className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+                  className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
                   title="Re-inject memories into the system prompt"
                   aria-label="Refresh memory injection"
                 >
@@ -192,7 +192,7 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
               )}
               <button
                 onClick={onClose}
-                className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+                className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
                 aria-label="Close"
               >
                 <XIcon width={16} height={16} />
@@ -208,7 +208,7 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 placeholder="Save a note the agent will remember across sessions…"
-                className="w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+                className="w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent focus:outline-none"
               />
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <div className="flex rounded-sm border border-ink-700 bg-ink-950 p-0.5">
@@ -231,7 +231,7 @@ export function MemoryPanel({ memories, onSave, onForget, onRefresh, onClose }: 
                   value={tags}
                   onChange={(e) => setTags(e.target.value)}
                   placeholder="tags, comma-separated"
-                  className="min-w-[8rem] flex-1 rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+                  className="min-w-[8rem] flex-1 rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent focus:outline-none"
                 />
                 <button
                   onClick={save}

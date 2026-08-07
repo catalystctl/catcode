@@ -130,7 +130,7 @@ export function CustomProviderModal({
     touched && !ok ? <p className="mt-1 text-[11px] text-danger">{msg}</p> : null;
 
   const inputCls =
-    "w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none";
+    "w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent focus:outline-none";
 
   const discover = () => {
     setTouched(true);
@@ -234,12 +234,12 @@ export function CustomProviderModal({
         aria-modal="true"
         aria-label="Add custom provider"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             {step === "models" && (
               <button
                 onClick={() => setStep("endpoint")}
-                className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+                className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
                 aria-label="Back to endpoint"
               >
                 <ArrowLeftIcon width={15} height={15} />
@@ -255,7 +255,7 @@ export function CustomProviderModal({
           </div>
           <button
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -406,7 +406,7 @@ export function CustomProviderModal({
             </div>
 
             {discoverError && (
-              <div className="rounded-sm border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+              <div className="rounded-sm border border-danger bg-ink-900 px-3 py-2 text-[12px] text-danger">
                 {discoverError}
                 <p className="mt-1 text-[11px] text-ink-400">
                   You can still add the provider without discovering, or enter model ids above.
@@ -502,7 +502,7 @@ export function CustomProviderModal({
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-3 border-t border-ink-800/80 px-5 py-3.5">
+        <div className="flex min-h-11 items-center justify-between gap-3 border-t border-ink-800 px-5 py-3.5">
           <p className="text-[11px] text-ink-600">Saved to ~/.config/catalyst-code/config.json</p>
           {step === "endpoint" ? (
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -510,7 +510,7 @@ export function CustomProviderModal({
                 type="button"
                 onClick={submit}
                 disabled={discovering}
-                className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 disabled:opacity-40"
+                className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 disabled:cursor-not-allowed disabled:border-ink-800 disabled:bg-ink-900 disabled:text-ink-500"
               >
                 Add without discovering
               </button>
@@ -519,7 +519,7 @@ export function CustomProviderModal({
                   type="button"
                   onClick={useManualModels}
                   disabled={!endpointValid || discovering}
-                  className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-200 hover:bg-ink-800 disabled:opacity-40"
+                  className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-200 hover:bg-ink-800 disabled:cursor-not-allowed disabled:border-ink-800 disabled:bg-ink-900 disabled:text-ink-500"
                 >
                   Use these models →
                 </button>
@@ -537,7 +537,7 @@ export function CustomProviderModal({
                 type="button"
                 onClick={discover}
                 disabled={!endpointValid || discovering}
-                className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft disabled:opacity-40"
+                className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft disabled:cursor-not-allowed disabled:border-ink-800 disabled:bg-ink-900 disabled:text-ink-500"
               >
                 {discovering ? "Discovering…" : "Discover models →"}
               </button>

@@ -366,6 +366,26 @@ describe("history replay", () => {
     expect(a.toolCalls[0].result?.output).toBe("a\nb\nc");
     expect(a.toolCalls[0].result?.unknown).toBe(true);
   });
+
+  test("peels MiniMax <think> tags from assistant content on history load", () => {
+    const s = ev({
+      type: "history",
+      messages: [
+        {
+          role: "assistant",
+          content:
+            "<think>\nstep one\n</think>\n\n</think>\n\n## Answer\nHi there",
+        },
+      ],
+    });
+    const a = s.messages[0];
+    if (!isAssistant(a)) throw new Error("expected assistant");
+    expect(a.thinking).toBe("step one");
+    expect(a.text).toBe("## Answer\nHi there");
+    expect(a.text.includes("<think>")).toBe(false);
+    expect(a.text.includes("</think>")).toBe(false);
+  });
+
 });
 
 describe("reset clears stale prompts", () => {

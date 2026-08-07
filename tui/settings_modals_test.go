@@ -41,17 +41,64 @@ func TestApprovalCommandOpensPicker(t *testing.T) {
 	}
 }
 
-// TestApprovalCommandWithArgSetsDirectly: /approval always applies without a modal.
-func TestApprovalCommandWithArgSetsDirectly(t *testing.T) {
+func TestApprovalArgumentsStillOpenPicker(t *testing.T) {
 	s := initialSession()
 	s.ready = true
-	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
 	s.handleUserLine("/approval always")
-	if s.modal.kind != modalNone {
-		t.Fatalf("expected no modal after /approval always, got %v", s.modal.kind)
+	if s.modal.kind != modalApproval {
+		t.Fatalf("approval arguments must not bypass picker; got %v", s.modal.kind)
 	}
-	if s.settings.Approval != "always" {
-		t.Errorf("settings.Approval = %q, want always", s.settings.Approval)
+}
+func TestAdvisorCommandOpensConfigurationModal(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.models = []modelInfo{{ID: "main"}, {ID: "reviewer"}}
+	s.handleUserLine("/advisor on")
+	if s.modal.kind != modalAdvisor {
+		t.Fatalf("advisor arguments must open modal; got %v", s.modal.kind)
+	}
+	before := s.settings.AdvisorEnabled
+	s.executeListSelect(0)
+	if s.settings.AdvisorEnabled == before {
+		t.Fatal("advisor toggle did not change state")
+	}
+	s.executeListSelect(1)
+	if s.modal.kind != modalAdvisorModels {
+		t.Fatalf("main model should open picker; got %v", s.modal.kind)
+	}
+	s.executeListSelect(2)
+	if s.settings.AdvisorModel != "reviewer" {
+		t.Fatalf("advisor model=%q, want reviewer", s.settings.AdvisorModel)
+	}
+}
+
+func TestAdvisorModalArrowKeysNavigate(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.keybinds = defaultKeybinds()
+	s.openAdvisorModal()
+	if s.modal.kind != modalAdvisor {
+		t.Fatalf("expected advisor modal, got %v", s.modal.kind)
+	}
+	if s.modal.cursor != 0 {
+		t.Fatalf("cursor=%d, want 0", s.modal.cursor)
+	}
+	_, _ = s.handleListKey(keyMsg("down"))
+	if s.modal.cursor != 1 {
+		t.Fatalf("down from 0: cursor=%d, want 1", s.modal.cursor)
+	}
+	_, _ = s.handleListKey(keyMsg("down"))
+	if s.modal.cursor != 2 {
+		t.Fatalf("down from 1: cursor=%d, want 2", s.modal.cursor)
+	}
+	_, _ = s.handleListKey(keyMsg("up"))
+	if s.modal.cursor != 1 {
+		t.Fatalf("up from 2: cursor=%d, want 1", s.modal.cursor)
+	}
+	// j/k alt binds should also move.
+	_, _ = s.handleListKey(keyMsg("j"))
+	if s.modal.cursor != 2 {
+		t.Fatalf("j from 1: cursor=%d, want 2", s.modal.cursor)
 	}
 }
 
@@ -161,47 +208,23 @@ func TestDedicatedSettingCommandsOpenModals(t *testing.T) {
 	}
 }
 
-// TestToggleCommandsWithArgs apply without opening a modal.
-func TestToggleCommandsWithArgs(t *testing.T) {
-	s := initialSession()
-	s.ready = true
-	s.settings.path = filepath.Join(t.TempDir(), "settings.json")
-
-	// The retired toggle remains a harmless compatibility alias for scripts,
-	// but no longer changes state or opens a modal.
-	s.handleUserLine("/mouse-wheel off")
-	if s.modal.kind != modalNone {
-		t.Error("retired mouse-wheel command should not open a modal")
+func TestConfigurableCommandsIgnoreInlineArguments(t *testing.T) {
+	cases := []struct {
+		command string
+		kind    modalKind
+	}{
+		{"/sandbox enable", modalSandbox},
+		{"/auto-compact off", modalAutoCompact},
+		{"/bash-timeout 90", modalValueEdit},
+		{"/footer-metrics off", modalFooterMetrics},
 	}
-
-	s.handleUserLine("/sandbox firejail")
-	// Deprecated backends migrate to microsandbox and start the fail-closed
-	// enable flow (status check). The setting is NOT persisted until the core
-	// reports the environment ready.
-	if s.settings.Sandbox != "none" {
-		t.Errorf("sandbox = %q, want none (not persisted until ready)", s.settings.Sandbox)
-	}
-	if !s.pendingSandboxEnable {
-		t.Error("/sandbox firejail should set pendingSandboxEnable")
-	}
-	if s.modal.kind != modalSandboxStatus {
-		t.Errorf("modal = %v, want modalSandboxStatus", s.modal.kind)
-	}
-
-	s.handleUserLine("/auto-compact off")
-	if s.coreAutoCompact {
-		t.Error("auto-compact off should set coreAutoCompact=false")
-	}
-	if s.settings.AutoCompact {
-		t.Error("auto-compact off should persist AutoCompact=false")
-	}
-
-	s.handleUserLine("/bash-timeout 90")
-	if s.coreBashTimeout != 90 {
-		t.Errorf("bash timeout = %d, want 90", s.coreBashTimeout)
-	}
-	if s.settings.BashTimeoutSecs != 90 {
-		t.Errorf("settings.BashTimeoutSecs = %d, want 90", s.settings.BashTimeoutSecs)
+	for _, tc := range cases {
+		s := initialSession()
+		s.ready = true
+		s.handleUserLine(tc.command)
+		if s.modal.kind != tc.kind {
+			t.Errorf("%s opened %v, want %v", tc.command, s.modal.kind, tc.kind)
+		}
 	}
 }
 

@@ -1511,7 +1511,12 @@ async fn run_agent_inner(
     if !reads.is_empty() {
         let mut read_ctx = String::new();
         for r in &reads {
-            let p = workspace.join(r);
+            let Ok(p) = crate::workspace::resolve(&workspace, r) else {
+                read_ctx.push_str(&format!(
+                    "--- {r} ---\n[skipped: path is outside the workspace]\n\n"
+                ));
+                continue;
+            };
             if let Ok(c) = std::fs::read_to_string(&p) {
                 read_ctx.push_str(&format!("--- {r} ---\n{}\n\n", truncate(&c, 8000)));
             }
@@ -1774,6 +1779,24 @@ async fn run_agent_inner(
             emit_subagent_message(run_id, "assistant", &truncate(&asst_text, 16000));
         }
 
+        if assistant
+            .tool_calls()
+            .map(|calls| calls.is_empty())
+            .unwrap_or(true)
+        {
+            for note in crate::advisor::review(
+                st,
+                crate::advisor::Scope::Subagent,
+                last_model.as_deref().unwrap_or(parent_model),
+                &sub,
+                cancel,
+            )
+            .await
+            {
+                sub.push(note);
+            }
+        }
+
         let Some(calls) = assistant.tool_calls().map(|tc| tc.to_vec()) else {
             // done — finalize output
             let text = finalize_subagent_text(assistant.content_text(), &sub);
@@ -1929,10 +1952,11 @@ async fn run_agent_inner(
                     && !model_output.starts_with("[restored from digest cache]")
                     && !model_output.starts_with("[duplicate of tool_call_id")
                 {
+                    let cache_args = format!("{}\0{}", cfg.workspace.display(), args_str);
                     st.tool_output_cache
                         .lock()
                         .await
-                        .store(&name, &args_str, &model_output);
+                        .store(&name, &cache_args, &model_output);
                 }
                 if !model_output.starts_with("[restored from digest cache]")
                     && !model_output.starts_with("[duplicate of tool_call_id")
@@ -2173,12 +2197,12 @@ async fn dispatch_subagent_tool(
         }
     }
 
-    // Cache restore: identical re-call of a read-only tool after digest/ingress
-    // (mirrors the main loop). Keyed by the original call args (`args_str`),
-    // matching the outer-loop store site.
+    // Cache restore is scoped to the resolved workspace. Parallel worktrees
+    // routinely issue identical relative reads but must never share bytes.
+    let cache_args = format!("{}\0{}", cfg.workspace.display(), args_str);
     if let Some(restored) = {
         let cache = st.tool_output_cache.lock().await;
-        cache.get(name, args_str).map(|s| s.to_string())
+        cache.get(name, &cache_args).map(|s| s.to_string())
     } {
         let mut o = Outcome::ok(crate::apply_restore_cap(&restored));
         if !hook_notes.is_empty() {
@@ -2708,7 +2732,7 @@ const SUBAGENT_MAX_TOOL_CALLS: u32 = 200;
 /// secrets, not to be a perfect scanner. Quoted values ("key":"x") are not
 /// handled (the pattern avoids a literal quote so it stays a clean raw string);
 /// bare `key=value` / `key: value` and well-known token formats are masked.
-fn redact_secrets(s: &str) -> String {
+pub(crate) fn redact_secrets(s: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -2818,11 +2842,16 @@ async fn run_parallel(
             )),
         ));
     }
-    let concurrency = args
+    let requested_concurrency = args
         .get("concurrency")
         .and_then(|v| v.as_u64())
         .unwrap_or(cfg.subagents.parallel_concurrency as u64)
-        .max(1) as usize;
+        .max(1);
+    let configured_concurrency =
+        usize::try_from(cfg.subagents.parallel_concurrency.max(1)).unwrap_or(usize::MAX);
+    let concurrency = usize::try_from(requested_concurrency)
+        .unwrap_or(usize::MAX)
+        .min(configured_concurrency);
     let context = args.get("context").and_then(|v| v.as_str());
     let use_worktree = args
         .get("worktree")
@@ -3944,5 +3973,18 @@ mod tests {
         let long = "z".repeat(2000);
         let s = nonempty_run_summary(&long);
         assert_eq!(s.chars().count(), 800);
+    }
+
+    #[test]
+    fn project_default_read_cannot_escape_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "catalyst-code-subagent-read-{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(root.join("secret.txt"), "must not reach provider context").unwrap();
+        assert!(crate::workspace::resolve(&workspace, "../secret.txt").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

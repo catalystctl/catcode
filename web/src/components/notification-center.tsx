@@ -63,7 +63,7 @@ export function NotificationCenter(props: Props) {
         {unreadCount > 0 && (
           <span
             aria-hidden="true"
-            className={`absolute right-1 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-0.5 text-[8px] font-bold leading-none text-white ${
+            className={`absolute right-1 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-sm px-0.5 text-[8px] font-bold leading-none text-white ${
               hasAttention ? "bg-danger" : "bg-accent"
             }`}
           >
@@ -125,13 +125,13 @@ export function NotificationCenter(props: Props) {
                 </div>
               </div>
             ) : (
-              <ul className="divide-y divide-ink-800/60">
+              <ul className="divide-y divide-ink-800">
                 {sorted.map((n) => {
                   const attention = n.kind === "attention";
                   const sameProject =
                     !!props.currentWorkspace && n.workspace === props.currentWorkspace;
                   return (
-                    <li key={n.id} className={`group relative ${n.read ? "opacity-60" : ""}`}>
+                    <li key={n.id} className="group relative">
                       <button
                         type="button"
                         onClick={() => {
@@ -139,20 +139,39 @@ export function NotificationCenter(props: Props) {
                           props.onOpen(n);
                           setOpen(false);
                         }}
-                        className="focus-ring flex min-h-11 w-full items-start gap-2 py-1.5 pl-2 pr-12 text-left transition-colors hover:bg-ink-800"
+                        className={`focus-ring flex min-h-11 w-full items-start gap-2 py-1.5 pl-2 pr-12 text-left transition-colors hover:bg-ink-800 ${
+                          n.read ? "text-ink-500" : ""
+                        }`}
                       >
                         <span
                           className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-none ${
-                            attention ? "bg-danger" : "bg-accent"
+                            n.read
+                              ? "bg-ink-600"
+                              : attention
+                                ? "bg-danger"
+                                : "bg-accent"
                           }`}
                           aria-hidden="true"
                         />
                         <div className="min-w-0 flex-1">
-                          <div className="truncate text-[11px] font-medium leading-4 text-ink-100" title={n.title}>
+                          <div
+                            className={`truncate text-[11px] font-medium leading-4 ${
+                              n.read ? "text-ink-400" : "text-ink-100"
+                            }`}
+                            title={n.title}
+                          >
                             {n.title || "Session"}
                           </div>
                           <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] leading-4 text-ink-500">
-                            <span className={attention ? "text-danger" : "text-accent-soft"}>
+                            <span
+                              className={
+                                n.read
+                                  ? "text-ink-500"
+                                  : attention
+                                    ? "text-danger"
+                                    : "text-accent-soft"
+                              }
+                            >
                               {attention ? attentionLabel(n.attentionKind) : "finished"}
                             </span>
                             <span>·</span>
@@ -169,7 +188,7 @@ export function NotificationCenter(props: Props) {
                       <button
                         type="button"
                         onClick={() => props.onDismiss(n.id)}
-                        className="focus-ring absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-700 hover:text-ink-100 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                        className="focus-ring absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-700 hover:text-ink-100"
                         aria-label={`Dismiss ${n.title || "session"} notification`}
                       >
                         <XIcon width={11} height={11} />

@@ -3471,8 +3471,10 @@ fn load_oauth_entry(
             ))
         }
     };
-    // Token file lives under ~/.config/catalyst-code/oauth/ (created lazily by
-    // the plugin's complete/token scripts on first write).
+    // Token files live directly under ~/.config/catalyst-code/oauth/. Treat
+    // plugin manifests as untrusted input: accepting absolute paths, parent
+    // traversal, or nested/symlinked parents would let logout delete arbitrary
+    // host files.
     let token_dir = crate::config::home_dir()
         .map(|h| h.join(".config/catalyst-code/oauth"))
         .unwrap_or_else(|| PathBuf::from(".config/catalyst-code/oauth"));
@@ -3480,7 +3482,16 @@ fn load_oauth_entry(
         .token_path
         .clone()
         .unwrap_or_else(|| format!("{provider_id}.json"));
-    let token_path = token_dir.join(&token_name);
+    let token_component = Path::new(&token_name);
+    let mut components = token_component.components();
+    let valid_filename = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !valid_filename {
+        return Err(format!(
+            "oauth provider '{provider_id}' token_path must be one relative filename"
+        ));
+    }
+    let token_path = token_dir.join(token_component);
 
     // Resolve the shared default (keyed "*") + per-action overrides.
     let mut scripts: HashMap<String, PathBuf> = HashMap::new();

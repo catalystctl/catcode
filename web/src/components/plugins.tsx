@@ -103,21 +103,21 @@ function PluginCard({
           {p.enabled ? (
             <button
               onClick={() => onDisable(p.name)}
-              className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+              className="focus-ring min-h-11 rounded-sm border border-ink-700 px-2.5 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:py-1"
             >
               Disable
             </button>
           ) : (
             <button
               onClick={() => onEnable(p.name)}
-              className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-success transition-colors hover:bg-ink-800"
+              className="focus-ring min-h-11 rounded-sm border border-ink-700 px-2.5 py-1.5 text-[11px] text-success transition-colors hover:bg-ink-800 sm:min-h-0 sm:py-1"
             >
               Enable
             </button>
           )}
           <button
             onClick={() => void onRemove(p.name)}
-            className="rounded-sm p-1 text-ink-600 opacity-100 transition-opacity hover:bg-ink-800 hover:text-danger sm:opacity-0 sm:group-hover:opacity-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-danger sm:h-7 sm:w-7"
             title="Remove"
             aria-label={`Remove ${p.name}`}
           >
@@ -231,10 +231,10 @@ export function PluginsPanel({
         aria-modal="true"
         aria-label="Plugins"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-4 py-3">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <TerminalIcon width={15} height={15} className="text-accent-soft" />
-            <span className="text-[13px] font-semibold text-ink-100">Plugins</span>
+            <span className="text-[15px] font-semibold text-ink-100">Plugins</span>
             {plugins.length > 0 && (
               <span className="rounded-sm bg-ink-800 px-2 py-0.5 font-mono text-[10px] text-ink-400">
                 {enabledCount}/{plugins.length} on
@@ -243,7 +243,7 @@ export function PluginsPanel({
           </div>
           <button
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -261,12 +261,12 @@ export function PluginsPanel({
                   if (e.key === "Enter") install();
                 }}
                 placeholder="/path/to/plugin or owner/repo@v1.2.0"
-                className="flex-1 rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+                className="flex-1 rounded-sm border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-[12px] text-ink-200 placeholder:text-ink-600 focus:border-accent focus:outline-none"
               />
               <button
                 onClick={install}
                 disabled={!path.trim()}
-                className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+                className="focus-ring flex min-h-11 items-center gap-1.5 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
               >
                 <PlusIcon width={13} height={13} /> Install
               </button>

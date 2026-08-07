@@ -21,9 +21,9 @@ type UpdateResponse =
   | { ok: false; error?: string; hint?: string };
 
 const STATUS_STYLES: Record<VersionUpdateStatus, string> = {
-  up_to_date: "border-success/40 bg-success/10 text-success",
-  out_of_date: "border-warning/40 bg-warning/10 text-warning",
-  uncommitted: "border-accent/40 bg-accent/10 text-accent-soft",
+  up_to_date: "border-success bg-ink-900 text-success",
+  out_of_date: "border-warning bg-ink-900 text-warning",
+  uncommitted: "border-accent bg-ink-900 text-accent-soft",
   ahead: "border-ink-600 bg-ink-850 text-ink-200",
   unknown: "border-ink-700 bg-ink-900 text-ink-400",
 };
@@ -171,7 +171,7 @@ export function VersionInfoPanel() {
         <button
           type="button"
           onClick={() => void refresh()}
-          className="rounded-md p-1.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+          className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-8 sm:w-8"
           title="Refresh version status"
           aria-label="Refresh version status"
           disabled={loading || updating}
@@ -187,7 +187,7 @@ export function VersionInfoPanel() {
         <div className="mt-3 space-y-2.5">
           <div className="flex flex-wrap items-center gap-2">
             <span
-              className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+              className={`inline-flex items-center rounded-sm border px-2 py-0.5 text-[11px] font-medium ${
                 STATUS_STYLES[info.status]
               }`}
             >
@@ -252,7 +252,7 @@ export function VersionInfoPanel() {
               type="button"
               onClick={() => void runUpdate()}
               disabled={updating}
-              className="mt-1 w-full rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+              className="focus-ring mt-1 w-full min-h-11 rounded-sm bg-accent px-3.5 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
             >
               {updating ? "Updating CLI + frontend…" : "Update CLI + frontend"}
             </button>

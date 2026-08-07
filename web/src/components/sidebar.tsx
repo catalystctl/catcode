@@ -247,7 +247,7 @@ export function Sidebar(props: Props) {
         // before React hydrates. The attribute is harmless but otherwise
         // produces a false-positive hydration mismatch in development.
         suppressHydrationWarning
-        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-[19.5rem] max-w-[88%] flex-col border-r border-ink-800/90 bg-ink-925/98 transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto lg:shadow-none"} ${
+        className={`${props.embedded ? "absolute" : "fixed"} left-0 top-0 z-30 flex h-full w-[19.5rem] max-w-[88%] flex-col border-r border-ink-800 bg-ink-900 transition-transform duration-200 ${props.embedded ? "" : "lg:static lg:z-0 lg:translate-x-0 lg:pointer-events-auto lg:shadow-none"} ${
           props.open
             ? "translate-x-0 pointer-events-auto"
             : props.embedded
@@ -256,7 +256,7 @@ export function Sidebar(props: Props) {
         }`}
       >
         {/* ── Sessions header ── */}
-        <div className="flex items-center justify-between border-b border-ink-800/90 px-3 py-2.5">
+        <div className="flex items-center justify-between border-b border-ink-800 bg-ink-900 px-3 py-2">
           <div className="flex min-w-0 items-baseline gap-2">
             <h2 className="text-[10px] font-mono font-medium uppercase tracking-[0.14em] text-ink-500">Sessions</h2>
             <span className="font-mono text-[10px] tabular-nums text-ink-600">
@@ -266,7 +266,7 @@ export function Sidebar(props: Props) {
           <button
             ref={closeButtonRef}
             onClick={props.onClose}
-            className={`focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11 ${props.embedded ? "" : "lg:hidden"}`}
+            className={`focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11 ${props.embedded ? "" : "lg:hidden"}`}
             aria-label="Close chat history"
           >
             <XIcon width={14} height={14} />
@@ -277,7 +277,7 @@ export function Sidebar(props: Props) {
           <button
             onClick={props.onNewSession}
             disabled={props.switching}
-            className="focus-ring flex min-h-9 w-full items-center justify-center gap-2 rounded-lg border border-ink-700/80 bg-ink-900/80 px-2.5 py-2 text-[12px] font-medium text-ink-100 transition-colors hover:border-accent/40 hover:bg-ink-850 focus-visible:border-accent/60 disabled:cursor-not-allowed disabled:opacity-50 [@media(pointer:coarse)]:min-h-11"
+            className="focus-ring flex min-h-9 w-full items-center justify-center gap-2 rounded-sm border border-ink-700 bg-ink-850 px-2.5 py-2 text-[12px] font-medium text-ink-100 transition-colors hover:border-accent hover:bg-ink-800 focus-visible:border-accent disabled:cursor-not-allowed disabled:opacity-50 [@media(pointer:coarse)]:min-h-11"
           >
             <PlusIcon width={14} height={14} className="text-accent-soft" /> New chat
           </button>
@@ -297,13 +297,13 @@ export function Sidebar(props: Props) {
               }}
               placeholder="Search sessions…"
               aria-label="Search chat history"
-              className="focus-ring min-h-9 w-full rounded-lg border border-ink-800 bg-ink-950/60 py-2 pl-8 pr-11 font-mono text-[11px] text-ink-200 outline-none transition-colors placeholder:text-ink-600 focus:border-accent/40 focus:bg-ink-950 [@media(pointer:coarse)]:min-h-11"
+              className="focus-ring min-h-9 w-full rounded-sm border border-ink-800 bg-ink-950 py-2 pl-8 pr-11 font-mono text-[11px] text-ink-200 outline-none transition-colors placeholder:text-ink-600 focus:border-accent focus:bg-ink-950 [@media(pointer:coarse)]:min-h-11"
             />
             {query && (
               <button
                 type="button"
                 onClick={() => setQuery("")}
-                className="focus-ring absolute right-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
+                className="focus-ring absolute right-0 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                 aria-label="Clear search"
               >
                 <XIcon width={11} height={11} />
@@ -329,7 +329,7 @@ export function Sidebar(props: Props) {
           ) : (
             grouped.map((group) => (
               <section key={group.label} className="mb-2 last:mb-0">
-                <div className="sticky top-0 z-10 flex items-center justify-between border-b border-ink-800/40 bg-ink-925/95 px-3 pb-1 pt-3 backdrop-blur-sm">
+                <div className="sticky top-0 z-10 flex items-center justify-between border-b border-ink-800 bg-ink-900 px-3 pb-1 pt-3">
                   <h3 className="text-[10px] font-mono uppercase tracking-[0.14em] text-ink-500">
                     {group.label}
                   </h3>
@@ -365,16 +365,16 @@ export function Sidebar(props: Props) {
                       onClick={() => !isRenaming && props.onLoadSession(s.path ?? s.name)}
                       onKeyDown={(event) => handleSessionKeyDown(event, visibleIndex)}
                       aria-current={active ? "page" : undefined}
-                      className={`focus-ring relative flex min-h-11 w-full items-start gap-2 overflow-hidden rounded-lg border border-transparent px-2 py-2 text-left transition-colors disabled:cursor-wait disabled:opacity-60 ${
+                      className={`focus-ring relative flex min-h-11 w-full items-start gap-2 overflow-hidden rounded-sm border-l-2 px-2 py-2 text-left transition-colors disabled:cursor-wait disabled:opacity-60 ${
                         active
-                          ? "session-row-active border-ink-800/60 text-ink-100"
-                          : "text-ink-300 hover:bg-ink-900/70 hover:text-ink-100"
+                          ? "border-accent bg-ink-850 text-ink-100"
+                          : "border-transparent text-ink-300 hover:bg-ink-850 hover:text-ink-100"
                       }`}
                     >
                       <span
-                        className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${
+                        className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-none ${
                           active
-                            ? "bg-accent shadow-[0_0_6px_rgb(var(--accent)/0.55)]"
+                            ? "bg-accent"
                             : showStreaming
                               ? "animate-pulse bg-accent-soft"
                               : needsAttention
@@ -407,7 +407,7 @@ export function Sidebar(props: Props) {
                               }
                               commitRename();
                             }}
-                            className="focus-ring w-full rounded-md border border-accent/40 bg-ink-950 px-1.5 py-0.5 font-mono text-[11px] text-ink-100"
+                            className="focus-ring w-full rounded-sm border border-accent bg-ink-950 px-1.5 py-0.5 font-mono text-[11px] text-ink-100"
                           />
                         ) : (
                           <>
@@ -449,7 +449,7 @@ export function Sidebar(props: Props) {
                             setMenuAbove(e.currentTarget.getBoundingClientRect().bottom + 170 > window.innerHeight);
                             setOpenMenu((current) => current === s.name ? null : s.name);
                           }}
-                          className="focus-ring flex h-7 w-7 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
+                          className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-850 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                           title="Conversation actions"
                           aria-label={`Actions for ${displayTitle}`}
                           aria-haspopup="menu"
@@ -496,7 +496,7 @@ export function Sidebar(props: Props) {
         </div>
 
         {/* ── Footer: quick actions + stats ── */}
-        <div className="border-t border-ink-800 bg-ink-925 p-2">
+        <div className="border-t border-ink-800 bg-ink-900 p-2">
           <div className="grid grid-cols-5 gap-px">
             <ActionBtn icon={<BrainIcon width={13} height={13} />} label="Memory" onClick={() => props.onOpenPanel("memory")} />
             <ActionBtn icon={<TerminalIcon width={13} height={13} />} label="Plugins" onClick={() => props.onOpenPanel("plugins")} />
@@ -504,13 +504,13 @@ export function Sidebar(props: Props) {
             <ActionBtn icon={<BoltIcon width={13} height={13} />} label="Control" onClick={() => props.onOpenPanel("control")} />
             <ActionBtn icon={<HelpIcon width={13} height={13} />} label="Help" onClick={() => props.onOpenPanel("help")} />
           </div>
-          <div className="mt-1 grid grid-cols-3 gap-px border-t border-ink-800/50 pt-1">
+          <div className="mt-1 grid grid-cols-3 gap-px border-t border-ink-800 pt-1">
             <CompactAction icon={<TrashIcon width={12} height={12} />} label="Reset" onClick={props.onReset} danger />
             <CompactAction icon={<CompactIcon width={12} height={12} />} label="Compact" onClick={props.onCompact} />
             <CompactAction icon={<HistoryIcon width={12} height={12} />} label="Usage" onClick={props.onStats} />
           </div>
           {props.stats && (
-            <div className="mt-1 flex items-center justify-between rounded-sm border border-ink-800 bg-ink-900 px-2 py-1 font-mono text-[10px] text-ink-500">
+            <div className="mt-1 flex items-center justify-between rounded-sm border border-ink-800 bg-ink-950 px-2 py-1 font-mono text-[10px] text-ink-500">
               <span>{props.stats.turns} turns</span>
               <span className="text-ink-600">·</span>
               <span>{formatTokens(props.stats.tokens_total)} tokens</span>
@@ -536,7 +536,7 @@ function ActionBtn({
   return (
     <button
       onClick={onClick}
-      className="focus-ring flex min-h-9 flex-col items-center justify-center gap-1 rounded-sm py-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 [@media(pointer:coarse)]:min-h-11"
+      className="focus-ring flex min-h-9 flex-col items-center justify-center gap-1 rounded-sm py-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:min-h-11"
     >
       {icon}
       {label}
@@ -559,7 +559,7 @@ function CompactAction({
     <button
       type="button"
       onClick={onClick}
-      className={`focus-ring flex min-h-8 items-center justify-center gap-1.5 rounded-sm px-1.5 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-ink-500 hover:bg-ink-800 hover:text-danger" : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"}`}
+      className={`focus-ring flex min-h-8 items-center justify-center gap-1.5 rounded-sm px-1.5 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-ink-500 hover:bg-ink-850 hover:text-danger" : "text-ink-500 hover:bg-ink-850 hover:text-ink-200"}`}
     >
       {icon}
       {label}
@@ -583,7 +583,7 @@ function SessionMenuItem({
       type="button"
       role="menuitem"
       onClick={onClick}
-      className={`focus-ring flex min-h-8 w-full items-center gap-2 px-2 py-1 text-left text-[11px] transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-danger hover:bg-ink-800" : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"}`}
+      className={`focus-ring flex min-h-8 w-full items-center gap-2 px-2 py-1 text-left text-[11px] transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-danger hover:bg-ink-850" : "text-ink-300 hover:bg-ink-850 hover:text-ink-100"}`}
     >
       {icon}
       {label}

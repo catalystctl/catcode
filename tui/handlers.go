@@ -284,6 +284,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		} else {
 			s.coreAutoCompact = s.settings.AutoCompact
 		}
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.enabled", "value": s.settings.AdvisorEnabled})
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagents", "value": s.settings.AdvisorSubagents})
+		if s.settings.AdvisorModel != "" {
+			s.sendCore(map[string]any{"type": "set_config", "key": "advisor.model", "value": s.settings.AdvisorModel})
+		}
+		if s.settings.AdvisorSubagentModel != "" {
+			s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagent_model", "value": s.settings.AdvisorSubagentModel})
+		}
 		// Populate plugin slash commands for the palette (list_plugins also
 		// emits plugin_commands as a companion; this covers cold start).
 		s.sendCore(map[string]any{"type": "list_plugin_commands"})
@@ -945,6 +953,20 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// curTool/counts only change the activity shelf — Bubble Tea still
 		// paints View after this Update; skip transcript renderBlocks/SetContent.
 
+	case "advisor_note":
+		severity := ev.get("severity")
+		msg := ev.get("message")
+		if msg != "" {
+			if severity == "concern" || severity == "blocker" {
+				s.logWarn("Advisor (" + severity + "): " + msg)
+			} else {
+				s.logInfo("Advisor: " + msg)
+			}
+		}
+
+	case "advisor_status":
+		// Reviewing/no-key state is available to protocol clients; keep the TUI
+		// quiet during normal reviews and surface only actionable notes.
 	case "info":
 		// Informational notices from the core (first-run staging, subagent
 		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
@@ -2474,11 +2496,18 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 	if strings.HasPrefix(text, "/") {
 		parts := strings.Fields(text)
 		s.recordRecentCommand(parts[0])
+		// The TUI is modal-first: text after a slash command is never interpreted
+		// as command arguments. Every configurable command opens its form/picker,
+		// where validation, defaults, and all options remain visible.
+		parts = parts[:1]
 		// /skill:<name> [optional task] — invoke a discoverable skill. Handled
 		// before the switch because the command token is dynamic (/skill:<x>
 		// has no fixed case). The core reads the SKILL.md and runs the turn.
 		if strings.HasPrefix(parts[0], "/skill:") {
-			return s.handleSkillCommand(parts)
+			name := strings.TrimPrefix(parts[0], "/skill:")
+			s.openValueEditModal(editTargetSkill+name, "Apply Skill: "+name,
+				"optional task (blank = apply without a task)", "")
+			return nil
 		}
 		switch parts[0] {
 		case "/login", "/provider":
@@ -2608,6 +2637,9 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			default:
 				s.logError("usage: /approval never|destructive|always")
 			}
+			return nil
+		case "/advisor":
+			s.openAdvisorModal()
 			return nil
 		case "/reasoning", "/thinking":
 			if len(parts) >= 2 {
@@ -2903,26 +2935,8 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			s.openDestructiveConfirm("memory-forget", parts[1], "permanently forget memory "+parts[1])
 			return nil
 		case "/index":
-			// Bootstrap learning on this repo: walk the structure and persist durable
-			// knowledge as memories + note candidate skills. Pure delegation to the
-			// orchestrator (it has read/grep/glob/bash + the memory tool); no core
-			// command needed. --full re-indexes from scratch; --incremental only
-			// covers files changed since the last index (detected via git).
-			mode := "full"
-			for _, a := range parts[1:] {
-				if a == "--incremental" || a == "-i" {
-					mode = "incremental"
-				} else if a == "--full" || a == "-f" {
-					mode = "full"
-				}
-			}
-			var task string
-			if mode == "incremental" {
-				task = "Run an incremental knowledge index of this repository. Use `git status` + `git diff --name-only` to find files changed since the last index; for each changed area, read it and use the `memory` tool (action: append) to UPDATE the relevant existing memories — architecture, conventions, APIs, gotchas — rather than creating duplicates. If a changed file reveals a new subsystem with no memory yet, save a new one. Then list the memories you touched. Be concise: only persist what genuinely changed."
-			} else {
-				task = "Run a full knowledge index of this repository to bootstrap learning. Walk the top-level layout, read README/package-manifest/entry points/config/tests, and identify the architecture, major subsystems, conventions, reusable patterns, build/test/deploy steps, and gotchas. Use the `memory` tool (action: save) to persist each as a durable, named memory (types: architecture/convention/api/gotcha/build). Then use `list_dir .catalyst-code/skills/` and, for any reusable workflow you solved 2+ times that has no skill yet, write a candidate SKILL.md under `.catalyst-code/skills/<name>/` with write_file (frontmatter: name/description; body: when-to-use + steps + example). End by listing the memories and any candidate skills you created, and name one area you are least confident about."
-			}
-			return s.sendDelegation(task, "/index")
+			s.openIndexModal()
+			return nil
 		case "/reflect":
 			// Deliberate end-of-task learning pass: critique the recent work in this
 			// session and persist durable takeaways via the memory tool. Pure
@@ -2938,10 +2952,6 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			return nil
 		case "/new":
-			if s.busy {
-				s.logWarn("wait for the active turn to finish (or stop it) before starting a new session")
-				return nil
-			}
 			path := filepath.Join(sessionsDir(), newSessionFilename())
 			if !reserveSession(path) {
 				s.logError("could not reserve a new session file")
@@ -3067,15 +3077,11 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 		case "/subagents-models":
 			return s.sendDelegation(`Run subagent({ action: "models" }) and show the runtime model mapping for the builtin agents.`, "/subagents-models")
 		default:
-			// Plugin-declared slash commands (/{name} [args]).
 			cmdName := strings.TrimPrefix(parts[0], "/")
 			for _, pc := range s.pluginCommands {
 				if strings.EqualFold(pc.Name, cmdName) {
-					args := ""
-					if len(parts) > 1 {
-						args = strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
-					}
-					s.sendCore(map[string]any{"type": "plugin_command", "name": pc.Name, "args": args})
+					s.openValueEditModal(editTargetPluginCommand+pc.Name, "Plugin Command: /"+pc.Name,
+						"optional command input", "")
 					return nil
 				}
 			}
@@ -3218,6 +3224,13 @@ func (s *session) handleSkillCommand(parts []string) tea.Cmd {
 	s.pushHistory(display)
 	s.busy = true
 	return nil
+}
+
+func (s *session) runIndex(incremental bool) tea.Cmd {
+	if incremental {
+		return s.sendDelegation("Run an incremental knowledge index of this repository. Inspect changed files and update relevant durable memories without duplicates. End by listing what changed.", "/index")
+	}
+	return s.sendDelegation("Run a full knowledge index of this repository. Inspect architecture, conventions, APIs, build steps, tests, and gotchas; persist durable named memories and list them.", "/index")
 }
 
 // openURL best-effort opens a URL in the OS default browser (used to surface an

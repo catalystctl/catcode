@@ -44,6 +44,25 @@ impl ProviderAdapter for AnthropicCompatibleAdapter {
         );
         body["stream"] = Value::Bool(true);
         body["model"] = Value::String(input.model.to_string());
+        // MiniMax's Anthropic-compatible OpenAPI only accepts thinking
+        // {type: adaptive|disabled}. The standard Anthropic enabled+budget_tokens
+        // shape is rewritten here so M3/M2.x turns do not 400 — on first-party
+        // MiniMax hosts and on OpenCode Go MiniMax model ids.
+        let minimax_host = crate::provider::is_minimax(&input.provider.base_url);
+        let minimax_model = input.model.to_ascii_lowercase().contains("minimax");
+        if minimax_host || minimax_model {
+            let off = input.reasoning_effort.eq_ignore_ascii_case("none")
+                || input.reasoning_effort.is_empty()
+                || input.thinking_levels.is_empty();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "thinking".into(),
+                    serde_json::json!({
+                        "type": if off { "disabled" } else { "adaptive" }
+                    }),
+                );
+            }
+        }
         Ok(BuiltProviderRequest {
             url: format!("{}/messages", input.provider.base_url.trim_end_matches('/')),
             body,
@@ -247,6 +266,53 @@ mod tests {
         assert_eq!(built.body["max_tokens"], 8192);
         assert_eq!(built.body["stream"], true);
         assert_eq!(built.body["model"], "claude-sonnet-4");
+    }
+
+    #[test]
+    fn minimax_rewrites_thinking_to_adaptive() {
+        use crate::config::{ProviderKind, ResolvedProvider};
+        use crate::message::Message;
+        use crate::providers::adapter::ProviderRequest;
+
+        let provider = ResolvedProvider {
+            name: "minimax".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://api.minimax.io/anthropic".into(),
+            api_key: Some("sk-test".into()),
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        };
+        let messages = [Message::user("hi")];
+        let levels = ["low".to_string(), "medium".to_string(), "high".to_string()];
+        let built = AnthropicCompatibleAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "MiniMax-M3",
+                messages: &messages,
+                tools: &[],
+                reasoning_effort: "high",
+                thinking_levels: &levels,
+                max_tokens: 4096,
+            })
+            .expect("build");
+        assert_eq!(built.body["thinking"]["type"], "adaptive");
+        assert!(built.body["thinking"].get("budget_tokens").is_none());
+
+        let off = AnthropicCompatibleAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "MiniMax-M3",
+                messages: &messages,
+                tools: &[],
+                reasoning_effort: "none",
+                thinking_levels: &levels,
+                max_tokens: 4096,
+            })
+            .expect("build");
+        assert_eq!(off.body["thinking"]["type"], "disabled");
     }
 
     #[test]

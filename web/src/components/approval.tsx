@@ -47,7 +47,7 @@ export function Approval({ approval, onApprove }: Props) {
       role="alertdialog"
       aria-modal="true"
       aria-label={`Approve ${approval.tool}`}
-      className={`chat-msg-enter my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 bg-ink-925 ${
+      className={`chat-msg-enter my-3 overflow-hidden rounded-sm border border-ink-700 border-l-[3px] bg-ink-925 ${
         danger ? "border-l-warning" : "border-l-accent"
       }`}
     >
@@ -84,7 +84,7 @@ export function Approval({ approval, onApprove }: Props) {
           <button
             onClick={() => onApprove("yes")}
             title="Approve once"
-            className="flex items-center justify-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft"
+            className="flex min-h-11 items-center justify-center gap-1.5 rounded-sm bg-accent px-2.5 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft sm:min-h-0"
           >
             <CheckIcon width={13} height={13} className="shrink-0" />
             <span className="truncate">Once</span>
@@ -92,7 +92,7 @@ export function Approval({ approval, onApprove }: Props) {
           <button
             onClick={() => onApprove("always")}
             title={`Always allow ${approval.tool}`}
-            className="flex items-center justify-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+            className="flex min-h-11 items-center justify-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0"
           >
             <ShieldIcon width={12} height={12} className="shrink-0" />
             <span className="truncate">Always</span>
@@ -100,14 +100,14 @@ export function Approval({ approval, onApprove }: Props) {
           <button
             onClick={() => onApprove("allow_session")}
             title="Allow for session"
-            className="flex items-center justify-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+            className="flex min-h-11 items-center justify-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0"
           >
             <span className="truncate">Session</span>
           </button>
           <button
             onClick={onDeny}
             title="Deny (Esc)"
-            className="flex items-center justify-center gap-1.5 rounded-sm bg-danger/90 px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-danger"
+            className="flex min-h-11 items-center justify-center gap-1.5 rounded-sm bg-danger px-2.5 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-danger sm:min-h-0"
           >
             <XIcon width={13} height={13} className="shrink-0" />
             <span className="truncate">Deny</span>

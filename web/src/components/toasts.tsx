@@ -53,7 +53,7 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
 
   return (
     <div
-      className={`pointer-events-auto flex items-center gap-2 rounded-sm border border-ink-700 border-l-2 ${cfg.bar} bg-ink-900 py-1.5 pl-2 pr-1.5 shadow-elev-2 animate-fade-in`}
+      className={`pointer-events-auto flex items-center gap-2 rounded-sm border border-ink-700 border-l-2 ${cfg.bar} bg-ink-900 py-2 pl-2.5 pr-1.5 shadow-elev-2 animate-fade-in`}
     >
       <span className={`h-1.5 w-1.5 shrink-0 rounded-none ${cfg.dot}`} aria-hidden />
       <p className="flex-1 break-words text-[11px] leading-snug text-ink-200 sm:break-normal">
@@ -62,7 +62,7 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
       <button
         onClick={() => onDismiss(toast.id)}
         aria-label="Dismiss notification"
-        className="shrink-0 rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+        className="focus-ring flex h-11 w-11 shrink-0 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
       >
         <XIcon width={12} height={12} />
       </button>

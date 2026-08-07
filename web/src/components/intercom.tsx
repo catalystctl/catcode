@@ -15,6 +15,7 @@ import { relativeTime } from "@/lib/format";
 import { DotIcon, SendIcon, XIcon } from "./icons";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 
 function QuestionIcon(props: { width?: number; height?: number; className?: string }) {
   const { width = 16, height = 16, className } = props;
@@ -78,7 +79,7 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
       aria-label="Subagent needs a decision"
       className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925"
     >
-      <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-2.5">
+      <div className="flex min-h-11 items-center gap-2 border-b border-ink-800 px-4 py-2.5">
         <QuestionIcon width={14} height={14} className="shrink-0 text-accent-soft" />
         <span className="text-[10px] font-mono uppercase tracking-wider text-ink-400">
           Subagent needs a decision
@@ -99,19 +100,19 @@ export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
           placeholder="Reply to the subagent…"
-          className="mb-3 w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] leading-relaxed text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent/50 focus:outline-none"
+          className="mb-3 w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] leading-relaxed text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent focus:outline-none"
         />
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={send}
             disabled={!text.trim()}
-            className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="focus-ring flex min-h-11 items-center gap-1.5 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             <SendIcon width={13} height={13} /> Send reply
           </button>
           <button
             onClick={onDismiss}
-            className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+            className="focus-ring flex min-h-11 items-center gap-1.5 rounded-sm border border-ink-700 px-3 py-2 text-[12px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             <XIcon width={13} height={13} /> Skip
           </button>
@@ -139,6 +140,7 @@ const KIND_COLOR: Record<IntercomEntry["kind"], string> = {
 export function SubagentPanel({ log, onClose }: PanelProps) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
   const entries = [...log].sort((a, b) => b.ts - a.ts);
 
   return (
@@ -150,13 +152,13 @@ export function SubagentPanel({ log, onClose }: PanelProps) {
         aria-modal="true"
         aria-label="Subagent activity"
       >
-        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <span className="text-[11px] font-mono uppercase tracking-wider text-ink-400">
             Subagent activity
           </span>
           <button
             onClick={onClose}
-            className="rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />

@@ -51,6 +51,9 @@ const (
 	modalNoNetwork
 	modalFooterMetrics
 	modalReducedMotion
+	modalAdvisor
+	modalIndex
+	modalAdvisorModels
 	modalValueEdit          // free-form edit (api_key, timeouts, remember, attach, run, …)
 	modalMemory             // pick a memory to forget
 	modalGoal               // multi-field /goal form (goal, concurrency, models, providers)
@@ -364,20 +367,24 @@ type goalPlanSnap struct {
 
 // Value-edit targets for modalValueEdit (stored in modal.editTarget).
 const (
-	editTargetBashTimeout      = "bash_timeout"
-	editTargetIdleTimeout      = "idle_timeout"
-	editTargetMaxSessionTokens = "max_session_tokens"
-	editTargetRemember         = "remember"
-	editTargetAttach           = "attach"
-	editTargetPluginInstall    = "plugin_install"
-	editTargetSteer            = "steer"
-	editTargetRun              = "run"
-	editTargetParallel         = "parallel"
-	editTargetChain            = "chain"
-	editTargetCompact          = "compact"
-	editTargetTranscriptFind   = "transcript_find"
-	editTargetSessionRename    = "session_rename:"
-	editTargetSearchKey        = "search_key" // +":" + provider (exa|tavily)
+	editTargetBashTimeout          = "bash_timeout"
+	editTargetIdleTimeout          = "idle_timeout"
+	editTargetMaxSessionTokens     = "max_session_tokens"
+	editTargetRemember             = "remember"
+	editTargetAttach               = "attach"
+	editTargetPluginInstall        = "plugin_install"
+	editTargetSteer                = "steer"
+	editTargetRun                  = "run"
+	editTargetParallel             = "parallel"
+	editTargetChain                = "chain"
+	editTargetCompact              = "compact"
+	editTargetTranscriptFind       = "transcript_find"
+	editTargetSessionRename        = "session_rename:"
+	editTargetSearchKey            = "search_key" // +":" + provider (exa|tavily)
+	editTargetAdvisorModel         = "advisor_model"
+	editTargetAdvisorSubagentModel = "advisor_subagent_model"
+	editTargetSkill                = "skill:"
+	editTargetPluginCommand        = "plugin_command:"
 )
 
 // Plugin picker modes (session.pluginPickerMode).
@@ -582,6 +589,47 @@ func (s *session) openReducedMotionPicker() {
 		s.modal.cursor = 1
 	}
 }
+func (s *session) openAdvisorModal() {
+	s.modal = newModal()
+	s.modal.kind = modalAdvisor
+	s.modal.cursor = 0
+}
+
+func (s *session) advisorItems() []listItem {
+	model := s.settings.AdvisorModel
+	if model == "" {
+		model = "executor model"
+	}
+	subModel := s.settings.AdvisorSubagentModel
+	if subModel == "" {
+		subModel = model
+	}
+	return []listItem{
+		{label: "Advisor", desc: boolStr(s.settings.AdvisorEnabled) + " · enable second-model review"},
+		{label: "Main model", desc: model + " · blank uses executor model"},
+		{label: "Review subagents", desc: boolStr(s.settings.AdvisorSubagents) + " · review completed subagent work"},
+		{label: "Subagent model", desc: subModel + " · blank uses main advisor model"},
+		{label: "Watchdogs", desc: "named reviewers load from WATCHDOG.md/WATCHDOG.yml"},
+	}
+}
+func (s *session) openAdvisorModelPicker(target string) {
+	s.modal = newModal()
+	s.modal.kind = modalAdvisorModels
+	s.modal.editTarget = target
+	s.modal.cursor = 0
+}
+
+func (s *session) advisorModelItems() []listItem {
+	items := []listItem{{label: "Inherit", desc: "use the fallback model", meta: ""}}
+	for _, model := range s.models {
+		desc := model.Provider
+		if desc == "" {
+			desc = "available model"
+		}
+		items = append(items, listItem{label: model.ID, desc: desc, meta: model.ID})
+	}
+	return items
+}
 
 // openValueEditModal opens a free-form edit box for a single numeric/text setting.
 func (s *session) openValueEditModal(target, title, placeholder, initial string) {
@@ -651,6 +699,19 @@ func (s *session) pluginInstallScopeItems() []listItem {
 func (s *session) sendPluginInstall(path, scope string) {
 	s.sendCore(map[string]any{"type": "install_plugin", "path": path, "scope": scope})
 	s.logInfo(fmt.Sprintf("installing plugin from %s (%s)…", path, scope))
+}
+
+func (s *session) openIndexModal() {
+	s.modal = newModal()
+	s.modal.kind = modalIndex
+	s.modal.cursor = 0
+}
+
+func (s *session) indexItems() []listItem {
+	return []listItem{
+		{label: "Full index", desc: "scan architecture, conventions, APIs, build steps, and gotchas"},
+		{label: "Incremental index", desc: "update knowledge only for changed files"},
+	}
 }
 
 // openSteerModal collects a mid-turn steer message.
@@ -1186,6 +1247,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Provider", label: "/search-key", desc: "set Exa/Tavily search API key (exa|tavily, paste modal)"},
 		{group: "Provider", label: "/model", desc: "switch model"},
 		{group: "Session", label: "/approval", desc: "auto-approve · ask destructive · ask every tool"},
+		{group: "Session", label: "/advisor", desc: "second-model review · status/on/off/model/subagents"},
 		{group: "Session", label: "/reasoning", desc: "set reasoning effort (per model) · alias: /thinking"},
 		{group: "Session", label: "/theme", desc: "switch colour theme"},
 		{group: "Session", label: "/bash-timeout", desc: "bash tool timeout (seconds)"},
@@ -1353,6 +1415,7 @@ func (s *session) settingsHubItems() []listItem {
 	return []listItem{
 		{label: "/login", desc: "provider · " + s.providerFieldLabel()},
 		{label: "/approval", desc: "safety gate · " + approvalModeLabel(s.approvalMode())},
+		{label: "/advisor", desc: "second-model review · " + boolStr(s.settings.AdvisorEnabled)},
 		{label: "/reasoning", desc: "effort · " + s.settings.ReasoningEffort},
 		{label: "/theme", desc: "colour · " + activeTheme.name},
 		{label: "/bash-timeout", desc: fmt.Sprintf("%ds", s.coreBashTimeout)},
@@ -1701,7 +1764,7 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case modalCommand, modalModels, modalSessions, modalPlugins, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
 		modalAutoCompact, modalNoNetwork, modalFooterMetrics, modalReducedMotion, modalMemory, modalPluginInstallScope,
-		modalSearchKey, modalRestartConfirm:
+		modalSearchKey, modalRestartConfirm, modalAdvisor, modalAdvisorModels, modalIndex:
 		return s.handleListKey(msg)
 	case modalVision:
 		return s.handleVisionKey(msg)
@@ -2230,6 +2293,12 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.restartConfirmItems()
 	case modalConfirm:
 		items = s.confirmItems()
+	case modalAdvisor:
+		items = s.advisorItems()
+	case modalAdvisorModels:
+		items = s.advisorModelItems()
+	case modalIndex:
+		items = s.indexItems()
 	}
 	idx := filterList(items, s.modal.filter)
 	n := len(idx)
@@ -2330,7 +2399,6 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		s.closeModal()
 		return s, s.runCommandByIndex(abs)
 	case modalSettings:
-		// Hub entry → open the dedicated modal / run the command for that option.
 		items := s.settingsHubItems()
 		if abs < 0 || abs >= len(items) {
 			s.closeModal()
@@ -2339,6 +2407,9 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		label := items[abs].label
 		s.closeModal()
 		return s, s.dispatchSettingsCommand(label)
+	case modalAdvisor:
+		s.switchAdvisorOption(abs)
+		return s, nil
 	case modalSessions:
 		if abs >= 0 && abs < len(s.sessionList) {
 			e := s.sessionList[abs]
@@ -2442,20 +2513,24 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		return s, nil
 	case modalSandbox:
 		items := s.sandboxItems()
-		if abs >= 0 && abs < len(items) {
-			mode := items[abs].meta // "none" | "microsandbox"
+		if abs < 0 || abs >= len(items) {
 			s.closeModal()
-			if mode == "microsandbox" {
-				// Fail-closed enable: ask the core for a preflight report and only
-				// persist the setting once the environment is ready. Never silently
-				// save "none" on the user's behalf.
-				s.requestSandboxEnable()
-				return s, nil
-			}
-			s.setSandboxNone()
 			return s, nil
 		}
+		action := items[abs].meta
 		s.closeModal()
+		switch action {
+		case "none":
+			s.setSandboxNone()
+		case "microsandbox":
+			s.requestSandboxEnable()
+		case "status", "recheck":
+			s.requestSandboxStatus()
+		case "setup":
+			s.requestSandboxPrepare()
+		case "reset":
+			s.requestSandboxReset()
+		}
 		return s, nil
 	case modalAutoCompact:
 		items := s.autoCompactItems()
@@ -2514,6 +2589,12 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 		}
 		s.closeModal()
 		return s, nil
+	case modalIndex:
+		s.closeModal()
+		return s, s.runIndex(abs == 1)
+	case modalAdvisorModels:
+		s.selectAdvisorModel(abs)
+		return s, nil
 	case modalPluginInstallScope:
 		items := s.pluginInstallScopeItems()
 		path := strings.TrimSpace(s.pendingPluginInstallPath)
@@ -2545,7 +2626,40 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
-// applyApprovalMode persists and sends the approval gate mode to the core.
+func (s *session) switchAdvisorOption(abs int) {
+	switch abs {
+	case 0:
+		s.settings.AdvisorEnabled = !s.settings.AdvisorEnabled
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.enabled", "value": s.settings.AdvisorEnabled})
+	case 1:
+		s.openAdvisorModelPicker(editTargetAdvisorModel)
+	case 2:
+		s.settings.AdvisorSubagents = !s.settings.AdvisorSubagents
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagents", "value": s.settings.AdvisorSubagents})
+	case 3:
+		s.openAdvisorModelPicker(editTargetAdvisorSubagentModel)
+	case 4:
+		s.logInfo("watchdogs are configured with WATCHDOG.md and WATCHDOG.yml")
+	}
+}
+func (s *session) selectAdvisorModel(abs int) {
+	items := s.advisorModelItems()
+	if abs >= 0 && abs < len(items) {
+		model := items[abs].meta
+		if s.modal.editTarget == editTargetAdvisorSubagentModel {
+			s.settings.AdvisorSubagentModel = model
+			s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagent_model", "value": model})
+		} else {
+			s.settings.AdvisorModel = model
+			s.sendCore(map[string]any{"type": "set_config", "key": "advisor.model", "value": model})
+		}
+		_ = s.settings.save()
+	}
+	s.closeModal()
+}
+
 func (s *session) applyApprovalMode(mode string) {
 	mode = normalizeApproval(mode)
 	s.sendCore(map[string]any{"type": "set_approval", "mode": mode})
@@ -2558,14 +2672,14 @@ func (s *session) applyApprovalMode(mode string) {
 	s.logInfo("approval: " + approvalModeLabel(mode))
 }
 
-// dispatchSettingsCommand opens the dedicated modal (or runs the command) for
-// a settings-hub entry. Shared by the hub list and runCommandByIndex.
 func (s *session) dispatchSettingsCommand(label string) tea.Cmd {
 	switch label {
 	case "/login":
 		s.openLoginPicker()
-	case "/approval", "/approvals":
+	case "/approval":
 		s.openApprovalPicker()
+	case "/advisor":
+		s.openAdvisorModal()
 	case "/reasoning":
 		s.openReasoningPicker()
 	case "/theme":
@@ -2609,24 +2723,6 @@ func (s *session) selectProviderItem(abs int) (tea.Model, tea.Cmd) {
 		name := it.meta
 		preset := s.presetByID(name)
 		if preset == nil {
-			s.closeModal()
-			return s, nil
-		}
-		// OAuth-only presets (empty EnvVar, e.g. xAI SuperGrok): never prompt
-		// for an API key. Logged-in → switch active provider; otherwise start
-		// the device-code / browser OAuth flow.
-		oauthOnly := preset.SupportsOauth && preset.EnvVar == ""
-		if oauthOnly {
-			if preset.LoggedIn {
-				s.settings.ActiveProvider = name
-				_ = s.settings.save()
-				s.sendCore(map[string]any{"type": "set_provider", "name": name})
-				s.logInfo("switching provider: " + preset.Label)
-				s.closeModal()
-				return s, nil
-			}
-			s.sendCore(map[string]any{"type": "login_oauth", "preset": name})
-			s.logInfo("OAuth login: " + preset.Label + " — follow the prompt to log in")
 			s.closeModal()
 			return s, nil
 		}
@@ -2744,12 +2840,14 @@ func (s *session) renderLoginKeyBox() string {
 		desc:  "paste your key, then Enter (Esc to cancel)",
 	}}, true)
 }
+
 func (s *session) openOauthCodeModal() {
+	s.modal = newModal()
 	s.modal.kind = modalOauthCode
 	s.modal.editing = true
 	ti := textinput.New()
 	ti.Prompt = ""
-	ti.Placeholder = "paste code or full localhost:51121 redirect URL"
+	ti.Placeholder = "paste code or full localhost redirect URL"
 	ti.Focus()
 	s.modal.editBuf = ti
 }
@@ -2780,16 +2878,14 @@ func (s *session) runCommandByIndex(i int) tea.Cmd {
 	// cannot drift into separate implementations.
 	if strings.HasPrefix(label, "/skill:") {
 		s.closeModal()
-		s.input.SetValue(label + " ")
-		s.input.MoveToEnd()
-		s.evalMention()
-		return s.input.Focus()
+		name := strings.TrimPrefix(label, "/skill:")
+		s.openValueEditModal(editTargetSkill+name, "Apply Skill: "+name,
+			"optional task (blank = apply without a task)", "")
+		return nil
 	}
 	return s.handleUserLine(label)
 }
 
-// ---------------------------------------------------------------------------
-// Value-edit modals + helpers (API key, timeouts, etc.)
 // ---------------------------------------------------------------------------
 
 func boolStr(b bool) string {
@@ -2988,6 +3084,19 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		s.modal.editBuf.Focus()
 		return s, nil
 	}
+	if strings.HasPrefix(target, editTargetSkill) {
+		name := strings.TrimPrefix(target, editTargetSkill)
+		parts := []string{"/skill:" + name}
+		if val != "" {
+			parts = append(parts, val)
+		}
+		return s, s.handleSkillCommand(parts)
+	}
+	if strings.HasPrefix(target, editTargetPluginCommand) {
+		name := strings.TrimPrefix(target, editTargetPluginCommand)
+		s.sendCore(map[string]any{"type": "plugin_command", "name": name, "args": val})
+		return s, nil
+	}
 	s.modal.loadError = ""
 	s.modal.editing = false
 	s.closeModal()
@@ -3014,6 +3123,14 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 		return s, nil
 	}
 	switch target {
+	case editTargetAdvisorModel:
+		s.settings.AdvisorModel = val
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.model", "value": val})
+	case editTargetAdvisorSubagentModel:
+		s.settings.AdvisorSubagentModel = val
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagent_model", "value": val})
 	case editTargetBashTimeout:
 		var n int
 		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
@@ -3320,6 +3437,12 @@ func (s *session) renderModalBody() string {
 		return s.renderListModal("Settings", s.settingsHubItems(), true)
 	case modalApproval:
 		return s.renderListModal("Approval Mode", s.approvalItems(), false)
+	case modalAdvisor:
+		return s.renderListModal("Advisor", s.advisorItems(), false)
+	case modalAdvisorModels:
+		return s.renderListModal("Advisor Model", s.advisorModelItems(), true)
+	case modalIndex:
+		return s.renderListModal("Knowledge Index", s.indexItems(), false)
 	case modalSearchKey:
 		return s.renderListModal("Set Search API Key", s.searchKeyItems(), false)
 	case modalSandbox:

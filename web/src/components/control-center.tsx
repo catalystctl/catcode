@@ -391,7 +391,7 @@ export function ControlCenterPanel({
         aria-modal="true"
         aria-label="Control Center"
       >
-        <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-3">
+        <div className="flex min-h-11 items-center gap-2 border-b border-ink-800 px-5 py-3.5">
           <BoltIcon width={16} height={16} className="text-accent-soft" />
           <span className="text-[15px] font-semibold text-ink-100">Control Center</span>
           <span
@@ -412,7 +412,7 @@ export function ControlCenterPanel({
               <button
                 type="button"
                 onClick={onAbort}
-                className="inline-flex items-center gap-1.5 rounded-sm bg-danger/90 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-danger"
+                className="focus-ring inline-flex min-h-11 items-center gap-1.5 rounded-sm bg-danger px-3 py-2 text-[12px] font-medium text-white transition-colors hover:brightness-110 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
               >
                 <StopIcon width={12} height={12} />
                 Abort mission
@@ -421,7 +421,7 @@ export function ControlCenterPanel({
             <button
               type="button"
               onClick={onClose}
-              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
               aria-label="Close"
             >
               <XIcon width={16} height={16} />
@@ -447,7 +447,7 @@ export function ControlCenterPanel({
                     onChange={(e) => setGoal(e.target.value)}
                     rows={4}
                     placeholder="Describe the outcome. The CEO will plan, self-review, deploy employees, verify, and replan until certified — without asking you."
-                    className="w-full resize-y rounded-sm border border-ink-700 bg-ink-950 px-3 py-2.5 text-[13px] leading-relaxed text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+                    className="w-full resize-y rounded-sm border border-ink-700 bg-ink-950 px-3 py-2.5 text-[13px] leading-relaxed text-ink-100 placeholder:text-ink-600 focus:border-accent focus:outline-none"
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
@@ -459,7 +459,7 @@ export function ControlCenterPanel({
                       max={32}
                       value={concurrency}
                       onChange={(e) => setConcurrency(Number(e.target.value) || 1)}
-                      className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[13px] text-ink-100 focus:border-accent/60 focus:outline-none"
+                      className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[13px] text-ink-100 focus:border-accent focus:outline-none"
                     />
                   </label>
                   <label className="block text-[12px] text-ink-400">
@@ -470,7 +470,7 @@ export function ControlCenterPanel({
                       max={64}
                       value={maxTasks}
                       onChange={(e) => setMaxTasks(Number(e.target.value) || 1)}
-                      className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[13px] text-ink-100 focus:border-accent/60 focus:outline-none"
+                      className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[13px] text-ink-100 focus:border-accent focus:outline-none"
                     />
                   </label>
                 </div>
@@ -541,7 +541,7 @@ export function ControlCenterPanel({
                         <select
                           value={value}
                           onChange={(e) => set(e.target.value)}
-                          className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2 py-1.5 font-mono text-[12px] text-ink-100 focus:border-accent/60 focus:outline-none"
+                          className="mt-1 w-full rounded-sm border border-ink-700 bg-ink-950 px-2 py-1.5 font-mono text-[12px] text-ink-100 focus:border-accent focus:outline-none"
                         >
                           <option value="">(default)</option>
                           {modelOpts.map((m) => (
@@ -562,7 +562,7 @@ export function ControlCenterPanel({
                   type="button"
                   disabled={!goal.trim()}
                   onClick={submit}
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-sm bg-accent px-4 py-2 text-[12px] font-medium text-white hover:bg-accent-soft disabled:opacity-40"
+                  className="focus-ring inline-flex w-full min-h-11 items-center justify-center gap-2 rounded-sm bg-accent px-4 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
                 >
                   <BoltIcon width={14} height={14} />
                   Launch mission
@@ -657,7 +657,7 @@ export function ControlCenterPanel({
                   <button
                     type="button"
                     onClick={onAbort}
-                    className="inline-flex w-full items-center justify-center gap-2 rounded-sm bg-danger/90 px-4 py-2 text-[12px] font-medium text-white hover:bg-danger"
+                    className="focus-ring inline-flex w-full min-h-11 items-center justify-center gap-2 rounded-sm bg-danger px-4 py-2 text-[12px] font-medium text-white transition-colors hover:brightness-110"
                   >
                     <StopIcon width={14} height={14} />
                     Abort mission

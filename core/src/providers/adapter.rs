@@ -105,7 +105,9 @@ pub(crate) fn normalize_http_error(status: Option<u16>, body: &str) -> ProviderE
         Some(code) if code >= 500 => ProviderErrorKind::Server,
         _ if lower.contains("context_length")
             || lower.contains("context length")
-            || lower.contains("maximum context") =>
+            || lower.contains("maximum context")
+            || lower.contains("prompt is too long")
+            || lower.contains("input is too long") =>
         {
             ProviderErrorKind::ContextLength
         }
@@ -194,6 +196,15 @@ mod tests {
         let context = normalize_http_error(Some(400), "maximum context length exceeded");
         assert_eq!(context.kind, ProviderErrorKind::ContextLength);
         assert!(!context.retryable);
+    }
+
+    #[test]
+    fn anthropic_prompt_too_long_is_context_length() {
+        for body in ["prompt is too long for this model", "input is too long"] {
+            let err = normalize_http_error(Some(400), body);
+            assert_eq!(err.kind, ProviderErrorKind::ContextLength, "{body}");
+            assert!(!err.retryable, "{body}");
+        }
     }
 
     #[test]

@@ -99,6 +99,7 @@ pub(crate) async fn run_turn(
     // rejected until one exists).
     let mut reflected = false;
     let mut answer_delivered = false;
+    let mut context_error_retried = false;
     let mut summary_nudge_count: u8 = 0;
     let mut turn_tool_calls: u32 = 0;
     let mut shape_tools: Vec<String> = Vec::new();
@@ -936,6 +937,61 @@ pub(crate) async fn run_turn(
         let (assistant, _finish, tokens_in, tokens_out, cached_tokens) = match provider_result {
             Ok(v) => v,
             Err(e) => {
+                let normalized = crate::providers::adapter::normalize_http_error(None, &e);
+                let context_length =
+                    normalized.kind == crate::providers::adapter::ProviderErrorKind::ContextLength;
+                if context_length && !context_error_retried && cfg.auto_compact {
+                    context_error_retried = true;
+                    for _ in 0..transient_tails {
+                        messages.pop();
+                    }
+                    let before_est = estimate_messages_tokens(&messages);
+                    emit(
+                        &Event::new("compacting")
+                            .with("trigger", json!("provider_context_length"))
+                            .with("before_tokens", json!(before_est)),
+                    );
+                    dispatch_lifecycle(st, "pre_compact").await;
+                    let mp = st.plugin_manager.memory_provider();
+                    compact_with_summary(
+                        client,
+                        &cfg,
+                        &provider,
+                        &model,
+                        &mut messages,
+                        &cancel,
+                        true,
+                        model_ctx,
+                        cfg.compact_instructions.as_deref(),
+                        mp.as_ref(),
+                    )
+                    .await;
+                    let after_est = estimate_messages_tokens(&messages);
+                    let retry_limit = context_policy(
+                        &messages,
+                        model_ctx,
+                        max_tokens,
+                        cfg.context_compact_at,
+                        cfg.context_digest_at,
+                    )
+                    .hard_limit;
+                    *st.conversation.lock().await = messages.clone();
+                    if let Some(path) = cfg.session_file.as_ref() {
+                        session::rewrite(path, &messages);
+                    }
+                    *st.estimated_tokens.lock().await = after_est;
+                    st.invalidate_real_token_baseline().await;
+                    if after_est >= before_est || after_est > retry_limit {
+                        let reason = format!(
+                            "provider rejected the context and forced compaction could not reclaim enough space ({before_est} → {after_est} tokens; safe limit {retry_limit})"
+                        );
+                        st.logger.log("turn_error", json!({ "error": reason }));
+                        emit(&Event::new("error").with("message", json!(reason)));
+                        emit(&Event::new("done"));
+                        return;
+                    }
+                    continue;
+                }
                 st.logger.log("turn_error", json!({ "error": e }));
                 sync_session_file(st).await;
                 if e == "aborted" {
@@ -2115,6 +2171,24 @@ pub(crate) async fn run_turn(
                 // Loop back for the model to continue.
             }
             _ => {
+                for note in crate::advisor::review(
+                    st,
+                    crate::advisor::Scope::Main,
+                    &model,
+                    &messages,
+                    &cancel,
+                )
+                .await
+                {
+                    let est = estimate_message_tokens(&note);
+                    messages.push(note.clone());
+                    let mut conv = st.conversation.lock().await;
+                    conv.push(note);
+                    if let Some(path) = st.cfg.read().await.session_file.as_ref() {
+                        session::append(path, conv.last().unwrap());
+                    }
+                    *st.estimated_tokens.lock().await += est;
+                }
                 // Turn complete — or, on a non-trivial turn, inject a reflect
                 // continuation before the real completion (auto-reflect gate).
                 let mut do_reflect = false;

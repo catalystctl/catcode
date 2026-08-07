@@ -68,25 +68,13 @@ pub fn is_umans(base_url: &str) -> bool {
     host == "umans.ai" || host.ends_with(".umans.ai")
 }
 
-/// True if the base URL points at the Kimi (Moonshot) Code endpoint
-/// (`https://api.kimi.com/coding/v1`). Kimi accepts non-standard fields — a
-/// top-level `thinking: {type: enabled|disabled}` sent alongside
-/// `reasoning_effort`, and streams `reasoning_content` — that vanilla OpenAI
-/// servers reject, so those are gated on this check. Mirrors `is_umans` host
-/// parsing (exact host) to avoid look-alike endpoints.
+/// True if the base URL points at a Kimi / Moonshot endpoint
+/// (`api.kimi.com` coding subscription or `api.moonshot.ai` platform API).
+/// Kimi accepts non-standard fields — top-level `thinking` / `reasoning_effort`
+/// and streams `reasoning_content` — that vanilla OpenAI servers reject.
 pub fn is_kimi(base_url: &str) -> bool {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "api.kimi.com"
+    let host = endpoint_host(base_url);
+    host == "api.kimi.com" || host == "api.moonshot.ai"
 }
 
 /// True if the base URL points at DeepSeek's official API endpoint
@@ -95,7 +83,25 @@ pub fn is_kimi(base_url: &str) -> bool {
 /// `reasoning_content`; those fields are host-gated so ordinary OpenAI
 /// compatible endpoints never receive them accidentally.
 pub fn is_deepseek(base_url: &str) -> bool {
-    let host = base_url
+    endpoint_host(base_url) == "api.deepseek.com"
+}
+
+/// True if the base URL points at Zhipu / Z.ai OpenAI-compatible endpoints.
+/// Exact hosts only — no suffix matching that would accept lookalikes.
+pub fn is_zhipu(base_url: &str) -> bool {
+    let host = endpoint_host(base_url);
+    host == "api.z.ai" || host == "open.bigmodel.cn" || host == "open.bigmodel.com"
+}
+
+/// True if the base URL points at MiniMax Anthropic/OpenAI-compatible hosts.
+/// Exact hosts only — no suffix matching that would accept lookalikes.
+pub fn is_minimax(base_url: &str) -> bool {
+    let host = endpoint_host(base_url);
+    host == "api.minimax.io" || host == "api.minimaxi.com"
+}
+
+fn endpoint_host(base_url: &str) -> String {
+    base_url
         .split("://")
         .nth(1)
         .unwrap_or(base_url)
@@ -105,8 +111,7 @@ pub fn is_deepseek(base_url: &str) -> bool {
         .split(':')
         .next()
         .unwrap_or("")
-        .to_ascii_lowercase();
-    host == "api.deepseek.com"
+        .to_ascii_lowercase()
 }
 
 /// True only for the loopback Catalyst Cursor SDK sidecar. The dedicated path
@@ -142,7 +147,7 @@ pub fn resolve_effort(requested: &str, levels: &[String]) -> String {
     if let Some(hit) = levels.iter().find(|l| l.eq_ignore_ascii_case(requested)) {
         return hit.clone();
     }
-    for pref in ["high", "medium", "low", "minimal", "none"] {
+    for pref in ["high", "medium", "low", "xhigh", "max", "minimal", "none"] {
         if let Some(hit) = levels.iter().find(|l| l.eq_ignore_ascii_case(pref)) {
             return hit.clone();
         }
@@ -451,7 +456,7 @@ pub async fn extract_facts(
 /// reply. Branches on provider kind so callers (summarize/extract_facts) stay
 /// protocol-agnostic. `max_tokens` caps the reply (Anthropic requires it;
 /// OpenAI servers ignore/apply it tolerantly).
-async fn complete_text(
+pub(crate) async fn complete_text(
     client: &reqwest::Client,
     provider: &ResolvedProvider,
     model: &str,
@@ -1256,21 +1261,23 @@ fn apply_codex_event(
 ) -> Result<(), String> {
     match event {
         NormalizedStreamEvent::TextDelta(text) => {
-            if content.is_empty() {
-                timer.mark_first_token();
-            }
-            content.push_str(&text);
-            if !quiet {
-                emit(&Event::new("delta").with("text", json!(text)));
+            if let Some(delta) = append_stream_fragment(content, &text, false) {
+                if content.len() == delta.len() {
+                    timer.mark_first_token();
+                }
+                if !quiet {
+                    emit(&Event::new("delta").with("text", json!(delta)));
+                }
             }
         }
         NormalizedStreamEvent::ReasoningDelta(text) => {
-            if reasoning.is_empty() {
-                timer.mark_first_token();
-            }
-            reasoning.push_str(&text);
-            if !quiet {
-                emit(&Event::new("thinking").with("text", json!(text)));
+            if let Some(delta) = append_stream_fragment(reasoning, &text, false) {
+                if reasoning.len() == delta.len() {
+                    timer.mark_first_token();
+                }
+                if !quiet {
+                    emit(&Event::new("thinking").with("text", json!(delta)));
+                }
             }
         }
         NormalizedStreamEvent::ToolCallStart(delta) => {
@@ -1344,18 +1351,24 @@ async fn stream_turn_openai(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
-    // reasoning_effort + reasoning_content replay are supported by Umans and
-    // the loopback Cursor sidecar. Other OpenAI-compatible servers may reject
-    // these non-standard fields, so keep the capability narrowly gated.
+    // reasoning_effort + reasoning_content replay are host-gated. Vanilla
+    // OpenAI-compatible servers may reject non-standard fields with 400.
     let base_url = &provider.base_url;
     let umans = is_umans(base_url);
     let cursor_bridge = is_cursor_bridge(base_url);
     let kimi = is_kimi(base_url);
     let deepseek = is_deepseek(base_url);
-    // Kimi and DeepSeek stream `reasoning_content` (OpenAI-shaped), same as
-    // Umans/Cursor — include it so thinking text is replayed into the assistant
-    // message.
-    let supports_reasoning_content = umans || cursor_bridge || kimi || deepseek;
+    let zhipu = is_zhipu(base_url);
+    let minimax_host = is_minimax(base_url);
+    let minimax_model = is_minimax_model(model);
+    // MiniMax first-party and proxy gateways both stream cumulative content
+    // snapshots (and/or embed <think> tags). De-cumulate the raw wire text
+    // before demux so snapshots are not re-parsed as fresh incremental tokens.
+    let minimax_cumulative = minimax_host || minimax_model;
+    // These hosts/models stream or demux reasoning and need it replayed on
+    // subsequent tool turns. MiniMax-by-model covers proxy gateways.
+    let supports_reasoning_content =
+        umans || cursor_bridge || kimi || deepseek || zhipu || minimax_host || minimax_model;
     let api_key = provider.api_key.as_deref().unwrap_or("");
     let adapter = adapter_for(provider);
     let built = adapter.build_request(&ProviderRequest {
@@ -1390,6 +1403,10 @@ async fn stream_turn_openai(
     let max_attempts = 3u32;
     let mut content = String::new();
     let mut reasoning = String::new();
+    let mut think_demux = ThinkTagDemux::default();
+    // Raw cumulative content from the provider, before <think> demux. Only
+    // advanced when minimax_cumulative; otherwise unused.
+    let mut wire_text = String::new();
     let mut tool_calls: Vec<ToolAccum> = Vec::new();
     let mut finish_reason = String::new();
     let mut tokens_in: u64 = 0;
@@ -1473,23 +1490,66 @@ async fn stream_turn_openai(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if content.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            content.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("delta").with("text", json!(text)));
+                            // 1) De-cumulate raw wire text for MiniMax/proxies.
+                            // 2) Demux <think>…</think> into thinking vs content.
+                            // 3) After demux, pieces are pure increments.
+                            let to_demux = if minimax_cumulative {
+                                match append_stream_fragment(&mut wire_text, &text, true) {
+                                    Some(suffix) => suffix,
+                                    None => continue,
+                                }
+                            } else {
+                                text
+                            };
+                            let pieces = think_demux.push(&to_demux);
+                            for piece in pieces {
+                                match piece {
+                                    ThinkPiece::Text(t) => {
+                                        if let Some(delta) =
+                                            append_stream_fragment(&mut content, &t, false)
+                                        {
+                                            if content.len() == delta.len() {
+                                                timer.mark_first_token();
+                                            }
+                                            if !quiet {
+                                                emitted = true;
+                                                emit(
+                                                    &Event::new("delta")
+                                                        .with("text", json!(delta)),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ThinkPiece::Thinking(t) => {
+                                        if let Some(delta) =
+                                            append_stream_fragment(&mut reasoning, &t, false)
+                                        {
+                                            if reasoning.len() == delta.len() {
+                                                timer.mark_first_token();
+                                            }
+                                            if !quiet {
+                                                emitted = true;
+                                                emit(
+                                                    &Event::new("thinking")
+                                                        .with("text", json!(delta)),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if reasoning.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            reasoning.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("thinking").with("text", json!(text)));
+                            if let Some(delta) =
+                                append_stream_fragment(&mut reasoning, &text, minimax_cumulative)
+                            {
+                                if reasoning.len() == delta.len() {
+                                    timer.mark_first_token();
+                                }
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("thinking").with("text", json!(delta)));
+                                }
                             }
                         }
                         NormalizedStreamEvent::ToolCallStart(delta)
@@ -1673,6 +1733,8 @@ async fn stream_turn_openai(
                     }
                     add_structured_tool_call_recovery_instruction(&mut body);
                     content.clear();
+                    wire_text.clear();
+        think_demux = ThinkTagDemux::default();
                     reasoning.clear();
                     tool_calls.clear();
                     finish_reason.clear();
@@ -1703,6 +1765,8 @@ async fn stream_turn_openai(
         // Reset accumulators for the fresh attempt.
         content.clear();
         reasoning.clear();
+        wire_text.clear();
+        think_demux = ThinkTagDemux::default();
         tool_calls.clear();
         finish_reason.clear();
         tokens_in = 0;
@@ -1712,6 +1776,21 @@ async fn stream_turn_openai(
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
 
+    // Flush any partial think-tag held across the last chunk.
+    for piece in think_demux.finish() {
+        match piece {
+            ThinkPiece::Text(t) => {
+                let _ = append_stream_fragment(&mut content, &t, false);
+            }
+            ThinkPiece::Thinking(t) => {
+                let _ = append_stream_fragment(&mut reasoning, &t, false);
+            }
+        }
+    }
+    // Belt-and-suspenders: drop any residual think tags that escaped demux
+    // (cumulative edge cases / model-emitted bare closers).
+    sanitize_assistant_content(&mut content);
+
     // Fold this call's generation time + output tokens into the turn totals so
     // finalize() computes TPS over generation time only (excluding tool-call
     // wait and prefill). est_out is the char/4 fallback numerator when the
@@ -1720,8 +1799,8 @@ async fn stream_turn_openai(
     timer.end_call(tokens_out, est_out);
 
     // Build the assistant message. OpenAI requires content null when tool_calls
-    // present and empty. reasoning_content is retained only for endpoints
-    // explicitly gated above.
+    // present and empty. reasoning_content is retained for hosts/models that
+    // need multi-turn thinking replay (incl. MiniMax-by-model on proxies).
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), json!("assistant"));
     msg.insert(
@@ -1880,23 +1959,25 @@ async fn stream_turn_gemini(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if content.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            content.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("delta").with("text", json!(text)));
+                            if let Some(delta) = append_stream_fragment(&mut content, &text, false) {
+                                if content.len() == delta.len() {
+                                    timer.mark_first_token();
+                                }
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("delta").with("text", json!(delta)));
+                                }
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if reasoning.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            reasoning.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("thinking").with("text", json!(text)));
+                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, false) {
+                                if reasoning.len() == delta.len() {
+                                    timer.mark_first_token();
+                                }
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("thinking").with("text", json!(delta)));
+                                }
                             }
                         }
                         NormalizedStreamEvent::ToolCallStart(delta) => {
@@ -2310,12 +2391,27 @@ async fn send_with_retry(
             return Err(format!("HTTP {status}: {}", normalized.message));
         }
 
-        // P2-6: Retry-After may be integer seconds OR an HTTP-date; parse both.
-        let retry_after = resp
+        // Providers use both standard Retry-After and non-standard
+        // retry-after-ms/x-ratelimit-reset-after headers. Normalize all three.
+        let retry_after_ms = resp
             .headers()
-            .get("retry-after")
+            .get("retry-after-ms")
             .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
+            .and_then(parse_retry_after_ms)
+            .or_else(|| {
+                resp.headers()
+                    .get("x-ratelimit-reset-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after_seconds)
+                    .map(|seconds| seconds.saturating_mul(1000))
+            })
+            .or_else(|| {
+                resp.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after)
+                    .map(|seconds| seconds.saturating_mul(1000))
+            });
         // Drain body before retry to free the connection.
         let err_body = resp.text().await.unwrap_or_default();
         if logging::debug_verbose() {
@@ -2335,7 +2431,7 @@ async fn send_with_retry(
                 }),
             );
         }
-        let backoff = backoff_ms(attempt, retry_after);
+        let backoff = backoff_with_provider_delay(attempt, retry_after_ms);
         emit(
             &Event::new("http_retry")
                 .with("attempt", json!(attempt))
@@ -2344,6 +2440,22 @@ async fn send_with_retry(
         );
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
+}
+
+fn parse_retry_after_ms(s: &str) -> Option<u64> {
+    let parsed = s.trim().parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some(parsed.ceil() as u64)
+}
+
+fn parse_retry_after_seconds(s: &str) -> Option<u64> {
+    let parsed = s.trim().parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some(parsed.ceil() as u64)
 }
 
 /// Parse a Retry-After header into seconds. Accepts an integer (seconds) or
@@ -2437,6 +2549,12 @@ fn backoff_ms(attempt: u32, retry_after: Option<u64>) -> u64 {
     // 500, 1000, 2000, 4000 ... capped at 8000
     let base = 500u64;
     base.saturating_mul(1u64 << (attempt - 1)).min(8000)
+}
+
+fn backoff_with_provider_delay(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
+    retry_after_ms
+        .map(|delay| delay.clamp(50, 60_000))
+        .unwrap_or_else(|| backoff_ms(attempt, None))
 }
 
 async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) -> Result<(), String> {
@@ -2564,6 +2682,189 @@ fn emit_stream_retry(attempt: u32, reason: &str, backoff: u64, discard_partial: 
         ev = ev.with("discard_partial", json!(true));
     }
     emit(&ev);
+}
+
+/// Streaming demuxer for MiniMax-style (and similar) content that embeds
+/// reasoning inside `<think>…</think>` tags on the assistant `content` stream.
+///
+/// Gateways that do not honor `reasoning_split` return thinking this way. The
+/// harness must still surface `thinking` events and persist `reasoning_content`
+/// so the UI and multi-turn tool chains work. Partial open/close tags that
+/// straddle chunk boundaries are held in `hold` until complete.
+#[derive(Default, Debug)]
+struct ThinkTagDemux {
+    /// True while inside an open `<think>` region.
+    in_think: bool,
+    /// Incomplete tag prefix held across chunks (e.g. `"<thi"`).
+    hold: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ThinkPiece {
+    Text(String),
+    Thinking(String),
+}
+
+impl ThinkTagDemux {
+    fn push(&mut self, incoming: &str) -> Vec<ThinkPiece> {
+        if incoming.is_empty() && self.hold.is_empty() {
+            return Vec::new();
+        }
+        let mut src = std::mem::take(&mut self.hold);
+        src.push_str(incoming);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < src.len() {
+            if self.in_think {
+                if let Some(rel) = src[i..].find("</think>") {
+                    let end = i + rel;
+                    if end > i {
+                        out.push(ThinkPiece::Thinking(src[i..end].to_string()));
+                    }
+                    i = end + "</think>".len();
+                    self.in_think = false;
+                    continue;
+                }
+                // May end mid-close-tag — hold a short suffix that could grow into it.
+                let hold_from = close_tag_hold_start(&src, i);
+                if hold_from > i {
+                    out.push(ThinkPiece::Thinking(src[i..hold_from].to_string()));
+                }
+                self.hold = src[hold_from..].to_string();
+                return out;
+            }
+            // Outside think: drop bare closing tags (model noise after a
+            // completed block) then look for the next open tag.
+            if let Some(rel) = src[i..].find("</think>") {
+                let open_rel = src[i..].find("<think>");
+                let close_first = open_rel.map(|o| rel < o).unwrap_or(true);
+                if close_first {
+                    let start = i + rel;
+                    if start > i {
+                        out.push(ThinkPiece::Text(src[i..start].to_string()));
+                    }
+                    i = start + "</think>".len();
+                    continue;
+                }
+            }
+            if let Some(rel) = src[i..].find("<think>") {
+                let start = i + rel;
+                if start > i {
+                    out.push(ThinkPiece::Text(src[i..start].to_string()));
+                }
+                i = start + "<think>".len();
+                self.in_think = true;
+                continue;
+            }
+            let hold_from = open_tag_hold_start(&src, i);
+            if hold_from > i {
+                out.push(ThinkPiece::Text(src[i..hold_from].to_string()));
+            }
+            self.hold = src[hold_from..].to_string();
+            return out;
+        }
+        out
+    }
+
+    /// Flush any held bytes at stream end. Incomplete tags are emitted as the
+    /// channel they were being accumulated for (text outside, thinking inside)
+    /// so no tokens are silently dropped.
+    fn finish(&mut self) -> Vec<ThinkPiece> {
+        if self.hold.is_empty() {
+            return Vec::new();
+        }
+        let held = std::mem::take(&mut self.hold);
+        if self.in_think {
+            vec![ThinkPiece::Thinking(held)]
+        } else {
+            vec![ThinkPiece::Text(held)]
+        }
+    }
+}
+
+fn open_tag_hold_start(src: &str, from: usize) -> usize {
+    // Hold a trailing prefix of `<think>` that might complete in the next chunk.
+    const TAG: &str = "<think>";
+    let tail = &src[from..];
+    let max = (TAG.len() - 1).min(tail.len());
+    for n in (1..=max).rev() {
+        if TAG.starts_with(&tail[tail.len() - n..]) {
+            return src.len() - n;
+        }
+    }
+    src.len()
+}
+
+fn close_tag_hold_start(src: &str, from: usize) -> usize {
+    const TAG: &str = "</think>";
+    let tail = &src[from..];
+    let max = (TAG.len() - 1).min(tail.len());
+    for n in (1..=max).rev() {
+        if TAG.starts_with(&tail[tail.len() - n..]) {
+            return src.len() - n;
+        }
+    }
+    src.len()
+}
+
+/// True when the model id is a MiniMax M-series id (host-agnostic). Used so
+/// proxy gateways that front MiniMax still get think-tag demux + replay.
+fn is_minimax_model(model: &str) -> bool {
+    let l = model.to_ascii_lowercase();
+    l.contains("minimax") || l.starts_with("m3-") || l == "m3"
+}
+
+/// Remove residual `<think>` / `</think>` markers from assistant visible content.
+fn sanitize_assistant_content(content: &mut String) {
+    while let Some(start) = content.find("<think>") {
+        if let Some(rel) = content[start..].find("</think>") {
+            let end = start + rel + "</think>".len();
+            content.replace_range(start..end, "");
+        } else {
+            content.replace_range(start.., "");
+            break;
+        }
+    }
+    while let Some(pos) = content.find("</think>") {
+        let end = pos + "</think>".len();
+        content.replace_range(pos..end, "");
+    }
+    let trimmed = content.trim();
+    if trimmed.len() != content.len() {
+        *content = trimmed.to_string();
+    }
+}
+
+/// Append a stream text fragment.
+///
+/// - `cumulative == false` (default OpenAI/Anthropic/Gemini/Codex): pure
+///   incremental append. Never drop a token that is a prefix of `acc` — that
+///   is a normal incremental re-emission (repeated digits, CJK, etc.).
+/// - `cumulative == true` (MiniMax `reasoning_split` / cumulative content):
+///   treat `incoming` as a full snapshot, emit only the new suffix, and ignore
+///   identical/shorter rewinds.
+///
+/// Returns only the newly added suffix for emission.
+fn append_stream_fragment(acc: &mut String, incoming: &str, cumulative: bool) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    if cumulative {
+        if !acc.is_empty() && incoming.starts_with(acc.as_str()) {
+            let suffix = &incoming[acc.len()..];
+            if suffix.is_empty() {
+                return None;
+            }
+            acc.push_str(suffix);
+            return Some(suffix.to_string());
+        }
+        // Cumulative vendor rewound or resent a shorter prefix — ignore.
+        if !acc.is_empty() && acc.starts_with(incoming) {
+            return None;
+        }
+    }
+    acc.push_str(incoming);
+    Some(incoming.to_string())
 }
 
 fn is_terminal_stream_event(event: &NormalizedStreamEvent) -> bool {
@@ -2976,11 +3277,25 @@ async fn send_anthropic_request(
                     let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
                     return Err(format!("HTTP {status}: {}", normalized.message));
                 }
-                let retry_after = r
+                let retry_after_ms = r
                     .headers()
-                    .get("retry-after")
+                    .get("retry-after-ms")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(parse_retry_after);
+                    .and_then(parse_retry_after_ms)
+                    .or_else(|| {
+                        r.headers()
+                            .get("x-ratelimit-reset-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after_seconds)
+                            .map(|seconds| seconds.saturating_mul(1000))
+                    })
+                    .or_else(|| {
+                        r.headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after)
+                            .map(|seconds| seconds.saturating_mul(1000))
+                    });
                 let err_body = r.text().await.unwrap_or_default();
                 if logging::debug_verbose() {
                     let (body_text, body_len, truncated) =
@@ -3000,7 +3315,7 @@ async fn send_anthropic_request(
                         }),
                     );
                 }
-                let backoff = backoff_ms(attempt, retry_after);
+                let backoff = backoff_with_provider_delay(attempt, retry_after_ms);
                 emit(
                     &Event::new("http_retry")
                         .with("attempt", json!(attempt))
@@ -3060,6 +3375,7 @@ async fn stream_turn_anthropic(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
+    let minimax = is_minimax(&provider.base_url);
     let adapter = adapter_for(provider);
     let built = adapter.build_request(&ProviderRequest {
         provider,
@@ -3145,23 +3461,25 @@ async fn stream_turn_anthropic(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if content.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            content.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("delta").with("text", json!(text)));
+                            if let Some(delta) = append_stream_fragment(&mut content, &text, minimax) {
+                                if content.len() == delta.len() {
+                                    timer.mark_first_token();
+                                }
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("delta").with("text", json!(delta)));
+                                }
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if reasoning.is_empty() {
-                                timer.mark_first_token();
-                            }
-                            reasoning.push_str(&text);
-                            if !quiet {
-                                emitted = true;
-                                emit(&Event::new("thinking").with("text", json!(text)));
+                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, minimax) {
+                                if reasoning.len() == delta.len() {
+                                    timer.mark_first_token();
+                                }
+                                if !quiet {
+                                    emitted = true;
+                                    emit(&Event::new("thinking").with("text", json!(delta)));
+                                }
                             }
                         }
                         NormalizedStreamEvent::ToolCallStart(delta) => {
@@ -3652,13 +3970,16 @@ mod tests {
     fn opencode_go_curated_lists_partition_by_protocol() {
         let openai = opencode_go_openai_models();
         let anth = opencode_go_anthropic_models();
-        // the OpenCode Go docs map exactly these models to each protocol
+        // Curated OpenCode Go docs map (2026-08) — OpenAI chat/completions.
         assert_eq!(
             openai.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
             vec![
                 "glm-5.2",
                 "glm-5.1",
+                "glm-5-turbo",
+                "kimi-k3",
                 "kimi-k2.7-code",
+                "kimi-k2.7-code-highspeed",
                 "kimi-k2.6",
                 "deepseek-v4-pro",
                 "deepseek-v4-flash",
@@ -3671,7 +3992,9 @@ mod tests {
             vec![
                 "minimax-m3",
                 "minimax-m2.7",
+                "minimax-m2.7-highspeed",
                 "minimax-m2.5",
+                "minimax-m2.5-highspeed",
                 "qwen3.7-max",
                 "qwen3.7-plus",
                 "qwen3.6-plus",
@@ -3691,9 +4014,8 @@ mod tests {
             deduped.len(),
             "model id duplicated across protocols"
         );
-        // conservative, honest capabilities: no advertised thinking levels (so
-        // no reasoning_effort/thinking block is ever sent over this endpoint)
-        // OpenAI-served models: no reasoning (reasoning_effort is Umans-only)
+        // OpenAI-served on OpenCode Go: no advertised thinking levels (host is
+        // not first-party Kimi/Zhipu, so vendor fields never hit the wire).
         for m in &openai {
             assert!(
                 m.thinking_levels.is_empty(),
@@ -3702,6 +4024,7 @@ mod tests {
             );
             assert!(!m.reasoning, "OpenAI {} marked reasoning", m.id);
             assert!(m.context_window > 0 && m.max_tokens > 0);
+            assert!(m.max_tokens < m.context_window, "{}", m.id);
         }
         // Anthropic-served models: extended thinking enabled
         for m in &anth {
@@ -3713,6 +4036,12 @@ mod tests {
             assert!(m.reasoning, "Anthropic {} not marked reasoning", m.id);
             assert!(m.context_window > 0 && m.max_tokens > 0);
         }
+        // Spot-check official caps.
+        let m3 = anth.iter().find(|m| m.id == "minimax-m3").unwrap();
+        assert_eq!(m3.context_window, 1_000_000);
+        let k3 = openai.iter().find(|m| m.id == "kimi-k3").unwrap();
+        assert_eq!(k3.context_window, 1_048_576);
+        assert_eq!(k3.max_tokens, 131_072);
     }
 
     #[test]
@@ -4116,6 +4445,21 @@ mod tests {
         assert!(!is_retryable_http_status(StatusCode::UNPROCESSABLE_ENTITY));
         assert!(!is_retryable_http_status(StatusCode::OK));
     }
+    #[test]
+    fn provider_retry_delay_accepts_millisecond_headers() {
+        assert_eq!(parse_retry_after_ms("125.1"), Some(126));
+        assert_eq!(parse_retry_after_ms("0"), Some(0));
+        assert!(parse_retry_after_ms("-1").is_none());
+        assert_eq!(parse_retry_after_seconds("1.25"), Some(2));
+        assert_eq!(
+            parse_retry_after_seconds("1.25").map(|seconds| seconds * 1000),
+            Some(2000)
+        );
+        assert!(parse_retry_after_ms("not-a-delay").is_none());
+        assert_eq!(backoff_with_provider_delay(1, Some(125)), 125);
+        assert_eq!(backoff_with_provider_delay(1, Some(0)), 50);
+        assert_eq!(backoff_with_provider_delay(1, Some(100_000)), 60_000);
+    }
 
     #[test]
     fn retryable_stream_failure_policy() {
@@ -4183,10 +4527,12 @@ mod tests {
         assert!(is_kimi("https://api.kimi.com/coding/v1"));
         assert!(is_kimi("https://api.kimi.com/v1"));
         assert!(is_kimi("https://api.kimi.com:443/coding/v1"));
+        assert!(is_kimi("https://api.moonshot.ai/v1"));
         assert!(!is_kimi("https://api.openai.com/v1"));
         // look-alike host must NOT match (substring false-positive guard)
         assert!(!is_kimi("https://api.kimi.com.evil.com/v1"));
         assert!(!is_kimi("https://kimi.com/v1"));
+        assert!(!is_kimi("https://evil.moonshot.ai/v1"));
     }
 
     #[test]
@@ -4197,6 +4543,169 @@ mod tests {
         assert!(!is_deepseek("https://deepseek.com/v1"));
         assert!(!is_deepseek("https://api.deepseek.com.evil.com/v1"));
         assert!(!is_deepseek("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn is_zhipu_and_minimax_detection() {
+        assert!(is_zhipu("https://api.z.ai/api/paas/v4"));
+        assert!(is_zhipu("https://open.bigmodel.cn/api/paas/v4"));
+        assert!(!is_zhipu("https://api.z.ai.evil.com/v1"));
+        assert!(!is_zhipu("https://evil.z.ai/v1"));
+        assert!(!is_zhipu("https://api.openai.com/v1"));
+
+        assert!(is_minimax("https://api.minimax.io/v1"));
+        assert!(is_minimax("https://api.minimaxi.com/v1"));
+        assert!(!is_minimax("https://api.minimax.io.evil.com/v1"));
+        assert!(!is_minimax("https://evil.minimax.io/v1"));
+        assert!(!is_minimax("https://api.openai.com/v1"));
+    }
+
+
+    #[test]
+    fn think_tag_demux_splits_complete_and_partial_tags() {
+        let mut d = ThinkTagDemux::default();
+        // Opening tag split across chunks.
+        assert!(d.push("<thi").is_empty());
+        let p1 = d.push("nk>\nstep one");
+        assert_eq!(
+            p1,
+            vec![ThinkPiece::Thinking("\nstep one".into())]
+        );
+        let p2 = d.push(" continues</th");
+        assert_eq!(p2, vec![ThinkPiece::Thinking(" continues".into())]);
+        let p3 = d.push("ink>\n\n## Answer\nHi");
+        assert_eq!(
+            p3,
+            vec![ThinkPiece::Text("\n\n## Answer\nHi".into())]
+        );
+        assert!(d.finish().is_empty());
+    }
+
+    #[test]
+    fn think_tag_demux_plain_text_passthrough() {
+        let mut d = ThinkTagDemux::default();
+        assert_eq!(
+            d.push("hello "),
+            vec![ThinkPiece::Text("hello ".into())]
+        );
+        assert_eq!(d.push("world"), vec![ThinkPiece::Text("world".into())]);
+    }
+
+    #[test]
+    fn think_tag_demux_drops_stray_close_tags() {
+        let mut d = ThinkTagDemux::default();
+        let pieces = d.push("<think>step</think>\n\n</think>\nAnswer");
+        let mut thinking = String::new();
+        let mut text = String::new();
+        for p in pieces.into_iter().chain(d.finish()) {
+            match p {
+                ThinkPiece::Thinking(t) => thinking.push_str(&t),
+                ThinkPiece::Text(t) => text.push_str(&t),
+            }
+        }
+        assert_eq!(thinking, "step");
+        assert_eq!(text, "\n\n\nAnswer");
+        assert!(!text.contains("</think>"));
+    }
+
+    #[test]
+    fn is_minimax_model_detection() {
+        assert!(is_minimax_model("minimax-m3"));
+        assert!(is_minimax_model("MiniMax-M2.5"));
+        assert!(is_minimax_model("umans-minimax-m3"));
+        assert!(!is_minimax_model("glm-5.2"));
+        assert!(!is_minimax_model("kimi-k3"));
+    }
+
+    #[test]
+    fn cumulative_wire_text_then_demux_does_not_duplicate() {
+        // Proxy MiniMax streams full content snapshots each chunk. De-cumulate
+        // first, then demux — otherwise thinking is re-parsed and duplicated.
+        let mut wire = String::new();
+        let mut demux = ThinkTagDemux::default();
+        let mut thinking = String::new();
+        let mut content = String::new();
+        let snapshots = [
+            "<think>\nThe user",
+            "<think>\nThe user is asking",
+            "<think>\nThe user is asking what.\n</think>\n\n</think>\n\nHello",
+        ];
+        for snap in snapshots {
+            let Some(suffix) = append_stream_fragment(&mut wire, snap, true) else {
+                continue;
+            };
+            for piece in demux.push(&suffix) {
+                match piece {
+                    ThinkPiece::Thinking(t) => thinking.push_str(&t),
+                    ThinkPiece::Text(t) => content.push_str(&t),
+                }
+            }
+        }
+        for piece in demux.finish() {
+            match piece {
+                ThinkPiece::Thinking(t) => thinking.push_str(&t),
+                ThinkPiece::Text(t) => content.push_str(&t),
+            }
+        }
+        sanitize_assistant_content(&mut content);
+        assert_eq!(thinking, "\nThe user is asking what.\n");
+        assert!(!thinking.contains("The userThe user"), "duplicated thinking: {thinking}");
+        assert_eq!(content, "Hello");
+        assert!(!content.contains("</think>"));
+    }
+
+    #[test]
+    fn sanitize_assistant_content_strips_residual_tags() {
+        let mut s = "\n\n</think>".to_string();
+        sanitize_assistant_content(&mut s);
+        assert!(s.is_empty());
+        let mut s2 = "Hi <think>x</think> there</think>".to_string();
+        sanitize_assistant_content(&mut s2);
+        assert_eq!(s2, "Hi  there");
+    }
+
+        #[test]
+    fn append_stream_fragment_handles_cumulative_and_delta() {
+        // Pure incremental: repeated prefix tokens must NOT be dropped.
+        let mut inc = String::new();
+        assert_eq!(
+            append_stream_fragment(&mut inc, "1", false).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            append_stream_fragment(&mut inc, "1", false).as_deref(),
+            Some("1")
+        );
+        assert_eq!(inc, "11");
+        assert_eq!(
+            append_stream_fragment(&mut inc, " 22", false).as_deref(),
+            Some(" 22")
+        );
+        assert_eq!(inc, "11 22");
+
+        // MiniMax cumulative snapshot: full prefix repeated + new suffix.
+        let mut acc = String::new();
+        assert_eq!(
+            append_stream_fragment(&mut acc, "think", true).as_deref(),
+            Some("think")
+        );
+        assert_eq!(acc, "think");
+        assert_eq!(
+            append_stream_fragment(&mut acc, "thinking", true).as_deref(),
+            Some("ing")
+        );
+        assert_eq!(acc, "thinking");
+        // Identical cumulative frame → no emission.
+        assert_eq!(append_stream_fragment(&mut acc, "thinking", true), None);
+        // Non-prefix extension still appends under cumulative mode.
+        assert_eq!(
+            append_stream_fragment(&mut acc, " more", true).as_deref(),
+            Some(" more")
+        );
+        assert_eq!(acc, "thinking more");
+        // Shorter cumulative rewind is ignored.
+        assert_eq!(append_stream_fragment(&mut acc, "think", true), None);
+        assert_eq!(acc, "thinking more");
     }
 
     #[test]
@@ -4472,9 +4981,16 @@ mod tests {
         let models = fallback_models();
         // every fallback entry has at least one thinking level
         assert!(models.iter().all(|m| !m.thinking_levels.is_empty()));
-        // GLM entries advertise only "high"
+        // Legacy GLM entries advertise only "high"; GLM-5.2 advertises high/max.
         for m in models.iter().filter(|m| m.id.contains("glm")) {
-            assert_eq!(m.thinking_levels, vec!["high".to_string()]);
+            if m.id.contains("glm-5.2") {
+                assert_eq!(
+                    m.thinking_levels,
+                    vec!["high".to_string(), "max".to_string()]
+                );
+            } else {
+                assert_eq!(m.thinking_levels, vec!["high".to_string()]);
+            }
         }
         // a non-GLM model advertises the standard trio
         let coder = models.iter().find(|m| m.id == "umans-coder").unwrap();
@@ -4482,6 +4998,9 @@ mod tests {
             coder.thinking_levels,
             vec!["low".to_string(), "medium".to_string(), "high".to_string()]
         );
+        let m3 = models.iter().find(|m| m.id == "umans-minimax-m3").unwrap();
+        assert_eq!(m3.context_window, 1_000_000);
+        assert_eq!(m3.max_tokens, 128_000);
     }
 
     #[test]

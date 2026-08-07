@@ -36,6 +36,7 @@ import {
 } from "./icons";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
 
 /** Fallback builtins if the core hasn't emitted an `agents` event yet. */
 const FALLBACK_AGENTS: AgentInfo[] = [
@@ -95,7 +96,7 @@ export function RunCard({ run, onClick }: { run: SubagentRunView; onClick: () =>
           {isContainer ? "❯" : "↳"} {title}
         </span>
         {run.mode !== "single" && (
-          <span className="rounded bg-ink-850 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-ink-400">
+          <span className="rounded-sm bg-ink-850 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-ink-400">
             {run.mode}
           </span>
         )}
@@ -160,7 +161,7 @@ function ToolBlock({ item }: { item: SubagentChatItem }) {
         <span className="text-[13px]">{toolIcon(name)}</span>
         <span className="font-mono text-[12px] font-medium text-ink-200">{name || "tool"}</span>
         {dangerous && (
-          <span className="rounded bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
+          <span className="rounded-sm bg-ink-900 px-1.5 py-0.5 text-[10px] font-medium text-danger">
             destructive
           </span>
         )}
@@ -288,6 +289,7 @@ interface PanelProps {
 export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: PanelProps) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -314,11 +316,11 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
         aria-modal="true"
         aria-label="Subagents"
       >
-        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <span className="text-[15px] font-semibold text-ink-100">Subagents</span>
             {runningCount > 0 && (
-              <span className="flex items-center gap-1.5 rounded-sm bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
+              <span className="flex items-center gap-1.5 rounded-sm border border-warning bg-ink-900 px-2 py-0.5 text-[11px] font-medium text-warning">
                 <DotIcon className="text-warning" /> {runningCount} running
               </span>
             )}
@@ -327,7 +329,7 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
             {onRefreshAgents && (
               <button
                 onClick={onRefreshAgents}
-                className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+                className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
                 aria-label="Refresh agents"
                 title="Refresh available agents"
               >
@@ -336,7 +338,7 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
             )}
             <button
               onClick={onClose}
-              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
               aria-label="Close"
             >
               <XIcon width={16} height={16} />

@@ -149,13 +149,13 @@ function ConfirmView({
         aria-describedby={descId}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
+        <div className="flex min-h-11 items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
           <h2 id={titleId} className="text-[15px] font-semibold text-ink-100">
             {title}
           </h2>
           <button
             onClick={() => finish(false)}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Cancel"
           >
             <XIcon width={16} height={16} />
@@ -168,17 +168,15 @@ function ConfirmView({
           <button
             autoFocus={!!danger}
             onClick={() => finish(false)}
-            className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800"
+            className="focus-ring min-h-11 rounded-sm border border-ink-700 px-3 py-2 text-[12px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             {cancelLabel}
           </button>
           <button
             autoFocus={!danger}
             onClick={() => finish(true)}
-            className={`rounded-sm px-2.5 py-1 text-[11px] font-medium text-white ${
-              danger
-                ? "bg-danger/90 hover:bg-danger"
-                : "bg-accent hover:bg-accent-soft"
+            className={`focus-ring min-h-11 rounded-sm px-3 py-2 text-[12px] font-medium text-white transition-colors sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px] ${
+              danger ? "bg-danger hover:brightness-110" : "bg-accent hover:bg-accent-soft"
             }`}
           >
             {confirmLabel}
@@ -244,13 +242,13 @@ function PromptView({
         aria-labelledby={titleId}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
+        <div className="flex min-h-11 items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
           <h2 id={titleId} className="text-[15px] font-semibold text-ink-100">
             {title}
           </h2>
           <button
             onClick={() => finish(null)}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Cancel"
           >
             <XIcon width={16} height={16} />
@@ -265,7 +263,7 @@ function PromptView({
               value={value}
               onChange={(e) => setValue(e.target.value)}
               placeholder={placeholder}
-              className="w-full resize-y rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+              className="w-full resize-y rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 transition-colors focus:border-accent focus:outline-none"
             />
           ) : (
             <input
@@ -280,21 +278,21 @@ function PromptView({
                 }
               }}
               placeholder={placeholder}
-              className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+              className="w-full rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[13px] text-ink-100 placeholder:text-ink-600 transition-colors focus:border-accent focus:outline-none"
             />
           )}
         </div>
         <div className="flex justify-end gap-2 border-t border-ink-800 px-5 py-3">
           <button
             onClick={() => finish(null)}
-            className="rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800"
+            className="focus-ring min-h-11 rounded-sm border border-ink-700 px-3 py-2 text-[12px] text-ink-300 transition-colors hover:bg-ink-800 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             {cancelLabel}
           </button>
           <button
             onClick={submit}
             disabled={required && !value.trim()}
-            className="rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+            className="focus-ring min-h-11 rounded-sm bg-accent px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500 sm:min-h-0 sm:px-2.5 sm:py-1 sm:text-[11px]"
           >
             {confirmLabel}
           </button>

@@ -55,7 +55,7 @@ export function DiagnosticsModal({
         aria-modal="true"
         aria-label="Diagnostics"
       >
-        <div className="flex items-center justify-between border-b border-ink-800 px-5 py-3.5">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <div className="flex items-center gap-2">
             <HistoryIcon width={16} height={16} className="text-accent-soft" />
             <h2 className="text-[15px] font-semibold text-ink-100">Diagnostics</h2>
@@ -63,7 +63,7 @@ export function DiagnosticsModal({
           <div className="flex items-center gap-1">
             <button
               onClick={onRefresh}
-              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
               title="Refresh stats, context, usage, and checkpoints"
               aria-label="Refresh"
             >
@@ -71,7 +71,7 @@ export function DiagnosticsModal({
             </button>
             <button
               onClick={onClose}
-              className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+              className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
               aria-label="Close"
             >
               <XIcon width={16} height={16} />

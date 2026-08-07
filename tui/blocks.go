@@ -1615,14 +1615,23 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 			b := s.push(blkUser)
 			b.appendText(text)
 		case "assistant":
-			if r := contentText(msg["reasoning_content"]); strings.TrimSpace(r) != "" {
+			content := contentText(msg["content"])
+			reasoning := contentText(msg["reasoning_content"])
+			// MiniMax proxy sessions embed thinking in content as <think> tags.
+			if strings.TrimSpace(reasoning) == "" {
+				if thought, visible, ok := peelThinkTags(content); ok {
+					reasoning = thought
+					content = visible
+				}
+			}
+			if strings.TrimSpace(reasoning) != "" {
 				b := s.push(blkThinking)
-				b.appendText(r)
+				b.appendText(reasoning)
 			}
 			msg["reasoning_content"] = nil
-			if c := contentText(msg["content"]); strings.TrimSpace(c) != "" {
+			if strings.TrimSpace(content) != "" {
 				b := s.push(blkAssistant)
-				b.appendText(c)
+				b.appendText(content)
 				if s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 					b.model = s.models[s.modelIdx].ID
 				}
@@ -1672,6 +1681,36 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 		}
 	}
 	s.cur = nil
+}
+
+
+// peelThinkTags extracts a leading <think>…</think> block from MiniMax-style
+// assistant content. ok is false when no complete tag pair is present.
+func peelThinkTags(content string) (thought, visible string, ok bool) {
+	trimmed := strings.TrimLeft(content, " \t\r\n")
+	const open = "<think>"
+	const close = "</think>"
+	if !strings.HasPrefix(trimmed, open) {
+		return "", content, false
+	}
+	rest := trimmed[len(open):]
+	idx := strings.Index(rest, close)
+	if idx < 0 {
+		return "", content, false
+	}
+	thought = strings.TrimSpace(rest[:idx])
+	visible = rest[idx+len(close):]
+	// MiniMax proxy streams sometimes append bare extra closing tags.
+	for {
+		v := strings.TrimLeft(visible, " \t\r\n")
+		if !strings.HasPrefix(v, close) {
+			visible = v
+			break
+		}
+		visible = v[len(close):]
+	}
+	visible = strings.TrimLeft(visible, " \t\r\n")
+	return thought, visible, true
 }
 
 // contentText extracts displayable text from a message content field, which may

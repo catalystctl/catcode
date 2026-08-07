@@ -189,24 +189,24 @@ pub(crate) fn fallback_models() -> Vec<ModelInfo> {
             ..Default::default()
         },
         ModelInfo {
-            id: "umans-glm-5.1".into(),
-            name: "Umans GLM 5.1".into(),
+            id: "umans-glm-5.2".into(),
+            name: "Umans GLM 5.2".into(),
             reasoning: true,
-            context_window: 202752,
-            max_tokens: 131072,
-            thinking_levels: vec!["high".to_string()],
+            context_window: 1_000_000,
+            max_tokens: 131_072,
+            thinking_levels: vec!["high".to_string(), "max".to_string()],
             vision: false,
 
             ..Default::default()
         },
         ModelInfo {
-            id: "umans-glm-5.2".into(),
-            name: "Umans GLM 5.2".into(),
+            id: "umans-minimax-m3".into(),
+            name: "Umans MiniMax M3".into(),
             reasoning: true,
-            context_window: 413696,
-            max_tokens: 131072,
-            thinking_levels: vec!["high".to_string()],
-            vision: false,
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            thinking_levels: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+            vision: true,
 
             ..Default::default()
         },
@@ -1365,11 +1365,13 @@ fn endpoint_host(base_url: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// True if the base URL points at the Kimi (Moonshot) Code endpoint
-/// (`https://api.kimi.com/coding/v1`). Used to route discovery through the
-/// curated `kimi_model_caps` table + live `/models` list.
+/// True if the base URL points at a Kimi / Moonshot endpoint
+/// (`api.kimi.com` coding subscription or `api.moonshot.ai` platform API).
+/// Used to route discovery through the curated `kimi_model_caps` table + live
+/// `/models` list. Must stay aligned with `crate::provider::is_kimi`.
 pub fn is_kimi(base_url: &str) -> bool {
-    endpoint_host(base_url) == "api.kimi.com"
+    let host = endpoint_host(base_url);
+    host == "api.kimi.com" || host == "api.moonshot.ai"
 }
 
 /// True if the base URL points at DeepSeek's official API. The endpoint uses
@@ -1397,33 +1399,23 @@ pub fn is_deepseek(base_url: &str) -> bool {
 /// drives the harness's compaction threshold, so an accurate value keeps
 /// compaction from firing far too early on the million-token models.
 ///
-/// Reasoning: for Anthropic-served models (MiniMax/Qwen, per
-/// [`opencode_go_model_protocol`]), `thinking_levels` is set to
-/// `["low", "medium", "high"]` which enables the standard Anthropic
-/// `thinking` block (budgets: 4 096 / 12 288 / 24 576 tokens, clamped below
-/// `max_tokens`). The block is only sent when the user picks an effort >
-/// "none". For OpenAI-served models (GLM / Kimi / DeepSeek / MiMo),
-/// reasoning stays false + levels empty — the OpenAI path only sends
-/// `reasoning_effort` for Umans endpoints, and opencode-go is not Umans.
-/// For ids not in the table (a model the registry hasn't indexed), fall back
-/// to conservative flat defaults.
+/// Reasoning: OpenCode Go is a multi-vendor proxy, not the first-party
+/// MiniMax/Kimi/Zhipu hosts. The OpenAI request builder only emits vendor
+/// thinking fields on those exact hosts, so OpenAI-served OpenCode Go models
+/// advertise `reasoning: false` + empty levels (honest: levels would not reach
+/// the wire). Anthropic-served MiniMax/Qwen still get thinking levels because
+/// `build_anthropic_request` emits the standard Anthropic thinking block; the
+/// MiniMax adaptive rewrite applies only when the base URL is a MiniMax host.
+/// Context/max/vision come from official model docs via [`opencode_go_caps`].
 fn opencode_go_model_caps(id: &str, name: &str) -> ModelInfo {
     let (context_window, max_tokens, vision) =
         opencode_go_caps(id).unwrap_or((200_000, 8_192, false));
-    let reasoning;
-    let thinking_levels;
-    if opencode_go_model_protocol(id) == Some(false) {
-        // Anthropic-served models: enable extended thinking via the standard
-        // Anthropic `thinking` block. Budgets: low=4096, medium=12288, high=24576
-        // (capped below max_tokens by anthropic_thinking_budget).
-        reasoning = true;
-        thinking_levels = vec!["low".into(), "medium".into(), "high".into()];
+    let (reasoning, thinking_levels) = if opencode_go_model_protocol(id) == Some(false) {
+        // Anthropic-served models (MiniMax/Qwen): standard Anthropic thinking.
+        (true, vec!["low".into(), "medium".into(), "high".into()])
     } else {
-        // OpenAI-served models: reasoning_effort is only sent for Umans
-        // endpoints (opencode-go is not Umans), so no reasoning.
-        reasoning = false;
-        thinking_levels = Vec::new();
-    }
+        (false, Vec::new())
+    };
     ModelInfo {
         id: id.to_string(),
         name: name.to_string(),
@@ -1450,19 +1442,23 @@ fn opencode_go_caps(id: &str) -> Option<(u32, u32, bool)> {
         // OpenAI-compatible /v1/chat/completions (zhipu / moonshot / deepseek / xiaomi)
         "glm-5.2" => (1_000_000, 131_072, false),
         "glm-5.1" => (200_000, 131_072, false),
-        // max_tokens must stay strictly below context_window (sanitize would
-        // otherwise rewrite equal pairs to 3/4 context). 32k output matches
-        // the Kimi-for-coding curated budget and leaves prompt headroom.
+        "glm-5-turbo" => (200_000, 131_072, false),
+        // Official Kimi K3 is 1M/128K with low/high/max effort. Keep output under
+        // context so sanitize does not rewrite equal pairs.
+        "kimi-k3" => (1_048_576, 131_072, true),
         "kimi-k2.7-code" => (262_144, 32_768, true),
+        "kimi-k2.7-code-highspeed" => (262_144, 32_768, true),
         "kimi-k2.6" => (262_144, 32_768, true),
         "deepseek-v4-pro" => (1_000_000, 384_000, false),
         "deepseek-v4-flash" => (1_000_000, 384_000, false),
         "mimo-v2.5" => (1_048_576, 131_072, true),
         "mimo-v2.5-pro" => (1_048_576, 131_072, false),
-        // Anthropic /v1/messages (minimax / alibaba)
-        "minimax-m3" => (512_000, 128_000, true),
+        // Anthropic /v1/messages (minimax / alibaba). Official MiniMax-M3 is 1M.
+        "minimax-m3" => (1_000_000, 128_000, true),
         "minimax-m2.7" => (204_800, 131_072, false),
+        "minimax-m2.7-highspeed" => (204_800, 131_072, false),
         "minimax-m2.5" => (204_800, 131_072, false),
+        "minimax-m2.5-highspeed" => (204_800, 131_072, false),
         "qwen3.7-max" => (1_000_000, 65_536, false),
         "qwen3.7-plus" => (1_000_000, 64_000, true),
         "qwen3.6-plus" => (1_000_000, 65_536, true),
@@ -1481,7 +1477,10 @@ fn opencode_go_known_models() -> &'static [(&'static str, &'static str)] {
         // OpenAI-compatible /v1/chat/completions
         ("glm-5.2", "GLM-5.2"),
         ("glm-5.1", "GLM-5.1"),
+        ("glm-5-turbo", "GLM-5-Turbo"),
+        ("kimi-k3", "Kimi K3"),
         ("kimi-k2.7-code", "Kimi K2.7 Code"),
+        ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed"),
         ("kimi-k2.6", "Kimi K2.6"),
         ("deepseek-v4-pro", "DeepSeek V4 Pro"),
         ("deepseek-v4-flash", "DeepSeek V4 Flash"),
@@ -1490,7 +1489,9 @@ fn opencode_go_known_models() -> &'static [(&'static str, &'static str)] {
         // Anthropic /v1/messages
         ("minimax-m3", "MiniMax M3"),
         ("minimax-m2.7", "MiniMax M2.7"),
+        ("minimax-m2.7-highspeed", "MiniMax M2.7 Highspeed"),
         ("minimax-m2.5", "MiniMax M2.5"),
+        ("minimax-m2.5-highspeed", "MiniMax M2.5 Highspeed"),
         ("qwen3.7-max", "Qwen3.7 Max"),
         ("qwen3.7-plus", "Qwen3.7 Plus"),
         ("qwen3.6-plus", "Qwen3.6 Plus"),
@@ -1733,29 +1734,51 @@ fn kimi_parse_models_list(data: &Value) -> Vec<ModelInfo> {
 /// is authoritative for the id list (auto-update); this supplies the display
 /// name + offline fallback.
 fn kimi_known_models() -> &'static [(&'static str, &'static str)] {
-    &[("kimi-for-coding", "Kimi for Coding")]
+    &[
+        ("kimi-k3", "Kimi K3"),
+        ("kimi-k2.7-code", "Kimi K2.7 Code"),
+        ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed"),
+        ("kimi-k2.6", "Kimi K2.6"),
+        ("kimi-for-coding", "Kimi for Coding"),
+    ]
 }
 
-/// Capabilities for a Kimi (Moonshot) Code model id. `kimi-for-coding`
-/// (256K context, dual thinking + vision) is curated; unknown ids (a new Kimi
-/// release the table hasn't caught up to) fall back to conservative defaults
-/// that still advertise reasoning + vision so thinking/image turns aren't
-/// silently disabled. Thinking levels are `[low, medium, high]` — Kimi's
-/// supported `reasoning_effort` values (per the official `kimi` CLI).
+/// Capabilities for a Kimi (Moonshot) model id. K3 is 1M context with low/high/max
+/// effort; coding models keep Preserved Thinking always-on semantics.
 fn kimi_model_caps(id: &str, name: &str) -> ModelInfo {
     let l = id.to_ascii_lowercase();
-    let (context_window, max_tokens, vision) = if l.contains("kimi-for-coding") {
-        (262_144, 32_000, true)
-    } else {
-        (200_000, 8_192, true)
-    };
+    let (context_window, max_tokens, vision, thinking_levels) =
+        if l == "kimi-k3" || l.starts_with("kimi-k3-") {
+            (
+                1_048_576,
+                131_072,
+                true,
+                vec!["low".into(), "high".into(), "max".into()],
+            )
+        } else if l.contains("k2.7-code") || l.contains("for-coding") {
+            (262_144, 32_768, true, Vec::new())
+        } else if l.contains("k2.6") || l.contains("k2.5") {
+            (
+                262_144,
+                32_768,
+                true,
+                vec!["low".into(), "medium".into(), "high".into()],
+            )
+        } else {
+            (
+                200_000,
+                8_192,
+                true,
+                vec!["low".into(), "high".into(), "max".into()],
+            )
+        };
     ModelInfo {
         id: id.to_string(),
         name: name.to_string(),
         reasoning: true,
         context_window,
         max_tokens,
-        thinking_levels: vec!["low".into(), "medium".into(), "high".into()],
+        thinking_levels,
         vision,
         ..Default::default()
     }
@@ -2026,27 +2049,34 @@ mod tests {
         assert!(is_kimi("https://api.kimi.com/coding/v1"));
         assert!(is_kimi("https://api.kimi.com/v1"));
         assert!(is_kimi("https://api.kimi.com:443/coding/v1"));
+        assert!(is_kimi("https://api.moonshot.ai/v1"));
         assert!(!is_kimi("https://api.openai.com/v1"));
         // look-alike host must NOT match
         assert!(!is_kimi("https://api.kimi.com.evil.com/v1"));
+        assert!(!is_kimi("https://evil.moonshot.ai/v1"));
     }
-
     #[test]
     fn kimi_model_caps_known_and_unknown() {
         let m = kimi_model_caps("kimi-for-coding", "Kimi for Coding");
         assert_eq!(m.id, "kimi-for-coding");
         assert_eq!(m.context_window, 262_144);
-        assert_eq!(m.max_tokens, 32_000);
+        assert_eq!(m.max_tokens, 32_768);
         assert!(m.reasoning);
         assert!(m.vision);
-        assert_eq!(m.thinking_levels, vec!["low", "medium", "high"]);
+        // Coding models: always-on thinking; no selectable effort levels.
+        assert!(m.thinking_levels.is_empty());
+
+        let k3 = kimi_model_caps("kimi-k3", "Kimi K3");
+        assert_eq!(k3.context_window, 1_048_576);
+        assert_eq!(k3.max_tokens, 131_072);
+        assert_eq!(k3.thinking_levels, vec!["low", "high", "max"]);
 
         // Unknown id → conservative defaults (still reasoning + vision so
         // thinking/image turns aren't silently disabled on a new release).
         let u = kimi_model_caps("kimi-future-99", "Kimi Future 99");
         assert!(u.reasoning);
         assert!(u.vision);
-        assert_eq!(u.thinking_levels, vec!["low", "medium", "high"]);
+        assert_eq!(u.thinking_levels, vec!["low", "high", "max"]);
     }
 
     #[test]
@@ -2069,8 +2099,17 @@ mod tests {
     #[test]
     fn kimi_fallback_models_curated() {
         let models = kimi_fallback_models();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "kimi-for-coding");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "kimi-k3",
+                "kimi-k2.7-code",
+                "kimi-k2.7-code-highspeed",
+                "kimi-k2.6",
+                "kimi-for-coding",
+            ]
+        );
     }
 
     #[test]

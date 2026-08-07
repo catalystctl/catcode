@@ -337,6 +337,60 @@ impl Message {
             }
         )
     }
+
+    /// If assistant `content` embeds MiniMax-style `<think>…</think>` and no
+    /// separate `thinking` field is set, peel the tag into `thinking` and leave
+    /// only the visible answer in `content`. Idempotent. Used on session load
+    /// so older proxy sessions (thinking stuck in content) render correctly and
+    /// multi-turn replay can re-embed cleanly.
+    pub fn normalize_embedded_thinking(&mut self) {
+        let Message::Assistant {
+            content,
+            thinking,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if thinking.as_ref().is_some_and(|t| !t.is_empty()) {
+            return;
+        }
+        let Some(raw) = content.as_deref() else {
+            return;
+        };
+        if let Some((thought, visible)) = peel_think_tags(raw) {
+            *thinking = if thought.is_empty() {
+                None
+            } else {
+                Some(thought)
+            };
+            *content = if visible.is_empty() {
+                None
+            } else {
+                Some(visible)
+            };
+        }
+    }
+}
+
+/// Peel a leading `<think>…</think>` block from assistant content.
+/// Returns `(thinking, visible_content)` when a complete open tag is present.
+pub fn peel_think_tags(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim_start();
+    let rest = trimmed.strip_prefix("<think>")?;
+    let close = rest.find("</think>")?;
+    let thought = rest[..close].trim().to_string();
+    // Drop repeated/stray closing tags some MiniMax proxy streams append.
+    let mut visible = rest[close + "</think>".len()..].to_string();
+    while let Some(v) = visible
+        .trim_start()
+        .strip_prefix("</think>")
+        .map(|s| s.to_string())
+    {
+        visible = v;
+    }
+    let visible = visible.trim_start().to_string();
+    Some((thought, visible))
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +876,33 @@ mod tests {
         assert_eq!(v["reasoning_content"], "let me think...");
         assert_eq!(v["content"], "ok");
     }
+
+    #[test]
+    fn normalize_embedded_thinking_peels_minimax_tags() {
+        let mut msg = Message::try_from(&json!({
+            "role": "assistant",
+            "content": "<think>\nstep one\n</think>\n\n## Answer\nHi"
+        }))
+        .unwrap();
+        msg.normalize_embedded_thinking();
+        assert_eq!(msg.thinking(), Some("step one"));
+        assert_eq!(msg.content_text(), Some("## Answer\nHi"));
+        // Idempotent.
+        msg.normalize_embedded_thinking();
+        assert_eq!(msg.thinking(), Some("step one"));
+        assert_eq!(msg.content_text(), Some("## Answer\nHi"));
+        // Existing reasoning_content wins.
+        let mut kept = Message::try_from(&json!({
+            "role": "assistant",
+            "content": "<think>\nignored\n</think>\nvisible",
+            "reasoning_content": "already set"
+        }))
+        .unwrap();
+        kept.normalize_embedded_thinking();
+        assert_eq!(kept.thinking(), Some("already set"));
+        assert!(kept.content_text().unwrap().contains("<think>"));
+    }
+
 
     #[test]
     fn anthropic_request_builds_from_messages() {

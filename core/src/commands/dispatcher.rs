@@ -388,10 +388,90 @@ pub(crate) async fn run() {
         });
     }
 
+    const MAX_COMMAND_BYTES: usize = 8 * 1024 * 1024;
     let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
+    let mut command_bytes = Vec::new();
+    let mut discarding_oversized = false;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    'commands: loop {
+        let line = loop {
+            let available = match reader.fill_buf().await {
+                Ok(bytes) if bytes.is_empty() => {
+                    if discarding_oversized || command_bytes.is_empty() {
+                        break 'commands;
+                    }
+                    match String::from_utf8(std::mem::take(&mut command_bytes)) {
+                        Ok(line) => break line,
+                        Err(e) => {
+                            emit(
+                                &Event::new("error")
+                                    .with("code", json!("invalid_command"))
+                                    .with(
+                                        "message",
+                                        json!(format!("command is not valid UTF-8: {e}")),
+                                    ),
+                            );
+                            break 'commands;
+                        }
+                    }
+                }
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    emit(
+                        &Event::new("error")
+                            .with("code", json!("protocol_read_error"))
+                            .with("message", json!(format!("stdin read failed: {e}"))),
+                    );
+                    break 'commands;
+                }
+            };
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |pos| pos + 1);
+
+            if discarding_oversized {
+                reader.consume(consumed);
+                if newline.is_some() {
+                    discarding_oversized = false;
+                }
+                continue;
+            }
+            if command_bytes.len().saturating_add(consumed) > MAX_COMMAND_BYTES {
+                command_bytes.clear();
+                discarding_oversized = newline.is_none();
+                reader.consume(consumed);
+                emit(
+                    &Event::new("error")
+                        .with("code", json!("invalid_command"))
+                        .with(
+                            "message",
+                            json!(format!("command exceeds {MAX_COMMAND_BYTES} byte limit")),
+                        ),
+                );
+                continue;
+            }
+            command_bytes.extend_from_slice(&available[..consumed]);
+            reader.consume(consumed);
+            if newline.is_none() {
+                continue;
+            }
+            while command_bytes
+                .last()
+                .is_some_and(|b| matches!(b, b'\n' | b'\r'))
+            {
+                command_bytes.pop();
+            }
+            match String::from_utf8(std::mem::take(&mut command_bytes)) {
+                Ok(line) => break line,
+                Err(e) => {
+                    emit(
+                        &Event::new("error")
+                            .with("code", json!("invalid_command"))
+                            .with("message", json!(format!("command is not valid UTF-8: {e}"))),
+                    );
+                }
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1305,6 +1385,31 @@ pub(crate) async fn run() {
                             out_val = json!(b);
                         }
                     }
+                    "advisor.enabled" => {
+                        if let Some(b) = as_bool(&value) {
+                            cfg.advisor.enabled = b;
+                            out_val = json!(b);
+                        }
+                    }
+                    "advisor.subagents" => {
+                        if let Some(b) = as_bool(&value) {
+                            cfg.advisor.subagents = b;
+                            out_val = json!(b);
+                        }
+                    }
+                    "advisor.model" => {
+                        if let Some(s) = value.as_str() {
+                            cfg.advisor.model = (!s.trim().is_empty()).then(|| s.to_string());
+                            out_val = json!(cfg.advisor.model);
+                        }
+                    }
+                    "advisor.subagent_model" => {
+                        if let Some(s) = value.as_str() {
+                            cfg.advisor.subagent_model =
+                                (!s.trim().is_empty()).then(|| s.to_string());
+                            out_val = json!(cfg.advisor.subagent_model);
+                        }
+                    }
                     "sandbox" => {
                         let mode = value.as_str().map(String::from).or_else(|| {
                             value
@@ -2183,18 +2288,30 @@ pub(crate) async fn run() {
                     }
                 }
             }
-            Command::RemovePlugin { name } => {
-                let _ = state.plugin_manager.remove(&name);
-                emit(&Event::new("plugin_removed").with("name", json!(name)));
-            }
-            Command::EnablePlugin { name } => {
-                let _ = state.plugin_manager.enable(&name);
-                emit(&Event::new("plugin_enabled").with("name", json!(name)));
-            }
-            Command::DisablePlugin { name } => {
-                let _ = state.plugin_manager.disable(&name);
-                emit(&Event::new("plugin_disabled").with("name", json!(name)));
-            }
+            Command::RemovePlugin { name } => match state.plugin_manager.remove(&name) {
+                Ok(()) => emit(&Event::new("plugin_removed").with("name", json!(name))),
+                Err(e) => emit(
+                    &Event::new("plugin_error")
+                        .with("name", json!(name))
+                        .with("message", json!(e)),
+                ),
+            },
+            Command::EnablePlugin { name } => match state.plugin_manager.enable(&name) {
+                Ok(()) => emit(&Event::new("plugin_enabled").with("name", json!(name))),
+                Err(e) => emit(
+                    &Event::new("plugin_error")
+                        .with("name", json!(name))
+                        .with("message", json!(e)),
+                ),
+            },
+            Command::DisablePlugin { name } => match state.plugin_manager.disable(&name) {
+                Ok(()) => emit(&Event::new("plugin_disabled").with("name", json!(name))),
+                Err(e) => emit(
+                    &Event::new("plugin_error")
+                        .with("name", json!(name))
+                        .with("message", json!(e)),
+                ),
+            },
             Command::ListPlugins => {
                 let plugins = state.plugin_manager.list();
                 let mut entries: Vec<Value> = plugins

@@ -135,7 +135,7 @@ function PasskeyManager({
             </div>
             <button
               onClick={() => deletePasskey(pk.id)}
-              className="rounded-sm px-2 py-1 text-[11px] text-ink-500 hover:bg-ink-800 hover:text-danger"
+              className="focus-ring min-h-11 rounded-sm px-2 py-1.5 text-[11px] text-ink-500 transition-colors hover:bg-ink-800 hover:text-danger sm:min-h-0"
             >
               Remove
             </button>

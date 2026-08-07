@@ -91,3 +91,25 @@ func TestNewSessionFilename_UniqueAndReadable(t *testing.T) {
 		t.Fatalf("newSessionFilename not producing unique names across calls: %q", a)
 	}
 }
+
+func TestNewWhileBusyEmitsNewSessionCommand(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	proj := filepath.Join(tmp, "project")
+	if err := os.MkdirAll(proj, 0700); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, proj)
+	if err := os.MkdirAll(sessionsDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	s := initialSession()
+	s.ready = true
+	s.busy = true
+	wireCoreStub(s)
+
+	s.handleUserLine("/new")
+	if got := sentType(s); got != "new_session" {
+		t.Fatalf("/new while busy emitted %q, want new_session", got)
+	}
+}

@@ -36,11 +36,11 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
         aria-modal="true"
         aria-labelledby="help-modal-title"
       >
-        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+        <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-5 py-3.5">
           <h2 id="help-modal-title" className="text-[15px] font-semibold text-ink-100">Help & Keybindings</h2>
           <button
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-11 w-11 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:h-7 sm:w-7"
             aria-label="Close"
           >
             <XIcon width={16} height={16} />
@@ -55,7 +55,7 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
               {KEYBINDS.map(([key, desc]) => (
                 <div key={key} className="flex items-center gap-2 text-[12px]">
-                  <kbd className="shrink-0 rounded-sm bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
+                  <kbd className="shrink-0 rounded-sm border border-ink-700 bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
                     {key}
                   </kbd>
                   <span className="text-ink-400">{desc}</span>

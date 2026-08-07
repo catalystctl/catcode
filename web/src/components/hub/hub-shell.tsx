@@ -471,7 +471,7 @@ export function HubShell() {
     <IdeContext.Provider value={ideValue}>
       <div className="flex h-[100dvh] w-full flex-col overflow-hidden bg-ink-950 text-ink-100">
         {/* ── Top bar: brand + project tabs + actions ─────────────────────── */}
-        <header className="flex h-12 shrink-0 items-center gap-1 border-b border-ink-800/90 bg-ink-925/95 px-2 backdrop-blur-sm">
+        <header className="flex h-11 shrink-0 items-center gap-1 border-b border-ink-800 bg-ink-900 px-2">
           <div className="flex items-center gap-2 px-1.5">
             <BrandMark size={18} />
             <span className="hidden font-display text-[13px] font-semibold tracking-tight text-ink-100 sm:inline">
@@ -479,10 +479,10 @@ export function HubShell() {
             </span>
           </div>
 
-          <div className="mx-1 h-5 w-px bg-ink-800/80" aria-hidden />
+          <div className="mx-1 h-5 w-px bg-ink-800" aria-hidden />
 
-          {/* Project tabs */}
-          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+          {/* Project tabs — structural rails mark the active project */}
+          <div className="flex min-w-0 flex-1 items-center gap-0 overflow-x-auto">
             {hub.tabPaths.map((path, i) => {
               const active = path === activePath;
               const label = hub.names[path] ?? pathBasename(path);
@@ -496,18 +496,18 @@ export function HubShell() {
                   key={path}
                   type="button"
                   onClick={() => selectTab(path)}
-                  className={`group relative flex max-w-[12rem] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                  className={`group relative flex max-w-[12rem] items-center gap-1.5 border-b-2 px-2.5 py-2 text-left text-[12px] transition-colors ${
                     active
-                      ? "bg-ink-850 text-ink-100 shadow-[inset_0_0_0_1px_rgb(var(--ink-700)/0.5)]"
-                      : "text-ink-400 hover:bg-ink-900/80 hover:text-ink-200"
+                      ? "border-accent bg-ink-850 text-ink-100"
+                      : "border-transparent text-ink-400 hover:bg-ink-850 hover:text-ink-200"
                   }`}
                   title={`${label}\n${path}${i < 9 ? `\n⌘${i + 1}` : ""}`}
                 >
-                  <FolderIcon width={12} height={12} className="shrink-0 opacity-70" />
+                  <FolderIcon width={12} height={12} className={`shrink-0 ${active ? "text-accent-soft" : "text-ink-500"}`} />
                   <span className="min-w-0 truncate font-medium">{label}</span>
                   {live && (
                     <span
-                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent shadow-[0_0_6px_rgb(var(--accent)/0.8)]"
+                      className="h-1.5 w-1.5 shrink-0 rounded-none bg-accent"
                       title="Live session activity"
                     />
                   )}
@@ -518,7 +518,7 @@ export function HubShell() {
                       e.stopPropagation();
                       closeTab(path);
                     }}
-                    className={`rounded-md p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-200 ${
+                    className={`rounded-sm p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-200 ${
                       isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100"
                     }`}
                     aria-label={`Close ${label}`}
@@ -532,7 +532,7 @@ export function HubShell() {
               type="button"
               onClick={() => setSwitcherOpen(true)}
               disabled={switching}
-              className="focus-ring ml-0.5 flex h-8 w-8 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-ink-900 hover:text-ink-200 disabled:opacity-50"
+              className="focus-ring ml-0.5 flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-200 disabled:opacity-50 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
               title="Open project"
               aria-label="Open project"
             >
@@ -548,10 +548,10 @@ export function HubShell() {
                 if (isMobile) setMobileGitOpen((o) => !o);
                 else setHub((p) => ({ ...p, gitOpen: !p.gitOpen }));
               }}
-              className={`flex h-7 items-center gap-1.5 rounded-sm px-2 text-[11px] transition-colors ${
+              className={`flex h-8 items-center gap-1.5 rounded-sm border-l-2 px-2 text-[11px] font-mono uppercase tracking-wider transition-colors [@media(pointer:coarse)]:h-11 ${
                 gitOpenDesktop || showGitDrawer
-                  ? "bg-ink-850 text-ink-100"
-                  : "text-ink-500 hover:bg-ink-900 hover:text-ink-200"
+                  ? "border-accent bg-ink-850 text-ink-100"
+                  : "border-transparent text-ink-500 hover:bg-ink-850 hover:text-ink-200"
               }`}
               title="Source control"
               aria-label="Toggle git panel"
@@ -565,7 +565,7 @@ export function HubShell() {
               <button
                 type="button"
                 onClick={() => setMenuOpen((o) => !o)}
-                className="flex h-7 w-7 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-900 hover:text-ink-200"
+                className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                 aria-label="Account menu"
                 aria-expanded={menuOpen}
               >
@@ -573,13 +573,13 @@ export function HubShell() {
               </button>
               {menuOpen && (
                 <div
-                  className="absolute right-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-md border border-ink-750 bg-ink-900 py-1 shadow-elev-2"
+                  className="absolute right-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-sm border border-ink-700 bg-ink-900 py-1 shadow-elev-2"
                   role="menu"
                 >
                   <button
                     type="button"
                     role="menuitem"
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850"
+                    className="flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-left text-[12px] text-ink-200 hover:border-accent hover:bg-ink-850"
                     onClick={() => {
                       setMenuOpen(false);
                       setSettingsOpen(true);
@@ -591,7 +591,7 @@ export function HubShell() {
                     type="button"
                     role="menuitem"
                     disabled={signingOut}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850 disabled:opacity-50"
+                    className="flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-left text-[12px] text-ink-200 hover:border-accent hover:bg-ink-850 disabled:opacity-50"
                     onClick={() => {
                       setMenuOpen(false);
                       void onSignOut();
@@ -606,7 +606,7 @@ export function HubShell() {
         </header>
 
         {projectsError && (
-          <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-1.5 font-mono text-[11px] text-danger">
+          <div className="shrink-0 border-b border-danger/40 bg-ink-925 px-3 py-1.5 font-mono text-[11px] text-danger">
             {projectsError}
           </div>
         )}
@@ -631,10 +631,10 @@ export function HubShell() {
                 aria-orientation="vertical"
                 aria-label="Resize git panel"
                 onPointerDown={onGitResizeStart}
-                className="w-1.5 shrink-0 cursor-col-resize touch-none bg-transparent hover:bg-accent/30 active:bg-accent/50"
+                className="w-1.5 shrink-0 cursor-col-resize touch-none bg-transparent hover:bg-ink-800 active:bg-ink-750"
               />
               <aside
-                className="flex min-h-0 shrink-0 flex-col border-l border-ink-800/80 bg-ink-925"
+                className="flex min-h-0 shrink-0 flex-col border-l border-ink-800 bg-ink-925"
                 style={{ width: hub.gitWidth }}
               >
                 <ErrorBoundary label="git">
@@ -648,25 +648,25 @@ export function HubShell() {
           {showGitDrawer && activePath && (
             <>
               <div
-                className="absolute inset-0 z-40 bg-black/50"
+                className="absolute inset-0 z-40 bg-ink-950/70"
                 onClick={() => setMobileGitOpen(false)}
                 aria-hidden
               />
               <aside
                 ref={mergeRefs(mobileGitCloseRef, mobileGitTrapRef)}
-                className="absolute inset-y-0 right-0 z-50 flex w-[min(100%,22rem)] flex-col border-l border-ink-800 bg-ink-925 shadow-elev-2"
+                className="absolute inset-y-0 right-0 z-50 flex w-[min(100%,22rem)] flex-col border-l border-ink-800 bg-ink-900 shadow-elev-2"
                 role="dialog"
                 aria-modal="true"
                 aria-label="Source control"
               >
-                <div className="flex h-10 items-center justify-between border-b border-ink-800 px-3">
-                  <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">
+                <div className="flex h-10 items-center justify-between border-b border-ink-800 bg-ink-900 px-3">
+                  <span className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-ink-500">
                     Source Control
                   </span>
                   <button
                     type="button"
                     onClick={() => setMobileGitOpen(false)}
-                    className="rounded p-1 text-ink-500 hover:bg-ink-850 hover:text-ink-100"
+                    className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                     aria-label="Close git panel"
                   >
                     <XIcon width={14} height={14} />
@@ -756,7 +756,7 @@ function EmptyHub({ onOpenProject }: { onOpenProject: () => void }) {
         <button
           type="button"
           onClick={onOpenProject}
-          className="focus-ring mt-6 inline-flex items-center gap-2 rounded-md bg-accent px-3.5 py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft"
+          className="focus-ring mt-6 inline-flex min-h-11 items-center gap-2 rounded-sm bg-accent px-3.5 py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft"
         >
           <FolderPlusIcon width={15} height={15} />
           Open project

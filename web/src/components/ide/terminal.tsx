@@ -506,10 +506,11 @@ export function Terminal({
         cursorBlink: true,
         scrollback: 10000,
         theme: {
-          background: "#080a0f",
-          foreground: "#d6d9e0",
-          cursor: "#a78bfa",
-          selectionBackground: "#3b4261",
+          // Ink tokens (dark execution-register): ground / body / ember / raised selection
+          background: "#0e0f12",
+          foreground: "#d8dbe2",
+          cursor: "#d68e58",
+          selectionBackground: "#22252c",
         },
       });
       const fit = new ghostty.FitAddon();
@@ -776,7 +777,7 @@ export function Terminal({
 
   return (
     <div
-      className="relative h-full w-full overflow-hidden bg-[#080a0f]"
+      className="relative h-full w-full overflow-hidden bg-ink-950"
       onPointerDownCapture={() => {
         // Clicking the terminal surface must own the keyboard even if a sibling
         // pane or a previously focused hidden tab still held document focus.
@@ -793,7 +794,7 @@ export function Terminal({
       <div ref={containerRef} className="h-full w-full" />
       {connectionState !== "connected" ? (
         <div
-          className="pointer-events-none absolute right-2 top-2 rounded bg-ink-900/90 px-2 py-1 text-[11px] text-ink-300"
+          className="pointer-events-none absolute right-2 top-2 rounded-sm border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-[11px] text-ink-300"
           role="status"
         >
           {connectionState === "initializing"
@@ -881,10 +882,10 @@ export function TerminalPanel({
                 onSelect(s.id);
               }
             }}
-            className={`group flex cursor-pointer items-center gap-1 rounded-t px-2 py-1 text-xs ${
+            className={`group flex min-h-9 cursor-pointer items-center gap-1 rounded-t-sm px-2 py-1 font-mono text-[11px] ${
               s.id === activeId
                 ? "bg-ink-950 text-ink-100"
-                : "text-ink-400 hover:bg-ink-800/50 hover:text-ink-200"
+                : "text-ink-400 hover:bg-ink-800 hover:text-ink-200"
             }`}
             title={s.cwd}
           >
@@ -899,7 +900,7 @@ export function TerminalPanel({
                   if (e.key === "Enter") { e.preventDefault(); commitRename(); }
                   if (e.key === "Escape") { e.preventDefault(); setRenamingId(null); }
                 }}
-                className="w-24 rounded bg-ink-900 px-1 py-0.5 text-xs text-ink-100 outline-none ring-1 ring-accent/50"
+                className="w-24 rounded-sm border border-accent bg-ink-950 px-1 py-0.5 font-mono text-[11px] text-ink-100 outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 aria-label={`Rename ${s.title}`}
               />
             ) : (
@@ -922,7 +923,7 @@ export function TerminalPanel({
               }}
               title="Rename"
               aria-label={`Rename ${s.title}`}
-              className="ml-1 hidden rounded text-ink-500 hover:text-ink-100 sm:group-hover:inline-block"
+              className="ml-1 hidden rounded-sm px-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100 sm:group-hover:inline-block"
             >
               ✎
             </button>
@@ -940,7 +941,7 @@ export function TerminalPanel({
                   closeWithConfirm(s.id, s.title, s.alive);
                 }
               }}
-              className="ml-0.5 rounded text-ink-500 opacity-100 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
+              className="ml-0.5 rounded-sm px-0.5 text-ink-500 hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100"
               aria-label={`close ${s.title}`}
             >
               ×
@@ -950,7 +951,7 @@ export function TerminalPanel({
         <button
           type="button"
           onClick={onNew}
-          className="ml-auto min-h-9 px-3 py-1 text-ink-400 hover:text-ink-100"
+          className="ml-auto min-h-9 rounded-sm px-3 py-1 font-mono text-[12px] text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           title="New terminal"
           aria-label="new terminal"
         >
@@ -959,8 +960,8 @@ export function TerminalPanel({
       </div>
       {active ? (
         <div className="flex items-center gap-1 border-b border-ink-800 bg-ink-925 px-2 py-1">
-          <button type="button" onClick={() => onRestart(active.id)} title="Restart terminal" aria-label="Restart terminal" className="rounded px-2 py-0.5 text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100">Restart</button>
-          <button type="button" onClick={() => requestClear(active.id)} title="Clear terminal" aria-label="Clear terminal" className="rounded px-2 py-0.5 text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100">Clear</button>
+          <button type="button" onClick={() => onRestart(active.id)} title="Restart terminal" aria-label="Restart terminal" className="rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Restart</button>
+          <button type="button" onClick={() => requestClear(active.id)} title="Clear terminal" aria-label="Clear terminal" className="rounded-sm px-2 py-0.5 font-mono text-[11px] text-ink-400 hover:bg-ink-800 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Clear</button>
           <span className="ml-auto truncate font-mono text-[10px] text-ink-600" title={active.cwd}>{active.cwd || "workspace root"}</span>
         </div>
       ) : null}
@@ -985,7 +986,7 @@ export function TerminalPanel({
             <button
               type="button"
               onClick={() => onRestart(active.id)}
-              className="rounded border border-ink-700 px-3 py-1.5 text-ink-300 hover:bg-ink-800"
+              className="rounded-sm border border-ink-700 bg-ink-900 px-3 py-1.5 font-mono text-[12px] text-ink-300 hover:bg-ink-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               Restart terminal
             </button>
@@ -995,7 +996,7 @@ export function TerminalPanel({
             <button
               type="button"
               onClick={onNew}
-              className="rounded border border-ink-700 px-3 py-1.5 text-sm text-ink-300 hover:bg-ink-800"
+              className="rounded-sm border border-ink-700 bg-ink-900 px-3 py-1.5 font-mono text-[12px] text-ink-300 hover:bg-ink-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               Open a terminal
             </button>

@@ -35,7 +35,9 @@ fn now_secs() -> u64 {
 }
 
 fn new_id() -> String {
-    format!("cp-{}", now_secs())
+    use rand::Rng;
+    let random: u64 = rand::thread_rng().gen();
+    format!("cp-{}-{random:016x}", now_secs())
 }
 
 pub fn index_path(session_file: Option<&Path>, workspace: &Path) -> PathBuf {
@@ -54,20 +56,24 @@ fn checkpoints_dir(workspace: &Path) -> PathBuf {
     workspace.join(".catalyst-code").join("checkpoints")
 }
 
-fn append_index(index: &Path, meta: &CheckpointMeta) {
+fn append_index(index: &Path, meta: &CheckpointMeta) -> Result<(), String> {
     if let Some(parent) = index.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create checkpoint index parent {}: {e}", parent.display()))?;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(index)
-    {
-        use std::io::Write;
-        if let Ok(line) = serde_json::to_string(meta) {
-            let _ = writeln!(f, "{line}");
-        }
-    }
+        .map_err(|e| format!("open checkpoint index {}: {e}", index.display()))?;
+    use std::io::Write;
+    let line =
+        serde_json::to_string(meta).map_err(|e| format!("serialize checkpoint metadata: {e}"))?;
+    writeln!(f, "{line}")
+        .map_err(|e| format!("write checkpoint index {}: {e}", index.display()))?;
+    f.flush()
+        .map_err(|e| format!("flush checkpoint index {}: {e}", index.display()))?;
+    Ok(())
 }
 
 pub fn list(index: &Path) -> Vec<CheckpointMeta> {
@@ -109,7 +115,19 @@ pub fn create(
     } else {
         create_files(workspace, &id, label, paths, auto)?
     };
-    append_index(&index, &meta);
+    if let Err(e) = append_index(&index, &meta) {
+        match meta.kind.as_str() {
+            "git" => {
+                let refname = format!("refs/catcode/checkpoints/{}", meta.id);
+                let _ = git_out(workspace, &["update-ref", "-d", &refname]);
+            }
+            "files" => {
+                let _ = std::fs::remove_dir_all(checkpoints_dir(workspace).join(&meta.id));
+            }
+            _ => {}
+        }
+        return Err(e);
+    }
     emit(
         &Event::new("checkpoint_created")
             .with("id", json!(meta.id))
@@ -129,22 +147,67 @@ fn create_git(
     auto: bool,
 ) -> Result<CheckpointMeta, String> {
     let head = git_out(workspace, &["rev-parse", "HEAD"]).ok();
-    // Include untracked so new files are recoverable.
-    let _ = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(workspace)
-        .status();
-    let stash = git_out(workspace, &["stash", "create", label])?;
-    // Reset the index stage from `git add -A` without losing worktree changes.
-    let _ = Command::new("git")
-        .args(["reset", "-q"])
-        .current_dir(workspace)
-        .status();
+    // Build the checkpoint through a temporary index. `git add -A` is needed
+    // so `stash create` includes untracked files, but it must never mutate the
+    // user's real staging area — even if staging or stash creation fails.
+    let index_name = git_out(workspace, &["rev-parse", "--git-path", "index"])?;
+    let real_index = {
+        let path = PathBuf::from(index_name);
+        let joined = if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        };
+        if joined.exists() {
+            std::fs::canonicalize(&joined)
+                .map_err(|e| format!("canonicalize git index {}: {e}", joined.display()))?
+        } else {
+            let parent = joined
+                .parent()
+                .ok_or_else(|| "git index has no parent".to_string())?;
+            let canon_parent = std::fs::canonicalize(parent)
+                .map_err(|e| format!("canonicalize git index parent {}: {e}", parent.display()))?;
+            canon_parent.join(
+                joined
+                    .file_name()
+                    .ok_or_else(|| "git index has no filename".to_string())?,
+            )
+        }
+    };
+    let temp_index = crate::fsutil::unique_tmp(&real_index);
+    match std::fs::copy(&real_index, &temp_index) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("copy git index for checkpoint: {e}")),
+    }
+    let run_with_temp_index = |args: &[&str]| -> Result<String, String> {
+        let out = Command::new("git")
+            .args(args)
+            .env("GIT_INDEX_FILE", &temp_index)
+            .current_dir(workspace)
+            .output()
+            .map_err(|e| format!("git spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let result = (|| {
+        run_with_temp_index(&["add", "-A"])?;
+        run_with_temp_index(&["stash", "create", label])
+    })();
+    let cleanup = std::fs::remove_file(&temp_index);
+    if let Err(e) = cleanup {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("remove temporary checkpoint index: {e}"));
+        }
+    }
+    let stash = result?;
+    let refname = format!("refs/catcode/checkpoints/{id}");
     if stash.is_empty() {
         // Clean tree — still record a checkpoint anchored at HEAD.
-        let refname = format!("refs/catcode/checkpoints/{id}");
         if let Some(h) = &head {
-            let _ = git_out(workspace, &["update-ref", &refname, h]);
+            git_out(workspace, &["update-ref", &refname, h])?;
         }
         return Ok(CheckpointMeta {
             id: id.to_string(),
@@ -158,7 +221,6 @@ fn create_git(
             auto,
         });
     }
-    let refname = format!("refs/catcode/checkpoints/{id}");
     git_out(workspace, &["update-ref", &refname, &stash])?;
     Ok(CheckpointMeta {
         id: id.to_string(),
@@ -173,9 +235,19 @@ fn create_git(
     })
 }
 
-fn collect_paths(workspace: &Path, paths: &[String]) -> Vec<String> {
+fn collect_paths(workspace: &Path, paths: &[String]) -> Result<Vec<String>, String> {
     if !paths.is_empty() {
-        return paths.to_vec();
+        let canon_workspace =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let mut resolved = Vec::with_capacity(paths.len());
+        for input in paths {
+            let path = crate::workspace::resolve(workspace, input)?;
+            let rel = path
+                .strip_prefix(&canon_workspace)
+                .map_err(|_| format!("checkpoint path {input:?} resolves outside the workspace"))?;
+            resolved.push(rel.to_string_lossy().to_string());
+        }
+        return Ok(resolved);
     }
     // Walk a shallow tree of non-ignored files (cap for safety).
     let mut out = Vec::new();
@@ -187,8 +259,8 @@ fn collect_paths(workspace: &Path, paths: &[String]) -> Vec<String> {
         };
         for ent in rd.flatten() {
             seen += 1;
-            if seen > 5000 || out.len() > 2000 {
-                return out;
+            if seen > 5000 || out.len() >= 2000 {
+                return Ok(out);
             }
             let p = ent.path();
             let name = ent.file_name().to_string_lossy().to_string();
@@ -208,7 +280,7 @@ fn collect_paths(workspace: &Path, paths: &[String]) -> Vec<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn create_files(
@@ -220,7 +292,7 @@ fn create_files(
 ) -> Result<CheckpointMeta, String> {
     let dir = checkpoints_dir(workspace).join(id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir checkpoint: {e}"))?;
-    let rels = collect_paths(workspace, paths);
+    let rels = collect_paths(workspace, paths)?;
     let mut saved = Vec::new();
     for rel in &rels {
         let src = workspace.join(rel);
@@ -229,14 +301,21 @@ fn create_files(
         }
         let dest = dir.join(rel);
         if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create checkpoint parent {}: {e}", parent.display()))?;
         }
-        if std::fs::copy(&src, &dest).is_ok() {
-            saved.push(rel.clone());
-        }
+        std::fs::copy(&src, &dest).map_err(|e| {
+            format!(
+                "copy checkpoint source {} to {}: {e}",
+                src.display(),
+                dest.display()
+            )
+        })?;
+        saved.push(rel.clone());
     }
     let manifest = json!({ "paths": saved });
-    let _ = std::fs::write(dir.join("manifest.json"), manifest.to_string());
+    crate::fsutil::atomic_write_str(&dir.join("manifest.json"), &manifest.to_string())
+        .map_err(|e| format!("write checkpoint manifest: {e}"))?;
     Ok(CheckpointMeta {
         id: id.to_string(),
         label: label.to_string(),
@@ -252,6 +331,91 @@ fn create_files(
 
 /// Restore a checkpoint by id. Git: `git stash apply <sha>` (keeps ref).
 /// Files: copy snapshot contents back over the workspace.
+fn install_restored_files(
+    ready: Vec<(PathBuf, PathBuf)>,
+    fail_before: Option<usize>,
+) -> Result<(), String> {
+    let mut installed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for (index, (tmp, dest)) in ready.iter().enumerate() {
+        let result = (|| {
+            if fail_before == Some(index) {
+                return Err("injected restore install failure".to_string());
+            }
+            let backup = if dest.exists() {
+                if !dest.is_file() {
+                    return Err(format!(
+                        "restore destination {} is not a file",
+                        dest.display()
+                    ));
+                }
+                let backup = crate::fsutil::unique_tmp(dest);
+                std::fs::rename(dest, &backup)
+                    .map_err(|e| format!("backup restore destination {}: {e}", dest.display()))?;
+                Some(backup)
+            } else {
+                None
+            };
+            if let Err(e) = std::fs::rename(tmp, dest) {
+                let mut rollback = Vec::new();
+                if let Some(backup) = &backup {
+                    if let Err(restore_error) = std::fs::rename(backup, dest) {
+                        rollback.push(format!(
+                            "restore current backup {}: {restore_error}",
+                            backup.display()
+                        ));
+                    }
+                }
+                let primary = format!("install restored file {}: {e}", dest.display());
+                return Err(if rollback.is_empty() {
+                    primary
+                } else {
+                    format!("{primary}; rollback failed: {}", rollback.join("; "))
+                });
+            }
+            installed.push((dest.clone(), backup));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut rollback = Vec::new();
+            for (installed_dest, backup) in installed.into_iter().rev() {
+                if let Err(e) = std::fs::remove_file(&installed_dest) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        rollback.push(format!("remove {}: {e}", installed_dest.display()));
+                    }
+                }
+                if let Some(backup) = backup {
+                    if let Err(e) = std::fs::rename(&backup, &installed_dest) {
+                        rollback.push(format!(
+                            "restore backup {} to {}: {e}",
+                            backup.display(),
+                            installed_dest.display()
+                        ));
+                    }
+                }
+            }
+            for (pending, _) in &ready[index..] {
+                if let Err(e) = std::fs::remove_file(pending) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        rollback.push(format!("remove staged {}: {e}", pending.display()));
+                    }
+                }
+            }
+            return Err(if rollback.is_empty() {
+                error
+            } else {
+                format!("{error}; rollback failed: {}", rollback.join("; "))
+            });
+        }
+    }
+    for (_, backup) in installed {
+        if let Some(backup) = backup {
+            std::fs::remove_file(&backup)
+                .map_err(|e| format!("remove restore backup {}: {e}", backup.display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn restore(
     workspace: &Path,
     session_file: Option<&Path>,
@@ -280,26 +444,50 @@ pub fn restore(
                 }
             } else if let Some(head) = &meta.head_sha {
                 // Clean checkpoint — reset tracked files to HEAD at that time.
-                let _ = git_out(workspace, &["checkout", head, "--", "."]);
+                git_out(workspace, &["checkout", head, "--", "."])?;
             }
         }
         "files" => {
-            let dir = meta
-                .dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| checkpoints_dir(workspace).join(&meta.id));
-            for rel in &meta.paths {
-                let src = dir.join(rel);
-                let dest = workspace.join(rel);
-                if !src.is_file() {
-                    continue;
-                }
-                if let Some(parent) = dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::copy(&src, &dest);
+            let id_path = Path::new(&meta.id);
+            let mut id_components = id_path.components();
+            if !matches!(id_components.next(), Some(std::path::Component::Normal(_)))
+                || id_components.next().is_some()
+            {
+                return Err(format!("invalid checkpoint id {:?}", meta.id));
             }
+            let dir = checkpoints_dir(workspace).join(&meta.id);
+            let mut staged = Vec::with_capacity(meta.paths.len());
+            for rel in &meta.paths {
+                let src = crate::workspace::resolve(&dir, rel)?;
+                let dest = crate::workspace::resolve(workspace, rel)?;
+                if !src.is_file() {
+                    return Err(format!(
+                        "checkpoint source {} is missing or not a file",
+                        src.display()
+                    ));
+                }
+                staged.push((src, dest));
+            }
+            let mut ready = Vec::with_capacity(staged.len());
+            for (src, dest) in staged {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create restore parent {}: {e}", parent.display()))?;
+                }
+                let tmp = crate::fsutil::unique_tmp(&dest);
+                if let Err(e) = std::fs::copy(&src, &tmp) {
+                    for (pending, _) in &ready {
+                        let _ = std::fs::remove_file(pending);
+                    }
+                    return Err(format!(
+                        "stage checkpoint source {} for {}: {e}",
+                        src.display(),
+                        dest.display()
+                    ));
+                }
+                ready.push((tmp, dest));
+            }
+            install_restored_files(ready, None)?;
         }
         other => return Err(format!("unknown checkpoint kind '{other}'")),
     }
@@ -347,14 +535,185 @@ mod tests {
     }
 
     #[test]
-    fn new_id_has_cp_prefix() {
-        let id = new_id();
-        assert!(id.starts_with("cp-"), "id must start with cp-: {id}");
-        let suffix = id.strip_prefix("cp-").unwrap();
-        assert!(
-            suffix.parse::<u64>().is_ok(),
-            "suffix must be timestamp: {suffix}"
+    fn file_checkpoint_rejects_paths_outside_workspace() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-escape-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = create(&dir, None, "escape", &["../outside".into()], true).unwrap_err();
+        assert!(err.contains("workspace escape denied"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_create_reports_index_open_failure() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-index-fail-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let blocked_parent = dir.join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let session = blocked_parent.join("session.jsonl");
+        let err = create(
+            &dir,
+            Some(&session),
+            "index-failure",
+            &["a.txt".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("checkpoint index parent"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_checkpoint_restore_reports_missing_snapshot() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-missing-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let meta = create(&dir, None, "create", &["a.txt".into()], true).unwrap();
+        std::fs::remove_file(
+            dir.join(".catalyst-code/checkpoints")
+                .join(&meta.id)
+                .join("a.txt"),
+        )
+        .unwrap();
+        let err = restore(&dir, None, &meta.id).unwrap_err();
+        assert!(err.contains("missing or not a file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_restore_install_failure_rolls_back_all_destinations() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-install-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "current-a").unwrap();
+        std::fs::write(&b, "current-b").unwrap();
+        let tmp_a = crate::fsutil::unique_tmp(&a);
+        let tmp_b = crate::fsutil::unique_tmp(&b);
+        std::fs::write(&tmp_a, "snapshot-a").unwrap();
+        std::fs::write(&tmp_b, "snapshot-b").unwrap();
+
+        let err = install_restored_files(
+            vec![(tmp_a.clone(), a.clone()), (tmp_b.clone(), b.clone())],
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(err.contains("injected"), "{err}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "current-a");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "current-b");
+        assert!(!tmp_a.exists());
+        assert!(!tmp_b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_id_is_unique_and_has_cp_prefix() {
+        let first = new_id();
+        let second = new_id();
+        assert!(first.starts_with("cp-"), "id must start with cp-: {first}");
+        assert_ne!(
+            first, second,
+            "checkpoints created in one second must not collide"
         );
+    }
+
+    #[test]
+    fn file_restore_preflight_prevents_partial_restore() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-atomic-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "snapshot-a").unwrap();
+        std::fs::write(dir.join("b.txt"), "snapshot-b").unwrap();
+        let meta = create(
+            &dir,
+            None,
+            "atomic",
+            &["a.txt".into(), "b.txt".into()],
+            true,
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.txt"), "current-a").unwrap();
+        std::fs::write(dir.join("b.txt"), "current-b").unwrap();
+        std::fs::remove_file(
+            dir.join(".catalyst-code/checkpoints")
+                .join(&meta.id)
+                .join("b.txt"),
+        )
+        .unwrap();
+
+        assert!(restore(&dir, None, &meta.id).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "current-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "current-b"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_checkpoint_preserves_staging_state() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("catcode-cp-git-index-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "checkpoint@test.invalid"]);
+        git(&["config", "user.name", "Checkpoint Test"]);
+        std::fs::write(dir.join("staged.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("unstaged.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(dir.join("staged.txt"), "staged\n").unwrap();
+        git(&["add", "staged.txt"]);
+        std::fs::write(dir.join("unstaged.txt"), "unstaged\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "untracked\n").unwrap();
+
+        create(&dir, None, "preserve-index", &[], true).unwrap();
+
+        assert_eq!(git(&["diff", "--cached", "--name-only"]), "staged.txt");
+        assert_eq!(git(&["diff", "--name-only"]), "unstaged.txt");
+        assert!(git(&["status", "--porcelain"])
+            .lines()
+            .any(|line| line == "?? untracked.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

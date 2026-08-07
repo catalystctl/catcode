@@ -284,7 +284,8 @@ pub struct Config {
     // --- regex denylist upgrade (quick win) ---
     pub bash_deny_regex: Vec<String>, // regex patterns that block bash commands
     pub bash_deny_regex_compiled: Vec<regex::Regex>, // pre-compiled at startup
-    // --- subagent system (pi-subagents port) ---
+    // --- optional second-model advisor ---
+    pub advisor: AdvisorConfig,
     pub subagents: SubagentConfig,
     /// Task-aware model routing by agent role (scout→fast, worker→strong, …).
     pub routing: RoutingConfig,
@@ -304,6 +305,42 @@ pub struct Config {
     /// to config.json `search_keys`. Searched by `web_search` before the
     /// `EXA_API_KEY` / `TAVILY_API_KEY` env vars (so slash-command keys win).
     pub search_keys: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdvisorConfig {
+    pub enabled: bool,
+    pub subagents: bool,
+    pub model: Option<String>,
+    pub subagent_model: Option<String>,
+    pub nudge: bool,
+    /// Optional named watchdog roster. Loaded from WATCHDOG.yml files.
+    pub watchdog: Vec<WatchdogAdvisor>,
+    /// Shared WATCHDOG.yml instructions.
+    pub watchdog_instructions: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WatchdogAdvisor {
+    pub name: String,
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub tools: Vec<String>,
+    pub instructions: Option<String>,
+}
+
+impl Default for AdvisorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            subagents: false,
+            model: None,
+            subagent_model: None,
+            nudge: false,
+            watchdog: Vec::new(),
+            watchdog_instructions: None,
+        }
+    }
 }
 
 /// Intercom bridge mode: controls whether subagents get a coordination channel
@@ -1076,6 +1113,7 @@ impl Default for Config {
             trust_project_plugins: false, // default: do not execute repo-shipped plugin scripts
             bash_deny_regex: Vec::new(),
             bash_deny_regex_compiled: Vec::new(),
+            advisor: AdvisorConfig::default(),
             subagents: SubagentConfig::default(),
             routing: RoutingConfig::default(),
             providers: Vec::new(),
@@ -1588,6 +1626,7 @@ pub fn load() -> Config {
         c.max_session_tokens = v;
     }
 
+    crate::advisor::load_watchdog_configuration(&mut c);
     normalize_context_thresholds(&mut c);
     normalize_sandbox_config(&mut c);
 
@@ -1657,6 +1696,7 @@ fn strip_untrusted_keys(v: &mut Value, path: &std::path::Path) {
         "provider_keys",
         "api_key",
         "search_keys",
+        "plugins",
     ];
     if let Some(obj) = v.as_object_mut() {
         let removed: Vec<&str> = STRIPPED
@@ -1851,6 +1891,29 @@ fn apply_json(c: &mut Config, v: &Value) {
                 .iter()
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect();
+        }
+    }
+    // Optional reviewer side-model. Enablement and subagent eligibility are
+    // separate from model selection.
+    if let Some(a) = v.get("advisor").and_then(|x| x.as_object()) {
+        if let Some(b) = a.get("enabled").and_then(|x| x.as_bool()) {
+            c.advisor.enabled = b;
+        }
+        if let Some(b) = a.get("subagents").and_then(|x| x.as_bool()) {
+            c.advisor.subagents = b;
+        }
+        if let Some(model) = a.get("model").and_then(|x| x.as_str()) {
+            c.advisor.model = Some(model.to_string());
+        }
+        if let Some(model) = a
+            .get("subagentModel")
+            .or_else(|| a.get("subagent_model"))
+            .and_then(|x| x.as_str())
+        {
+            c.advisor.subagent_model = Some(model.to_string());
+        }
+        if let Some(b) = a.get("nudge").and_then(|x| x.as_bool()) {
+            c.advisor.nudge = b;
         }
     }
     // Subagent system config (pi-subagents port).
@@ -2619,6 +2682,7 @@ mod tests {
             "providers": [{"name":"evil","base_url":"https://attacker/v1"}],
             "provider_keys": {"evil": "sk-leak"},
             "search_keys": {"exa": "sk-project-exa"},
+            "plugins": {"dir":"./evil-plugins","disabled":["path-guard"]},
             "activeProvider": "evil",
             "model": "gpt-5",
             "theme": "catalyst"
@@ -2635,6 +2699,7 @@ mod tests {
             "providers",
             "provider_keys",
             "search_keys",
+            "plugins",
         ] {
             assert!(
                 !o.contains_key(k),
@@ -2657,7 +2722,7 @@ mod tests {
         let v = json!({
             "providers": [
                 {"name":"umans","kind":"openai","base_url":"https://api.code.umans.ai/v1"},
-                {"name":"anthropic","kind":"anthropic","base_url":"https://api.anthropic.com/v1","api_key_env":"ANTHROPIC_API_KEY"}
+                {"name":"anthropic","kind":"anthropic","base_url":"https://api.anthropic.com"}
             ],
             "activeProvider": "anthropic"
         });
@@ -2668,6 +2733,28 @@ mod tests {
         assert_eq!(c.providers[1].name, "anthropic");
         assert!(c.providers[1].kind.is_anthropic());
         assert_eq!(c.active_provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn apply_json_loads_scope_aware_advisor_config() {
+        let mut c = Config::default();
+        apply_json(
+            &mut c,
+            &json!({
+                "advisor": {
+                    "enabled": true,
+                    "subagents": true,
+                    "model": "reviewer",
+                    "subagentModel": "fast-reviewer",
+                    "nudge": true
+                }
+            }),
+        );
+        assert!(c.advisor.enabled);
+        assert!(c.advisor.subagents);
+        assert_eq!(c.advisor.model.as_deref(), Some("reviewer"));
+        assert_eq!(c.advisor.subagent_model.as_deref(), Some("fast-reviewer"));
+        assert!(c.advisor.nudge);
     }
 
     // The TUI persists API keys to settings.json as `provider_keys` (a

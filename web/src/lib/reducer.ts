@@ -523,8 +523,30 @@ function onToolResult(
   return { ...state, messages: [...state.messages, fallback] };
 }
 
+function peelThinkTags(raw: string): { thinking: string; text: string } | null {
+  let trimmed = raw.trimStart();
+  if (!trimmed.startsWith("<think>")) return null;
+  const close = trimmed.indexOf("</think>");
+  if (close < 0) return null;
+  const thinking = trimmed.slice("<think>".length, close).trim();
+  let text = trimmed.slice(close + "</think>".length);
+  // MiniMax proxy streams sometimes append bare extra closing tags.
+  while (true) {
+    const next = text.trimStart();
+    if (!next.startsWith("</think>")) {
+      text = next;
+      break;
+    }
+    text = next.slice("</think>".length);
+  }
+  return { thinking, text: text.trimStart() };
+}
+
 function asText(content: unknown): string {
-  if (typeof content === "string") return content;
+  if (typeof content === "string") {
+    const peeled = peelThinkTags(content);
+    return peeled ? peeled.text : content;
+  }
   if (Array.isArray(content)) {
     return content
       .map((c: any) =>
@@ -542,7 +564,13 @@ function asText(content: unknown): string {
 }
 
 function asThinking(m: any): string {
-  if (typeof m.reasoning_content === "string") return m.reasoning_content;
+  if (typeof m.reasoning_content === "string" && m.reasoning_content.length > 0) {
+    return m.reasoning_content;
+  }
+  if (typeof m.content === "string") {
+    const peeled = peelThinkTags(m.content);
+    if (peeled?.thinking) return peeled.thinking;
+  }
   if (Array.isArray(m.content)) {
     return m.content
       .filter((c: any) => c?.type === "thinking" || c?.type === "reasoning")

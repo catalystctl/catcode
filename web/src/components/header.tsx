@@ -96,12 +96,12 @@ export function Header(props: Props) {
 
   return (
     <header
-      className={`relative z-20 flex min-w-0 items-center gap-1.5 border-b border-ink-800/90 bg-ink-925/95 px-2 backdrop-blur-sm ${props.compact ? "flex-wrap py-1.5" : "h-10 sm:px-3"}`}
+      className={`relative z-20 flex min-w-0 items-center gap-1.5 border-b border-ink-800 bg-ink-900 px-2 ${props.compact ? "flex-wrap py-1.5" : "h-10 sm:px-3"}`}
     >
       {/* Mobile sidebar toggle */}
       <button
         onClick={props.onMenuClick}
-        className={`focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 ${props.compact ? "" : "lg:hidden"}`}
+        className={`focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11 ${props.compact ? "" : "lg:hidden"}`}
         aria-label="Open sessions"
       >
         <MenuIcon />
@@ -110,11 +110,11 @@ export function Header(props: Props) {
       {/* Brand + workspace / active conversation */}
       <div className={`min-w-0 items-center gap-2.5 ${props.compact ? "flex flex-1" : "flex"}`}>
         {props.compact ? (
-          <div className="min-w-0">
+          <div className="min-w-0 border-l-2 border-accent pl-2">
             <div className="flex items-center gap-2">
               {props.streaming && (
                 <span
-                  className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent shadow-[0_0_8px_rgb(var(--accent)/0.6)]"
+                  className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-none bg-accent"
                   title="Streaming"
                   aria-hidden="true"
                 />
@@ -130,7 +130,7 @@ export function Header(props: Props) {
           </div>
         ) : (
           <>
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-accent text-[12px] font-bold text-white shadow-[0_0_0_1px_rgb(var(--accent-deep)/0.4)]">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-sm bg-accent text-[12px] font-bold text-white">
               c
             </span>
             <div className="hidden min-w-0 sm:block">
@@ -157,7 +157,7 @@ export function Header(props: Props) {
           onClick={() => setModelOpen((o) => !o)}
           aria-haspopup="menu"
           aria-expanded={modelOpen}
-          className="focus-ring flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="focus-ring flex h-8 items-center gap-1.5 rounded-sm px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11"
         >
           <ModelIcon width={12} height={12} className="text-accent-soft" />
           <span className={`${props.compact ? "max-w-[82px]" : "max-w-[120px]"} truncate`}>{current?.name || current?.id || "no model"}</span>
@@ -184,7 +184,7 @@ export function Header(props: Props) {
           onClick={() => setThinkOpen((o) => !o)}
           aria-haspopup="menu"
           aria-expanded={thinkOpen}
-          className="focus-ring flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+          className="focus-ring flex h-8 items-center gap-1.5 rounded-sm px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11"
           title={`Thinking: ${props.thinkingLevel}`}
         >
           <BrainIcon width={12} height={12} className="text-accent-soft" />
@@ -218,7 +218,7 @@ export function Header(props: Props) {
           onClick={() => setApprovOpen((o) => !o)}
           aria-haspopup="menu"
           aria-expanded={approvOpen}
-          className={`focus-ring flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-mono transition-colors hover:bg-ink-800 ${
+          className={`focus-ring flex h-8 items-center gap-1.5 rounded-sm px-2 text-[11px] font-mono transition-colors hover:bg-ink-850 [@media(pointer:coarse)]:h-11 ${
             props.approvalMode === "always"
               ? "text-success"
               : props.approvalMode === "never"
@@ -261,7 +261,7 @@ export function Header(props: Props) {
             aria-expanded={configOpen}
             aria-label="Chat configuration"
             title="Chat configuration"
-            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
           >
             <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
               <path d="M4 7h10M18 7h2M4 17h2M10 17h10" />
@@ -293,7 +293,7 @@ export function Header(props: Props) {
                     props.onOpenIde?.();
                     setConfigOpen(false);
                   }}
-                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
                 >
                   <LayoutIdeIcon width={13} height={13} className="text-accent-soft" />
                   Open IDE
@@ -306,38 +306,38 @@ export function Header(props: Props) {
                     props.onOpenProjects?.();
                     setConfigOpen(false);
                   }}
-                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
                 >
                   <FolderIcon width={13} height={13} className="text-accent-soft" />
                   Switch project
                 </button>
               )}
               {props.onOpenControl && (
-          <button
-            type="button"
-            onClick={props.onOpenControl}
-            className="focus-ring mt-1 flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
-            title="Control Center"
-            aria-label="Control Center"
-          >
-            <BoltIcon width={14} height={14} />
-          </button>
-        )}
-        {props.onOpenSettings && (
+                <button
+                  type="button"
+                  onClick={props.onOpenControl}
+                  className="focus-ring mt-1 flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
+                  title="Control Center"
+                  aria-label="Control Center"
+                >
+                  <BoltIcon width={14} height={14} />
+                </button>
+              )}
+              {props.onOpenSettings && (
                 <button
                   role="menuitem"
                   onClick={() => {
                     props.onOpenSettings?.();
                     setConfigOpen(false);
                   }}
-                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="mt-1 flex w-full items-center gap-2 border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100"
                 >
                   <BoltIcon width={13} height={13} className="text-accent-soft" />
                   Settings
                 </button>
               )}
               {props.onToggleTheme && (
-                <button role="menuitem" onClick={props.onToggleTheme} className="mt-1 flex w-full items-center justify-between border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100">
+                <button role="menuitem" onClick={props.onToggleTheme} className="mt-1 flex w-full items-center justify-between border-t border-ink-800 px-2 py-1.5 text-[11px] text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100">
                   <span>Appearance</span><span className="font-mono text-[10px] uppercase text-ink-500">{props.theme ?? "dark"}</span>
                 </button>
               )}
@@ -380,7 +380,7 @@ export function Header(props: Props) {
           <button
             type="button"
             onClick={props.onOpenIde}
-            className="focus-ring flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 items-center gap-1.5 rounded-sm px-2 text-[11px] font-mono text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11"
             title="Open IDE layout"
             aria-label="Open IDE layout"
           >
@@ -392,7 +392,7 @@ export function Header(props: Props) {
           <button
             type="button"
             onClick={props.onOpenProjects}
-            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
             title="Switch project"
             aria-label="Switch project"
           >
@@ -403,7 +403,7 @@ export function Header(props: Props) {
           <button
             type="button"
             onClick={props.onOpenSettings}
-            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
             title="Settings"
             aria-label="Settings"
           >
@@ -414,7 +414,7 @@ export function Header(props: Props) {
         {props.onToggleTheme && !props.compact && (
           <button
             onClick={props.onToggleTheme}
-            className="focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
             title={`Theme: ${props.theme ?? "dark"} (click to toggle)`}
             aria-label="Toggle theme"
           >
@@ -460,7 +460,7 @@ export function Header(props: Props) {
         {!props.connected && props.onReconnect && (
           <button
             onClick={props.onReconnect}
-            className="focus-ring flex h-7 items-center gap-1 rounded-md px-2 font-mono text-[10px] uppercase tracking-wider text-ink-300 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            className="focus-ring flex h-8 items-center gap-1 rounded-sm px-2 font-mono text-[10px] uppercase tracking-wider text-ink-300 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11"
             title="Reconnect to catcode-core"
           >
             <RefreshIcon width={11} height={11} /> Reconnect
