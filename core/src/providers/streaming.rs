@@ -53,6 +53,14 @@ fn token_count(value: &Value) -> Option<u64> {
         })
 }
 
+/// Hard cap on streamed tool-call `index` growth. A malicious or buggy gateway
+/// can emit `index: 1e9` and OOM the process if the accumulator grows unbounded
+/// (`while len <= idx { push }`). Parallel tool batches stay well under this.
+pub(crate) const MAX_STREAM_TOOL_CALL_INDEX: usize = 64;
+
+/// Cap total argument bytes across all streamed tool calls in one turn.
+pub(crate) const MAX_STREAM_TOOL_ARGS_BYTES: usize = 8 * 1024 * 1024;
+
 /// Tool-call indices arrive as ints, floats (`1.0`), or quoted numbers on some
 /// gateways. Falling back to `0` silently merges parallel tool streams.
 fn tool_call_index(value: Option<&Value>) -> usize {
@@ -79,6 +87,40 @@ fn tool_call_index(value: Option<&Value>) -> usize {
                 })
         })
         .unwrap_or(0) as usize
+}
+
+/// Ensure `tool_calls` has a slot at `idx` without unbounded allocation (H3).
+pub(crate) fn ensure_stream_tool_slot<T: Default>(
+    tool_calls: &mut Vec<T>,
+    idx: usize,
+) -> Result<(), String> {
+    if idx >= MAX_STREAM_TOOL_CALL_INDEX {
+        return Err(format!(
+            "stream tool_call index {idx} exceeds cap ({MAX_STREAM_TOOL_CALL_INDEX})"
+        ));
+    }
+    while tool_calls.len() <= idx {
+        tool_calls.push(T::default());
+    }
+    Ok(())
+}
+
+/// Append a tool-call argument fragment if total args stay under the byte cap.
+pub(crate) fn append_stream_tool_args(
+    total_args_bytes: &mut usize,
+    acc_args: &mut String,
+    fragment: &str,
+) -> Result<(), String> {
+    let add = fragment.len();
+    let next = total_args_bytes.saturating_add(add);
+    if next > MAX_STREAM_TOOL_ARGS_BYTES {
+        return Err(format!(
+            "stream tool_call arguments exceed cap ({MAX_STREAM_TOOL_ARGS_BYTES} bytes)"
+        ));
+    }
+    *total_args_bytes = next;
+    acc_args.push_str(fragment);
+    Ok(())
 }
 
 /// Some providers stream `function.arguments` as a JSON object/array instead of
@@ -458,6 +500,34 @@ mod tests {
             }
             other => panic!("expected tool delta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ensure_stream_tool_slot_rejects_malicious_high_index() {
+        let mut slots: Vec<u8> = Vec::new();
+        assert!(ensure_stream_tool_slot(&mut slots, 0).is_ok());
+        assert_eq!(slots.len(), 1);
+        assert!(ensure_stream_tool_slot(&mut slots, MAX_STREAM_TOOL_CALL_INDEX - 1).is_ok());
+        assert_eq!(slots.len(), MAX_STREAM_TOOL_CALL_INDEX);
+        let err = ensure_stream_tool_slot(&mut slots, MAX_STREAM_TOOL_CALL_INDEX).unwrap_err();
+        assert!(err.contains("exceeds cap"), "{err}");
+        // Must not allocate multi-GB for a huge index.
+        let before = slots.len();
+        let _ = ensure_stream_tool_slot(&mut slots, usize::MAX / 2);
+        assert_eq!(slots.len(), before);
+    }
+
+    #[test]
+    fn append_stream_tool_args_caps_total_bytes() {
+        let mut total = 0usize;
+        let mut acc = String::new();
+        append_stream_tool_args(&mut total, &mut acc, "abc").unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(acc, "abc");
+        let big = "x".repeat(MAX_STREAM_TOOL_ARGS_BYTES);
+        let err = append_stream_tool_args(&mut total, &mut acc, &big).unwrap_err();
+        assert!(err.contains("exceed cap"), "{err}");
+        assert_eq!(acc, "abc");
     }
 
     #[test]
