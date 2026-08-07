@@ -345,9 +345,7 @@ impl Message {
     /// multi-turn replay can re-embed cleanly.
     pub fn normalize_embedded_thinking(&mut self) {
         let Message::Assistant {
-            content,
-            thinking,
-            ..
+            content, thinking, ..
         } = self
         else {
             return;
@@ -902,7 +900,6 @@ mod tests {
         assert_eq!(kept.thinking(), Some("already set"));
         assert!(kept.content_text().unwrap().contains("<think>"));
     }
-
 
     #[test]
     fn anthropic_request_builds_from_messages() {
