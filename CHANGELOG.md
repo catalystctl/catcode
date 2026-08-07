@@ -2,6 +2,12 @@
 
 All notable changes to **Catalyst Code** (formerly Umans Harness), day by day from first commit.
 
+## 2026-08-07
+
+- Atomic Windows web updates: stage/validate then promote (TUI + install.ps1 stop service first); chat execution-register UI with AA contrast/focus, multi-session bridge hardening. [c845be8]
+- Linux release artifacts built on ubuntu-22.04 with glibc <=2.35 baseline guard. [4c1aeb6]
+- Chat hub frontend + session runtime merge (SSE multi-session, HarnessBridge pool). [aa4469b]
+
 ## 2026-08-06
 
 - Hub-only web UI: `/` is the terminal hub (project tabs, git panel, split catcode PTYs); removed IDE/chat/SSE bridge + Monaco stack; account-scoped hub layout store. [ee0dbbd]
