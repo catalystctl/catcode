@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { authClient, setTwoFactorHandler } from "@/lib/auth-client";
 import { AuthScreen } from "@/components/auth-screen";
 import { AppDialogHost, useAppDialog } from "@/components/app-dialog";
+import { ArrowLeftIcon, ShieldIcon } from "@/components/icons";
 
 type Step = "credentials" | "two-factor";
 
@@ -109,7 +110,7 @@ export function LoginForm() {
     return (
       <>
         <AppDialogHost dialog={dialog} />
-        <AuthScreen title="Two-factor verification" subtitle="Enter the code from your authenticator app.">
+        <AuthScreen title="Verify access" subtitle="Enter the code from your authenticator app to return to the workbench.">
           <form onSubmit={onVerifyTotp} className="space-y-4">
             <input
               type="text"
@@ -139,9 +140,10 @@ export function LoginForm() {
                 setStep("credentials");
                 setError(null);
               }}
-              className="auth-btn-ghost"
+              className="auth-btn-ghost flex items-center justify-center gap-2"
             >
-              ← Back
+              <ArrowLeftIcon width={14} height={14} />
+              Back to sign in
             </button>
           </form>
         </AuthScreen>
@@ -150,7 +152,7 @@ export function LoginForm() {
   }
 
   return (
-    <AuthScreen title="Welcome back" subtitle="Sign in to your account.">
+    <AuthScreen title="Sign in" subtitle="Resume your projects and active agent sessions.">
       <form onSubmit={onPassword} className="space-y-4">
         <label className="block">
           <span className="mb-1.5 block text-xs font-medium text-ink-400">Email</span>
@@ -186,8 +188,13 @@ export function LoginForm() {
         OR
         <div className="h-px flex-1 bg-ink-800" />
       </div>
-      <button onClick={onPasskey} disabled={loading} className="auth-btn-ghost w-full">
-        🔑 Sign in with passkey
+      <button
+        onClick={onPasskey}
+        disabled={loading}
+        className="auth-btn-ghost flex w-full items-center justify-center gap-2"
+      >
+        <ShieldIcon width={15} height={15} />
+        Sign in with passkey
       </button>
     </AuthScreen>
   );

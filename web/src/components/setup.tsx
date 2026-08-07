@@ -45,9 +45,9 @@ export function SetupForm() {
 
   return (
     <AuthScreen
-      title="Create your account"
-      subtitle="This is the only account this instance will ever have."
-      footer="Catalyst Code · self-hosted"
+      title="Set up workbench access"
+      subtitle="Create the owner account for this self-hosted CatCode instance."
+      footer="CatCode · self-hosted workbench"
     >
       <form onSubmit={onSubmit} className="space-y-4">
         <Field label="Display name (optional)">
@@ -56,7 +56,7 @@ export function SetupForm() {
             value={name}
             onChange={(e) => setName(e.target.value)}
             className="auth-input"
-            placeholder="admin"
+            placeholder="Your name"
             autoComplete="name"
           />
         </Field>
@@ -99,7 +99,7 @@ export function SetupForm() {
           disabled={loading}
           className="auth-btn-primary"
         >
-          {loading ? "Creating…" : "Create account"}
+          {loading ? "Creating…" : "Create owner account"}
         </button>
       </form>
     </AuthScreen>

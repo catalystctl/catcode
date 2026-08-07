@@ -71,7 +71,7 @@ function RoleLabel({
         ? "text-accent-soft"
         : "text-ink-500";
   return (
-    <span className={`text-[10px] font-mono font-medium uppercase tracking-[0.14em] ${color}`}>
+    <span className={`chat-role-label text-[10px] font-mono font-medium uppercase tracking-[0.14em] ${color}`}>
       {children}
     </span>
   );
@@ -117,7 +117,7 @@ function UserMessage({
       className={`chat-turn chat-turn--user group chat-msg-enter ${compact ? "pr-2" : "pr-4 sm:pr-6"}`}
     >
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="flex items-center gap-2 pb-1.5 pt-3">
+      <div className="chat-turn-header flex items-center gap-2 pb-2 pt-5">
         <RoleLabel tone="ember">You</RoleLabel>
         {m.steer && (
           <span className="rounded-full border border-warning/35 bg-warning/10 px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider text-warning">
@@ -139,7 +139,7 @@ function UserMessage({
         </span>
       </div>
       {editing ? (
-        <div className="chat-user-well mb-3 px-3.5 py-2.5">
+        <div className="chat-user-well mb-5 px-4 py-3.5 sm:px-5">
           <textarea
             ref={inputRef}
             value={draft}
@@ -170,7 +170,7 @@ function UserMessage({
           </div>
         </div>
       ) : (
-        <div className="chat-user-well mb-3 whitespace-pre-wrap break-words px-3.5 py-2.5 text-[13.5px] leading-relaxed text-ink-100">
+        <div className="chat-user-well mb-5 whitespace-pre-wrap break-words px-4 py-3.5 text-[14px] leading-relaxed text-ink-100 sm:px-5">
           {m.images && m.images.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-1.5">
               {m.images.map((src, i) => (
@@ -209,7 +209,7 @@ function AssistantMessage({
       } ${compact ? "pr-2" : "pr-4 sm:pr-6"}`}
     >
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="flex items-center gap-2 pb-1.5 pt-3">
+      <div className="chat-turn-header flex items-center gap-2 pb-2 pt-5">
         <RoleLabel tone={m.streaming ? "live" : "muted"}>Agent</RoleLabel>
         {m.model && (
           <span className="truncate font-mono text-[10px] text-ink-600">{m.model}</span>
@@ -233,7 +233,7 @@ function AssistantMessage({
           <CopyBtn text={m.text} />
         </span>
       </div>
-      <div className="pb-3">
+      <div className="chat-agent-body pb-6">
         <Thinking text={m.thinking} active={m.streaming} />
         {m.text ? (
           m.streaming ? (
@@ -252,7 +252,7 @@ function AssistantMessage({
           )
         )}
         {m.toolCalls.length > 0 && (
-          <div className="mt-2.5 space-y-1.5">
+          <div className="chat-run-stack mt-4 space-y-2">
             {m.toolCalls.map((tc) => (
               <ToolCallCard key={tc.id} tc={tc} />
             ))}
@@ -272,9 +272,9 @@ function AssistantMessage({
 
 function ToolMessage({ m }: { m: ToolMsg }) {
   return (
-    <article className="chat-turn chat-turn--meta chat-msg-enter pr-4 sm:pr-6">
+    <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="my-1.5 overflow-hidden rounded-lg border border-ink-800 bg-ink-950/80">
+      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950/80">
         <div className="flex items-center gap-2 border-b border-ink-800/80 bg-ink-925/80 px-2.5 py-1.5">
           <span className={`h-1.5 w-1.5 rounded-full ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
           <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-ink-500">
@@ -296,9 +296,9 @@ function ToolMessage({ m }: { m: ToolMsg }) {
 function BashMessage({ m }: { m: BashMsg }) {
   const prefix = m.excludeFromContext ? "!!" : "!";
   return (
-    <article className="chat-turn chat-turn--meta chat-msg-enter pr-4 sm:pr-6">
+    <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className="my-1.5 overflow-hidden rounded-lg border border-ink-800 bg-ink-950/80">
+      <div className="chat-run-record my-2 overflow-hidden border border-ink-800 bg-ink-950/80">
         <div className="flex items-center gap-2 border-b border-ink-800/80 bg-ink-925/80 px-2.5 py-1.5">
           <span className={`h-1.5 w-1.5 rounded-full ${m.ok ? "bg-success" : "bg-danger"}`} aria-hidden="true" />
           <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-ink-500">
@@ -339,9 +339,9 @@ function GoalMessage({ m }: { m: GoalMsg }) {
           ? "verdict"
           : "phase";
   return (
-    <article className="chat-turn chat-turn--meta chat-msg-enter pr-4 sm:pr-6">
+    <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
       <span className="chat-turn-tick" aria-hidden="true" />
-      <div className={`my-1.5 rounded-r-lg border-l-2 bg-ink-925/70 px-3.5 py-2.5 ${tone.bar}`}>
+      <div className={`chat-run-record my-2 border-l-2 bg-ink-925/70 px-3.5 py-2.5 ${tone.bar}`}>
         <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em]">
           <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} aria-hidden="true" />
           <span className={tone.label}>goal · {kindLabel}</span>

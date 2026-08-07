@@ -11,6 +11,9 @@ const config: Config = {
         mono: ["var(--font-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
         display: ["var(--font-display)", "ui-sans-serif", "system-ui", "sans-serif"],
       },
+      letterSpacing: {
+        tight: "0",
+      },
       colors: {
         // Refined dark surface scale (zinc-tuned, slightly cooler).
         // Defined as CSS variables (RGB triplets) so the light theme can override
@@ -35,6 +38,7 @@ const config: Config = {
           DEFAULT: "rgb(var(--accent) / <alpha-value>)",
           soft: "rgb(var(--accent-soft) / <alpha-value>)",
           deep: "rgb(var(--accent-deep) / <alpha-value>)",
+          foreground: "rgb(var(--accent-foreground) / <alpha-value>)",
         },
         // Semantic tokens (catalyst Obsidian: success / warning / danger / info).
         success: "rgb(var(--success) / <alpha-value>)",
@@ -44,8 +48,8 @@ const config: Config = {
       },
       keyframes: {
         "fade-in": {
-          "0%": { opacity: "0", transform: "translateY(4px)" },
-          "100%": { opacity: "1", transform: "translateY(0)" },
+          "0%": { opacity: "0" },
+          "100%": { opacity: "1" },
         },
         shimmer: {
           "0%": { backgroundPosition: "-200% 0" },

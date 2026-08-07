@@ -11,7 +11,7 @@
 // The tab badge + OS desktop notifications are driven separately in useAgent
 // from the same feed; this component only renders the feed itself.
 
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { NotificationItem } from "@/lib/types";
 import { relativeTime, basename } from "@/lib/format";
 import { attentionLabel } from "@/lib/notifications";
@@ -30,6 +30,9 @@ interface Props {
 
 export function NotificationCenter(props: Props) {
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverId = useId();
+  const headingId = useId();
   const ref = useOutsideClose(() => setOpen(false), open);
 
   const sorted = [...props.notifications].sort((a, b) => b.ts - a.ts);
@@ -40,17 +43,15 @@ export function NotificationCenter(props: Props) {
   return (
     <div className="relative" ref={ref}>
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => {
-          setOpen((o) => !o);
-          if (!open && unreadCount > 0) {
-            // Opening the bell marks everything seen (clears the badge count).
-            props.onMarkAllRead();
-          }
-        }}
+        onClick={() => setOpen((o) => !o)}
         aria-label={`Notifications${unreadCount > 0 ? ` (${unreadCount} unread)` : ""}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={popoverId}
         title="Notifications"
-        className={`relative flex h-6 w-6 items-center justify-center rounded-sm transition-colors hover:bg-ink-800 hover:text-ink-100 ${
+        className={`focus-ring relative flex h-11 w-11 items-center justify-center rounded-sm transition-colors hover:bg-ink-800 hover:text-ink-100 ${
           unreadCount > 0
             ? hasAttention
               ? "text-danger"
@@ -61,7 +62,8 @@ export function NotificationCenter(props: Props) {
         <BellIcon width={14} height={14} />
         {unreadCount > 0 && (
           <span
-            className={`absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-0.5 text-[8px] font-bold leading-none text-white ${
+            aria-hidden="true"
+            className={`absolute right-1 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-0.5 text-[8px] font-bold leading-none text-white ${
               hasAttention ? "bg-danger" : "bg-accent"
             }`}
           >
@@ -72,19 +74,30 @@ export function NotificationCenter(props: Props) {
 
       {open && (
         <div
-          role="menu"
-          className="absolute right-0 z-30 mt-1 flex max-h-[min(70vh,30rem)] w-[min(20rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-sm border border-ink-700 bg-ink-900 shadow-elev-2 animate-fade-in sm:w-80"
+          id={popoverId}
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby={headingId}
+          tabIndex={-1}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setOpen(false);
+              triggerRef.current?.focus();
+            }
+          }}
+          className="absolute right-0 z-30 mt-1 flex max-h-[min(70vh,30rem)] w-[min(20rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-sm border border-ink-700 bg-ink-900 shadow-elev-2 outline-none animate-fade-in sm:w-80"
         >
-          <div className="flex items-center justify-between border-b border-ink-800 px-2 py-1.5">
-            <span className="text-[10px] font-mono uppercase tracking-wider text-ink-500">
+          <div className="flex min-h-11 items-center justify-between border-b border-ink-800 px-2">
+            <span id={headingId} className="text-[10px] font-mono uppercase tracking-wider text-ink-500">
               Notifications
             </span>
             <div className="flex items-center gap-1">
               {sorted.length > 0 && unreadCount > 0 && (
                 <button
-                  role="menuitem"
+                  type="button"
                   onClick={props.onMarkAllRead}
-                  className="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-mono text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="focus-ring flex min-h-11 items-center gap-1 rounded-sm px-2 text-[10px] font-mono text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
                   title="Mark all read"
                 >
                   <CheckDoubleIcon width={11} height={11} /> Read all
@@ -92,9 +105,9 @@ export function NotificationCenter(props: Props) {
               )}
               {sorted.length > 0 && (
                 <button
-                  role="menuitem"
+                  type="button"
                   onClick={props.onClear}
-                  className="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-mono text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
+                  className="focus-ring flex min-h-11 items-center gap-1 rounded-sm px-2 text-[10px] font-mono text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
                   title="Clear all"
                 >
                   <TrashIcon width={11} height={11} /> Clear
@@ -118,7 +131,7 @@ export function NotificationCenter(props: Props) {
                   const sameProject =
                     !!props.currentWorkspace && n.workspace === props.currentWorkspace;
                   return (
-                    <li key={n.id}>
+                    <li key={n.id} className={`group relative ${n.read ? "opacity-60" : ""}`}>
                       <button
                         type="button"
                         onClick={() => {
@@ -126,9 +139,7 @@ export function NotificationCenter(props: Props) {
                           props.onOpen(n);
                           setOpen(false);
                         }}
-                        className={`group flex w-full items-start gap-2 px-2 py-1.5 text-left transition-colors hover:bg-ink-800 ${
-                          n.read ? "opacity-60" : ""
-                        }`}
+                        className="focus-ring flex min-h-11 w-full items-start gap-2 py-1.5 pl-2 pr-12 text-left transition-colors hover:bg-ink-800"
                       >
                         <span
                           className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-none ${
@@ -154,25 +165,14 @@ export function NotificationCenter(props: Props) {
                             )}
                           </div>
                         </div>
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            props.onDismiss(n.id);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              props.onDismiss(n.id);
-                            }
-                          }}
-                          className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-ink-500 opacity-0 transition-colors hover:bg-ink-700 hover:text-ink-100 group-hover:opacity-100"
-                          aria-label="Dismiss notification"
-                        >
-                          <XIcon width={11} height={11} />
-                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => props.onDismiss(n.id)}
+                        className="focus-ring absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-700 hover:text-ink-100 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                        aria-label={`Dismiss ${n.title || "session"} notification`}
+                      >
+                        <XIcon width={11} height={11} />
                       </button>
                     </li>
                   );

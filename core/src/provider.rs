@@ -2499,9 +2499,7 @@ fn is_retryable_stream_failure(message: &str) -> bool {
         || lower.contains("connection reset")
         || lower.contains("broken pipe")
         || (lower.contains("connection")
-            && (lower.contains("closed")
-                || lower.contains("aborted")
-                || lower.contains("reset")))
+            && (lower.contains("closed") || lower.contains("aborted") || lower.contains("reset")))
     {
         return true;
     }
@@ -2540,7 +2538,12 @@ fn is_retryable_stream_failure(message: &str) -> bool {
 /// output we retry broadly (same as historical behaviour). After partial
 /// deltas we only retry classified transport/gateway failures, and always ask
 /// the TUI to discard the partial so a successful retry cannot duplicate text.
-fn should_retry_stream_attempt(message: &str, emitted: bool, attempt: u32, max_attempts: u32) -> bool {
+fn should_retry_stream_attempt(
+    message: &str,
+    emitted: bool,
+    attempt: u32,
+    max_attempts: u32,
+) -> bool {
     if attempt >= max_attempts {
         return false;
     }
@@ -4128,8 +4131,12 @@ mod tests {
             "stream read: error decoding response body -> error reading a body from connection -> unexpected EOF during chunk size line"
         ));
         assert!(is_retryable_stream_failure("HTTP 504: gateway timeout"));
-        assert!(is_retryable_stream_failure("provider stream error: 504 Gateway Timeout"));
-        assert!(is_retryable_stream_failure("provider stream error: overloaded"));
+        assert!(is_retryable_stream_failure(
+            "provider stream error: 504 Gateway Timeout"
+        ));
+        assert!(is_retryable_stream_failure(
+            "provider stream error: overloaded"
+        ));
         assert!(is_retryable_stream_failure("connection reset by peer"));
 
         // Non-transient: stay fatal once tokens were shown.
@@ -4139,7 +4146,9 @@ mod tests {
         assert!(!is_retryable_stream_failure(
             "stream idle timeout (90s with no data)"
         ));
-        assert!(!is_retryable_stream_failure("HTTP 401: invalid credentials"));
+        assert!(!is_retryable_stream_failure(
+            "HTTP 401: invalid credentials"
+        ));
         assert!(!should_retry_stream_attempt(
             "malformed provider stream event: nope",
             true,

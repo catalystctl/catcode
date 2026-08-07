@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -332,20 +333,19 @@ func installBinaryAsset(rel *ghRelease, name, dest string) error {
 	return selfReplace(staged, dest)
 }
 
-// extractTarGz clears destDir and extracts the gzip/tar archive into it.
+// extractTarGz extracts into a sibling directory and promotes it into place.
+// In-place removal is dangerous on Windows: a still-exiting node process can
+// hold a native addon open and leave a half-installed web tree.
 func extractTarGz(archive, destDir string) error {
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	parent := filepath.Dir(filepath.Clean(destDir))
+	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(destDir)
+	stage, err := os.MkdirTemp(parent, ".web-update-")
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(destDir, e.Name())); err != nil {
-			return fmt.Errorf("clear %s: %w", e.Name(), err)
-		}
-	}
+	defer os.RemoveAll(stage)
 
 	f, err := os.Open(archive)
 	if err != nil {
@@ -373,8 +373,8 @@ func extractTarGz(archive, destDir string) error {
 		if strings.HasPrefix(name, "..") || strings.Contains(name, string(filepath.Separator)+"..") {
 			return fmt.Errorf("refusing unsafe path in archive: %s", hdr.Name)
 		}
-		target := filepath.Join(destDir, name)
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) && target != filepath.Clean(destDir) {
+		target := filepath.Join(stage, name)
+		if !strings.HasPrefix(target, filepath.Clean(stage)+string(os.PathSeparator)) && target != filepath.Clean(stage) {
 			return fmt.Errorf("refusing path outside dest: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {
@@ -403,7 +403,54 @@ func extractTarGz(archive, destDir string) error {
 		default:
 		}
 	}
+	if err := validateWebBundle(stage); err != nil {
+		return err
+	}
+	return promoteWebDir(stage, destDir)
+}
+
+func validateWebBundle(dir string) error {
+	required := []string{
+		"start.js",
+		"server.js",
+		"package.json",
+		filepath.Join(".next", "BUILD_ID"),
+		filepath.Join("node_modules", "next", "package.json"),
+		filepath.Join("node_modules", "ws", "package.json"),
+		filepath.Join("node_modules", "zigpty", "package.json"),
+		filepath.Join("node_modules", "better-auth", "package.json"),
+	}
+	for _, rel := range required {
+		if info, err := os.Stat(filepath.Join(dir, rel)); err != nil || info.IsDir() {
+			return fmt.Errorf("web bundle missing %s", filepath.ToSlash(rel))
+		}
+	}
 	return nil
+}
+
+func promoteWebDir(stage, destDir string) error {
+	backup := destDir + ".old"
+	_ = os.RemoveAll(backup)
+	for attempt := 0; attempt < 10; attempt++ {
+		if err := os.Rename(destDir, backup); err != nil && !os.IsNotExist(err) {
+			if runtime.GOOS == "windows" {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("replace existing web bundle: %w", err)
+		}
+		if err := os.Rename(stage, destDir); err != nil {
+			_ = os.Rename(backup, destDir)
+			if runtime.GOOS == "windows" {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("install web bundle: %w", err)
+		}
+		_ = os.RemoveAll(backup)
+		return nil
+	}
+	return fmt.Errorf("web bundle is still in use; close the web service and retry")
 }
 
 func writeWebVersionStamp(webDir, ver string) error {

@@ -40,11 +40,14 @@ interface Props {
   modelLabel: string;
   images: string[];
   workspace: string;
+  /** Workspace/session identity used to isolate persisted drafts. */
+  draftId: string;
   /** Active IDE file supplied as ambient context for user awareness. */
   activeFile?: string | null;
   onAddImage: (url: string) => void;
   onRemoveImage: (i: number) => void;
-  onPrompt: (text: string, images?: string[]) => void | Promise<void>;
+  onRestoreImages: (urls: string[]) => void;
+  onPrompt: (text: string, images?: string[]) => boolean | void | Promise<boolean | void>;
   onSteer: (text: string) => void;
   onAbort: () => void;
   onClearQueue?: () => void;
@@ -71,6 +74,10 @@ export interface ComposerHandle {
 
 const DRAFT_KEY = "umans:draft";
 const DRAFT_IMG_KEY = "umans:draft-images";
+
+function scopedDraftKey(base: string, draftId: string): string {
+  return `${base}:${encodeURIComponent(draftId)}`;
+}
 
 function lsGet(k: string): string | null {
   try {
@@ -122,9 +129,11 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     modelLabel,
     images,
     workspace,
+    draftId,
     activeFile,
     onAddImage,
     onRemoveImage,
+    onRestoreImages,
     onPrompt,
     onSteer,
     onAbort,
@@ -164,6 +173,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const mentionRef = useRef<{ start: number; query: string } | null>(null);
   const fetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restoredDraftImgsRef = useRef(false);
+  const draftTextReadyRef = useRef(false);
+  const draftImagesReadyRef = useRef(false);
+  const draftTextKey = scopedDraftKey(DRAFT_KEY, draftId);
+  const draftImageKey = scopedDraftKey(DRAFT_IMG_KEY, draftId);
 
   // ── Imperative handle (stable — only refs/setState are touched) ──
   useImperativeHandle(
@@ -211,35 +224,44 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   // saved values back through the parent callbacks so there is a single source
   // of truth (no divergent local image state).
   useEffect(() => {
-    const saved = lsGet(DRAFT_KEY);
+    const saved = lsGet(draftTextKey);
     if (saved) setText(saved);
     // Ref flag: Strict Mode remounts once; without this, images double-append.
     if (restoredDraftImgsRef.current) return;
     restoredDraftImgsRef.current = true;
-    const savedImgs = lsGet(DRAFT_IMG_KEY);
-    if (savedImgs) {
+    const savedImgs = lsGet(draftImageKey);
+    if (!savedImgs) {
+      onRestoreImages([]);
+    } else {
       try {
         const arr = JSON.parse(savedImgs);
-        if (Array.isArray(arr)) {
-          // Restore ALL saved images (not just the first).
-          for (const url of arr) {
-            if (typeof url === "string" && url) onAddImage(url);
-          }
-        }
+        onRestoreImages(
+          Array.isArray(arr)
+            ? arr.filter((url): url is string => typeof url === "string" && !!url)
+            : [],
+        );
       } catch {
-        /* ignore */
+        onRestoreImages([]);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    lsSet(DRAFT_KEY, text);
-  }, [text]);
+    if (!draftTextReadyRef.current) {
+      draftTextReadyRef.current = true;
+      return;
+    }
+    lsSet(draftTextKey, text);
+  }, [draftTextKey, text]);
 
   useEffect(() => {
-    lsSet(DRAFT_IMG_KEY, JSON.stringify(images));
-  }, [images]);
+    if (!draftImagesReadyRef.current) {
+      draftImagesReadyRef.current = true;
+      return;
+    }
+    lsSet(draftImageKey, JSON.stringify(images));
+  }, [draftImageKey, images]);
 
   // Auto-grow.
   useEffect(() => {
@@ -395,9 +417,18 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
     const imgs = images.length ? images : undefined;
     // Mid-turn Enter queues a follow-up via core; Ctrl+Enter steers (submitSteer).
-    onPrompt(t, imgs);
+    // Clear optimistically, but restore the submitted text if dispatch fails.
     setText("");
     closeFlyouts();
+    void Promise.resolve()
+      .then(() => onPrompt(t, imgs))
+      .then((ok) => {
+        if (ok !== false) return;
+        setText((current) => (current ? `${t}\n\n${current}` : t));
+      })
+      .catch(() => {
+        setText((current) => (current ? `${t}\n\n${current}` : t));
+      });
   }, [text, images, connected, canSend, onCommand, onPrompt, onSkill, onBash, closeFlyouts, hitlOpen]);
 
   const submitSteer = useCallback(() => {
@@ -570,7 +601,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         compact ? "px-2" : "px-4 sm:px-6 sm:pb-4"
       }`}
     >
-      <div className={`mx-auto ${compact ? "max-w-none" : "max-w-[48rem]"}`}>
+      <div className="mx-auto w-full max-w-[60rem]">
         {hitlOpen && (
           <p
             className="mb-2.5 flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/5 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.1em] text-ink-300"
@@ -667,7 +698,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             // attribute mismatch while preserving SSR for the composer.
             suppressHydrationWarning
             className={
-              "composer-shell flex flex-wrap items-end gap-1.5 p-2 " +
+              "composer-shell flex flex-wrap items-end gap-2 p-2.5 " +
               (streaming ? "composer-inflight" : "")
             }
           >
@@ -706,7 +737,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                         (!canSend &&
                           !(text.trim().startsWith("/") || text.trim().startsWith("!")))
                       }
-                      className="focus-ring flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
+                      className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm bg-accent text-white transition-colors hover:bg-accent-soft disabled:bg-ink-800 disabled:text-ink-500"
                       title="Queue follow-up (Enter)"
                       aria-label="Queue follow-up"
                     >
@@ -715,7 +746,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                     <button
                       onClick={submitSteer}
                       disabled={hitlOpen || !connected || !canSend}
-                      className="focus-ring flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40"
+                      className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100 disabled:opacity-40"
                       title="Steer in-flight turn (Ctrl+Enter)"
                       aria-label="Steer in-flight turn"
                     >
@@ -725,7 +756,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
                 )}
                 <button
                   onClick={onAbort}
-                  className="focus-ring flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-danger transition-colors hover:bg-ink-800"
+                  className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-sm text-danger transition-colors hover:bg-ink-800"
                   title="Stop"
                   aria-label="Stop"
                 >

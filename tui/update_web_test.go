@@ -81,8 +81,23 @@ func TestExtractTarGz(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "start.js"), []byte("console.log(1)"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "server.js"), []byte("//srv"), 0o644); err != nil {
-		t.Fatal(err)
+	required := []string{
+		"server.js",
+		"package.json",
+		filepath.Join(".next", "BUILD_ID"),
+		filepath.Join("node_modules", "next", "package.json"),
+		filepath.Join("node_modules", "ws", "package.json"),
+		filepath.Join("node_modules", "zigpty", "package.json"),
+		filepath.Join("node_modules", "better-auth", "package.json"),
+	}
+	for _, rel := range required {
+		path := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	archive := filepath.Join(t.TempDir(), "web.tar.gz")
 	cmd := exec.Command("tar", "-C", src, "-czf", archive, ".")
@@ -105,6 +120,34 @@ func TestExtractTarGz(t *testing.T) {
 	}
 	if string(got) != "console.log(1)" {
 		t.Fatalf("extracted content = %q", got)
+	}
+}
+
+func TestExtractTarGzRejectsIncompleteBundleWithoutReplacingInstall(t *testing.T) {
+	if _, err := exec.LookPath("tar"); err != nil {
+		t.Skip("tar not available")
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "start.js"), []byte("incomplete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "web.tar.gz")
+	if out, err := exec.Command("tar", "-C", src, "-czf", archive, ".").CombinedOutput(); err != nil {
+		t.Fatalf("tar: %v\n%s", err, out)
+	}
+	dest := filepath.Join(t.TempDir(), "web")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dest, "old.txt")
+	if err := os.WriteFile(old, []byte("still runnable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractTarGz(archive, dest); err == nil || !strings.Contains(err.Error(), "web bundle missing") {
+		t.Fatalf("expected missing bundle error, got %v", err)
+	}
+	if got, err := os.ReadFile(old); err != nil || string(got) != "still runnable" {
+		t.Fatalf("existing install was modified: %q, %v", got, err)
 	}
 }
 

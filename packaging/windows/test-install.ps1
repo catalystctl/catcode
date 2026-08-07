@@ -141,6 +141,16 @@ if ($src -notmatch 'Assert-WebBundle') {
 } else {
     Pass 'Install-WebBundle validates the extracted web bundle'
 }
+if ($src -notmatch 'Stop-WebService[\s\S]*Install-WebBundle') {
+    Fail 'Install-WebService does not stop Windows web service before replacement'
+} else {
+    Pass 'Install-WebService stops Windows web service before replacement'
+}
+if ($src -notmatch '\$stage[\s\S]*Move-Item -LiteralPath \$stage') {
+    Fail 'Install-WebBundle does not stage and promote the bundle atomically'
+} else {
+    Pass 'Install-WebBundle stages and promotes the bundle atomically'
+}
 
 # ── 7. Host survives scriptblock-wrapped Die ──────────────────
 $wrappedOk = $false

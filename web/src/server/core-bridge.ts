@@ -19,8 +19,8 @@
 // Low-level CoreProcess layer (not the PI-compatible AgentSession): this gives
 // full yes/no/always approval control and direct session/model/stats commands.
 
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { join, dirname, relative, normalize, sep } from "node:path";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { join, dirname, relative, normalize, resolve, sep, isAbsolute } from "node:path";
 import { resolveCoreBinary, configDir } from "@catalyst-code/coding-agent";
 import type { AgentEvent, AgentState, CoreCommand, CoreEvent, LiveSessionStatus, ProjectEntry, ReadyPayload } from "@/lib/types";
 import { loadTitles, setTitle } from "@/lib/session-titles";
@@ -28,6 +28,7 @@ import { loadProjects, touchProject, removeProject } from "@/lib/projects";
 import { LiveSession, type SessionCallbacks, type SessionEnv } from "./live-session";
 import { loadSettings } from "./settings-file";
 import { getDefaultWorkspace } from "./default-workspace";
+import { authorizeWorkspaceOrThrow } from "./workspace";
 
 interface CoreRoot {
   binary: string;
@@ -188,12 +189,52 @@ class HarnessBridge {
     }
   }
 
+  /** Validate routing metadata before a core can be spawned or addressed. */
+  private authorizedSession(workspace: string, sessionFile: string): string {
+    const ws = authorizeWorkspaceOrThrow(workspace);
+    if (!isAbsolute(sessionFile) || !sessionFile.endsWith(".jsonl")) {
+      throw new Error("unauthorized session");
+    }
+    const dir = resolve(sessionsDir(ws));
+    const file = normalize(sessionFile);
+    const rel = relative(dir, file);
+    // Session files are direct children of the hashed workspace directory.
+    if (!rel || rel.startsWith("..") || rel.includes(sep) || isAbsolute(rel)) {
+      throw new Error("unauthorized session");
+    }
+    // Existing symlinks must not point outside the session directory.
+    if (existsSync(file)) {
+      const realDir = realpathSync(dir);
+      const realFile = realpathSync(file);
+      const realRel = relative(realDir, realFile);
+      if (!realRel || realRel.startsWith("..") || realRel.includes(sep)) {
+        throw new Error("unauthorized session");
+      }
+    }
+    return file;
+  }
+
+  /** Public routing guards for API handlers that do not start a session. */
+  authorizeWorkspace(workspace: string): string {
+    return this.authorizedWorkspace(workspace);
+  }
+
+  authorizeSession(workspace: string, sessionFile: string): string {
+    return this.authorizedSession(workspace, sessionFile);
+  }
+
+  private authorizedWorkspace(workspace: string): string {
+    return authorizeWorkspaceOrThrow(workspace);
+  }
+
   /** Find or create the LiveSession for a session file. Does NOT start it. */
   getOrCreate(workspace: string, sessionFile: string): LiveSession {
-    let s = this.sessions.get(sessionFile);
+    const ws = this.authorizedWorkspace(workspace);
+    const file = this.authorizedSession(ws, sessionFile);
+    let s = this.sessions.get(file);
     if (!s) {
-      s = new LiveSession(workspace, sessionFile, this.env(), this.callbacks());
-      this.sessions.set(sessionFile, s);
+      s = new LiveSession(ws, file, this.env(), this.callbacks());
+      this.sessions.set(file, s);
     }
     return s;
   }
@@ -201,8 +242,10 @@ class HarnessBridge {
   /** Ensure the session's core is running. If `sessionFile` is omitted, use the
    *  workspace's most-recent session (creating one if the workspace is empty). */
   async ensure(workspace?: string, sessionFile?: string): Promise<LiveSession> {
-    const ws = workspace ?? this.defaultWorkspace;
-    const file = sessionFile ?? resolveSessionFile(ws);
+    const ws = this.authorizedWorkspace(workspace ?? this.defaultWorkspace);
+    const file = sessionFile
+      ? this.authorizedSession(ws, sessionFile)
+      : resolveSessionFile(ws);
     const s = this.getOrCreate(ws, file);
     await s.ensure();
     return s;
@@ -221,7 +264,7 @@ class HarnessBridge {
 
   /** Most-recent session file for a workspace (or a fresh name if empty). */
   mostRecentSession(workspace: string): string {
-    return resolveSessionFile(workspace);
+    return resolveSessionFile(this.authorizedWorkspace(workspace));
   }
 
   // ── Workspace switching (no respawn — other sessions keep running) ──
@@ -229,20 +272,20 @@ class HarnessBridge {
   /** Switch the client to a workspace: record it, fan the project list, and
    *  ensure its most-recent session is live. Returns the session to show. */
   async switchWorkspace(path: string): Promise<{ session: string; workspace: string }> {
-    touchProject(path);
-    this.broadcastProjects();
-    const file = resolveSessionFile(path);
-    const s = this.getOrCreate(path, file);
+    const workspace = this.authorizedWorkspace(path);
+    const file = resolveSessionFile(workspace);
+    const s = this.getOrCreate(workspace, file);
     await s.ensure();
-    return { session: file, workspace: path };
+    return { session: file, workspace };
   }
 
   /** Start a brand-new session file in a workspace and return it. */
   async newSession(workspace: string): Promise<{ session: string; workspace: string }> {
-    const file = freshSessionFile(workspace);
-    const s = this.getOrCreate(workspace, file);
+    const ws = this.authorizedWorkspace(workspace);
+    const file = freshSessionFile(ws);
+    const s = this.getOrCreate(ws, file);
     await s.ensure(); // starts the core, which creates the file (session::ensure)
-    return { session: file, workspace };
+    return { session: file, workspace: ws };
   }
 
   /** Rename a session (web-layer overlay). Broadcast to all live sessions in
@@ -277,14 +320,18 @@ class HarnessBridge {
   }
 
   addProject(path: string): ProjectEntry[] {
-    const projects = touchProject(path);
+    // Project registration is exposed through the validated project APIs; core
+    // routing must never turn an arbitrary command path into a capability grant.
+    const workspace = this.authorizedWorkspace(path);
+    const projects = touchProject(workspace);
     const ev: CoreEvent = { type: "projects", projects };
     for (const s of this.sessions.values()) s.inject(ev);
     return projects;
   }
 
   removeProjectEntry(path: string): ProjectEntry[] {
-    const projects = removeProject(path);
+    const workspace = this.authorizedWorkspace(path);
+    const projects = removeProject(workspace);
     const ev: CoreEvent = { type: "projects", projects };
     for (const s of this.sessions.values()) s.inject(ev);
     return projects;
@@ -295,9 +342,10 @@ class HarnessBridge {
    *  viewing the deleted session can switch. Refreshes every live sibling's
    *  session list so all sidebars update. */
   async deleteSession(workspace: string, sessionFile: string): Promise<{ session: string; workspace: string }> {
+    const ws = this.authorizedWorkspace(workspace);
+    const resolved = this.authorizedSession(ws, sessionFile);
     // Confine the file to this workspace's session directory (no escaping).
-    const dir = sessionsDir(workspace);
-    const resolved = normalize(sessionFile);
+    const dir = sessionsDir(ws);
     const rel = relative(dir, resolved);
     if (rel === "" || rel.startsWith("..") || rel.includes(`..${sep}`)) {
       throw new Error("session file outside its workspace session dir");
@@ -322,7 +370,7 @@ class HarnessBridge {
     // The deleted session left the live map — re-broadcast status so clients
     // drop its sidebar badge / feed entry.
     this.broadcastStatus();
-    return { session: resolveSessionFile(workspace), workspace };
+    return { session: resolveSessionFile(ws), workspace: ws };
   }
 
   /** A session's core became ready — bump its workspace in the recent list and

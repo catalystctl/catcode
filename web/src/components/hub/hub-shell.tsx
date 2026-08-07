@@ -739,43 +739,29 @@ function ChatPane({ agent }: { agent: ReturnType<typeof useAgent> }) {
 
 function EmptyHub({ onOpenProject }: { onOpenProject: () => void }) {
   return (
-    <div className="chat-empty flex h-full flex-col items-center justify-center gap-6 px-6 text-center">
-      <div className="chat-empty-card relative max-w-lg px-6 py-8 sm:px-8">
-        <div className="chat-empty-mark mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/12 text-accent-soft ring-1 ring-accent/25">
-          <BrandMark size={30} />
-        </div>
-        <div className="mt-5 space-y-2">
-          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-500">Workspace</p>
-          <h1 className="font-display text-xl font-semibold tracking-tight text-ink-100 sm:text-[1.35rem]">
-            Open a project to begin
-          </h1>
-          <p className="mx-auto max-w-sm text-[13px] leading-relaxed text-ink-400">
-            Chats stay live across devices — switch phones, close the tab, come back mid-turn.
+    <div className="chat-empty flex h-full items-center justify-center px-6 py-10">
+      <div className="w-full max-w-md border-l border-ink-800 pl-5 text-left sm:pl-6">
+        <div className="flex items-center gap-3">
+          <BrandMark size={24} />
+          <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-500">
+            No project open
           </p>
         </div>
+        <h1 className="mt-5 font-display text-xl font-semibold text-ink-100">
+          Choose a repository to start work
+        </h1>
+        <p className="mt-2 max-w-sm text-[13px] leading-relaxed text-ink-400">
+          Open a local project to start a session and keep its chat and repository state together.
+        </p>
         <button
           type="button"
           onClick={onOpenProject}
-          className="focus-ring mt-6 inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-[13px] font-semibold text-white shadow-glow transition-colors hover:bg-accent-soft"
+          className="focus-ring mt-6 inline-flex items-center gap-2 rounded-md bg-accent px-3.5 py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-accent-soft"
         >
           <FolderPlusIcon width={15} height={15} />
-          Open a project
+          Open project
         </button>
-        <ul className="mt-6 grid gap-2 text-left text-[12px] text-ink-500 sm:grid-cols-3">
-          <EmptyFeature title="Multi-session" body="Many chats per project; switch without killing work." />
-          <EmptyFeature title="Live everywhere" body="Same stream on another device — no restart." />
-          <EmptyFeature title="Git beside chat" body="Review, commit, and push without leaving." />
-        </ul>
       </div>
     </div>
-  );
-}
-
-function EmptyFeature({ title, body }: { title: string; body: string }) {
-  return (
-    <li className="rounded-lg border border-ink-800/80 bg-ink-950/40 px-3 py-2.5">
-      <div className="text-[12px] font-medium text-ink-200">{title}</div>
-      <div className="mt-0.5 leading-snug text-ink-500">{body}</div>
-    </li>
   );
 }

@@ -58,11 +58,27 @@ export function Sidebar(props: Props) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const { onClose } = props;
   const [menuAbove, setMenuAbove] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const renameCancelledRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const wasOverlayOpenRef = useRef(false);
+  const [desktopLayout, setDesktopLayout] = useState(false);
   const sessionButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const overlayDrawer = props.embedded || !desktopLayout;
+  const overlayOpen = overlayDrawer && props.open;
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1024px)");
+    const update = () => setDesktopLayout(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   useEffect(() => {
     setLoadedPreferenceScope(null);
@@ -112,18 +128,60 @@ export function Sidebar(props: Props) {
     }
   }, [renaming]);
 
+  // Overlay drawers own keyboard focus. The persistent desktop sidebar remains
+  // ordinary navigation and keeps the parent's existing focus behavior.
+  useEffect(() => {
+    if (overlayOpen && !wasOverlayOpenRef.current) {
+      const active = document.activeElement;
+      restoreFocusRef.current = active instanceof HTMLElement ? active : null;
+      requestAnimationFrame(() => closeButtonRef.current?.focus());
+    } else if (!overlayOpen && wasOverlayOpenRef.current) {
+      const drawer = sidebarRef.current;
+      const restore = restoreFocusRef.current;
+      requestAnimationFrame(() => {
+        const active = document.activeElement;
+        if (restore?.isConnected && (active === document.body || !!drawer?.contains(active))) {
+          restore.focus();
+        }
+      });
+      restoreFocusRef.current = null;
+    }
+    wasOverlayOpenRef.current = overlayOpen;
+  }, [overlayOpen]);
+
   // Esc closes the sidebar when open (unless renaming — that Esc cancels rename).
   useEffect(() => {
-    if (!props.open) return;
+    if (!overlayOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (renaming) return;
-      if (openMenu) return; // session menu owns this Esc
-      props.onClose();
+      if (event.key === "Escape") {
+        if (renaming) return;
+        if (openMenu) return; // session menu owns this Esc
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = Array.from(sidebarRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? []).filter((element) => !element.hasAttribute("hidden") && element.getAttribute("aria-hidden") !== "true");
+      if (!focusable.length) {
+        event.preventDefault();
+        sidebarRef.current?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === sidebarRef.current)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [props.open, renaming, openMenu, props.onClose]);
+  }, [overlayOpen, renaming, openMenu, onClose]);
 
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -178,6 +236,13 @@ export function Sidebar(props: Props) {
         />
       )}
       <aside
+        ref={sidebarRef}
+        role={overlayDrawer ? "dialog" : undefined}
+        aria-modal={overlayOpen ? "true" : undefined}
+        aria-label={overlayDrawer ? "Chat history" : "Chat history navigation"}
+        aria-hidden={overlayDrawer && !props.open ? "true" : undefined}
+        inert={overlayDrawer && !props.open ? true : undefined}
+        tabIndex={overlayOpen ? -1 : undefined}
         // Password managers such as Proton Pass may annotate form containers
         // before React hydrates. The attribute is harmless but otherwise
         // produces a false-positive hydration mismatch in development.
@@ -199,8 +264,9 @@ export function Sidebar(props: Props) {
             </span>
           </div>
           <button
+            ref={closeButtonRef}
             onClick={props.onClose}
-            className={`focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 ${props.embedded ? "" : "lg:hidden"}`}
+            className={`focus-ring flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11 ${props.embedded ? "" : "lg:hidden"}`}
             aria-label="Close chat history"
           >
             <XIcon width={14} height={14} />
@@ -211,7 +277,7 @@ export function Sidebar(props: Props) {
           <button
             onClick={props.onNewSession}
             disabled={props.switching}
-            className="focus-ring flex w-full items-center justify-center gap-2 rounded-lg border border-ink-700/80 bg-ink-900/80 px-2.5 py-2 text-[12px] font-medium text-ink-100 transition-colors hover:border-accent/40 hover:bg-ink-850 disabled:cursor-not-allowed disabled:opacity-50"
+            className="focus-ring flex min-h-9 w-full items-center justify-center gap-2 rounded-lg border border-ink-700/80 bg-ink-900/80 px-2.5 py-2 text-[12px] font-medium text-ink-100 transition-colors hover:border-accent/40 hover:bg-ink-850 focus-visible:border-accent/60 disabled:cursor-not-allowed disabled:opacity-50 [@media(pointer:coarse)]:min-h-11"
           >
             <PlusIcon width={14} height={14} className="text-accent-soft" /> New chat
           </button>
@@ -231,13 +297,13 @@ export function Sidebar(props: Props) {
               }}
               placeholder="Search sessions…"
               aria-label="Search chat history"
-              className="w-full rounded-lg border border-ink-800 bg-ink-950/60 py-2 pl-8 pr-8 font-mono text-[11px] text-ink-200 outline-none transition-colors placeholder:text-ink-600 focus:border-accent/40 focus:bg-ink-950"
+              className="focus-ring min-h-9 w-full rounded-lg border border-ink-800 bg-ink-950/60 py-2 pl-8 pr-11 font-mono text-[11px] text-ink-200 outline-none transition-colors placeholder:text-ink-600 focus:border-accent/40 focus:bg-ink-950 [@media(pointer:coarse)]:min-h-11"
             />
             {query && (
               <button
                 type="button"
                 onClick={() => setQuery("")}
-                className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200"
+                className="focus-ring absolute right-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                 aria-label="Clear search"
               >
                 <XIcon width={11} height={11} />
@@ -299,7 +365,7 @@ export function Sidebar(props: Props) {
                       onClick={() => !isRenaming && props.onLoadSession(s.path ?? s.name)}
                       onKeyDown={(event) => handleSessionKeyDown(event, visibleIndex)}
                       aria-current={active ? "page" : undefined}
-                      className={`relative flex w-full items-start gap-2 overflow-hidden rounded-lg border border-transparent px-2 py-2 text-left transition-colors disabled:cursor-wait disabled:opacity-60 ${
+                      className={`focus-ring relative flex min-h-11 w-full items-start gap-2 overflow-hidden rounded-lg border border-transparent px-2 py-2 text-left transition-colors disabled:cursor-wait disabled:opacity-60 ${
                         active
                           ? "session-row-active border-ink-800/60 text-ink-100"
                           : "text-ink-300 hover:bg-ink-900/70 hover:text-ink-100"
@@ -341,7 +407,7 @@ export function Sidebar(props: Props) {
                               }
                               commitRename();
                             }}
-                            className="w-full rounded-md border border-accent/40 bg-ink-950 px-1.5 py-0.5 font-mono text-[11px] text-ink-100 focus:outline-none"
+                            className="focus-ring w-full rounded-md border border-accent/40 bg-ink-950 px-1.5 py-0.5 font-mono text-[11px] text-ink-100"
                           />
                         ) : (
                           <>
@@ -383,7 +449,7 @@ export function Sidebar(props: Props) {
                             setMenuAbove(e.currentTarget.getBoundingClientRect().bottom + 170 > window.innerHeight);
                             setOpenMenu((current) => current === s.name ? null : s.name);
                           }}
-                          className="flex h-5 w-5 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                          className="focus-ring flex h-7 w-7 items-center justify-center rounded-sm text-ink-500 opacity-100 transition-colors hover:bg-ink-800 hover:text-ink-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
                           title="Conversation actions"
                           aria-label={`Actions for ${displayTitle}`}
                           aria-haspopup="menu"
@@ -470,7 +536,7 @@ function ActionBtn({
   return (
     <button
       onClick={onClick}
-      className="flex flex-col items-center gap-1 rounded-sm py-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+      className="focus-ring flex min-h-9 flex-col items-center justify-center gap-1 rounded-sm py-1.5 text-[10px] font-mono uppercase tracking-wider text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100 [@media(pointer:coarse)]:min-h-11"
     >
       {icon}
       {label}
@@ -493,7 +559,7 @@ function CompactAction({
     <button
       type="button"
       onClick={onClick}
-      className={`flex items-center justify-center gap-1.5 rounded-sm px-1.5 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors ${danger ? "text-ink-500 hover:bg-ink-800 hover:text-danger" : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"}`}
+      className={`focus-ring flex min-h-8 items-center justify-center gap-1.5 rounded-sm px-1.5 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-ink-500 hover:bg-ink-800 hover:text-danger" : "text-ink-500 hover:bg-ink-800 hover:text-ink-200"}`}
     >
       {icon}
       {label}
@@ -517,7 +583,7 @@ function SessionMenuItem({
       type="button"
       role="menuitem"
       onClick={onClick}
-      className={`flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] transition-colors ${danger ? "text-danger hover:bg-ink-800" : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"}`}
+      className={`focus-ring flex min-h-8 w-full items-center gap-2 px-2 py-1 text-left text-[11px] transition-colors [@media(pointer:coarse)]:min-h-11 ${danger ? "text-danger hover:bg-ink-800" : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"}`}
     >
       {icon}
       {label}

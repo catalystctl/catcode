@@ -4,7 +4,7 @@
 // remotes — every /api/git action) in a minimal IdeContext shim. openDiff /
 // openPatch / openFile open an in-hub viewer modal instead of an editor.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Diff } from "@/components/diff";
 import { GitPanel } from "@/components/ide/git-panel";
 import { XIcon } from "@/components/icons";
@@ -23,16 +23,30 @@ type ViewerState =
 export function HubGitSidebar({ workspace }: { workspace: string }) {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [viewer, setViewer] = useState<ViewerState>({ kind: "none" });
+  const viewerRequestRef = useRef<{ generation: number; controller: AbortController | null }>({
+    generation: 0,
+    controller: null,
+  });
+
+  const cancelViewerRequest = useCallback(() => {
+    viewerRequestRef.current.controller?.abort();
+    viewerRequestRef.current = {
+      generation: viewerRequestRef.current.generation + 1,
+      controller: null,
+    };
+  }, []);
 
   // A project switch must not leak the previous project's git state.
   useEffect(() => {
+    cancelViewerRequest();
     setGitStatus(null);
     setViewer({ kind: "none" });
-  }, [workspace]);
+    return cancelViewerRequest;
+  }, [cancelViewerRequest, workspace]);
 
   const fetchText = useCallback(
-    async (url: string, field: "diff" | "patch" | "content"): Promise<string> => {
-      const res = await fetch(url, { cache: "no-store" });
+    async (url: string, field: "diff" | "patch" | "content", signal: AbortSignal): Promise<string> => {
+      const res = await fetch(url, { cache: "no-store", signal });
       const data = (await res.json().catch(() => ({}))) as Record<string, unknown> & {
         error?: string;
       };
@@ -44,6 +58,10 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
 
   const openDiff = useCallback(
     (path: string, opts?: { staged?: boolean }) => {
+      cancelViewerRequest();
+      const controller = new AbortController();
+      const generation = viewerRequestRef.current.generation;
+      viewerRequestRef.current.controller = controller;
       const staged = !!opts?.staged;
       setViewer({
         kind: "diff",
@@ -53,59 +71,75 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
       fetchText(
         `/api/git?workspace=${encodeURIComponent(workspace)}&diff=${encodeURIComponent(path)}&staged=${staged ? "1" : "0"}`,
         "diff",
+        controller.signal,
       )
-        .then((content) =>
+        .then((content) => {
+          if (viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "diff" ? { ...v, loading: false, content: content || "(no changes)" } : v,
-          ),
-        )
-        .catch((e) =>
+          );
+        })
+        .catch((e) => {
+          if (controller.signal.aborted || viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "diff" ? { ...v, loading: false, error: String(e?.message ?? e) } : v,
-          ),
-        );
+          );
+        });
     },
-    [fetchText, workspace],
+    [cancelViewerRequest, fetchText, workspace],
   );
 
   const openPatch = useCallback(
     (source: "commit" | "stash", ref: string, label: string) => {
+      cancelViewerRequest();
+      const controller = new AbortController();
+      const generation = viewerRequestRef.current.generation;
+      viewerRequestRef.current.controller = controller;
       setViewer({ kind: "patch", title: label || ref, loading: true });
       const param = source === "commit" ? `commit=${encodeURIComponent(ref)}` : `stash=${encodeURIComponent(ref)}`;
-      fetchText(`/api/git?workspace=${encodeURIComponent(workspace)}&${param}`, "patch")
-        .then((content) =>
+      fetchText(`/api/git?workspace=${encodeURIComponent(workspace)}&${param}`, "patch", controller.signal)
+        .then((content) => {
+          if (viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "patch" ? { ...v, loading: false, content: content || "(empty patch)" } : v,
-          ),
-        )
-        .catch((e) =>
+          );
+        })
+        .catch((e) => {
+          if (controller.signal.aborted || viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "patch" ? { ...v, loading: false, error: String(e?.message ?? e) } : v,
-          ),
-        );
+          );
+        });
     },
-    [fetchText, workspace],
+    [cancelViewerRequest, fetchText, workspace],
   );
 
   const openFile = useCallback(
     (path: string) => {
+      cancelViewerRequest();
+      const controller = new AbortController();
+      const generation = viewerRequestRef.current.generation;
+      viewerRequestRef.current.controller = controller;
       setViewer({ kind: "file", title: path, loading: true });
       fetchText(
         `/api/file?workspace=${encodeURIComponent(workspace)}&path=${encodeURIComponent(path)}`,
         "content",
+        controller.signal,
       )
-        .then((content) =>
+        .then((content) => {
+          if (viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "file" ? { ...v, loading: false, content } : v,
-          ),
-        )
-        .catch((e) =>
+          );
+        })
+        .catch((e) => {
+          if (controller.signal.aborted || viewerRequestRef.current.generation !== generation) return;
           setViewer((v) =>
             v.kind === "file" ? { ...v, loading: false, error: String(e?.message ?? e) } : v,
-          ),
-        );
+          );
+        });
     },
-    [fetchText, workspace],
+    [cancelViewerRequest, fetchText, workspace],
   );
 
   // Minimal IdeApi shim — GitPanel consumes exactly: state.gitStatus,
@@ -136,7 +170,13 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
         <GitPanel />
       </IdeContext.Provider>
       {viewer.kind !== "none" ? (
-        <ViewerModal viewer={viewer} onClose={() => setViewer({ kind: "none" })} />
+        <ViewerModal
+          viewer={viewer}
+          onClose={() => {
+            cancelViewerRequest();
+            setViewer({ kind: "none" });
+          }}
+        />
       ) : null}
     </div>
   );

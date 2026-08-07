@@ -1869,8 +1869,7 @@ pub(crate) async fn run_turn(
                             && !cancel.is_cancelled()
                             && summary_nudge_count < SUMMARY_NUDGE_MAX
                         {
-                            summary_nudge_count =
-                                summary_nudge_count.saturating_add(1);
+                            summary_nudge_count = summary_nudge_count.saturating_add(1);
                             outcome.output = build_summary_required_nudge();
                             do_summary_nudge = true;
                         }

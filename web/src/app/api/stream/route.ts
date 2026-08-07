@@ -27,18 +27,26 @@ export async function GET(req: Request) {
   const bridge = getBridge();
 
   const url = new URL(req.url);
-  const session = url.searchParams.get("session") ?? undefined;
-  const workspace = url.searchParams.get("workspace") ?? undefined;
+  const requestedWorkspace = url.searchParams.get("workspace");
+  const requestedSession = url.searchParams.get("session");
 
   let live;
   try {
+    const workspace = requestedWorkspace
+      ? bridge.authorizeWorkspace(requestedWorkspace)
+      : (requestedSession ? bridge.getWorkspaceForSession(requestedSession) : undefined);
+    if (requestedSession) {
+      bridge.authorizeSession(workspace ?? bridge.getDefaultWorkspace(), requestedSession);
+    }
     // Ensure the session's core is running. If `session` is omitted, fall back to
     // the default workspace's most-recent session (the initial connection).
-    live = await bridge.ensure(workspace, session);
+    live = await bridge.ensure(workspace, requestedSession ?? undefined);
   } catch (err: any) {
+    const message = err?.message ?? "failed to start catcode-core";
+    const status = message.startsWith("unauthorized") ? 403 : 502;
     return new Response(
-      JSON.stringify({ error: err?.message ?? "failed to start catcode-core" }),
-      { status: 502, headers: { "Content-Type": "application/json" } },
+      JSON.stringify({ error: message }),
+      { status, headers: { "Content-Type": "application/json" } },
     );
   }
 

@@ -482,21 +482,62 @@ web bundle has nested web/ layout - this release artifact was packed incorrectly
     W-Ok "Web bundle looks runnable ($Dir)"
 }
 
+function Stop-WebService {
+    $nssm = Get-Command nssm -ErrorAction SilentlyContinue
+    if ($nssm) { [void](Invoke-Native $nssm.Source stop $SvcName) }
+    [void](Invoke-Native sc.exe stop $SvcName)
+    if ((Invoke-Native schtasks /query /tn $TaskName) -eq 0) {
+        [void](Invoke-Native schtasks /end /tn $TaskName)
+    }
+}
+
+function Start-ExistingWebService {
+    $nssm = Get-Command nssm -ErrorAction SilentlyContinue
+    if ($nssm -and (Invoke-Native $nssm.Source start $SvcName) -eq 0) { return }
+    if ((Invoke-Native sc.exe start $SvcName) -eq 0) { return }
+    if ((Invoke-Native schtasks /query /tn $TaskName) -eq 0) {
+        [void](Invoke-Native schtasks /run /tn $TaskName)
+    }
+}
+
 function Install-WebBundle {
     # Universal cross-platform tarball (same asset Linux/macOS/Windows installers fetch).
     $tgz = Get-Asset "catcode-web-$($script:Ver).tar.gz"
-    if (-not (Test-Path -LiteralPath $WebDir)) { New-Item -ItemType Directory -Path $WebDir -Force | Out-Null }
-    Get-ChildItem -LiteralPath $WebDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.
-    $tar = Get-Command tar -ErrorAction SilentlyContinue
-    if (-not $tar) { Die 'tar not found (Windows 10 1803+ ships it). Extract the .tar.gz manually or install tar.' }
-    W-Info "Extracting web bundle -> $WebDir ..."
-    & tar -xzf $tgz -C $WebDir
-    if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
-    Write-WebVersionJson -Dir $WebDir -Commit $script:Ver -Source 'release'
-    Assert-WebBundle -Dir $WebDir
+    $parent = Split-Path -Parent $WebDir
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $stage = Join-Path $parent ('.web-update-' + [guid]::NewGuid().ToString('N'))
+    $backup = "$WebDir.old"
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        # Windows 10+ ships tar (bsdtar); it handles .tar.gz natively.
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+        if (-not $tar) { Die 'tar not found (Windows 10 1803+ ships it). Extract the .tar.gz manually or install tar.' }
+        W-Info "Extracting web bundle -> $stage ..."
+        & tar -xzf $tgz -C $stage
+        if ($LASTEXITCODE -ne 0) { Die "tar extraction failed (exit $LASTEXITCODE)" }
+        Write-WebVersionJson -Dir $stage -Commit $script:Ver -Source 'release'
+        Assert-WebBundle -Dir $stage
 
-    W-Ok "Web bundle extracted to $WebDir"
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+        $promoted = $false
+        for ($attempt = 0; $attempt -lt 10 -and -not $promoted; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $WebDir) { Move-Item -LiteralPath $WebDir -Destination $backup -ErrorAction Stop }
+                Move-Item -LiteralPath $stage -Destination $WebDir -ErrorAction Stop
+                $promoted = $true
+            } catch {
+                if ((Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $WebDir)) {
+                    Move-Item -LiteralPath $backup -Destination $WebDir -ErrorAction SilentlyContinue
+                }
+                if (-not $promoted) { Start-Sleep -Milliseconds 500 }
+            }
+        }
+        if (-not $promoted) { Die 'web bundle is still in use; close the web service and retry' }
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+        W-Ok "Web bundle extracted to $WebDir"
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Write-WebVersionJson {
@@ -614,7 +655,13 @@ function Install-WebService {
     if (-not (Test-Path -LiteralPath $CoreExe)) {
         Die "catcode-core.exe missing at $CoreExe - install core first"
     }
-    Install-WebBundle
+    Stop-WebService
+    try {
+        Install-WebBundle
+    } catch {
+        Start-ExistingWebService
+        throw
+    }
     if (-not (Install-NssmService)) { Install-Task }
     W-Ok "Web frontend service ready at http://localhost:$Port"
 }

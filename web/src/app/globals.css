@@ -20,7 +20,7 @@
   --ink-750: 42 46 54;      /* strong border */
   --ink-700: 52 56 65;      /* border */
   --ink-600: 72 77 88;      /* faint text */
-  --ink-500: 104 110 122;   /* muted text */
+  --ink-500: 124 130 142;   /* muted text (AA on page/surface) */
   --ink-400: 140 146 158;   /* secondary text */
   --ink-300: 176 181 191;   /* body-dim */
   --ink-200: 216 219 226;   /* body */
@@ -30,6 +30,7 @@
   --accent: 214 142 88;
   --accent-soft: 232 170 122;
   --accent-deep: 182 118 66;
+  --accent-foreground: 14 15 18;
 
   /* Semantic tokens. */
   --success: 74 214 128;
@@ -74,7 +75,7 @@
   --ink-750: 218 218 223;
   --ink-700: 207 207 212;
   --ink-600: 178 178 184;
-  --ink-500: 128 128 135;
+  --ink-500: 112 112 119;
   --ink-400: 101 101 108;
   --ink-300: 76 76 83;
   --ink-200: 50 50 57;
@@ -83,6 +84,7 @@
   --accent: 182 110 58;
   --accent-soft: 200 130 80;
   --accent-deep: 150 90 48;
+  --accent-foreground: 22 22 27;
 
   --success: 24 124 62;
   --warning: 176 96 10;
@@ -127,6 +129,19 @@ body {
   color: rgb(var(--ink-100));
 }
 
+/* Shared keyboard-focus baseline. Component-specific rings declared below can
+   replace this outline without losing a visible focus indicator. */
+:where(a, button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid rgb(var(--accent));
+  outline-offset: 2px;
+}
+
+/* Existing accent-filled controls use text-white; keep them AA in both themes
+   until callers can adopt the semantic Tailwind token directly. */
+.bg-accent.text-white {
+  color: rgb(var(--accent-foreground));
+}
+
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
 * {
   scrollbar-width: thin;
@@ -154,10 +169,6 @@ body {
 @keyframes caret-blink {
   0%, 70%, 100% { opacity: 1; }
   20%, 50% { opacity: 0; }
-}
-@keyframes fade-in {
-  0% { opacity: 0; }
-  100% { opacity: 1; }
 }
 @keyframes rise-in {
   0% { opacity: 0; transform: translateY(10px) scale(0.99); }
@@ -219,49 +230,41 @@ body {
   background-size: 24px 24px;
 }
 
-/* ── Composer dock ────────────────────────────────────────────────────────
-   The prompt is the primary instrument: a slightly raised well with a soft
-   outer rim so it reads as a control surface, not another message row. */
+/* ── Composer instrument ──────────────────────────────────────────────────
+   Shares the execution register's measure. The squared top edge makes the
+   prompt feel attached to the record instead of floating as a chat pill. */
 .composer-dock {
   position: relative;
-  background:
-    linear-gradient(
-      180deg,
-      rgb(var(--ink-925) / 0.55) 0%,
-      rgb(var(--ink-925)) 28%
-    );
-  border-top: 1px solid rgb(var(--ink-800) / 0.9);
-  box-shadow: 0 -12px 32px -20px rgb(0 0 0 / 0.55);
+  background: rgb(var(--ink-925) / 0.96);
+  border-top: 1px solid rgb(var(--ink-800));
+  box-shadow: 0 -18px 32px -30px rgb(0 0 0 / 0.8);
 }
 .composer-shell {
-  border: 1px solid rgb(var(--ink-700) / 0.75);
-  background: rgb(var(--ink-950) / 0.92);
-  border-radius: 10px;
-  box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.03),
-    0 1px 0 rgb(0 0 0 / 0.2);
+  border: 1px solid rgb(var(--ink-700) / 0.8);
+  border-left: 3px solid rgb(var(--ink-700));
+  background: rgb(var(--ink-950));
+  border-radius: 3px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.025);
   transition:
     border-color var(--motion-fast) var(--ease-out),
     box-shadow var(--motion-med) var(--ease-out);
 }
 .composer-shell:focus-within {
-  border-color: rgb(var(--accent) / 0.55);
+  border-color: rgb(var(--ink-700));
+  border-left-color: rgb(var(--accent));
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.04),
-    0 0 0 3px rgb(var(--accent) / 0.14),
-    0 8px 24px -16px rgb(var(--accent) / 0.35);
+    inset 0 1px 0 rgb(255 255 255 / 0.035),
+    0 0 0 2px rgb(var(--accent) / 0.12);
 }
-/* In-flight: left ember rail on the shell, not a full border flash. */
 .composer-inflight {
-  border-color: rgb(var(--ink-700) / 0.7);
+  border-left-color: rgb(var(--accent));
   box-shadow:
-    inset 2px 0 0 0 rgb(var(--accent)),
     inset 0 1px 0 rgb(255 255 255 / 0.03),
-    0 0 0 1px rgb(var(--accent) / 0.12);
+    0 0 0 1px rgb(var(--accent) / 0.1);
   animation: inflight-bar 1.4s ease-in-out infinite;
 }
 .composer-inflight:focus-within {
-  border-color: rgb(var(--accent) / 0.55);
+  border-left-color: rgb(var(--accent-soft));
 }
 
 /* Flat "thinking" text — a simple opacity pulse on the label. */
@@ -269,91 +272,140 @@ body {
   animation: shimmer-pulse 1.4s ease-in-out infinite;
 }
 
-/* ── Turn rail (signature) ────────────────────────────────────────────────
-   Continuous left spine through the transcript. Each turn is a tick on the
-   same rail — YOU (ember), AGENT (cool slate), live stream (ember pulse).
-   Reads like a session log / protocol trace, not a bubble chat. */
+/* ── Execution register (signature) ───────────────────────────────────────
+   Labels occupy a real gutter instead of decorating the content edge. The
+   continuous rule encodes chronology; marks distinguish intent, agent, and run. */
 .chat-turn {
+  --register-rule: 4.8rem;
   position: relative;
-  padding-left: 1.35rem;
+  padding-left: 6.15rem;
 }
 .chat-turn::before {
   content: "";
   position: absolute;
-  left: 0.42rem;
+  left: var(--register-rule);
   top: 0;
   bottom: 0;
   width: 1px;
-  background: rgb(var(--ink-750) / 0.9);
+  background: rgb(var(--ink-700) / 0.78);
 }
 .chat-turn:first-child::before {
-  top: 1.15rem;
+  top: 1.45rem;
 }
 .chat-turn:last-child::before {
-  bottom: 0.35rem;
+  bottom: 0.65rem;
 }
 .chat-turn-tick {
   position: absolute;
-  left: 0.2rem;
-  top: 1.05rem;
+  left: calc(var(--register-rule) - 0.3rem);
+  top: 1.42rem;
   z-index: 1;
-  width: 0.55rem;
-  height: 0.55rem;
-  border-radius: 9999px;
-  border: 1.5px solid rgb(var(--ink-700));
-  background: rgb(var(--ink-925));
-  box-shadow: 0 0 0 3px rgb(var(--ink-950));
+  width: 0.62rem;
+  height: 0.62rem;
+  border: 2px solid rgb(var(--ink-700));
+  background: rgb(var(--ink-950));
+  box-shadow: 0 0 0 4px rgb(var(--ink-950));
+}
+.chat-role-label {
+  position: absolute;
+  left: 0;
+  width: 3.8rem;
+  text-align: right;
 }
 .chat-turn--user .chat-turn-tick {
-  border-color: rgb(var(--accent) / 0.85);
-  background: rgb(var(--accent) / 0.35);
+  border-color: rgb(var(--accent));
+  background: rgb(var(--accent));
 }
 .chat-turn--agent .chat-turn-tick {
-  border-color: rgb(var(--ink-500));
-  background: rgb(var(--ink-800));
+  border-color: rgb(var(--ink-400));
+  background: rgb(var(--ink-850));
 }
 .chat-turn--streaming .chat-turn-tick {
   border-color: rgb(var(--accent-soft));
   background: rgb(var(--accent));
   box-shadow:
-    0 0 0 3px rgb(var(--ink-950)),
-    0 0 10px 1px rgb(var(--accent) / 0.55);
+    0 0 0 4px rgb(var(--ink-950)),
+    0 0 12px 1px rgb(var(--accent) / 0.5);
   animation: rail-pulse 1.35s ease-in-out infinite;
 }
+.chat-turn--meta::after {
+  content: "RUN";
+  position: absolute;
+  left: 0;
+  top: 1.08rem;
+  width: 3.8rem;
+  color: rgb(var(--ink-600));
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-align: right;
+}
 .chat-turn--meta .chat-turn-tick {
-  width: 0.4rem;
-  height: 0.4rem;
-  left: 0.28rem;
-  top: 1.15rem;
-  border-color: rgb(var(--ink-600));
-  background: rgb(var(--ink-850));
+  width: 0.42rem;
+  height: 0.42rem;
+  left: calc(var(--register-rule) - 0.2rem);
+  top: 1.2rem;
+  border: 1px solid rgb(var(--ink-500));
+  background: rgb(var(--ink-800));
 }
 @keyframes rail-pulse {
   0%, 100% { box-shadow: 0 0 0 3px rgb(var(--ink-950)), 0 0 8px 0 rgb(var(--accent) / 0.4); }
   50% { box-shadow: 0 0 0 3px rgb(var(--ink-950)), 0 0 14px 2px rgb(var(--accent) / 0.7); }
 }
 
-/* User prompt as a soft quote well on the rail. */
+/* User intent is a brief band, not a messenger bubble. */
 .chat-user-well {
-  border-left: 2px solid rgb(var(--accent) / 0.75);
-  background:
-    linear-gradient(
-      90deg,
-      rgb(var(--accent) / 0.08) 0%,
-      rgb(var(--ink-925) / 0.55) 42%
-    );
-  border-radius: 0 8px 8px 0;
+  border-top: 1px solid rgb(var(--ink-800));
+  border-bottom: 1px solid rgb(var(--ink-800));
+  border-left: 3px solid rgb(var(--accent));
+  background: rgb(var(--ink-925) / 0.72);
+  border-radius: 0 3px 3px 0;
+}
+.chat-agent-body {
+  min-width: 0;
+}
+.chat-run-stack {
+  border-left: 1px solid rgb(var(--ink-750));
+  padding-left: 0.7rem;
+}
+.chat-run-record {
+  border-radius: 3px;
 }
 
-/* Transcript column rhythm. */
+/* One readable measure in every host, including the full-width hub dock. */
 .chat-thread {
-  max-width: 48rem;
+  width: 100%;
+  max-width: 60rem;
   margin-inline: auto;
-  padding-block: 0.75rem 1.25rem;
+  padding-block: 0.65rem 1.75rem;
 }
 .chat-thread--wide {
-  max-width: none;
-  padding-inline: 0.25rem;
+  max-width: 60rem;
+}
+
+@media (max-width: 640px) {
+  .chat-turn {
+    --register-rule: 0.45rem;
+    padding-left: 1.6rem;
+  }
+  .chat-turn-tick {
+    left: 0.13rem;
+  }
+  .chat-role-label {
+    position: static;
+    width: auto;
+    text-align: left;
+  }
+  .chat-turn--meta::after {
+    display: none;
+  }
+  .chat-turn--meta .chat-turn-tick {
+    left: 0.25rem;
+  }
+  .chat-run-stack {
+    margin-left: -0.2rem;
+  }
 }
 
 /* Empty-state instrument panel. */
@@ -433,29 +485,14 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .composer-inflight { animation: none; }
-  .chat-turn--streaming .chat-turn-tick { animation: none; }
-  .animate-fade-in,
-  .animate-ping,
-  .animate-bounce,
-  .animate-pulse,
-  .animate-caret-blink,
-  .chat-empty-hero,
-  .chat-empty-mark,
-  .chat-msg-enter,
-  .chat-jump-pill,
-  .shimmer-text,
-  .stagger-1,
-  .stagger-2,
-  .stagger-3,
-  .stagger-4,
-  .modal-sheet {
+  html:focus-within {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
     animation: none !important;
-  }
-  .stream-caret::after {
-    animation: none;
-  }
-  .chrome-fade {
+    scroll-behavior: auto !important;
     transition: none !important;
   }
   .chat-empty-prompt:hover:not(:disabled) {
@@ -504,7 +541,7 @@ body {
 .prose-catalyst h4 {
   font-weight: 650;
   line-height: 1.3;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   margin: 1.15em 0 0.5em;
   color: rgb(var(--prose-heading));
 }
@@ -522,13 +559,13 @@ body {
   padding-bottom: 0.32em;
   border-bottom: 1px solid rgb(var(--border-subtle));
   font-size: 2em;
-  letter-spacing: -0.025em;
+  letter-spacing: 0;
 }
 .prose-catalyst-document h2 {
   padding-bottom: 0.28em;
   border-bottom: 1px solid rgb(var(--border-subtle));
   font-size: 1.5em;
-  letter-spacing: -0.015em;
+  letter-spacing: 0;
 }
 .prose-catalyst-document h3 {
   font-size: 1.25em;
@@ -831,7 +868,7 @@ body {
   padding: 0.6rem 1rem;
   font-size: 0.9rem;
   font-weight: 600;
-  color: rgb(var(--ink-950));
+  color: rgb(var(--accent-foreground));
   transition: opacity 0.15s, background 0.15s, box-shadow 0.15s;
 }
 .auth-btn-primary:hover:not(:disabled) {

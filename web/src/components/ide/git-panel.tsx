@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AppDialogHost, useAppDialog } from "@/components/app-dialog";
 import {
   CheckIcon,
@@ -106,26 +106,61 @@ export function GitPanel({ compact }: { compact?: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const statusRequestRef = useRef<{
+    generation: number;
+    refreshController: AbortController | null;
+    actionController: AbortController | null;
+  }>({ generation: 0, refreshController: null, actionController: null });
+
+  const invalidateStatusRequests = useCallback(() => {
+    statusRequestRef.current.refreshController?.abort();
+    statusRequestRef.current.actionController?.abort();
+    statusRequestRef.current = {
+      generation: statusRequestRef.current.generation + 1,
+      refreshController: null,
+      actionController: null,
+    };
+  }, []);
 
   const refresh = useCallback(
     async (silent = false) => {
+      if (statusRequestRef.current.actionController) return;
+      statusRequestRef.current.refreshController?.abort();
+      const controller = new AbortController();
+      const generation = statusRequestRef.current.generation + 1;
+      statusRequestRef.current.generation = generation;
+      statusRequestRef.current.refreshController = controller;
       if (!silent) setLoading(true);
       try {
-        const response = await fetch(`/api/git?workspace=${encodeURIComponent(workspace)}`);
+        const response = await fetch(`/api/git?workspace=${encodeURIComponent(workspace)}`, {
+          signal: controller.signal,
+        });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(typeof data.error === "string" ? data.error : "Failed to load Git repository");
         }
+        if (statusRequestRef.current.generation !== generation) return;
         setGitStatus(data as GitStatus);
         setError(null);
       } catch (cause) {
+        if (controller.signal.aborted || statusRequestRef.current.generation !== generation) return;
         setError(cause instanceof Error ? cause.message : "Network error");
       } finally {
-        if (!silent) setLoading(false);
+        if (statusRequestRef.current.generation === generation) {
+          statusRequestRef.current.refreshController = null;
+          setLoading(false);
+        }
       }
     },
     [setGitStatus, workspace],
   );
+
+  useEffect(() => {
+    setLoading(false);
+    setBusy(false);
+    setSelected(null);
+    return invalidateStatusRequests;
+  }, [invalidateStatusRequests, workspace]);
 
   useEffect(() => {
     void refresh();
@@ -149,6 +184,14 @@ export function GitPanel({ compact }: { compact?: boolean }) {
 
   const postAction = useCallback<Action>(
     async (action, extra = {}) => {
+      statusRequestRef.current.refreshController?.abort();
+      statusRequestRef.current.actionController?.abort();
+      setLoading(false);
+      const controller = new AbortController();
+      const generation = statusRequestRef.current.generation + 1;
+      statusRequestRef.current.generation = generation;
+      statusRequestRef.current.refreshController = null;
+      statusRequestRef.current.actionController = controller;
       setBusy(true);
       setResult(null);
       try {
@@ -156,21 +199,27 @@ export function GitPanel({ compact }: { compact?: boolean }) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action, workspace, ...extra }),
+          signal: controller.signal,
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(typeof data.error === "string" ? data.error : `${action} failed`);
         }
+        if (statusRequestRef.current.generation !== generation) return false;
         if (data.status) setGitStatus(data.status as GitStatus);
         setError(null);
         setResult(`${actionLabel(action)} completed`);
         setSelected(null);
         return true;
       } catch (cause) {
+        if (controller.signal.aborted || statusRequestRef.current.generation !== generation) return false;
         setError(cause instanceof Error ? cause.message : "Network error");
         return false;
       } finally {
-        setBusy(false);
+        if (statusRequestRef.current.actionController === controller) {
+          statusRequestRef.current.actionController = null;
+          setBusy(false);
+        }
       }
     },
     [setGitStatus, workspace],

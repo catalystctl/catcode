@@ -77,9 +77,41 @@ The plan matches none of the first four. It retains one restrained cursor/live-s
 
 Both explicit light and dark themes must meet WCAG AA. Every interactive element gets a visible `:focus-visible` state and a minimum 44px target on touch layouts. The shell must fit at 320px without horizontal page scroll. Dialogs and drawers trap focus and preserve semantic landmarks. Reduced-motion mode disables entrance, rail pulse, shimmer, lift, and sheet transitions while preserving state through color and copy.
 
+## Populated Chat, Second Pass
+
+The first implementation preserved the rail but allowed docked chat to become full-width. In a wide hub this made the output read like an unstructured README and reduced the signature to a faint line against the viewport edge.
+
+Revised concept: **execution register**. A bounded transcript sits inside the broad workspace. Every turn has a fixed register gutter: an explicit `YOU`, `AGENT`, or `RUN` mark is aligned to a stronger vertical rule, followed by a quiet content column. Human prompts are concise brief bands; assistant output remains unboxed and document-like; tools are subordinate run records. The composer shares the exact same width and left alignment as the transcript.
+
+```text
+                  bounded execution register
+            +------------------------------------+
+        YOU |  brief / user intent               |
+            |                                    |
+      AGENT |  unboxed answer                    |
+            |  headings, prose, tools            |
+        RUN |  compact tool record               |
+            +------------------------------------+
+            |  prompt instrument                 |
+            +------------------------------------+
+```
+
+The aesthetic risk is the oversized register gutter: it spends horizontal space on authorship and chronology instead of maximizing text width. That cost is justified because supervision, not document publishing, is the product. On narrow screens the gutter collapses to a compact mark while preserving the rail.
+
+Second-pass reverse-5:
+
+1. A generic chat redesign would alternate left/right bubbles; this does not.
+2. It would place each assistant answer in a floating card; assistant prose remains unframed.
+3. It would use avatars as authorship; the register uses execution labels and rail marks.
+4. It would maximize content width in the name of density; the register deliberately bounds line length.
+5. It would make the composer a detached floating pill; the composer is a squared-off continuation of the record.
+
 ## Critique Checklist
 
 - Does the turn rail read immediately on populated sessions?
+- Is the transcript bounded to a readable measure even in docked hub mode?
+- Do user intent, assistant reasoning, and tool execution have distinct hierarchy without bubbles?
+- Does the composer align with the same register as the transcript?
 - Is ember reserved for intent, focus, and live state?
 - Does any panel look like a decorative card or card-inside-card?
 - Are tool output, repository state, and prompts readable without competing for attention?

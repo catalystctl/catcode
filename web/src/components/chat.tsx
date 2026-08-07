@@ -33,14 +33,7 @@ import { ErrorBoundary } from "./error-boundary";
 import { AppDialogHost, useAppDialog } from "./app-dialog";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useFocusTrap } from "@/lib/use-focus-trap";
-import { SparkIcon, ShieldIcon, SendIcon, BrandMark } from "./icons";
-
-const EXAMPLES = [
-  { label: "Build", detail: "Create a feature", prompt: "Build a useful feature for this project. First inspect the existing patterns, then implement and test it." },
-  { label: "Debug", detail: "Track down a problem", prompt: "Find and fix an important bug in this workspace. Explain the cause and verify the fix." },
-  { label: "Explain", detail: "Understand the code", prompt: "Explain the architecture of this codebase and identify the most important entry points." },
-  { label: "Review", detail: "Improve recent work", prompt: "Review the recent changes for correctness, usability, and maintainability. Fix any clear issues you find." },
-];
+import { ShieldIcon, SendIcon, BrandMark } from "./icons";
 
 /** Parse `agent "task"` / `agent 'task'` / `agent bare-task` pairs from slash args. */
 function parseAgentTasks(args: string): Array<{ agent: string; task: string }> {
@@ -586,8 +579,14 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const sendPrompt = async (text: string, imgs?: string[]) => {
     const snapshot = imgs?.length ? imgs : images.length ? [...images] : undefined;
     setImages([]);
-    const ok = await agent.prompt(text, snapshot);
-    if (!ok && snapshot?.length) setImages(snapshot);
+    try {
+      const ok = await agent.prompt(text, snapshot);
+      if (!ok && snapshot?.length) setImages(snapshot);
+      return ok;
+    } catch (error) {
+      if (snapshot?.length) setImages(snapshot);
+      throw error;
+    }
   };
 
   // Preview (and other IDE panels) attach context into the composer via IdeContext.
@@ -668,6 +667,17 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const currentSessionTitle = currentSession
     ? currentSession.title || basename(currentSession.name) || currentSession.name
     : undefined;
+  const draftId = `${state.workspace}\n${state.currentSessionFile || "new-session"}`;
+  const manualPlanReady =
+    state.goalMode?.phase === "plan_ready" && !state.goalMode.auto_deploy;
+  const hitlOpen = !!(
+    state.pendingApproval ||
+    state.pendingAsk ||
+    state.pendingSudo ||
+    state.pendingIntercom ||
+    state.pendingOauth ||
+    manualPlanReady
+  );
   const empty = state.messages.length === 0;
   const switching = state.switching;
   const activeFile =
@@ -772,21 +782,12 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               connected={agent.connected}
               switching={switching}
               canSend={!!currentModel && agent.connected}
-              compact={
-                !!(
-                  state.pendingApproval ||
-                  state.pendingAsk ||
-                  state.pendingSudo ||
-                  state.pendingIntercom ||
-                  state.pendingOauth ||
-                  state.goalMode
-                )
-              }
+              compact={hitlOpen || !!state.goalMode}
               adaptive={!!docked}
               onPick={(t) => agent.prompt(t)}
             />
           ) : (
-            <div className={`chat-thread w-full ${docked ? "chat-thread--wide px-2" : "px-4 sm:px-6"}`}>
+            <div className={`chat-thread w-full ${docked ? "chat-thread--wide px-3 sm:px-5" : "px-3 sm:px-6"}`}>
               <ErrorBoundary label="message list">
                 {state.messages.map((m, i) => (
                   <Message
@@ -822,7 +823,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
 
         {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
         {!switching && (
-          <div ref={hitlGateRef} className={`mx-auto w-full shrink-0 ${docked ? "max-w-none" : "max-w-[48rem]"}`}>
+          <div ref={hitlGateRef} className="mx-auto w-full max-w-[60rem] shrink-0">
             {state.pendingApproval && (
               <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
                 <Approval approval={state.pendingApproval} onApprove={agent.approve} />
@@ -867,7 +868,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
             {state.goalMode &&
               state.goalMode.phase === "plan_ready" &&
               !state.goalMode.auto_deploy && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <div className={`${docked ? "mx-3 mb-2 mt-2 sm:mx-5" : "mx-3 mb-2 mt-3 sm:mx-6"}`}>
                   <GoalPlanBanner
                     goal={state.goalMode.goal}
                     summary={state.goalPlan?.summary}
@@ -899,7 +900,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
               state.goalMode.phase !== "idle" &&
               (state.goalMode.phase !== "plan_ready" ||
                 state.goalMode.auto_deploy) && (
-                <div className={`${docked ? "mx-2 mb-2 mt-2" : "mx-4 mb-2 mt-3 sm:mx-6"}`}>
+                <div className={`${docked ? "mx-3 mb-2 mt-2 sm:mx-5" : "mx-3 mb-2 mt-3 sm:mx-6"}`}>
                   <GoalProgressPanel
                     goalMode={state.goalMode}
                     onCancel={() => void agent.cancelGoal()}
@@ -910,28 +911,23 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         )}
 
         <Composer
+          key={draftId}
           ref={composerRef}
           compact={docked}
           streaming={state.streaming}
           followUpQueued={state.followUpQueued}
-          hitlOpen={
-            !!(
-              state.pendingApproval ||
-              state.pendingAsk ||
-              state.pendingSudo ||
-              state.pendingIntercom ||
-              state.pendingOauth
-            )
-          }
+          hitlOpen={hitlOpen}
           connected={agent.connected}
           canSend={!!currentModel && !switching}
           thinkingLevel={state.thinkingLevel}
           modelLabel={modelLabel}
           images={images}
           workspace={state.workspace}
+          draftId={draftId}
           activeFile={activeFile}
           onAddImage={onAddImage}
           onRemoveImage={onRemoveImage}
+          onRestoreImages={setImages}
           onPrompt={sendPrompt}
           onSteer={(t) => agent.steer(t)}
           onAbort={agent.abort}
@@ -1114,76 +1110,57 @@ function EmptyState({
           hitlCompact ? "py-3" : dockedEmpty ? "py-6" : "py-10"
         } ${dockedEmpty ? "max-w-none" : "max-w-[40rem]"}`}
       >
-        <div className={`chat-empty-card ${hitlCompact ? "p-3" : "p-5 sm:p-6"}`}>
-          <div className="flex items-start gap-3">
-            <span className="chat-empty-mark flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-accent/12 text-accent-soft ring-1 ring-accent/20">
-              <BrandMark size={22} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-500">
+        <div className={`border-l border-ink-800 ${hitlCompact ? "py-1 pl-3" : "py-2 pl-5 sm:pl-6"}`}>
+          <div className="flex items-center gap-3">
+            <BrandMark size={22} />
+            <div className="min-w-0">
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-500">
                 Session ready
               </p>
-              {switching ? (
-                <p className="mt-1 font-mono text-[12px] text-ink-400">Loading session…</p>
-              ) : (
-                <>
-                  <h2 className="mt-1 font-display text-[1.15rem] font-semibold tracking-tight text-ink-100 sm:text-[1.25rem]">
-                    What should we work on?
-                  </h2>
-                  <p className="mt-1 truncate font-mono text-[11px] text-accent-soft/90">
-                    {basename(workspace) || workspace || "this workspace"}
-                    {!connected && (
-                      <span className="ml-2 text-ink-600">· connecting…</span>
-                    )}
-                  </p>
-                </>
-              )}
+              <p className="mt-0.5 truncate font-mono text-[11px] text-accent-soft/90">
+                {basename(workspace) || workspace || "this workspace"}
+                {!connected && <span className="ml-2 text-ink-600">· connecting…</span>}
+              </p>
             </div>
           </div>
 
-          {!switching && !(dockedEmpty && hitlCompact) && (
-            <div className={`mt-5 grid gap-2 ${dockedEmpty ? "" : "sm:grid-cols-2"}`}>
-              {EXAMPLES.map((ex, i) => (
+          {switching ? (
+            <p className="mt-4 font-mono text-[12px] text-ink-400">Loading session…</p>
+          ) : (
+            <>
+              <h2 className="mt-5 font-display text-[1.15rem] font-semibold text-ink-100 sm:text-[1.25rem]">
+                Start with the repository
+              </h2>
+              <p className="mt-2 max-w-lg text-[13px] leading-relaxed text-ink-400">
+                Ask CatCode to inspect the project before choosing the first change, or write a specific task below.
+              </p>
+
+              {!(dockedEmpty && hitlCompact) && (
                 <button
-                  key={ex.label}
                   type="button"
                   disabled={!canSend}
                   onClick={() => {
                     if (!canSend) return;
-                    onPick(ex.prompt);
+                    onPick(
+                      "Inspect this project and summarize its structure, current state, and the most useful next task.",
+                    );
                   }}
-                  className={`chat-empty-prompt group stagger-${Math.min(i + 1, 4)}`}
+                  className="focus-ring mt-5 inline-flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900 px-3.5 py-2.5 text-[13px] font-medium text-ink-100 transition-colors hover:border-accent/40 hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-ink-900 text-ink-400 ring-1 ring-ink-800 transition-colors group-hover:text-accent-soft group-hover:ring-accent/30">
-                    <SparkIcon width={13} height={13} />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-2">
-                      <span className="text-[13px] font-medium text-ink-100">{ex.label}</span>
-                      <SendIcon
-                        width={12}
-                        height={12}
-                        className="ml-auto shrink-0 text-ink-700 opacity-0 transition group-hover:opacity-100 group-hover:text-accent-soft"
-                      />
-                    </span>
-                    {!dockedEmpty && (
-                      <span className="mt-0.5 block text-[12px] leading-snug text-ink-500">
-                        {ex.detail}
-                      </span>
-                    )}
-                  </span>
+                  Inspect project
+                  <SendIcon width={13} height={13} />
                 </button>
-              ))}
-            </div>
-          )}
+              )}
 
-          {!switching && !hitlCompact && (
-            <p className="mt-4 font-mono text-[10px] leading-relaxed text-ink-600">
-              <kbd className={kbd}>/</kbd> commands{" "}
-              <span className="text-ink-700">·</span>{" "}
-              <kbd className={kbd}>@</kbd> files{" "}
-              <span className="text-ink-700">·</span> live across devices
-            </p>
+              {!hitlCompact && (
+                <p className="mt-5 font-mono text-[10px] leading-relaxed text-ink-600">
+                  <kbd className={kbd}>/</kbd> commands{" "}
+                  <span className="text-ink-700">·</span>{" "}
+                  <kbd className={kbd}>@</kbd> files{" "}
+                  <span className="text-ink-700">·</span> sessions stay live across devices
+                </p>
+              )}
+            </>
           )}
         </div>
       </div>

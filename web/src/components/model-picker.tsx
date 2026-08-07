@@ -91,16 +91,16 @@ export function ModelPicker({
             className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-600"
           />
           <input
-            autoFocus={true}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search models…"
-            className="w-full rounded-sm border border-ink-700 bg-ink-950 py-1.5 pl-8 pr-7 text-[12px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+            className="min-h-11 w-full rounded-sm border border-ink-700 bg-ink-950 py-1.5 pl-8 pr-12 text-[16px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:pr-7 sm:text-[12px]"
           />
           {query && (
             <button
+              type="button"
               onClick={() => setQuery("")}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-600 hover:text-ink-300"
+              className="absolute right-1 top-1/2 flex min-h-11 min-w-11 -translate-y-1/2 items-center justify-center text-ink-600 hover:text-ink-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70"
               aria-label="Clear search"
             >
               <XIcon width={12} height={12} />
@@ -144,11 +144,12 @@ export function ModelPicker({
             return (
               <button
                 key={mo.id}
+                type="button"
                 onClick={() => {
                   onSelect(mo.id);
                   onClose?.();
                 }}
-                className={`flex w-full items-center gap-2.5 border-l-2 px-3 py-2 text-left transition-colors hover:bg-ink-850 ${
+                className={`flex min-h-11 w-full items-center gap-2.5 border-l-2 px-3 py-2 text-left transition-colors hover:bg-ink-850 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/70 sm:min-h-0 ${
                   active ? "border-l-accent bg-ink-850" : "border-l-transparent"
                 } ${i > 0 ? "border-t border-ink-800/50" : ""}`}
               >
@@ -200,7 +201,7 @@ export function ModelPicker({
               type="button"
               onClick={onRefresh}
               disabled={refreshing}
-              className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-200 disabled:cursor-wait disabled:opacity-60"
+              className="inline-flex min-h-11 items-center gap-1 rounded-sm px-2 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:cursor-wait disabled:opacity-60 sm:min-h-0 sm:px-1.5"
               title="Refresh model list from providers"
               aria-label="Refresh model list"
             >
@@ -229,8 +230,10 @@ function ProviderChip({
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
-      className={`rounded-sm border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+      aria-pressed={active}
+      className={`min-h-11 rounded-sm border px-3 py-2 font-mono text-[10px] uppercase tracking-wider transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 sm:min-h-0 sm:px-2 sm:py-0.5 ${
         active
           ? "border-accent/60 bg-ink-850 text-accent-soft"
           : "border-ink-700 bg-ink-900 text-ink-400 hover:border-ink-600 hover:text-ink-200"

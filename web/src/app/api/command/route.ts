@@ -40,16 +40,31 @@ export async function POST(req: Request) {
   const workspaceDir = typeof workspace === "string" ? workspace : undefined;
   const cmd = cmdRest as CoreCommand;
 
+  let authorizedWorkspace: string;
+  try {
+    authorizedWorkspace = bridge.authorizeWorkspace(
+      workspaceDir ?? bridge.getWorkspaceForSession(sessionFile) ?? bridge.getDefaultWorkspace(),
+    );
+    if (sessionFile) bridge.authorizeSession(authorizedWorkspace, sessionFile);
+  } catch (err) {
+    return Response.json(
+      { ok: false, error: err instanceof Error ? err.message : "unauthorized workspace" },
+      { status: 403 },
+    );
+  }
+
   // ── Bridge-intercepted commands (never forwarded to a core) ──
   try {
     switch (cmd.type) {
       case "switch_workspace": {
         const path = (cmd as { path: string }).path;
-        const { session: file, workspace: ws } = await bridge.switchWorkspace(path);
+        const { session: file, workspace: ws } = await bridge.switchWorkspace(
+          bridge.authorizeWorkspace(path),
+        );
         return Response.json({ ok: true, session: file, workspace: ws });
       }
       case "new_session": {
-        const ws = workspaceDir ?? bridge.getDefaultWorkspace();
+        const ws = authorizedWorkspace;
         const { session: file, workspace: ws2 } = await bridge.newSession(ws);
         return Response.json({ ok: true, session: file, workspace: ws2 });
       }
@@ -58,11 +73,12 @@ export async function POST(req: Request) {
         // each session loads its own file on start. Echo the path back so the
         // client can switch its active session if it sent this command.
         const path = (cmd as { path: string }).path;
+        bridge.authorizeSession(authorizedWorkspace, path);
         return Response.json({ ok: true, session: path });
       }
       case "rename_session": {
         const { name, title } = cmd as { name: string; title: string };
-        bridge.renameSession(workspaceDir ?? bridge.getDefaultWorkspace(), name, title);
+        bridge.renameSession(authorizedWorkspace, name, title);
         return Response.json({ ok: true });
       }
       case "list_projects":
@@ -80,23 +96,28 @@ export async function POST(req: Request) {
       }
       case "delete_session": {
         const path = (cmd as { path: string }).path;
-        const ws = workspaceDir ?? bridge.getWorkspaceForSession(path) ?? bridge.getDefaultWorkspace();
+        const ws = bridge.authorizeWorkspace(
+          workspaceDir ?? bridge.getWorkspaceForSession(path) ?? bridge.getDefaultWorkspace(),
+        );
         const { session: file, workspace: ws2 } = await bridge.deleteSession(ws, path);
         return Response.json({ ok: true, session: file, workspace: ws2 });
       }
     }
 
     // ── Route to the target session's core ──
-    const ws = workspaceDir ?? bridge.getWorkspaceForSession(sessionFile) ?? bridge.getDefaultWorkspace();
-    const file = sessionFile ?? bridge.mostRecentSession(ws);
+    const ws = authorizedWorkspace;
+    const file = sessionFile
+      ? bridge.authorizeSession(ws, sessionFile)
+      : bridge.mostRecentSession(ws);
     const live = bridge.getOrCreate(ws, file);
     await live.ensure();
     live.send(cmd);
     return Response.json({ ok: true });
   } catch (err: any) {
+    const message = err?.message ?? "send failed";
     return Response.json(
-      { ok: false, error: err?.message ?? "send failed" },
-      { status: 500 },
+      { ok: false, error: message },
+      { status: message.startsWith("unauthorized") ? 403 : 500 },
     );
   }
 }
