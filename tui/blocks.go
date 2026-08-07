@@ -1683,7 +1683,6 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 	s.cur = nil
 }
 
-
 // peelThinkTags extracts a leading <think>…</think> block from MiniMax-style
 // assistant content. ok is false when no complete tag pair is present.
 func peelThinkTags(content string) (thought, visible string, ok bool) {

@@ -569,13 +569,10 @@ mod tests {
         assert!(content.starts_with("<think>\nhidden chain\n</think>\n"));
         assert!(content.ends_with("visible answer"));
         assert!(
-            built.body["messages"][0]
-                .get("reasoning_content")
-                .is_none(),
+            built.body["messages"][0].get("reasoning_content").is_none(),
             "proxy path must not send bare reasoning_content"
         );
     }
-
 
     #[test]
     fn zhipu_omits_stream_options_and_enables_thinking() {

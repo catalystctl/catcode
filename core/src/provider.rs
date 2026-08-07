@@ -1514,8 +1514,7 @@ async fn stream_turn_openai(
                                             if !quiet {
                                                 emitted = true;
                                                 emit(
-                                                    &Event::new("delta")
-                                                        .with("text", json!(delta)),
+                                                    &Event::new("delta").with("text", json!(delta)),
                                                 );
                                             }
                                         }
@@ -1734,7 +1733,7 @@ async fn stream_turn_openai(
                     add_structured_tool_call_recovery_instruction(&mut body);
                     content.clear();
                     wire_text.clear();
-        think_demux = ThinkTagDemux::default();
+                    think_demux = ThinkTagDemux::default();
                     reasoning.clear();
                     tool_calls.clear();
                     finish_reason.clear();
@@ -1959,7 +1958,8 @@ async fn stream_turn_gemini(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut content, &text, false) {
+                            if let Some(delta) = append_stream_fragment(&mut content, &text, false)
+                            {
                                 if content.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -1970,7 +1970,9 @@ async fn stream_turn_gemini(
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, false) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut reasoning, &text, false)
+                            {
                                 if reasoning.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -3461,7 +3463,9 @@ async fn stream_turn_anthropic(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut content, &text, minimax) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut content, &text, minimax)
+                            {
                                 if content.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -3472,7 +3476,9 @@ async fn stream_turn_anthropic(
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, minimax) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut reasoning, &text, minimax)
+                            {
                                 if reasoning.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -4560,34 +4566,24 @@ mod tests {
         assert!(!is_minimax("https://api.openai.com/v1"));
     }
 
-
     #[test]
     fn think_tag_demux_splits_complete_and_partial_tags() {
         let mut d = ThinkTagDemux::default();
         // Opening tag split across chunks.
         assert!(d.push("<thi").is_empty());
         let p1 = d.push("nk>\nstep one");
-        assert_eq!(
-            p1,
-            vec![ThinkPiece::Thinking("\nstep one".into())]
-        );
+        assert_eq!(p1, vec![ThinkPiece::Thinking("\nstep one".into())]);
         let p2 = d.push(" continues</th");
         assert_eq!(p2, vec![ThinkPiece::Thinking(" continues".into())]);
         let p3 = d.push("ink>\n\n## Answer\nHi");
-        assert_eq!(
-            p3,
-            vec![ThinkPiece::Text("\n\n## Answer\nHi".into())]
-        );
+        assert_eq!(p3, vec![ThinkPiece::Text("\n\n## Answer\nHi".into())]);
         assert!(d.finish().is_empty());
     }
 
     #[test]
     fn think_tag_demux_plain_text_passthrough() {
         let mut d = ThinkTagDemux::default();
-        assert_eq!(
-            d.push("hello "),
-            vec![ThinkPiece::Text("hello ".into())]
-        );
+        assert_eq!(d.push("hello "), vec![ThinkPiece::Text("hello ".into())]);
         assert_eq!(d.push("world"), vec![ThinkPiece::Text("world".into())]);
     }
 
@@ -4649,7 +4645,10 @@ mod tests {
         }
         sanitize_assistant_content(&mut content);
         assert_eq!(thinking, "\nThe user is asking what.\n");
-        assert!(!thinking.contains("The userThe user"), "duplicated thinking: {thinking}");
+        assert!(
+            !thinking.contains("The userThe user"),
+            "duplicated thinking: {thinking}"
+        );
         assert_eq!(content, "Hello");
         assert!(!content.contains("</think>"));
     }
@@ -4664,7 +4663,7 @@ mod tests {
         assert_eq!(s2, "Hi  there");
     }
 
-        #[test]
+    #[test]
     fn append_stream_fragment_handles_cumulative_and_delta() {
         // Pure incremental: repeated prefix tokens must NOT be dropped.
         let mut inc = String::new();
