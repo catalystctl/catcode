@@ -108,21 +108,22 @@ await runtime.session.prompt("explain this repo");
 
 ### `web/` — Hub frontend
 
-A project-centric terminal workspace in the browser. The Next.js server hosts
-persistent zigpty sessions that auto-launch the `catcode` TUI per pane, plus
-git/browse/project APIs. Fully prebuilt — no `next build` on the host. The
-former IDE shell and chat-only SSE bridge have been removed.
+A project-centric **chat + git** workspace in the browser. The Next.js server
+hosts a multi-session SSE bridge to `catcode-core` (one live core per chat
+session file), plus git/browse/project APIs. Fully prebuilt — no `next build`
+on the host. Terminal panes have been removed; sessions reattach across devices.
 
 [Source: `web/`](../web) · [`web/README.md`](../web/README.md) · [`hub-frontend.md`](hub-frontend.md)
 
 ```
-Browser ──WS───▶ /api/terminal ──▶ zigpty ──▶ catcode (per pane)
-Browser ──HTTP─▶ /api/git|/api/browse|/api/hub/projects ──▶ workspace FS
+Browser ──SSE───▶ /api/stream   ──▶ HarnessBridge ──▶ catcode-core (per session)
+Browser ──HTTP──▶ /api/command ──▶ HarnessBridge ──▶ same cores
+Browser ──HTTP──▶ /api/git|/api/browse|/api/hub/* ──▶ workspace FS
 ```
 
-- Project tabs with split terminal grids (presets up to 4×4)
+- Project tabs with multi-session agent chat (live across devices)
 - Git sidebar (status, history, branches, stashes, remotes)
-- Server-side PTY persistence across refresh / sign-out
+- Server-side core persistence across refresh / sign-out / other devices
 
 ---
 
@@ -351,7 +352,7 @@ source](../core/src/checkpoint.rs)
 
 ```
 core/        Rust async engine (stdio JSONL)   tui/   Go + Bubble Tea terminal UI
-sdk/         TypeScript pi-compatible wrapper   web/   Next.js hub frontend (terminal workspace)
+sdk/         TypeScript pi-compatible wrapper   web/   Next.js hub frontend (chat + git)
 packaging/   per-platform install scripts       .catalyst-code/   bundled agents, plugins, skills
 ```
 
@@ -432,7 +433,7 @@ packaging/   per-platform install scripts       .catalyst-code/   bundled agents
 | Document | Scope |
 |----------|-------|
 | [`SELF_LEARNING.md`](SELF_LEARNING.md) | Self-learning layer design & implementation |
-| [`hub-frontend.md`](hub-frontend.md) | Hub terminal workspace architecture |
+| [`hub-frontend.md`](hub-frontend.md) | Hub chat + git workspace architecture |
 | [`tui-perf-surface.md`](tui-perf-surface.md) | TUI performance surface map |
 | [`PLUGINS.md`](PLUGINS.md) | Plugin authoring contract entry point |
 | [`examples/plugins/README.md`](examples/plugins/README.md) | Example plugin catalog |

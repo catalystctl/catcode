@@ -1,49 +1,44 @@
 // Hub layout state helpers — pure sanitize + client fetch/push against the
 // account-scoped server store (`/api/hub/layout`).
 //
-// Server-side PTYs outlive the browser (see web/src/server/server.ts), and
-// pane ids ARE the terminal session ids — so restoring the layout on ANY
-// signed-in device reattaches every running catcode. localStorage is only a
-// same-device cache / one-shot migration source, never the source of truth.
+// Chat sessions live server-side (one catcode-core per session file via the
+// HarnessBridge). The account layout only remembers which projects are open,
+// which session was last viewed per project, and git-sidebar chrome — so any
+// signed-in device reopens the same chats and reattaches the live feed.
+// localStorage is only a same-device cache / one-shot migration source.
 
-import { leafNode, validateLayout, type LayoutNode } from "@/lib/hub-layout";
-
-/** Legacy same-device cache key (pre multi-device sync). Still read once to migrate. */
+/** Legacy same-device cache key (pre multi-device sync + pre chat-hub). */
 export const HUB_STORAGE_KEY = "catcode:hub:v1";
 
+/** Current account-layout schema version (chat hub, no terminal panes). */
+export const HUB_LAYOUT_VERSION = 2 as const;
+
 export interface HubPersistState {
-  version: 1;
+  version: typeof HUB_LAYOUT_VERSION;
   /** Open project tabs, in order (absolute workspace paths). */
   tabPaths: string[];
   /** Display name per project path (basename at add time). */
   names: Record<string, string>;
-  /** Split-tree layout per project path (survives tab close). */
-  layouts: Record<string, LayoutNode>;
   /** Active tab path (must be in tabPaths, else null). */
   active: string | null;
-  /** Last-focused pane id per project path. */
-  focused: Record<string, string>;
+  /**
+   * Last-viewed chat session file per project path. Absolute .jsonl path.
+   * When a device opens a project, it reattaches this session's live core
+   * (or starts the most-recent session if missing).
+   */
+  sessions: Record<string, string>;
   /** Git sidebar visibility + width. */
   gitOpen: boolean;
   gitWidth: number;
 }
 
-let paneSeq = 0;
-
-/** Fresh pane id — also the persistent server-side terminal session id. */
-export function newPaneId(): string {
-  paneSeq += 1;
-  return `hub_${Date.now().toString(36)}_${paneSeq}`;
-}
-
 export function defaultHubState(): HubPersistState {
   return {
-    version: 1,
+    version: HUB_LAYOUT_VERSION,
     tabPaths: [],
     names: {},
-    layouts: {},
     active: null,
-    focused: {},
+    sessions: {},
     gitOpen: true,
     gitWidth: 320,
   };
@@ -54,37 +49,30 @@ export function pathBasename(abs: string): string {
   return abs.split(/[\\/]/).filter(Boolean).pop() ?? abs;
 }
 
-/** Sanitize untrusted layout JSON into a HubPersistState. */
-export function sanitizeHubState(
-  raw: unknown,
-  makePaneId: () => string = newPaneId,
-): HubPersistState {
+/** Sanitize untrusted layout JSON into a HubPersistState (v1 terminal → v2 chat). */
+export function sanitizeHubState(raw: unknown): HubPersistState {
   const base = defaultHubState();
   if (!raw || typeof raw !== "object") return base;
-  const parsed = raw as Partial<HubPersistState>;
+  const parsed = raw as Partial<HubPersistState> & {
+    /** v1 terminal hub fields — ignored but tolerated for migration. */
+    layouts?: unknown;
+    focused?: unknown;
+  };
 
   const tabPaths = Array.isArray(parsed.tabPaths)
     ? parsed.tabPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
     : [];
-
-  const layouts: Record<string, LayoutNode> = {};
-  const allPaths = new Set<string>([
-    ...tabPaths,
-    ...Object.keys(parsed.layouts ?? {}).filter((k) => typeof k === "string"),
-  ]);
-  for (const path of allPaths) {
-    const restored = validateLayout(parsed.layouts?.[path]);
-    layouts[path] = restored ?? leafNode(makePaneId());
-  }
 
   const names: Record<string, string> = {};
   for (const [k, v] of Object.entries(parsed.names ?? {})) {
     if (typeof k === "string" && typeof v === "string" && v) names[k] = v;
   }
 
-  const focused: Record<string, string> = {};
-  for (const [k, v] of Object.entries(parsed.focused ?? {})) {
-    if (typeof k === "string" && typeof v === "string" && v) focused[k] = v;
+  const sessions: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed.sessions ?? {})) {
+    if (typeof k === "string" && typeof v === "string" && v.endsWith(".jsonl")) {
+      sessions[k] = v;
+    }
   }
 
   const active =
@@ -93,12 +81,11 @@ export function sanitizeHubState(
       : (tabPaths[0] ?? null);
 
   return {
-    version: 1,
+    version: HUB_LAYOUT_VERSION,
     tabPaths,
     names,
-    layouts,
     active,
-    focused,
+    sessions,
     gitOpen: typeof parsed.gitOpen === "boolean" ? parsed.gitOpen : true,
     gitWidth:
       typeof parsed.gitWidth === "number" && Number.isFinite(parsed.gitWidth)
@@ -137,12 +124,11 @@ export interface HubLayoutFetchResult {
 /**
  * Load the account layout from the server. If the server has never stored a
  * layout but this browser still has the legacy localStorage key, migrate it
- * once so the first multi-device session picks up existing tabs/panes.
+ * once so the first multi-device session picks up existing tabs.
  */
 export async function fetchHubLayout(): Promise<HubLayoutFetchResult> {
   const res = await fetch("/api/hub/layout", { cache: "no-store" });
   if (!res.ok) {
-    // Fall back to local cache when offline / server error so the shell still opens.
     const cached = readLocalHubCache();
     return {
       layout: cached ?? defaultHubState(),
@@ -157,14 +143,13 @@ export async function fetchHubLayout(): Promise<HubLayoutFetchResult> {
   const serverLayout = sanitizeHubState(data.layout);
   const updatedAt = typeof data.updatedAt === "number" ? data.updatedAt : 0;
 
-  // Empty server + non-empty local cache → one-shot migration.
   const isEmpty =
     serverLayout.tabPaths.length === 0 &&
-    Object.keys(serverLayout.layouts).length === 0 &&
+    Object.keys(serverLayout.sessions).length === 0 &&
     updatedAt === 0;
   if (isEmpty) {
     const local = readLocalHubCache();
-    if (local && (local.tabPaths.length > 0 || Object.keys(local.layouts).length > 0)) {
+    if (local && (local.tabPaths.length > 0 || Object.keys(local.sessions).length > 0)) {
       const pushed = await pushHubLayout(local);
       return { layout: pushed.layout, updatedAt: pushed.updatedAt, migrated: true };
     }
@@ -198,6 +183,6 @@ export async function pushHubLayout(state: HubPersistState): Promise<HubLayoutPu
   writeLocalHubCache(layout);
   return {
     layout,
-    updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : Date.now(),
+    updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : 0,
   };
 }

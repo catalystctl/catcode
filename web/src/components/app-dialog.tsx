@@ -3,7 +3,7 @@
 // Promise-based confirm / prompt dialogs that replace window.confirm / window.prompt.
 // Each call site mounts <AppDialogHost dialog={…} /> and awaits confirm()/prompt().
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
 import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
@@ -119,6 +119,8 @@ function ConfirmView({
   onCancel,
 }: ConfirmOpts & { onConfirm: () => void; onCancel: () => void }) {
   const done = useRef(false);
+  const titleId = useId();
+  const descId = useId();
   const finish = (ok: boolean) => {
     if (done.current) return;
     done.current = true;
@@ -131,7 +133,8 @@ function ConfirmView({
 
   return (
     <div
-      className="modal-backdrop z-[60]"
+      // Above hub chrome: mobile git drawer z-65, project switcher z-70, viewer z-80.
+      className="modal-backdrop z-[90]"
       onMouseDown={(e) => {
         e.stopPropagation();
         finish(false);
@@ -142,12 +145,12 @@ function ConfirmView({
         className="modal-sheet modal-sheet-auto max-w-md"
         role="alertdialog"
         aria-modal="true"
-        aria-labelledby="app-dialog-title"
-        aria-describedby="app-dialog-desc"
+        aria-labelledby={titleId}
+        aria-describedby={descId}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
-          <h2 id="app-dialog-title" className="text-[15px] font-semibold text-ink-100">
+          <h2 id={titleId} className="text-[15px] font-semibold text-ink-100">
             {title}
           </h2>
           <button
@@ -158,7 +161,7 @@ function ConfirmView({
             <XIcon width={16} height={16} />
           </button>
         </div>
-        <p id="app-dialog-desc" className="px-5 py-4 text-[13px] leading-relaxed text-ink-300">
+        <p id={descId} className="px-5 py-4 text-[13px] leading-relaxed text-ink-300">
           {message}
         </p>
         <div className="flex justify-end gap-2 border-t border-ink-800 px-5 py-3">
@@ -202,6 +205,7 @@ function PromptView({
   const [value, setValue] = useState(defaultValue);
   const done = useRef(false);
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const titleId = useId();
   const finish = (v: string | null) => {
     if (done.current) return;
     done.current = true;
@@ -225,7 +229,8 @@ function PromptView({
 
   return (
     <div
-      className="modal-backdrop z-[60]"
+      // Above hub chrome: mobile git drawer z-65, project switcher z-70, viewer z-80.
+      className="modal-backdrop z-[90]"
       onMouseDown={(e) => {
         e.stopPropagation();
         finish(null);
@@ -236,11 +241,11 @@ function PromptView({
         className="modal-sheet modal-sheet-auto max-w-md"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="app-prompt-title"
+        aria-labelledby={titleId}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 border-b border-ink-800 px-5 py-3.5">
-          <h2 id="app-prompt-title" className="text-[15px] font-semibold text-ink-100">
+          <h2 id={titleId} className="text-[15px] font-semibold text-ink-100">
             {title}
           </h2>
           <button

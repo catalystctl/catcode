@@ -1,0 +1,200 @@
+"use client";
+
+// Intercom — the subagent supervisor surface.
+//
+// (1) IntercomPrompt: when a subagent calls contact_supervisor({reason:
+// "need_decision"}), the core emits an `intercom_message` event and blocks
+// waiting for `intercom_reply`. This banner surfaces the ask + a reply box so
+// the orchestrator (the user) can unblock the child. Without it the subagent
+// hangs forever — this is the P0 correctness path.
+// (2) SubagentPanel: a modal log of recent intercom/subagent activity.
+
+import { useEffect, useRef, useState } from "react";
+import type { IntercomEntry, IntercomPrompt } from "@/lib/types";
+import { relativeTime } from "@/lib/format";
+import { DotIcon, SendIcon, XIcon } from "./icons";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+
+function QuestionIcon(props: { width?: number; height?: number; className?: string }) {
+  const { width = 16, height = 16, className } = props;
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
+      <path d="M12 17h.01" />
+    </svg>
+  );
+}
+
+interface PromptProps {
+  prompt: IntercomPrompt;
+  onReply: (reply: string) => void;
+  onDismiss: () => void;
+}
+
+export function IntercomPrompt({ prompt, onReply, onDismiss }: PromptProps) {
+  const [text, setText] = useState("");
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    ref.current?.focus();
+  }, []);
+
+  const send = () => {
+    const t = text.trim();
+    // An empty "Send reply" used to dispatch an empty reply to the subagent
+    // (mirroring the TUI's fixed "Enter does not reply" bug). No-op instead —
+    // the user can type a reply or press Skip to defer to the subagent.
+    if (!t) return;
+    onReply(t);
+    setText("");
+  };
+
+  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      send();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onDismiss();
+    }
+  };
+
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="Subagent needs a decision"
+      className="my-3 overflow-hidden rounded-sm border border-ink-700 border-l-2 border-l-accent bg-ink-925"
+    >
+      <div className="flex items-center gap-2 border-b border-ink-800 px-4 py-2.5">
+        <QuestionIcon width={14} height={14} className="shrink-0 text-accent-soft" />
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-400">
+          Subagent needs a decision
+        </span>
+        <span className="ml-auto flex min-w-0 items-center gap-1.5 rounded-sm border border-ink-800 bg-ink-950 px-1.5 py-0.5">
+          <span className="text-xs">↳</span>
+          <span className="truncate font-mono text-[11px] text-ink-200">{prompt.from}</span>
+        </span>
+      </div>
+      <div className="px-4 py-3">
+        <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-sm border border-ink-800 bg-ink-950 p-2.5 font-mono text-[11px] leading-relaxed text-ink-200">
+          <code>{prompt.message}</code>
+        </pre>
+        <textarea
+          ref={ref}
+          rows={2}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={onKey}
+          placeholder="Reply to the subagent…"
+          className="mb-3 w-full resize-none rounded-sm border border-ink-700 bg-ink-950 px-3 py-2 text-[12px] leading-relaxed text-ink-100 placeholder:text-ink-500 transition-colors focus:border-accent/50 focus:outline-none"
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={send}
+            disabled={!text.trim()}
+            className="flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-800 disabled:text-ink-500"
+          >
+            <SendIcon width={13} height={13} /> Send reply
+          </button>
+          <button
+            onClick={onDismiss}
+            className="flex items-center gap-1.5 rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 transition-colors hover:bg-ink-800"
+          >
+            <XIcon width={13} height={13} /> Skip
+          </button>
+          <span className="ml-auto hidden font-mono text-[10px] text-ink-500 sm:inline">
+            <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Enter</kbd> reply ·{" "}
+            <kbd className="rounded-sm border border-ink-800 bg-ink-950 px-1 py-0.5 font-mono text-[10px]">Esc</kbd> skip
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface PanelProps {
+  log: IntercomEntry[];
+  onClose: () => void;
+}
+
+const KIND_COLOR: Record<IntercomEntry["kind"], string> = {
+  ask: "text-warning",
+  reply: "text-success",
+  status: "text-ink-500",
+};
+
+export function SubagentPanel({ log, onClose }: PanelProps) {
+  const closeRef = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
+  const entries = [...log].sort((a, b) => b.ts - a.ts);
+
+  return (
+    <div className="modal-backdrop">
+      <div
+        ref={mergeRefs(closeRef, trapRef)}
+        className="modal-sheet max-w-lg"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Subagent activity"
+      >
+        <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
+          <span className="text-[11px] font-mono uppercase tracking-wider text-ink-400">
+            Subagent activity
+          </span>
+          <button
+            onClick={onClose}
+            className="rounded-sm p-1 text-ink-500 transition-colors hover:bg-ink-800 hover:text-ink-100"
+            aria-label="Close"
+          >
+            <XIcon width={16} height={16} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-2">
+          {entries.length === 0 ? (
+            <div className="px-3 py-10 text-center text-[12px] text-ink-600">
+              No subagent activity yet.
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {entries.map((e) => (
+                <li
+                  key={e.id}
+                  className="rounded-sm px-2.5 py-2 transition-colors hover:bg-ink-900"
+                >
+                  <div className="flex items-center gap-2">
+                    <DotIcon className={KIND_COLOR[e.kind]} />
+                    {e.from && (
+                      <span className="font-mono text-[11px] text-ink-400">{e.from}</span>
+                    )}
+                    {e.to && (
+                      <span className="font-mono text-[11px] text-ink-600">→ {e.to}</span>
+                    )}
+                    <span className="ml-auto font-mono text-[10px] text-ink-600">
+                      {relativeTime(e.ts)}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 pl-4 text-[12px] leading-relaxed text-ink-200">
+                    {e.message}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

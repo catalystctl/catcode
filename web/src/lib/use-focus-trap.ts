@@ -40,7 +40,21 @@ export function useFocusTrap<T extends HTMLElement = HTMLDivElement>(active = tr
     el.addEventListener("keydown", onKey);
     return () => {
       el.removeEventListener("keydown", onKey);
-      previouslyFocused?.focus?.();
+      // Only restore if the previous target is still in the document AND
+      // visible. Hub keeps every project tab mounted under `display:none`;
+      // restoring into a hidden Ghostty container makes the visible pane look
+      // dead to typing.
+      if (
+        previouslyFocused &&
+        document.contains(previouslyFocused) &&
+        previouslyFocused.offsetParent !== null
+      ) {
+        try {
+          previouslyFocused.focus?.();
+        } catch {
+          /* ignore */
+        }
+      }
     };
   }, [active]);
   return ref;

@@ -773,6 +773,15 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 
 	case "http_retry":
 		s.logInfo(fmt.Sprintf("retry #%s %s (%s ms)", ev.get("attempt"), ev.get("status"), ev.get("backoff_ms")))
+		// Mid-stream transport retries re-POST the same turn. Core already
+		// cleared its own accumulators; drop any partial assistant/thinking
+		// text the failed attempt streamed so a successful retry cannot
+		// append a second copy. Tool calls already dispatched this turn are
+		// left alone — the agent loop owns them and re-running side effects
+		// is unsafe.
+		if raw, ok := ev.rawKey("discard_partial"); ok && strings.TrimSpace(string(raw)) == "true" {
+			s.discardPartialStreamOutput()
+		}
 
 	case "metrics":
 		s.lastMetrics = ev.Raw

@@ -10,6 +10,9 @@ import { GitPanel } from "@/components/ide/git-panel";
 import { XIcon } from "@/components/icons";
 import { IdeContext, type IdeApi, type IdeContextValue } from "@/lib/ide-context";
 import type { GitStatus } from "@/lib/types";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+import { mergeRefs, useOutsideClose } from "@/lib/use-outside-close";
 
 type ViewerState =
   | { kind: "none" }
@@ -109,12 +112,13 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
   // setGitStatus, openDiff, openPatch, openFile, selectEditor. Everything
   // else is an inert no-op (the hub has no editor/tabs/docks).
   const ide: IdeApi = {
-    state: { gitStatus },
+    state: { gitStatus, openTabs: [], activeTabId: null },
     setGitStatus,
     openDiff,
     openPatch,
     openFile,
     selectEditor: () => {},
+    setUiMode: () => {},
   };
 
   const contextValue: IdeContextValue = {
@@ -122,6 +126,8 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
     ide,
     openSettings: () => {},
     openProjects: () => {},
+    attachToChat: () => {},
+    registerAttachToChat: () => {},
   };
 
   return (
@@ -137,13 +143,9 @@ export function HubGitSidebar({ workspace }: { workspace: string }) {
 }
 
 function ViewerModal({ viewer, onClose }: { viewer: Exclude<ViewerState, { kind: "none" }>; onClose: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const closeRef = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLElement>();
+  useBodyScrollLock();
 
   const kindLabel =
     viewer.kind === "diff" ? "Diff" : viewer.kind === "patch" ? "Patch" : "File";
@@ -154,6 +156,7 @@ function ViewerModal({ viewer, onClose }: { viewer: Exclude<ViewerState, { kind:
       onMouseDown={onClose}
     >
       <section
+        ref={mergeRefs(closeRef, trapRef)}
         role="dialog"
         aria-modal="true"
         aria-label={`${kindLabel}: ${viewer.title}`}

@@ -198,8 +198,6 @@ body {
 }
 
 /* ── Chat entrance motion ───────────────────────────────────────────────── */
-/* Kept as plain layout hooks while the empty state transitions — no glow or
-   float animations in the flat IDE-native design. */
 .chat-empty-hero {
   position: relative;
 }
@@ -209,18 +207,10 @@ body {
 .chat-msg-enter {
   animation: fade-in var(--motion-fast) var(--ease-out) both;
 }
-.chat-jump-pill {
-  border-radius: 4px;
-  border: 1px solid rgb(var(--ink-700));
-  background: rgb(var(--ink-900));
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25), 0 2px 8px -2px rgb(0 0 0 / 0.3);
-  backdrop-filter: none;
-  animation: fade-in var(--motion-med) var(--ease-out) both;
-}
-.stagger-1 { animation: rise-in 0.5s var(--ease-out) 0.10s both; }
-.stagger-2 { animation: rise-in 0.5s var(--ease-out) 0.18s both; }
-.stagger-3 { animation: rise-in 0.5s var(--ease-out) 0.26s both; }
-.stagger-4 { animation: rise-in 0.5s var(--ease-out) 0.34s both; }
+.stagger-1 { animation: rise-in 0.45s var(--ease-out) 0.06s both; }
+.stagger-2 { animation: rise-in 0.45s var(--ease-out) 0.12s both; }
+.stagger-3 { animation: rise-in 0.45s var(--ease-out) 0.18s both; }
+.stagger-4 { animation: rise-in 0.45s var(--ease-out) 0.24s both; }
 
 /* ── Subtle dotted backdrop for the app shell ───────────────────────────── */
 .bg-grid {
@@ -229,15 +219,49 @@ body {
   background-size: 24px 24px;
 }
 
-/* ── Composer inflight indicator ──────────────────────────────────────────
-   Flat IDE-native busy state: a 2px accent bar along the composer's left
-   edge that pulses opacity while the model works. No glow, no gradients,
-   no blur. Applied to the composer container div. */
+/* ── Composer dock ────────────────────────────────────────────────────────
+   The prompt is the primary instrument: a slightly raised well with a soft
+   outer rim so it reads as a control surface, not another message row. */
+.composer-dock {
+  position: relative;
+  background:
+    linear-gradient(
+      180deg,
+      rgb(var(--ink-925) / 0.55) 0%,
+      rgb(var(--ink-925)) 28%
+    );
+  border-top: 1px solid rgb(var(--ink-800) / 0.9);
+  box-shadow: 0 -12px 32px -20px rgb(0 0 0 / 0.55);
+}
+.composer-shell {
+  border: 1px solid rgb(var(--ink-700) / 0.75);
+  background: rgb(var(--ink-950) / 0.92);
+  border-radius: 10px;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.03),
+    0 1px 0 rgb(0 0 0 / 0.2);
+  transition:
+    border-color var(--motion-fast) var(--ease-out),
+    box-shadow var(--motion-med) var(--ease-out);
+}
+.composer-shell:focus-within {
+  border-color: rgb(var(--accent) / 0.55);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.04),
+    0 0 0 3px rgb(var(--accent) / 0.14),
+    0 8px 24px -16px rgb(var(--accent) / 0.35);
+}
+/* In-flight: left ember rail on the shell, not a full border flash. */
 .composer-inflight {
-  border: 1px solid rgb(var(--ink-700) / 0.6);
-  background: rgb(var(--ink-900) / 0.9);
-  box-shadow: inset 2px 0 0 0 rgb(var(--accent));
-  animation: inflight-bar 1.2s ease-in-out infinite;
+  border-color: rgb(var(--ink-700) / 0.7);
+  box-shadow:
+    inset 2px 0 0 0 rgb(var(--accent)),
+    inset 0 1px 0 rgb(255 255 255 / 0.03),
+    0 0 0 1px rgb(var(--accent) / 0.12);
+  animation: inflight-bar 1.4s ease-in-out infinite;
+}
+.composer-inflight:focus-within {
+  border-color: rgb(var(--accent) / 0.55);
 }
 
 /* Flat "thinking" text — a simple opacity pulse on the label. */
@@ -245,8 +269,172 @@ body {
   animation: shimmer-pulse 1.4s ease-in-out infinite;
 }
 
+/* ── Turn rail (signature) ────────────────────────────────────────────────
+   Continuous left spine through the transcript. Each turn is a tick on the
+   same rail — YOU (ember), AGENT (cool slate), live stream (ember pulse).
+   Reads like a session log / protocol trace, not a bubble chat. */
+.chat-turn {
+  position: relative;
+  padding-left: 1.35rem;
+}
+.chat-turn::before {
+  content: "";
+  position: absolute;
+  left: 0.42rem;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgb(var(--ink-750) / 0.9);
+}
+.chat-turn:first-child::before {
+  top: 1.15rem;
+}
+.chat-turn:last-child::before {
+  bottom: 0.35rem;
+}
+.chat-turn-tick {
+  position: absolute;
+  left: 0.2rem;
+  top: 1.05rem;
+  z-index: 1;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 9999px;
+  border: 1.5px solid rgb(var(--ink-700));
+  background: rgb(var(--ink-925));
+  box-shadow: 0 0 0 3px rgb(var(--ink-950));
+}
+.chat-turn--user .chat-turn-tick {
+  border-color: rgb(var(--accent) / 0.85);
+  background: rgb(var(--accent) / 0.35);
+}
+.chat-turn--agent .chat-turn-tick {
+  border-color: rgb(var(--ink-500));
+  background: rgb(var(--ink-800));
+}
+.chat-turn--streaming .chat-turn-tick {
+  border-color: rgb(var(--accent-soft));
+  background: rgb(var(--accent));
+  box-shadow:
+    0 0 0 3px rgb(var(--ink-950)),
+    0 0 10px 1px rgb(var(--accent) / 0.55);
+  animation: rail-pulse 1.35s ease-in-out infinite;
+}
+.chat-turn--meta .chat-turn-tick {
+  width: 0.4rem;
+  height: 0.4rem;
+  left: 0.28rem;
+  top: 1.15rem;
+  border-color: rgb(var(--ink-600));
+  background: rgb(var(--ink-850));
+}
+@keyframes rail-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgb(var(--ink-950)), 0 0 8px 0 rgb(var(--accent) / 0.4); }
+  50% { box-shadow: 0 0 0 3px rgb(var(--ink-950)), 0 0 14px 2px rgb(var(--accent) / 0.7); }
+}
+
+/* User prompt as a soft quote well on the rail. */
+.chat-user-well {
+  border-left: 2px solid rgb(var(--accent) / 0.75);
+  background:
+    linear-gradient(
+      90deg,
+      rgb(var(--accent) / 0.08) 0%,
+      rgb(var(--ink-925) / 0.55) 42%
+    );
+  border-radius: 0 8px 8px 0;
+}
+
+/* Transcript column rhythm. */
+.chat-thread {
+  max-width: 48rem;
+  margin-inline: auto;
+  padding-block: 0.75rem 1.25rem;
+}
+.chat-thread--wide {
+  max-width: none;
+  padding-inline: 0.25rem;
+}
+
+/* Empty-state instrument panel. */
+.chat-empty {
+  position: relative;
+  isolation: isolate;
+}
+.chat-empty::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 60% 40% at 50% 0%, rgb(var(--accent) / 0.07), transparent 70%);
+  opacity: 0.9;
+}
+.chat-empty-card {
+  position: relative;
+  border: 1px solid rgb(var(--ink-800));
+  background: rgb(var(--ink-925) / 0.65);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
+}
+.chat-empty-prompt {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 0.75rem;
+  border: 1px solid rgb(var(--ink-800) / 0.9);
+  background: rgb(var(--ink-950) / 0.45);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  text-align: left;
+  transition:
+    border-color var(--motion-fast) var(--ease-out),
+    background var(--motion-fast) var(--ease-out),
+    transform var(--motion-fast) var(--ease-out);
+}
+.chat-empty-prompt:hover:not(:disabled) {
+  border-color: rgb(var(--accent) / 0.45);
+  background: rgb(var(--ink-900) / 0.8);
+  transform: translateY(-1px);
+}
+.chat-empty-prompt:focus-visible {
+  outline: none;
+  border-color: rgb(var(--accent) / 0.7);
+  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.18);
+}
+.chat-empty-prompt:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Session list active tick. */
+.session-row-active {
+  background:
+    linear-gradient(
+      90deg,
+      rgb(var(--accent) / 0.1) 0%,
+      rgb(var(--ink-900) / 0.95) 28%
+    );
+}
+
+/* Jump-to-latest chip. */
+.chat-jump-pill {
+  border-radius: 9999px;
+  border: 1px solid rgb(var(--ink-700));
+  background: rgb(var(--ink-900) / 0.92);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 16px -6px rgb(0 0 0 / 0.5);
+}
+
+/* Focus ring utility for icon buttons. */
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--ink-950)), 0 0 0 4px rgb(var(--accent) / 0.55);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .composer-inflight { animation: none; }
+  .chat-turn--streaming .chat-turn-tick { animation: none; }
   .animate-fade-in,
   .animate-ping,
   .animate-bounce,
@@ -260,7 +448,8 @@ body {
   .stagger-1,
   .stagger-2,
   .stagger-3,
-  .stagger-4 {
+  .stagger-4,
+  .modal-sheet {
     animation: none !important;
   }
   .stream-caret::after {
@@ -268,6 +457,9 @@ body {
   }
   .chrome-fade {
     transition: none !important;
+  }
+  .chat-empty-prompt:hover:not(:disabled) {
+    transform: none;
   }
 }
 

@@ -1382,10 +1382,11 @@ async fn stream_turn_openai(
         .cloned()
         .unwrap_or_default();
 
-    // ponytail: retry the stream only while NOTHING has been emitted to the TUI
-    // yet — once a delta/thinking/tool_call event went out, a retry would
-    // duplicate visible output, so we fail instead. The idle + connect timeouts
-    // catch stalls; this catches a transient cut *before* the first token.
+    // ponytail: retry the stream on transient cut-offs. Before the first token
+    // we retry any failure. After partial deltas we still retry classified
+    // transport/gateway failures (body drop, 5xx/504 stream frames) and ask
+    // the TUI to discard the partial so a successful retry cannot duplicate
+    // visible output. Non-retryable failures (malformed SSE, auth) stay fatal.
     let max_attempts = 3u32;
     let mut content = String::new();
     let mut reasoning = String::new();
@@ -1685,17 +1686,20 @@ async fn stream_turn_openai(
             break; // stream completed cleanly
         }
         let msg = err.unwrap();
-        // Retry only if we showed nothing to the TUI yet (else output duplicates).
-        if emitted || attempt >= max_attempts {
+        // Retry transient stream failures even after partial tokens: the TUI
+        // discards the partial on `discard_partial` so a successful retry cannot
+        // duplicate visible output. Non-retryable failures (malformed SSE,
+        // auth, idle after partial) still fail immediately.
+        if !should_retry_stream_attempt(&msg, emitted, attempt, max_attempts) {
             return Err(msg);
         }
         let backoff = backoff_ms(attempt, None);
-        emit(
-            &Event::new("http_retry")
-                .with("attempt", json!(attempt))
-                .with("reason", json!("stream error before first token"))
-                .with("backoff_ms", json!(backoff)),
-        );
+        let reason = if emitted {
+            "retryable stream error after partial output"
+        } else {
+            "stream error before first token"
+        };
+        emit_stream_retry(attempt, reason, backoff, emitted);
         // Reset accumulators for the fresh attempt.
         content.clear();
         reasoning.clear();
@@ -2005,16 +2009,16 @@ async fn stream_turn_gemini(
             break;
         }
         let msg = err.unwrap();
-        if emitted || attempt >= max_attempts {
+        if !should_retry_stream_attempt(&msg, emitted, attempt, max_attempts) {
             return Err(msg);
         }
         let backoff = backoff_ms(attempt, None);
-        emit(
-            &Event::new("http_retry")
-                .with("attempt", json!(attempt))
-                .with("reason", json!("stream error before first token"))
-                .with("backoff_ms", json!(backoff)),
-        );
+        let reason = if emitted {
+            "retryable stream error after partial output"
+        } else {
+            "stream error before first token"
+        };
+        emit_stream_retry(attempt, reason, backoff, emitted);
         content.clear();
         reasoning.clear();
         genai_tool_calls.clear();
@@ -2022,6 +2026,9 @@ async fn stream_turn_gemini(
         tokens_in = 0;
         tokens_out = 0;
         cached_tokens = 0;
+        // Gemini path tracks emitted outside the attempt loop; reset so a
+        // successful retry starts clean and a second failure reclassifies.
+        emitted = false;
         timer.call_first_token = None;
         sleep_or_cancel(Duration::from_millis(backoff), cancel).await?;
     }
@@ -2473,6 +2480,87 @@ fn is_recoverable_truncated_chunked_body(
     }
     let lower = error.to_ascii_lowercase();
     lower.contains("unexpected eof") && lower.contains("chunk size line")
+}
+
+/// Transient mid-stream failures worth a fresh POST even after the TUI already
+/// saw partial tokens. Covers reqwest/hyper body drops (h2 "unexpected internal
+/// error", connection reset mid-SSE) and gateway blips that surface as stream
+/// or provider error frames (504/502/503, overloaded). Non-transient failures
+/// (auth, validation, malformed SSE, idle timeout after partial) stay fatal so
+/// we never loop on a broken request shape or hang-then-retry forever.
+fn is_retryable_stream_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    // Body/transport drops while reading an otherwise-accepted SSE response.
+    if lower.contains("stream read:")
+        || lower.contains("error decoding response body")
+        || lower.contains("error reading a body from connection")
+        || lower.contains("stream error received")
+        || lower.contains("unexpected internal error")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || (lower.contains("connection")
+            && (lower.contains("closed")
+                || lower.contains("aborted")
+                || lower.contains("reset")))
+    {
+        return true;
+    }
+    // Gateway / provider overload frames (HTTP 5xx already retried on the
+    // initial POST; this path covers mid-stream error events and body text).
+    if lower.contains("gateway timeout")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("server_error")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("http 408")
+        || lower.contains("http 429")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        // Bare status tokens in provider stream error frames / bodies.
+        || lower.contains("\"code\":504")
+        || lower.contains("\"code\":\"504\"")
+        || lower.contains(" status 504")
+        || lower.contains(" 504 ")
+        || lower.ends_with(" 504")
+        || lower.contains("status: 504")
+        || lower.contains("error 504")
+        || lower.contains(" 502 bad gateway")
+        || lower.contains(" 503 service")
+        || lower.contains("504 gateway")
+    {
+        return true;
+    }
+    false
+}
+
+/// Decide whether a failed stream attempt may be retried. Before any visible
+/// output we retry broadly (same as historical behaviour). After partial
+/// deltas we only retry classified transport/gateway failures, and always ask
+/// the TUI to discard the partial so a successful retry cannot duplicate text.
+fn should_retry_stream_attempt(message: &str, emitted: bool, attempt: u32, max_attempts: u32) -> bool {
+    if attempt >= max_attempts {
+        return false;
+    }
+    if !emitted {
+        return true;
+    }
+    is_retryable_stream_failure(message)
+}
+
+/// Emit the shared http_retry event. `discard_partial` tells the TUI to drop
+/// any in-progress assistant/thinking/tool blocks from the failed attempt.
+fn emit_stream_retry(attempt: u32, reason: &str, backoff: u64, discard_partial: bool) {
+    let mut ev = Event::new("http_retry")
+        .with("attempt", json!(attempt))
+        .with("reason", json!(reason))
+        .with("backoff_ms", json!(backoff));
+    if discard_partial {
+        ev = ev.with("discard_partial", json!(true));
+    }
+    emit(&ev);
 }
 
 fn is_terminal_stream_event(event: &NormalizedStreamEvent) -> bool {
@@ -3178,16 +3266,16 @@ async fn stream_turn_anthropic(
             break; // stream completed cleanly
         }
         let msg = err.unwrap();
-        if emitted || attempt >= max_attempts {
+        if !should_retry_stream_attempt(&msg, emitted, attempt, max_attempts) {
             return Err(msg);
         }
         let backoff = backoff_ms(attempt, None);
-        emit(
-            &Event::new("http_retry")
-                .with("attempt", json!(attempt))
-                .with("reason", json!("stream error before first token"))
-                .with("backoff_ms", json!(backoff)),
-        );
+        let reason = if emitted {
+            "retryable stream error after partial output"
+        } else {
+            "stream error before first token"
+        };
+        emit_stream_retry(attempt, reason, backoff, emitted);
         content.clear();
         reasoning.clear();
         blocks.clear();
@@ -4016,6 +4104,7 @@ mod tests {
         assert!(is_retryable_http_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
         assert!(is_retryable_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_http_status(StatusCode::GATEWAY_TIMEOUT));
         // Non-retryable client errors must fail fast.
         assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
@@ -4023,6 +4112,47 @@ mod tests {
         assert!(!is_retryable_http_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_http_status(StatusCode::UNPROCESSABLE_ENTITY));
         assert!(!is_retryable_http_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn retryable_stream_failure_policy() {
+        // The exact error chain from h2/hyper mid-SSE body drops (seen on
+        // karutoil/ck-grok): must be retryable even after partial output.
+        let h2_drop = "stream read: error decoding response body -> error reading a body from connection -> stream error received: unexpected internal error encountered";
+        assert!(is_retryable_stream_failure(h2_drop));
+        assert!(should_retry_stream_attempt(h2_drop, true, 1, 3));
+        assert!(should_retry_stream_attempt(h2_drop, false, 1, 3));
+        assert!(!should_retry_stream_attempt(h2_drop, true, 3, 3));
+
+        assert!(is_retryable_stream_failure(
+            "stream read: error decoding response body -> error reading a body from connection -> unexpected EOF during chunk size line"
+        ));
+        assert!(is_retryable_stream_failure("HTTP 504: gateway timeout"));
+        assert!(is_retryable_stream_failure("provider stream error: 504 Gateway Timeout"));
+        assert!(is_retryable_stream_failure("provider stream error: overloaded"));
+        assert!(is_retryable_stream_failure("connection reset by peer"));
+
+        // Non-transient: stay fatal once tokens were shown.
+        assert!(!is_retryable_stream_failure(
+            "malformed provider stream event: {not json"
+        ));
+        assert!(!is_retryable_stream_failure(
+            "stream idle timeout (90s with no data)"
+        ));
+        assert!(!is_retryable_stream_failure("HTTP 401: invalid credentials"));
+        assert!(!should_retry_stream_attempt(
+            "malformed provider stream event: nope",
+            true,
+            1,
+            3
+        ));
+        // Pre-token still retries broadly (historical behaviour).
+        assert!(should_retry_stream_attempt(
+            "stream idle timeout (90s with no data)",
+            false,
+            1,
+            3
+        ));
     }
 
     #[test]

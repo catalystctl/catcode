@@ -7,8 +7,8 @@
 //   PUT  /api/hub/layout  body: HubPersistState (or partial — sanitized)
 //   → 200 { ok: true, layout: HubPersistState, updatedAt: number }
 //
-// The layout carries pane ids that ARE server terminal session ids, so every
-// device that loads it reattaches the same still-running catcode PTYs.
+// The layout remembers open projects + last-viewed chat session per project
+// so every signed-in device reopens the same chats and reattaches live cores.
 
 import { getSession } from "@/lib/auth";
 import {

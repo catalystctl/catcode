@@ -90,6 +90,7 @@ fn write_error_response(stream: &mut std::net::TcpStream, status: u16, body: &st
         401 => "Unauthorized",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let response = format!(
@@ -274,6 +275,104 @@ fn retry_provider(fatal: bool) -> (String, Arc<AtomicBool>, thread::JoinHandle<(
             let payload = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                 serde_json::json!({"choices":[{"delta":{"content":"RETRY_OK"}}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
+            );
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+            let _ = write_sse_chunk(&mut stream, &payload);
+            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+    });
+    (format!("http://{address}/v1"), stop, handle)
+}
+
+/// First chat POST streams a partial delta then drops the TCP connection
+/// mid-body (no terminal frame, no zero-sized chunk). Second POST completes
+/// cleanly. Exercises mid-stream body-drop retry after partial tokens.
+fn midstream_drop_then_success_provider() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut posts = 0_u32;
+        while Instant::now() < deadline && !thread_stop.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let request = read_http_request(&mut stream);
+            if request.starts_with("GET ") {
+                write_json_response(
+                    &mut stream,
+                    r#"{"mock-model":{"display_name":"Mock","capabilities":{"context_window":8192,"recommended_max_tokens":1024}}}"#,
+                );
+                continue;
+            }
+            posts += 1;
+            if posts == 1 {
+                // Partial assistant text, then hard-close so the client sees a
+                // body/connection read error (mirrors h2 internal-error drops).
+                let partial = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices":[{"delta":{"content":"PARTIAL "}}]})
+                );
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+                let _ = write_sse_chunk(&mut stream, &partial);
+                // Deliberately omit the terminating 0-chunk and RST/close.
+                drop(stream);
+                continue;
+            }
+            let payload = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"FULL_OK"}}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
+            );
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+            let _ = write_sse_chunk(&mut stream, &payload);
+            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+    });
+    (format!("http://{address}/v1"), stop, handle)
+}
+
+/// First chat POST returns HTTP 504; second completes. Confirms gateway
+/// timeout stays on the retryable status path at the initial POST layer.
+fn gateway_timeout_then_success_provider() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut posts = 0_u32;
+        while Instant::now() < deadline && !thread_stop.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let request = read_http_request(&mut stream);
+            if request.starts_with("GET ") {
+                write_json_response(
+                    &mut stream,
+                    r#"{"mock-model":{"display_name":"Mock","capabilities":{"context_window":8192,"recommended_max_tokens":1024}}}"#,
+                );
+                continue;
+            }
+            posts += 1;
+            if posts == 1 {
+                write_error_response(
+                    &mut stream,
+                    504,
+                    r#"{"error":{"message":"gateway timeout"}}"#,
+                );
+                continue;
+            }
+            let payload = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"GATE_OK"}}]}),
                 serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
             );
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
@@ -1111,6 +1210,76 @@ fn provider_retry_then_success_preserves_event_order() {
         .position(|event| event["type"] == "done")
         .unwrap();
     assert!(retry_index < delta_index && delta_index < done_index);
+
+    drop(core);
+    stop_server.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn provider_midstream_body_drop_retries_after_partial_and_succeeds() {
+    let (base_url, stop_server, server) = midstream_drop_then_success_provider();
+    let workspace = temp_workspace();
+    let mut core = CoreHarness::start(&workspace, &base_url);
+    core.send(serde_json::json!({"type":"init","protocol_version":2}));
+    core.until("protocol_hello");
+    core.send(serde_json::json!({"type":"send","prompt":"midstream","model":"mock-model"}));
+    let events = core.until("done");
+
+    let partial_index = events
+        .iter()
+        .position(|event| event["type"] == "delta" && event["text"] == "PARTIAL ")
+        .expect("partial delta from first attempt");
+    let retry = events
+        .iter()
+        .find(|event| event["type"] == "http_retry")
+        .expect("http_retry after mid-stream body drop");
+    assert_eq!(retry["discard_partial"], true);
+    assert_eq!(
+        retry["reason"],
+        "retryable stream error after partial output"
+    );
+    let retry_index = events
+        .iter()
+        .position(|event| event["type"] == "http_retry")
+        .unwrap();
+    let full_index = events
+        .iter()
+        .position(|event| event["type"] == "delta" && event["text"] == "FULL_OK")
+        .expect("FULL_OK delta from successful retry");
+    assert!(partial_index < retry_index && retry_index < full_index);
+    // No terminal error — the turn recovered.
+    assert!(!events.iter().any(|event| event["type"] == "error"));
+
+    drop(core);
+    stop_server.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn provider_504_gateway_timeout_retries_then_succeeds() {
+    let (base_url, stop_server, server) = gateway_timeout_then_success_provider();
+    let workspace = temp_workspace();
+    let mut core = CoreHarness::start(&workspace, &base_url);
+    core.send(serde_json::json!({"type":"init","protocol_version":2}));
+    core.until("protocol_hello");
+    core.send(serde_json::json!({"type":"send","prompt":"gate","model":"mock-model"}));
+    let events = core.until("done");
+    let retry_index = events
+        .iter()
+        .position(|event| event["type"] == "http_retry")
+        .expect("http_retry on 504");
+    // Initial-POST 504 retry carries status, not discard_partial.
+    let retry = &events[retry_index];
+    assert_eq!(retry["status"], 504);
+    let delta_index = events
+        .iter()
+        .position(|event| event["type"] == "delta" && event["text"] == "GATE_OK")
+        .expect("GATE_OK after 504 retry");
+    assert!(retry_index < delta_index);
+    assert!(!events.iter().any(|event| event["type"] == "error"));
 
     drop(core);
     stop_server.store(true, Ordering::Relaxed);

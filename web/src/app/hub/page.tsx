@@ -8,7 +8,7 @@ import { ErrorBoundary } from "@/components/error-boundary";
 import { HubShell } from "@/components/hub/hub-shell";
 import { accountExists, getSession } from "@/lib/auth";
 
-export const metadata = { title: "Catalyst Code · Hub" };
+export const metadata = { title: "Catalyst Code" };
 
 export default async function HubPage() {
   const h = await headers();

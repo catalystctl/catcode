@@ -1,0 +1,212 @@
+"use client";
+
+// ProviderLoginModal — pick a first-party provider preset (Umans, OpenCode Go,
+// OpenRouter) or a plugin OAuth provider and either start OAuth or paste an
+// API key. Replaces the numbered window.prompt /login flow.
+
+import { useState } from "react";
+import type { ProviderPreset } from "@/lib/types";
+import { useOutsideClose, mergeRefs } from "@/lib/use-outside-close";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
+import { CheckIcon, XIcon, ShieldIcon, PlusIcon } from "./icons";
+
+interface Props {
+  presets: ProviderPreset[];
+  mode: "login" | "logout";
+  onLoginKey: (presetId: string, apiKey: string) => void;
+  onLoginOauth: (presetId: string) => void;
+  onLoginSaved: (presetId: string) => void;
+  onSwitchProvider: (presetId: string) => void;
+  onLogout: (presetId: string) => void;
+  /** Open the custom-provider form (any OpenAI/Anthropic-compatible endpoint). */
+  onAddCustom: () => void;
+  onClose: () => void;
+}
+
+export function ProviderLoginModal({
+  presets,
+  mode,
+  onLoginKey,
+  onLoginOauth,
+  onLoginSaved,
+  onSwitchProvider,
+  onLogout,
+  onAddCustom,
+  onClose,
+}: Props) {
+  const closeRef = useOutsideClose(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
+  useBodyScrollLock();
+  const [selected, setSelected] = useState<string | null>(null);
+  const [keyInput, setKeyInput] = useState("");
+  const list =
+    mode === "logout" ? presets.filter((p) => p.loggedIn) : presets;
+  const current = list.find((p) => p.id === selected) ?? null;
+
+  return (
+    <div className="modal-backdrop">
+      <div
+        ref={mergeRefs(closeRef, trapRef)}
+        className="modal-sheet max-w-md"
+        role="dialog"
+        aria-modal="true"
+        aria-label={mode === "logout" ? "Log out of provider" : "Log in to provider"}
+      >
+        <div className="flex items-center justify-between border-b border-ink-800/80 px-5 py-3.5">
+          <div className="flex items-center gap-2">
+            <ShieldIcon width={16} height={16} className="text-accent-soft" />
+            <h2 className="text-[15px] font-semibold text-ink-100">
+              {mode === "logout" ? "Log out" : "Log in / switch provider"}
+            </h2>
+          </div>
+          <button
+            onClick={onClose}
+            className="flex h-6 w-6 items-center justify-center rounded-sm text-ink-400 hover:bg-ink-800 hover:text-ink-100"
+            aria-label="Close"
+          >
+            <XIcon width={16} height={16} />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-1 overflow-y-auto px-5 py-4">
+          {list.length === 0 ? (
+            <p className="text-[13px] text-ink-500">
+              {mode === "logout" ? "Not logged into any provider." : "No provider presets available."}
+            </p>
+          ) : (
+            <>
+              {list.map((p) => {
+                const active = selected === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      setSelected(p.id);
+                      setKeyInput("");
+                    }}
+                    className={`flex w-full items-start gap-2.5 rounded-sm border px-3.5 py-2.5 text-left transition-colors ${
+                      active
+                        ? "border-ink-700 border-l-2 border-l-accent bg-ink-900"
+                        : "border-ink-800 bg-ink-900 hover:border-ink-600"
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 text-[13px] font-medium text-ink-100">
+                        {p.loggedIn && <CheckIcon width={12} height={12} className="text-success" />}
+                        {p.label}
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-ink-500">{p.description}</div>
+                    </div>
+                  </button>
+                );
+              })}
+              {mode === "login" && (
+                <button
+                  onClick={() => {
+                    onAddCustom();
+                  }}
+                  className="flex w-full items-start gap-2.5 rounded-sm border border-dashed border-ink-700 bg-ink-900 px-3.5 py-2.5 text-left transition-colors hover:border-ink-500"
+                >
+                  <div className="flex min-w-0 flex-1 items-start gap-2">
+                    <PlusIcon width={14} height={14} className="mt-0.5 shrink-0 text-accent-soft" />
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-medium text-ink-100">Add custom provider…</div>
+                      <div className="mt-0.5 text-[11px] text-ink-500">
+                        Any OpenAI- or Anthropic-compatible endpoint — full config parity
+                        (name · base URL · key or env var · headers · context window).
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              )}
+            </>
+          )}
+        </div>
+
+        {current && mode === "login" && (
+          <div className="space-y-3 border-t border-ink-800/80 px-5 py-4">
+            {current.loggedIn && (
+              <button
+                onClick={() => {
+                  onSwitchProvider(current.id);
+                  onClose();
+                }}
+                className="w-full rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
+              >
+                Switch to {current.label}
+              </button>
+            )}
+            {!current.loggedIn && current.hasKey && (
+              <button
+                onClick={() => {
+                  onLoginSaved(current.id);
+                  onClose();
+                }}
+                className="w-full rounded-sm bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-soft"
+              >
+                Use saved credentials
+              </button>
+            )}
+            {!current.loggedIn && current.supportsOauth && (
+              <button
+                onClick={() => {
+                  onLoginOauth(current.id);
+                  onClose();
+                }}
+                className="w-full rounded-sm border border-accent/50 px-2.5 py-1 text-[11px] font-medium text-accent-soft hover:bg-ink-800"
+              >
+                Continue with OAuth
+              </button>
+            )}
+            <div>
+              <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
+                {current.loggedIn ? "Override API key" : "API key"}
+                {current.supportsOauth && !current.loggedIn ? " (optional)" : ""}
+              </label>
+              <input
+                type="password"
+                autoComplete="off"
+                value={keyInput}
+                onChange={(e) => setKeyInput(e.target.value)}
+                placeholder={current.envVar || "sk-…"}
+                className="w-full rounded-sm border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 placeholder:text-ink-600 focus:border-accent/60 focus:outline-none"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && keyInput.trim()) {
+                    onLoginKey(current.id, keyInput.trim());
+                    onClose();
+                  }
+                }}
+              />
+            </div>
+            <button
+              disabled={!keyInput.trim()}
+              onClick={() => {
+                if (!keyInput.trim()) return;
+                onLoginKey(current.id, keyInput.trim());
+                onClose();
+              }}
+              className="w-full rounded-sm border border-ink-700 px-2.5 py-1 text-[11px] text-ink-300 hover:bg-ink-800 disabled:opacity-40"
+            >
+              Save API key
+            </button>
+          </div>
+        )}
+
+        {current && mode === "logout" && (
+          <div className="border-t border-ink-800/80 px-5 py-4">
+            <button
+              onClick={() => {
+                onLogout(current.id);
+                onClose();
+              }}
+              className="w-full rounded-sm border border-danger/40 px-2.5 py-1 text-[11px] font-medium text-danger hover:bg-ink-800"
+            >
+              Log out of {current.label}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

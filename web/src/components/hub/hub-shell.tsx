@@ -1,90 +1,67 @@
 "use client";
 
-// The hub shell — a project-centric terminal workspace:
+// The hub shell — a project-centric chat workspace:
 //
 //   • PROJECT TABS across the top. Add projects by browsing the machine
 //     (ProjectSwitcher → /api/browse), or create/clone them.
-//   • GIT SIDEBAR (collapsible, resizable) — full GitPanel bound
-//     to the active project via an IdeContext shim (see ./git-sidebar.tsx).
-//   • SPLIT TERMINAL GRID — every pane is a persistent PTY that auto-runs
-//     `catcode` in the project root. Split right/down per pane, or apply a
-//     preset (1, 1×2, 2×1, 2×2, 3×3, 4×4). Dividers drag; ratios persist.
-//   • Tab-switching KEEPS every project mounted (display:none) so terminals
-//     never detach; PTYs are server-persistent anyway (see server.ts).
+//   • CHAT CENTER — full multi-session agent chat (SSE live feed to a pool of
+//     catcode-core processes). Sessions keep running when you switch projects,
+//     close the tab, or open another device — reconnecting rehydrates from the
+//     server snapshot and resumes the live event stream.
+//   • GIT SIDEBAR (collapsible, resizable) — full GitPanel bound to the active
+//     project via an IdeContext shim.
 //
-// Pane ids double as server-side terminal session ids, so a refresh — or a
-// second signed-in device loading the account layout — reattaches every
-// running catcode (scrollback replayed by the WS endpoint).
+// Account layout (GET/PUT /api/hub/layout) remembers open projects + the last
+// viewed session per project so multi-device clients reattach the same chats.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   BrandMark,
   FolderIcon,
   FolderPlusIcon,
   GitBranchIcon,
   PlusIcon,
-  TerminalIcon,
   UserIcon,
   XIcon,
 } from "@/components/icons";
 import { ProjectSwitcher } from "@/components/ide/project-switcher";
+import { ChatInner } from "@/components/chat";
+import { SettingsModal } from "@/components/settings";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { signOut } from "@/lib/auth-client";
 import { useIsMobile } from "@/lib/use-media-query";
-import { useOutsideClose } from "@/lib/use-outside-close";
+import { useBodyScrollLock } from "@/lib/use-body-scroll-lock";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+import { mergeRefs, useOutsideClose } from "@/lib/use-outside-close";
 import {
-  HUB_PRESETS,
-  MAX_PANES,
-  closeLeaf,
-  countLeaves,
-  firstLeafId,
-  gridLayoutWithIds,
-  leafIds,
-  leafNode,
-  presetShape,
-  replaceLeafId,
-  setRatio,
-  splitLeaf,
-  type HubPreset,
-  type LayoutNode,
-} from "@/lib/hub-layout";
+  IdeContext,
+  type AttachToChatFn,
+  type IdeApi,
+  type IdeContextValue,
+} from "@/lib/ide-context";
+import { useAgent } from "@/lib/use-agent";
 import type { ProjectEntry } from "@/lib/types";
 import { HubGitSidebar as GitSidebar } from "./git-sidebar";
-import { HubPane } from "./pane";
-import { SplitView } from "./split-view";
 import {
   defaultHubState,
   fetchHubLayout,
-  newPaneId,
   pathBasename,
   pushHubLayout,
   sanitizeHubState,
   writeLocalHubCache,
   type HubPersistState,
 } from "./hub-state";
-import { terminateTerminalSession } from "@/components/ide/terminal";
 
-/** Debounce for account-store writes (split/resize fires often). */
+/** Debounce for account-store writes (tab switches fire often). */
 const HUB_SAVE_DEBOUNCE_MS = 400;
 /** Poll so a second signed-in device picks up layout changes while open. */
 const HUB_SYNC_POLL_MS = 4_000;
-
-
-/** Ensure every open tab with a layout has a focused leaf id that still exists. */
-function ensureFocusedPanes(state: HubPersistState): HubPersistState {
-  const focused = { ...state.focused };
-  let changed = false;
-  for (const path of state.tabPaths) {
-    const layout = state.layouts[path];
-    if (!layout) continue;
-    const ids = leafIds(layout);
-    if (ids.length === 0) continue;
-    if (!focused[path] || !ids.includes(focused[path])) {
-      focused[path] = firstLeafId(layout);
-      changed = true;
-    }
-  }
-  return changed ? { ...state, focused } : state;
-}
 
 export function HubShell() {
   // ── state ─────────────────────────────────────────────────────────────────
@@ -96,20 +73,32 @@ export function HubShell() {
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // Mobile: the git panel is a transient drawer (NOT persisted) so a small
-  // screen never boots with the terminals covered; desktop keeps its
-  // persisted hub.gitOpen state.
+  // screen never boots with chat covered; desktop keeps hub.gitOpen.
   const [mobileGitOpen, setMobileGitOpen] = useState(false);
   const gitResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const isMobile = useIsMobile();
   const menuRef = useOutsideClose(() => setMenuOpen(false), menuOpen);
-  // Account-store sync bookkeeping: updatedAt is last known server write;
-  // skipNextSaveRef suppresses the push that would echo a remote apply.
+  const menuTrapRef = useFocusTrap<HTMLDivElement>(menuOpen);
+  const mobileGitCloseRef = useOutsideClose(
+    () => setMobileGitOpen(false),
+    isMobile && mobileGitOpen,
+    { outsideClick: false },
+  );
+  const mobileGitTrapRef = useFocusTrap<HTMLElement>(isMobile && mobileGitOpen);
+  useBodyScrollLock(isMobile && mobileGitOpen);
+
   const layoutUpdatedAtRef = useRef(0);
   const skipNextSaveRef = useRef(false);
   const hubRef = useRef(hub);
   hubRef.current = hub;
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // One agent hook for the whole shell — the bridge keeps every session's core
+  // alive; switching projects just reopens the SSE stream on another LiveSession.
+  const agent = useAgent();
+  const attachRef = useRef<AttachToChatFn | null>(null);
 
   // Load the account layout (server is source of truth; localStorage is a
   // same-device cache + one-shot migration for pre-sync installs).
@@ -121,7 +110,7 @@ export function HubShell() {
         if (cancelled) return;
         layoutUpdatedAtRef.current = result.updatedAt;
         skipNextSaveRef.current = true;
-        setHub(ensureFocusedPanes(result.layout));
+        setHub(result.layout);
       } finally {
         if (!cancelled) setHydrated(true);
       }
@@ -163,19 +152,16 @@ export function HubShell() {
         const data = (await res.json()) as { layout?: unknown; updatedAt?: number };
         const remoteAt = typeof data.updatedAt === "number" ? data.updatedAt : 0;
         if (remoteAt <= layoutUpdatedAtRef.current) return;
-        // Another device wrote a newer layout — adopt it and reattach panes.
         const layout = sanitizeHubState(data.layout);
         layoutUpdatedAtRef.current = remoteAt;
-        const normalized = ensureFocusedPanes(layout);
-        writeLocalHubCache(normalized);
+        writeLocalHubCache(layout);
         skipNextSaveRef.current = true;
-        setHub(normalized);
+        setHub(layout);
       } catch {
         /* offline / transient — next poll retries */
       }
     };
     const id = setInterval(() => void tick(), HUB_SYNC_POLL_MS);
-    // Also re-check when the tab becomes visible again (phone unlock, tab focus).
     const onVis = () => {
       if (document.visibilityState === "visible") void tick();
     };
@@ -197,9 +183,6 @@ export function HubShell() {
       }
       const snapshot = hubRef.current;
       writeLocalHubCache(snapshot);
-      // keepalive lets the PUT complete after the document unloads. sendBeacon
-      // always POSTs, so we use fetch+keepalive with the same PUT the rest of
-      // the shell uses.
       try {
         void fetch("/api/hub/layout", {
           method: "PUT",
@@ -237,611 +220,562 @@ export function HubShell() {
     };
   }, []);
 
+  // Remember the live session file per project so multi-device reattach works.
+  useEffect(() => {
+    const ws = agent.state.workspace;
+    const file = agent.state.currentSessionFile;
+    if (!ws || !file || !file.endsWith(".jsonl")) return;
+    setHub((prev) => {
+      if (prev.sessions[ws] === file) return prev;
+      // Only track sessions for projects we have open as tabs.
+      if (!prev.tabPaths.includes(ws) && prev.active !== ws) return prev;
+      return { ...prev, sessions: { ...prev.sessions, [ws]: file } };
+    });
+  }, [agent.state.workspace, agent.state.currentSessionFile]);
+
+  // When the active hub tab changes (local or remote), point the agent at that
+  // project's remembered session (or its most-recent via switch_workspace).
+  const lastSyncedTabRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hydrated) return;
+    const path = hub.active;
+    if (!path) return;
+    if (lastSyncedTabRef.current === path && agent.state.workspace === path) return;
+    lastSyncedTabRef.current = path;
+    const remembered = hub.sessions[path];
+    void (async () => {
+      try {
+        if (remembered) {
+          await agent.loadSession(remembered, path);
+        } else if (agent.state.workspace !== path) {
+          await agent.switchWorkspace(path);
+        }
+      } catch {
+        /* errors surface via agent toasts */
+      }
+    })();
+    // Intentionally only react to tab changes — not every session update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, hub.active]);
+
   const activePath = hub.active;
-  const activeLayout = activePath ? (hub.layouts[activePath] ?? null) : null;
 
   // ── tab actions ───────────────────────────────────────────────────────────
-  const openTab = useCallback(async (path: string, name?: string) => {
-    const abs = path.trim();
-    if (!abs) return;
-    setSwitching(true);
-    try {
-      // Register the project (idempotent) so the terminal WS + git routes
-      // allowlist the workspace immediately.
-      const res = await fetch("/api/hub/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "add", path: abs }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        ok?: boolean;
-        projects?: ProjectEntry[];
-        error?: string;
-      };
-      if (!res.ok || !data.ok) {
-        setProjectsError(data.error ?? `could not open project (${res.status})`);
-        return;
+  const openTab = useCallback(
+    async (path: string, name?: string) => {
+      const abs = path.trim();
+      if (!abs) return;
+      setSwitching(true);
+      try {
+        // Register the project (idempotent) so git/file routes allowlist it.
+        const res = await fetch("/api/hub/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "add", path: abs }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          projects?: ProjectEntry[];
+          error?: string;
+        };
+        if (!res.ok || !data.ok) {
+          setProjectsError(data.error ?? `could not open project (${res.status})`);
+          return;
+        }
+        setProjects(data.projects ?? []);
+        setProjectsError(null);
+        setHub((prev) => {
+          const tabPaths = prev.tabPaths.includes(abs)
+            ? prev.tabPaths
+            : [...prev.tabPaths, abs];
+          return {
+            ...prev,
+            tabPaths,
+            active: abs,
+            names: { ...prev.names, [abs]: name ?? prev.names[abs] ?? pathBasename(abs) },
+          };
+        });
+        // Drive the agent immediately (don't wait for the effect).
+        lastSyncedTabRef.current = abs;
+        const remembered = hubRef.current.sessions[abs];
+        if (remembered) await agent.loadSession(remembered, abs);
+        else await agent.switchWorkspace(abs);
+      } finally {
+        setSwitching(false);
       }
-      setProjects(data.projects ?? []);
-      setProjectsError(null);
-      setHub((prev) => {
-        const tabPaths = prev.tabPaths.includes(abs)
-          ? prev.tabPaths
-          : [...prev.tabPaths, abs];
-        const layout = prev.layouts[abs] ?? leafNode(newPaneId());
-        const focusId =
-          (prev.focused[abs] && leafIds(layout).includes(prev.focused[abs])
-            ? prev.focused[abs]
-            : firstLeafId(layout));
-        return {
-          ...prev,
-          tabPaths,
-          active: abs,
-          names: { ...prev.names, [abs]: name ?? prev.names[abs] ?? pathBasename(abs) },
-          layouts: { ...prev.layouts, [abs]: layout },
-          focused: { ...prev.focused, [abs]: focusId },
-        };
-      });
-    } finally {
-      setSwitching(false);
-    }
+    },
+    [agent],
+  );
+
+  const closeTab = useCallback((path: string) => {
+    setHub((prev) => {
+      const tabPaths = prev.tabPaths.filter((p) => p !== path);
+      const active =
+        prev.active === path
+          ? (tabPaths[Math.max(0, prev.tabPaths.indexOf(path) - 1)] ?? null)
+          : prev.active;
+      // Keep sessions[path] so reopening the project reattaches the same chat.
+      return { ...prev, tabPaths, active };
+    });
   }, []);
 
-  const closeTab = useCallback(
-    (path: string) => {
-      setHub((prev) => {
-        // Terminate every PTY the tab owns (layout is kept so reopening the
-        // project restores the arrangement with fresh catcode instances).
-        const layout = prev.layouts[path];
-        if (layout) for (const id of leafIds(layout)) terminateTerminalSession(id, path);
-        const tabPaths = prev.tabPaths.filter((p) => p !== path);
-        const active =
-          prev.active === path
-            ? (tabPaths[Math.max(0, prev.tabPaths.indexOf(path) - 1)] ?? null)
-            : prev.active;
-        return { ...prev, tabPaths, active };
-      });
-    },
-    [],
-  );
-
-  // ── pane actions (active project) ────────────────────────────────────────
-  const updateLayout = useCallback(
-    (updater: (layout: LayoutNode) => LayoutNode | null) => {
-      if (!activePath) return;
-      setHub((prev) => {
-        const layout = prev.layouts[activePath];
-        if (!layout) return prev;
-        const next = updater(layout);
-        if (next === null) return prev;
-        return { ...prev, layouts: { ...prev.layouts, [activePath]: next } };
-      });
-    },
-    [activePath],
-  );
-
-  const splitPane = useCallback(
-    (paneId: string, dir: "h" | "v") => {
-      if (!activePath) return;
-      const newId = newPaneId();
-      setHub((prev) => {
-        const layout = prev.layouts[activePath];
-        if (!layout) return prev;
-        // Returns null when the MAX_PANES cap is hit → state left untouched.
-        const next = splitLeaf(layout, paneId, dir, newId);
-        if (!next) return prev;
-        return {
-          ...prev,
-          layouts: { ...prev.layouts, [activePath]: next },
-          focused: { ...prev.focused, [activePath]: newId },
+  const removeProject = useCallback(
+    async (path: string) => {
+      try {
+        const res = await fetch("/api/hub/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "remove", path }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          projects?: ProjectEntry[];
+          error?: string;
         };
-      });
+        if (res.ok && data.ok) {
+          setProjects(data.projects ?? []);
+          closeTab(path);
+        } else {
+          setProjectsError(data.error ?? `could not remove project (${res.status})`);
+        }
+      } catch (e) {
+        setProjectsError(e instanceof Error ? e.message : String(e));
+      }
     },
-    [activePath],
+    [closeTab],
   );
 
-  const closePane = useCallback(
-    (paneId: string) => {
-      if (!activePath) return;
-      const layout = hub.layouts[activePath];
-      if (!layout) return;
-      const ok =
-        countLeaves(layout) <= 1 ||
-        window.confirm("Close this pane? Its catcode session will be terminated.");
-      if (!ok) return;
-      terminateTerminalSession(paneId, activePath);
-      setHub((prev) => {
-        const current = prev.layouts[activePath];
-        if (!current) return prev;
-        const next = closeLeaf(current, paneId) ?? leafNode(newPaneId());
-        const focused = firstLeafId(next);
-        return {
-          ...prev,
-          layouts: { ...prev.layouts, [activePath]: next },
-          focused: { ...prev.focused, [activePath]: focused },
-        };
-      });
-    },
-    [activePath, hub.layouts],
-  );
+  const switcherProjects = useMemo(() => {
+    // Merge registry + open tabs so every open tab is listed even if not yet touched.
+    const byPath = new Map<string, ProjectEntry>();
+    for (const p of projects) byPath.set(p.path, p);
+    for (const path of hub.tabPaths) {
+      if (!byPath.has(path)) {
+        byPath.set(path, {
+          path,
+          name: hub.names[path] ?? pathBasename(path),
+          lastUsed: Date.now(),
+        });
+      }
+    }
+    return [...byPath.values()].sort((a, b) => b.lastUsed - a.lastUsed);
+  }, [projects, hub.tabPaths, hub.names]);
 
-  const restartPane = useCallback(
-    (paneId: string) => {
-      if (!activePath) return;
-      terminateTerminalSession(paneId, activePath);
-      const newId = newPaneId();
-      updateLayout((layout) => replaceLeafId(layout, paneId, newId) ?? layout);
-    },
-    [activePath, updateLayout],
-  );
+  const selectTab = useCallback((path: string) => {
+    setHub((prev) => (prev.active === path ? prev : { ...prev, active: path }));
+  }, []);
 
-  const focusPane = useCallback(
-    (paneId: string) => {
-      if (!activePath) return;
-      setHub((prev) => ({ ...prev, focused: { ...prev.focused, [activePath]: paneId } }));
-    },
-    [activePath],
-  );
-
-  const applyPreset = useCallback(
-    (preset: HubPreset) => {
-      if (!activePath) return;
-      const { rows, cols } = presetShape(preset);
-      setHub((prev) => {
-        const layout = prev.layouts[activePath];
-        if (!layout) return prev;
-        const existing = leafIds(layout);
-        const need = rows * cols;
-        // Reuse existing pane ids (their PTYs keep running) and mint ids for
-        // the shortfall; terminate anything beyond the new grid.
-        const ids = [...existing];
-        while (ids.length < need) ids.push(newPaneId());
-        const kept = ids.slice(0, need);
-        for (const id of ids.slice(need)) terminateTerminalSession(id, activePath);
-        const next = gridLayoutWithIds(rows, cols, kept);
-        const focusedId = prev.focused[activePath];
-        const focused =
-          focusedId && kept.includes(focusedId) ? focusedId : firstLeafId(next);
-        return {
-          ...prev,
-          layouts: { ...prev.layouts, [activePath]: next },
-          focused: { ...prev.focused, [activePath]: focused },
-        };
-      });
-    },
-    [activePath],
-  );
-
-  const onRatioChange = useCallback(
-    (splitId: string, ratio: number) => {
-      updateLayout((layout) => setRatio(layout, splitId, ratio));
-    },
-    [updateLayout],
-  );
-
-  // ── project removal (from the switcher's Recent list) ────────────────────
-  const removeProject = useCallback(async (path: string) => {
-    try {
-      const res = await fetch("/api/hub/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "remove", path }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        ok?: boolean;
-        projects?: ProjectEntry[];
+  // ── git resize ────────────────────────────────────────────────────────────
+  const onGitResizeStart = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      gitResizeRef.current = { startX: e.clientX, startWidth: hub.gitWidth };
+      const onMove = (ev: PointerEvent) => {
+        const start = gitResizeRef.current;
+        if (!start) return;
+        // Dragging the left edge of a right sidebar: moving left grows width.
+        const next = Math.min(560, Math.max(240, start.startWidth + (start.startX - ev.clientX)));
+        setHub((prev) => (prev.gitWidth === next ? prev : { ...prev, gitWidth: next }));
       };
-      if (res.ok && data.ok) setProjects(data.projects ?? []);
-    } catch {
-      /* best-effort */
-    }
-  }, []);
+      const onUp = () => {
+        gitResizeRef.current = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [hub.gitWidth],
+  );
 
-  // ── keyboard: Ctrl/Cmd+1..9 switches project tabs ────────────────────────
+  // ── keyboard: Ctrl/Cmd+1..9 jump tabs ─────────────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
-      const n = Number(e.key);
-      if (!Number.isInteger(n) || n < 1 || n > 9) return;
-      setHub((prev) => {
-        const path = prev.tabPaths[n - 1];
-        return path ? { ...prev, active: path } : prev;
-      });
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key < "1" || e.key > "9") return;
+      const idx = Number(e.key) - 1;
+      const path = hubRef.current.tabPaths[idx];
+      if (!path) return;
       e.preventDefault();
+      selectTab(path);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [selectTab]);
 
-  // ── git sidebar resize ────────────────────────────────────────────────────
-  const startGitResize = (e: React.PointerEvent) => {
-    gitResizeRef.current = { startX: e.clientX, startWidth: hub.gitWidth };
-    const move = (ev: PointerEvent) => {
-      const start = gitResizeRef.current;
-      if (!start) return;
-      const width = Math.min(560, Math.max(240, start.startWidth + (start.startX - ev.clientX)));
-      setHub((prev) => ({ ...prev, gitWidth: width }));
-    };
-    const up = () => {
-      gitResizeRef.current = null;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      window.removeEventListener("pointercancel", up);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-    window.addEventListener("pointercancel", up);
-  };
-
-  // The switcher renders the CURRENT project as "active" — include open tabs
-  // that may no longer be in projects.json (e.g. removed from Recent).
-  const switcherProjects = useMemo(() => {
-    const byPath = new Map(projects.map((p) => [p.path, p]));
-    for (const path of hub.tabPaths) {
-      if (!byPath.has(path)) {
-        byPath.set(path, { path, name: hub.names[path] ?? pathBasename(path), lastUsed: Date.now() });
-      }
-    }
-    return [...byPath.values()];
-  }, [projects, hub.tabPaths, hub.names]);
-
-  // ── account menu: sign-out intentionally NEVER terminates PTYs ────────────
-  // Server-side terminals are owned by the user's session map, not by the
-  // browser connection: closing the page, signing out, or losing the network
-  // all leave them running. Signing back in (on ANY device) restores the
-  // account layout from /api/hub/layout and every pane reattaches to its
-  // still-running catcode.
-  const handleSignOut = useCallback(async () => {
+  const onSignOut = useCallback(async () => {
     setSigningOut(true);
     try {
-      // Flush any pending debounced layout write before dropping the session.
+      // Flush layout so the next device/sign-in sees the latest tabs/sessions.
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
       }
       await pushHubLayout(hubRef.current);
       await signOut();
-    } finally {
       window.location.href = "/login";
+    } catch {
+      setSigningOut(false);
     }
   }, []);
 
-  const gitVisible = isMobile ? mobileGitOpen : hub.gitOpen;
-  const toggleGit = useCallback(() => {
-    if (isMobile) setMobileGitOpen((v) => !v);
-    else setHub((prev) => ({ ...prev, gitOpen: !prev.gitOpen }));
-  }, [isMobile]);
+  // ── IdeContext for Chat + GitPanel ────────────────────────────────────────
+  const ideApi = useMemo<IdeApi>(
+    () => ({
+      state: {
+        gitStatus: null, // GitSidebar owns its own status; Chat only reads openTabs.
+        openTabs: [],
+        activeTabId: null,
+      },
+      setGitStatus: () => {},
+      openDiff: () => {},
+      openPatch: () => {},
+      openFile: () => {},
+      selectEditor: () => {},
+      setUiMode: () => {},
+    }),
+    [],
+  );
 
-  const paneCount = activeLayout ? countLeaves(activeLayout) : 1;
-  const currentPresetId =
-    HUB_PRESETS.find((p) => p.rows * p.cols === paneCount)?.id ?? HUB_PRESETS[0].id;
+  // GitSidebar provides its own IdeContext around GitPanel; the shell-level
+  // provider is for ChatInner (settings / projects / attach).
+  const ideValue = useMemo<IdeContextValue>(
+    () => ({
+      workspace: activePath ?? agent.state.workspace ?? "",
+      ide: ideApi,
+      openSettings: () => setSettingsOpen(true),
+      openProjects: () => setSwitcherOpen(true),
+      attachToChat: (payload) => attachRef.current?.(payload),
+      registerAttachToChat: (fn) => {
+        attachRef.current = fn;
+      },
+    }),
+    [activePath, agent.state.workspace, ideApi],
+  );
 
-  // ── render ────────────────────────────────────────────────────────────────
+  const gitOpenDesktop = hub.gitOpen && !isMobile;
+  const showGitDrawer = isMobile && mobileGitOpen;
+
   if (!hydrated) {
     return (
-      <div className="flex h-dvh items-center justify-center bg-ink-950 text-ink-500">
-        <div className="flex items-center gap-2 text-sm">
+      <div className="flex h-[100dvh] items-center justify-center bg-ink-950 text-ink-400">
+        <div className="flex items-center gap-3 font-mono text-[12px]">
           <BrandMark size={22} />
-          Loading hub…
+          <span>Loading workspace…</span>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden bg-ink-950 text-ink-100">
-      {/* ── tab bar ── */}
-      <header className="flex shrink-0 items-center gap-1 border-b border-ink-800 bg-ink-900/70 px-2 pt-1.5">
-        <span className="mr-1 flex items-center gap-1.5 pr-1" title="Catalyst Code Hub">
-          <BrandMark size={20} />
-          <span className="hidden text-[12px] font-semibold tracking-wide text-ink-300 sm:inline">
-            Hub
-          </span>
-        </span>
+    <IdeContext.Provider value={ideValue}>
+      <div className="flex h-[100dvh] w-full flex-col overflow-hidden bg-ink-950 text-ink-100">
+        {/* ── Top bar: brand + project tabs + actions ─────────────────────── */}
+        <header className="flex h-12 shrink-0 items-center gap-1 border-b border-ink-800/90 bg-ink-925/95 px-2 backdrop-blur-sm">
+          <div className="flex items-center gap-2 px-1.5">
+            <BrandMark size={18} />
+            <span className="hidden font-display text-[13px] font-semibold tracking-tight text-ink-100 sm:inline">
+              CatCode
+            </span>
+          </div>
 
-        <div
-          className="flex min-w-0 flex-1 items-end gap-0.5 overflow-x-auto"
-          role="tablist"
-          aria-label="Projects"
-        >
-          {hub.tabPaths.map((path) => {
-            const active = path === activePath;
-            const name = hub.names[path] ?? pathBasename(path);
-            return (
-              <div
-                key={path}
-                role="tab"
-                aria-selected={active}
-                title={path}
-                onClick={() => setHub((prev) => ({ ...prev, active: path }))}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setHub((prev) => ({ ...prev, active: path }));
-                  }
-                }}
-                tabIndex={0}
-                className={`group/tab flex max-w-[16rem] shrink-0 cursor-pointer items-center gap-1.5 rounded-t-lg border border-b-0 px-3 py-1.5 text-[12px] transition-colors ${
-                  active
-                    ? "border-ink-700 bg-ink-950 text-ink-100"
-                    : "border-transparent text-ink-400 hover:bg-ink-850 hover:text-ink-200"
-                }`}
-              >
-                <FolderIcon width={12} height={12} className={active ? "text-accent-soft" : "text-ink-600"} />
-                <span className="max-w-[7rem] truncate font-medium sm:max-w-[11rem]">{name}</span>
-                {/* Always visible on touch (no hover); hover-revealed on desktop. */}
-                <button
-                  type="button"
-                  title={`Close ${name}`}
-                  aria-label={`Close ${name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(path);
-                  }}
-                  className="rounded p-1 text-ink-600 opacity-100 transition-opacity hover:bg-danger/15 hover:text-danger focus:opacity-100 sm:p-0.5 sm:opacity-0 sm:group-hover/tab:opacity-100"
-                >
-                  <XIcon width={11} height={11} />
-                </button>
-              </div>
-            );
-          })}
+          <div className="mx-1 h-5 w-px bg-ink-800/80" aria-hidden />
 
-          <button
-            type="button"
-            onClick={() => setSwitcherOpen(true)}
-            title="Add or switch project"
-            aria-label="Add or switch project"
-            className="ml-0.5 shrink-0 rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
-          >
-            <PlusIcon width={14} height={14} />
-          </button>
-        </div>
-
-        {/* ── layout presets (active project) ── */}
-        {/* Mobile: a native <select> (touch-friendly picker); desktop keeps
-            the inline button group (hidden below md). */}
-        {activePath && isMobile ? (
-          <select
-            aria-label="Terminal layout"
-            value={currentPresetId}
-            onChange={(e) => applyPreset(e.target.value as HubPreset)}
-            className="shrink-0 rounded-lg border border-ink-800 bg-ink-950 px-1.5 py-1 font-mono text-[11px] text-ink-300 outline-none focus:border-accent/50"
-          >
-            {HUB_PRESETS.map((preset) => (
-              <option key={preset.id} value={preset.id}>
-                {preset.label}
-              </option>
-            ))}
-          </select>
-        ) : null}
-        {activePath && !isMobile ? (
-          <div
-            className="hidden items-center gap-0.5 rounded-lg border border-ink-800 bg-ink-950 p-0.5 md:flex"
-            role="group"
-            aria-label="Terminal layout presets"
-            title="Terminal layout"
-          >
-            {HUB_PRESETS.map((preset) => {
-              const paneCount = activeLayout ? countLeaves(activeLayout) : 1;
-              const current = paneCount === preset.rows * preset.cols;
+          {/* Project tabs */}
+          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+            {hub.tabPaths.map((path, i) => {
+              const active = path === activePath;
+              const label = hub.names[path] ?? pathBasename(path);
+              const live =
+                agent.state.liveSessions &&
+                Object.values(agent.state.liveSessions).some(
+                  (s) => s.workspace === path && (s.streaming || s.needsAttention),
+                );
               return (
                 <button
-                  key={preset.id}
+                  key={path}
                   type="button"
-                  onClick={() => applyPreset(preset.id)}
-                  disabled={preset.rows * preset.cols > MAX_PANES}
-                  title={`${preset.rows}×${preset.cols} terminals`}
-                  aria-label={`Layout ${preset.label}`}
-                  aria-pressed={current}
-                  className={`rounded px-1.5 py-1 font-mono text-[10px] transition-colors ${
-                    current
-                      ? "bg-accent/15 text-accent-soft"
-                      : "text-ink-500 hover:bg-ink-850 hover:text-ink-200"
-                  } disabled:opacity-30`}
+                  onClick={() => selectTab(path)}
+                  className={`group relative flex max-w-[12rem] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                    active
+                      ? "bg-ink-850 text-ink-100 shadow-[inset_0_0_0_1px_rgb(var(--ink-700)/0.5)]"
+                      : "text-ink-400 hover:bg-ink-900/80 hover:text-ink-200"
+                  }`}
+                  title={`${label}\n${path}${i < 9 ? `\n⌘${i + 1}` : ""}`}
                 >
-                  {preset.label}
+                  <FolderIcon width={12} height={12} className="shrink-0 opacity-70" />
+                  <span className="min-w-0 truncate font-medium">{label}</span>
+                  {live && (
+                    <span
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent shadow-[0_0_6px_rgb(var(--accent)/0.8)]"
+                      title="Live session activity"
+                    />
+                  )}
+                  <span
+                    role="button"
+                    tabIndex={-1}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(path);
+                    }}
+                    className={`rounded-md p-0.5 text-ink-600 hover:bg-ink-800 hover:text-ink-200 ${
+                      isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                    }`}
+                    aria-label={`Close ${label}`}
+                  >
+                    <XIcon width={11} height={11} />
+                  </span>
                 </button>
               );
             })}
-          </div>
-        ) : null}
-
-        <button
-          type="button"
-          onClick={toggleGit}
-          title={gitVisible ? "Hide Git panel" : "Show Git panel"}
-          aria-label={gitVisible ? "Hide Git panel" : "Show Git panel"}
-          aria-pressed={gitVisible}
-          className={`shrink-0 rounded-md p-1.5 transition-colors hover:bg-ink-850 ${
-            gitVisible ? "text-accent-soft" : "text-ink-400 hover:text-ink-100"
-          }`}
-        >
-          <GitBranchIcon width={15} height={15} />
-        </button>
-
-        {/* ── account menu ── */}
-        <div ref={menuRef} className="relative shrink-0">
-          <button
-            type="button"
-            onClick={() => setMenuOpen((v) => !v)}
-            title="Account"
-            aria-label="Account menu"
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100"
-          >
-            <UserIcon width={15} height={15} />
-          </button>
-          {menuOpen ? (
-            <div
-              role="menu"
-              aria-label="Account"
-              className="absolute right-0 top-full z-[75] mt-1 w-48 rounded-lg border border-ink-700 bg-ink-925 p-1 shadow-elev-2 animate-fade-in"
+            <button
+              type="button"
+              onClick={() => setSwitcherOpen(true)}
+              disabled={switching}
+              className="focus-ring ml-0.5 flex h-8 w-8 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-ink-900 hover:text-ink-200 disabled:opacity-50"
+              title="Open project"
+              aria-label="Open project"
             >
+              <PlusIcon width={14} height={14} />
+            </button>
+          </div>
+
+          {/* Right actions */}
+          <div className="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                if (isMobile) setMobileGitOpen((o) => !o);
+                else setHub((p) => ({ ...p, gitOpen: !p.gitOpen }));
+              }}
+              className={`flex h-7 items-center gap-1.5 rounded-sm px-2 text-[11px] transition-colors ${
+                gitOpenDesktop || showGitDrawer
+                  ? "bg-ink-850 text-ink-100"
+                  : "text-ink-500 hover:bg-ink-900 hover:text-ink-200"
+              }`}
+              title="Source control"
+              aria-label="Toggle git panel"
+              aria-pressed={gitOpenDesktop || showGitDrawer}
+            >
+              <GitBranchIcon width={13} height={13} />
+              <span className="hidden sm:inline">Git</span>
+            </button>
+
+            <div className="relative" ref={mergeRefs(menuRef, menuTrapRef)}>
               <button
                 type="button"
-                role="menuitem"
-                disabled={signingOut}
-                onClick={() => void handleSignOut()}
-                className="block w-full rounded-md px-2.5 py-1.5 text-left text-[12px] text-danger hover:bg-danger/10 disabled:opacity-50"
+                onClick={() => setMenuOpen((o) => !o)}
+                className="flex h-7 w-7 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-900 hover:text-ink-200"
+                aria-label="Account menu"
+                aria-expanded={menuOpen}
               >
-                {signingOut ? "Signing out…" : "Sign out"}
+                <UserIcon width={14} height={14} />
               </button>
-              <p className="border-t border-ink-800 px-2.5 pb-1 pt-1.5 text-[10px] leading-snug text-ink-600">
-                Terminals keep running on the server — sign back in to pick up
-                where you left off.
-              </p>
-            </div>
-          ) : null}
-        </div>
-      </header>
-
-      {projectsError ? (
-        <div className="flex shrink-0 items-center gap-2 border-b border-ink-800 bg-danger/10 px-3 py-1 text-[11px] text-danger">
-          <span className="min-w-0 flex-1 truncate">{projectsError}</span>
-          <button
-            type="button"
-            className="rounded p-0.5 hover:bg-danger/20"
-            aria-label="Dismiss error"
-            onClick={() => setProjectsError(null)}
-          >
-            <XIcon width={11} height={11} />
-          </button>
-        </div>
-      ) : null}
-
-      {/* ── body ── */}
-      <div className="flex min-h-0 flex-1">
-        {/* Every tab stays mounted; inactive ones are display:none so their
-            terminals never detach while switching projects. */}
-        {hub.tabPaths.map((path) => (
-          <main
-            key={path}
-            className={`min-h-0 min-w-0 flex-1 ${path === activePath ? "" : "hidden"}`}
-            role="tabpanel"
-            aria-label={hub.names[path] ?? pathBasename(path)}
-          >
-            {hub.layouts[path] ? (
-              <SplitView
-                node={hub.layouts[path]}
-                onRatioChange={path === activePath ? onRatioChange : () => {}}
-                renderLeaf={(leafId) => (
-                  <HubPane
-                    paneId={leafId}
-                    workspace={path}
-                    focused={
-                      path === activePath &&
-                      (hub.focused[path] ??
-                        (hub.layouts[path] ? firstLeafId(hub.layouts[path]) : "")) === leafId
-                    }
-                    onFocus={() => (path === activePath ? focusPane(leafId) : undefined)}
-                    onSplitRight={() => splitPane(leafId, "h")}
-                    onSplitDown={() => splitPane(leafId, "v")}
-                    onRestart={() => restartPane(leafId)}
-                    onClose={() => closePane(leafId)}
-                  />
-                )}
-              />
-            ) : null}
-          </main>
-        ))}
-
-        {hub.tabPaths.length === 0 ? <EmptyState onAdd={() => setSwitcherOpen(true)} switching={switching} /> : null}
-
-        {/* ── git sidebar: inline + resizable on desktop, overlay drawer on
-            mobile (a fixed-width column would eat a phone's whole screen) ── */}
-        {activePath && gitVisible && !isMobile ? (
-          <>
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              onPointerDown={startGitResize}
-              className="w-1.5 shrink-0 cursor-col-resize bg-ink-800/70 transition-colors hover:bg-accent/60"
-              title="Drag to resize the Git panel"
-            />
-            <aside
-              className="shrink-0 border-l border-ink-800 bg-ink-925"
-              style={{ width: hub.gitWidth }}
-              aria-label="Git"
-            >
-              <GitSidebar workspace={activePath} />
-            </aside>
-          </>
-        ) : null}
-        {activePath && gitVisible && isMobile ? (
-          <>
-            <div
-              className="fixed inset-0 z-[64] bg-black/55"
-              onClick={() => setMobileGitOpen(false)}
-              aria-hidden
-            />
-            <aside
-              className="fixed inset-y-0 right-0 z-[65] flex w-[min(88vw,22rem)] flex-col border-l border-ink-800 bg-ink-925 shadow-2xl shadow-black/50"
-              aria-label="Git"
-            >
-              <div className="flex shrink-0 items-center justify-between border-b border-ink-800 px-3 py-2">
-                <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">
-                  Git
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileGitOpen(false)}
-                  className="rounded-md p-1.5 text-ink-400 hover:bg-ink-850 hover:text-ink-100"
-                  aria-label="Close Git panel"
+              {menuOpen && (
+                <div
+                  className="absolute right-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-md border border-ink-750 bg-ink-900 py-1 shadow-elev-2"
+                  role="menu"
                 >
-                  <XIcon width={14} height={14} />
-                </button>
-              </div>
-              <div className="min-h-0 flex-1">
-                <GitSidebar workspace={activePath} />
-              </div>
-            </aside>
-          </>
-        ) : null}
-      </div>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setSettingsOpen(true);
+                    }}
+                  >
+                    Settings
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={signingOut}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850 disabled:opacity-50"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void onSignOut();
+                    }}
+                  >
+                    {signingOut ? "Signing out…" : "Sign out"}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </header>
 
-      {/* ── project switcher (recent / browse / create / clone) ── */}
-      {switcherOpen ? (
-        <ProjectSwitcher
-          workspace={activePath ?? ""}
-          projects={switcherProjects}
-          switching={switching}
-          mobile={isMobile}
-          onSwitchWorkspace={(path) => {
-            void openTab(path);
-          }}
-          onRemoveProject={(path) => void removeProject(path)}
-          onClose={() => setSwitcherOpen(false)}
-        />
-      ) : null}
+        {projectsError && (
+          <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-1.5 font-mono text-[11px] text-danger">
+            {projectsError}
+          </div>
+        )}
+
+        {/* ── Body: chat + optional git ───────────────────────────────────── */}
+        <div className="relative flex min-h-0 flex-1">
+          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            {activePath ? (
+              <ErrorBoundary label="chat">
+                <ChatPane agent={agent} />
+              </ErrorBoundary>
+            ) : (
+              <EmptyHub onOpenProject={() => setSwitcherOpen(true)} />
+            )}
+          </main>
+
+          {/* Desktop git column */}
+          {gitOpenDesktop && activePath && (
+            <>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize git panel"
+                onPointerDown={onGitResizeStart}
+                className="w-1.5 shrink-0 cursor-col-resize touch-none bg-transparent hover:bg-accent/30 active:bg-accent/50"
+              />
+              <aside
+                className="flex min-h-0 shrink-0 flex-col border-l border-ink-800/80 bg-ink-925"
+                style={{ width: hub.gitWidth }}
+              >
+                <ErrorBoundary label="git">
+                  <GitSidebar workspace={activePath} />
+                </ErrorBoundary>
+              </aside>
+            </>
+          )}
+
+          {/* Mobile git drawer */}
+          {showGitDrawer && activePath && (
+            <>
+              <div
+                className="absolute inset-0 z-40 bg-black/50"
+                onClick={() => setMobileGitOpen(false)}
+                aria-hidden
+              />
+              <aside
+                ref={mergeRefs(mobileGitCloseRef, mobileGitTrapRef)}
+                className="absolute inset-y-0 right-0 z-50 flex w-[min(100%,22rem)] flex-col border-l border-ink-800 bg-ink-925 shadow-elev-2"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Source control"
+              >
+                <div className="flex h-10 items-center justify-between border-b border-ink-800 px-3">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">
+                    Source Control
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setMobileGitOpen(false)}
+                    className="rounded p-1 text-ink-500 hover:bg-ink-850 hover:text-ink-100"
+                    aria-label="Close git panel"
+                  >
+                    <XIcon width={14} height={14} />
+                  </button>
+                </div>
+                <div className="min-h-0 flex-1">
+                  <ErrorBoundary label="git-mobile">
+                    <GitSidebar workspace={activePath} />
+                  </ErrorBoundary>
+                </div>
+              </aside>
+            </>
+          )}
+        </div>
+
+        {switcherOpen && (
+          <ProjectSwitcher
+            workspace={activePath ?? ""}
+            projects={switcherProjects}
+            switching={switching}
+            mobile={isMobile}
+            onSwitchWorkspace={(path) => {
+              setSwitcherOpen(false);
+              void openTab(path);
+            }}
+            onRemoveProject={(path) => void removeProject(path)}
+            onClose={() => setSwitcherOpen(false)}
+          />
+        )}
+
+        {settingsOpen && (
+          <SettingsModal
+            ready={agent.state.ready}
+            models={agent.state.models}
+            selectedModel={agent.state.selectedModel}
+            modelsRefreshing={agent.state.modelsRefreshing}
+            thinkingLevel={agent.state.thinkingLevel}
+            approvalMode={agent.state.approvalMode}
+            autoCompact={agent.state.ready?.auto_compact ?? true}
+            sandbox={agent.state.ready?.sandbox ?? "none"}
+            onSelectModel={agent.setModel}
+            onRefreshModels={() => void agent.refreshModels()}
+            onSelectThinking={agent.setThinking}
+            onSetApproval={agent.setApproval}
+            onSetBashTimeout={(secs) => void agent.setConfig("bash_timeout_secs", secs)}
+            onSetAutoCompact={(on) => void agent.setConfig("auto_compact", on)}
+            onSetSandbox={(mode) => void agent.setConfig("sandbox", mode)}
+            sandboxStatus={agent.state.sandbox}
+            onRecheckSandbox={() => void agent.getSandboxStatus()}
+            onPrepareSandbox={() => void agent.prepareSandbox()}
+            onResetSandbox={() => void agent.resetSandbox()}
+            visionConfig={agent.state.visionConfig}
+            onSetVisionConfig={(vision_model, vision_models, enabled) =>
+              void agent.setVisionConfig(vision_model, vision_models, enabled)
+            }
+            onRefreshVision={() => void agent.getVisionConfig()}
+            onClose={() => setSettingsOpen(false)}
+            uiMode="chat"
+          />
+        )}
+      </div>
+    </IdeContext.Provider>
+  );
+}
+
+/** ChatInner needs the agent from the parent (one hook per shell). */
+function ChatPane({ agent }: { agent: ReturnType<typeof useAgent> }) {
+  return <ChatInner agent={agent} docked />;
+}
+
+function EmptyHub({ onOpenProject }: { onOpenProject: () => void }) {
+  return (
+    <div className="chat-empty flex h-full flex-col items-center justify-center gap-6 px-6 text-center">
+      <div className="chat-empty-card relative max-w-lg px-6 py-8 sm:px-8">
+        <div className="chat-empty-mark mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/12 text-accent-soft ring-1 ring-accent/25">
+          <BrandMark size={30} />
+        </div>
+        <div className="mt-5 space-y-2">
+          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-500">Workspace</p>
+          <h1 className="font-display text-xl font-semibold tracking-tight text-ink-100 sm:text-[1.35rem]">
+            Open a project to begin
+          </h1>
+          <p className="mx-auto max-w-sm text-[13px] leading-relaxed text-ink-400">
+            Chats stay live across devices — switch phones, close the tab, come back mid-turn.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenProject}
+          className="focus-ring mt-6 inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-[13px] font-semibold text-white shadow-glow transition-colors hover:bg-accent-soft"
+        >
+          <FolderPlusIcon width={15} height={15} />
+          Open a project
+        </button>
+        <ul className="mt-6 grid gap-2 text-left text-[12px] text-ink-500 sm:grid-cols-3">
+          <EmptyFeature title="Multi-session" body="Many chats per project; switch without killing work." />
+          <EmptyFeature title="Live everywhere" body="Same stream on another device — no restart." />
+          <EmptyFeature title="Git beside chat" body="Review, commit, and push without leaving." />
+        </ul>
+      </div>
     </div>
   );
 }
 
-function EmptyState({ onAdd, switching }: { onAdd: () => void; switching: boolean }) {
+function EmptyFeature({ title, body }: { title: string; body: string }) {
   return (
-    <main className="flex min-h-0 min-w-0 flex-1 items-center justify-center p-6" role="tabpanel">
-      <div className="max-w-md text-center">
-        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/10 ring-1 ring-accent/25">
-          <TerminalIcon width={24} height={24} className="text-accent-soft" />
-        </div>
-        <h1 className="text-[15px] font-semibold text-ink-100">No projects open yet</h1>
-        <p className="mt-2 text-[12px] leading-relaxed text-ink-400">
-          Add a project by browsing the files on this machine. Each project gets its own tab with
-          a Git panel and a grid of terminals — every terminal launches{" "}
-          <code className="rounded bg-ink-900 px-1 py-0.5 font-mono text-[11px] text-accent-soft">catcode</code>{" "}
-          in the project root automatically.
-        </p>
-        <button
-          type="button"
-          onClick={onAdd}
-          disabled={switching}
-          className="mt-5 inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-accent-soft disabled:opacity-50"
-        >
-          <FolderPlusIcon width={14} height={14} />
-          {switching ? "Opening…" : "Add a project"}
-        </button>
-      </div>
-    </main>
+    <li className="rounded-lg border border-ink-800/80 bg-ink-950/40 px-3 py-2.5">
+      <div className="text-[12px] font-medium text-ink-200">{title}</div>
+      <div className="mt-0.5 leading-snug text-ink-500">{body}</div>
+    </li>
   );
 }

@@ -23,10 +23,24 @@ export function mergeRefs<T>(
 type EscapeHandler = () => void;
 const escapeStack: EscapeHandler[] = [];
 
-export function useOutsideClose(onClose: () => void, enabled = true) {
+export type OutsideCloseOptions = {
+  /**
+   * When false, only Escape (LIFO) closes — useful for drawers that already
+   * have an explicit backdrop click handler (avoids double-close races).
+   * Default true.
+   */
+  outsideClick?: boolean;
+};
+
+export function useOutsideClose(
+  onClose: () => void,
+  enabled = true,
+  opts: OutsideCloseOptions = {},
+) {
   const ref = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const outsideClick = opts.outsideClick !== false;
 
   useEffect(() => {
     if (!enabled) return;
@@ -44,14 +58,14 @@ export function useOutsideClose(onClose: () => void, enabled = true) {
       e.preventDefault();
       close();
     };
-    document.addEventListener("mousedown", h);
+    if (outsideClick) document.addEventListener("mousedown", h);
     document.addEventListener("keydown", k);
     return () => {
       const idx = escapeStack.lastIndexOf(close);
       if (idx >= 0) escapeStack.splice(idx, 1);
-      document.removeEventListener("mousedown", h);
+      if (outsideClick) document.removeEventListener("mousedown", h);
       document.removeEventListener("keydown", k);
     };
-  }, [enabled]);
+  }, [enabled, outsideClick]);
   return ref;
 }

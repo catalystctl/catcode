@@ -1,6 +1,5 @@
-// Default workspace for hub allowlists when no project is selected yet.
-// Replaces the old core-bridge getDefaultWorkspace() so the hub server no
-// longer spawns catcode-core processes.
+// Default workspace for hub allowlists and the agent bridge when no project
+// is selected yet. Shared by terminal WS, git/file routes, and core-bridge.
 
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";

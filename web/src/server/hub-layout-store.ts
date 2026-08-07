@@ -1,29 +1,30 @@
 // Server-side hub layout store — account-scoped persistence for project tabs,
-// split trees, focused panes, and git sidebar chrome.
+// last-viewed chat sessions, and git sidebar chrome.
 //
-// Pane ids ARE terminal session ids, so every signed-in device that loads this
-// layout reattaches the same still-running server PTYs (see server.ts).
+// Chat sessions themselves live as on-disk JSONL + live catcode-core processes
+// in the HarnessBridge. This store only remembers which projects are open and
+// which session each project last viewed, so every signed-in device reopens
+// the same chats and reattaches the live SSE feed.
 //
 // Single-account install: one file under the shared config dir. The owning
 // userId is recorded so a future multi-user deploy can partition cleanly.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { leafNode, validateLayout, type LayoutNode } from "@/lib/hub-layout";
+
+export const HUB_LAYOUT_VERSION = 2 as const;
 
 export interface HubPersistState {
-  version: 1;
+  version: typeof HUB_LAYOUT_VERSION;
   /** Open project tabs, in order (absolute workspace paths). */
   tabPaths: string[];
   /** Display name per project path (basename at add time). */
   names: Record<string, string>;
-  /** Split-tree layout per project path (survives tab close). */
-  layouts: Record<string, LayoutNode>;
   /** Active tab path (must be in tabPaths, else null). */
   active: string | null;
-  /** Last-focused pane id per project path. */
-  focused: Record<string, string>;
+  /** Last-viewed chat session file (.jsonl) per project path. */
+  sessions: Record<string, string>;
   /** Git sidebar visibility + width. */
   gitOpen: boolean;
   gitWidth: number;
@@ -54,49 +55,39 @@ function layoutFile(): string {
 
 export function defaultHubState(): HubPersistState {
   return {
-    version: 1,
+    version: HUB_LAYOUT_VERSION,
     tabPaths: [],
     names: {},
-    layouts: {},
     active: null,
-    focused: {},
+    sessions: {},
     gitOpen: true,
     gitWidth: 320,
   };
 }
 
-/** Sanitize untrusted JSON into a HubPersistState (server + client). */
-export function sanitizeHubState(
-  raw: unknown,
-  makePaneId: () => string = () => `hub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-): HubPersistState {
+/** Sanitize untrusted JSON into a HubPersistState (v1 terminal → v2 chat). */
+export function sanitizeHubState(raw: unknown): HubPersistState {
   const base = defaultHubState();
   if (!raw || typeof raw !== "object") return base;
-  const parsed = raw as Partial<HubPersistState>;
+  const parsed = raw as Partial<HubPersistState> & {
+    layouts?: unknown;
+    focused?: unknown;
+  };
 
   const tabPaths = Array.isArray(parsed.tabPaths)
     ? parsed.tabPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
     : [];
-
-  const layouts: Record<string, LayoutNode> = {};
-  const allPaths = new Set<string>([
-    ...tabPaths,
-    ...Object.keys(parsed.layouts ?? {}).filter((k) => typeof k === "string"),
-  ]);
-  for (const path of allPaths) {
-    const restored = validateLayout(parsed.layouts?.[path]);
-    // Keep a single fresh leaf when a layout is corrupt so the tab still opens.
-    layouts[path] = restored ?? leafNode(makePaneId());
-  }
 
   const names: Record<string, string> = {};
   for (const [k, v] of Object.entries(parsed.names ?? {})) {
     if (typeof k === "string" && typeof v === "string" && v) names[k] = v;
   }
 
-  const focused: Record<string, string> = {};
-  for (const [k, v] of Object.entries(parsed.focused ?? {})) {
-    if (typeof k === "string" && typeof v === "string" && v) focused[k] = v;
+  const sessions: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed.sessions ?? {})) {
+    if (typeof k === "string" && typeof v === "string" && v.endsWith(".jsonl")) {
+      sessions[k] = v;
+    }
   }
 
   const active =
@@ -105,12 +96,11 @@ export function sanitizeHubState(
       : (tabPaths[0] ?? null);
 
   return {
-    version: 1,
+    version: HUB_LAYOUT_VERSION,
     tabPaths,
     names,
-    layouts,
     active,
-    focused,
+    sessions,
     gitOpen: typeof parsed.gitOpen === "boolean" ? parsed.gitOpen : true,
     gitWidth:
       typeof parsed.gitWidth === "number" && Number.isFinite(parsed.gitWidth)
@@ -154,6 +144,11 @@ export function saveHubLayout(userId: string, raw: unknown): LoadedHubLayout {
   };
   const dir = configDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(layoutFile(), JSON.stringify(record, null, 2), "utf8");
+  const target = layoutFile();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  // Atomic replace: write temp then rename so a crash mid-write cannot leave a
+  // truncated hub-layout.json that loadHubLayout would treat as empty.
+  writeFileSync(tmp, JSON.stringify(record, null, 2), "utf8");
+  renameSync(tmp, target);
   return { state, updatedAt: record.updatedAt, userId };
 }

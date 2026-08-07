@@ -1,13 +1,13 @@
 # Catalyst Code — Web (Hub)
 
-A browser frontend for running [CatCode](..) terminal sessions side by side.
-It is a project-centric workspace: open project tabs, inspect git state, and
-auto-launch persistent `catcode` PTYs in a split grid. The former IDE shell
-and chat-only view have been removed — hub is the only authenticated UI.
+A browser frontend for [CatCode](..) multi-session agent chat. Open project
+tabs, keep git beside the conversation, and reattach live sessions from any
+signed-in device — no terminal panes, no restart mid-turn.
 
 ```
-Browser ──WS───▶ /api/terminal ──▶ zigpty ──▶ catcode (per pane)
-Browser ──HTTP─▶ /api/git|/api/browse|/api/hub/projects ──▶ workspace FS
+Browser ──SSE───▶ /api/stream  ──▶ HarnessBridge ──▶ catcode-core (per session)
+Browser ──HTTP──▶ /api/command ──▶ HarnessBridge ──▶ same cores
+Browser ──HTTP──▶ /api/git|/api/browse|/api/hub/* ──▶ workspace FS
 ```
 
 ## Install
@@ -33,8 +33,9 @@ Open `http://localhost:49283` after installation (`/hub` is an alias of `/`).
 
 ```bash
 cd web
-npm install                 # Bun may also be used to install dependencies
+npm install                 # builds the local @catalyst-code/coding-agent SDK link
 
+# Ensure catcode-core is on PATH (or set CATCODE_CORE to the binary).
 npm run dev                 # http://localhost:3000
 # production:
 npm run build && npm run start
@@ -49,23 +50,22 @@ because authentication uses Node's built-in `node:sqlite` module. Bun remains
 supported for dependency installation and `bun test`, but `bun run dev`,
 `bun run build`, and `bun run start` require a real Node executable on `PATH`.
 
-See [TESTING.md](TESTING.md) for the unit suite and hub browser regression.
-Architecture details live in [`docs/hub-frontend.md`](../docs/hub-frontend.md).
+See [TESTING.md](TESTING.md) for the unit suite. Architecture details live in
+[`docs/hub-frontend.md`](../docs/hub-frontend.md).
 
-## CatCode TUI binary
+## Core binary
 
-Each hub pane spawns the `catcode` TUI on the server (not `catcode-core`).
-Resolution order:
-
-1. `CATCODE_WEB_TUI_BIN` env var (absolute or server-cwd-relative). A set but
-   missing override fails fast rather than falling back.
-2. A `PATH` walk for `catcode` (POSIX) / `catcode.exe|cmd|bat` (Windows).
+Each live chat session spawns `catcode-core` (not the Go TUI). Resolution uses
+the SDK's `resolveCoreBinary()` (`CATCODE_CORE`, dev `core/target/release`, then
+`PATH`).
 
 ## Workspace
 
 - **Projects**: registered via the ProjectSwitcher / `POST /api/hub/projects`
-  into `~/.config/catalyst-code/projects.json`. That list is the capability
-  grant for terminal + git + file routes.
+  into `~/.config/catalyst-code/projects.json`.
+- **Sessions**: `~/.config/catalyst-code/sessions/<hash>/*.jsonl` — shared with
+  the TUI. The account layout stores the last-viewed session per project so
+  multi-device clients reattach the same live cores.
 - **Default workspace**: `CATALYST_CODE_WORKSPACE` or a discovered repo root
   (`web/src/server/default-workspace.ts`).
 

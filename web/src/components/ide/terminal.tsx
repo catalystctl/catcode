@@ -17,6 +17,14 @@ import {
   terminalTerminateEnvelope,
   type TerminalLaunch,
 } from "@/lib/terminal-protocol";
+import {
+  clientToCell,
+  domButtonToXterm,
+  encodeSgrMouse,
+  encodeSgrMouseMotion,
+  encodeWheelReports,
+  modsFromEvent,
+} from "@/lib/terminal-mouse";
 
 // ── WS message envelopes (mirror web/src/server/server.ts, contract §4.5) ──
 type ServerMsg =
@@ -38,6 +46,325 @@ const PONG_TIMEOUT_MS = 75_000;
 const DEFAULT_MAX_RECONNECTS = 6;
 
 let ghosttyReady: Promise<void> | null = null;
+
+/**
+ * Ghostty-web 0.4 `Terminal.open()` sets the container `contenteditable=true`
+ * for IME. Chromium then reports `keyCode === 229` (composition) for plain
+ * Latin keys, and Ghostty's InputHandler drops them (`if (keyCode===229) return`).
+ * Holding Alt cancels composition so keys appear to "only work with Alt".
+ *
+ * Fix: drop contenteditable, keep the container as the tabbable target, and
+ * park the hidden textarea at tabIndex=-1. Safe to call repeatedly (idempotent
+ * attribute updates) when Ghostty re-applies contenteditable.
+ */
+function applyGhosttyInputHardening(
+  term: GhosttyTerminal,
+  container: HTMLElement,
+): void {
+  try {
+    container.removeAttribute("contenteditable");
+    // Explicit false beats some engines re-inferring editable from residual attrs.
+    container.setAttribute("contenteditable", "false");
+    container.removeAttribute("contenteditable");
+    if (!container.hasAttribute("tabindex")) container.setAttribute("tabindex", "0");
+    container.style.outline = container.style.outline || "none";
+    // Stop mobile browsers from hijacking gestures (double-tap zoom / swipe nav)
+    // which steals the first tap and breaks "click then type".
+    container.style.touchAction = container.style.touchAction || "manipulation";
+    container.style.userSelect = "none";
+    (container.style as CSSStyleDeclaration & { webkitUserSelect?: string }).webkitUserSelect =
+      "none";
+  } catch {
+    /* ignore */
+  }
+  const textarea = term.textarea;
+  if (textarea) {
+    try {
+      textarea.tabIndex = -1;
+      textarea.setAttribute("tabindex", "-1");
+      // iOS: keep the software keyboard from auto-capitalising / correcting
+      // when the textarea is briefly focused for paste.
+      textarea.setAttribute("autocorrect", "off");
+      textarea.setAttribute("autocapitalize", "off");
+      textarea.setAttribute("spellcheck", "false");
+      textarea.setAttribute("autocomplete", "off");
+      textarea.style.pointerEvents = "none";
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * One-shot listener install: canvas/textarea pointer events must focus the
+ * container (Ghostty InputHandler target), not the hidden textarea. Also
+ * re-assert hardening if Ghostty re-sets contenteditable, and skip right-click
+ * so the context-menu paste path can raise the textarea briefly.
+ */
+function installGhosttyFocusRedirect(
+  term: GhosttyTerminal,
+  container: HTMLElement,
+): () => void {
+  applyGhosttyInputHardening(term, container);
+  const textarea = term.textarea;
+
+  const refocusContainer = (event: Event) => {
+    const mouse = event as MouseEvent;
+    // button===2: allow Ghostty's contextmenu handler to park the textarea
+    // under the cursor for system paste without fighting focus.
+    if (typeof mouse.button === "number" && mouse.button === 2) return;
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const isCanvas = target.tagName === "CANVAS";
+    const isTextarea = !!(textarea && (target === textarea || textarea.contains(target)));
+    if (!isCanvas && !isTextarea) return;
+    try {
+      applyGhosttyInputHardening(term, container);
+      // Only steal focus when this pane is allowed to — callers gate via
+      // autoFocus, but a click on the surface always means the user wants it.
+      container.focus({ preventScroll: true });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // Capture on both mouse + touch: Ghostty open() binds canvas touchend →
+  // textarea.focus(), which reintroduces the keyCode-229 path on mobile Chrome.
+  container.addEventListener("mousedown", refocusContainer, true);
+  container.addEventListener("touchstart", refocusContainer, { capture: true, passive: true });
+  container.addEventListener("touchend", refocusContainer, { capture: true, passive: true });
+
+  // Ghostty (or accessibility helpers) may flip contenteditable back on; watch
+  // and strip it so Chromium does not re-enter composition mode mid-session.
+  const mo = new MutationObserver(() => {
+    if (container.getAttribute("contenteditable") === "true") {
+      applyGhosttyInputHardening(term, container);
+    }
+  });
+  try {
+    mo.observe(container, { attributes: true, attributeFilter: ["contenteditable", "tabindex"] });
+  } catch {
+    /* ignore */
+  }
+
+  // Without contenteditable, many browsers never fire a paste event on the
+  // focused container for Ctrl/Cmd+V. Ghostty's InputHandler also bails on
+  // meta/ctrl+v ("let the browser handle it"), so bridge clipboard → onData.
+  const onPasteKey = (event: KeyboardEvent) => {
+    const isPaste =
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      (event.key === "v" || event.key === "V" || event.code === "KeyV");
+    if (!isPaste) return;
+    if (document.activeElement !== container && !container.contains(document.activeElement)) {
+      return;
+    }
+    // Prefer the async Clipboard API; fall back is silent if permission denied.
+    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (!text) return;
+        try {
+          term.paste(text);
+        } catch {
+          try {
+            term.input(text, true);
+          } catch {
+            /* disposed */
+          }
+        }
+      })
+      .catch(() => {
+        /* permission denied / insecure context — user can still right-click paste */
+      });
+  };
+  container.addEventListener("keydown", onPasteKey, true);
+
+  return () => {
+    container.removeEventListener("mousedown", refocusContainer, true);
+    container.removeEventListener("touchstart", refocusContainer, true);
+    container.removeEventListener("touchend", refocusContainer, true);
+    container.removeEventListener("keydown", onPasteKey, true);
+    mo.disconnect();
+  };
+}
+
+/**
+ * Ghostty-web 0.4 never emits application mouse reports (DECSET 1000/1002/1003
+ * + SGR 1006) on onData — hasMouseTracking() becomes true after the TUI enables
+ * it, but clicks only drive local selection / scrollbar / alt-screen cursor-key
+ * wheel. Bridge pointer events → SGR CSI sequences while tracking is on so the
+ * catcode clickable chrome works in the hub.
+ */
+function installAppMouseBridge(
+  term: GhosttyTerminal,
+  container: HTMLElement,
+): () => void {
+  let pressedBtn: number | null = null;
+  let lastCell = { col: 1, row: 1 };
+
+  const tracking = (): boolean => {
+    try {
+      return term.hasMouseTracking();
+    } catch {
+      return false;
+    }
+  };
+
+  const metrics = () => {
+    const canvas = container.querySelector("canvas");
+    const el = canvas ?? container;
+    const rect = el.getBoundingClientRect();
+    return {
+      cols: term.cols,
+      rows: term.rows,
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+    };
+  };
+
+  /** Push bytes through Ghostty's onData path (same pipe as keystrokes → WS). */
+  const emit = (seq: string) => {
+    if (!seq) return;
+    try {
+      term.input(seq, true);
+    } catch {
+      /* disposed */
+    }
+  };
+
+  const isTerminalSurface = (target: EventTarget | null): boolean => {
+    if (!(target instanceof HTMLElement)) return false;
+    if (target.tagName === "CANVAS") return true;
+    if (target === container) return true;
+    // Textarea is 1×1 / pointer-events none after hardening; still allow.
+    if (term.textarea && (target === term.textarea || term.textarea.contains(target))) return true;
+    return false;
+  };
+
+  const onPointerDown = (event: PointerEvent) => {
+    if (!tracking()) return;
+    if (!isTerminalSurface(event.target)) return;
+    // Let the pane toolbar / chrome keep their own clicks.
+    if ((event.target as HTMLElement).closest?.("[data-pane-toolbar]")) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const cell = clientToCell(event.clientX, event.clientY, metrics());
+    lastCell = cell;
+    const btn = domButtonToXterm(event.button);
+    pressedBtn = btn;
+    try {
+      container.setPointerCapture(event.pointerId);
+    } catch {
+      /* older Safari */
+    }
+    try {
+      term.clearSelection();
+    } catch {
+      /* ignore */
+    }
+    emit(encodeSgrMouse(btn, cell.col, cell.row, false, modsFromEvent(event)));
+  };
+
+  const onPointerMove = (event: PointerEvent) => {
+    if (!tracking() || pressedBtn === null) return;
+    const cell = clientToCell(event.clientX, event.clientY, metrics());
+    if (cell.col === lastCell.col && cell.row === lastCell.row) return;
+    lastCell = cell;
+    // Cell-motion (1002): report motion only while a button is held.
+    emit(encodeSgrMouseMotion(pressedBtn, cell.col, cell.row, modsFromEvent(event)));
+  };
+
+  const onPointerUp = (event: PointerEvent) => {
+    if (!tracking()) {
+      pressedBtn = null;
+      return;
+    }
+    if (pressedBtn === null) return;
+    const cell = clientToCell(event.clientX, event.clientY, metrics());
+    lastCell = cell;
+    const btn = pressedBtn;
+    pressedBtn = null;
+    try {
+      container.releasePointerCapture(event.pointerId);
+    } catch {
+      /* ignore */
+    }
+    emit(encodeSgrMouse(btn, cell.col, cell.row, true, modsFromEvent(event)));
+  };
+
+  const onPointerCancel = (event: PointerEvent) => {
+    if (pressedBtn === null) return;
+    const btn = pressedBtn;
+    pressedBtn = null;
+    emit(encodeSgrMouse(btn, lastCell.col, lastCell.row, true, modsFromEvent(event)));
+  };
+
+  // Capture so we beat Ghostty's SelectionManager (canvas bubble) and the
+  // canvas mousedown → textarea.focus() handler while app tracking is live.
+  container.addEventListener("pointerdown", onPointerDown, true);
+  container.addEventListener("pointermove", onPointerMove, true);
+  container.addEventListener("pointerup", onPointerUp, true);
+  container.addEventListener("pointercancel", onPointerCancel, true);
+
+  // Wheel: when tracking, send SGR wheel buttons instead of Ghostty's
+  // alt-screen cursor-key emulation (\x1b[A/B) which the TUI does not want.
+  const prevWheel = undefined;
+  term.attachCustomWheelEventHandler((event) => {
+    if (!tracking()) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    const cell = clientToCell(event.clientX, event.clientY, metrics());
+    for (const seq of encodeWheelReports(
+      event.deltaY,
+      event.deltaX,
+      cell.col,
+      cell.row,
+      modsFromEvent(event),
+    )) {
+      emit(seq);
+    }
+    return true;
+  });
+
+  // Focus in/out reports (DECSET 1004) — TUI sets ReportFocus; Ghostty never
+  // forwards \x1b[I / \x1b[O on its own.
+  const onFocus = () => {
+    try {
+      if (term.hasFocusEvents()) emit("\x1b[I");
+    } catch {
+      /* ignore */
+    }
+  };
+  const onBlur = () => {
+    try {
+      if (term.hasFocusEvents()) emit("\x1b[O");
+    } catch {
+      /* ignore */
+    }
+  };
+  container.addEventListener("focus", onFocus);
+  container.addEventListener("blur", onBlur);
+
+  return () => {
+    container.removeEventListener("pointerdown", onPointerDown, true);
+    container.removeEventListener("pointermove", onPointerMove, true);
+    container.removeEventListener("pointerup", onPointerUp, true);
+    container.removeEventListener("pointercancel", onPointerCancel, true);
+    container.removeEventListener("focus", onFocus);
+    container.removeEventListener("blur", onBlur);
+    try {
+      term.attachCustomWheelEventHandler(prevWheel);
+    } catch {
+      /* ignore */
+    }
+  };
+}
 
 function terminalSocketUrl(): string {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
@@ -104,6 +431,10 @@ export interface TerminalProps {
    *  only the active pane steals focus — otherwise a hidden terminal can own
    *  document.activeElement and keystrokes never reach the visible catcode. */
   autoFocus?: boolean;
+  /** When false the pane is under a hidden project tab (display:none). We skip
+   *  auto-focus work and only re-fit once the tab becomes visible again —
+   *  FitAddon measures 0×0 under `hidden`, which desyncs mouse cell math. */
+  visible?: boolean;
 }
 
 /**
@@ -121,6 +452,7 @@ export function Terminal({
   launch,
   maxReconnects,
   autoFocus = true,
+  visible = true,
 }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<GhosttyTerminal | null>(null);
@@ -130,6 +462,8 @@ export function Terminal({
   const lastClearSeq = useRef(clearSeq ?? 0);
   const autoFocusRef = useRef(autoFocus);
   autoFocusRef.current = autoFocus;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
   // Keep latest values in refs so the effect only re-runs when the session id
   // changes (one renderer + WS attachment per session), not on parent renders.
@@ -181,6 +515,10 @@ export function Terminal({
       const fit = new ghostty.FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
+      // Must run after open(): open() re-applies contenteditable + textarea tabindex.
+      const unharden = installGhosttyFocusRedirect(term, containerRef.current);
+      // Application mouse tracking bridge (Ghostty never emits SGR mouse itself).
+      const unmouse = installAppMouseBridge(term, containerRef.current);
       fitRef.current = fit;
       try {
         fit.fit();
@@ -191,13 +529,11 @@ export function Terminal({
       setTermReady(true);
       // Only auto-focus when this pane is supposed to own the keyboard. Hub
       // mounts every project tab at once; focusing a hidden pane makes the
-      // visible one appear dead to typing.
+      // visible one appear dead to typing. Focus the container (InputHandler
+      // target) — never the hidden textarea (see applyGhosttyInputHardening).
       if (autoFocusRef.current) {
         try {
           term.focus();
-          // Ghostty's InputHandler listens on the container, but canvas clicks
-          // move focus to the hidden textarea — keep both in sync.
-          term.textarea?.focus?.();
         } catch {
           /* ignore */
         }
@@ -318,6 +654,8 @@ export function Terminal({
       (term as GhosttyTerminal & { __dispose?: () => void }).__dispose = () => {
         onDataDisp.dispose();
         onResizeDisp.dispose();
+        unharden();
+        unmouse();
         if (pingTimer) clearInterval(pingTimer);
         if (reconnectTimer) clearTimeout(reconnectTimer);
       };
@@ -363,39 +701,78 @@ export function Terminal({
 
   // Take / release keyboard focus when the hub marks this pane active, and
   // re-fit after becoming visible (FitAddon often measures 0×0 under `hidden`).
+  // `visible` covers project-tab switches where sibling leaves in the newly
+  // shown tab are not focused but still need correct cols/rows for mouse math.
   useEffect(() => {
     const term = termRef.current;
-    if (!term) return;
-    if (autoFocus) {
+    if (!term || !termReady) return;
+
+    const refit = () => {
       try {
         fitRef.current?.fit();
       } catch {
         /* container may still be settling */
       }
-      try {
-        term.focus();
-        term.textarea?.focus?.();
-      } catch {
-        /* ignore */
-      }
-      // Second pass after layout (tab un-hide / split resize) so cols/rows match.
-      const t = window.setTimeout(() => {
+      if (containerRef.current) {
         try {
-          fitRef.current?.fit();
-          term.focus();
-          term.textarea?.focus?.();
+          applyGhosttyInputHardening(term, containerRef.current);
         } catch {
           /* ignore */
         }
-      }, 50);
-      return () => window.clearTimeout(t);
+      }
+    };
+
+    if (!visible) {
+      // Hidden tab: release focus if we somehow still own it, skip fit (0×0).
+      try {
+        term.blur?.();
+      } catch {
+        /* ignore */
+      }
+      return;
     }
+
+    refit();
+    if (autoFocus) {
+      try {
+        term.focus();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      try {
+        term.blur?.();
+      } catch {
+        /* ignore */
+      }
+    }
+    // Second pass after layout (tab un-hide / split resize) so cols/rows match.
+    const t = window.setTimeout(() => {
+      refit();
+      if (autoFocus) {
+        try {
+          term.focus();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, 50);
+    // visualViewport resize (mobile keyboard) also desyncs cell metrics.
+    const onVv = () => refit();
     try {
-      term.blur?.();
+      window.visualViewport?.addEventListener("resize", onVv);
     } catch {
       /* ignore */
     }
-  }, [autoFocus, termReady]);
+    return () => {
+      window.clearTimeout(t);
+      try {
+        window.visualViewport?.removeEventListener("resize", onVv);
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [autoFocus, visible, termReady]);
 
   return (
     <div
@@ -403,9 +780,11 @@ export function Terminal({
       onPointerDownCapture={() => {
         // Clicking the terminal surface must own the keyboard even if a sibling
         // pane or a previously focused hidden tab still held document focus.
+        // Focus the container (Ghostty InputHandler), not the hidden textarea.
         try {
-          termRef.current?.focus();
-          termRef.current?.textarea?.focus?.();
+          const term = termRef.current;
+          if (term && containerRef.current) applyGhosttyInputHardening(term, containerRef.current);
+          term?.focus();
         } catch {
           /* ignore */
         }

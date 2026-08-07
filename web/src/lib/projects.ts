@@ -5,7 +5,7 @@
 // This is a server-side store (reads/writes the filesystem). The browser talks
 // to it via the /api/workspace route.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -48,7 +48,10 @@ export function loadProjects(): ProjectEntry[] {
 
 export function saveProjects(list: ProjectEntry[]): void {
   ensureDir();
-  writeFileSync(projectsFile(), JSON.stringify(list, null, 2), "utf8");
+  const target = projectsFile();
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(list, null, 2), "utf8");
+  renameSync(tmp, target);
 }
 
 /** Add or bump a workspace to the top of the recent list (dedup by path). */

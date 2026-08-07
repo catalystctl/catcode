@@ -597,6 +597,61 @@ func (s *session) refresh() {
 	}
 }
 
+// discardPartialStreamOutput drops the live assistant/thinking stream blocks
+// produced by a failed provider attempt so a mid-stream transport retry can
+// re-emit cleanly without duplicating partial text. Finalized history and any
+// tool activity already started this turn are left intact.
+func (s *session) discardPartialStreamOutput() {
+	if s == nil || len(s.blocks) == 0 {
+		return
+	}
+	// Prefer dropping the live stream cursor; if s.cur was already finalized
+	// by an intervening push (info toast, etc.), strip a trailing
+	// assistant/thinking run at the end of the transcript instead.
+	dropFrom := -1
+	if s.cur != nil && (s.cur.kind == blkAssistant || s.cur.kind == blkThinking) {
+		for i := len(s.blocks) - 1; i >= 0; i-- {
+			if s.blocks[i] == s.cur {
+				dropFrom = i
+				break
+			}
+		}
+		// Also drop any immediately preceding stream blocks of the same turn
+		// (thinking then assistant, or consecutive assistant chunks).
+		for dropFrom > 0 {
+			prev := s.blocks[dropFrom-1]
+			if prev != nil && (prev.kind == blkAssistant || prev.kind == blkThinking) {
+				dropFrom--
+				continue
+			}
+			break
+		}
+	} else {
+		i := len(s.blocks)
+		for i > 0 {
+			b := s.blocks[i-1]
+			if b != nil && (b.kind == blkAssistant || b.kind == blkThinking) {
+				i--
+				continue
+			}
+			break
+		}
+		if i < len(s.blocks) {
+			dropFrom = i
+		}
+	}
+	if dropFrom < 0 || dropFrom >= len(s.blocks) {
+		return
+	}
+	// Fresh slice so GC can reclaim the dropped block strings.
+	out := make([]*block, dropFrom)
+	copy(out, s.blocks[:dropFrom])
+	s.blocks = out
+	s.cur = nil
+	s.invalidateAll()
+	s.refresh()
+}
+
 // ---------------------------------------------------------------------------
 // log helpers: push a block, then refresh
 // ---------------------------------------------------------------------------

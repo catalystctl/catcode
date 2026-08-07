@@ -2,7 +2,7 @@
 // terminal). Pure Node — no React, no core bridge.
 
 import { existsSync, realpathSync } from "node:fs";
-import { normalize, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, normalize, join, relative, resolve, sep } from "node:path";
 import { loadProjects } from "@/lib/projects";
 import { getDefaultWorkspace } from "@/server/default-workspace";
 
@@ -44,12 +44,25 @@ export function resolveAuthorizedWorkspace(req: Request, explicit?: string | nul
 /**
  * Resolve `rel` under `workspace` and CONFINE it. Returns the absolute path, or
  * throws "path outside workspace" if `rel` escapes.
- * Accepts workspace-relative paths with forward slashes.
+ * Accepts workspace-relative paths with forward slashes. Absolute `rel` values
+ * are rejected (on Windows, `path.join(root, "D:\\evil")` / cross-drive
+ * `relative` can fail to look like a `..` escape).
  */
 export function confinePath(workspace: string, rel: string): string {
-  const abs = normalize(join(workspace, rel));
-  const r = relative(workspace, abs);
-  if (r === ".." || r.startsWith(`..${sep}`)) {
+  if (typeof rel !== "string" || rel.length === 0) {
+    throw new Error("path outside workspace");
+  }
+  // Defense in depth: never accept absolute client paths. `path.join` on POSIX
+  // strips a leading slash (`join("/proj","/etc")` → `/proj/etc`), which would
+  // silently reinterpret absolutes as workspace-relative; on Windows, absolute
+  // or cross-drive segments can bypass a naive `..` check.
+  if (isAbsolute(rel)) {
+    throw new Error("path outside workspace");
+  }
+  const root = resolve(workspace);
+  const abs = normalize(join(root, rel));
+  const r = relative(root, abs);
+  if (r === ".." || r.startsWith(`..${sep}`) || isAbsolute(r)) {
     throw new Error("path outside workspace");
   }
   return abs;
