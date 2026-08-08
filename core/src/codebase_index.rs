@@ -628,7 +628,11 @@ fn extract_config_tests_routes(
             continue;
         };
         let sample = if text.len() > 64_000 {
-            &text[..64_000]
+            let mut end = 64_000;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
         } else {
             text.as_str()
         };
@@ -998,5 +1002,33 @@ mod tests {
         );
         assert!(syms.is_empty());
         assert!(!format!("{syms:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn extract_config_sample_respects_utf8_boundary() {
+        // H7: sampling the first 64 KB must not panic when byte 64000 sits
+        // inside a multi-byte UTF-8 sequence (e.g. U+2019 ’).
+        let ws = tmp();
+        // 63999 ASCII bytes + one 3-byte apostrophe straddling the cap, then more.
+        let mut body = "a".repeat(63_999);
+        body.push('’'); // bytes 63999..64002
+        body.push_str("\nenv::var(\"AFTER_BOUNDARY\")\n");
+        std::fs::write(ws.join("big.rs"), &body).unwrap();
+        let files = vec![FileRecord {
+            path: "big.rs".into(),
+            language: "rust".into(),
+            size: body.len() as u64,
+            content_hash: "x".into(),
+            modified_at: 0,
+            ignored: false,
+            generated: false,
+            binary: false,
+        }];
+        let (configs, _, _) = extract_config_tests_routes(&ws, &files);
+        // The env key sits after the sample window; we only assert no panic and
+        // that the sample path completed. Config extraction may or may not see
+        // the post-boundary key depending on the walked-back end.
+        let _ = configs;
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

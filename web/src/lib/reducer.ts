@@ -78,6 +78,9 @@ export const initialState: AgentState = {
   memories: [],
   plugins: [],
   skills: [],
+  marketplaceDisclaimerAccepted: false,
+  marketplaceInstalled: [],
+  marketplaceResults: [],
   availableAgents: [],
   pendingIntercom: null,
   pendingOauth: null,
@@ -1446,6 +1449,18 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     // ── Skills ──
     case "skills":
       return { ...state, skills: Array.isArray(ev.skills) ? ev.skills : [] };
+    case "skill_marketplace_state":
+      return {
+        ...state,
+        marketplaceDisclaimerAccepted: ev.disclaimer_accepted === true,
+        marketplaceInstalled: Array.isArray(ev.installed) ? ev.installed : [],
+      };
+    case "skill_marketplace_results":
+      return { ...state, marketplaceResults: Array.isArray(ev.skills) ? ev.skills : [] };
+    case "skill_marketplace_changed":
+      return { ...state, toasts: pushToast(state.toasts, "success", `Skill ${ev.action}: ${ev.name}`) };
+    case "skill_marketplace_error":
+      return { ...state, toasts: pushToast(state.toasts, "error", ev.message || "Skill marketplace error") };
 
     // ── Vision ──
     case "vision_config":
@@ -2199,6 +2214,24 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         ),
       };
     }
+    case "advisor_note": {
+      // Watchdog advisor recommendation. Surface concerns/blockers as warnings;
+      // nits stay informational (matches TUI handlers).
+      const severity = typeof ev.severity === "string" ? ev.severity : "";
+      const message = typeof ev.message === "string" ? ev.message : "";
+      if (!message) return state;
+      const kind =
+        severity === "concern" || severity === "blocker" ? "warning" : "info";
+      const prefix = severity ? `Advisor (${severity})` : "Advisor";
+      return {
+        ...state,
+        toasts: pushToast(state.toasts, kind, `${prefix}: ${message}`),
+      };
+    }
+    case "advisor_status":
+      // Reviewing/no-key state is available to protocol clients; keep the UI
+      // quiet during normal reviews and surface only actionable notes.
+      return state;
 
     default:
       return state;

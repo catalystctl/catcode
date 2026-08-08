@@ -1498,6 +1498,34 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 				s.openVisionPicker()
 			}
 		}
+	case "skill_marketplace_state":
+		var installed []installedMarketplaceSkill
+		if raw, ok := ev.rawKey("installed"); ok {
+			_ = json.Unmarshal(raw, &installed)
+		}
+		s.marketplaceInstalled = installed
+		s.marketplaceAccepted = ev.get("disclaimer_accepted") == "true"
+		if s.modal.kind == modalMarketplace {
+			if s.marketplaceAccepted {
+				s.openValueEditModal(editTargetMarketplaceSearch, "Search skills.sh", "at least 2 characters", "")
+			} else {
+				s.openValueEditModal(editTargetMarketplaceDisclaimer, "WARNING: third-party skills may be malicious", "type ACCEPT to continue at your own risk", "")
+			}
+		}
+	case "skill_marketplace_results":
+		var results []marketplaceSkill
+		if raw, ok := ev.rawKey("skills"); ok {
+			_ = json.Unmarshal(raw, &results)
+		}
+		s.marketplaceResults = results
+		s.modal = newModal()
+		s.modal.kind = modalMarketplace
+	case "skill_marketplace_changed":
+		s.logSuccess(fmt.Sprintf("skill %s: %s (%s)", ev.get("action"), ev.get("name"), ev.get("scope")))
+		s.sendCore(map[string]any{"type": "list_marketplace_skills"})
+	case "skill_marketplace_error":
+		s.modal.loading = false
+		s.logError("skill marketplace: " + ev.get("message"))
 	case "skills":
 		// Discoverable skills list (name + description). Populates the
 		// /skill:<name> command-palette entries; the body is inlined into the
@@ -3000,6 +3028,12 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 				return nil
 			}
 			s.findTranscript(query)
+			return nil
+		case "/skills":
+			s.modal = newModal()
+			s.modal.kind = modalMarketplace
+			s.marketplaceResults = nil
+			s.sendCore(map[string]any{"type": "list_marketplace_skills"})
 			return nil
 		case "/plugin-install":
 			if len(parts) < 2 {

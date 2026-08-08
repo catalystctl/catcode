@@ -36,7 +36,9 @@
             "plugin_command", "list_plugin_commands", "list_agents",
             "refresh_memory", "save_memory", "list_memory", "forget_memory",
             "intercom_reply", "ask_reply", "sudo_reply", "get_vision_config",
-            "set_vision_config", "list_skills", "refresh_models", "apply_skill", "start_goal",
+            "set_vision_config", "list_skills", "list_marketplace_skills", "accept_skill_disclaimer",
+            "search_marketplace_skills", "install_marketplace_skill", "update_marketplace_skill",
+            "remove_marketplace_skill", "refresh_models", "apply_skill", "start_goal",
             "cancel_goal", "goal_status", "approve_goal_plan", "revise_goal",
             "user_bash", "add_custom_provider", "discover_provider_models",
             "get_sandbox_status", "prepare_sandbox", "reset_sandbox"
@@ -70,7 +72,9 @@
             "provider_presets", "ready", "reflecting", "reset", "run_cancelled",
             "runtime_status", "search_key_set", "session_change_failed",
             "session_changed", "session_deleted", "session_pinned",
-            "session_recovered", "session_renamed", "sessions", "skills", "stats",
+            "session_recovered", "session_renamed", "sessions", "skills",
+            "skill_marketplace_state", "skill_marketplace_results", "skill_marketplace_changed",
+            "skill_marketplace_error", "stats",
             "steer", "subagent_done", "subagent_message", "subagent_progress",
             "subagent_start", "subagent_tool_call", "subagent_tool_result",
             "sudo_request", "thinking", "tool_call", "tool_call_args",
@@ -79,7 +83,7 @@
             "worktree_promoted", "worktree_ready", "worktree_seeded",
             "provider_models_preview", "sandbox_error",
             "sandbox_prepare_progress", "sandbox_ready", "sandbox_status", "stuck_nudge",
-            "summary_required"
+            "summary_required", "advisor_note", "advisor_status"
           ]
         },
         "protocol_version": { "const": 2 },

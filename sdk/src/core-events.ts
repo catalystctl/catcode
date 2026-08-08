@@ -110,6 +110,12 @@ export const CORE_EVENT_TYPES = [
   "sandbox_error",
   "stuck_nudge",
   "summary_required",
+  "advisor_note",
+  "advisor_status",
+  "skill_marketplace_state",
+  "skill_marketplace_results",
+  "skill_marketplace_changed",
+  "skill_marketplace_error",
 ] as const;
 
 export type CoreEventType = (typeof CORE_EVENT_TYPES)[number];

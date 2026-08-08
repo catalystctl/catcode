@@ -65,3 +65,9 @@
 {"type":"get_sandbox_status"}
 {"type":"prepare_sandbox"}
 {"type":"reset_sandbox"}
+{"type":"list_marketplace_skills"}
+{"type":"accept_skill_disclaimer"}
+{"type":"search_marketplace_skills","query":"react"}
+{"type":"install_marketplace_skill","source":"anthropics/skills","name":"frontend-design","scope":"project"}
+{"type":"update_marketplace_skill","name":"frontend-design","scope":"project"}
+{"type":"remove_marketplace_skill","name":"frontend-design","scope":"project"}

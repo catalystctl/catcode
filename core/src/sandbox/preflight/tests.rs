@@ -1,5 +1,4 @@
 use super::*;
-use crate::sandbox::error::CheckStatus;
 
 fn check_codes(r: &SandboxPreflightReport) -> Vec<String> {
     r.checks.iter().map(|c| c.code.clone()).collect()

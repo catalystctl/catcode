@@ -123,6 +123,12 @@ export interface AgentApi {
   // ── Skills ──
   listSkills: () => Promise<void>;
   applySkill: (name: string, task?: string) => Promise<void>;
+  listMarketplaceSkills: () => Promise<void>;
+  acceptSkillDisclaimer: () => Promise<void>;
+  searchMarketplaceSkills: (query: string) => Promise<void>;
+  installMarketplaceSkill: (source: string, name: string, scope: "project" | "global") => Promise<void>;
+  updateMarketplaceSkill: (name: string, scope: "project" | "global") => Promise<void>;
+  removeMarketplaceSkill: (name: string, scope: "project" | "global") => Promise<void>;
   // ── Goal mode ──
   startGoal: (opts: {
     goal: string;
@@ -1126,6 +1132,12 @@ export function useAgent(): AgentApi {
 
   // ── Skills ──
   const listSkills = useCallback(() => fire({ type: "list_skills" }), [fire]);
+  const listMarketplaceSkills = useCallback(() => fire({ type: "list_marketplace_skills" }), [fire]);
+  const acceptSkillDisclaimer = useCallback(async () => { await send({ type: "accept_skill_disclaimer" }); }, [send]);
+  const searchMarketplaceSkills = useCallback(async (query: string) => { await send({ type: "search_marketplace_skills", query }); }, [send]);
+  const installMarketplaceSkill = useCallback(async (source: string, name: string, scope: "project" | "global") => { await send({ type: "install_marketplace_skill", source, name, scope }); await fire({ type: "list_marketplace_skills" }); }, [send, fire]);
+  const updateMarketplaceSkill = useCallback(async (name: string, scope: "project" | "global") => { await send({ type: "update_marketplace_skill", name, scope }); await fire({ type: "list_marketplace_skills" }); }, [send, fire]);
+  const removeMarketplaceSkill = useCallback(async (name: string, scope: "project" | "global") => { await send({ type: "remove_marketplace_skill", name, scope }); await fire({ type: "list_marketplace_skills" }); }, [send, fire]);
   const applySkill = useCallback(
     async (name: string, task?: string) => {
       const s = stateRef.current;
@@ -1451,6 +1463,12 @@ export function useAgent(): AgentApi {
       refreshModels,
       listSkills,
       applySkill,
+      listMarketplaceSkills,
+      acceptSkillDisclaimer,
+      searchMarketplaceSkills,
+      installMarketplaceSkill,
+      updateMarketplaceSkill,
+      removeMarketplaceSkill,
       startGoal,
       cancelGoal,
       approveGoalPlan,

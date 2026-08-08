@@ -49,7 +49,9 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
       ? { bar: "border-l-danger", dot: "bg-danger" }
       : toast.kind === "success"
         ? { bar: "border-l-success", dot: "bg-success" }
-        : { bar: "border-l-accent", dot: "bg-accent" };
+        : toast.kind === "warning"
+          ? { bar: "border-l-warning", dot: "bg-warning" }
+          : { bar: "border-l-accent", dot: "bg-accent" };
 
   return (
     <div

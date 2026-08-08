@@ -395,6 +395,28 @@ pub enum Command {
     /// TUI/web to populate the `/skill:<name>` autocomplete.
     #[serde(rename = "list_skills")]
     ListSkills,
+    /// List installed marketplace skills and disclaimer state.
+    #[serde(rename = "list_marketplace_skills")]
+    ListMarketplaceSkills,
+    /// Persist first-time consent in the user-owned config directory.
+    #[serde(rename = "accept_skill_disclaimer")]
+    AcceptSkillDisclaimer,
+    /// Search skills.sh. Requires prior disclaimer acceptance.
+    #[serde(rename = "search_marketplace_skills")]
+    SearchMarketplaceSkills { query: String },
+    /// Install a skills.sh snapshot into project or global scope.
+    #[serde(rename = "install_marketplace_skill")]
+    InstallMarketplaceSkill {
+        source: String,
+        name: String,
+        scope: String,
+    },
+    /// Update one managed skill from its recorded skills.sh source.
+    #[serde(rename = "update_marketplace_skill")]
+    UpdateMarketplaceSkill { name: String, scope: String },
+    /// Remove one managed skill from the selected scope.
+    #[serde(rename = "remove_marketplace_skill")]
+    RemoveMarketplaceSkill { name: String, scope: String },
     /// On-demand model-cache refresh: force a LIVE discovery for every
     /// logged-in provider (bypassing the 8h disk-cache TTL, rewriting the
     /// cache), re-aggregate, and re-emit `models` + `provider_presets`,

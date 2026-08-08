@@ -63,6 +63,7 @@ export const COMMANDS: CommandDef[] = [
   { label: "/remember", desc: "save a memory note", category: "tools", action: "remember" },
   { label: "/forget", desc: "forget a memory", category: "tools", action: "forget" },
   { label: "/plugins", desc: "manage plugins", category: "tools", action: "plugins" },
+  { label: "/skills", desc: "browse and manage skills.sh skills", category: "tools", action: "skills" },
   { label: "/vision", desc: "configure vision handoff", category: "tools", action: "vision" },
   { label: "/attach", desc: "attach an image", category: "tools", action: "attach" },
 

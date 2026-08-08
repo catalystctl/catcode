@@ -303,12 +303,11 @@ pub fn subagent_target(run_id: &str, agent: &str, index: Option<usize>) -> Strin
             .to_lowercase()
     };
     let rid = run_id.replace('-', "");
-    format!(
-        "subagent-{}-{}{}",
-        clean(agent),
-        &rid[..rid.len().min(8)],
-        suffix
-    )
+    let mut rid_end = rid.len().min(8);
+    while rid_end > 0 && !rid.is_char_boundary(rid_end) {
+        rid_end -= 1;
+    }
+    format!("subagent-{}-{}{}", clean(agent), &rid[..rid_end], suffix)
 }
 
 /// Discover all agents: builtin (lowest) < user < project (project wins on name).
@@ -3873,6 +3872,19 @@ mod tests {
     fn target_is_stable() {
         let t = subagent_target("run-1", "worker", Some(0));
         assert!(t.starts_with("subagent-worker-"));
+    }
+
+    #[test]
+    fn target_truncates_on_char_boundary() {
+        // 8-byte cap can land mid multi-byte char. U+2019 ’ is 3 bytes; three
+        // of them are 9 bytes so min(8) is inside the third apostrophe.
+        let t = subagent_target("’’’extra", "worker", None);
+        assert!(t.starts_with("subagent-worker-"));
+        let prefix = t.trim_start_matches("subagent-worker-");
+        assert!(prefix.len() <= 8);
+        assert!(prefix.is_char_boundary(prefix.len()));
+        // Must not panic and must keep only whole characters (0, 3, or 6 bytes).
+        assert_eq!(prefix.len() % 3, 0);
     }
 
     #[test]

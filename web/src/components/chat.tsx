@@ -23,6 +23,7 @@ import { WorkStatePanel } from "./work-state";
 import { SubagentsPanel } from "./subagents";
 import { MemoryPanel } from "./memory";
 import { PluginsPanel } from "./plugins";
+import { SkillsMarketplace } from "./skills-marketplace";
 import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalProgressPanel } from "./goal-modal";
 import { ControlCenterPanel } from "./control-center";
@@ -92,7 +93,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
   const composerRef = useRef<ComposerHandle>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [modal, setModal] = useState<
-    null | "memory" | "plugins" | "subagents" | "help" | "goal" | "control" | "login" | "logout" | "custom-provider" | "diagnostics"
+    null | "memory" | "plugins" | "skills-marketplace" | "subagents" | "help" | "goal" | "control" | "login" | "logout" | "custom-provider" | "diagnostics"
   >(null);
   const [images, setImages] = useState<string[]>([]);
   // True while `discover_provider_models` is in flight (custom-provider modal).
@@ -342,6 +343,9 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         case "plugins":
           a.listPlugins();
           return setModal("plugins");
+        case "skills":
+          a.listMarketplaceSkills();
+          return setModal("skills-marketplace");
         case "auto-compact": {
           const on = !(a.state.ready?.auto_compact ?? true);
           return void a.setConfig("auto_compact", on);
@@ -958,6 +962,20 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
           onRemove={agent.removePlugin}
           onEnable={agent.enablePlugin}
           onDisable={agent.disablePlugin}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "skills-marketplace" && (
+        <SkillsMarketplace
+          accepted={state.marketplaceDisclaimerAccepted}
+          results={state.marketplaceResults}
+          installed={state.marketplaceInstalled}
+          onAccept={agent.acceptSkillDisclaimer}
+          onSearch={agent.searchMarketplaceSkills}
+          onInstall={agent.installMarketplaceSkill}
+          onUpdate={agent.updateMarketplaceSkill}
+          onRemove={agent.removeMarketplaceSkill}
+          onRefresh={agent.listMarketplaceSkills}
           onClose={() => setModal(null)}
         />
       )}

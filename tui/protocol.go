@@ -159,6 +159,19 @@ type skillInfo struct {
 	Location    string `json:"location"`
 }
 
+type marketplaceSkill struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Source   string `json:"source"`
+	Installs int    `json:"installs"`
+}
+
+type installedMarketplaceSkill struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	Scope  string `json:"scope"`
+}
+
 // coreEvent is one newline-delimited JSON line from the core.
 // fields caches the once-parsed object map so get/rawKey do not re-Unmarshal
 // Raw on every field read (D-004). Populated at ingest or lazily on first get.

@@ -36,6 +36,7 @@ const (
 	modalTheme
 	modalSessions
 	modalPlugins
+	modalMarketplace
 	modalReasoning
 	modalVision
 	modalProviders
@@ -367,24 +368,26 @@ type goalPlanSnap struct {
 
 // Value-edit targets for modalValueEdit (stored in modal.editTarget).
 const (
-	editTargetBashTimeout          = "bash_timeout"
-	editTargetIdleTimeout          = "idle_timeout"
-	editTargetMaxSessionTokens     = "max_session_tokens"
-	editTargetRemember             = "remember"
-	editTargetAttach               = "attach"
-	editTargetPluginInstall        = "plugin_install"
-	editTargetSteer                = "steer"
-	editTargetRun                  = "run"
-	editTargetParallel             = "parallel"
-	editTargetChain                = "chain"
-	editTargetCompact              = "compact"
-	editTargetTranscriptFind       = "transcript_find"
-	editTargetSessionRename        = "session_rename:"
-	editTargetSearchKey            = "search_key" // +":" + provider (exa|tavily)
-	editTargetAdvisorModel         = "advisor_model"
-	editTargetAdvisorSubagentModel = "advisor_subagent_model"
-	editTargetSkill                = "skill:"
-	editTargetPluginCommand        = "plugin_command:"
+	editTargetBashTimeout           = "bash_timeout"
+	editTargetIdleTimeout           = "idle_timeout"
+	editTargetMaxSessionTokens      = "max_session_tokens"
+	editTargetRemember              = "remember"
+	editTargetAttach                = "attach"
+	editTargetPluginInstall         = "plugin_install"
+	editTargetSteer                 = "steer"
+	editTargetRun                   = "run"
+	editTargetParallel              = "parallel"
+	editTargetChain                 = "chain"
+	editTargetCompact               = "compact"
+	editTargetTranscriptFind        = "transcript_find"
+	editTargetSessionRename         = "session_rename:"
+	editTargetSearchKey             = "search_key" // +":" + provider (exa|tavily)
+	editTargetAdvisorModel          = "advisor_model"
+	editTargetAdvisorSubagentModel  = "advisor_subagent_model"
+	editTargetSkill                 = "skill:"
+	editTargetPluginCommand         = "plugin_command:"
+	editTargetMarketplaceDisclaimer = "marketplace_disclaimer"
+	editTargetMarketplaceSearch     = "marketplace_search"
 )
 
 // Plugin picker modes (session.pluginPickerMode).
@@ -1294,6 +1297,7 @@ func (s *session) commandItems() []listItem {
 		{group: "Agent", label: "/subagents-status", desc: "show active subagent runs"},
 		{group: "Agent", label: "/remember", desc: "save a memory note (modal)"},
 		{group: "Agent", label: "/memory", desc: "list / forget saved memories (picker) · alias: /memories"},
+		{group: "Agent", label: "/skills", desc: "browse, install, update, and remove skills.sh skills"},
 		{group: "Agent", label: "/forget", desc: "forget a memory (picker)"},
 		{group: "Agent", label: "/index", desc: "bootstrap repo knowledge → memories + candidate skills"},
 		{group: "Agent", label: "/reflect", desc: "reflect on this session, persist durable learnings"},
@@ -1515,6 +1519,27 @@ func (s *session) reducedMotionItems() []listItem {
 		"allow animated progress and flourishes")
 }
 
+func (s *session) marketplaceItems() []listItem {
+	items := make([]listItem, 0, len(s.marketplaceInstalled)*2+len(s.marketplaceResults)*2)
+	for _, skill := range s.marketplaceInstalled {
+		items = append(items,
+			listItem{group: "Installed", label: skill.Name + " · " + skill.Scope + " · update", desc: skill.Source + " · enter to update", meta: "update|" + skill.Name + "|" + skill.Scope},
+			listItem{group: "Installed", label: skill.Name + " · " + skill.Scope + " · remove", desc: skill.Source + " · enter to remove", meta: "remove|" + skill.Name + "|" + skill.Scope},
+		)
+	}
+	for _, result := range s.marketplaceResults {
+		desc := result.Source + " · " + fmt.Sprintf("%d installs", result.Installs)
+		items = append(items,
+			listItem{group: "Search results", label: result.Name + " · project", desc: desc + " · enter to install", meta: "install|" + result.Source + "|" + result.Name + "|project"},
+			listItem{group: "Search results", label: result.Name + " · global", desc: desc + " · enter to install", meta: "install|" + result.Source + "|" + result.Name + "|global"},
+		)
+	}
+	if len(items) == 0 {
+		items = append(items, listItem{label: "(no results)", desc: "run /skills and search for a capability"})
+	}
+	return items
+}
+
 func (s *session) pluginItems() []listItem {
 	removeMode := s.pluginPickerMode == pluginModeRemove
 	var items []listItem
@@ -1623,6 +1648,13 @@ func (s *session) executeDestructive(action, id string) {
 		s.transcriptPlain = nil
 		s.viewport.SetContent("")
 		s.logInfo("conversation and session reset")
+	case "skill-remove|project", "skill-remove|global":
+		if id == "" {
+			return
+		}
+		scope := strings.TrimPrefix(action, "skill-remove|")
+		s.sendCore(map[string]any{"type": "remove_marketplace_skill", "name": id, "scope": scope})
+		s.logInfo("removing skill: " + id)
 	case "plugin-remove":
 		if id == "" {
 			return
@@ -1761,7 +1793,7 @@ func (s *session) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch s.modal.kind {
-	case modalCommand, modalModels, modalSessions, modalPlugins, modalReasoning,
+	case modalCommand, modalModels, modalSessions, modalPlugins, modalMarketplace, modalReasoning,
 		modalProviders, modalLogout, modalSettings, modalApproval, modalSandbox,
 		modalAutoCompact, modalNoNetwork, modalFooterMetrics, modalReducedMotion, modalMemory, modalPluginInstallScope,
 		modalSearchKey, modalRestartConfirm, modalAdvisor, modalAdvisorModels, modalIndex:
@@ -2263,6 +2295,8 @@ func (s *session) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		items = s.sessionItems()
 	case modalPlugins:
 		items = s.pluginItems()
+	case modalMarketplace:
+		items = s.marketplaceItems()
 	case modalMemory:
 		items = s.memoryItems()
 	case modalReasoning:
@@ -2462,6 +2496,22 @@ func (s *session) executeListSelect(abs int) (tea.Model, tea.Cmd) {
 			s.logInfo("theme: " + themes[abs].name)
 		}
 		s.closeModal()
+		return s, nil
+	case modalMarketplace:
+		items := s.marketplaceItems()
+		if abs >= 0 && abs < len(items) {
+			parts := strings.Split(items[abs].meta, "|")
+			switch {
+			case len(parts) == 4 && parts[0] == "install":
+				s.sendCore(map[string]any{"type": "install_marketplace_skill", "source": parts[1], "name": parts[2], "scope": parts[3]})
+				s.logInfo("installing skill " + parts[2] + " (" + parts[3] + ")…")
+			case len(parts) == 3 && parts[0] == "update":
+				s.sendCore(map[string]any{"type": "update_marketplace_skill", "name": parts[1], "scope": parts[2]})
+				s.logInfo("updating skill " + parts[1] + " (" + parts[2] + ")…")
+			case len(parts) == 3 && parts[0] == "remove":
+				s.openDestructiveConfirm("skill-remove|"+parts[2], parts[1], "remove skill "+parts[1]+" from "+parts[2])
+			}
+		}
 		return s, nil
 	case modalPlugins:
 		// Toggle mode: enter flips enable/disable (modal stays open).
@@ -3045,6 +3095,14 @@ func (s *session) valueEditError(target, val string) string {
 			return err.Error()
 		}
 		return requireReady()
+	case editTargetMarketplaceDisclaimer:
+		if !strings.EqualFold(val, "accept") {
+			return "Type ACCEPT to acknowledge that skills may be malicious and are used at your own risk."
+		}
+	case editTargetMarketplaceSearch:
+		if len([]rune(val)) < 2 {
+			return "Enter at least 2 characters to search skills.sh."
+		}
 	case editTargetPluginInstall:
 		if val == "" {
 			return "Enter a plugin path or GitHub URL."
@@ -3091,6 +3149,16 @@ func (s *session) commitValueEdit() (tea.Model, tea.Cmd) {
 			parts = append(parts, val)
 		}
 		return s, s.handleSkillCommand(parts)
+	}
+	if target == editTargetMarketplaceDisclaimer {
+		s.sendCore(map[string]any{"type": "accept_skill_disclaimer"})
+		s.openValueEditModal(editTargetMarketplaceSearch, "Search skills.sh", "at least 2 characters", "")
+		return s, nil
+	}
+	if target == editTargetMarketplaceSearch {
+		s.sendCore(map[string]any{"type": "search_marketplace_skills", "query": val})
+		s.modal.loading = true
+		return s, nil
 	}
 	if strings.HasPrefix(target, editTargetPluginCommand) {
 		name := strings.TrimPrefix(target, editTargetPluginCommand)
@@ -3406,6 +3474,8 @@ func (s *session) renderModalBody() string {
 		return s.renderPickerList()
 	case modalSessions:
 		return s.renderPickerList()
+	case modalMarketplace:
+		return s.renderListModal("Skills Explorer", s.marketplaceItems(), true)
 	case modalPlugins:
 		title := "Plugins"
 		if s.pluginPickerMode == pluginModeRemove {

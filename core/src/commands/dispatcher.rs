@@ -2665,6 +2665,122 @@ pub(crate) async fn run() {
                 let ws = state.cfg.read().await.workspace.clone();
                 emit_skills_event(&ws);
             }
+            Command::ListMarketplaceSkills => {
+                let ws = state.cfg.read().await.workspace.clone();
+                emit(
+                    &Event::new("skill_marketplace_state")
+                        .with(
+                            "disclaimer_accepted",
+                            json!(skill_marketplace::disclaimer_accepted()),
+                        )
+                        .with("installed", json!(skill_marketplace::installed(&ws))),
+                );
+            }
+            Command::AcceptSkillDisclaimer => match skill_marketplace::accept_disclaimer() {
+                Ok(()) => {
+                    let ws = state.cfg.read().await.workspace.clone();
+                    emit(
+                        &Event::new("skill_marketplace_state")
+                            .with("disclaimer_accepted", json!(true))
+                            .with("installed", json!(skill_marketplace::installed(&ws))),
+                    );
+                }
+                Err(error) => {
+                    emit(&Event::new("skill_marketplace_error").with("message", json!(error)))
+                }
+            },
+            Command::SearchMarketplaceSkills { query } => {
+                match skill_marketplace::search(&client, &query).await {
+                    Ok(skills) => emit(
+                        &Event::new("skill_marketplace_results")
+                            .with("query", json!(query))
+                            .with("skills", json!(skills)),
+                    ),
+                    Err(error) => {
+                        emit(&Event::new("skill_marketplace_error").with("message", json!(error)))
+                    }
+                }
+            }
+            Command::InstallMarketplaceSkill {
+                source,
+                name,
+                scope,
+            } => {
+                let ws = state.cfg.read().await.workspace.clone();
+                match skill_marketplace::SkillScope::parse(&scope) {
+                    Ok(scope) => {
+                        match skill_marketplace::install(&client, &ws, &source, &name, scope).await
+                        {
+                            Ok(_) => {
+                                emit(
+                                    &Event::new("skill_marketplace_changed")
+                                        .with("action", json!("installed"))
+                                        .with("name", json!(name))
+                                        .with("scope", json!(scope.as_str())),
+                                );
+                                emit_skills_event(&ws);
+                            }
+                            Err(error) => emit(
+                                &Event::new("skill_marketplace_error")
+                                    .with("message", json!(error)),
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        emit(&Event::new("skill_marketplace_error").with("message", json!(error)))
+                    }
+                }
+            }
+            Command::UpdateMarketplaceSkill { name, scope } => {
+                let ws = state.cfg.read().await.workspace.clone();
+                match skill_marketplace::SkillScope::parse(&scope) {
+                    Ok(scope) => {
+                        match skill_marketplace::update(&client, &ws, &name, scope).await {
+                            Ok((_, changed)) => {
+                                emit(
+                                    &Event::new("skill_marketplace_changed")
+                                        .with(
+                                            "action",
+                                            json!(if changed { "updated" } else { "unchanged" }),
+                                        )
+                                        .with("name", json!(name))
+                                        .with("scope", json!(scope.as_str())),
+                                );
+                                emit_skills_event(&ws);
+                            }
+                            Err(error) => emit(
+                                &Event::new("skill_marketplace_error")
+                                    .with("message", json!(error)),
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        emit(&Event::new("skill_marketplace_error").with("message", json!(error)))
+                    }
+                }
+            }
+            Command::RemoveMarketplaceSkill { name, scope } => {
+                let ws = state.cfg.read().await.workspace.clone();
+                match skill_marketplace::SkillScope::parse(&scope) {
+                    Ok(scope) => match skill_marketplace::remove(&ws, &name, scope) {
+                        Ok(()) => {
+                            emit(
+                                &Event::new("skill_marketplace_changed")
+                                    .with("action", json!("removed"))
+                                    .with("name", json!(name))
+                                    .with("scope", json!(scope.as_str())),
+                            );
+                            emit_skills_event(&ws);
+                        }
+                        Err(error) => emit(
+                            &Event::new("skill_marketplace_error").with("message", json!(error)),
+                        ),
+                    },
+                    Err(error) => {
+                        emit(&Event::new("skill_marketplace_error").with("message", json!(error)))
+                    }
+                }
+            }
             Command::RefreshModels => {
                 // On-demand model-cache refresh (TUI `/refresh`, web refresh
                 // button). Force a live discovery for every logged-in provider

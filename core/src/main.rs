@@ -61,6 +61,7 @@ mod runtime;
 mod sandbox;
 mod search_tool;
 mod session;
+mod skill_marketplace;
 mod skill_metrics;
 mod staging;
 mod subagent;

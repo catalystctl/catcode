@@ -192,6 +192,9 @@ type session struct {
 	pendingVisionPicker      bool               // open the vision picker once the config arrives
 	pendingPluginInstallPath string             // path/URL awaiting scope pick (modalPluginInstallScope)
 	pluginTrust              *pluginTrustPrompt // active trust modal state (modalPluginTrust)
+	marketplaceAccepted      bool
+	marketplaceResults       []marketplaceSkill
+	marketplaceInstalled     []installedMarketplaceSkill
 
 	// Active model provider (openai/anthropic endpoint). activeProvider is the
 	// name the core resolved; providers is the list of configured names for the

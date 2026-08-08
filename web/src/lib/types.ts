@@ -419,6 +419,22 @@ export interface SkillInfo {
   content: string;
 }
 
+export interface MarketplaceSkill {
+  id: string;
+  skillId?: string;
+  name: string;
+  installs: number;
+  source: string;
+}
+
+export interface InstalledMarketplaceSkill {
+  name: string;
+  source: string;
+  scope: "project" | "global";
+  hash?: string;
+  location?: string;
+}
+
 /** An intercom message from a subagent to the orchestrator. `need_decision`
  *  asks are surfaced as a blocking prompt; other traffic is logged. */
 export interface IntercomPrompt {
@@ -662,6 +678,21 @@ export type CoreEvent =
   | { type: "session_recovered"; warnings?: string[]; interrupted_runs?: string[] }
   | { type: "summary_required"; attempt?: number; max_attempts?: number }
   | {
+      type: "advisor_note";
+      scope?: string;
+      advisor?: string;
+      model?: string;
+      severity?: string;
+      message?: string;
+    }
+  | {
+      type: "advisor_status";
+      scope?: string;
+      advisor?: string;
+      state?: string;
+      model?: string;
+    }
+  | {
       type: "protocol_hello";
       version: string;
       min_client: string;
@@ -833,6 +864,10 @@ export type CoreEvent =
   | { type: "goal_phase"; from: string; to: string; message?: string; wave?: number; step_count?: number; done_count?: number }
   // ── Skills ──
   | { type: "skills"; skills: SkillInfo[] }
+  | { type: "skill_marketplace_state"; disclaimer_accepted: boolean; installed: InstalledMarketplaceSkill[] }
+  | { type: "skill_marketplace_results"; query: string; skills: MarketplaceSkill[] }
+  | { type: "skill_marketplace_changed"; action: string; name: string; scope: string }
+  | { type: "skill_marketplace_error"; message: string }
   // ── Sandbox (Microsandbox) ──
   // Core wire events emitted by the sandbox subsystem. Not yet in the SDK's
   // CORE_EVENT_TYPES catalog (the SDK lags the core); the reducer.test.ts
@@ -938,6 +973,12 @@ export type CoreCommand =
   | { type: "delete_session"; path: string }
   // ── Skills ──
   | { type: "list_skills" }
+  | { type: "list_marketplace_skills" }
+  | { type: "accept_skill_disclaimer" }
+  | { type: "search_marketplace_skills"; query: string }
+  | { type: "install_marketplace_skill"; source: string; name: string; scope: "project" | "global" }
+  | { type: "update_marketplace_skill"; name: string; scope: "project" | "global" }
+  | { type: "remove_marketplace_skill"; name: string; scope: "project" | "global" }
   | { type: "apply_skill"; name: string; task?: string; model: string; reasoning_effort?: string }
   // ── Goal mode ──
   | {
@@ -1084,7 +1125,7 @@ export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg | GoalMsg;
 
 export interface Toast {
   id: string;
-  kind: "info" | "error" | "success";
+  kind: "info" | "error" | "success" | "warning";
   message: string;
 }
 
@@ -1165,6 +1206,9 @@ export interface AgentState {
   memories: MemoryEntry[];
   plugins: PluginEntry[];
   skills: SkillInfo[];
+  marketplaceDisclaimerAccepted: boolean;
+  marketplaceInstalled: InstalledMarketplaceSkill[];
+  marketplaceResults: MarketplaceSkill[];
   /** Discoverable subagents from core `agents` events. */
   availableAgents: AgentInfo[];
   pendingIntercom: IntercomPrompt | null;
