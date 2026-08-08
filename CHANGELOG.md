@@ -4,6 +4,7 @@ All notable changes to **Catalyst Code** (formerly Umans Harness), day by day fr
 
 ## 2026-08-07
 
+- Added the skills.sh marketplace explorer with consent-gated search, scoped install/update/remove, lock-file integrity, and matching core, TUI, SDK, and web protocol support. [f8d62bf]
 - Atomic Windows web updates: stage/validate then promote (TUI + install.ps1 stop service first); chat execution-register UI with AA contrast/focus, multi-session bridge hardening. [c845be8]
 - Linux release artifacts built on ubuntu-22.04 with glibc <=2.35 baseline guard. [4c1aeb6]
 - Chat hub frontend + session runtime merge (SSE multi-session, HarnessBridge pool). [aa4469b]
