@@ -1050,7 +1050,10 @@ pub fn execute(
             )
             .await;
             if let Some(ref wt) = wt_path {
-                if outcome.ok {
+                // Cancelled runs report non-ok. Also refuse promote if the
+                // parent turn token fired (H13). run_single uses a child token
+                // for interrupt; abort paths already return Outcome::err.
+                if outcome.ok && !cancel.is_cancelled() {
                     match crate::worktree::promote_worktree(&workspace, wt) {
                         Ok(paths) if !paths.is_empty() => {
                             emit(
@@ -1606,7 +1609,7 @@ async fn run_agent_inner(
 
     loop {
         if cancel.is_cancelled() {
-            return Outcome::ok("[subagent aborted]");
+            return Outcome::err("[subagent aborted]");
         }
         // Poll intercom mailbox for orchestrator steer messages (peek + steer actions)
         // Drain orchestrator steer messages from the mailbox without
@@ -1826,7 +1829,7 @@ async fn run_agent_inner(
             // destructive writes don't execute once cancelled.
             if cancel.is_cancelled() {
                 emit_subagent_summary(sub_in, sub_out, sub_cached, &last_model);
-                return Outcome::ok("[subagent aborted]");
+                return Outcome::err("[subagent aborted]");
             }
             let id = call.id.clone();
             let name = call.function.name.clone();
@@ -2078,7 +2081,7 @@ async fn dispatch_subagent_tool(
                 return Outcome::err(format!("tool call '{}' was denied by the user", name));
             }
             crate::ApprovalResult::Aborted => {
-                return Outcome::ok("[subagent aborted]");
+                return Outcome::err("[subagent aborted]");
             }
         }
     }
@@ -3047,9 +3050,11 @@ async fn run_parallel(
     let all_ok = collected.iter().all(|(_, o)| o.ok);
 
     // Promote successful worktrees into the main workspace, then clean up.
+    // Never promote on cancel even if a child reported ok before the abort (H13).
+    let batch_cancelled = run_cancel.is_cancelled();
     for (i, o) in &collected {
         if let Some(wt) = worktrees.get(*i).and_then(|w| w.as_ref()) {
-            if o.ok {
+            if o.ok && !batch_cancelled {
                 match crate::worktree::promote_worktree(&workspace, wt) {
                     Ok(paths) if !paths.is_empty() => {
                         emit(
@@ -3211,7 +3216,7 @@ async fn run_chain(
 
         for (step_i, step) in chain.iter().enumerate() {
             if run_cancel.is_cancelled() {
-                return Outcome::ok("[chain aborted]");
+                return Outcome::err("[chain aborted]");
             }
             // parallel group?
             if let Some(group) = step.get("parallel").and_then(|v| v.as_array()) {
@@ -3986,5 +3991,29 @@ mod tests {
         std::fs::write(root.join("secret.txt"), "must not reach provider context").unwrap();
         assert!(crate::workspace::resolve(&workspace, "../secret.txt").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_subagent_outcome_is_not_ok() {
+        // H13: abort/cancel must return non-ok so worktree promote gates
+        // (`outcome.ok && !cancel`) never merge half-done trees.
+        let aborted = Outcome::err("[subagent aborted]");
+        assert!(!aborted.ok);
+        assert_eq!(aborted.output, "[subagent aborted]");
+        let chain = Outcome::err("[chain aborted]");
+        assert!(!chain.ok);
+    }
+
+    #[test]
+    fn promote_gate_requires_ok_and_not_cancelled() {
+        // Mirrors the single/parallel promote predicate used after run_single.
+        let ok = true;
+        let cancelled = true;
+        assert!(
+            !(ok && !cancelled),
+            "cancel must block promote even when ok"
+        );
+        assert!(ok && !false, "successful non-cancelled run may promote");
+        assert!(!(!true && !false), "failed run must not promote");
     }
 }

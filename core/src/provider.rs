@@ -17,7 +17,9 @@ use crate::providers::adapter::{
 pub use crate::providers::discovery::*;
 use crate::providers::registry::{adapter_for, protocol_for};
 use crate::providers::sse::{SseDecoder, SseFrame};
-use crate::providers::streaming::NormalizedStreamEvent;
+use crate::providers::streaming::{
+    append_stream_tool_args, ensure_stream_tool_slot, NormalizedStreamEvent,
+};
 pub use crate::providers::usage::*;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -1282,11 +1284,21 @@ fn apply_codex_event(
         }
         NormalizedStreamEvent::ToolCallStart(delta) => {
             timer.mark_first_token();
+            if calls.len() >= crate::providers::streaming::MAX_STREAM_TOOL_CALL_INDEX {
+                return Err(format!(
+                    "stream tool_call count exceeds cap ({})",
+                    crate::providers::streaming::MAX_STREAM_TOOL_CALL_INDEX
+                ));
+            }
             let index = calls.len();
+            let args = delta.arguments.unwrap_or_else(|| "{}".into());
+            let mut total_args: usize = calls.iter().map(|c| c.args.len()).sum();
+            let mut acc_args = String::new();
+            append_stream_tool_args(&mut total_args, &mut acc_args, &args)?;
             let call = ToolAccum {
                 id: delta.id.unwrap_or_default(),
                 name: delta.name.unwrap_or_default(),
-                args: delta.arguments.unwrap_or_else(|| "{}".into()),
+                args: acc_args,
             };
             if !quiet {
                 emit(
@@ -1408,6 +1420,7 @@ async fn stream_turn_openai(
     // advanced when minimax_cumulative; otherwise unused.
     let mut wire_text = String::new();
     let mut tool_calls: Vec<ToolAccum> = Vec::new();
+    let mut tool_args_bytes: usize = 0;
     let mut finish_reason = String::new();
     let mut tokens_in: u64 = 0;
     let mut tokens_out: u64 = 0;
@@ -1514,8 +1527,7 @@ async fn stream_turn_openai(
                                             if !quiet {
                                                 emitted = true;
                                                 emit(
-                                                    &Event::new("delta")
-                                                        .with("text", json!(delta)),
+                                                    &Event::new("delta").with("text", json!(delta)),
                                                 );
                                             }
                                         }
@@ -1556,8 +1568,11 @@ async fn stream_turn_openai(
                         | NormalizedStreamEvent::ToolCallDelta(delta) => {
                             timer.mark_first_token();
                             let idx = delta.index;
-                            while tool_calls.len() <= idx {
-                                tool_calls.push(ToolAccum::default());
+                            // H3: bound index growth + total args bytes so a
+                            // malicious high index cannot allocate multi-GB.
+                            if let Err(e) = ensure_stream_tool_slot(&mut tool_calls, idx) {
+                                err = Some(e);
+                                break 'read_stream;
                             }
                             let acc = &mut tool_calls[idx];
                             if let Some(id) = delta.id {
@@ -1587,7 +1602,14 @@ async fn stream_turn_openai(
                                 }
                             }
                             if let Some(arguments) = delta.arguments {
-                                acc.args.push_str(&arguments);
+                                if let Err(e) = append_stream_tool_args(
+                                    &mut tool_args_bytes,
+                                    &mut acc.args,
+                                    &arguments,
+                                ) {
+                                    err = Some(e);
+                                    break 'read_stream;
+                                }
                                 if !quiet {
                                     emitted = true;
                                     emit(
@@ -1734,9 +1756,10 @@ async fn stream_turn_openai(
                     add_structured_tool_call_recovery_instruction(&mut body);
                     content.clear();
                     wire_text.clear();
-        think_demux = ThinkTagDemux::default();
+                    think_demux = ThinkTagDemux::default();
                     reasoning.clear();
                     tool_calls.clear();
+                    tool_args_bytes = 0;
                     finish_reason.clear();
                     tokens_in = 0;
                     tokens_out = 0;
@@ -1768,6 +1791,7 @@ async fn stream_turn_openai(
         wire_text.clear();
         think_demux = ThinkTagDemux::default();
         tool_calls.clear();
+        tool_args_bytes = 0;
         finish_reason.clear();
         tokens_in = 0;
         tokens_out = 0;
@@ -1959,7 +1983,8 @@ async fn stream_turn_gemini(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut content, &text, false) {
+                            if let Some(delta) = append_stream_fragment(&mut content, &text, false)
+                            {
                                 if content.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -1970,7 +1995,9 @@ async fn stream_turn_gemini(
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, false) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut reasoning, &text, false)
+                            {
                                 if reasoning.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -1983,11 +2010,29 @@ async fn stream_turn_gemini(
                         NormalizedStreamEvent::ToolCallStart(delta) => {
                             timer.mark_first_token();
                             let name = delta.name.unwrap_or_default();
-                            let args = delta
-                                .arguments
-                                .as_deref()
-                                .and_then(|arguments| serde_json::from_str(arguments).ok())
-                                .unwrap_or_else(|| json!({}));
+                            let args_raw = delta.arguments.unwrap_or_else(|| "{}".into());
+                            if genai_tool_calls.len()
+                                >= crate::providers::streaming::MAX_STREAM_TOOL_CALL_INDEX
+                            {
+                                err = Some(format!(
+                                    "stream tool_call count exceeds cap ({})",
+                                    crate::providers::streaming::MAX_STREAM_TOOL_CALL_INDEX
+                                ));
+                                break 'read_stream;
+                            }
+                            let mut total_args: usize = genai_tool_calls
+                                .iter()
+                                .map(|(_, a)| a.to_string().len())
+                                .sum();
+                            let mut acc = String::new();
+                            if let Err(e) =
+                                append_stream_tool_args(&mut total_args, &mut acc, &args_raw)
+                            {
+                                err = Some(e);
+                                break 'read_stream;
+                            }
+                            let args: Value =
+                                serde_json::from_str(&acc).unwrap_or_else(|_| json!({}));
                             let index = genai_tool_calls.len();
                             genai_tool_calls.push((name.clone(), args.clone()));
                             if !quiet {
@@ -2663,6 +2708,10 @@ fn should_retry_stream_attempt(
     max_attempts: u32,
 ) -> bool {
     if attempt >= max_attempts {
+        return false;
+    }
+    // Policy/DoS caps (H3) are permanent for this request shape — never retry.
+    if message.contains("exceeds cap") || message.contains("exceed cap") {
         return false;
     }
     if !emitted {
@@ -3397,6 +3446,7 @@ async fn stream_turn_anthropic(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut blocks: Vec<AnthropicBlock> = Vec::new();
+    let mut tool_args_bytes: usize = 0;
     let mut finish_reason = String::new();
     let mut tokens_in: u64 = 0;
     let mut tokens_out: u64 = 0;
@@ -3461,7 +3511,9 @@ async fn stream_turn_anthropic(
                     terminal_event |= is_terminal_stream_event(&event);
                     match event {
                         NormalizedStreamEvent::TextDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut content, &text, minimax) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut content, &text, minimax)
+                            {
                                 if content.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -3472,7 +3524,9 @@ async fn stream_turn_anthropic(
                             }
                         }
                         NormalizedStreamEvent::ReasoningDelta(text) => {
-                            if let Some(delta) = append_stream_fragment(&mut reasoning, &text, minimax) {
+                            if let Some(delta) =
+                                append_stream_fragment(&mut reasoning, &text, minimax)
+                            {
                                 if reasoning.len() == delta.len() {
                                     timer.mark_first_token();
                                 }
@@ -3484,8 +3538,9 @@ async fn stream_turn_anthropic(
                         }
                         NormalizedStreamEvent::ToolCallStart(delta) => {
                             timer.mark_first_token();
-                            while blocks.len() <= delta.index {
-                                blocks.push(AnthropicBlock::default());
+                            if let Err(e) = ensure_stream_tool_slot(&mut blocks, delta.index) {
+                                err = Some(e);
+                                break 'read_stream;
                             }
                             let block = &mut blocks[delta.index];
                             block.kind = "tool_use".into();
@@ -3513,13 +3568,21 @@ async fn stream_turn_anthropic(
                         }
                         NormalizedStreamEvent::ToolCallDelta(delta) => {
                             timer.mark_first_token();
-                            while blocks.len() <= delta.index {
-                                blocks.push(AnthropicBlock::default());
+                            if let Err(e) = ensure_stream_tool_slot(&mut blocks, delta.index) {
+                                err = Some(e);
+                                break 'read_stream;
                             }
                             let block = &mut blocks[delta.index];
                             block.kind = "tool_use".into();
                             if let Some(arguments) = delta.arguments {
-                                block.tool_args.push_str(&arguments);
+                                if let Err(e) = append_stream_tool_args(
+                                    &mut tool_args_bytes,
+                                    &mut block.tool_args,
+                                    &arguments,
+                                ) {
+                                    err = Some(e);
+                                    break 'read_stream;
+                                }
                                 if !quiet {
                                     emitted = true;
                                     emit(
@@ -3600,6 +3663,7 @@ async fn stream_turn_anthropic(
         content.clear();
         reasoning.clear();
         blocks.clear();
+        tool_args_bytes = 0;
         finish_reason.clear();
         tokens_in = 0;
         tokens_out = 0;
@@ -3686,6 +3750,20 @@ mod tests {
             "DSML must never be written instead of tool_calls."
         ));
         assert!(!reasoning_contains_dsml_tool_call("ordinary reasoning"));
+    }
+
+    #[test]
+    fn stream_tool_slot_helpers_reject_unbounded_index() {
+        // H3: high index must fail without growing the vector to multi-GB.
+        let mut calls: Vec<ToolAccum> = Vec::new();
+        assert!(ensure_stream_tool_slot(&mut calls, 0).is_ok());
+        let err = ensure_stream_tool_slot(
+            &mut calls,
+            crate::providers::streaming::MAX_STREAM_TOOL_CALL_INDEX,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds cap"), "{err}");
+        assert_eq!(calls.len(), 1);
     }
 
     #[test]
@@ -4560,34 +4638,24 @@ mod tests {
         assert!(!is_minimax("https://api.openai.com/v1"));
     }
 
-
     #[test]
     fn think_tag_demux_splits_complete_and_partial_tags() {
         let mut d = ThinkTagDemux::default();
         // Opening tag split across chunks.
         assert!(d.push("<thi").is_empty());
         let p1 = d.push("nk>\nstep one");
-        assert_eq!(
-            p1,
-            vec![ThinkPiece::Thinking("\nstep one".into())]
-        );
+        assert_eq!(p1, vec![ThinkPiece::Thinking("\nstep one".into())]);
         let p2 = d.push(" continues</th");
         assert_eq!(p2, vec![ThinkPiece::Thinking(" continues".into())]);
         let p3 = d.push("ink>\n\n## Answer\nHi");
-        assert_eq!(
-            p3,
-            vec![ThinkPiece::Text("\n\n## Answer\nHi".into())]
-        );
+        assert_eq!(p3, vec![ThinkPiece::Text("\n\n## Answer\nHi".into())]);
         assert!(d.finish().is_empty());
     }
 
     #[test]
     fn think_tag_demux_plain_text_passthrough() {
         let mut d = ThinkTagDemux::default();
-        assert_eq!(
-            d.push("hello "),
-            vec![ThinkPiece::Text("hello ".into())]
-        );
+        assert_eq!(d.push("hello "), vec![ThinkPiece::Text("hello ".into())]);
         assert_eq!(d.push("world"), vec![ThinkPiece::Text("world".into())]);
     }
 
@@ -4649,7 +4717,10 @@ mod tests {
         }
         sanitize_assistant_content(&mut content);
         assert_eq!(thinking, "\nThe user is asking what.\n");
-        assert!(!thinking.contains("The userThe user"), "duplicated thinking: {thinking}");
+        assert!(
+            !thinking.contains("The userThe user"),
+            "duplicated thinking: {thinking}"
+        );
         assert_eq!(content, "Hello");
         assert!(!content.contains("</think>"));
     }
@@ -4664,7 +4735,7 @@ mod tests {
         assert_eq!(s2, "Hi  there");
     }
 
-        #[test]
+    #[test]
     fn append_stream_fragment_handles_cumulative_and_delta() {
         // Pure incremental: repeated prefix tokens must NOT be dropped.
         let mut inc = String::new();

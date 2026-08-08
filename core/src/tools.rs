@@ -79,7 +79,16 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
                 _ => Outcome::err("edit requires a non-empty 'edits' array"),
             }
         }
-        "write_file" => write_file(s("path"), s("content"), cfg),
+        "write_file" => {
+            let path = s("path");
+            // Require the `content` key (schema marks it required). Missing key
+            // used to silently write "" and truncate existing files (H5).
+            // Explicit empty string is allowed when the key is present.
+            match require_string_arg(args, "content") {
+                Ok(content) => write_file(path, content, cfg),
+                Err(e) => Outcome::err(e),
+            }
+        }
         "delete" => delete_path(s("path"), cfg),
         "rename" => rename_path(s("from"), s("to"), cfg),
         "mkdir" => mkdir_path(s("path"), cfg),
@@ -122,6 +131,16 @@ impl Outcome {
             output: msg.into(),
             diff: None,
         }
+    }
+}
+
+/// Require a string argument key to be present. Null or non-string values fail.
+/// Empty string is allowed when the key exists (explicit wipe).
+fn require_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+    match args.get(key) {
+        Some(Value::String(s)) => Ok(s.as_str()),
+        Some(_) => Err(format!("'{key}' must be a string")),
+        None => Err(format!("missing required '{key}'")),
     }
 }
 
@@ -2099,12 +2118,19 @@ fn bulk_write(args: &Value, cfg: &Config) -> Outcome {
     let mut ok = true;
     for (i, f) in files.iter().enumerate() {
         let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if path.is_empty() {
             ok = false;
             lines.push(format!("[{i}] error: missing 'path'"));
             continue;
         }
+        let content = match require_string_arg(f, "content") {
+            Ok(c) => c,
+            Err(e) => {
+                ok = false;
+                lines.push(format!("[{i}] {path}: error: {e}"));
+                continue;
+            }
+        };
         let r = write_file(path, content, cfg);
         if !r.ok {
             ok = false;
@@ -4149,6 +4175,61 @@ mod tests {
         );
         assert!(o.ok, "{}", o.output);
         assert!(cfg.workspace.join(".git/config").exists());
+    }
+
+    #[test]
+    fn write_file_missing_content_errors_and_leaves_file() {
+        // H5: omit `content` → tool error; existing file must not be emptied.
+        let (_root, cfg) = tmp_ws();
+        let path = cfg.workspace.join("keep.txt");
+        fs::write(&path, "precious").unwrap();
+        let o = execute("write_file", &json!({"path": "keep.txt"}), &cfg);
+        assert!(!o.ok, "missing content must fail: {}", o.output);
+        assert!(
+            o.output.contains("content"),
+            "error should mention content: {}",
+            o.output
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "precious");
+    }
+
+    #[test]
+    fn write_file_explicit_empty_content_allowed() {
+        let (_root, cfg) = tmp_ws();
+        let path = cfg.workspace.join("wipe.txt");
+        fs::write(&path, "old").unwrap();
+        let o = execute(
+            "write_file",
+            &json!({"path": "wipe.txt", "content": ""}),
+            &cfg,
+        );
+        assert!(o.ok, "{}", o.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn bulk_write_missing_content_errors_and_skips_file() {
+        let (_root, cfg) = tmp_ws();
+        let keep = cfg.workspace.join("keep.txt");
+        fs::write(&keep, "safe").unwrap();
+        let o = bulk_write(
+            &json!({"files":[
+                {"path":"keep.txt"},
+                {"path":"ok.txt","content":"hi"}
+            ]}),
+            &cfg,
+        );
+        assert!(!o.ok, "{}", o.output);
+        assert!(
+            o.output.contains("content"),
+            "error should mention content: {}",
+            o.output
+        );
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "safe");
+        assert_eq!(
+            fs::read_to_string(cfg.workspace.join("ok.txt")).unwrap(),
+            "hi"
+        );
     }
 
     #[test]
